@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { AcquisitionOrchestrator, type Clock } from "../src/acquisition-orchestrator.js";
+import {
+  AcquisitionOrchestrator,
+  recoverStaleRecoveryLock,
+  type Clock,
+} from "../src/acquisition-orchestrator.js";
 import type { DataPaths } from "../src/filesystem-layout.js";
 import type { IdAllocator } from "../src/ids.js";
 import type { OpenCliAcquisitionRequest } from "../src/opencli-gateway.js";
@@ -389,6 +393,74 @@ describe("AcquisitionOrchestrator", () => {
       "utf8",
     );
     await expect(orchestrator.resume("ACQ-20260826-0001")).rejects.toThrow(/claim.*recovery/i);
+  });
+
+  it("uses explicit recovery to clear only a dead recovery-lock owner", async () => {
+    const paths = await createPaths();
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+    const jobDirectory = path.join(paths.staging, "ACQ-20260826-0001");
+    await mkdir(jobDirectory, { recursive: true });
+    await writeFile(
+      path.join(jobDirectory, "job.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","objective":"brave/search","status":"FETCHING","startedAt":"2026-08-26T12:00:00+08:00","counts":{"discovered":0,"stored":0,"duplicated":0,"quarantined":0,"failed":0}}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(jobDirectory, "acquisition-result.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","adapterRef":"brave/search","strategy":"public","retrievedAt":"2026-08-26T12:00:00+08:00","items":[]}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(paths.staging, ".acquisition-recovery-lock"),
+      '{"pid":999999999,"nonce":"dead-recovery-owner"}\n',
+      "utf8",
+    );
+
+    await expect(orchestrator.resume("ACQ-20260826-0001")).rejects.toThrow(/stale.*recovery/i);
+    await expect(recoverStaleRecoveryLock(paths)).resolves.toBe(true);
+    await expect(orchestrator.resume("ACQ-20260826-0001")).resolves.toMatchObject({ status: "STAGED" });
+  });
+
+  it("never bypasses a live recovery owner", async () => {
+    const paths = await createPaths();
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+    await mkdir(paths.staging, { recursive: true });
+    await writeFile(
+      path.join(paths.staging, ".acquisition-recovery-lock"),
+      `${JSON.stringify({ pid: process.pid, nonce: "live-recovery-owner" })}\n`,
+      "utf8",
+    );
+
+    await expect(recoverStaleRecoveryLock(paths)).rejects.toThrow(/already.*progress/i);
+    await expect(orchestrator.run(request)).rejects.toThrow(/already.*progress/i);
+    await expect(readFile(path.join(paths.staging, ".acquisition-recovery-lock"), "utf8"))
+      .resolves.toContain("live-recovery-owner");
+  });
+
+  it("surfaces an ownerless recovery lock for explicit operator recovery", async () => {
+    const paths = await createPaths();
+    await mkdir(path.join(paths.staging, ".acquisition-recovery-lock"), { recursive: true });
+
+    await expect(recoverStaleRecoveryLock(paths)).rejects.toThrow(/recovery lock.*explicit recovery/i);
+  });
+
+  it("does not block new work when a crash leaves an unpublished recovery owner", async () => {
+    const paths = await createPaths();
+    await mkdir(paths.staging, { recursive: true });
+    await writeFile(
+      path.join(paths.staging, ".acquisition-recovery-owner-999999999-orphan.json"),
+      '{"pid":999999999,"nonce":"orphan-recovery"}\n',
+      "utf8",
+    );
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+
+    await expect(orchestrator.run(request)).resolves.toMatchObject({ status: "STAGED" });
   });
 
   it("does not block a new job when a crash leaves an unpublished owner record", async () => {

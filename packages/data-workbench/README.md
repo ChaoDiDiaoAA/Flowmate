@@ -25,6 +25,7 @@
 - `data:init`
 - `data:discover`
 - `data:acquire`
+- `data:recover` — clears only a published recovery lock whose owner PID is verified dead. A live, missing, or malformed owner requires operator investigation and is never removed automatically.
 - `data:catalog:flush`
 - `data:publish`
 - `data:backup`

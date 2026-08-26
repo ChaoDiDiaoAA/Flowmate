@@ -1,4 +1,4 @@
-import { access, link, mkdir, readFile, rename, rmdir, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { DataPaths } from "./filesystem-layout.js";
@@ -110,7 +110,7 @@ export class AcquisitionOrchestrator {
 
   public async resume(jobId: string): Promise<AcquisitionJob> {
     assertAcquisitionJobId(jobId);
-    await acquireRecoveryLock(this.paths.staging);
+    const recoveryLock = await acquireRecoveryLock(this.paths.staging);
     let claim: AcquiredClaim | undefined;
     try {
       await removeDeadClaimForRecovery(this.paths.staging, this.hooks);
@@ -130,7 +130,7 @@ export class AcquisitionOrchestrator {
       if (claim !== undefined) {
         await releaseOwnedClaim(this.paths.staging, claim);
       }
-      await releaseRecoveryLock(this.paths.staging);
+      await releaseOwnedRecoveryLock(this.paths.staging, recoveryLock);
     }
   }
 }
@@ -187,6 +187,10 @@ function claimOwnerPath(stagingPath: string, owner: ClaimOwner): string {
   return path.join(stagingPath, `.acquisition-owner-${owner.pid}-${owner.nonce}.json`);
 }
 
+function recoveryOwnerPath(stagingPath: string, owner: ClaimOwner): string {
+  return path.join(stagingPath, `.acquisition-recovery-owner-${owner.pid}-${owner.nonce}.json`);
+}
+
 async function acquireGlobalClaim(
   stagingPath: string,
   whileRecovering = false,
@@ -221,21 +225,31 @@ async function releaseOwnedClaim(stagingPath: string, claim: AcquiredClaim): Pro
   }
 }
 
-async function acquireRecoveryLock(stagingPath: string): Promise<void> {
+async function acquireRecoveryLock(stagingPath: string): Promise<AcquiredClaim> {
   await mkdir(stagingPath, { recursive: true });
+  const owner: ClaimOwner = { pid: process.pid, nonce: randomUUID() };
+  const ownerPath = recoveryOwnerPath(stagingPath, owner);
+  await writeFile(ownerPath, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
   try {
-    await mkdir(recoveryLockDirectory(stagingPath));
+    await link(ownerPath, recoveryLockDirectory(stagingPath));
+    return { owner, ownerPath };
   } catch (error: unknown) {
+    await unlink(ownerPath);
     if (hasErrorCode(error, "EEXIST")) {
-      throw new Error("Acquisition recovery is already in progress", { cause: error });
+      const publishedOwner = await readPublishedRecoveryLockOwner(stagingPath);
+      if (publishedOwner !== undefined && isProcessLive(publishedOwner.pid)) {
+        throw new Error("Acquisition recovery is already in progress", { cause: error });
+      }
+      throw new Error("Acquisition has a stale recovery lock; run data:recover", { cause: error });
     }
     throw error;
   }
 }
 
-async function releaseRecoveryLock(stagingPath: string): Promise<void> {
+async function releaseOwnedRecoveryLock(stagingPath: string, lock: AcquiredClaim): Promise<void> {
+  await removePublishedRecoveryLockIfOwned(stagingPath, lock.owner);
   try {
-    await rmdir(recoveryLockDirectory(stagingPath));
+    await unlink(lock.ownerPath);
   } catch (error: unknown) {
     if (!hasErrorCode(error, "ENOENT")) {
       throw error;
@@ -244,15 +258,14 @@ async function releaseRecoveryLock(stagingPath: string): Promise<void> {
 }
 
 async function rejectIfRecoveryInProgress(stagingPath: string): Promise<void> {
-  try {
-    await access(recoveryLockDirectory(stagingPath));
-  } catch (error: unknown) {
-    if (hasErrorCode(error, "ENOENT")) {
-      return;
-    }
-    throw error;
+  const owner = await readPublishedRecoveryLockOwner(stagingPath);
+  if (owner === undefined) {
+    return;
   }
-  throw new Error("Acquisition recovery is already in progress");
+  if (isProcessLive(owner.pid)) {
+    throw new Error("Acquisition recovery is already in progress");
+  }
+  throw new Error("Acquisition has a stale recovery lock; run data:recover");
 }
 
 async function removeDeadClaimForRecovery(
@@ -292,6 +305,45 @@ async function readPublishedClaimOwner(stagingPath: string): Promise<ClaimOwner 
     throw new Error("Acquisition claim requires explicit recovery");
   }
   return parsed;
+}
+
+async function readPublishedRecoveryLockOwner(stagingPath: string): Promise<ClaimOwner | undefined> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(recoveryLockDirectory(stagingPath), "utf8"));
+  } catch (error: unknown) {
+    if (hasErrorCode(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new Error("Acquisition recovery lock requires explicit recovery", { cause: error });
+  }
+  if (!isClaimOwner(parsed)) {
+    throw new Error("Acquisition recovery lock requires explicit recovery");
+  }
+  return parsed;
+}
+
+async function removePublishedRecoveryLockIfOwned(
+  stagingPath: string,
+  expectedOwner: ClaimOwner,
+): Promise<void> {
+  const owner = await readPublishedRecoveryLockOwner(stagingPath);
+  if (owner === undefined || owner.pid !== expectedOwner.pid || owner.nonce !== expectedOwner.nonce) {
+    return;
+  }
+  await unlink(recoveryLockDirectory(stagingPath));
+}
+
+export async function recoverStaleRecoveryLock(paths: DataPaths): Promise<boolean> {
+  const owner = await readPublishedRecoveryLockOwner(paths.staging);
+  if (owner === undefined) {
+    return false;
+  }
+  if (isProcessLive(owner.pid)) {
+    throw new Error("Acquisition recovery is already in progress");
+  }
+  await removePublishedRecoveryLockIfOwned(paths.staging, owner);
+  return true;
 }
 
 function isClaimOwner(value: unknown): value is ClaimOwner {

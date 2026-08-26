@@ -1,5 +1,9 @@
 import { parseArgs } from "node:util";
-import { AcquisitionOrchestrator, type Clock } from "./acquisition-orchestrator.js";
+import {
+  AcquisitionOrchestrator,
+  recoverStaleRecoveryLock,
+  type Clock,
+} from "./acquisition-orchestrator.js";
 import { resolveConfig } from "./config.js";
 import { initializeDataLayout } from "./filesystem-layout.js";
 import { createIdAllocator } from "./ids.js";
@@ -33,6 +37,14 @@ async function main(): Promise<void> {
       sourcePolicy,
     );
     process.stdout.write(`${JSON.stringify(await orchestrator.run(request), null, 2)}\n`);
+    return;
+  }
+  if (command === "recover") {
+    parseArgs({ args: argumentsAfterCommand, allowPositionals: false, strict: true });
+    const config = resolveConfig(process.env);
+    const paths = await initializeDataLayout(config.dataRoot);
+    const recovered = await recoverStaleRecoveryLock(paths);
+    process.stdout.write(`${recovered ? "recovery-lock-cleared" : "no-recovery-lock"}\n`);
     return;
   }
   if (command !== "init") {
