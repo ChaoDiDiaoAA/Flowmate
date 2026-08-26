@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { DataWorkbenchConfig } from "./config.js";
 
@@ -25,6 +25,51 @@ const prefixes: Record<SequentialIdKind, string> = {
   sample: "SAMPLE",
   business: "BIZ",
 };
+
+const lockRetryDelayMs = 10;
+const lockRetryLimit = 500;
+const staleLockAgeMs = 30_000;
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === code
+  );
+}
+
+function waitForLockRetry(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, lockRetryDelayMs));
+}
+
+async function removeStaleLock(lockPath: string): Promise<void> {
+  try {
+    const lockStats = await stat(lockPath);
+    if (Date.now() - lockStats.mtimeMs > staleLockAgeMs) {
+      await unlink(lockPath);
+    }
+  } catch (error: unknown) {
+    if (!hasErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
+
+async function acquireDataRootLock(lockPath: string) {
+  for (let attempt = 0; attempt < lockRetryLimit; attempt += 1) {
+    try {
+      return await open(lockPath, "wx");
+    } catch (error: unknown) {
+      if (!hasErrorCode(error, "EEXIST")) {
+        throw error;
+      }
+      await removeStaleLock(lockPath);
+      await waitForLockRetry();
+    }
+  }
+  throw new Error(`Timed out acquiring ID counter lock at ${lockPath}`);
+}
 
 function emptyCounters(): IdCounters {
   return {
@@ -110,35 +155,42 @@ class FileIdAllocator implements IdAllocator {
     const manifestsDirectory = path.join(this.dataRoot, "manifests");
     const countersPath = path.join(manifestsDirectory, "id-counters.json");
     await mkdir(manifestsDirectory, { recursive: true });
+    const lockPath = path.join(manifestsDirectory, "id-counters.lock");
+    const lock = await acquireDataRootLock(lockPath);
 
-    let counters = emptyCounters();
     try {
-      counters = parseCounters(JSON.parse(await readFile(countersPath, "utf8")));
-    } catch (error: unknown) {
-      if (!(error instanceof Error) || "code" in error === false || error.code !== "ENOENT") {
-        throw error;
+      let counters = emptyCounters();
+      try {
+        counters = parseCounters(JSON.parse(await readFile(countersPath, "utf8")));
+      } catch (error: unknown) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw error;
+        }
       }
-    }
 
-    let id: string;
-    if (kind === "acquisition") {
-      const date = acquisitionDate(new Date());
-      const next = (counters.acquisition[date] ?? 0) + 1;
-      counters.acquisition[date] = next;
-      id = `ACQ-${date}-${next.toString().padStart(4, "0")}`;
-    } else {
-      const next = counters[kind] + 1;
-      counters[kind] = next;
-      id = `${prefixes[kind]}-${next.toString().padStart(6, "0")}`;
-    }
+      let id: string;
+      if (kind === "acquisition") {
+        const date = acquisitionDate(new Date());
+        const next = (counters.acquisition[date] ?? 0) + 1;
+        counters.acquisition[date] = next;
+        id = `ACQ-${date}-${next.toString().padStart(4, "0")}`;
+      } else {
+        const next = counters[kind] + 1;
+        counters[kind] = next;
+        id = `${prefixes[kind]}-${next.toString().padStart(6, "0")}`;
+      }
 
-    const temporaryPath = path.join(
-      manifestsDirectory,
-      `id-counters.${process.pid}.${Date.now()}.tmp`,
-    );
-    await writeFile(temporaryPath, `${JSON.stringify(counters, null, 2)}\n`, "utf8");
-    await rename(temporaryPath, countersPath);
-    return id;
+      const temporaryPath = path.join(
+        manifestsDirectory,
+        `id-counters.${process.pid}.${Date.now()}.tmp`,
+      );
+      await writeFile(temporaryPath, `${JSON.stringify(counters, null, 2)}\n`, "utf8");
+      await rename(temporaryPath, countersPath);
+      return id;
+    } finally {
+      await lock.close();
+      await unlink(lockPath);
+    }
   }
 }
 

@@ -48,6 +48,24 @@ describe("IdAllocator", () => {
     ).resolves.toContain('"source": 2');
   });
 
+  it("coordinates concurrent allocations from independent allocators", async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), "flowmate-ids-"));
+    temporaryRoots.push(dataRoot);
+    const config = { dataRoot, mineruMaxFilesPerRun: 200 };
+    const firstAllocator = createIdAllocator(config);
+    const secondAllocator = createIdAllocator(config);
+
+    const ids = await Promise.all([
+      firstAllocator.next("source"),
+      secondAllocator.next("source"),
+    ]);
+
+    expect(new Set(ids)).toEqual(new Set(["SRC-000001", "SRC-000002"]));
+    await expect(
+      readFile(path.join(dataRoot, "manifests", "id-counters.json"), "utf8"),
+    ).resolves.toContain('"source": 2');
+  });
+
   it("uses the approved China calendar date for acquisition IDs", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-25T16:30:00.000Z"));
