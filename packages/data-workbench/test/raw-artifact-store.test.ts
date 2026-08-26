@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -162,5 +162,23 @@ describe("RawArtifactStore", () => {
       acquisitionJobIds: ["ACQ-20260826-0001", "ACQ-20260826-0002"],
     });
     expect(duplicate.rawRef).toBeUndefined();
+  });
+
+  it("rejects a staged file reached through a staging reparse point", async () => {
+    const { paths, store } = await createStore();
+    const outside = path.join(paths.root, "outside");
+    const reparsePoint = path.join(paths.staging, "ACQ-20260826-0001", "escape");
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "invoice.txt"), "outside staging", "utf8");
+    await symlink(outside, reparsePoint, process.platform === "win32" ? "junction" : "dir");
+
+    await expect(store.ingest({
+      sourceId: "SRC-000001",
+      jobId: "ACQ-20260826-0001",
+      stagedFile: path.join(reparsePoint, "invoice.txt"),
+      mimeType: "text/plain",
+      retentionStatus: "retained",
+    })).rejects.toThrow(/reparse|staging/i);
+    await expect(readFile(path.join(outside, "invoice.txt"), "utf8")).resolves.toBe("outside staging");
   });
 });

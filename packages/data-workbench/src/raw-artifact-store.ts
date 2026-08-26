@@ -11,6 +11,7 @@ import {
 import path from "node:path";
 import type { DataPaths } from "./filesystem-layout.js";
 import type { IdAllocator } from "./ids.js";
+import { resolveContainedStagingFile } from "./staging-containment.js";
 import { assertAcquisitionJobId, assertSourceId } from "./stable-ids.js";
 import type { RawArtifactRef } from "./types.js";
 
@@ -37,7 +38,7 @@ export class RawArtifactStore {
   }): Promise<RawArtifactRef> {
     const sourceId = assertSourceId(input.sourceId);
     const jobId = assertAcquisitionJobId(input.jobId);
-    const stagedFile = assertStagedFile(this.paths.staging, jobId, input.stagedFile);
+    const stagedFile = await resolveContainedStagingFile(this.paths.staging, jobId, input.stagedFile);
     const canonicalUrl = input.canonicalUrl === undefined
       ? undefined
       : canonicalizeUrl(input.canonicalUrl);
@@ -106,16 +107,6 @@ function associate(existing: RawArtifactRef, sourceId: string, jobId: string): R
 
 function uniqueAppend(values: string[], value: string): string[] {
   return values.includes(value) ? values : [...values, value];
-}
-
-function assertStagedFile(stagingRoot: string, jobId: string, stagedFile: string): string {
-  const jobDirectory = path.resolve(stagingRoot, jobId);
-  const resolvedFile = path.resolve(stagedFile);
-  const relative = path.relative(jobDirectory, resolvedFile);
-  if (relative === "" || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error("Staged file must be inside the current acquisition job staging directory");
-  }
-  return resolvedFile;
 }
 
 function canonicalizeUrl(value: string): string {

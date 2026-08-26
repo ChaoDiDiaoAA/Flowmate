@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ProcessRunner } from "./process-runner.js";
+import { resolveContainedStagingFile } from "./staging-containment.js";
 
 export interface PublicFileDownloader {
   download(input: {
@@ -24,7 +25,11 @@ export class PowerShellPublicFileDownloader implements PublicFileDownloader {
     targetFile: string;
   }): Promise<{ fileRef: string; rawSha256: string }> {
     const url = validatePublicUrl(input.url, input.allowedDomain);
-    const targetFile = assertInsideDirectory(this.stagingDirectory, input.targetFile);
+    const targetFile = await resolveContainedStagingFile(
+      path.dirname(this.stagingDirectory),
+      path.basename(this.stagingDirectory),
+      input.targetFile,
+    );
     if (await fileExists(targetFile)) {
       return { fileRef: targetFile, rawSha256: await sha256File(targetFile) };
     }
@@ -60,16 +65,6 @@ function validatePublicUrl(value: string, allowedDomain: string): URL {
     throw new Error("Public file URL domain does not match the allowed domain");
   }
   return url;
-}
-
-function assertInsideDirectory(directory: string, filePath: string): string {
-  const resolvedDirectory = path.resolve(directory);
-  const resolvedFile = path.resolve(filePath);
-  const relative = path.relative(resolvedDirectory, resolvedFile);
-  if (relative === "" || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error("Public file target must be inside the current job staging directory");
-  }
-  return resolvedFile;
 }
 
 async function fileExists(filePath: string): Promise<boolean> {

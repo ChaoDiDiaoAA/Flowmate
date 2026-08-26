@@ -33,8 +33,17 @@ export class DedupeEngine {
       const index = await readIndex(indexPath);
       const byUrl = input.canonicalUrl === undefined ? undefined : index.urls[input.canonicalUrl];
       if (byUrl) {
-        if (byUrl.rawSha256 === input.rawSha256) {
-          const canonicalArtifactId = await reconcileRawArtifactIdentity(indexPath, index, byUrl, input);
+        if (hasSameCanonicalContent(byUrl, input)) {
+          if (byUrl.rawSha256 !== input.rawSha256) {
+            index.raws[input.rawSha256] = newFingerprint({
+              ...input,
+              artifactId: byUrl.artifactId,
+            });
+            await writeJsonAtomically(indexPath, index);
+          }
+          const canonicalArtifactId = byUrl.rawSha256 === input.rawSha256
+            ? await reconcileRawArtifactIdentity(indexPath, index, byUrl, input)
+            : byUrl.artifactId;
           return duplicate("duplicate_url", canonicalArtifactId);
         }
         const fingerprint = newFingerprint(input);
@@ -72,6 +81,16 @@ export class DedupeEngine {
       return { status: "unique", canonicalArtifactId: fingerprint.artifactId, relatedArtifactIds: [] };
     });
   }
+}
+
+function hasSameCanonicalContent(
+  existing: ArtifactFingerprint,
+  input: { rawSha256: string; contentSha256?: string },
+): boolean {
+  if (existing.contentSha256 !== undefined && input.contentSha256 !== undefined) {
+    return existing.contentSha256 === input.contentSha256;
+  }
+  return existing.rawSha256 === input.rawSha256;
 }
 
 export function normalizeContent(value: string): string {

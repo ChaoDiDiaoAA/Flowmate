@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -101,6 +101,22 @@ describe("PowerShellPublicFileDownloader", () => {
       allowedDomain: "example.com",
       targetFile: path.join(root, "outside.pdf"),
     })).rejects.toThrow(/staging/i);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("rejects an existing target reached through a staging reparse point before spawning", async () => {
+    const { root, staging, downloader, runner } = await createDownloader();
+    const outside = path.join(root, "outside");
+    const reparsePoint = path.join(staging, "escape");
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "invoice.pdf"), "outside staging", "utf8");
+    await symlink(outside, reparsePoint, process.platform === "win32" ? "junction" : "dir");
+
+    await expect(downloader.download({
+      url: "https://example.com/invoice.pdf",
+      allowedDomain: "example.com",
+      targetFile: path.join(reparsePoint, "invoice.pdf"),
+    })).rejects.toThrow(/reparse|staging/i);
     expect(runner.calls).toEqual([]);
   });
 

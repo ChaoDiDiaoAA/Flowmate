@@ -43,6 +43,91 @@ describe("DedupeEngine", () => {
     expect(normalizeContent("Cat")).not.toBe(normalizeContent("Feline"));
   });
 
+  it("treats changed raw bytes with the same canonical URL content as a duplicate URL", async () => {
+    const { root, engine } = await createEngine();
+
+    await engine.decide({
+      artifactId: "ART-000101",
+      canonicalUrl: "https://example.com/a",
+      rawSha256: hashA,
+      contentSha256: hashB,
+    });
+
+    await expect(engine.decide({
+      artifactId: "ART-000102",
+      canonicalUrl: "https://example.com/a",
+      rawSha256: hashC,
+      contentSha256: hashB,
+    })).resolves.toEqual({
+      status: "duplicate_url",
+      canonicalArtifactId: "ART-000101",
+      relatedArtifactIds: [],
+    });
+    await expect(engine.decide({
+      artifactId: "ART-000102",
+      canonicalUrl: "https://example.com/b",
+      rawSha256: hashC,
+      contentSha256: hashB,
+    })).resolves.toEqual({
+      status: "duplicate_raw",
+      canonicalArtifactId: "ART-000101",
+      relatedArtifactIds: [],
+    });
+    await expect(readFile(path.join(root, "manifests", "dedupe-index.json"), "utf8"))
+      .resolves.toContain(hashC);
+  });
+
+  it("treats changed canonical URL content as an update even when raw bytes match", async () => {
+    const { engine } = await createEngine();
+
+    await engine.decide({
+      artifactId: "ART-000101",
+      canonicalUrl: "https://example.com/a",
+      rawSha256: hashA,
+      contentSha256: hashB,
+    });
+
+    await expect(engine.decide({
+      artifactId: "ART-000101",
+      canonicalUrl: "https://example.com/a",
+      rawSha256: hashA,
+      contentSha256: hashC,
+    })).resolves.toEqual({
+      status: "url_updated",
+      canonicalArtifactId: "ART-000101",
+      relatedArtifactIds: ["ART-000101"],
+    });
+  });
+
+  it("falls back to raw SHA-256 for URL comparison when either content hash is unavailable", async () => {
+    const { engine } = await createEngine();
+
+    await engine.decide({
+      artifactId: "ART-000101",
+      canonicalUrl: "https://example.com/a",
+      rawSha256: hashA,
+    });
+    await expect(engine.decide({
+      artifactId: "ART-000101",
+      canonicalUrl: "https://example.com/a",
+      rawSha256: hashA,
+      contentSha256: hashB,
+    })).resolves.toEqual({
+      status: "duplicate_url",
+      canonicalArtifactId: "ART-000101",
+      relatedArtifactIds: [],
+    });
+    await expect(engine.decide({
+      artifactId: "ART-000102",
+      canonicalUrl: "https://example.com/a",
+      rawSha256: hashC,
+    })).resolves.toEqual({
+      status: "url_updated",
+      canonicalArtifactId: "ART-000102",
+      relatedArtifactIds: ["ART-000101"],
+    });
+  });
+
   it("reconciles a legacy virtual dedupe ID to the supplied raw artifact ID", async () => {
     const { root, engine } = await createEngine();
     const manifests = path.join(root, "manifests");
