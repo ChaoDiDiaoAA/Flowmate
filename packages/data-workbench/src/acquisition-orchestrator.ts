@@ -1,4 +1,4 @@
-import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { DataPaths } from "./filesystem-layout.js";
@@ -27,6 +27,7 @@ export interface PublicOpenCliGateway {
 
 export interface AcquisitionOrchestratorHooks {
   afterReceiptWritten?(jobId: string): Promise<void>;
+  afterDeadClaimChecked?(): Promise<void>;
 }
 
 interface ClaimOwner {
@@ -109,9 +110,11 @@ export class AcquisitionOrchestrator {
 
   public async resume(jobId: string): Promise<AcquisitionJob> {
     assertAcquisitionJobId(jobId);
-    await removeDeadClaimForRecovery(this.paths.staging);
-    const claim = await acquireGlobalClaim(this.paths.staging);
+    await acquireRecoveryLock(this.paths.staging);
+    let claim: AcquiredClaim | undefined;
     try {
+      await removeDeadClaimForRecovery(this.paths.staging, this.hooks);
+      claim = await acquireGlobalClaim(this.paths.staging, true);
       const jobDirectory = stagingJobDirectory(this.paths.staging, jobId);
       const job = await readJob(path.join(jobDirectory, "job.json"));
       const receipt = await readReceipt(path.join(jobDirectory, "acquisition-result.json"));
@@ -124,7 +127,10 @@ export class AcquisitionOrchestrator {
       }
       return stagedJob;
     } finally {
-      await releaseOwnedClaim(this.paths.staging, claim);
+      if (claim !== undefined) {
+        await releaseOwnedClaim(this.paths.staging, claim);
+      }
+      await releaseRecoveryLock(this.paths.staging);
     }
   }
 }
@@ -173,12 +179,22 @@ function claimDirectory(stagingPath: string): string {
   return path.join(stagingPath, ".acquisition-claim");
 }
 
+function recoveryLockDirectory(stagingPath: string): string {
+  return path.join(stagingPath, ".acquisition-recovery-lock");
+}
+
 function claimOwnerPath(stagingPath: string, owner: ClaimOwner): string {
   return path.join(stagingPath, `.acquisition-owner-${owner.pid}-${owner.nonce}.json`);
 }
 
-async function acquireGlobalClaim(stagingPath: string): Promise<AcquiredClaim> {
+async function acquireGlobalClaim(
+  stagingPath: string,
+  whileRecovering = false,
+): Promise<AcquiredClaim> {
   await mkdir(stagingPath, { recursive: true });
+  if (!whileRecovering) {
+    await rejectIfRecoveryInProgress(stagingPath);
+  }
   const owner: ClaimOwner = { pid: process.pid, nonce: randomUUID() };
   const ownerPath = claimOwnerPath(stagingPath, owner);
   await writeFile(ownerPath, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
@@ -205,7 +221,44 @@ async function releaseOwnedClaim(stagingPath: string, claim: AcquiredClaim): Pro
   }
 }
 
-async function removeDeadClaimForRecovery(stagingPath: string): Promise<void> {
+async function acquireRecoveryLock(stagingPath: string): Promise<void> {
+  await mkdir(stagingPath, { recursive: true });
+  try {
+    await mkdir(recoveryLockDirectory(stagingPath));
+  } catch (error: unknown) {
+    if (hasErrorCode(error, "EEXIST")) {
+      throw new Error("Acquisition recovery is already in progress", { cause: error });
+    }
+    throw error;
+  }
+}
+
+async function releaseRecoveryLock(stagingPath: string): Promise<void> {
+  try {
+    await rmdir(recoveryLockDirectory(stagingPath));
+  } catch (error: unknown) {
+    if (!hasErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
+
+async function rejectIfRecoveryInProgress(stagingPath: string): Promise<void> {
+  try {
+    await access(recoveryLockDirectory(stagingPath));
+  } catch (error: unknown) {
+    if (hasErrorCode(error, "ENOENT")) {
+      return;
+    }
+    throw error;
+  }
+  throw new Error("Acquisition recovery is already in progress");
+}
+
+async function removeDeadClaimForRecovery(
+  stagingPath: string,
+  hooks: AcquisitionOrchestratorHooks,
+): Promise<void> {
   const owner = await readPublishedClaimOwner(stagingPath);
   if (owner === undefined) {
     return;
@@ -213,6 +266,7 @@ async function removeDeadClaimForRecovery(stagingPath: string): Promise<void> {
   if (isProcessLive(owner.pid)) {
     throw new Error("Acquisition claim is still running");
   }
+  await hooks.afterDeadClaimChecked?.();
   await removePublishedClaimIfOwned(stagingPath, owner);
 }
 
@@ -246,7 +300,8 @@ function isClaimOwner(value: unknown): value is ClaimOwner {
   }
   const candidate = value as Record<string, unknown>;
   return (
-    typeof candidate.pid === "number" && Number.isInteger(candidate.pid) && candidate.pid > 0 &&
+    typeof candidate.pid === "number" && Number.isSafeInteger(candidate.pid) &&
+    candidate.pid > 0 && candidate.pid <= 2_147_483_647 &&
     typeof candidate.nonce === "string" && candidate.nonce.length > 0
   );
 }

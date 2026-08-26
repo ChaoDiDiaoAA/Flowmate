@@ -125,6 +125,31 @@ class ReceiptPause {
   }
 }
 
+class RecoveryPause {
+  public entered: Promise<void>;
+  private markEntered: (() => void) | undefined;
+  private releasePause: (() => void) | undefined;
+  private readonly completion: Promise<void>;
+
+  public constructor() {
+    this.entered = new Promise((resolve) => {
+      this.markEntered = resolve;
+    });
+    this.completion = new Promise((resolve) => {
+      this.releasePause = resolve;
+    });
+  }
+
+  public async wait(): Promise<void> {
+    this.markEntered?.();
+    await this.completion;
+  }
+
+  public release(): void {
+    this.releasePause?.();
+  }
+}
+
 async function createPaths(): Promise<DataPaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), "flowmate-acquisition-"));
   temporaryRoots.push(root);
@@ -287,6 +312,83 @@ describe("AcquisitionOrchestrator", () => {
 
     await expect(orchestrator.resume("ACQ-20260826-0001")).rejects.toThrow(/claim.*recovery/i);
     await expect(readFile(path.join(paths.staging, ".acquisition-claim"), "utf8")).rejects.toMatchObject({ code: "EISDIR" });
+  });
+
+  it("serializes concurrent dead-owner recovery before replacing the claim", async () => {
+    const paths = await createPaths();
+    const pause = new RecoveryPause();
+    const first = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+      { afterDeadClaimChecked: () => pause.wait() },
+    );
+    const second = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+    const competingRun = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), {
+        ...allowedSourcePolicy, sourceId: "SRC-000002",
+      },
+    );
+    const jobDirectory = path.join(paths.staging, "ACQ-20260826-0001");
+    await mkdir(jobDirectory, { recursive: true });
+    await writeFile(
+      path.join(jobDirectory, "job.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","objective":"brave/search","status":"FETCHING","startedAt":"2026-08-26T12:00:00+08:00","counts":{"discovered":0,"stored":0,"duplicated":0,"quarantined":0,"failed":0}}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(jobDirectory, "acquisition-result.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","adapterRef":"brave/search","strategy":"public","retrievedAt":"2026-08-26T12:00:00+08:00","items":[]}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(paths.staging, ".acquisition-claim"),
+      '{"pid":999999999,"nonce":"dead-owner"}\n',
+      "utf8",
+    );
+
+    const firstResume = first.resume("ACQ-20260826-0001");
+    await expect(Promise.race([
+      pause.entered.then(() => "entered"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("not-entered"), 50)),
+    ])).resolves.toBe("entered");
+    await expect(second.resume("ACQ-20260826-0001")).rejects.toThrow(/recovery.*progress/i);
+    await expect(competingRun.run({ ...request, sourceId: "SRC-000002" }))
+      .rejects.toThrow(/recovery.*progress/i);
+    pause.release();
+    await expect(firstResume).resolves.toMatchObject({ status: "STAGED" });
+  });
+
+  it("routes out-of-range and nonnumeric claim PIDs to explicit recovery", async () => {
+    const paths = await createPaths();
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+    const jobDirectory = path.join(paths.staging, "ACQ-20260826-0001");
+    await mkdir(jobDirectory, { recursive: true });
+    await writeFile(
+      path.join(jobDirectory, "job.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","objective":"brave/search","status":"FETCHING","startedAt":"2026-08-26T12:00:00+08:00","counts":{"discovered":0,"stored":0,"duplicated":0,"quarantined":0,"failed":0}}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(jobDirectory, "acquisition-result.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","adapterRef":"brave/search","strategy":"public","retrievedAt":"2026-08-26T12:00:00+08:00","items":[]}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(paths.staging, ".acquisition-claim"),
+      '{"pid":1e100,"nonce":"invalid-pid"}\n',
+      "utf8",
+    );
+
+    await expect(orchestrator.resume("ACQ-20260826-0001")).rejects.toThrow(/claim.*recovery/i);
+    await writeFile(
+      path.join(paths.staging, ".acquisition-claim"),
+      '{"pid":"123","nonce":"nonnumeric-pid"}\n',
+      "utf8",
+    );
+    await expect(orchestrator.resume("ACQ-20260826-0001")).rejects.toThrow(/claim.*recovery/i);
   });
 
   it("does not block a new job when a crash leaves an unpublished owner record", async () => {
