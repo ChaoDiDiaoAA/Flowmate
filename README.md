@@ -17,11 +17,11 @@ The only formal seam to the later runtime is the `DatasetManifest` interface: st
 
 ## Commands
 
-This repository currently has no root npm project. If a package is added, use its documented scripts (normally `npm install`, `npm test`, `npm run lint`, and `npm run build`). The MinerU wrapper is a Python project under `tools/mineru-mcp-wrapper`; run its tests from that directory with `pytest` and use the project metadata/README for its launcher command.
+The repository uses npm workspaces. Run `npm install`, then the documented root scripts (`npm test`, `npm run lint`, `npm run typecheck`, and `npm run build`). The MinerU wrapper is a separate Python project under `tools/mineru-mcp-wrapper`; run its tests from that directory with `pytest` and use its README for the launcher command.
 
 ## Security and data handling
 
-Never commit tokens, cookies, passwords, API keys, private keys, real enterprise data, or network raw data. Keep the Obsidian vault and `FlowmateData/` outside this repository. `.env.example` may document variable names but must contain placeholders only. The project-level MinerU wrapper is required for P0; do not upload private data to MinerU cloud unless the owner and security policy explicitly allow it.
+Never commit tokens, cookies, passwords, API keys, private keys, real enterprise data, or network raw data. The working data root is `D:\code\agent-learn\agent\Flowmate\FlowmateData`; it lives under the project directory but is protected by `.gitignore` and must never be staged. `.env.example` may document variable names but must contain placeholders only. The project-level MinerU wrapper is required for P0; do not upload private data to MinerU cloud unless the owner and security policy explicitly allow it.
 
 ## Stop conditions
 

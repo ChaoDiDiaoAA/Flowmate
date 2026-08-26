@@ -447,7 +447,7 @@ import { resolveConfig } from "../src/config.js";
 describe("resolveConfig", () => {
   it("uses the approved FlowmateData root", () => {
     expect(resolveConfig({}).dataRoot).toBe(
-      "D:\\code\\agent-learn\\agent\\FlowmateData",
+      "D:\\code\\agent-learn\\agent\\Flowmate\\FlowmateData",
     );
   });
 
@@ -486,7 +486,7 @@ export function resolveConfig(
   env: Record<string, string | undefined>,
 ): DataWorkbenchConfig {
   const dataRoot = path.win32.normalize(
-    env.FLOWMATE_DATA_ROOT ?? "D:\\code\\agent-learn\\agent\\FlowmateData",
+    env.FLOWMATE_DATA_ROOT ?? "D:\\code\\agent-learn\\agent\\Flowmate\\FlowmateData",
   );
   const mineruMaxFilesPerRun = Number(
     env.FLOWMATE_MINERU_MAX_FILES_PER_RUN ?? "200",
@@ -975,7 +975,7 @@ args = [
   "D:\\code\\agent-learn\\agent\\Flowmate\\tools\\mineru-mcp-wrapper",
   "flowmate-mineru-mcp",
   "--output-dir",
-  "D:\\code\\agent-learn\\agent\\FlowmateData\\derived\\mineru"
+  "D:\\code\\agent-learn\\agent\\Flowmate\\FlowmateData\\derived\\mineru"
 ]
 
 [mcp_servers.mineru.env]
