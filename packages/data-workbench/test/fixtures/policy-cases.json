@@ -1,0 +1,16 @@
+[
+  { "name": "allowed-public", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "public invoice rule", "quality": "good", "want": "catalog" },
+  { "name": "allowed-synthetic-invoice", "license": "allowed", "synthetic": true, "containsSyntheticIdentifiers": true, "text": "IBAN GB91YXO05542456978150 Tax Id 991-72-5826", "quality": "good", "want": "catalog" },
+  { "name": "unknown-license", "license": "unknown", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "good", "want": "quarantine" },
+  { "name": "denied-license", "license": "denied", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "good", "want": "delete_content_keep_metadata" },
+  { "name": "api-key", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "API_KEY=secret-value", "quality": "good", "want": "delete_content_keep_metadata" },
+  { "name": "phone", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "联系电话 13800138000", "quality": "good", "want": "quarantine" },
+  { "name": "empty", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "", "quality": "bad", "want": "quarantine" },
+  { "name": "raw-retention-denied", "license": "allowed", "rawRetention": "denied", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "good", "want": "delete_content_keep_metadata" },
+  { "name": "dataset-usage-denied", "license": "allowed", "datasetUsage": "denied", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "good", "want": "quarantine" },
+  { "name": "disabled-source", "license": "allowed", "enabled": false, "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "good", "want": "quarantine" },
+  { "name": "internal-source", "license": "allowed", "sourceType": "internal_business", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "good", "want": "quarantine" },
+  { "name": "bank-account", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "Account 1234567890123456", "quality": "good", "want": "quarantine" },
+  { "name": "identity-number", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "身份证 11010519491231002X", "quality": "good", "want": "quarantine" },
+  { "name": "synthetic-claim-without-policy", "license": "allowed", "synthetic": true, "containsSyntheticIdentifiers": false, "text": "Account 1234567890123456", "quality": "good", "want": "quarantine" }
+]
