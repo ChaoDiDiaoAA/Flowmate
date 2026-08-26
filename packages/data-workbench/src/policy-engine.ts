@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { ParsedDocument, PolicyDecision, RawArtifactRef, SourcePolicy } from "./types.js";
@@ -100,6 +100,7 @@ export class PolicyDeletionExecutor {
   private async assertSafeTarget(fileRef: string): Promise<void> {
     const resolved = path.resolve(fileRef);
     assertContainedPath(this.root, resolved, "Refusing to delete path outside the configured deletion root");
+    await assertNoReparseAncestor(this.root);
     await assertNoReparsePoint(this.root, resolved);
     const realRoot = await realpath(this.root);
     const realParent = await realpath(path.dirname(resolved));
@@ -157,6 +158,10 @@ function assessPrivacy(content: string, policy: SourcePolicy, reasonCodes: Set<s
 }
 
 function inspectContent(parsedDocument: ParsedDocument, reasonCodes: Set<string>): ContentInspection {
+  if (!isSafeDerivedReference(path.dirname(parsedDocument.contentRef), parsedDocument.contentRef)) {
+    reasonCodes.add("DERIVED_OUTPUT_REPARSE");
+    return { content: "", readable: false };
+  }
   try { return { content: readFileSync(parsedDocument.contentRef, "utf8"), readable: true }; }
   catch { reasonCodes.add("CONTENT_UNREADABLE"); return { content: "", readable: false }; }
 }
@@ -197,6 +202,13 @@ function assessDerivedOutputQuality(
   const derivedRoot = path.dirname(parsedDocument.contentRef);
   const metadataRef = path.join(derivedRoot, "metadata.json");
   const checksumsRef = path.join(derivedRoot, "checksums.sha256");
+  if (!areSafeDerivedReferences(derivedRoot, [
+    parsedDocument.contentRef,
+    parsedDocument.structureRef,
+    metadataRef,
+    checksumsRef,
+    ...parsedDocument.imageRefs,
+  ])) { fail("DERIVED_OUTPUT_REPARSE"); return; }
   const requiredFiles = new Map<string, string>([
     ["content.md", parsedDocument.contentRef],
     [relativeDerivedRef(derivedRoot, parsedDocument.structureRef, fail), parsedDocument.structureRef],
@@ -221,6 +233,7 @@ function assessDerivedOutputQuality(
   for (const [name, expectedHash] of manifest) {
     const fileRef = path.resolve(derivedRoot, name);
     if (!isRelativeDerivedPath(derivedRoot, fileRef)) { fail("DERIVED_CHECKSUMS_INVALID"); return; }
+    if (!isSafeDerivedReference(derivedRoot, fileRef)) { fail("DERIVED_OUTPUT_REPARSE"); return; }
     const output = inspectFile(fileRef);
     if (!output.readable || expectedHash !== sha256(output.contents)) { fail("DERIVED_CHECKSUMS_INVALID"); return; }
   }
@@ -256,6 +269,76 @@ function inspectFile(fileRef: string | undefined): FileInspection {
 
 function uniqueFileRefs(fileRefs: Array<string | undefined>): string[] {
   return [...new Set(fileRefs.filter((fileRef): fileRef is string => Boolean(fileRef)))];
+}
+
+function areSafeDerivedReferences(root: string, fileRefs: string[]): boolean {
+  return fileRefs.every((fileRef) => isSafeDerivedReference(root, fileRef));
+}
+
+function isSafeDerivedReference(root: string, fileRef: string): boolean {
+  try {
+    const resolvedRoot = path.resolve(root);
+    const resolvedFile = path.resolve(fileRef);
+    assertContainedPath(resolvedRoot, resolvedFile, "Derived output is outside its root");
+    assertNoReparseAncestorSync(resolvedRoot);
+    assertNoReparsePointSync(resolvedRoot, resolvedFile);
+    const realRoot = realpathSync(resolvedRoot);
+    const realParent = realpathSync(path.dirname(resolvedFile));
+    assertContainedPath(realRoot, realParent, "Derived output is outside its root", true);
+    const target = tryLstatSync(resolvedFile);
+    if (!target) return true;
+    if (target.isSymbolicLink()) return false;
+    assertContainedPath(realRoot, realpathSync(resolvedFile), "Derived output is outside its root");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function assertNoReparseAncestor(directory: string): Promise<void> {
+  const resolved = path.resolve(directory);
+  const filesystemRoot = path.parse(resolved).root;
+  const rootStats = await lstatIfPresent(filesystemRoot);
+  if (!rootStats?.isDirectory() || rootStats.isSymbolicLink()) throw new Error("Deletion filesystem root must be a real directory");
+  let current = filesystemRoot;
+  for (const segment of path.relative(filesystemRoot, resolved).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stats = await lstatIfPresent(current);
+    if (!stats?.isDirectory() || stats.isSymbolicLink()) throw new Error(`Deletion root cannot cross a symbolic link or reparse point: ${current}`);
+  }
+}
+
+function assertNoReparseAncestorSync(directory: string): void {
+  const resolved = path.resolve(directory);
+  const filesystemRoot = path.parse(resolved).root;
+  const rootStats = lstatSync(filesystemRoot);
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) throw new Error("Derived filesystem root must be a real directory");
+  let current = filesystemRoot;
+  for (const segment of path.relative(filesystemRoot, resolved).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stats = lstatSync(current);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error(`Derived root cannot cross a symbolic link or reparse point: ${current}`);
+  }
+}
+
+function assertNoReparsePointSync(root: string, target: string): void {
+  let current = root;
+  const segments = path.relative(root, target).split(path.sep);
+  for (const [index, segment] of segments.entries()) {
+    current = path.join(current, segment);
+    const stats = tryLstatSync(current);
+    if (!stats) {
+      if (index !== segments.length - 1) throw new Error(`Derived output parent is missing: ${current}`);
+      return;
+    }
+    if (stats.isSymbolicLink()) throw new Error(`Derived output cannot cross a symbolic link or reparse point: ${current}`);
+    if (index !== segments.length - 1 && !stats.isDirectory()) throw new Error(`Derived output parent must be a directory: ${current}`);
+  }
+}
+
+function tryLstatSync(fileRef: string) {
+  try { return lstatSync(fileRef); }
+  catch (error: unknown) { if (isNotFound(error)) return undefined; throw error; }
 }
 
 async function assertNoReparsePoint(root: string, target: string): Promise<void> {

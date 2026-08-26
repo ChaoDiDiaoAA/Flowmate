@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -215,6 +215,53 @@ describe("PolicyEngine", () => {
     await expect(new PolicyDeletionExecutor(root).execute({ decision, ...input }))
       .rejects.toThrow(/reparse|symbolic|deletion root/i);
     await expect(readFile(outsideVictim, "utf8")).resolves.toBe("outside victim");
+  });
+
+  it("rejects a configured deletion root below an ancestor junction", async () => {
+    const input = await policyInput(fixture("denied-license"));
+    const anchor = await mkdtemp(path.join(os.tmpdir(), "flowmate-policy-ancestor-anchor-"));
+    const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "flowmate-policy-ancestor-outside-"));
+    temporaryRoots.push(anchor, outsideRoot);
+    const physicalRoot = path.join(outsideRoot, "nested");
+    const junction = path.join(anchor, "junction");
+    await mkdir(physicalRoot, { recursive: true });
+    await symlink(outsideRoot, junction, process.platform === "win32" ? "junction" : "dir");
+    const victim = path.join(physicalRoot, "victim.txt");
+    const contentRef = path.join(physicalRoot, "content.md");
+    const structureRef = path.join(physicalRoot, "structure.json");
+    await Promise.all([writeFile(victim, "outside victim", "utf8"), writeFile(contentRef, "content", "utf8"), writeFile(structureRef, "{}", "utf8")]);
+    input.rawArtifact.rawRef = victim;
+    input.rawArtifact.rawSha256 = createHash("sha256").update("outside victim").digest("hex");
+    input.parsedDocument.contentRef = contentRef;
+    input.parsedDocument.contentSha256 = createHash("sha256").update("content").digest("hex");
+    input.parsedDocument.structureRef = structureRef;
+    const decision = new PolicyEngine(new FixedClock()).evaluate(input);
+
+    await expect(new PolicyDeletionExecutor(path.join(junction, "nested")).execute({ decision, ...input }))
+      .rejects.toThrow(/reparse|symbolic|deletion root/i);
+    await expect(readFile(victim, "utf8")).resolves.toBe("outside victim");
+  });
+
+  it("quarantines a matching-hash derived structure reached through a junction", async () => {
+    const input = await policyInput(fixture("allowed-public"));
+    const derivedRoot = path.dirname(input.parsedDocument.contentRef);
+    const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "flowmate-policy-derived-outside-"));
+    temporaryRoots.push(outsideRoot);
+    const junction = path.join(derivedRoot, "junction");
+    const outsideStructure = path.join(outsideRoot, "structure.json");
+    await writeFile(outsideStructure, "{\"outside\":true}\n", "utf8");
+    await symlink(outsideRoot, junction, process.platform === "win32" ? "junction" : "dir");
+    input.parsedDocument.structureRef = path.join(junction, "structure.json");
+    await writeChecksums(path.join(derivedRoot, "checksums.sha256"), {
+      "content.md": "public invoice rule",
+      "junction/structure.json": "{\"outside\":true}\n",
+      "metadata.json": "{}\n",
+    });
+
+    const decision = new PolicyEngine(new FixedClock()).evaluate(input);
+
+    expect(decision).toMatchObject({ action: "quarantine", qualityStatus: "quarantined" });
+    expect(decision.reasonCodes).toContain("DERIVED_OUTPUT_REPARSE");
   });
 });
 
