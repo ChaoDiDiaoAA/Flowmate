@@ -111,6 +111,21 @@ export interface ParsedDocument {
   warnings: string[];
 }
 
+export interface ParseDocumentInput {
+  artifact: RawArtifactRef;
+  /**
+   * A sealed staging handle rather than an arbitrary pathname. Parsers may
+   * materialize a private, short-lived copy when an external tool requires a
+   * local filename.
+   */
+  sourceFile: import("./sealed-staged-file.js").SealedStagedFile;
+}
+
+export interface DocumentParser {
+  readonly name: string;
+  parse(input: ParseDocumentInput): Promise<ParsedDocument>;
+}
+
 export interface DedupeDecision {
   status: "unique" | "duplicate_url" | "duplicate_raw" | "duplicate_content" | "url_updated";
   canonicalArtifactId: string;
