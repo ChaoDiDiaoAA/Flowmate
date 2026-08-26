@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -55,6 +55,11 @@ describe("PolicyEngine", () => {
     ["raw-hash-mismatch", "RAW_HASH_MISMATCH"],
     ["content-hash-mismatch", "CONTENT_HASH_MISMATCH"],
     ["invalid-page-count", "PAGE_COUNT_INVALID"],
+    ["empty-derived-structure", "DERIVED_OUTPUT_EMPTY"],
+    ["invalid-derived-checksums", "DERIVED_CHECKSUMS_INVALID"],
+    ["client-secret", "SECRET_DETECTED"],
+    ["international-phone", "PHONE_DETECTED"],
+    ["unlabeled-address", "ADDRESS_DETECTED"],
   ])("records %s as %s", async (name, reasonCode) => {
     const decision = new PolicyEngine(new FixedClock()).evaluate(await policyInput(fixture(name)));
 
@@ -193,6 +198,24 @@ describe("PolicyEngine", () => {
       .rejects.toThrow(/outside the configured deletion root/i);
     await expect(readFile(outsideRaw, "utf8")).resolves.toBe("outside");
   });
+
+  it("rejects a junction-backed reference before an outside victim can be deleted", async () => {
+    const input = await policyInput(fixture("denied-license"));
+    const root = path.dirname(input.parsedDocument.contentRef);
+    const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "flowmate-policy-junction-outside-"));
+    temporaryRoots.push(outsideRoot);
+    const outsideVictim = path.join(outsideRoot, "victim.txt");
+    const junction = path.join(root, "junction");
+    await writeFile(outsideVictim, "outside victim", "utf8");
+    await symlink(outsideRoot, junction, process.platform === "win32" ? "junction" : "dir");
+    input.rawArtifact.rawRef = path.join(junction, "victim.txt");
+    input.rawArtifact.rawSha256 = createHash("sha256").update("outside victim").digest("hex");
+    const decision = new PolicyEngine(new FixedClock()).evaluate(input);
+
+    await expect(new PolicyDeletionExecutor(root).execute({ decision, ...input }))
+      .rejects.toThrow(/reparse|symbolic|deletion root/i);
+    await expect(readFile(outsideVictim, "utf8")).resolves.toBe("outside victim");
+  });
 });
 
 async function expectReason(engine: PolicyEngine, name: string, reasonCode: string): Promise<void> {
@@ -214,9 +237,13 @@ async function policyInput(policyCase: (typeof cases)[number]): Promise<PolicyIn
   const contentRef = path.join(root, "content.md");
   const rawRef = path.join(root, "raw.txt");
   const structureRef = path.join(root, "structure.json");
+  const metadataRef = path.join(root, "metadata.json");
+  const checksumsRef = path.join(root, "checksums.sha256");
   await writeFile(contentRef, policyCase.text, "utf8");
   await writeFile(rawRef, "raw source", "utf8");
   await writeFile(structureRef, "{}", "utf8");
+  await writeFile(metadataRef, "{}\n", "utf8");
+  await writeChecksums(checksumsRef, { "content.md": policyCase.text, "structure.json": "{}", "metadata.json": "{}\n" });
   const sourcePolicy: SourcePolicy = {
     sourceId: "SRC-000001",
     domain: "example.com",
@@ -272,6 +299,19 @@ async function policyInput(policyCase: (typeof cases)[number]): Promise<PolicyIn
     case "invalid-page-count":
       parsedDocument.pageCount = 0;
       break;
+    case "empty-structure":
+      await writeFile(structureRef, "", "utf8");
+      break;
+    case "invalid-checksums":
+      await writeFile(checksumsRef, "not a checksum\n", "utf8");
+      break;
   }
   return { itemId: "SAMPLE-000001", sourcePolicy, rawArtifact, parsedDocument };
+}
+
+async function writeChecksums(checksumsRef: string, files: Record<string, string>): Promise<void> {
+  const contents = Object.entries(files)
+    .map(([name, content]) => `${createHash("sha256").update(content).digest("hex")}  ${name}`)
+    .join("\n") + "\n";
+  await writeFile(checksumsRef, contents, "utf8");
 }

@@ -23,5 +23,10 @@
   { "name": "fatal-parser-warning", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "fatal-warning", "want": "quarantine" },
   { "name": "unreadable-derived-output", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "missing-structure", "want": "quarantine" },
   { "name": "raw-hash-mismatch", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "bad-raw-hash", "want": "quarantine" },
-  { "name": "invalid-page-count", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "invalid-page-count", "want": "quarantine" }
+  { "name": "invalid-page-count", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "invalid-page-count", "want": "quarantine" },
+  { "name": "empty-derived-structure", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "empty-structure", "want": "quarantine" },
+  { "name": "invalid-derived-checksums", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "invalid-checksums", "want": "quarantine" },
+  { "name": "client-secret", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "clientSecret: super-secret-value", "quality": "good", "want": "delete_content_keep_metadata" },
+  { "name": "international-phone", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "Call +1 212-555-1234", "quality": "good", "want": "quarantine" },
+  { "name": "unlabeled-address", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "Ship to 123 Main Street, Springfield", "quality": "good", "want": "quarantine" }
 ]
