@@ -2,15 +2,32 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const PROJECT_WRAPPER_PATH = "D:\\code\\agent-learn\\agent\\Flowmate\\tools\\mineru-mcp-wrapper";
+const DEFAULT_REQUEST_TIMEOUT_MS = 180_000;
+const MIN_REQUEST_TIMEOUT_MS = 60_000;
+const MAX_REQUEST_TIMEOUT_MS = 900_000;
+
+export interface MineruMcpCallOptions {
+  timeout: number;
+  resetTimeoutOnProgress: boolean;
+}
 
 export interface MineruMcpTransport {
   connect(): Promise<void>;
-  callTool(name: string, arguments_: Record<string, unknown>): Promise<unknown>;
+  callTool(
+    name: string,
+    arguments_: Record<string, unknown>,
+    options: MineruMcpCallOptions,
+  ): Promise<unknown>;
   close(): Promise<void>;
 }
 
 export interface MineruMcpClientConfig {
   maxFilesPerRun: number;
+  /** Defaults to three minutes, within the 1–15 minute safety envelope. */
+  requestTimeoutMs?: number;
+  /** English is the safe default for Flowmate's approved public invoice sample. */
+  ocrLanguage?: string;
+  enableOcr?: boolean;
 }
 
 export interface MineruParsedFile {
@@ -48,6 +65,16 @@ export class MineruResultDownloadTlsError extends Error {
   }
 }
 
+export class MineruMcpRequestTimeoutError extends Error {
+  public readonly status = "PARSER_UNAVAILABLE" as const;
+  public readonly retryable = true;
+
+  public constructor() {
+    super("PARSER_UNAVAILABLE: MinerU MCP request timed out");
+    this.name = "MineruMcpRequestTimeoutError";
+  }
+}
+
 /** Starts the project-scoped safety wrapper; it never reads process secrets. */
 export class ProjectMineruMcpTransport implements MineruMcpTransport {
   private readonly client = new Client({ name: "flowmate-data-workbench", version: "0.1.0" });
@@ -63,8 +90,12 @@ export class ProjectMineruMcpTransport implements MineruMcpTransport {
     await this.client.connect(this.transport);
   }
 
-  public async callTool(name: string, arguments_: Record<string, unknown>): Promise<unknown> {
-    return this.client.callTool({ name, arguments: arguments_ });
+  public async callTool(
+    name: string,
+    arguments_: Record<string, unknown>,
+    options: MineruMcpCallOptions,
+  ): Promise<unknown> {
+    return this.client.callTool({ name, arguments: arguments_ }, undefined, options);
   }
 
   public async close(): Promise<void> {
@@ -81,6 +112,10 @@ export class MineruMcpClient {
   ) {
     if (!Number.isInteger(config.maxFilesPerRun) || config.maxFilesPerRun < 1 || config.maxFilesPerRun > 200) {
       throw new Error("MinerU maximum files per run must be between 1 and 200");
+    }
+    const timeout = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    if (!Number.isInteger(timeout) || timeout < MIN_REQUEST_TIMEOUT_MS || timeout > MAX_REQUEST_TIMEOUT_MS) {
+      throw new Error("MinerU request timeout must be between 60000 and 900000 milliseconds");
     }
   }
 
@@ -99,7 +134,23 @@ export class MineruMcpClient {
       await this.transport.connect();
       this.connected = true;
     }
-    const response = parseToolResponse(await this.transport.callTool("parse_documents", { file_sources: [...fileSources] }));
+    let toolResponse: unknown;
+    try {
+      toolResponse = await this.transport.callTool("parse_documents", {
+        file_sources: [...fileSources],
+        enable_ocr: this.config.enableOcr ?? true,
+        language: this.config.ocrLanguage ?? "en",
+      }, {
+        timeout: this.config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+        resetTimeoutOnProgress: true,
+      });
+    } catch (error) {
+      if (isRequestTimeout(error)) {
+        throw new MineruMcpRequestTimeoutError();
+      }
+      throw error;
+    }
+    const response = parseToolResponse(toolResponse);
     if (response.message.includes("RESULT_DOWNLOAD_TLS_FAILED")) {
       throw new MineruResultDownloadTlsError();
     }
@@ -170,4 +221,8 @@ function isMineruToolResult(value: unknown): value is MineruToolResult {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRequestTimeout(error: unknown): boolean {
+  return isRecord(error) && error.code === -32001;
 }

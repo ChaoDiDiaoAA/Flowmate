@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MineruMcpClient,
+  MineruMcpRequestTimeoutError,
   MineruResultDownloadTlsError,
   type MineruMcpTransport,
 } from "../src/mineru-mcp-client.js";
@@ -8,6 +9,7 @@ import {
 class RecordingMcpTransport implements MineruMcpTransport {
   public callCount = 0;
   public connectCount = 0;
+  public lastCallOptions: { timeout: number; resetTimeoutOnProgress: boolean } | undefined;
 
   public constructor(private readonly response: unknown = successResponse()) {}
 
@@ -15,11 +17,30 @@ class RecordingMcpTransport implements MineruMcpTransport {
     this.connectCount += 1;
   }
 
-  public async callTool(name: string, arguments_: Record<string, unknown>): Promise<unknown> {
+  public async callTool(
+    name: string,
+    arguments_: Record<string, unknown>,
+    options?: { timeout: number; resetTimeoutOnProgress: boolean },
+  ): Promise<unknown> {
     this.callCount += 1;
+    this.lastCallOptions = options;
     expect(name).toBe("parse_documents");
-    expect(arguments_).toEqual({ file_sources: ["dummy.pdf"] });
+    expect(arguments_).toEqual({
+      file_sources: ["dummy.pdf"],
+      enable_ocr: true,
+      language: "en",
+    });
     return this.response;
+  }
+
+  public async close(): Promise<void> {}
+}
+
+class RequestTimeoutTransport implements MineruMcpTransport {
+  public async connect(): Promise<void> {}
+
+  public async callTool(): Promise<unknown> {
+    throw { code: -32001, message: "Request timed out" };
   }
 
   public async close(): Promise<void> {}
@@ -67,6 +88,21 @@ describe("MineruMcpClient", () => {
       truncated: false,
       warnings: [],
     }]);
+  });
+
+  it("forwards a three-minute request timeout and resets it on MCP progress", async () => {
+    const transport = new RecordingMcpTransport();
+    const client = new MineruMcpClient(transport, { maxFilesPerRun: 200 });
+
+    await client.parseDocuments(["dummy.pdf"]);
+
+    expect(transport.lastCallOptions).toEqual({ timeout: 180_000, resetTimeoutOnProgress: true });
+  });
+
+  it("classifies an MCP request timeout as a recoverable parser-unavailable failure", async () => {
+    const client = new MineruMcpClient(new RequestTimeoutTransport(), { maxFilesPerRun: 200 });
+
+    await expect(client.parseDocuments(["dummy.pdf"])).rejects.toBeInstanceOf(MineruMcpRequestTimeoutError);
   });
 
   it("keeps successful files and exposes failed files as warnings from a partial response", async () => {

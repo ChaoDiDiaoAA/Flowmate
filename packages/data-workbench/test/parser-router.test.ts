@@ -130,5 +130,5 @@ describe("ParserRouter", () => {
       await client.close();
       await sourceFile.dispose();
     }
-  }, 120_000);
+  }, 240_000);
 });
