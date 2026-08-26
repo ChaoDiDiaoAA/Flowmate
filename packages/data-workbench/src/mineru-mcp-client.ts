@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { redactSensitiveDetails } from "./redaction.js";
 
 const PROJECT_WRAPPER_PATH = "D:\\code\\agent-learn\\agent\\Flowmate\\tools\\mineru-mcp-wrapper";
 const DEFAULT_REQUEST_TIMEOUT_MS = 180_000;
@@ -25,7 +26,7 @@ export interface MineruMcpClientConfig {
   maxFilesPerRun: number;
   /** Defaults to three minutes, within the 1–15 minute safety envelope. */
   requestTimeoutMs?: number;
-  /** English is the safe default for Flowmate's approved public invoice sample. */
+  /** Optional official MinerU OCR language; omit to preserve the wrapper default. */
   ocrLanguage?: string;
   enableOcr?: boolean;
 }
@@ -138,8 +139,8 @@ export class MineruMcpClient {
     try {
       toolResponse = await this.transport.callTool("parse_documents", {
         file_sources: [...fileSources],
-        enable_ocr: this.config.enableOcr ?? true,
-        language: this.config.ocrLanguage ?? "en",
+        ...(this.config.enableOcr === undefined ? {} : { enable_ocr: this.config.enableOcr }),
+        ...(this.config.ocrLanguage === undefined ? {} : { language: this.config.ocrLanguage }),
       }, {
         timeout: this.config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
         resetTimeoutOnProgress: true,
@@ -151,11 +152,13 @@ export class MineruMcpClient {
       throw error;
     }
     const response = parseToolResponse(toolResponse);
-    if (response.message.includes("RESULT_DOWNLOAD_TLS_FAILED")) {
+    if (containsTlsFailure(response.message) || response.results.some((result) =>
+      containsTlsFailure(result.status) || containsTlsFailure(result.error),
+    )) {
       throw new MineruResultDownloadTlsError();
     }
     const failures = response.results.filter((result) => result.status !== "success");
-    const warnings = failures.map((result) => `${result.filename}: ${result.error ?? result.status}`);
+    const warnings = failures.map((result) => redactSensitiveDetails(`${result.filename}: ${result.error ?? result.status}`));
     const successful = response.results
       .filter((result) => result.status === "success")
       .map((result): MineruParsedFile => ({
@@ -225,4 +228,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isRequestTimeout(error: unknown): boolean {
   return isRecord(error) && error.code === -32001;
+}
+
+function containsTlsFailure(value: unknown): boolean {
+  return typeof value === "string" && value.includes("RESULT_DOWNLOAD_TLS_FAILED");
 }

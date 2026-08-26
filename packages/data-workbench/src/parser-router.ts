@@ -2,11 +2,16 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { MineruMcpClient } from "./mineru-mcp-client.js";
+import type { MineruParsedFile } from "./mineru-mcp-client.js";
+import { redactSensitiveDetails } from "./redaction.js";
 import type { DocumentParser, ParsedDocument, ParseDocumentInput } from "./types.js";
 
 interface DerivedParser extends DocumentParser {
   readonly parserVersion: string;
+}
+
+export interface MineruDocumentClient {
+  parseDocuments(fileSources: readonly string[]): Promise<MineruParsedFile[]>;
 }
 
 interface DerivedOutput {
@@ -53,13 +58,13 @@ export class MineruDocumentParser implements DerivedParser {
   public readonly parserVersion = "mineru-open-mcp-1.0.21";
 
   public constructor(
-    private readonly client: MineruMcpClient,
+    private readonly client: MineruDocumentClient,
     private readonly derivedRoot: string,
   ) {}
 
   public async parse(input: ParseDocumentInput): Promise<ParsedDocument> {
     const workDirectory = await mkdtemp(path.join(os.tmpdir(), "flowmate-mineru-input-"));
-    const localFile = path.join(workDirectory, input.sourceFile.fileName);
+    const localFile = containedTemporaryFile(workDirectory, input.sourceFile.fileName);
     try {
       await input.sourceFile.copyTo(localFile);
       const result = (await this.client.parseDocuments([localFile]))[0];
@@ -128,7 +133,7 @@ export class ParserRouter {
 
 async function readSealedText(input: ParseDocumentInput): Promise<string> {
   const directory = await mkdtemp(path.join(os.tmpdir(), "flowmate-native-input-"));
-  const localFile = path.join(directory, input.sourceFile.fileName);
+  const localFile = containedTemporaryFile(directory, input.sourceFile.fileName);
   try {
     await input.sourceFile.copyTo(localFile);
     return readFile(localFile, "utf8");
@@ -171,7 +176,7 @@ async function writeDerivedOutput(
     outputFiles: Object.keys(outputHashes),
     outputHashes,
     ...(output.pageCount === undefined ? {} : { pageCount: output.pageCount }),
-    warnings: output.warnings,
+    warnings: output.warnings.map(redactSensitiveDetails),
   }, null, 2)}\n`, "utf8");
   const metadataHash = sha256(await readFile(metadataRef));
   await writeFile(
@@ -191,7 +196,7 @@ async function writeDerivedOutput(
     imageRefs: [],
     contentSha256,
     ...(output.pageCount === undefined ? {} : { pageCount: output.pageCount }),
-    warnings: output.warnings,
+    warnings: output.warnings.map(redactSensitiveDetails),
   };
 }
 
@@ -204,4 +209,17 @@ function htmlToText(html: string): string {
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function containedTemporaryFile(directory: string, untrustedFileName: string): string {
+  const fileName = path.basename(untrustedFileName);
+  if (fileName.length === 0 || fileName === "." || fileName === "..") {
+    throw new Error("Sealed staged filename is invalid");
+  }
+  const resolvedDirectory = path.resolve(directory);
+  const candidate = path.resolve(resolvedDirectory, fileName);
+  if (path.dirname(candidate) !== resolvedDirectory) {
+    throw new Error("Sealed staged filename escapes its temporary directory");
+  }
+  return candidate;
 }

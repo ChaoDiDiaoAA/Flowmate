@@ -11,7 +11,10 @@ class RecordingMcpTransport implements MineruMcpTransport {
   public connectCount = 0;
   public lastCallOptions: { timeout: number; resetTimeoutOnProgress: boolean } | undefined;
 
-  public constructor(private readonly response: unknown = successResponse()) {}
+  public constructor(
+    private readonly response: unknown = successResponse(),
+    private readonly expectedArguments: Record<string, unknown> = { file_sources: ["dummy.pdf"] },
+  ) {}
 
   public async connect(): Promise<void> {
     this.connectCount += 1;
@@ -25,11 +28,7 @@ class RecordingMcpTransport implements MineruMcpTransport {
     this.callCount += 1;
     this.lastCallOptions = options;
     expect(name).toBe("parse_documents");
-    expect(arguments_).toEqual({
-      file_sources: ["dummy.pdf"],
-      enable_ocr: true,
-      language: "en",
-    });
+    expect(arguments_).toEqual(this.expectedArguments);
     return this.response;
   }
 
@@ -99,6 +98,21 @@ describe("MineruMcpClient", () => {
     expect(transport.lastCallOptions).toEqual({ timeout: 180_000, resetTimeoutOnProgress: true });
   });
 
+  it("forwards explicitly selected English OCR options", async () => {
+    const transport = new RecordingMcpTransport(successResponse(), {
+      file_sources: ["dummy.pdf"],
+      enable_ocr: true,
+      language: "en",
+    });
+    const client = new MineruMcpClient(transport, {
+      maxFilesPerRun: 200,
+      enableOcr: true,
+      ocrLanguage: "en",
+    });
+
+    await client.parseDocuments(["dummy.pdf"]);
+  });
+
   it("classifies an MCP request timeout as a recoverable parser-unavailable failure", async () => {
     const client = new MineruMcpClient(new RequestTimeoutTransport(), { maxFilesPerRun: 200 });
 
@@ -140,6 +154,30 @@ describe("MineruMcpClient", () => {
           results: [],
           summary: { total_files: 1, success_count: 0, error_count: 1 },
           message: "RESULT_DOWNLOAD_TLS_FAILED: result download failed",
+        }),
+      }],
+    };
+    const client = new MineruMcpClient(new RecordingMcpTransport(response), { maxFilesPerRun: 200 });
+
+    await expect(client.parseDocuments(["dummy.pdf"])).rejects.toBeInstanceOf(MineruResultDownloadTlsError);
+  });
+
+  it("classifies a per-file wrapper TLS download error even when another result succeeded", async () => {
+    const response = {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          status: "partial_success",
+          results: [
+            { filename: "ok.pdf", status: "success", content: "ok", content_chars: 2, truncated: false },
+            {
+              filename: "failed.pdf",
+              status: "error",
+              error: "RESULT_DOWNLOAD_TLS_FAILED: https://cdn.example/result.zip?signature=secret",
+            },
+          ],
+          summary: { total_files: 2, success_count: 1, error_count: 1 },
+          message: "Parsing partially complete!\n",
         }),
       }],
     };

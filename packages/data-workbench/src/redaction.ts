@@ -10,6 +10,10 @@ export function redactSensitiveDetails(message: string): string {
     )
     .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
     .replace(
+      /([?&](?:signature|sig|token|api[_-]?key|access[_-]?key|x-amz-signature|ossaccesskeyid)=)[^&#\s]+/gi,
+      "$1[REDACTED]",
+    )
+    .replace(
       /\b(cookie|token|authorization|api[_-]?key|password)\b\s*([:=])\s*[^\s,;]+/gi,
       "$1$2[REDACTED]",
     );

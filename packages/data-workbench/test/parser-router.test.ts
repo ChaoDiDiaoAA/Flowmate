@@ -3,8 +3,8 @@ import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { HtmlContentParser, MineruDocumentParser, NativeTextParser, ParserRouter } from "../src/parser-router.js";
-import { MineruMcpClient } from "../src/mineru-mcp-client.js";
+import { HtmlContentParser, MineruDocumentParser, NativeTextParser, ParserRouter, type MineruDocumentClient } from "../src/parser-router.js";
+import { MineruMcpClient, type MineruParsedFile } from "../src/mineru-mcp-client.js";
 import { SealedStagedFile } from "../src/sealed-staged-file.js";
 import type { RawArtifactRef } from "../src/types.js";
 
@@ -91,6 +91,60 @@ describe("ParserRouter", () => {
     await input.dispose();
   });
 
+  it("redacts untrusted MinerU warning secrets before they reach derived metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "flowmate-parser-router-"));
+    temporaryRoots.push(root);
+    const input = await sealed("image bytes", "invoice.jpg");
+    const client = {
+      parseDocuments: async (): Promise<MineruParsedFile[]> => [{
+        filename: "invoice.jpg",
+        content: "Invoice content",
+        contentChars: 15,
+        truncated: false,
+        warnings: [
+          "download failed https://cdn.example/result?signature=secret-signature",
+          "Authorization: Bearer secret-bearer",
+          "api_key=secret-api-key",
+        ],
+      }],
+    } satisfies MineruDocumentClient;
+    const parser = new MineruDocumentParser(client, path.join(root, "derived", "mineru"));
+
+    const parsed = await parser.parse({ artifact: artifact("image/jpeg"), sourceFile: input });
+    const metadata = await readFile(path.join(path.dirname(parsed.contentRef), "metadata.json"), "utf8");
+
+    expect(metadata).not.toMatch(/secret-signature|secret-bearer|secret-api-key/i);
+    expect(metadata).toContain("[REDACTED]");
+    expect(parsed.warnings.join("\n")).not.toMatch(/secret-signature|secret-bearer|secret-api-key/i);
+    await input.dispose();
+  });
+
+  it("materializes a hostile staged filename under a basename-only temporary path", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "flowmate-parser-router-"));
+    temporaryRoots.push(root);
+    let copiedTo: string | undefined;
+    const hostileSource = {
+      fileName: "..\\untrusted.txt",
+      copyTo: async (destination: string): Promise<void> => {
+        copiedTo = destination;
+        await writeFile(destination, "safe text", "utf8");
+      },
+    } as SealedStagedFile;
+    const parser = new NativeTextParser(path.join(root, "derived", "native"));
+
+    try {
+      await expect(parser.parse({ artifact: artifact("text/plain"), sourceFile: hostileSource })).resolves.toMatchObject({
+        contentSha256: createHash("sha256").update("safe text").digest("hex"),
+      });
+      expect(path.basename(copiedTo!)).toBe("untrusted.txt");
+      expect(path.basename(path.dirname(copiedTo!))).toMatch(/^flowmate-native-input-/);
+    } finally {
+      if (copiedTo) {
+        await rm(copiedTo, { force: true });
+      }
+    }
+  });
+
   it.runIf(process.env.FLOWMATE_RUN_MINERU_INTEGRATION === "1")("parses the retained public invoice JPEG through the project wrapper from a sealed staging copy", async () => {
     const projectRoot = path.resolve(process.cwd(), "..", "..");
     const rawFile = path.join(
@@ -108,7 +162,13 @@ describe("ParserRouter", () => {
     const staged = await SealedStagedFile.create("ACQ-20260826-0002", "batch1-0494.jpg");
     await copyFile(rawFile, staged.targetFile);
     const sourceFile = await staged.seal();
-    const client = MineruMcpClient.usingProjectWrapper({ maxFilesPerRun: 200 });
+    const ocrLanguage = process.env.FLOWMATE_MINERU_OCR_LANGUAGE || undefined;
+    const enableOcr = process.env.FLOWMATE_MINERU_ENABLE_OCR === "true";
+    const client = MineruMcpClient.usingProjectWrapper({
+      maxFilesPerRun: 200,
+      ...(ocrLanguage === undefined ? {} : { ocrLanguage }),
+      ...(enableOcr ? { enableOcr: true } : {}),
+    });
     const parser = new MineruDocumentParser(
       client,
       path.join(root, "derived", "mineru"),
