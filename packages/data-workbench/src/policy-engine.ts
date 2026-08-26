@@ -1,7 +1,11 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { lstat, unlink } from "node:fs/promises";
+import path from "node:path";
 import type { ParsedDocument, PolicyDecision, RawArtifactRef, SourcePolicy } from "./types.js";
 
 const POLICY_VERSION = "p0-policy-1.0" as const;
+const MAX_REASONABLE_PAGE_COUNT = 10_000;
 
 export interface PolicyClock {
   now(): string;
@@ -14,24 +18,34 @@ export interface PolicyEvaluationInput {
   parsedDocument: ParsedDocument;
 }
 
+export interface PolicyDeletionAudit {
+  itemId: string;
+  canonicalUrl?: string;
+  rawSha256: string;
+  contentSha256: string;
+  decidedAt: string;
+  policyVersion: PolicyDecision["policyVersion"];
+  reasonCodes: string[];
+  deletedFileCount: number;
+}
+
+type GateFinding = "passed" | "quarantine" | "delete";
+
+interface ContentInspection {
+  content: string;
+  readable: boolean;
+}
+
 export class PolicyEngine {
   public constructor(private readonly clock: PolicyClock = { now: () => new Date().toISOString() }) {}
 
   public evaluate(input: PolicyEvaluationInput): PolicyDecision {
     const reasonCodes = new Set<string>();
-    const content = readContent(input.parsedDocument, reasonCodes);
-    const syntheticIdentifiersAreDeclared = isDeclaredSynthetic(input.sourcePolicy);
-
-    const privacyFinding = assessPrivacy(content, syntheticIdentifiersAreDeclared, reasonCodes);
-    const deleteContent = assessLicense(input.sourcePolicy, reasonCodes) || privacyFinding === "delete";
-    const quarantine = privacyFinding === "quarantine"
-      || assessSourceConstraints(input.sourcePolicy, reasonCodes)
-      || assessQuality(input.rawArtifact, input.parsedDocument, content, reasonCodes);
-
-    if (syntheticIdentifiersAreDeclared && hasSyntheticIdentifierSignal(content)) {
-      reasonCodes.add("SYNTHETIC_IDENTIFIERS_PRESENT");
-      reasonCodes.add("FINAL_ACCEPTANCE_INELIGIBLE");
-    }
+    const content = inspectContent(input.parsedDocument, reasonCodes);
+    const licenseFinding = assessLicense(input.sourcePolicy, reasonCodes);
+    const sourceFinding = assessSourceConstraints(input.sourcePolicy, reasonCodes);
+    const privacyFinding = assessPrivacy(content.content, input.sourcePolicy, reasonCodes);
+    const qualityFinding = assessQuality(input.rawArtifact, input.parsedDocument, content, reasonCodes);
 
     return {
       itemId: input.itemId,
@@ -41,8 +55,8 @@ export class PolicyEngine {
         : privacyFinding === "quarantine"
           ? "quarantined"
           : "passed",
-      qualityStatus: hasQualityFailure(reasonCodes) ? "quarantined" : "passed",
-      action: deleteContent ? "delete_content_keep_metadata" : quarantine ? "quarantine" : "catalog",
+      qualityStatus: qualityFinding === "passed" ? "passed" : "quarantined",
+      action: chooseAction(licenseFinding, sourceFinding, privacyFinding, qualityFinding),
       reasonCodes: [...reasonCodes].sort(),
       policyVersion: POLICY_VERSION,
       decidedAt: this.clock.now(),
@@ -50,119 +64,249 @@ export class PolicyEngine {
   }
 }
 
-function readContent(parsedDocument: ParsedDocument, reasonCodes: Set<string>): string {
-  try {
-    return readFileSync(parsedDocument.contentRef, "utf8");
-  } catch {
-    reasonCodes.add("CONTENT_UNREADABLE");
-    return "";
+/**
+ * Removes rejected files only after the decision has been persisted by the
+ * caller. The returned record is deliberately metadata-only for audit use.
+ */
+export class PolicyDeletionExecutor {
+  private readonly root: string;
+
+  public constructor(deletionRoot: string) {
+    this.root = path.resolve(deletionRoot);
+  }
+
+  public async execute(input: PolicyEvaluationInput & { decision: PolicyDecision }): Promise<PolicyDeletionAudit> {
+    if (input.decision.action !== "delete_content_keep_metadata") {
+      throw new Error("Policy deletion requires a delete_content_keep_metadata decision");
+    }
+    const fileRefs = uniqueFileRefs([
+      input.rawArtifact.rawRef,
+      input.parsedDocument.contentRef,
+      input.parsedDocument.structureRef,
+      ...input.parsedDocument.imageRefs,
+    ]);
+    fileRefs.forEach((fileRef) => this.assertWithinRoot(fileRef));
+
+    let deletedFileCount = 0;
+    for (const fileRef of fileRefs) {
+      const metadata = await lstatIfPresent(fileRef);
+      if (!metadata) {
+        continue;
+      }
+      if (metadata.isDirectory()) {
+        throw new Error(`Policy deletion only accepts file references: ${fileRef}`);
+      }
+      await unlink(fileRef);
+      deletedFileCount += 1;
+    }
+    return {
+      itemId: input.decision.itemId,
+      ...(input.rawArtifact.canonicalUrl ? { canonicalUrl: input.rawArtifact.canonicalUrl } : {}),
+      rawSha256: input.rawArtifact.rawSha256,
+      contentSha256: input.parsedDocument.contentSha256,
+      decidedAt: input.decision.decidedAt,
+      policyVersion: input.decision.policyVersion,
+      reasonCodes: [...input.decision.reasonCodes],
+      deletedFileCount,
+    };
+  }
+
+  private assertWithinRoot(fileRef: string): void {
+    const resolved = path.resolve(fileRef);
+    const relative = path.relative(this.root, resolved);
+    if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) {
+      throw new Error(`Refusing to delete path outside the configured deletion root: ${fileRef}`);
+    }
   }
 }
 
-function assessLicense(policy: SourcePolicy, reasonCodes: Set<string>): boolean {
+function uniqueFileRefs(fileRefs: Array<string | undefined>): string[] {
+  return [...new Set(fileRefs.filter((fileRef): fileRef is string => Boolean(fileRef)))];
+}
+
+async function lstatIfPresent(fileRef: string): Promise<Awaited<ReturnType<typeof lstat>> | undefined> {
+  try {
+    return await lstat(fileRef);
+  } catch (error: unknown) {
+    if (isNotFoundError(error)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function isNotFoundError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error
+    && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function chooseAction(...findings: GateFinding[]): PolicyDecision["action"] {
+  if (findings.includes("delete")) {
+    return "delete_content_keep_metadata";
+  }
+  return findings.includes("quarantine") ? "quarantine" : "catalog";
+}
+
+function assessLicense(policy: SourcePolicy, reasonCodes: Set<string>): GateFinding {
+  let finding: GateFinding = "passed";
   if (policy.sourcePolicy === "denied") {
     reasonCodes.add("LICENSE_DENIED");
+    finding = "delete";
   } else if (policy.sourcePolicy === "unknown") {
     reasonCodes.add("LICENSE_UNKNOWN");
+    finding = "quarantine";
   }
   if (policy.rawRetention === "denied") {
     reasonCodes.add("RAW_RETENTION_DENIED");
+    finding = "delete";
   }
-  return policy.sourcePolicy === "denied" || policy.rawRetention === "denied";
+  return finding;
 }
 
-function assessSourceConstraints(policy: SourcePolicy, reasonCodes: Set<string>): boolean {
-  let failed = policy.sourcePolicy === "unknown";
+function assessSourceConstraints(policy: SourcePolicy, reasonCodes: Set<string>): GateFinding {
+  let finding: GateFinding = "passed";
   if (!policy.enabled) {
     reasonCodes.add("SOURCE_DISABLED");
-    failed = true;
+    finding = "quarantine";
   }
   if (policy.sourceType !== "public_web" || policy.accessStrategy !== "public") {
     reasonCodes.add("SOURCE_NOT_PUBLIC");
-    failed = true;
+    finding = "quarantine";
   }
   if (policy.rawRetention === "metadata_only") {
     reasonCodes.add("RAW_RETENTION_METADATA_ONLY");
-    failed = true;
+    finding = "quarantine";
   }
   if (policy.datasetUsage !== "allowed") {
     reasonCodes.add("DATASET_USAGE_DENIED");
-    failed = true;
+    finding = "quarantine";
   }
-  return failed;
+  return finding;
 }
 
-function assessPrivacy(
-  content: string,
-  syntheticIdentifiersAreDeclared: boolean,
-  reasonCodes: Set<string>,
-): "passed" | "quarantine" | "delete" {
-  if (secretPattern.test(content)) {
-    reasonCodes.add("SECRET_DETECTED");
-    return "delete";
-  }
+function assessPrivacy(content: string, policy: SourcePolicy, reasonCodes: Set<string>): GateFinding {
+  const declaredSynthetic = isDeclaredSynthetic(policy);
+  const supportedSyntheticIdentifierPresent = declaredSynthetic && (ibanPattern.test(content) || taxIdentifierPattern.test(content));
+  let finding: GateFinding = "passed";
 
-  const privateIdentifierDetected = phonePattern.test(content)
-    || bankAccountPattern.test(content)
-    || identityPattern.test(content)
-    || emailPattern.test(content);
-  if (!privateIdentifierDetected || syntheticIdentifiersAreDeclared) {
-    return "passed";
+  if (secretPattern.test(content) || awsAccessKeyPattern.test(content) || privateKeyPattern.test(content)) {
+    reasonCodes.add("SECRET_DETECTED");
+    finding = "delete";
   }
   if (phonePattern.test(content)) {
     reasonCodes.add("PHONE_DETECTED");
-  }
-  if (bankAccountPattern.test(content)) {
-    reasonCodes.add("BANK_ACCOUNT_DETECTED");
-  }
-  if (identityPattern.test(content)) {
-    reasonCodes.add("IDENTITY_NUMBER_DETECTED");
+    finding = preserveDeleteSeverity(finding, "quarantine");
   }
   if (emailPattern.test(content)) {
     reasonCodes.add("EMAIL_DETECTED");
+    finding = preserveDeleteSeverity(finding, "quarantine");
   }
-  return "quarantine";
+  if (addressPattern.test(content)) {
+    reasonCodes.add("ADDRESS_DETECTED");
+    finding = preserveDeleteSeverity(finding, "quarantine");
+  }
+  if (bankAccountPattern.test(content) || (!declaredSynthetic && ibanPattern.test(content))) {
+    reasonCodes.add("BANK_ACCOUNT_DETECTED");
+    finding = preserveDeleteSeverity(finding, "quarantine");
+  }
+  if (identityPattern.test(content) || (!declaredSynthetic && taxIdentifierPattern.test(content))) {
+    reasonCodes.add("IDENTITY_NUMBER_DETECTED");
+    finding = preserveDeleteSeverity(finding, "quarantine");
+  }
+  if (supportedSyntheticIdentifierPresent) {
+    reasonCodes.add("SYNTHETIC_IDENTIFIERS_PRESENT");
+    reasonCodes.add("FINAL_ACCEPTANCE_INELIGIBLE");
+  }
+  return finding;
+}
+
+function preserveDeleteSeverity(current: GateFinding, next: GateFinding): GateFinding {
+  return current === "delete" ? current : next;
+}
+
+function inspectContent(parsedDocument: ParsedDocument, reasonCodes: Set<string>): ContentInspection {
+  try {
+    return { content: readFileSync(parsedDocument.contentRef, "utf8"), readable: true };
+  } catch {
+    reasonCodes.add("CONTENT_UNREADABLE");
+    return { content: "", readable: false };
+  }
 }
 
 function assessQuality(
   rawArtifact: RawArtifactRef,
   parsedDocument: ParsedDocument,
-  content: string,
+  content: ContentInspection,
   reasonCodes: Set<string>,
-): boolean {
-  let failed = false;
-  if (!content.trim()) {
-    reasonCodes.add("CONTENT_EMPTY");
-    failed = true;
+): GateFinding {
+  let finding: GateFinding = "passed";
+  const fail = (reasonCode: string): void => {
+    reasonCodes.add(reasonCode);
+    finding = "quarantine";
+  };
+
+  if (!content.readable || !content.content.trim()) {
+    fail("CONTENT_EMPTY");
   }
   if (!rawArtifact.canonicalUrl) {
-    reasonCodes.add("SOURCE_URL_MISSING");
-    failed = true;
+    fail("SOURCE_URL_MISSING");
   }
   if (!rawArtifact.rawSha256 || !parsedDocument.contentSha256) {
-    reasonCodes.add("HASH_MISSING");
-    failed = true;
+    fail("HASH_MISSING");
   }
-  if (!parsedDocument.parserName || !parsedDocument.parserVersion) {
-    reasonCodes.add("PARSER_METADATA_MISSING");
-    failed = true;
+  if (!parsedDocument.parserName || !parsedDocument.parserVersion || !parsedDocument.parsedAt) {
+    fail("PARSER_METADATA_MISSING");
+  }
+  if (rawArtifact.artifactId !== parsedDocument.artifactId) {
+    fail("ARTIFACT_ID_MISMATCH");
+  }
+  if (rawArtifact.retentionStatus !== "retained") {
+    fail("RAW_ARTIFACT_NOT_RETAINED");
+  }
+
+  const raw = inspectBinaryFile(rawArtifact.rawRef);
+  if (!raw.readable) {
+    fail("RAW_ARTIFACT_UNREADABLE");
+  } else if (rawArtifact.rawSha256 && sha256(raw.contents) !== rawArtifact.rawSha256.toLowerCase()) {
+    fail("RAW_HASH_MISMATCH");
+  }
+  if (content.readable && parsedDocument.contentSha256 && sha256(Buffer.from(content.content)) !== parsedDocument.contentSha256.toLowerCase()) {
+    fail("CONTENT_HASH_MISMATCH");
+  }
+  if (parsedDocument.structureRef && !inspectBinaryFile(parsedDocument.structureRef).readable) {
+    fail("DERIVED_OUTPUT_UNREADABLE");
+  }
+  if (parsedDocument.imageRefs.some((imageRef) => !inspectBinaryFile(imageRef).readable)) {
+    fail("DERIVED_OUTPUT_UNREADABLE");
+  }
+  if (parsedDocument.pageCount !== undefined
+    && (!Number.isInteger(parsedDocument.pageCount)
+      || parsedDocument.pageCount < 1
+      || parsedDocument.pageCount > MAX_REASONABLE_PAGE_COUNT)) {
+    fail("PAGE_COUNT_INVALID");
+  }
+  if (parsedDocument.imageRefs.length > MAX_REASONABLE_PAGE_COUNT) {
+    fail("OUTPUT_COUNT_INVALID");
   }
   if (parsedDocument.warnings.some((warning) => /(?:fatal|corrupt|unreadable)/i.test(warning))) {
-    reasonCodes.add("PARSER_FATAL_WARNING");
-    failed = true;
+    fail("PARSER_FATAL_WARNING");
   }
-  return failed;
+  return finding;
 }
 
-function hasQualityFailure(reasonCodes: Set<string>): boolean {
-  return [
-    "CONTENT_EMPTY",
-    "CONTENT_UNREADABLE",
-    "SOURCE_URL_MISSING",
-    "HASH_MISSING",
-    "PARSER_METADATA_MISSING",
-    "PARSER_FATAL_WARNING",
-  ].some((reasonCode) => reasonCodes.has(reasonCode));
+function inspectBinaryFile(fileRef: string | undefined): { readable: boolean; contents: Buffer } {
+  if (!fileRef) {
+    return { readable: false, contents: Buffer.alloc(0) };
+  }
+  try {
+    return { readable: true, contents: readFileSync(fileRef) };
+  } catch {
+    return { readable: false, contents: Buffer.alloc(0) };
+  }
+}
+
+function sha256(contents: Buffer): string {
+  return createHash("sha256").update(contents).digest("hex");
 }
 
 function isDeclaredSynthetic(policy: SourcePolicy): boolean {
@@ -171,12 +315,13 @@ function isDeclaredSynthetic(policy: SourcePolicy): boolean {
     && policy.containsSyntheticIdentifiers;
 }
 
-function hasSyntheticIdentifierSignal(content: string): boolean {
-  return bankAccountPattern.test(content) || identityPattern.test(content);
-}
-
-const secretPattern = /\b(?:api[_-]?key|access[_-]?token|authorization|password|passwd|secret|token|cookie)\b\s*(?:[:=]|is)\s*(?:bearer\s+)?\S+/i;
+const secretPattern = /(?:\b(?:api[_-]?key|x-api-key|access[_-]?token|authorization|password|passwd|secret|token|cookie)\b\s*(?:[:=]|is)\s*(?:bearer\s+)?\S+|\bbearer\s+[A-Z0-9._~+\-/]{8,})/i;
+const awsAccessKeyPattern = /\bAKIA[0-9A-Z]{16}\b/;
+const privateKeyPattern = /-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----/;
 const phonePattern = /(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)/;
-const bankAccountPattern = /\b(?:[A-Z]{2}\d{2}[A-Z0-9]{11,30}|(?:\d[ -]?){13,19}\d)\b/i;
-const identityPattern = /\b(?:[1-9]\d{5}(?:19|20)\d{2}(?:(?:0[1-9])|(?:1[0-2]))(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]|(?!000|666|9\d\d)\d{3}-\d{2}-\d{4})\b/;
 const emailPattern = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const addressPattern = /(?:\b(?:home |residential )?address\s*[:：#]?\s*\d+\s+[^\n,]+|(?:地址|住址|收货地址)\s*[:：]?\s*[^\n]{4,})/i;
+const ibanPattern = /\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/i;
+const bankAccountPattern = /\b(?:\d[ -]?){13,19}\d\b/;
+const taxIdentifierPattern = /\b(?:tax\s*(?:id|identifier)|vat\s*(?:id|number))\s*[:#]?\s*[A-Z0-9-]{6,}\b/i;
+const identityPattern = /\b(?:[1-9]\d{5}(?:19|20)\d{2}(?:(?:0[1-9])|(?:1[0-2]))(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]|(?!000|666|9\d\d)\d{3}-\d{2}-\d{4})\b/;

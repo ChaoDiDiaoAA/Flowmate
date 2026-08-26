@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import cases from "./fixtures/policy-cases.json" with { type: "json" };
-import { PolicyEngine } from "../src/policy-engine.js";
+import { PolicyDeletionExecutor, PolicyEngine } from "../src/policy-engine.js";
 import type { ParsedDocument, RawArtifactRef, SourcePolicy } from "../src/types.js";
 
 const temporaryRoots: string[] = [];
@@ -43,6 +43,24 @@ describe("PolicyEngine", () => {
     await expectReason(engine, "empty", "CONTENT_EMPTY");
   });
 
+  it.each([
+    ["email", "EMAIL_DETECTED"],
+    ["bank-account", "BANK_ACCOUNT_DETECTED"],
+    ["identity-number", "IDENTITY_NUMBER_DETECTED"],
+    ["address", "ADDRESS_DETECTED"],
+    ["credential-variant", "SECRET_DETECTED"],
+    ["missing-raw-artifact", "RAW_ARTIFACT_UNREADABLE"],
+    ["unreadable-derived-artifact", "CONTENT_UNREADABLE"],
+    ["unreadable-derived-output", "DERIVED_OUTPUT_UNREADABLE"],
+    ["raw-hash-mismatch", "RAW_HASH_MISMATCH"],
+    ["content-hash-mismatch", "CONTENT_HASH_MISMATCH"],
+    ["invalid-page-count", "PAGE_COUNT_INVALID"],
+  ])("records %s as %s", async (name, reasonCode) => {
+    const decision = new PolicyEngine(new FixedClock()).evaluate(await policyInput(fixture(name)));
+
+    expect(decision.reasonCodes).toContain(reasonCode);
+  });
+
   it("keeps license, privacy, and quality statuses independent", async () => {
     const engine = new PolicyEngine(new FixedClock());
 
@@ -55,12 +73,54 @@ describe("PolicyEngine", () => {
     expect(emptyContent).toMatchObject({ licenseStatus: "allowed", privacyStatus: "passed", qualityStatus: "quarantined" });
   });
 
+  it("collects every license, source, privacy, and quality failure in a mixed decision", async () => {
+    const input = await policyInput(fixture("denied-license"));
+    input.sourcePolicy.enabled = false;
+    input.sourcePolicy.rawRetention = "denied";
+    input.sourcePolicy.datasetUsage = "denied";
+    input.parsedDocument.contentSha256 = "b".repeat(64);
+    await writeFile(input.parsedDocument.contentRef, "API_KEY=secret-value phone 13800138000", "utf8");
+
+    const decision = new PolicyEngine(new FixedClock()).evaluate(input);
+
+    expect(decision).toMatchObject({
+      licenseStatus: "denied",
+      privacyStatus: "delete_content",
+      qualityStatus: "quarantined",
+      action: "delete_content_keep_metadata",
+    });
+    expect(decision.reasonCodes).toEqual(expect.arrayContaining([
+      "LICENSE_DENIED",
+      "RAW_RETENTION_DENIED",
+      "SOURCE_DISABLED",
+      "DATASET_USAGE_DENIED",
+      "SECRET_DETECTED",
+      "PHONE_DETECTED",
+      "CONTENT_HASH_MISMATCH",
+    ]));
+  });
+
   it("does not allow synthetic identifiers into a final acceptance split", async () => {
     const policyCase = fixture("allowed-synthetic-invoice");
     const decision = new PolicyEngine(new FixedClock()).evaluate(await policyInput(policyCase));
 
     expect(decision.reasonCodes).toContain("SYNTHETIC_IDENTIFIERS_PRESENT");
     expect(decision.reasonCodes).toContain("FINAL_ACCEPTANCE_INELIGIBLE");
+  });
+
+  it("does not let synthetic invoice policy bypass phone or email detection", async () => {
+    const engine = new PolicyEngine(new FixedClock());
+    const phoneDecision = engine.evaluate(await policyInput(fixture("synthetic-phone")));
+    const emailInput = await policyInput(fixture("allowed-synthetic-invoice"));
+    const emailContent = "IBAN GB91YXO05542456978150 jane.doe@example.com";
+    await writeFile(emailInput.parsedDocument.contentRef, emailContent, "utf8");
+    emailInput.parsedDocument.contentSha256 = createHash("sha256").update(emailContent).digest("hex");
+    const emailDecision = engine.evaluate(emailInput);
+
+    expect(phoneDecision).toMatchObject({ action: "quarantine", privacyStatus: "quarantined" });
+    expect(phoneDecision.reasonCodes).toContain("PHONE_DETECTED");
+    expect(emailDecision).toMatchObject({ action: "quarantine", privacyStatus: "quarantined" });
+    expect(emailDecision.reasonCodes).toContain("EMAIL_DETECTED");
   });
 
   it("does not let caller-supplied model or quality flags override deterministic scans", async () => {
@@ -95,6 +155,44 @@ describe("PolicyEngine", () => {
     expect(decision).not.toHaveProperty("rawRef");
     expect(decision).not.toHaveProperty("fileRef");
   });
+
+  it("deletes only policy-rejected content under its configured root and returns audit metadata", async () => {
+    const input = await policyInput(fixture("denied-license"));
+    const decision = new PolicyEngine(new FixedClock()).evaluate(input);
+    const root = path.dirname(input.parsedDocument.contentRef);
+
+    const audit = await new PolicyDeletionExecutor(root).execute({ decision, ...input });
+
+    await expect(readFile(input.rawArtifact.rawRef!, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(input.parsedDocument.contentRef, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(input.parsedDocument.structureRef!, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(audit).toEqual({
+      itemId: input.itemId,
+      canonicalUrl: input.rawArtifact.canonicalUrl,
+      rawSha256: input.rawArtifact.rawSha256,
+      contentSha256: input.parsedDocument.contentSha256,
+      decidedAt: now,
+      policyVersion: "p0-policy-1.0",
+      reasonCodes: ["LICENSE_DENIED"],
+      deletedFileCount: 3,
+    });
+    expect(audit).not.toHaveProperty("contentRef");
+    expect(audit).not.toHaveProperty("rawRef");
+  });
+
+  it("refuses to delete a reference outside its configured root", async () => {
+    const input = await policyInput(fixture("denied-license"));
+    const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "flowmate-policy-outside-"));
+    temporaryRoots.push(outsideRoot);
+    const outsideRaw = path.join(outsideRoot, "raw.txt");
+    await writeFile(outsideRaw, "outside", "utf8");
+    input.rawArtifact.rawRef = outsideRaw;
+    const decision = new PolicyEngine(new FixedClock()).evaluate(input);
+
+    await expect(new PolicyDeletionExecutor(path.dirname(input.parsedDocument.contentRef)).execute({ decision, ...input }))
+      .rejects.toThrow(/outside the configured deletion root/i);
+    await expect(readFile(outsideRaw, "utf8")).resolves.toBe("outside");
+  });
 });
 
 async function expectReason(engine: PolicyEngine, name: string, reasonCode: string): Promise<void> {
@@ -114,7 +212,11 @@ async function policyInput(policyCase: (typeof cases)[number]): Promise<PolicyIn
   const root = await mkdtemp(path.join(os.tmpdir(), "flowmate-policy-engine-"));
   temporaryRoots.push(root);
   const contentRef = path.join(root, "content.md");
+  const rawRef = path.join(root, "raw.txt");
+  const structureRef = path.join(root, "structure.json");
   await writeFile(contentRef, policyCase.text, "utf8");
+  await writeFile(rawRef, "raw source", "utf8");
+  await writeFile(structureRef, "{}", "utf8");
   const sourcePolicy: SourcePolicy = {
     sourceId: "SRC-000001",
     domain: "example.com",
@@ -132,8 +234,8 @@ async function policyInput(policyCase: (typeof cases)[number]): Promise<PolicyIn
     sourceIds: [sourcePolicy.sourceId],
     acquisitionJobIds: ["ACQ-20260826-0001"],
     canonicalUrl: "https://example.com/public-invoice",
-    rawRef: path.join(root, "raw.pdf"),
-    rawSha256: "a".repeat(64),
+    rawRef,
+    rawSha256: createHash("sha256").update("raw source").digest("hex"),
     mimeType: "text/plain",
     retentionStatus: "retained",
   };
@@ -143,9 +245,33 @@ async function policyInput(policyCase: (typeof cases)[number]): Promise<PolicyIn
     parserVersion: "native-text-v1",
     parsedAt: now,
     contentRef,
+    structureRef,
     imageRefs: [],
     contentSha256: createHash("sha256").update(policyCase.text).digest("hex"),
     warnings: [],
   };
+  switch (policyCase.quality) {
+    case "missing-raw":
+      await unlink(rawRef);
+      break;
+    case "missing-derived":
+      await unlink(contentRef);
+      break;
+    case "bad-content-hash":
+      parsedDocument.contentSha256 = "b".repeat(64);
+      break;
+    case "fatal-warning":
+      parsedDocument.warnings = ["Fatal parser corruption"];
+      break;
+    case "missing-structure":
+      await unlink(structureRef);
+      break;
+    case "bad-raw-hash":
+      rawArtifact.rawSha256 = "b".repeat(64);
+      break;
+    case "invalid-page-count":
+      parsedDocument.pageCount = 0;
+      break;
+  }
   return { itemId: "SAMPLE-000001", sourcePolicy, rawArtifact, parsedDocument };
 }

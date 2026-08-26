@@ -12,5 +12,16 @@
   { "name": "internal-source", "license": "allowed", "sourceType": "internal_business", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "good", "want": "quarantine" },
   { "name": "bank-account", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "Account 1234567890123456", "quality": "good", "want": "quarantine" },
   { "name": "identity-number", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "身份证 11010519491231002X", "quality": "good", "want": "quarantine" },
-  { "name": "synthetic-claim-without-policy", "license": "allowed", "synthetic": true, "containsSyntheticIdentifiers": false, "text": "Account 1234567890123456", "quality": "good", "want": "quarantine" }
+  { "name": "synthetic-claim-without-policy", "license": "allowed", "synthetic": true, "containsSyntheticIdentifiers": false, "text": "Account 1234567890123456", "quality": "good", "want": "quarantine" },
+  { "name": "synthetic-phone", "license": "allowed", "synthetic": true, "containsSyntheticIdentifiers": true, "text": "IBAN GB91YXO05542456978150 phone 13800138000", "quality": "good", "want": "quarantine" },
+  { "name": "email", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "Contact jane.doe@example.com", "quality": "good", "want": "quarantine" },
+  { "name": "address", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "Address: 123 Main Street", "quality": "good", "want": "quarantine" },
+  { "name": "credential-variant", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "Authorization: Bearer secret-value", "quality": "good", "want": "delete_content_keep_metadata" },
+  { "name": "missing-raw-artifact", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "missing-raw", "want": "quarantine" },
+  { "name": "unreadable-derived-artifact", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "missing-derived", "want": "quarantine" },
+  { "name": "content-hash-mismatch", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "bad-content-hash", "want": "quarantine" },
+  { "name": "fatal-parser-warning", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "fatal-warning", "want": "quarantine" },
+  { "name": "unreadable-derived-output", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "missing-structure", "want": "quarantine" },
+  { "name": "raw-hash-mismatch", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "bad-raw-hash", "want": "quarantine" },
+  { "name": "invalid-page-count", "license": "allowed", "synthetic": false, "containsSyntheticIdentifiers": false, "text": "content", "quality": "invalid-page-count", "want": "quarantine" }
 ]
