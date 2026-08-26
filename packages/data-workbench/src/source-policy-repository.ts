@@ -3,12 +3,14 @@ import path from "node:path";
 import { parse } from "yaml";
 import type { DataPaths } from "./filesystem-layout.js";
 import { sourcePolicySchema } from "./schemas.js";
+import { assertSourceId } from "./stable-ids.js";
 import type { SourcePolicy } from "./types.js";
 
 export class SourcePolicyRepository {
   public constructor(private readonly paths: DataPaths) {}
 
   public async load(sourceId: string): Promise<SourcePolicy> {
+    assertSourceId(sourceId);
     const sourcePath = path.join(this.paths.vault, "10_Sources", `${sourceId}.md`);
     const frontmatter = extractFrontmatter(await readFile(sourcePath, "utf8"), sourcePath);
     const value = sourcePolicySchema.safeParse({

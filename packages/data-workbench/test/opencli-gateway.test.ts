@@ -40,6 +40,25 @@ describe("OpenCliGateway", () => {
     await expect(gateway.discover()).rejects.toThrow(/registry entry 1.*access/i);
   });
 
+  it("does not expose OpenCLI stderr credentials in registry errors", async () => {
+    const runner = new RecordingProcessRunner({
+      stdout: "",
+      stderr: 'Cookie: session=secret; Authorization: Bearer supersecret; {"api_key":"key-secret"}',
+      exitCode: 1,
+    });
+    const gateway = new OpenCliGateway(runner);
+
+    const error = await gateway.discover().then(
+      () => undefined,
+      (reason: unknown) => reason,
+    );
+    const message = error instanceof Error ? error.message : String(error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(message).toContain("OpenCLI registry discovery failed");
+    expect(message).not.toMatch(/secret|Bearer|Cookie|api_key/i);
+  });
+
   it("runs a discovered public read command with an argv array", async () => {
     const runner = new RecordingProcessRunner({ stdout: '[{"id":"1"}]', stderr: "", exitCode: 0 });
     const gateway = new OpenCliGateway(runner, registryFixture);

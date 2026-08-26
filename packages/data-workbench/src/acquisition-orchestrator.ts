@@ -1,10 +1,11 @@
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { DataPaths } from "./filesystem-layout.js";
 import type { IdAllocator } from "./ids.js";
 import type { OpenCliAcquisitionRequest } from "./opencli-gateway.js";
 import { acquisitionJobSchema } from "./schemas.js";
-import type { AcquisitionJob, AcquisitionResult } from "./types.js";
+import { assertAcquisitionJobId, assertSourceId } from "./stable-ids.js";
+import type { AcquisitionJob, AcquisitionResult, SourcePolicy } from "./types.js";
 
 export interface Clock {
   now(): string;
@@ -26,22 +27,23 @@ export interface PublicOpenCliGateway {
 let temporaryFileCounter = 0;
 
 export class AcquisitionOrchestrator {
-  private readonly runningSourceIds = new Set<string>();
-
   public constructor(
     private readonly idAllocator: IdAllocator,
     private readonly gateway: PublicOpenCliGateway,
     private readonly paths: DataPaths,
     private readonly clock: Clock,
+    private readonly sourcePolicy: SourcePolicy,
   ) {}
 
   public async run(request: OpenCliAcquisitionRequest): Promise<AcquisitionJob> {
-    await this.rejectIfAlreadyRunning(request.sourceId);
-    this.runningSourceIds.add(request.sourceId);
-
+    assertSourceId(request.sourceId);
+    assertRunnablePolicy(this.sourcePolicy, request.sourceId);
+    await acquireGlobalClaim(this.paths.staging);
+    let jobId: string | undefined;
     try {
-      const jobId = await this.idAllocator.next("acquisition");
-      const jobDirectory = path.join(this.paths.staging, jobId);
+      jobId = assertAcquisitionJobId(await this.idAllocator.next("acquisition"));
+      await writeJsonAtomically(claimOwnerPath(this.paths.staging), { jobId });
+      const jobDirectory = stagingJobDirectory(this.paths.staging, jobId);
       let job: AcquisitionJob = {
         jobId,
         sourceId: request.sourceId,
@@ -52,17 +54,20 @@ export class AcquisitionOrchestrator {
       };
       await writeJsonAtomically(path.join(jobDirectory, "job.json"), job);
 
+      job = { ...job, status: "DISCOVERING_ADAPTER" };
+      await writeJsonAtomically(path.join(jobDirectory, "job.json"), job);
       job = { ...job, status: "FETCHING" };
       await writeJsonAtomically(path.join(jobDirectory, "job.json"), job);
-      const result = await this.gateway.runPublic(request);
+
+      let result: AcquisitionResult;
+      try {
+        result = await this.gateway.runPublic(request);
+      } catch {
+        await persistFetchFailure(jobDirectory, job, this.clock);
+        throw new Error("OpenCLI acquisition failed");
+      }
       if (result.status !== "succeeded") {
-        job = {
-          ...job,
-          status: "FETCH_FAILED",
-          finishedAt: this.clock.now(),
-          counts: { ...job.counts, failed: 1 },
-        };
-        await writeJsonAtomically(path.join(jobDirectory, "job.json"), job);
+        await persistFetchFailure(jobDirectory, job, this.clock);
         throw new Error(`OpenCLI acquisition failed for ${request.site}/${request.command}`);
       }
 
@@ -74,10 +79,7 @@ export class AcquisitionOrchestrator {
         retrievedAt: this.clock.now(),
         items: result.items,
       };
-      await writeJsonAtomically(
-        path.join(jobDirectory, "acquisition-result.json"),
-        receipt,
-      );
+      await writeJsonAtomically(path.join(jobDirectory, "acquisition-result.json"), receipt);
       job = {
         ...job,
         status: "STAGED",
@@ -86,48 +88,33 @@ export class AcquisitionOrchestrator {
       await writeJsonAtomically(path.join(jobDirectory, "job.json"), job);
       return job;
     } finally {
-      this.runningSourceIds.delete(request.sourceId);
+      await releaseGlobalClaim(this.paths.staging, jobId);
     }
   }
 
   public async resume(jobId: string): Promise<AcquisitionJob> {
-    const jobDirectory = path.join(this.paths.staging, jobId);
+    assertAcquisitionJobId(jobId);
+    const jobDirectory = stagingJobDirectory(this.paths.staging, jobId);
     const job = await readJob(path.join(jobDirectory, "job.json"));
-    if (job.status !== "STAGED") {
-      throw new Error(`Only STAGED acquisition jobs can be resumed: ${jobId}`);
-    }
     const receipt = await readReceipt(path.join(jobDirectory, "acquisition-result.json"));
     if (receipt.jobId !== job.jobId || receipt.sourceId !== job.sourceId) {
       throw new Error(`Staging receipt does not match acquisition job: ${jobId}`);
     }
-    return job;
+    const stagedJob = toStagedJob(job, receipt.items.length);
+    if (job.status !== "STAGED" || job.counts.discovered !== receipt.items.length) {
+      await writeJsonAtomically(path.join(jobDirectory, "job.json"), stagedJob);
+    }
+    await releaseGlobalClaim(this.paths.staging, jobId);
+    return stagedJob;
   }
+}
 
-  private async rejectIfAlreadyRunning(sourceId: string): Promise<void> {
-    if (this.runningSourceIds.has(sourceId)) {
-      throw new Error(`Acquisition is already running for source: ${sourceId}`);
-    }
-    let entries: string[];
-    try {
-      entries = await readdir(this.paths.staging);
-    } catch (error: unknown) {
-      if (hasErrorCode(error, "ENOENT")) {
-        return;
-      }
-      throw error;
-    }
-    for (const entry of entries) {
-      try {
-        const job = await readJob(path.join(this.paths.staging, entry, "job.json"));
-        if (job.sourceId === sourceId && isRunning(job.status)) {
-          throw new Error(`Acquisition is already running for source: ${sourceId}`);
-        }
-      } catch (error: unknown) {
-        if (!hasErrorCode(error, "ENOENT")) {
-          throw error;
-        }
-      }
-    }
+function assertRunnablePolicy(policy: SourcePolicy, sourceId: string): void {
+  if (
+    policy.sourceId !== sourceId || policy.accessStrategy !== "public" ||
+    !policy.enabled || policy.sourcePolicy !== "allowed"
+  ) {
+    throw new Error("Acquisition source policy must be enabled, allowed, and public");
   }
 }
 
@@ -135,8 +122,88 @@ function emptyCounts(): AcquisitionJob["counts"] {
   return { discovered: 0, stored: 0, duplicated: 0, quarantined: 0, failed: 0 };
 }
 
-function isRunning(status: AcquisitionJob["status"]): boolean {
-  return status === "CREATED" || status === "DISCOVERING_ADAPTER" || status === "FETCHING";
+async function persistFetchFailure(
+  jobDirectory: string,
+  job: AcquisitionJob,
+  clock: Clock,
+): Promise<void> {
+  await writeJsonAtomically(path.join(jobDirectory, "job.json"), {
+    ...job,
+    status: "FETCH_FAILED",
+    finishedAt: clock.now(),
+    counts: { ...job.counts, failed: job.counts.failed + 1 },
+  });
+}
+
+function toStagedJob(job: AcquisitionJob, discovered: number): AcquisitionJob {
+  const stagedJob: AcquisitionJob = {
+    ...job,
+    status: "STAGED",
+    counts: { ...job.counts, discovered },
+  };
+  delete stagedJob.finishedAt;
+  return stagedJob;
+}
+
+function stagingJobDirectory(stagingPath: string, jobId: string): string {
+  return path.join(stagingPath, assertAcquisitionJobId(jobId));
+}
+
+function claimDirectory(stagingPath: string): string {
+  return path.join(stagingPath, ".acquisition-claim");
+}
+
+function claimOwnerPath(stagingPath: string): string {
+  return path.join(claimDirectory(stagingPath), "owner.json");
+}
+
+async function acquireGlobalClaim(stagingPath: string): Promise<void> {
+  await mkdir(stagingPath, { recursive: true });
+  try {
+    await mkdir(claimDirectory(stagingPath));
+  } catch (error: unknown) {
+    if (hasErrorCode(error, "EEXIST")) {
+      throw new Error("An acquisition job is already running", { cause: error });
+    }
+    throw error;
+  }
+}
+
+async function releaseGlobalClaim(stagingPath: string, expectedJobId: string | undefined): Promise<void> {
+  const ownerPath = claimOwnerPath(stagingPath);
+  if (expectedJobId !== undefined) {
+    try {
+      const owner: unknown = JSON.parse(await readFile(ownerPath, "utf8"));
+      if (!owner || typeof owner !== "object" || Array.isArray(owner)) {
+        return;
+      }
+      if ((owner as Record<string, unknown>).jobId !== expectedJobId) {
+        return;
+      }
+    } catch (error: unknown) {
+      if (hasErrorCode(error, "ENOENT")) {
+        // This process created the claim, but failed before its owner record was durable.
+        // The empty claim directory is still safe to release.
+      }
+      else {
+        throw error;
+      }
+    }
+  }
+  try {
+    await unlink(ownerPath);
+  } catch (error: unknown) {
+    if (!hasErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+  try {
+    await rmdir(claimDirectory(stagingPath));
+  } catch (error: unknown) {
+    if (!hasErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
 }
 
 async function readJob(jobPath: string): Promise<AcquisitionJob> {

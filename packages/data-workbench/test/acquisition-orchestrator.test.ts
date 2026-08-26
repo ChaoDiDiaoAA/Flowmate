@@ -9,6 +9,7 @@ import type { DataPaths } from "../src/filesystem-layout.js";
 import type { IdAllocator } from "../src/ids.js";
 import type { OpenCliAcquisitionRequest } from "../src/opencli-gateway.js";
 import type { AcquisitionResult } from "../src/types.js";
+import type { SourcePolicy } from "../src/types.js";
 
 const temporaryRoots: string[] = [];
 const request: OpenCliAcquisitionRequest = {
@@ -19,6 +20,18 @@ const request: OpenCliAcquisitionRequest = {
 };
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = path.resolve(packageRoot, "..", "..");
+const allowedSourcePolicy: SourcePolicy = {
+  sourceId: "SRC-000001",
+  domain: "example.com",
+  sourceType: "public_web",
+  accessStrategy: "public",
+  sourcePolicy: "allowed",
+  rawRetention: "allowed",
+  datasetUsage: "allowed",
+  synthetic: false,
+  containsSyntheticIdentifiers: false,
+  enabled: true,
+};
 
 class FixedClock implements Clock {
   public now(): string {
@@ -52,6 +65,41 @@ class FakeGateway {
   }
 }
 
+class ThrowingGateway extends FakeGateway {
+  public override async runPublic(): Promise<AcquisitionResult> {
+    this.callCount += 1;
+    throw new Error("Authorization: Bearer gateway-secret");
+  }
+}
+
+class BlockingGateway extends FakeGateway {
+  public entered: Promise<void>;
+  private markEntered: (() => void) | undefined;
+  private releaseRun: (() => void) | undefined;
+  private readonly completion: Promise<void>;
+
+  public constructor() {
+    super();
+    this.entered = new Promise((resolve) => {
+      this.markEntered = resolve;
+    });
+    this.completion = new Promise((resolve) => {
+      this.releaseRun = resolve;
+    });
+  }
+
+  public override async runPublic(): Promise<AcquisitionResult> {
+    this.callCount += 1;
+    this.markEntered?.();
+    await this.completion;
+    return super.runPublic();
+  }
+
+  public release(): void {
+    this.releaseRun?.();
+  }
+}
+
 async function createPaths(): Promise<DataPaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), "flowmate-acquisition-"));
   temporaryRoots.push(root);
@@ -78,7 +126,7 @@ describe("AcquisitionOrchestrator", () => {
     const paths = await createPaths();
     const allocator = new FakeAllocator();
     const gateway = new FakeGateway();
-    const orchestrator = new AcquisitionOrchestrator(allocator, gateway, paths, new FixedClock());
+    const orchestrator = new AcquisitionOrchestrator(allocator, gateway, paths, new FixedClock(), allowedSourcePolicy);
 
     await expect(orchestrator.run(request)).resolves.toMatchObject({
       jobId: "ACQ-20260826-0001",
@@ -102,11 +150,11 @@ describe("AcquisitionOrchestrator", () => {
     }, null, 2)));
   });
 
-  it("resumes a staged job from its receipt without spawning OpenCLI again", async () => {
+  it("recovers the receipt-write crash window without spawning OpenCLI again", async () => {
     const paths = await createPaths();
     const allocator = new FakeAllocator();
     const gateway = new FakeGateway();
-    const orchestrator = new AcquisitionOrchestrator(allocator, gateway, paths, new FixedClock());
+    const orchestrator = new AcquisitionOrchestrator(allocator, gateway, paths, new FixedClock(), allowedSourcePolicy);
     await orchestrator.run(request);
     await writeFile(
       path.join(paths.staging, "ACQ-20260826-0001", "job.json"),
@@ -114,10 +162,16 @@ describe("AcquisitionOrchestrator", () => {
         jobId: "ACQ-20260826-0001",
         sourceId: "SRC-000001",
         objective: "brave/search",
-        status: "STAGED",
+        status: "FETCHING",
         startedAt: "2026-08-26T12:00:00+08:00",
         counts: { discovered: 2, stored: 0, duplicated: 0, quarantined: 0, failed: 0 },
       })}\n`,
+      "utf8",
+    );
+    await mkdir(path.join(paths.staging, ".acquisition-claim"), { recursive: true });
+    await writeFile(
+      path.join(paths.staging, ".acquisition-claim", "owner.json"),
+      '{"jobId":"ACQ-20260826-0001"}\n',
       "utf8",
     );
 
@@ -127,6 +181,60 @@ describe("AcquisitionOrchestrator", () => {
       counts: { discovered: 2 },
     });
     expect(gateway.callCount).toBe(1);
+    await expect(
+      readFile(path.join(paths.staging, ".acquisition-claim", "owner.json"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("persists FETCH_FAILED when the gateway throws", async () => {
+    const paths = await createPaths();
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new ThrowingGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+
+    await expect(orchestrator.run(request)).rejects.toThrow(/OpenCLI acquisition failed/i);
+    await expect(
+      readFile(path.join(paths.staging, "ACQ-20260826-0001", "job.json"), "utf8"),
+    ).resolves.toContain('"status": "FETCH_FAILED"');
+  });
+
+  it("uses a single durable staging claim across concurrent orchestrators", async () => {
+    const paths = await createPaths();
+    const gateway = new BlockingGateway();
+    const first = new AcquisitionOrchestrator(
+      new FakeAllocator(), gateway, paths, new FixedClock(), allowedSourcePolicy,
+    );
+    const second = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), {
+        ...allowedSourcePolicy, sourceId: "SRC-000002",
+      },
+    );
+
+    const firstRun = first.run(request);
+    await gateway.entered;
+    await expect(second.run({ ...request, sourceId: "SRC-000002" })).rejects.toThrow(/already running/i);
+    gateway.release();
+    await expect(firstRun).resolves.toMatchObject({ status: "STAGED" });
+  });
+
+  it("rejects disallowed policy at the orchestrator API boundary", async () => {
+    const paths = await createPaths();
+    const allocator = new FakeAllocator();
+    const orchestrator = new AcquisitionOrchestrator(
+      allocator, new FakeGateway(), paths, new FixedClock(), { ...allowedSourcePolicy, enabled: false },
+    );
+
+    await expect(orchestrator.run(request)).rejects.toThrow(/enabled.*allowed.*public/i);
+    expect(allocator.callCount).toBe(0);
+  });
+
+  it("rejects traversal-like job IDs before reading staging files", async () => {
+    const paths = await createPaths();
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+
+    await expect(orchestrator.resume("../outside")).rejects.toThrow(/invalid acquisition job ID/i);
   });
 });
 
@@ -147,6 +255,13 @@ describe("data-workbench acquire CLI", () => {
     const paths = await createPaths();
     const existingJobDirectory = path.join(paths.staging, "ACQ-20260826-0001");
     await mkdir(existingJobDirectory, { recursive: true });
+    const globalClaimDirectory = path.join(paths.staging, ".acquisition-claim");
+    await mkdir(globalClaimDirectory, { recursive: true });
+    await writeFile(
+      path.join(globalClaimDirectory, "owner.json"),
+      '{"jobId":"ACQ-20260826-0001"}\n',
+      "utf8",
+    );
     await mkdir(path.join(paths.vault, "10_Sources"), { recursive: true });
     await writeFile(
       path.join(paths.vault, "10_Sources", "SRC-000001.md"),

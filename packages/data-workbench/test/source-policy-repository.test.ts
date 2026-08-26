@@ -80,4 +80,10 @@ describe("SourcePolicyRepository", () => {
 
     await expect(repository.load("SRC-000001")).rejects.toThrow(/rawRetention/i);
   });
+
+  it("rejects traversal-like source IDs before reading a vault path", async () => {
+    const repository = await createRepository(allowedPolicy);
+
+    await expect(repository.load("../outside")).rejects.toThrow(/invalid source ID/i);
+  });
 });

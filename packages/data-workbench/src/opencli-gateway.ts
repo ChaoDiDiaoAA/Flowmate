@@ -21,7 +21,7 @@ export class OpenCliGateway {
   async discover(): Promise<OpenCliCommandDescriptor[]> {
     const result = await this.runner.run("opencli", ["list", "-f", "json"]);
     if (result.exitCode !== 0) {
-      throw new Error(`OpenCLI registry discovery failed: ${result.stderr.trim()}`);
+      throw new Error("OpenCLI registry discovery failed");
     }
 
     this.registry = parseJsonArray(result.stdout, "OpenCLI registry").map(

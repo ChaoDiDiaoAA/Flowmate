@@ -5,6 +5,7 @@ import { initializeDataLayout } from "./filesystem-layout.js";
 import { createIdAllocator } from "./ids.js";
 import { OpenCliGateway } from "./opencli-gateway.js";
 import { SpawnProcessRunner } from "./process-runner.js";
+import { redactSensitiveDetails } from "./redaction.js";
 import { SourcePolicyRepository } from "./source-policy-repository.js";
 
 const systemClock: Clock = {
@@ -23,12 +24,13 @@ async function main(): Promise<void> {
     const request = parseAcquireRequest(argumentsAfterCommand);
     const config = resolveConfig(process.env);
     const paths = await initializeDataLayout(config.dataRoot);
-    await new SourcePolicyRepository(paths).load(request.sourceId);
+    const sourcePolicy = await new SourcePolicyRepository(paths).load(request.sourceId);
     const orchestrator = new AcquisitionOrchestrator(
       createIdAllocator(config),
       new OpenCliGateway(new SpawnProcessRunner()),
       paths,
       systemClock,
+      sourcePolicy,
     );
     process.stdout.write(`${JSON.stringify(await orchestrator.run(request), null, 2)}\n`);
     return;
@@ -86,10 +88,3 @@ main().catch((error: unknown) => {
   process.stderr.write(`${redactSensitiveDetails(error instanceof Error ? error.message : String(error))}\n`);
   process.exitCode = 1;
 });
-
-function redactSensitiveDetails(message: string): string {
-  return message.replace(
-    /\b(cookie|token|authorization|api[_-]?key|password)\b\s*([:=])\s*[^\s,;]+/gi,
-    "$1$2[REDACTED]",
-  );
-}
