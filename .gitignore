@@ -1,0 +1,41 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+out/
+coverage/
+.cache/
+
+# Local configuration and credentials (keep the template)
+.env
+.env.*
+!.env.example
+auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local databases and runtime data
+*.sqlite
+*.sqlite3
+*.db
+FlowmateData/
+FlowmateData
+private/
+secrets/
+
+# Temporary probes and Python environments/caches
+.tmp-mineru-probe/
+tools/mineru-mcp-wrapper/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
