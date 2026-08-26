@@ -22,7 +22,9 @@ const rootReadme = `# FlowmateData
 
 \`\`\`text
 FlowmateData/
+├─ README.md
 ├─ vault/
+│  └─ README.md
 ├─ staging/
 ├─ web-raw/
 ├─ derived/{mineru,html,native}/
@@ -63,7 +65,7 @@ const vaultReadme = `# Flowmate Obsidian Vault
 
 ## Vault 外文件
 
-\`web-raw\`、\`derived\`、\`files\`、\`labels\`、\`manifests\`、\`releases\`、\`quarantine\`、\`failures\` 与 \`backups\` 都保存在 FlowmateData 根目录的 Vault 外；卡片只能引用其稳定路径和 SHA-256。
+\`staging\`、\`web-raw\`、\`derived\`、\`files\`、\`labels\`、\`manifests\`、\`releases\`、\`quarantine\`、\`failures\` 与 \`backups\` 都保存在 FlowmateData 根目录的 Vault 外；卡片只能引用其稳定路径和 SHA-256。
 `;
 
 async function writeReadmeIfMissing(

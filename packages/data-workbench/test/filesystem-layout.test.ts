@@ -83,6 +83,18 @@ describe("initializeDataLayout", () => {
     await expect(readFile(rootReadmePath, "utf8")).resolves.toContain("User root note");
     await expect(readFile(vaultReadmePath, "utf8")).resolves.toContain("User vault note");
   });
+
+  it("documents both README locations and staging outside the Vault", async () => {
+    const root = await createTemporaryRoot();
+    await initializeDataLayout(root);
+
+    const rootReadme = await readFile(path.join(root, "README.md"), "utf8");
+    const vaultReadme = await readFile(path.join(root, "vault", "README.md"), "utf8");
+
+    expect(rootReadme).toContain("├─ README.md");
+    expect(rootReadme).toContain("│  └─ README.md");
+    expect(vaultReadme).toContain("`staging`");
+  });
 });
 
 describe("data-workbench CLI", () => {
