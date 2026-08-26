@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { DataPaths } from "../src/filesystem-layout.js";
 import type { IdAllocator } from "../src/ids.js";
 import { RawArtifactStore } from "../src/raw-artifact-store.js";
+import { SealedStagedFile } from "../src/sealed-staged-file.js";
 
 const temporaryRoots: string[] = [];
 
@@ -42,10 +43,10 @@ async function createStore(): Promise<{ paths: DataPaths; store: RawArtifactStor
   return { paths, store: new RawArtifactStore(paths, new FixedIdAllocator()) };
 }
 
-async function stage(paths: DataPaths, jobId: string, name: string, contents: string): Promise<string> {
-  const file = path.join(paths.staging, jobId, name);
-  await writeFile(file, contents, "utf8");
-  return file;
+async function stage(_paths: DataPaths, jobId: string, name: string, contents: string): Promise<SealedStagedFile> {
+  const privateFile = await SealedStagedFile.create(jobId, name);
+  await writeFile(privateFile.targetFile, contents, "utf8");
+  return privateFile.seal();
 }
 
 afterEach(async () => {
@@ -78,7 +79,6 @@ describe("RawArtifactStore", () => {
       retentionStatus: "retained",
     });
     await expect(readFile(rawFile, "utf8")).resolves.toBe("raw invoice\n");
-    await expect(readFile(stagedFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(path.dirname(path.dirname(rawFile)), "source.json"), "utf8"))
       .resolves.not.toContain("signature=secret");
     await expect(readFile(path.join(path.dirname(path.dirname(rawFile)), "checksums.sha256"), "utf8"))
@@ -112,7 +112,6 @@ describe("RawArtifactStore", () => {
     await expect(stat(path.join(paths.webRaw, "example.com", "ACQ-20260826-0002", "ART-000002")))
       .rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(first.rawRef!, "utf8")).resolves.toBe("same bytes");
-    await expect(readFile(secondStagedFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("keeps only auditable metadata when policy forbids retaining the body", async () => {
@@ -134,7 +133,6 @@ describe("RawArtifactStore", () => {
     await expect(readFile(path.join(artifactDirectory, "source.json"), "utf8")).resolves.toContain("SRC-000001");
     await expect(readFile(path.join(artifactDirectory, "files", "private.txt"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(stagedFile, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("associates a repeated metadata-only body without restoring or requiring a raw file", async () => {
@@ -164,21 +162,15 @@ describe("RawArtifactStore", () => {
     expect(duplicate.rawRef).toBeUndefined();
   });
 
-  it("rejects a staged file reached through a staging reparse point", async () => {
-    const { paths, store } = await createStore();
+  it("rejects a junction-backed staging root before accepting a download target", async () => {
+    const { paths } = await createStore();
     const outside = path.join(paths.root, "outside");
-    const reparsePoint = path.join(paths.staging, "ACQ-20260826-0001", "escape");
+    const reparsePoint = path.join(paths.root, "staging-link");
     await mkdir(outside, { recursive: true });
-    await writeFile(path.join(outside, "invoice.txt"), "outside staging", "utf8");
     await symlink(outside, reparsePoint, process.platform === "win32" ? "junction" : "dir");
 
-    await expect(store.ingest({
-      sourceId: "SRC-000001",
-      jobId: "ACQ-20260826-0001",
-      stagedFile: path.join(reparsePoint, "invoice.txt"),
-      mimeType: "text/plain",
-      retentionStatus: "retained",
-    })).rejects.toThrow(/reparse|staging/i);
-    await expect(readFile(path.join(outside, "invoice.txt"), "utf8")).resolves.toBe("outside staging");
+    await expect(import("../src/staging-containment.js").then(({ resolveContainedStagingFile }) =>
+      resolveContainedStagingFile(reparsePoint, "ACQ-20260826-0001", path.join(reparsePoint, "ACQ-20260826-0001", "invoice.txt")),
+    )).rejects.toThrow(/reparse|staging/i);
   });
 });

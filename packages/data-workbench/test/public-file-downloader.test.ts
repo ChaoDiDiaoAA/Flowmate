@@ -25,6 +25,19 @@ class DownloadingProcessRunner implements ProcessRunner {
   }
 }
 
+class ReplacingParentProcessRunner extends DownloadingProcessRunner {
+  constructor(private readonly staging: string, private readonly outside: string) {
+    super();
+  }
+
+  override async run(command: string, args: string[]): Promise<ProcessResult> {
+    const movedStaging = `${this.staging}.moved`;
+    await rename(this.staging, movedStaging);
+    await symlink(this.outside, this.staging, process.platform === "win32" ? "junction" : "dir");
+    return super.run(command, args);
+  }
+}
+
 async function createDownloader(exitCode = 0): Promise<{
   root: string;
   staging: string;
@@ -76,21 +89,13 @@ describe("PowerShellPublicFileDownloader", () => {
       targetFile: target,
     });
 
-    expect(runner.calls).toEqual([{
-      command: "powershell.exe",
-      args: [
-        "-NoProfile",
-        "-NonInteractive",
-        "-File",
-        "C:\\scripts\\download-public-file.ps1",
-        "-Url",
-        "https://example.com/invoice.pdf?signature=secret",
-        "-TargetFile",
-        target,
-      ],
-    }]);
-    expect(download.fileRef).toBe(target);
-    await expect(readFile(download.fileRef, "utf8")).resolves.toBe("downloaded body");
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0]?.command).toBe("powershell.exe");
+    expect(runner.calls[0]?.args.slice(0, -1)).toEqual(["-NoProfile", "-NonInteractive", "-File", "C:\\scripts\\download-public-file.ps1", "-Url", "https://example.com/invoice.pdf?signature=secret", "-TargetFile"]);
+    expect(runner.calls[0]?.args.at(-1)).not.toBe(target);
+    expect(download.fileRef.fileName).toBe("invoice.pdf");
+    expect(download.rawSha256).toMatch(/^[a-f0-9]{64}$/);
+    await download.fileRef.dispose();
   });
 
   it("rejects targets outside the current job staging directory before spawning", async () => {
@@ -120,6 +125,24 @@ describe("PowerShellPublicFileDownloader", () => {
     expect(runner.calls).toEqual([]);
   });
 
+  it("keeps an outside replacement parent untouched when it changes after validation", async () => {
+    const { root, staging } = await createDownloader();
+    const outside = path.join(root, "outside");
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "invoice.pdf"), "outside sentinel", "utf8");
+    const runner = new ReplacingParentProcessRunner(staging, outside);
+    const downloader = new PowerShellPublicFileDownloader(runner, staging, "C:\\scripts\\download-public-file.ps1");
+
+    const download = await downloader.download({
+      url: "https://example.com/invoice.pdf",
+      allowedDomain: "example.com",
+      targetFile: path.join(staging, "invoice.pdf"),
+    });
+
+    await expect(readFile(path.join(outside, "invoice.pdf"), "utf8")).resolves.toBe("outside sentinel");
+    await download.fileRef.dispose();
+  });
+
   it("does not disclose signed URL queries when PowerShell fails", async () => {
     const { staging, downloader } = await createDownloader(1);
 
@@ -130,7 +153,7 @@ describe("PowerShellPublicFileDownloader", () => {
     })).rejects.toThrow("Public file download failed: https://example.com/invoice.pdf");
   });
 
-  it("does not invoke PowerShell again when the target is already a complete file", async () => {
+  it("does not trust a pre-existing staging target as a downloadable body", async () => {
     const { staging, downloader, runner } = await createDownloader();
     const target = path.join(staging, "invoice.pdf");
     await writeFile(target, "already present", "utf8");
@@ -141,7 +164,8 @@ describe("PowerShellPublicFileDownloader", () => {
       targetFile: target,
     });
 
-    expect(runner.calls).toEqual([]);
+    expect(runner.calls).toHaveLength(1);
     expect(download.rawSha256).toMatch(/^[a-f0-9]{64}$/);
+    await download.fileRef.dispose();
   });
 });

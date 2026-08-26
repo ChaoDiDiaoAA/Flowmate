@@ -1,17 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   mkdir,
   readFile,
   rename,
   rm,
   rmdir,
-  unlink,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import type { DataPaths } from "./filesystem-layout.js";
 import type { IdAllocator } from "./ids.js";
-import { resolveContainedStagingFile } from "./staging-containment.js";
+import { SealedStagedFile } from "./sealed-staged-file.js";
 import { assertAcquisitionJobId, assertSourceId } from "./stable-ids.js";
 import type { RawArtifactRef } from "./types.js";
 
@@ -32,17 +31,20 @@ export class RawArtifactStore {
     sourceId: string;
     jobId: string;
     canonicalUrl?: string;
-    stagedFile: string;
+    stagedFile: SealedStagedFile;
     mimeType: string;
     retentionStatus: RawArtifactRef["retentionStatus"];
   }): Promise<RawArtifactRef> {
     const sourceId = assertSourceId(input.sourceId);
     const jobId = assertAcquisitionJobId(input.jobId);
-    const stagedFile = await resolveContainedStagingFile(this.paths.staging, jobId, input.stagedFile);
+    const stagedFile = input.stagedFile;
+    if (stagedFile.jobId !== jobId) {
+      throw new Error("Sealed staged file does not belong to the current acquisition job");
+    }
     const canonicalUrl = input.canonicalUrl === undefined
       ? undefined
       : canonicalizeUrl(input.canonicalUrl);
-    const rawSha256 = await sha256File(stagedFile);
+    const rawSha256 = await stagedFile.sha256();
 
     return withExclusiveLock(path.join(this.paths.manifests, "raw-artifact-index.lock"), async () => {
       const indexPath = path.join(this.paths.manifests, "raw-artifact-index.json");
@@ -53,7 +55,7 @@ export class RawArtifactStore {
         index.artifactsBySha256[rawSha256] = updated;
         await writeArtifactMetadata(updated, artifactDirectoryFor(this.paths.webRaw, updated));
         await writeJsonAtomically(indexPath, index);
-        await unlink(stagedFile);
+        await stagedFile.dispose();
         return updated;
       }
 
@@ -62,7 +64,7 @@ export class RawArtifactStore {
       const artifactDirectory = path.join(this.paths.webRaw, domain, jobId, artifactId);
       const stagedArtifactDirectory = `${artifactDirectory}.${randomUUID()}.tmp`;
       const retained = input.retentionStatus === "retained";
-      const fileName = path.basename(stagedFile);
+      const fileName = stagedFile.fileName;
       const rawRef = retained ? path.join(artifactDirectory, "files", fileName) : undefined;
       const artifact: RawArtifactRef = {
         artifactId,
@@ -78,9 +80,9 @@ export class RawArtifactStore {
       try {
         await mkdir(path.join(stagedArtifactDirectory, "files"), { recursive: true });
         if (retained) {
-          await rename(stagedFile, path.join(stagedArtifactDirectory, "files", fileName));
+          await stagedFile.copyTo(path.join(stagedArtifactDirectory, "files", fileName));
         } else {
-          await unlink(stagedFile);
+          // The sealed temporary body is discarded after its audit hash is recorded.
         }
         await writeArtifactMetadata(artifact, stagedArtifactDirectory, fileName);
         await mkdir(path.dirname(artifactDirectory), { recursive: true });
@@ -88,6 +90,8 @@ export class RawArtifactStore {
       } catch (error) {
         await rm(stagedArtifactDirectory, { recursive: true, force: true });
         throw error;
+      } finally {
+        await stagedFile.dispose();
       }
 
       index.artifactsBySha256[rawSha256] = artifact;
@@ -114,10 +118,6 @@ function canonicalizeUrl(value: string): string {
   url.search = "";
   url.hash = "";
   return url.toString();
-}
-
-async function sha256File(filePath: string): Promise<string> {
-  return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
 
 async function readIndex(indexPath: string): Promise<RawArtifactIndex> {

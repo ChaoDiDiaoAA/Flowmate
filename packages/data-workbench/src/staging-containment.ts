@@ -9,7 +9,7 @@ export async function resolveContainedStagingFile(
   const jobDirectory = path.resolve(stagingRoot, jobId);
   const resolvedFile = path.resolve(filePath);
   assertLexicallyContained(jobDirectory, resolvedFile);
-  await assertNoStagingReparsePoint(jobDirectory, resolvedFile);
+  await assertNoStagingReparsePoint(path.resolve(stagingRoot), jobDirectory, resolvedFile);
 
   const realJobDirectory = await realpath(jobDirectory);
   const realParentDirectory = await realpath(path.dirname(resolvedFile));
@@ -40,7 +40,11 @@ function assertContainedDirectory(directory: string, candidate: string): void {
   }
 }
 
-async function assertNoStagingReparsePoint(jobDirectory: string, filePath: string): Promise<void> {
+async function assertNoStagingReparsePoint(stagingRoot: string, jobDirectory: string, filePath: string): Promise<void> {
+  const stagingRootStats = await tryLstat(stagingRoot);
+  if (!stagingRootStats?.isDirectory() || stagingRootStats.isSymbolicLink()) {
+    throw new Error("Staging root must be a real directory, not a symbolic link or reparse point");
+  }
   const jobDirectoryStats = await tryLstat(jobDirectory);
   if (!jobDirectoryStats?.isDirectory() || jobDirectoryStats.isSymbolicLink()) {
     throw new Error("Current acquisition job staging directory must be a real directory");
