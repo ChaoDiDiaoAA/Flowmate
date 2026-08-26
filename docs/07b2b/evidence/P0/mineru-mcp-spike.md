@@ -69,6 +69,28 @@ MinerU Tool 返回的原始 message：
 Parsing complete!
 ```
 
+## 项目级配置门禁复验
+
+> 日期：2026-08-26 16:25（Asia/Shanghai）  
+> 配置：`D:\code\agent-learn\agent\Flowmate\.codex\config.toml`  
+> 启动：`uv run --project D:\code\agent-learn\agent\Flowmate\tools\mineru-mcp-wrapper flowmate-mineru-mcp`  
+> 输出目录：`D:\code\agent-learn\agent\Flowmate\FlowmateData\derived\mineru`
+
+通过 MCP stdio 客户端直接启动项目配置对应的 wrapper，实测结果：
+
+```text
+tools = [get_ocr_languages, parse_documents]
+parse_documents.file_sources.maxItems = 200
+get_ocr_languages.status = success
+W3C PDF:
+status = success
+content = Dummy PDF file
+success_count = 1
+error_count = 0
+```
+
+本次复验未读取或修改用户级 Codex 配置，也未将 Token 写入文件或输出。
+
 ## 结论
 
-包装层通过真实 MCP 调用验证，可作为 P0 实施计划中的 MinerU MCP 启动方式。用户级 Codex MCP 配置不修改；Flowmate 将在项目级 `.codex/config.toml` 注册包装层。当前线程不会动态加载新 Tool，该配置动作应写入并在 P0 实施计划审核后执行，再通过新的受信任 Flowmate Codex 会话验证。
+包装层和项目级 MCP 配置均已通过真实 MCP 调用验证，可作为 P0 实施计划中的 MinerU MCP 启动方式。用户级 Codex MCP 配置不修改；Flowmate 使用项目级 `.codex/config.toml` 注册包装层。
