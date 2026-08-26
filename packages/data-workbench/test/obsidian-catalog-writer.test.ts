@@ -63,8 +63,6 @@ describe("ObsidianCatalogWriter", () => {
     const entry = await writePayload(root, "KNOW-000001", {
       ...publicPayload("knowledge"),
       title: "Invoice: a # heading\n---\nnot frontmatter",
-      rawRef: "../web-raw/example.com/ART-000001/original.pdf",
-      derivedRef: "../derived/mineru/ART-000001/content.md",
     });
 
     await writer.flush([entry]);
@@ -79,12 +77,56 @@ describe("ObsidianCatalogWriter", () => {
       privacy_status: "passed",
       quality_status: "passed",
       pipeline_status: "cataloged",
-      raw_ref: "../web-raw/example.com/ART-000001/original.pdf",
-      derived_ref: "../derived/mineru/ART-000001/content.md",
       title: "Invoice: a # heading\n---\nnot frontmatter",
     });
+    expect(frontmatter(note)).not.toHaveProperty("raw_ref");
+    expect(frontmatter(note)).not.toHaveProperty("derived_ref");
     expect(await readdir(path.join(vault, "30_PublicKnowledge"))).toEqual(["KNOW-000001.md"]);
     await expect(readFile(path.join(vault, "30_PublicKnowledge", "original.pdf"))).rejects.toThrow();
+  });
+
+  it("writes the exact Public Sample file-reference schema without generic aliases", async () => {
+    const root = await createTemporaryRoot();
+    const vault = path.join(root, "vault");
+    const writer = new ObsidianCatalogWriter(vault);
+    const entry = await writePayload(root, "SAMPLE-000001", publicPayload("public_sample"));
+
+    await writer.flush([entry]);
+
+    const metadata = frontmatter(await readFile(path.join(vault, "40_PublicSamples", "SAMPLE-000001.md"), "utf8"));
+    expect(metadata).toMatchObject({
+      sample_id: "SAMPLE-000001",
+      raw_file_ref: "../web-raw/example.com/ART-000001/original.pdf",
+      derived_ref: "../derived/mineru/ART-000001/content.md",
+    });
+    expect(metadata).not.toHaveProperty("raw_ref");
+  });
+
+  it("writes the exact Business Asset file-reference schema without generic aliases", async () => {
+    const root = await createTemporaryRoot();
+    const vault = path.join(root, "vault");
+    const writer = new ObsidianCatalogWriter(vault);
+    const entry = await writePayload(root, "BIZ-000001", {
+      ...publicPayload("business_asset"),
+      sourceType: "internal_finance",
+      dataOwnerRole: "finance_ap",
+      authorizationStatus: "approved_for_development",
+      businessReviewStatus: "approved",
+      sanitizedFileRef: "../files/private-sanitized/BIZ-000001.pdf",
+      expectedRef: "../labels/BIZ-000001.expected.json",
+    });
+
+    await writer.flush([entry]);
+
+    const metadata = frontmatter(await readFile(path.join(vault, "50_BusinessAssets", "BIZ-000001.md"), "utf8"));
+    expect(metadata).toMatchObject({
+      business_asset_id: "BIZ-000001",
+      raw_file_ref: "../web-raw/example.com/ART-000001/original.pdf",
+      sanitized_file_ref: "../files/private-sanitized/BIZ-000001.pdf",
+      expected_ref: "../labels/BIZ-000001.expected.json",
+    });
+    expect(metadata).not.toHaveProperty("raw_ref");
+    expect(metadata).not.toHaveProperty("derived_ref");
   });
 
   it("creates the P0 Vault directories and templates without overwriting an existing note", async () => {
@@ -115,7 +157,7 @@ function publicPayload(entryType: CatalogPayload["entryType"]): CatalogPayload {
     retrievedAt: "2026-08-26T10:00:00+08:00",
     rawSha256: "a".repeat(64),
     contentSha256: "b".repeat(64),
-    rawRef: "../web-raw/example.com/ART-000001/original.pdf",
+    rawFileRef: "../web-raw/example.com/ART-000001/original.pdf",
     derivedRef: "../derived/mineru/ART-000001/content.md",
     fileFormat: "pdf",
     parserName: "mineru",

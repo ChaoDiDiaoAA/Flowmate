@@ -112,4 +112,62 @@ describe("data-workbench CLI", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("Unknown data-workbench command: unknown");
   });
+
+  it("preserves an existing catalog card when data:init is run again", async () => {
+    const root = await createTemporaryRoot();
+    const cardPath = path.join(root, "vault", "30_PublicKnowledge", "KNOW-000001.md");
+    const environment = { ...process.env, FLOWMATE_DATA_ROOT: root };
+    const init = () => spawnSync(
+      process.execPath,
+      [path.join(repositoryRoot, "node_modules", "tsx", "dist", "cli.mjs"), path.join(packageRoot, "src", "cli.ts"), "init"],
+      { cwd: packageRoot, encoding: "utf8", env: environment },
+    );
+
+    expect(init().status).toBe(0);
+    await writeFile(cardPath, "existing catalog card\n", "utf8");
+    expect(init().status).toBe(0);
+
+    await expect(readFile(cardPath, "utf8")).resolves.toBe("existing catalog card\n");
+  });
+
+  it("persists a pending catalog-flush failure and writes it on the next successful retry", async () => {
+    const root = await createTemporaryRoot();
+    const outboxPath = path.join(root, "catalog-outbox.json");
+    const payloadPath = path.join(root, "payload.json");
+    const environment = { ...process.env, FLOWMATE_DATA_ROOT: root };
+    await writeFile(outboxPath, JSON.stringify([{
+      entryId: "KNOW-000001",
+      entryType: "knowledge",
+      payloadRef: payloadPath,
+      status: "pending",
+      attempts: 0,
+    }]), "utf8");
+    const flush = () => spawnSync(
+      process.execPath,
+      [
+        path.join(repositoryRoot, "node_modules", "tsx", "dist", "cli.mjs"),
+        path.join(packageRoot, "src", "cli.ts"),
+        "catalog-flush",
+        "--outbox", outboxPath,
+      ],
+      { cwd: packageRoot, encoding: "utf8", env: environment },
+    );
+
+    expect(flush().status).not.toBe(0);
+    await expect(readFile(outboxPath, "utf8")).resolves.toContain('"status": "pending"');
+    await expect(readFile(outboxPath, "utf8")).resolves.toContain('"attempts": 1');
+
+    await writeFile(payloadPath, JSON.stringify({
+      entryType: "knowledge",
+      sourceId: "SRC-000001",
+      artifactId: "ART-000001",
+      title: "Invoice field definition",
+      pipelineStatus: "cataloged",
+    }), "utf8");
+
+    expect(flush().status).toBe(0);
+    await expect(readFile(outboxPath, "utf8")).resolves.toContain('"status": "written"');
+    await expect(readFile(outboxPath, "utf8")).resolves.toContain('"attempts": 2');
+    await expect(readFile(path.join(root, "vault", "30_PublicKnowledge", "KNOW-000001.md"), "utf8")).resolves.toContain("knowledge_id: KNOW-000001");
+  });
 });

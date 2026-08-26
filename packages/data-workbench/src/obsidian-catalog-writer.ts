@@ -14,8 +14,9 @@ export interface CatalogPayload {
   retrievedAt?: string;
   rawSha256?: string;
   contentSha256?: string;
-  rawRef?: string;
+  rawFileRef?: string;
   derivedRef?: string;
+  sanitizedFileRef?: string;
   expectedRef?: string;
   sourceType?: string;
   sampleType?: string;
@@ -98,9 +99,6 @@ function baseMetadata(payload: CatalogPayload): Record<string, unknown> {
     retrieved_at: payload.retrievedAt,
     raw_sha256: payload.rawSha256,
     content_sha256: payload.contentSha256,
-    raw_ref: payload.rawRef,
-    derived_ref: payload.derivedRef,
-    expected_ref: payload.expectedRef,
     license_status: payload.licenseStatus,
     privacy_status: payload.privacyStatus,
     quality_status: payload.qualityStatus,
@@ -116,6 +114,8 @@ function entryMetadata(entry: CatalogOutboxEntry, payload: CatalogPayload): Reco
       return {
         sample_id: entry.entryId,
         sample_type: payload.sampleType,
+        raw_file_ref: payload.rawFileRef,
+        derived_ref: payload.derivedRef,
         file_format: payload.fileFormat,
         parser_name: payload.parserName,
         parser_version: payload.parserVersion,
@@ -130,6 +130,9 @@ function entryMetadata(entry: CatalogOutboxEntry, payload: CatalogPayload): Reco
         data_owner_role: payload.dataOwnerRole,
         authorization_status: payload.authorizationStatus,
         business_review_status: payload.businessReviewStatus,
+        raw_file_ref: payload.rawFileRef,
+        sanitized_file_ref: payload.sanitizedFileRef,
+        expected_ref: payload.expectedRef,
         dataset_version: payload.datasetVersion ?? "unassigned",
       };
     case "quarantine":
