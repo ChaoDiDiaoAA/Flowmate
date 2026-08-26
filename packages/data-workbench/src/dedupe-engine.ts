@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rmdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { IdAllocator } from "./ids.js";
 import type { DedupeDecision } from "./types.js";
 
 interface ArtifactFingerprint {
@@ -21,12 +20,10 @@ const lockRetryDelayMs = 10;
 const lockRetryLimit = 100;
 
 export class DedupeEngine {
-  public constructor(
-    private readonly dataRoot: string,
-    private readonly idAllocator: IdAllocator,
-  ) {}
+  public constructor(private readonly dataRoot: string) {}
 
   public async decide(input: {
+    artifactId: string;
     canonicalUrl?: string;
     rawSha256: string;
     contentSha256?: string;
@@ -37,9 +34,10 @@ export class DedupeEngine {
       const byUrl = input.canonicalUrl === undefined ? undefined : index.urls[input.canonicalUrl];
       if (byUrl) {
         if (byUrl.rawSha256 === input.rawSha256) {
-          return duplicate("duplicate_url", byUrl.artifactId);
+          const canonicalArtifactId = await reconcileRawArtifactIdentity(indexPath, index, byUrl, input);
+          return duplicate("duplicate_url", canonicalArtifactId);
         }
-        const fingerprint = await newFingerprint(this.idAllocator, input);
+        const fingerprint = newFingerprint(input);
         index.urls[input.canonicalUrl!] = fingerprint;
         index.raws[input.rawSha256] = fingerprint;
         if (input.contentSha256) {
@@ -62,7 +60,7 @@ export class DedupeEngine {
         return duplicate("duplicate_content", byContent.artifactId);
       }
 
-      const fingerprint = await newFingerprint(this.idAllocator, input);
+      const fingerprint = newFingerprint(input);
       if (input.canonicalUrl) {
         index.urls[input.canonicalUrl] = fingerprint;
       }
@@ -89,16 +87,48 @@ function duplicate(status: Extract<DedupeDecision["status"], "duplicate_url" | "
   return { status, canonicalArtifactId: artifactId, relatedArtifactIds: [] };
 }
 
-async function newFingerprint(
-  idAllocator: IdAllocator,
-  input: { canonicalUrl?: string; rawSha256: string; contentSha256?: string },
-): Promise<ArtifactFingerprint> {
+function newFingerprint(input: {
+  artifactId: string;
+  canonicalUrl?: string;
+  rawSha256: string;
+  contentSha256?: string;
+}): ArtifactFingerprint {
   return {
-    artifactId: await idAllocator.next("artifact"),
+    artifactId: input.artifactId,
     ...(input.canonicalUrl === undefined ? {} : { canonicalUrl: input.canonicalUrl }),
     rawSha256: input.rawSha256,
     ...(input.contentSha256 === undefined ? {} : { contentSha256: input.contentSha256 }),
   };
+}
+
+async function reconcileRawArtifactIdentity(
+  indexPath: string,
+  index: DedupeIndex,
+  fingerprint: ArtifactFingerprint,
+  input: { artifactId: string; rawSha256: string },
+): Promise<string> {
+  if (fingerprint.artifactId === input.artifactId) {
+    return fingerprint.artifactId;
+  }
+
+  const corrected = { ...fingerprint, artifactId: input.artifactId };
+  replaceFingerprint(index.urls, fingerprint, corrected);
+  replaceFingerprint(index.raws, fingerprint, corrected);
+  replaceFingerprint(index.contents, fingerprint, corrected);
+  await writeJsonAtomically(indexPath, index);
+  return corrected.artifactId;
+}
+
+function replaceFingerprint(
+  entries: Record<string, ArtifactFingerprint>,
+  expected: ArtifactFingerprint,
+  replacement: ArtifactFingerprint,
+): void {
+  for (const [key, value] of Object.entries(entries)) {
+    if (value.artifactId === expected.artifactId && value.rawSha256 === expected.rawSha256) {
+      entries[key] = replacement;
+    }
+  }
 }
 
 async function readIndex(indexPath: string): Promise<DedupeIndex> {
