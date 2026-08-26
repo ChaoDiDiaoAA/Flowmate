@@ -16,4 +16,4 @@ specs（目标与边界） → plans（实施步骤） → evidence（验证结�
 
 ## 教程状态
 
-根目录下的 `A_`–`G_`、`DATA-01`–`DATA-03` 等 Superpowers 之前编写的手把手教程保留作 draft/archive 参考，不能作为当前执行入口，也不能覆盖最新 spec、plan 或 evidence。若教程与批准后的计划冲突，以 spec → plan → evidence 链为准。
+`docs/07b2b` 下的 `A_`–`G_`、`DATA-01`–`DATA-03` 等 Superpowers 之前编写的手把手教程保留作 draft/archive 参考，不能作为当前执行入口，也不能覆盖最新 spec、plan 或 evidence。若教程与批准后的计划冲突，以 spec → plan → evidence 链为准。

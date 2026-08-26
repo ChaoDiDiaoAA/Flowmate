@@ -20,6 +20,10 @@ auth.json
 *.sqlite
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+data/raw/
+data/private/
 FlowmateData/
 FlowmateData
 private/
@@ -31,6 +35,7 @@ tools/mineru-mcp-wrapper/.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+tools/mineru-mcp-wrapper/.pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
