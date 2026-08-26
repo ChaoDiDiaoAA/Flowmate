@@ -1,8 +1,13 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createIdAllocator } from "../src/ids.js";
+import {
+  acquireDataRootLock,
+  createIdAllocator,
+  releaseDataRootLock,
+  removeStaleLock,
+} from "../src/ids.js";
 
 const temporaryRoots: string[] = [];
 
@@ -19,6 +24,14 @@ async function createTestAllocator() {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), "flowmate-ids-"));
   temporaryRoots.push(dataRoot);
   return { allocator: createIdAllocator({ dataRoot, mineruMaxFilesPerRun: 200 }), dataRoot };
+}
+
+async function createTestLockPath(): Promise<{ dataRoot: string; lockPath: string }> {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), "flowmate-ids-"));
+  temporaryRoots.push(dataRoot);
+  const manifestsDirectory = path.join(dataRoot, "manifests");
+  await mkdir(manifestsDirectory, { recursive: true });
+  return { dataRoot, lockPath: path.join(manifestsDirectory, "id-counters.lock") };
 }
 
 describe("IdAllocator", () => {
@@ -64,6 +77,29 @@ describe("IdAllocator", () => {
     await expect(
       readFile(path.join(dataRoot, "manifests", "id-counters.json"), "utf8"),
     ).resolves.toContain('"source": 2');
+  });
+
+  it("does not remove a stale-aged lock owned by a live process", async () => {
+    const { lockPath } = await createTestLockPath();
+    const owner = { token: "live-owner", pid: process.pid };
+    await writeFile(lockPath, JSON.stringify(owner), "utf8");
+    const oneMinuteAgo = new Date(Date.now() - 60_000);
+    await utimes(lockPath, oneMinuteAgo, oneMinuteAgo);
+
+    await removeStaleLock(lockPath);
+
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(JSON.stringify(owner));
+  });
+
+  it("does not let a prior owner release a replacement lock", async () => {
+    const { lockPath } = await createTestLockPath();
+    const firstLock = await acquireDataRootLock(lockPath);
+    const replacement = { token: "replacement-owner", pid: process.pid };
+    await writeFile(lockPath, JSON.stringify(replacement), "utf8");
+
+    await releaseDataRootLock(lockPath, firstLock.owner);
+
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(JSON.stringify(replacement));
   });
 
   it("uses the approved China calendar date for acquisition IDs", async () => {
