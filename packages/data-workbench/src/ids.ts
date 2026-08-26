@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { link, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { DataWorkbenchConfig } from "./config.js";
 
@@ -15,15 +14,6 @@ interface IdCounters {
   acquisition: Record<string, number>;
 }
 
-export interface DataRootLockOwner {
-  token: string;
-  pid: number;
-}
-
-export interface DataRootLock {
-  owner: DataRootLockOwner;
-}
-
 export interface IdAllocator {
   next(kind: IdKind): Promise<string>;
 }
@@ -37,8 +27,7 @@ const prefixes: Record<SequentialIdKind, string> = {
 };
 
 const lockRetryDelayMs = 10;
-const lockRetryLimit = 500;
-const staleLockAgeMs = 30_000;
+const lockRetryLimit = 100;
 
 function hasErrorCode(error: unknown, code: string): boolean {
   return (
@@ -53,116 +42,45 @@ function waitForLockRetry(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, lockRetryDelayMs));
 }
 
-async function removeTemporaryLock(temporaryLockPath: string): Promise<void> {
-  try {
-    await unlink(temporaryLockPath);
-  } catch (error: unknown) {
-    if (!hasErrorCode(error, "ENOENT")) {
-      throw error;
-    }
-  }
-}
-
-async function removeStaleLock(lockPath: string): Promise<void> {
-  try {
-    const lockStats = await stat(lockPath);
-    if (Date.now() - lockStats.mtimeMs <= staleLockAgeMs) {
-      return;
-    }
-    const owner = await readLockOwner(lockPath);
-    if (owner !== undefined && isProcessAlive(owner.pid)) {
-      return;
-    }
-    await unlink(lockPath);
-  } catch (error: unknown) {
-    if (!hasErrorCode(error, "ENOENT")) {
-      throw error;
-    }
-  }
-}
-
-function parseLockOwner(value: unknown): DataRootLockOwner | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return undefined;
-  }
-  const candidate = value as Record<string, unknown>;
-  if (
-    typeof candidate.token !== "string" ||
-    candidate.token.length === 0 ||
-    typeof candidate.pid !== "number" ||
-    !Number.isInteger(candidate.pid) ||
-    candidate.pid < 1
-  ) {
-    return undefined;
-  }
-  return { token: candidate.token, pid: candidate.pid };
-}
-
-async function readLockOwner(lockPath: string): Promise<DataRootLockOwner | undefined> {
-  try {
-    return parseLockOwner(JSON.parse(await readFile(lockPath, "utf8")));
-  } catch (error: unknown) {
-    if (hasErrorCode(error, "ENOENT") || error instanceof SyntaxError) {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error: unknown) {
-    if (hasErrorCode(error, "ESRCH")) {
-      return false;
-    }
-    if (hasErrorCode(error, "EPERM")) {
-      return true;
-    }
-    throw error;
-  }
-}
-
-export async function acquireDataRootLock(lockPath: string): Promise<DataRootLock> {
+async function acquireDataRootLock(lockPath: string): Promise<void> {
   for (let attempt = 0; attempt < lockRetryLimit; attempt += 1) {
-    const owner = { token: randomUUID(), pid: process.pid };
-    const temporaryLockPath = `${lockPath}.${owner.token}.tmp`;
     try {
-      await writeFile(temporaryLockPath, JSON.stringify(owner), "utf8");
-      await link(temporaryLockPath, lockPath);
+      await mkdir(lockPath);
+      await writeFile(
+        path.join(lockPath, "owner.json"),
+        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+        "utf8",
+      );
+      return;
     } catch (error: unknown) {
-      await removeTemporaryLock(temporaryLockPath);
       if (!hasErrorCode(error, "EEXIST")) {
         throw error;
       }
-      await removeStaleLock(lockPath);
       await waitForLockRetry();
-      continue;
-    }
-    await removeTemporaryLock(temporaryLockPath);
-    return { owner };
-  }
-  throw new Error(`Timed out acquiring ID counter lock at ${lockPath}`);
-}
-
-export async function releaseDataRootLock(
-  lockPath: string,
-  owner: DataRootLockOwner,
-): Promise<void> {
-  const currentOwner = await readLockOwner(lockPath);
-  if (currentOwner?.token === owner.token) {
-    try {
-      await unlink(lockPath);
-    } catch (error: unknown) {
-      if (!hasErrorCode(error, "ENOENT")) {
-        throw error;
-      }
     }
   }
+  throw new Error(
+    `Timed out acquiring ID counter lock at ${lockPath}. ` +
+      `Confirm no Flowmate allocation is running, then manually remove ${lockPath} and retry.`,
+  );
 }
 
-export { removeStaleLock };
+async function releaseDataRootLock(lockPath: string): Promise<void> {
+  try {
+    await unlink(path.join(lockPath, "owner.json"));
+  } catch (error: unknown) {
+    if (!hasErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+  try {
+    await rmdir(lockPath);
+  } catch (error: unknown) {
+    if (!hasErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
 
 function emptyCounters(): IdCounters {
   return {
@@ -249,7 +167,7 @@ class FileIdAllocator implements IdAllocator {
     const countersPath = path.join(manifestsDirectory, "id-counters.json");
     await mkdir(manifestsDirectory, { recursive: true });
     const lockPath = path.join(manifestsDirectory, "id-counters.lock");
-    const lock = await acquireDataRootLock(lockPath);
+    await acquireDataRootLock(lockPath);
 
     try {
       let counters = emptyCounters();
@@ -281,7 +199,7 @@ class FileIdAllocator implements IdAllocator {
       await rename(temporaryPath, countersPath);
       return id;
     } finally {
-      await releaseDataRootLock(lockPath, lock.owner);
+      await releaseDataRootLock(lockPath);
     }
   }
 }

@@ -1,13 +1,8 @@
-import { mkdir, mkdtemp, readFile, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  acquireDataRootLock,
-  createIdAllocator,
-  releaseDataRootLock,
-  removeStaleLock,
-} from "../src/ids.js";
+import { createIdAllocator } from "../src/ids.js";
 
 const temporaryRoots: string[] = [];
 
@@ -79,27 +74,28 @@ describe("IdAllocator", () => {
     ).resolves.toContain('"source": 2');
   });
 
-  it("does not remove a stale-aged lock owned by a live process", async () => {
+  it("keeps a stale crashed lock and reports manual recovery instead of reclaiming it", async () => {
     const { lockPath } = await createTestLockPath();
-    const owner = { token: "live-owner", pid: process.pid };
+    const owner = { token: "crashed-owner", pid: 999_999 };
     await writeFile(lockPath, JSON.stringify(owner), "utf8");
     const oneMinuteAgo = new Date(Date.now() - 60_000);
     await utimes(lockPath, oneMinuteAgo, oneMinuteAgo);
 
-    await removeStaleLock(lockPath);
+    await expect(createIdAllocator({ dataRoot: path.dirname(path.dirname(lockPath)), mineruMaxFilesPerRun: 200 }).next("source"))
+      .rejects.toThrow(/manually remove.*id-counters\.lock/i);
 
     await expect(readFile(lockPath, "utf8")).resolves.toBe(JSON.stringify(owner));
   });
 
-  it("does not let a prior owner release a replacement lock", async () => {
+  it("does not let another allocator replace a held lock", async () => {
     const { lockPath } = await createTestLockPath();
-    const firstLock = await acquireDataRootLock(lockPath);
-    const replacement = { token: "replacement-owner", pid: process.pid };
-    await writeFile(lockPath, JSON.stringify(replacement), "utf8");
+    await mkdir(lockPath);
 
-    await releaseDataRootLock(lockPath, firstLock.owner);
+    await expect(
+      createIdAllocator({ dataRoot: path.dirname(path.dirname(lockPath)), mineruMaxFilesPerRun: 200 }).next("source"),
+    ).rejects.toThrow(/manually remove.*id-counters\.lock/i);
 
-    await expect(readFile(lockPath, "utf8")).resolves.toBe(JSON.stringify(replacement));
+    await expect(stat(lockPath)).resolves.toBeDefined();
   });
 
   it("uses the approved China calendar date for acquisition IDs", async () => {
