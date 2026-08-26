@@ -28,7 +28,7 @@
 [ ] DATA-01 完成
 [ ] DATA-02 至少有 100 张真实脱敏发票及人工正确答案
 [ ] 已确认 OCR 服务的数据处理和隐私许可
-[ ] 数据文件从 D:\code\agent-learn\agent\FlowmateData 读取，不复制进仓库
+[ ] 数据文件从 D:\code\agent-learn\agent\Flowmate\FlowmateData 读取，不复制进仓库
 ```
 
 ## Task B1：定义文档和 OCR Contract

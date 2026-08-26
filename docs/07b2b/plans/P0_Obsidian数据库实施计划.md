@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - P0 必须完成后才能开始 P1。
-- 数据根目录固定为 `D:\code\agent-learn\agent\FlowmateData`。
+- 数据根目录固定为 `D:\code\agent-learn\agent\Flowmate\FlowmateData`。
 - 源码仓库不得保存网络原始数据、企业真实数据、Token、Cookie、密码或 API Key。
 - 用户级 `~/.codex/config.toml` 不修改。
 - MinerU 通过项目级 `.codex/config.toml` 启动 `tools/mineru-mcp-wrapper`。
@@ -806,8 +806,8 @@ git commit -m "feat: define P0 data contracts"
 - Create: `packages/data-workbench/src/filesystem-layout.ts`
 - Create: `packages/data-workbench/test/filesystem-layout.test.ts`
 - Create: `packages/data-workbench/src/cli.ts`
-- Create at execution time: `D:\code\agent-learn\agent\FlowmateData\README.md`
-- Create at execution time: `D:\code\agent-learn\agent\FlowmateData\vault\README.md`
+- Create at execution time: `D:\code\agent-learn\agent\Flowmate\FlowmateData\README.md`
+- Create at execution time: `D:\code\agent-learn\agent\Flowmate\FlowmateData\vault\README.md`
 
 **Interfaces:**
 
@@ -935,7 +935,7 @@ Run:
 
 ```powershell
 npm run data:init
-Get-ChildItem -LiteralPath 'D:\code\agent-learn\agent\FlowmateData'
+Get-ChildItem -LiteralPath 'D:\code\agent-learn\agent\Flowmate\FlowmateData'
 ```
 
 Expected: 只出现 Spec 规定的目录。⛔ 若命令指向 `Flowmate` 源码目录，立即停止。
@@ -1690,7 +1690,7 @@ git commit -m "feat: enforce automatic P0 data policy"
 - Create: `packages/data-workbench/test/catalog-outbox.test.ts`
 - Create: `packages/data-workbench/test/obsidian-catalog-writer.test.ts`
 - Modify: `packages/data-workbench/src/cli.ts`
-- Create at execution time: `D:\code\agent-learn\agent\FlowmateData\vault\90_Templates\*.md`
+- Create at execution time: `D:\code\agent-learn\agent\Flowmate\FlowmateData\vault\90_Templates\*.md`
 
 **Interfaces:**
 
@@ -1794,7 +1794,7 @@ Expected: Vault 结构和模板创建成功，重复执行不覆盖已有卡片�
 
 1. 启动 Obsidian。
 2. 选择“打开文件夹作为仓库”。
-3. 打开 `D:\code\agent-learn\agent\FlowmateData\vault`。
+3. 打开 `D:\code\agent-learn\agent\Flowmate\FlowmateData\vault`。
 4. 启用 Core plugins：Properties、Templates、Bases。
 5. 运行：
 
@@ -1984,7 +1984,7 @@ backup-YYYYMMDD-HHmmss
 `backup-flowmate-data.ps1` 只负责设置工作目录并调用：
 
 ```powershell
-npm run data:backup -- --backup-root 'D:\code\agent-learn\agent\FlowmateData\backups'
+npm run data:backup -- --backup-root 'D:\code\agent-learn\agent\Flowmate\FlowmateData\backups'
 ```
 
 `verify-flowmate-data-restore.ps1` 调用：
@@ -2011,7 +2011,7 @@ npm test
 - [ ] **Step 6: 执行真实备份和隔离恢复** 👤
 
 1. 创建备份。
-2. 选择 `D:\code\agent-learn\agent\FlowmateData\restore-drill` 作为隔离恢复目录。
+2. 选择 `D:\code\agent-learn\agent\Flowmate\FlowmateData\restore-drill` 作为隔离恢复目录。
 3. 恢复一份备份。
 4. 运行 verify。
 5. 用 Obsidian 打开恢复后的 Vault。
@@ -2036,7 +2036,7 @@ git commit -m "feat: back up and verify P0 data restores"
 **Files:**
 
 - Create: `packages/data-workbench/test/p0-smoke.integration.test.ts`
-- Create external evidence: `D:\code\agent-learn\agent\FlowmateData\manifests\smoke-test-result.json`
+- Create external evidence: `D:\code\agent-learn\agent\Flowmate\FlowmateData\manifests\smoke-test-result.json`
 - Create: `docs/07b2b/evidence/P0/p0-smoke-summary.md`
 - Read: `docs/07b2b/research/公开发票数据源核验.md`
 
@@ -2169,10 +2169,10 @@ git commit -m "test: prove P0 data workbench end to end"
 - Inspect: `docs/07b2b/README.md`
 - Inspect: `packages/data-workbench/README.md`
 - Inspect: `tools/mineru-mcp-wrapper/README.md`
-- Inspect: `D:\code\agent-learn\agent\FlowmateData\README.md`
-- Inspect: `D:\code\agent-learn\agent\FlowmateData\vault\README.md`
+- Inspect: `D:\code\agent-learn\agent\Flowmate\FlowmateData\README.md`
+- Inspect: `D:\code\agent-learn\agent\Flowmate\FlowmateData\vault\README.md`
 - Inspect: `docs/07b2b/specs/P0_Obsidian数据库目标方案.md`
-- Inspect: `D:\code\agent-learn\agent\FlowmateData\releases\dataset-v0.1\manifest.json`
+- Inspect: `D:\code\agent-learn\agent\Flowmate\FlowmateData\releases\dataset-v0.1\manifest.json`
 - Inspect: 最新 `backup-manifest.json`
 
 **Interfaces:**
@@ -2215,8 +2215,8 @@ $requiredReadmes = @(
   'D:\code\agent-learn\agent\Flowmate\docs\07b2b\README.md',
   'D:\code\agent-learn\agent\Flowmate\packages\data-workbench\README.md',
   'D:\code\agent-learn\agent\Flowmate\tools\mineru-mcp-wrapper\README.md',
-  'D:\code\agent-learn\agent\FlowmateData\README.md',
-  'D:\code\agent-learn\agent\FlowmateData\vault\README.md'
+  'D:\code\agent-learn\agent\Flowmate\FlowmateData\README.md',
+  'D:\code\agent-learn\agent\Flowmate\FlowmateData\vault\README.md'
 )
 $missingReadmes = @($requiredReadmes | Where-Object { -not (Test-Path -LiteralPath $_) })
 if ($missingReadmes.Count -gt 0) { throw "Missing README: $($missingReadmes -join ', ')" }

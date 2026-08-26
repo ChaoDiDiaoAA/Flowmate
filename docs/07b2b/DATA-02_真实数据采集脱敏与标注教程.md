@@ -66,7 +66,7 @@ PO 样例：覆盖存在、不存在、余额不足、币种或税率异常
 👤 每批数据创建批次目录：
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\files\raw\BATCH-20260825-001\
+D:\code\agent-learn\agent\Flowmate\FlowmateData\files\raw\BATCH-20260825-001\
 ```
 
 保留数据 Owner 提供的原始文件名映射，但正式 Case ID 使用 `INV-000001` 形式。
@@ -74,7 +74,7 @@ D:\code\agent-learn\agent\FlowmateData\files\raw\BATCH-20260825-001\
 计算 SHA-256：
 
 ```powershell
-Get-FileHash -Algorithm SHA256 -LiteralPath 'D:\code\agent-learn\agent\FlowmateData\files\raw\BATCH-20260825-001\sample.pdf'
+Get-FileHash -Algorithm SHA256 -LiteralPath 'D:\code\agent-learn\agent\Flowmate\FlowmateData\files\raw\BATCH-20260825-001\sample.pdf'
 ```
 
 - [ ] 把 hash 记录到对应 Obsidian 案例卡片。
@@ -86,7 +86,7 @@ Get-FileHash -Algorithm SHA256 -LiteralPath 'D:\code\agent-learn\agent\FlowmateD
 脱敏副本放入：
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\files\sanitized\INV-000001.pdf
+D:\code\agent-learn\agent\Flowmate\FlowmateData\files\sanitized\INV-000001.pdf
 ```
 
 必须检查的敏感信息包括：
@@ -108,7 +108,7 @@ D:\code\agent-learn\agent\FlowmateData\files\sanitized\INV-000001.pdf
 每张发票创建：
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\labels\INV-000001.expected.json
+D:\code\agent-learn\agent\Flowmate\FlowmateData\labels\INV-000001.expected.json
 ```
 
 统一结构：

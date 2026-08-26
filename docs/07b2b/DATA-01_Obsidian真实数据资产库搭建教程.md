@@ -25,14 +25,14 @@
 - [ ] 👤 打开 PowerShell，创建目录：
 
 ```powershell
-New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\FlowmateData\vault'
-New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\FlowmateData\files\raw'
-New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\FlowmateData\files\sanitized'
-New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\FlowmateData\labels'
-New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\FlowmateData\manifests'
-New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\FlowmateData\releases'
-New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\FlowmateData\backups'
-Get-ChildItem -LiteralPath 'D:\code\agent-learn\agent\FlowmateData'
+New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\Flowmate\FlowmateData\vault'
+New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\Flowmate\FlowmateData\files\raw'
+New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\Flowmate\FlowmateData\files\sanitized'
+New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\Flowmate\FlowmateData\labels'
+New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\Flowmate\FlowmateData\manifests'
+New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\Flowmate\FlowmateData\releases'
+New-Item -ItemType Directory -Force -Path 'D:\code\agent-learn\agent\Flowmate\FlowmateData\backups'
+Get-ChildItem -LiteralPath 'D:\code\agent-learn\agent\Flowmate\FlowmateData'
 ```
 
 期望看到 `vault`、`files`、`labels`、`manifests`、`releases`、`backups`。
@@ -44,7 +44,7 @@ Get-ChildItem -LiteralPath 'D:\code\agent-learn\agent\FlowmateData'
 
 - [ ] 👤 打开 Obsidian。
 - [ ] 选择“打开文件夹作为仓库”。
-- [ ] 选择 `D:\code\agent-learn\agent\FlowmateData\vault`。
+- [ ] 选择 `D:\code\agent-learn\agent\Flowmate\FlowmateData\vault`。
 - [ ] 在设置的 Core plugins 中启用 `Properties view`、`Templates` 和 `Bases`。
 
 在 Vault 内创建：
@@ -187,8 +187,8 @@ last_received_date: 2026-08-25
 
 ```powershell
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-Copy-Item -LiteralPath 'D:\code\agent-learn\agent\FlowmateData\vault' -Destination "D:\code\agent-learn\agent\FlowmateData\backups\vault-$stamp" -Recurse
-Get-ChildItem -LiteralPath 'D:\code\agent-learn\agent\FlowmateData\backups'
+Copy-Item -LiteralPath 'D:\code\agent-learn\agent\Flowmate\FlowmateData\vault' -Destination "D:\code\agent-learn\agent\Flowmate\FlowmateData\backups\vault-$stamp" -Recurse
+Get-ChildItem -LiteralPath 'D:\code\agent-learn\agent\Flowmate\FlowmateData\backups'
 ```
 
 - [ ] 👤 用 Obsidian 临时打开备份目录，确认模板和 Dashboard 可见。

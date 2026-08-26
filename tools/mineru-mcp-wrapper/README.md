@@ -35,7 +35,7 @@ uv run --group dev pytest -q
 ## Start
 
 ```powershell
-uv run flowmate-mineru-mcp --output-dir D:\code\agent-learn\agent\FlowmateData\derived\mineru
+uv run flowmate-mineru-mcp --output-dir D:\code\agent-learn\agent\Flowmate\FlowmateData\derived\mineru
 ```
 
 The process uses stdio transport by default and preserves the upstream tools:

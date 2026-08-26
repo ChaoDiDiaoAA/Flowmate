@@ -52,7 +52,7 @@ export interface DatasetManifest {
 根目录命令固定为：
 
 ```powershell
-npm run data:validate -- --vault 'D:\code\agent-learn\agent\FlowmateData\vault' --data-root 'D:\code\agent-learn\agent\FlowmateData'
+npm run data:validate -- --vault 'D:\code\agent-learn\agent\Flowmate\FlowmateData\vault' --data-root 'D:\code\agent-learn\agent\Flowmate\FlowmateData'
 ```
 
 必须检查：
@@ -105,13 +105,13 @@ acceptance：20%
 命令固定为：
 
 ```powershell
-npm run data:release -- --version dataset-v0.1 --vault 'D:\code\agent-learn\agent\FlowmateData\vault' --data-root 'D:\code\agent-learn\agent\FlowmateData'
+npm run data:release -- --version dataset-v0.1 --vault 'D:\code\agent-learn\agent\Flowmate\FlowmateData\vault' --data-root 'D:\code\agent-learn\agent\Flowmate\FlowmateData'
 ```
 
 输出目录：
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\releases\dataset-v0.1\
+D:\code\agent-learn\agent\Flowmate\FlowmateData\releases\dataset-v0.1\
 ├─ manifest.json
 ├─ release-notes.md
 ├─ development.json

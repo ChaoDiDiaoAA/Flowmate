@@ -518,7 +518,7 @@ interface DatasetManifestItem {
 默认数据根目录：
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\
+D:\code\agent-learn\agent\Flowmate\FlowmateData\
 ├─ README.md
 ├─ vault\
 │  └─ README.md
@@ -562,7 +562,7 @@ Staging 内容经过精确去重后：
 ### 8.2 Web Raw Archive
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\web-raw\
+D:\code\agent-learn\agent\Flowmate\FlowmateData\web-raw\
 └─ <source-domain>\
    └─ <acquisition-job-id>\
       └─ <artifact-id>\
@@ -584,7 +584,7 @@ D:\code\agent-learn\agent\FlowmateData\web-raw\
 ### 8.3 MinerU 派生目录
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\derived\mineru\
+D:\code\agent-learn\agent\Flowmate\FlowmateData\derived\mineru\
 └─ <artifact-id>\
    └─ <parser-version>\
       ├─ content.md
@@ -611,7 +611,7 @@ warnings
 ## 9. Obsidian Vault 结构
 
 ```text
-D:\code\agent-learn\agent\FlowmateData\vault\
+D:\code\agent-learn\agent\Flowmate\FlowmateData\vault\
 ├─ 00_Dashboard\
 ├─ 10_Sources\
 ├─ 20_AcquisitionJobs\
@@ -1167,7 +1167,7 @@ failures
 最低备份形态：
 
 ```text
-工作数据：D:\code\agent-learn\agent\FlowmateData
+工作数据：D:\code\agent-learn\agent\Flowmate\FlowmateData
 第一备份：同机加密备份目录
 第二备份：另一块加密磁盘或批准的企业存储
 ```
@@ -1185,7 +1185,7 @@ failures
 ## 20. P0 完成标准
 
 ```text
-[ ] D:\code\agent-learn\agent\FlowmateData 逻辑结构符合本 Spec
+[ ] D:\code\agent-learn\agent\Flowmate\FlowmateData 逻辑结构符合本 Spec
 [ ] 仓库根 `README.md` 可作为项目入口
 [ ] `docs/07b2b/README.md` 可导航 Spec、Plan 和 Evidence
 [ ] `packages/data-workbench/README.md` 的命令已验证
@@ -1278,7 +1278,7 @@ P1 不依赖：
 
 在用户批准 P0 实施计划之前：
 
-- 不创建 `D:\code\agent-learn\agent\FlowmateData`；
+- 不创建 `D:\code\agent-learn\agent\Flowmate\FlowmateData`；
 - 不启动数据库搭建；
 - 不执行网络采集；
 - 不调用 MinerU 解析真实文件；
