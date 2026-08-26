@@ -22,6 +22,24 @@ describe("OpenCliGateway", () => {
     expect(runner.lastArgs).toEqual(["list", "-f", "json"]);
   });
 
+  it("rejects a dynamic registry descriptor with an invalid access value", async () => {
+    const runner = new RecordingProcessRunner({
+      stdout: JSON.stringify([{
+        command: "brave/search",
+        site: "brave",
+        name: "search",
+        access: "delete",
+        strategy: "public",
+        browser: true,
+      }]),
+      stderr: "",
+      exitCode: 0,
+    });
+    const gateway = new OpenCliGateway(runner);
+
+    await expect(gateway.discover()).rejects.toThrow(/registry entry 1.*access/i);
+  });
+
   it("runs a discovered public read command with an argv array", async () => {
     const runner = new RecordingProcessRunner({ stdout: '[{"id":"1"}]', stderr: "", exitCode: 0 });
     const gateway = new OpenCliGateway(runner, registryFixture);
@@ -73,6 +91,8 @@ describe("OpenCliGateway", () => {
     });
 
     expect(result.items).toEqual([]);
+    expect(result.status).toBe("failed");
+    expect(result.exitCode).toBe(1);
     expect(result.traceRef).toBe("C:\\temp\\opencli-traces\\failure.json");
   });
 });

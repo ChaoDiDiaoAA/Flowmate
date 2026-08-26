@@ -81,6 +81,8 @@ export interface AcquisitionResult {
   adapterRef: string;
   strategy: "public";
   retrievedAt: string;
+  status: "succeeded" | "failed";
+  exitCode: number;
   items: unknown[];
   traceRef?: string;
 }
