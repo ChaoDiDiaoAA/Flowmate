@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, rmdir, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { DataPaths } from "./filesystem-layout.js";
 import type { IdAllocator } from "./ids.js";
@@ -24,6 +25,20 @@ export interface PublicOpenCliGateway {
   runPublic(request: OpenCliAcquisitionRequest): Promise<AcquisitionResult>;
 }
 
+export interface AcquisitionOrchestratorHooks {
+  afterReceiptWritten?(jobId: string): Promise<void>;
+}
+
+interface ClaimOwner {
+  pid: number;
+  nonce: string;
+}
+
+interface AcquiredClaim {
+  owner: ClaimOwner;
+  ownerPath: string;
+}
+
 let temporaryFileCounter = 0;
 
 export class AcquisitionOrchestrator {
@@ -33,16 +48,15 @@ export class AcquisitionOrchestrator {
     private readonly paths: DataPaths,
     private readonly clock: Clock,
     private readonly sourcePolicy: SourcePolicy,
+    private readonly hooks: AcquisitionOrchestratorHooks = {},
   ) {}
 
   public async run(request: OpenCliAcquisitionRequest): Promise<AcquisitionJob> {
     assertSourceId(request.sourceId);
     assertRunnablePolicy(this.sourcePolicy, request.sourceId);
-    await acquireGlobalClaim(this.paths.staging);
-    let jobId: string | undefined;
+    const claim = await acquireGlobalClaim(this.paths.staging);
     try {
-      jobId = assertAcquisitionJobId(await this.idAllocator.next("acquisition"));
-      await writeJsonAtomically(claimOwnerPath(this.paths.staging), { jobId });
+      const jobId = assertAcquisitionJobId(await this.idAllocator.next("acquisition"));
       const jobDirectory = stagingJobDirectory(this.paths.staging, jobId);
       let job: AcquisitionJob = {
         jobId,
@@ -80,6 +94,7 @@ export class AcquisitionOrchestrator {
         items: result.items,
       };
       await writeJsonAtomically(path.join(jobDirectory, "acquisition-result.json"), receipt);
+      await this.hooks.afterReceiptWritten?.(jobId);
       job = {
         ...job,
         status: "STAGED",
@@ -88,24 +103,29 @@ export class AcquisitionOrchestrator {
       await writeJsonAtomically(path.join(jobDirectory, "job.json"), job);
       return job;
     } finally {
-      await releaseGlobalClaim(this.paths.staging, jobId);
+      await releaseOwnedClaim(this.paths.staging, claim);
     }
   }
 
   public async resume(jobId: string): Promise<AcquisitionJob> {
     assertAcquisitionJobId(jobId);
-    const jobDirectory = stagingJobDirectory(this.paths.staging, jobId);
-    const job = await readJob(path.join(jobDirectory, "job.json"));
-    const receipt = await readReceipt(path.join(jobDirectory, "acquisition-result.json"));
-    if (receipt.jobId !== job.jobId || receipt.sourceId !== job.sourceId) {
-      throw new Error(`Staging receipt does not match acquisition job: ${jobId}`);
+    await removeDeadClaimForRecovery(this.paths.staging);
+    const claim = await acquireGlobalClaim(this.paths.staging);
+    try {
+      const jobDirectory = stagingJobDirectory(this.paths.staging, jobId);
+      const job = await readJob(path.join(jobDirectory, "job.json"));
+      const receipt = await readReceipt(path.join(jobDirectory, "acquisition-result.json"));
+      if (receipt.jobId !== job.jobId || receipt.sourceId !== job.sourceId) {
+        throw new Error(`Staging receipt does not match acquisition job: ${jobId}`);
+      }
+      const stagedJob = toStagedJob(job, receipt.items.length);
+      if (job.status !== "STAGED" || job.counts.discovered !== receipt.items.length) {
+        await writeJsonAtomically(path.join(jobDirectory, "job.json"), stagedJob);
+      }
+      return stagedJob;
+    } finally {
+      await releaseOwnedClaim(this.paths.staging, claim);
     }
-    const stagedJob = toStagedJob(job, receipt.items.length);
-    if (job.status !== "STAGED" || job.counts.discovered !== receipt.items.length) {
-      await writeJsonAtomically(path.join(jobDirectory, "job.json"), stagedJob);
-    }
-    await releaseGlobalClaim(this.paths.staging, jobId);
-    return stagedJob;
   }
 }
 
@@ -153,15 +173,20 @@ function claimDirectory(stagingPath: string): string {
   return path.join(stagingPath, ".acquisition-claim");
 }
 
-function claimOwnerPath(stagingPath: string): string {
-  return path.join(claimDirectory(stagingPath), "owner.json");
+function claimOwnerPath(stagingPath: string, owner: ClaimOwner): string {
+  return path.join(stagingPath, `.acquisition-owner-${owner.pid}-${owner.nonce}.json`);
 }
 
-async function acquireGlobalClaim(stagingPath: string): Promise<void> {
+async function acquireGlobalClaim(stagingPath: string): Promise<AcquiredClaim> {
   await mkdir(stagingPath, { recursive: true });
+  const owner: ClaimOwner = { pid: process.pid, nonce: randomUUID() };
+  const ownerPath = claimOwnerPath(stagingPath, owner);
+  await writeFile(ownerPath, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
   try {
-    await mkdir(claimDirectory(stagingPath));
+    await link(ownerPath, claimDirectory(stagingPath));
+    return { owner, ownerPath };
   } catch (error: unknown) {
+    await unlink(ownerPath);
     if (hasErrorCode(error, "EEXIST")) {
       throw new Error("An acquisition job is already running", { cause: error });
     }
@@ -169,40 +194,69 @@ async function acquireGlobalClaim(stagingPath: string): Promise<void> {
   }
 }
 
-async function releaseGlobalClaim(stagingPath: string, expectedJobId: string | undefined): Promise<void> {
-  const ownerPath = claimOwnerPath(stagingPath);
-  if (expectedJobId !== undefined) {
-    try {
-      const owner: unknown = JSON.parse(await readFile(ownerPath, "utf8"));
-      if (!owner || typeof owner !== "object" || Array.isArray(owner)) {
-        return;
-      }
-      if ((owner as Record<string, unknown>).jobId !== expectedJobId) {
-        return;
-      }
-    } catch (error: unknown) {
-      if (hasErrorCode(error, "ENOENT")) {
-        // This process created the claim, but failed before its owner record was durable.
-        // The empty claim directory is still safe to release.
-      }
-      else {
-        throw error;
-      }
-    }
-  }
+async function releaseOwnedClaim(stagingPath: string, claim: AcquiredClaim): Promise<void> {
+  await removePublishedClaimIfOwned(stagingPath, claim.owner);
   try {
-    await unlink(ownerPath);
+    await unlink(claim.ownerPath);
   } catch (error: unknown) {
     if (!hasErrorCode(error, "ENOENT")) {
       throw error;
     }
   }
+}
+
+async function removeDeadClaimForRecovery(stagingPath: string): Promise<void> {
+  const owner = await readPublishedClaimOwner(stagingPath);
+  if (owner === undefined) {
+    return;
+  }
+  if (isProcessLive(owner.pid)) {
+    throw new Error("Acquisition claim is still running");
+  }
+  await removePublishedClaimIfOwned(stagingPath, owner);
+}
+
+async function removePublishedClaimIfOwned(stagingPath: string, expectedOwner: ClaimOwner): Promise<void> {
+  const owner = await readPublishedClaimOwner(stagingPath);
+  if (owner === undefined || owner.pid !== expectedOwner.pid || owner.nonce !== expectedOwner.nonce) {
+    return;
+  }
+  await unlink(claimDirectory(stagingPath));
+}
+
+async function readPublishedClaimOwner(stagingPath: string): Promise<ClaimOwner | undefined> {
+  let parsed: unknown;
   try {
-    await rmdir(claimDirectory(stagingPath));
+    parsed = JSON.parse(await readFile(claimDirectory(stagingPath), "utf8"));
   } catch (error: unknown) {
-    if (!hasErrorCode(error, "ENOENT")) {
-      throw error;
+    if (hasErrorCode(error, "ENOENT")) {
+      return undefined;
     }
+    throw new Error("Acquisition claim requires explicit recovery", { cause: error });
+  }
+  if (!isClaimOwner(parsed)) {
+    throw new Error("Acquisition claim requires explicit recovery");
+  }
+  return parsed;
+}
+
+function isClaimOwner(value: unknown): value is ClaimOwner {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.pid === "number" && Number.isInteger(candidate.pid) && candidate.pid > 0 &&
+    typeof candidate.nonce === "string" && candidate.nonce.length > 0
+  );
+}
+
+function isProcessLive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    return !hasErrorCode(error, "ESRCH");
   }
 }
 

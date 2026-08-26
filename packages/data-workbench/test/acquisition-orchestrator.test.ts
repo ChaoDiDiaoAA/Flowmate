@@ -100,6 +100,31 @@ class BlockingGateway extends FakeGateway {
   }
 }
 
+class ReceiptPause {
+  public entered: Promise<void>;
+  private markEntered: (() => void) | undefined;
+  private releasePause: (() => void) | undefined;
+  private readonly completion: Promise<void>;
+
+  public constructor() {
+    this.entered = new Promise((resolve) => {
+      this.markEntered = resolve;
+    });
+    this.completion = new Promise((resolve) => {
+      this.releasePause = resolve;
+    });
+  }
+
+  public async wait(): Promise<void> {
+    this.markEntered?.();
+    await this.completion;
+  }
+
+  public release(): void {
+    this.releasePause?.();
+  }
+}
+
 async function createPaths(): Promise<DataPaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), "flowmate-acquisition-"));
   temporaryRoots.push(root);
@@ -168,10 +193,9 @@ describe("AcquisitionOrchestrator", () => {
       })}\n`,
       "utf8",
     );
-    await mkdir(path.join(paths.staging, ".acquisition-claim"), { recursive: true });
     await writeFile(
-      path.join(paths.staging, ".acquisition-claim", "owner.json"),
-      '{"jobId":"ACQ-20260826-0001"}\n',
+      path.join(paths.staging, ".acquisition-claim"),
+      '{"pid":999999999,"nonce":"stale-owner"}\n',
       "utf8",
     );
 
@@ -182,8 +206,102 @@ describe("AcquisitionOrchestrator", () => {
     });
     expect(gateway.callCount).toBe(1);
     await expect(
-      readFile(path.join(paths.staging, ".acquisition-claim", "owner.json"), "utf8"),
+      readFile(path.join(paths.staging, ".acquisition-claim"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not recover or release a claim owned by a live process", async () => {
+    const paths = await createPaths();
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+    const jobDirectory = path.join(paths.staging, "ACQ-20260826-0001");
+    await mkdir(jobDirectory, { recursive: true });
+    await writeFile(
+      path.join(jobDirectory, "job.json"),
+      `${JSON.stringify({
+        jobId: "ACQ-20260826-0001", sourceId: "SRC-000001", objective: "brave/search",
+        status: "FETCHING", startedAt: "2026-08-26T12:00:00+08:00",
+        counts: { discovered: 0, stored: 0, duplicated: 0, quarantined: 0, failed: 0 },
+      })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(jobDirectory, "acquisition-result.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","adapterRef":"brave/search","strategy":"public","retrievedAt":"2026-08-26T12:00:00+08:00","items":[]}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(paths.staging, ".acquisition-claim"),
+      `${JSON.stringify({ pid: process.pid, nonce: "live-owner" })}\n`,
+      "utf8",
+    );
+
+    await expect(orchestrator.resume("ACQ-20260826-0001")).rejects.toThrow(/still running/i);
+    await expect(readFile(path.join(paths.staging, ".acquisition-claim"), "utf8"))
+      .resolves.toContain("live-owner");
+  });
+
+  it("keeps the claim while resume races a live run after receipt publication", async () => {
+    const paths = await createPaths();
+    const pause = new ReceiptPause();
+    const first = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+      { afterReceiptWritten: () => pause.wait() },
+    );
+    const second = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), {
+        ...allowedSourcePolicy, sourceId: "SRC-000002",
+      },
+    );
+
+    const firstRun = first.run(request);
+    await expect(Promise.race([
+      pause.entered.then(() => "entered"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("not-entered"), 50)),
+    ])).resolves.toBe("entered");
+    await expect(first.resume("ACQ-20260826-0001")).rejects.toThrow(/still running/i);
+    await expect(second.run({ ...request, sourceId: "SRC-000002" })).rejects.toThrow(/already running/i);
+    pause.release();
+    await expect(firstRun).resolves.toMatchObject({ status: "STAGED" });
+  });
+
+  it("requires explicit recovery for an ownerless claim instead of deleting it", async () => {
+    const paths = await createPaths();
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+    const jobDirectory = path.join(paths.staging, "ACQ-20260826-0001");
+    await mkdir(jobDirectory, { recursive: true });
+    await writeFile(
+      path.join(jobDirectory, "job.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","objective":"brave/search","status":"FETCHING","startedAt":"2026-08-26T12:00:00+08:00","counts":{"discovered":0,"stored":0,"duplicated":0,"quarantined":0,"failed":0}}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(jobDirectory, "acquisition-result.json"),
+      '{"jobId":"ACQ-20260826-0001","sourceId":"SRC-000001","adapterRef":"brave/search","strategy":"public","retrievedAt":"2026-08-26T12:00:00+08:00","items":[]}\n',
+      "utf8",
+    );
+    await mkdir(path.join(paths.staging, ".acquisition-claim"), { recursive: true });
+
+    await expect(orchestrator.resume("ACQ-20260826-0001")).rejects.toThrow(/claim.*recovery/i);
+    await expect(readFile(path.join(paths.staging, ".acquisition-claim"), "utf8")).rejects.toMatchObject({ code: "EISDIR" });
+  });
+
+  it("does not block a new job when a crash leaves an unpublished owner record", async () => {
+    const paths = await createPaths();
+    await mkdir(paths.staging, { recursive: true });
+    await writeFile(
+      path.join(paths.staging, ".acquisition-owner-999999999-orphan.json"),
+      '{"pid":999999999,"nonce":"orphan"}\n',
+      "utf8",
+    );
+    const orchestrator = new AcquisitionOrchestrator(
+      new FakeAllocator(), new FakeGateway(), paths, new FixedClock(), allowedSourcePolicy,
+    );
+
+    await expect(orchestrator.run(request)).resolves.toMatchObject({ status: "STAGED" });
   });
 
   it("persists FETCH_FAILED when the gateway throws", async () => {
