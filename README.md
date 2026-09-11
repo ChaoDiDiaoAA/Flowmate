@@ -1,32 +1,16 @@
 # Flowmate
 
-Flowmate is a digital-employee platform. This repository is currently at **P0: the Obsidian data workbench** stage. P0 establishes a traceable, deduplicated, recoverable dataset workflow before product-runtime engineering begins.
+Flowmate 交付基于 Pi SDK 二次开发的企业数字员工平台，以及首个可生产运行的 07B2B 发票员工。Pi 提供 Agent Runtime 能力；Flowmate 自研员工定义、运行控制、任务与业务 Kernel、能力管理、人工协同及 Agent Ops。
 
-## P0 boundary
+`docs/spec` 维护两份各自完整的总方案：
 
-P0 is responsible for acquisition receipts, approved public-source collection, immutable raw artifacts, parser-derived content, deduplication, privacy/licence/quality gates, quarantine and failure evidence, Obsidian metadata, and versioned `DatasetManifest` releases. It is not the Flowmate runtime: no Electron app, Pi SDK/kernel, enterprise adapter, production SQLite, scheduled crawler, unattended bulk crawl, or production business-agent behavior is built here.
+- [项目总方案](docs/spec/00_Flowmate完整方案.md)：产品与业务目标、Pi SDK/Flowmate 职责、从已解析文件开始的业务链、P0–P6 功能实施、功能测试、生产发布与运维。
+- [Agent 评测总方案](docs/spec/01_Flowmate_Agent评测总方案.md)：评测目标与平台、人工定向制作 Case/Gold 的流程和模板、Benchmark、裁判与指标、运行比较、P0–P6 评测路线及后续阶段方案的编写要求。第 5 节可直接用于安排人工准备工作。
 
-The only formal seam to the later runtime is the `DatasetManifest` interface: stable IDs, file paths/references, SHA-256 hashes, schema/version metadata, and release status. The runtime must not depend on Obsidian, OpenCLI, MinerU, or a particular website adapter being available.
+两条路线沿用相同的 P0–P6 阶段。功能实现后提供可运行版本与证据；独立质量结论作为阶段退出和发布的必要输入。后续按阶段编写具体实施方案，评测阶段稿放在 `docs/plans/agent-eval`，进入对应阶段时再建立，不提前创建空白文档。
 
-## Start here
+当前完成的是方案设计与整理，文档中的 Case/Gold 模板、基准、程序与验收要求不代表已完成数据标注、功能实现或实际评测。企业契约与运行参数仍需在相应阶段明确。
 
-1. Read the target design: [`docs/07b2b/specs/P0_Obsidian数据库目标方案.md`](docs/07b2b/specs/P0_Obsidian数据库目标方案.md).
-2. Read the implementation plan: [`docs/07b2b/plans/P0_Obsidian数据库实施计划.md`](docs/07b2b/plans/P0_Obsidian数据库实施计划.md).
-3. Review the MinerU spike evidence and wrapper documentation before parser work.
-4. Follow [`docs/07b2b/README.md`](docs/07b2b/README.md) for the documentation map.
+旧方案及旧教程已在迁移复核完成后删除。[归档审查与迁移记录](docs/archive/2026-09-10-spec-review/04_旧方案迁移清单.md)仅用于追溯，其章节落点属于归档时版本；当前项目范围与评测安排分别以两份总方案为准。
 
-## Commands
-
-The repository uses npm workspaces. Run `npm install`, then the documented root scripts (`npm test`, `npm run lint`, `npm run typecheck`, and `npm run build`). The MinerU wrapper is a separate Python project under `tools/mineru-mcp-wrapper`; run its tests from that directory with `pytest` and use its README for the launcher command.
-
-## Security and data handling
-
-Never commit tokens, cookies, passwords, API keys, private keys, real enterprise data, or network raw data. The working data root is `D:\code\agent-learn\agent\Flowmate\FlowmateData`; it lives under the project directory but is protected by `.gitignore` and must never be staged. `.env.example` may document variable names but must contain placeholders only. The project-level MinerU wrapper is required for P0; do not upload private data to MinerU cloud unless the owner and security policy explicitly allow it.
-
-## Stop conditions
-
-Stop and record evidence when an approved public adapter is unavailable, a source requires login/cookies/UI interception, licensing or privacy is unclear, a parser is unavailable, a result download fails TLS, a batch exceeds its configured limit, hashes/IDs are missing, or a gate cannot prove quality. Quarantine or delete disallowed content according to the P0 spec; never silently downgrade safeguards or overwrite raw artifacts.
-
-## Next step
-
-After this baseline, continue with the approved P0 implementation plan. Do not start P1 product-runtime scaffolding until P0 acceptance and a versioned Dataset Manifest release are complete.
+本地数据位于 `D:\paper\Invoice`，独立于源码仓库。工作区中原有源码存在删除记录，旧教程中的命令及实现状态不能视为当前可运行基线。
