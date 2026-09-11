@@ -34,8 +34,11 @@ _Avoid_: 将模型知道工具名称称为已获工具权限
 **Pi 原生扩展（Pi Extension）**：通过 Pi 原生接口加载的可执行扩展，可注册工具、命令或事件处理。Flowmate 对其版本、员工绑定和运行权限进行管理。
 _Avoid_: 与 Skill/SOP 文字资源混称，或将扩展 Hook 当作操作系统沙箱
 
-**子 Agent（Subagent）**：主 Agent 通过选定的 mjakl/pi-subagent 插件委派的任务内辅助角色，使用受控子 Pi 执行并返回证据与建议。
+**子 Agent（Subagent）**：主 Agent 的 LLM 调用 @tintinweb/pi-subagents 原生 Agent 工具委派的任务内辅助角色，在同宿主进程的独立 Pi AgentSession 中执行并返回证据与建议。
 _Avoid_: 将子角色视为新增生产员工、人工复核人或审批主体
+
+**PiSubAgentAdapter**：Flowmate 对插件的观测与控制适配层，关联真实工具调用和父子 Session，记录状态、产物与用量并协调取消；不提供创建入口，不调用 subagents:rpc:spawn。
+_Avoid_: 将适配器称为委派决策者，或将子 Session 等同于独立操作系统进程
 
 **委派与子执行（Delegation / ChildRun）**：委派定义子任务目标、角色、输入与约束；子执行记录其实际尝试、父子身份、会话、状态、用量和产物，始终归属父业务任务。
 _Avoid_: 将子执行计作独立业务评测样本，或认为子返回成功就代表父任务完成
