@@ -1,0 +1,22 @@
+{
+  "name": "@flowmate/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@flowmate/contracts": "0.1.0",
+    "@flowmate/core": "0.1.0",
+    "@flowmate/data": "0.1.0",
+    "@flowmate/runtime-pi": "0.1.0",
+    "electron": "44.3.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0"
+  }
+}

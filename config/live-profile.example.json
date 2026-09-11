@@ -1,0 +1,13 @@
+{
+  "profileId": "live-main",
+  "mode": "live",
+  "environment": "local-test",
+  "available": false,
+  "modelProfileHash": "replace-with-sha256-of-non-secret-model-settings",
+  "modelRef": {
+    "provider": "replace-provider",
+    "modelId": "replace-model"
+  },
+  "authPath": "./private/pi-auth.json",
+  "allowedSampleIds": ["replace-after-freeze"]
+}

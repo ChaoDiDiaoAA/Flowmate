@@ -1,0 +1,15 @@
+{
+  "sourceRoot": "./FlowmateData/source",
+  "roleMap": {
+    "sourceId": "project-invoice-source",
+    "parserVersion": "existing-parser-1",
+    "encoding": "utf8",
+    "sampleIdRegex": "(?:^|/)(?<sampleId>[^/]+)\\.[^.]+$",
+    "roles": {
+      "original": { "patterns": ["original/**/*.{pdf,jpg,jpeg,png}"] },
+      "parsed": { "patterns": ["parsed/**/*.{json,md,markdown}"] },
+      "metadata": { "patterns": ["metadata/**/*.json"] },
+      "labels": { "patterns": ["labels/**/*.json"] }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/contracts" },
+    { "path": "./packages/core" },
+    { "path": "./packages/data" },
+    { "path": "./packages/runtime-pi" },
+    { "path": "./apps/desktop" },
+    { "path": "./scripts/tsconfig.json" }
+  ]
+}
