@@ -70,7 +70,7 @@ Flowmate 不需要 Longbridge CLI，也不使用截图中的 `FINAGENT_*` 环境
 | `bun run p0 -- run --profile <liveProfile> --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 通过正式 Application/Pi Runtime 执行一次真实字段抽取 | Live Profile、冻结输入、候选和 Provider 已获准 | 入口可执行，真实环境待接入 |
 | `bun run verify:handoff <manifest>` | 验证功能证据交接文件 | 交接文件已生成 | 可执行 |
 
-模型契约模板见 [`config/model-profile.example.json`](config/model-profile.example.json)，Parser 模板见 [`config/parser-profile.example.json`](config/parser-profile.example.json)。模板不包含真实凭证；缺少真实数据、Live Profile 或 MinerU 时，命令必须明确返回未就绪。
+模型接入目标为完全复用 Pi 原生 Provider、模型配置与认证；内置模型使用原生模型引用和认证，自定义服务使用可选的 [`Pi models 示例`](config/pi-models.example.json)。`.env` 由启动工具加载，变量必须被 Pi 原生机制支持或引用。Flowmate 只管理业务授权、预算及运行证据。现有 `ModelProfile` 代码及重复模板尚待按 [P0 实施计划 §2.2.1](docs/plans/P0_实施计划.md) 收敛，本次方案修订不代表代码迁移完成。Parser 模板仍见 [`config/parser-profile.example.json`](config/parser-profile.example.json)；缺少真实数据、Live 授权或 MinerU 时，命令须明确返回未就绪。
 
 ## Agent 评测与发布命令
 
