@@ -75,7 +75,7 @@ P0 的“完整链”仅指解析输入到候选接受和保存的最小通路�
 
 ### 2.2 当前依赖与范围固定
 
-当前尚无 P0 产品实现。用户确认数据在项目内，实际子目录仍需定位；本方案不采用历史外部数据路径，不填写未核验数量和样本 ID。已知的包候选版本不作为实际锁：以产品 T01 输出的 config/runtime-lock.json、发布包摘要、Node/Electron/插件适配和实际入口为准。
+当前尚无 P0 产品实现。用户已指定来源根 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51`，原始发票与已有解析保留原位。目录存在且已列举 000001 文件；数量、完整性、配对和可用范围以产品 T03/T04 的盘点与冻结报告为准。评测 Case/Gold 留在 agent-eval/data/p0，不将来源 annotation/fields 或其他答案元数据交给被测模型。已知的包候选版本不作为实际锁：以产品 T01 输出的 config/runtime-lock.json、发布包摘要、Node/Electron/插件适配和实际入口为准。
 
 | 准备或执行 | 最早前置 | 不具备时的状态 |
 |---|---|---|

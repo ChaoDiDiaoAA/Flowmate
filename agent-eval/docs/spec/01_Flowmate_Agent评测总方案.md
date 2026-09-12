@@ -867,7 +867,7 @@ P0/P1 可先准备现有解析文件的抽取 Case、可核验字段 Gold，以�
 
 ### 5.3 从现有 Invoice 数据中选样和整理材料
 
-1. 从 `D:\paper\Invoice` 的登记记录中按 sample_id 选样，记录来源、允许用途、原图和解析引用、版本与摘要；不凭目录数量断定样本已就绪。
+1. 从 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51` 的登记记录中按 sample_id 选样，记录来源、允许用途、原图和解析引用、版本与摘要；不凭目录数量断定样本已就绪。
 2. 原文由 `original.jpg` 提供；解析输入从 `content.json`、`content.md`、`pages.json` 取得。按 `parse.json` 的文件清单检查文件是否存在、正文是否非空、页数是否完整，登记这次采用的解析版本。
 3. 将 `annotation.json` 和 `fields.json` 作为人工核验的参考。检查 `fields.<字段>.value/status/source_locator`、明细和 provenance；`provided` 只表示提供方给了值，`missing` 不代表原文不存在，`ambiguous` 不能强行归成确定答案。
 4. 注意 `source_locator` 可能指向提供方标注 JSON 的路径，并非票据页码或原文位置。人工应另外记录可核验的页码、原文片段和区域；没有坐标可写“第 1 页 Total 行”，不要编造 geometry。
