@@ -46,3 +46,6 @@ tools/mineru-mcp-wrapper/.pytest_cache/
 Thumbs.db
 .idea/
 .vscode/
+
+# Private Agent evaluation assets and run output
+/agent-eval/data/
