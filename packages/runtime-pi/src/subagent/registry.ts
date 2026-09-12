@@ -29,6 +29,8 @@ export type SubagentBudget = {
   reserveToolCall(): void;
 };
 
+export type ChildMemoryBinding = { dispose(): void };
+
 export type DelegationOutcome = {
   delegationId: string;
   parentRunId: string;
@@ -155,6 +157,7 @@ export class SubagentScope {
   private disposed = false;
   private abortChild: (() => void) | undefined;
   private toolCalls = 0;
+  private childMemory: ChildMemoryBinding | undefined;
 
   constructor(options: SubagentScopeOptions) {
     validateProbeIdentity(options.parentIdentity);
@@ -242,6 +245,14 @@ export class SubagentScope {
     this.abortChild = abortChild;
   }
 
+  bindChildMemory(binding: ChildMemoryBinding): void {
+    if (!this.current || !this.childClaimed || !this.current.childSessionId) {
+      throw new SubagentPolicyError("SUBAGENT_CHILD_BINDING_INVALID", "child Memory must bind after the child Session");
+    }
+    this.childMemory?.dispose();
+    this.childMemory = binding;
+  }
+
   async invokeChildTool(toolName: string, args: Record<string, unknown>, requestId: string, signal?: AbortSignal): Promise<ToolResult<unknown>> {
     assertProbeTool(toolName);
     const current = this.current;
@@ -295,6 +306,8 @@ export class SubagentScope {
   revoke(reason = "parent cancelled"): void {
     this.revoked = true;
     this.abortChild?.();
+    this.childMemory?.dispose();
+    this.childMemory = undefined;
     if (this.current && (this.current.status === "reserved" || this.current.status === "running")) {
       this.current.status = "cancelled";
       this.current.error = reason;
@@ -315,6 +328,8 @@ export class SubagentScope {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.childMemory?.dispose();
+    this.childMemory = undefined;
     if (this.current && (this.current.status === "reserved" || this.current.status === "running")) {
       this.current.status = "cancelled";
       this.current.endedAt = now();

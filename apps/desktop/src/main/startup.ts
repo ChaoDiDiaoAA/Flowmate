@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { TestCandidateSchema } from "@flowmate/contracts";
 import { createProjection, loadFrozenDataset } from "@flowmate/data";
-import { parseRuntimeProfile, preflight } from "@flowmate/core";
+import { loadDotEnv, parseRuntimeProfile, preflight } from "@flowmate/core";
 import { createApplication, createPiRuntimeFactory, type Application, type RuntimeFactory } from "./composition.js";
 
 function object(value: unknown): Record<string, unknown> {
@@ -21,6 +21,7 @@ function required(record: Record<string, unknown>, key: string): string {
  */
 export async function loadDesktopApplication(configFile: string, injectedFactory?: RuntimeFactory): Promise<Application> {
   const base = dirname(resolve(configFile));
+  await loadDotEnv(resolve(base, ".env"), resolve(base, "..", ".env"), resolve(process.cwd(), ".env"));
   const config = object(JSON.parse(await readFile(configFile, "utf8")));
   const path = (key: string) => resolve(base, required(config, key));
   const profileFile = path("profilePath");

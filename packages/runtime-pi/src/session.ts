@@ -28,6 +28,8 @@ import { createSubagentPolicyExtension } from "./subagent/tool-hook.js";
 import { SubagentPolicyError } from "./subagent/policy.js";
 import { createP0ResourceLoader } from "./resources.js";
 import { toRuntimeEvent } from "./events.js";
+import { attachMemory, type MemoryBinding } from "./memory/index.js";
+import { modelConfigEvidence, type PiModelConfigSnapshot } from "./model-config.js";
 
 export type RuntimeOutcome =
   | { kind: "completed"; sessionId: string; lastAssistantText?: string }
@@ -43,6 +45,10 @@ export type RuntimeBudget = {
 
 export type AgentRuntime = {
   readonly sessionId: string;
+  readonly modelRef: { provider: string; modelId: string };
+  readonly modelConfigHash: string;
+  readonly modelConfigSnapshot: PiModelConfigSnapshot;
+  readonly memory: MemoryBinding;
   toolNames(): string[];
   systemPrompt(): string;
   subagentOutcomes(): ReturnType<typeof subagentOutcomes>;
@@ -120,6 +126,7 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
     const model = options.model
       ?? (provider ? provider.model : options.modelRef ? modelRuntime.getModel(options.modelRef.provider, options.modelRef.modelId) : undefined);
     if (!model) throw new Error("MODEL_CONFIGURATION_REQUIRED: provide a Model, modelRef, or controlled Provider");
+    const modelEvidence = modelConfigEvidence(model);
     const settingsManager = options.settingsManager ?? SettingsManager.inMemory({ defaultProvider: model.provider, defaultModel: model.id, compaction: { enabled: false }, retry: { enabled: false }, defaultTools: [] }, { projectTrusted: true });
     const sessionManager = options.sessionManager ?? SessionManager.inMemory(options.cwd, { id: `flowmate-${randomUUID()}` });
     let resourceLoader: ResourceLoader;
@@ -164,6 +171,15 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
     }
     session.setAutoCompactionEnabled(false);
     session.setAutoRetryEnabled(false);
+    const memory = attachMemory(session, {
+      scopeId: `parent:${options.identity.runId}`,
+      kind: "parent",
+      jobId: options.identity.jobId,
+      runId: options.identity.runId,
+      generation: options.identity.generation,
+      candidateId: options.identity.candidateId,
+      parentScopeId: null,
+    });
     let seq = 0;
     let aborted = false;
     let unsubscribe: (() => void) | undefined;
@@ -175,6 +191,10 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
     };
     return {
       get sessionId() { return session.sessionId; },
+      modelRef: { provider: model.provider, modelId: model.id },
+      modelConfigHash: modelEvidence.hash,
+      modelConfigSnapshot: modelEvidence.snapshot,
+      memory,
       toolNames() { return session.getActiveToolNames(); },
       systemPrompt() { return session.systemPrompt; },
       subagentOutcomes() { return subagentScope ? subagentOutcomes(subagentScope) : []; },
@@ -208,6 +228,7 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
           emit(event, onEvent);
         });
         try {
+          memory.assertWithinCapacity(context.taskPrompt);
           await session.prompt(context.taskPrompt);
           if (aborted) return { kind: "aborted", sessionId: session.sessionId };
           if (budgetError) return { kind: "failed", sessionId: session.sessionId, error: budgetError.message };
@@ -235,7 +256,7 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
         try {
           await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
         } finally {
-          try { session.dispose(); } finally {
+          try { memory.dispose(); session.dispose(); } finally {
             unsubscribe?.();
             unsubscribe = undefined;
             subagentScope?.dispose();

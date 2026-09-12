@@ -15,7 +15,10 @@ test.beforeEach(async () => {
   const electronBinary = resolve(process.cwd(), "node_modules/electron", process.platform === "win32" ? "dist/electron.exe" : "dist/electron");
   await access(electronBinary, constants.X_OK);
   userData = await mkdtemp(join(tmpdir(), "flowmate-desktop-"));
-  application = await electron.launch({ args: [main, `--user-data-dir=${userData}`], env: { ...process.env, ELECTRON_IS_DEV: "0", FLOWMATE_DESKTOP_CONFIG: "" } });
+  // The test host may not have the Windows GPU runtime DLLs. Keep production
+  // Electron defaults unchanged; disable only the optional test GPU process so
+  // renderer/IPC assertions remain deterministic on CI and local sandboxes.
+  application = await electron.launch({ args: ["--disable-gpu", main, `--user-data-dir=${userData}`], env: { ...process.env, ELECTRON_IS_DEV: "0", FLOWMATE_DESKTOP_CONFIG: "" } });
   page = await application.firstWindow();
   await page.waitForLoadState("domcontentloaded");
 });

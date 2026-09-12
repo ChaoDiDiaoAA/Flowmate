@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 type Sample = { sampleId: string; sourceId: string; purpose: string; parserVersion: string };
 type JobSnapshot = { job: { id: string; sampleId: string; status: string }; candidates: Array<{ id: string; runId: string; rawRef: { assetId: string }; candidate: { fields: Record<string, { normalized: string | null; status: string }> } }> };
-type Diagnostics = { activeRunCount: number; datasetVersion: string; candidateId: string; profileId: string };
+type Diagnostics = { activeRunCount: number; datasetVersion: string; candidateId: string; profileId: string; modelRef: { provider: string; modelId: string } | null; modelConfigHash: string | null };
 type EvidenceView = { assetId: string; sampleId: string; blocks: Array<{ id: string; text: string; page: number | null }> };
 
 const activeStatuses = new Set(["created", "running", "cancelling"]);
@@ -142,7 +142,7 @@ export function App() {
         </article>
         <article className="card diagnostics">
           <div className="card-title"><h2>诊断</h2><span className="dot" /></div>
-          {diagnostics ? <dl className="facts"><div><dt>数据版本</dt><dd>{diagnostics.datasetVersion}</dd></div><div><dt>候选</dt><dd>{diagnostics.candidateId}</dd></div><div><dt>Profile</dt><dd>{diagnostics.profileId}</dd></div><div><dt>活动 Run</dt><dd>{diagnostics.activeRunCount}</dd></div></dl> : <p className="muted">等待主进程。</p>}
+          {diagnostics ? <dl className="facts"><div><dt>数据版本</dt><dd>{diagnostics.datasetVersion}</dd></div><div><dt>候选</dt><dd>{diagnostics.candidateId}</dd></div><div><dt>Profile</dt><dd>{diagnostics.profileId}</dd></div><div><dt>活动 Run</dt><dd>{diagnostics.activeRunCount}</dd></div>{diagnostics.modelRef && <div><dt>Pi 模型</dt><dd>{diagnostics.modelRef.provider}/{diagnostics.modelRef.modelId}</dd></div>}</dl> : <p className="muted">等待主进程。</p>}
         </article>
       </section>
       <footer>结果状态代表技术执行结果；复核、审批与正式提交在后续阶段接入。</footer>

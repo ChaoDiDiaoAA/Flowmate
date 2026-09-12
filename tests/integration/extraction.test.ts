@@ -10,7 +10,7 @@ import { createApplication, createPiRuntimeFactory } from "../../apps/desktop/sr
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 const config: CandidateConfig = {
-  schemaVersion: "1", appSourceHash: hash("app"), lockHash: hash("lock"), runtimeLockHash: hash("runtime"), datasetVersion: "pending", modelProfileHash: hash("model"), promptHash: hash("prompt"), toolVersions: { read_parsed_document: "1", read_evidence: "1", submit_invoice_candidate: "1" }, extensionVersions: {}, environment: "local-test", budget: { maxModelRequests: 6, maxToolCalls: 12, wallTimeMs: 20_000 }, eligibility: "test",
+  schemaVersion: "1", appSourceHash: hash("app"), lockHash: hash("lock"), runtimeLockHash: hash("runtime"), datasetVersion: "pending", modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, modelConfigHash: hash("model"), promptHash: hash("prompt"), toolVersions: { read_parsed_document: "1", read_evidence: "1", submit_invoice_candidate: "1" }, extensionVersions: {}, environment: "local-test", budget: { maxModelRequests: 6, maxToolCalls: 12, wallTimeMs: 20_000 }, eligibility: "test",
 };
 
 function candidateForSample() {
@@ -28,7 +28,7 @@ describe("P0 extraction application", () => {
       const manifest = await freezeDataset(report, { "SYN-001": "development" }, { outputRoot: join(root, "frozen-no-candidate") });
       const candidate = freezeCandidate({ ...config, datasetVersion: manifest.datasetVersion });
       const provider = createControlledProvider([{ text: "I did not submit a candidate" }]);
-      const app = createApplication({ dataRoot: join(root, "app-data-no-candidate"), agentRoot: join(root, "app-agent-no-candidate"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelProfileHash: hash("model"), available: true }, runtimeFactory: ({ identity, gateway, cwd, agentDir, budget }) => createPiRuntime({ identity, gateway, cwd, agentDir, budget, provider }) });
+      const app = createApplication({ dataRoot: join(root, "app-data-no-candidate"), agentRoot: join(root, "app-agent-no-candidate"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelConfigHash: hash("model"), modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, available: true }, runtimeFactory: ({ identity, gateway, cwd, agentDir, budget }) => createPiRuntime({ identity, gateway, cwd, agentDir, budget, provider }) });
       try {
         const started = await app.start({ sampleId: "SYN-001", candidateId: candidate.candidateId, clientRequestId: "no-candidate" });
         await expect(app.wait(started.runId)).resolves.toMatchObject({ kind: "failed", error: "NO_CANDIDATE" });
@@ -50,7 +50,7 @@ describe("P0 extraction application", () => {
         { toolCall: { name: "submit_invoice_candidate", arguments: { candidate: candidateForSample() } } },
         { text: "candidate accepted" },
       ]);
-      const app = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelProfileHash: hash("model"), available: true }, runtimeFactory: createPiRuntimeFactory({ provider }) });
+      const app = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelConfigHash: hash("model"), modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, available: true }, runtimeFactory: createPiRuntimeFactory({ provider }) });
       const started = await app.start({ sampleId: "SYN-001", candidateId: candidate.candidateId, clientRequestId: "click-1" });
       const duplicate = await app.start({ sampleId: "SYN-001", candidateId: candidate.candidateId, clientRequestId: "click-1" });
       expect(duplicate.runId).toBe(started.runId);
@@ -63,7 +63,7 @@ describe("P0 extraction application", () => {
       await expect(app.getEvidence({ jobId: started.jobId, assetId: "original:fixture-source:SYN-001" })).resolves.toMatchObject({ assetId: "original:fixture-source:SYN-001" });
       await app.close();
       provider.close();
-      const reopened = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent-2"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelProfileHash: hash("model"), available: true }, runtimeFactory: ({ identity, gateway, cwd, agentDir }) => createPiRuntime({ identity, gateway, cwd, agentDir, provider: createControlledProvider([{ text: "unused" }]) }) });
+      const reopened = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent-2"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelConfigHash: hash("model"), modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, available: true }, runtimeFactory: ({ identity, gateway, cwd, agentDir }) => createPiRuntime({ identity, gateway, cwd, agentDir, provider: createControlledProvider([{ text: "unused" }]) }) });
       expect(reopened.getJob({ jobId: started.jobId }).candidates).toHaveLength(1);
       await reopened.close();
     });
@@ -75,7 +75,7 @@ describe("P0 extraction application", () => {
       const manifest = await freezeDataset(report, { "SYN-001": "development" }, { outputRoot: join(root, "frozen") });
       const candidate = freezeCandidate({ ...config, datasetVersion: manifest.datasetVersion });
       const provider = createControlledProvider([{ text: "done", delayMs: 250 }, { text: "done" }]);
-      const app = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelProfileHash: hash("model"), available: true }, runtimeFactory: ({ identity, gateway, cwd, agentDir }) => createPiRuntime({ identity, gateway, cwd, agentDir, provider }) });
+      const app = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelConfigHash: hash("model"), modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, available: true }, runtimeFactory: ({ identity, gateway, cwd, agentDir }) => createPiRuntime({ identity, gateway, cwd, agentDir, provider }) });
       try {
         await app.start({ sampleId: "SYN-001", candidateId: candidate.candidateId, clientRequestId: "click-1" });
         await expect(app.start({ sampleId: "SYN-001", candidateId: candidate.candidateId, clientRequestId: "click-2" })).rejects.toThrow("RUN_BUSY");

@@ -13,7 +13,7 @@ function assetId(entry: SourceEntry): string {
 
 function evidence(entry: SourceEntry, blockId: string, text: string, raw: unknown): ParsedDocument["blocks"][number]["evidence"] {
   const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
-  const pageValue = value.page;
+  const pageValue = value.page ?? value.pageNumber ?? (typeof value.page_idx === "number" ? value.page_idx + 1 : undefined);
   const page = typeof pageValue === "number" && Number.isInteger(pageValue) && pageValue > 0 ? pageValue : null;
   const bboxValue = value.bbox;
   const bbox = Array.isArray(bboxValue) && bboxValue.length === 4 && bboxValue.every((item) => typeof item === "number")
@@ -30,10 +30,33 @@ function jsonBlocks(entry: SourceEntry, value: Record<string, unknown>): ParsedD
   return candidates.flatMap((candidate, index) => {
     if (!candidate || typeof candidate !== "object") return [];
     const item = candidate as Record<string, unknown>;
-    const text = typeof item.text === "string" ? item.text : typeof item.content === "string" ? item.content : "";
+    const text = typeof item.text === "string"
+      ? item.text
+      : typeof item.content === "string"
+        ? item.content
+        : typeof item.table_body === "string"
+          ? item.table_body
+          : "";
     const id = typeof item.id === "string" && item.id.length > 0 ? item.id : `b${index + 1}`;
     const kind = item.kind === "table" ? "table" : "text";
     return [{ id, kind, text, evidence: evidence(entry, id, text, item.evidence ?? item) }];
+  });
+}
+
+function jsonArrayBlocks(entry: SourceEntry, values: unknown[]): ParsedDocument["blocks"] {
+  return values.flatMap((candidate, index) => {
+    if (!candidate || typeof candidate !== "object") return [];
+    const item = candidate as Record<string, unknown>;
+    const text = typeof item.text === "string"
+      ? item.text
+      : typeof item.table_body === "string"
+        ? item.table_body
+        : typeof item.content === "string"
+          ? item.content
+          : "";
+    const id = typeof item.id === "string" && item.id.length > 0 ? item.id : `b${index + 1}`;
+    const kind = item.type === "table" || item.kind === "table" ? "table" : "text";
+    return [{ id, kind: kind as "text" | "table", text, evidence: evidence(entry, id, text, item) }];
   });
 }
 
@@ -66,13 +89,20 @@ export async function importParsed(entry: SourceEntry): Promise<ToolResult<Parse
   if (extension === ".json") {
     try {
       const parsed = JSON.parse(parsedRead.bytes.toString("utf8")) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return failure("INVALID_PARSE_JSON", "parsed JSON root must be an object");
-      value = parsed as Record<string, unknown>;
-      blocks = jsonBlocks(entry, value);
-      const declaredSample = value.sampleId;
-      if (typeof declaredSample === "string" && declaredSample !== entry.sampleId) return failure("SAMPLE_ID_MISMATCH", "parsed sample id differs from the inspected entry");
-      const declaredSource = value.sourceId;
-      if (typeof declaredSource === "string" && declaredSource !== entry.sourceId) return failure("SOURCE_ID_MISMATCH", "parsed source id differs from the inspected role map");
+      if (!parsed || typeof parsed !== "object") return failure("INVALID_PARSE_JSON", "parsed JSON root must be an object or array");
+      if (Array.isArray(parsed)) {
+        blocks = jsonArrayBlocks(entry, parsed);
+        value = null;
+      } else {
+        value = parsed as Record<string, unknown>;
+        blocks = jsonBlocks(entry, value);
+      }
+      if (value) {
+        const declaredSample = value.sampleId;
+        if (typeof declaredSample === "string" && declaredSample !== entry.sampleId) return failure("SAMPLE_ID_MISMATCH", "parsed sample id differs from the inspected entry");
+        const declaredSource = value.sourceId;
+        if (typeof declaredSource === "string" && declaredSource !== entry.sourceId) return failure("SOURCE_ID_MISMATCH", "parsed source id differs from the inspected role map");
+      }
     } catch {
       return failure("INVALID_PARSE_JSON", "parsed JSON could not be decoded");
     }

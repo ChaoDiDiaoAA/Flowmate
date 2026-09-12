@@ -6,6 +6,7 @@
     { "path": "./packages/data" },
     { "path": "./packages/runtime-pi" },
     { "path": "./apps/desktop" },
-    { "path": "./scripts/tsconfig.json" }
+    { "path": "./scripts/tsconfig.json" },
+    { "path": "./agent-eval/tsconfig.json" }
   ]
 }

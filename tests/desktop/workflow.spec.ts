@@ -14,12 +14,12 @@ async function withDesktop(fn: (config: string, root: string) => Promise<void>) 
     const manifest = await freezeDataset(await inspectSource(root, roleMap), { "SYN-001": "development" }, { outputRoot: join(root, "frozen") });
     const candidate = freezeCandidate({
       schemaVersion: "1", appSourceHash: hash("desktop-fixture"), lockHash: hash("lock"), runtimeLockHash: hash("runtime"),
-      datasetVersion: manifest.datasetVersion, modelProfileHash: hash("controlled"), promptHash: hash("prompt"),
+      datasetVersion: manifest.datasetVersion, modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, modelConfigHash: hash("controlled"), promptHash: hash("prompt"),
       toolVersions: { read_parsed_document: "1", read_evidence: "1", submit_invoice_candidate: "1" }, extensionVersions: {},
       environment: "local-test", budget: { maxModelRequests: 12, maxToolCalls: 20, wallTimeMs: 30_000 }, eligibility: "test",
     });
     await writeFile(join(root, "candidate.json"), JSON.stringify(candidate));
-    await writeFile(join(root, "profile.json"), JSON.stringify({ profileId: "desktop-controlled", environment: "local-test", available: true, mode: "controlled", modelProfileHash: hash("controlled") }));
+    await writeFile(join(root, "profile.json"), JSON.stringify({ profileId: "desktop-controlled", environment: "local-test", available: true, mode: "controlled", modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, modelConfigHash: hash("controlled") }));
     const config = join(root, "desktop.json");
     await writeFile(config, JSON.stringify({ manifestRoot: "frozen", candidatePath: "candidate.json", profilePath: "profile.json", dataRoot: "state" }));
     await fn(config, root);
@@ -27,7 +27,7 @@ async function withDesktop(fn: (config: string, root: string) => Promise<void>) 
 }
 
 async function launch(config: string, root: string, flags: Record<string, string> = {}) {
-  const application = await electron.launch({ args: [fixtureEntry, `--user-data-dir=${join(root, "user-data")}`], env: { ...process.env, FLOWMATE_DESKTOP_CONFIG: config, ...flags } });
+  const application = await electron.launch({ args: ["--disable-gpu", fixtureEntry, `--user-data-dir=${join(root, "user-data")}`], env: { ...process.env, FLOWMATE_DESKTOP_CONFIG: config, ...flags } });
   const page = await application.firstWindow();
   await expect(page.getByText("desktop-controlled", { exact: true })).toBeVisible();
   await page.getByLabel("选择已解析文件").selectOption("SYN-001");
@@ -132,7 +132,7 @@ test("Electron runs the native Agent tool and cleans up its actual child Session
 
 test("production entry rejects a controlled Profile instead of silently using a fake model", async () => {
   await withDesktop(async (config, root) => {
-    const application = await electron.launch({ args: [resolve("out/main/index.js"), `--user-data-dir=${join(root, "production-user-data")}`], env: { ...process.env, FLOWMATE_DESKTOP_CONFIG: config } });
+    const application = await electron.launch({ args: ["--disable-gpu", resolve("out/main/index.js"), `--user-data-dir=${join(root, "production-user-data")}`], env: { ...process.env, FLOWMATE_DESKTOP_CONFIG: config } });
     const child = application.process();
     try {
       await application.waitForEvent("close");

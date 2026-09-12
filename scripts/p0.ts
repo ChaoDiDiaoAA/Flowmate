@@ -2,8 +2,8 @@ import { readFile } from "node:fs/promises";
 import { dirname, extname, isAbsolute, resolve } from "node:path";
 import { inspectEnvironment } from "./doctor.js";
 import { freezeDataset, inspectSource, loadFrozenDataset, parseOriginal, parseParserProfile, type ParserInputRef, type SourceRoleMap } from "@flowmate/data";
-import { TestCandidateSchema, type DatasetPurpose } from "@flowmate/contracts";
-import { parseRuntimeProfile, verifyHandoff } from "@flowmate/core";
+import { makeInvoiceCandidate, TestCandidateSchema, type DatasetPurpose, type InvoiceCandidate } from "@flowmate/contracts";
+import { exportHandoff, loadDotEnv, parseRuntimeProfile, verifyHandoff } from "@flowmate/core";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -21,6 +21,9 @@ export type P0Command = {
   roleMapPath: string | null;
   manifestPath: string | null;
   candidatePath: string | null;
+  evidencePath: string | null;
+  datasetVersion: string | null;
+  exportHandoff: boolean;
   outputRoot: string | null;
   inputPath: string | null;
   sourceId: string | null;
@@ -62,6 +65,8 @@ export function parseP0Args(args: string[]): P0Command {
   const roleMapIndex = rest.indexOf("--role-map");
   const manifestIndex = rest.indexOf("--manifest");
   const candidateIndex = rest.indexOf("--candidate");
+  const evidenceIndex = rest.indexOf("--evidence");
+  const datasetVersionIndex = rest.indexOf("--dataset-version");
   const outputIndex = rest.indexOf("--output");
   const inputIndex = rest.indexOf("--input");
   const sourceIdIndex = rest.indexOf("--source-id");
@@ -70,10 +75,13 @@ export function parseP0Args(args: string[]): P0Command {
   const roleMapPath = roleMapIndex >= 0 ? rest[roleMapIndex + 1] ?? null : null;
   const manifestPath = manifestIndex >= 0 ? rest[manifestIndex + 1] ?? null : null;
   const candidatePath = candidateIndex >= 0 ? rest[candidateIndex + 1] ?? null : null;
+  const evidencePath = evidenceIndex >= 0 ? rest[evidenceIndex + 1] ?? null : null;
+  const datasetVersion = datasetVersionIndex >= 0 ? rest[datasetVersionIndex + 1] ?? null : null;
   const outputRoot = outputIndex >= 0 ? rest[outputIndex + 1] ?? null : null;
   const inputPath = inputIndex >= 0 ? rest[inputIndex + 1] ?? null : null;
   const sourceId = sourceIdIndex >= 0 ? rest[sourceIdIndex + 1] ?? null : null;
   const sampleId = sampleIndex >= 0 ? rest[sampleIndex + 1] ?? null : null;
+  const exportHandoff = rest.includes("--export");
   const purposes: Array<{ sampleId: string; purpose: DatasetPurpose }> = [];
   for (let index = 0; index < rest.length; index += 1) {
     if (rest[index] !== "--purpose") continue;
@@ -84,15 +92,16 @@ export function parseP0Args(args: string[]): P0Command {
     if (sampleId && (purpose === "development" || purpose === "test" || purpose === "holdout")) purposes.push({ sampleId, purpose });
   }
   const consumed = new Set<number>();
-  for (const index of [profileIndex, rootIndex, roleMapIndex, manifestIndex, candidateIndex, outputIndex, inputIndex, sourceIdIndex, sampleIndex]) {
+  for (const index of [profileIndex, rootIndex, roleMapIndex, manifestIndex, candidateIndex, evidenceIndex, datasetVersionIndex, outputIndex, inputIndex, sourceIdIndex, sampleIndex]) {
     if (index >= 0) {
       consumed.add(index);
       if (index + 1 < rest.length) consumed.add(index + 1);
     }
   }
+  for (const index of [rest.indexOf("--export")]) if (index >= 0) consumed.add(index);
   for (let index = 0; index < rest.length; index += 1) if (rest[index] === "--purpose") { consumed.add(index); consumed.add(index + 1); }
   const positional = rest.filter((arg, index) => arg !== "--live" && !consumed.has(index));
-  return { kind, live, profile, positional, sourceRoot, roleMapPath, manifestPath, candidatePath, outputRoot, inputPath, sourceId, sampleId, purposes };
+  return { kind, live, profile, positional, sourceRoot, roleMapPath, manifestPath, candidatePath, evidencePath, datasetVersion, exportHandoff, outputRoot, inputPath, sourceId, sampleId, purposes };
 }
 
 export type P0CommandOptions = { cwd: string; sourceRoot?: string; roleMap?: SourceRoleMap };
@@ -172,7 +181,17 @@ function mediaTypeForPath(path: string): string {
   }
 }
 
+function controlledCandidateForSample(sampleId: string): InvoiceCandidate {
+  const candidate = makeInvoiceCandidate();
+  candidate.sampleId = sampleId;
+  for (const key of Object.keys(candidate.fields) as Array<keyof InvoiceCandidate["fields"]>) {
+    candidate.fields[key] = { raw: null, normalized: null, status: "missing", evidence: [] };
+  }
+  return candidate;
+}
+
 export async function runP0Command(command: P0Command, options: P0CommandOptions): Promise<P0CommandResult> {
+  await loadDotEnv(resolve(options.cwd, ".env"));
   if (command.live && command.profile === null) {
     return { exitCode: 2, code: "LIVE_PROFILE_REQUIRED", message: "a Live Profile must be selected explicitly" };
   }
@@ -235,6 +254,32 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
     }
   }
   if (command.kind === "handoff") {
+    if (command.exportHandoff) {
+      if (!command.candidatePath || !command.outputRoot) {
+        return { exitCode: 2, code: "INVALID_COMMAND", message: "handoff --export requires --candidate <candidate.json> and --output <manifest.json>" };
+      }
+      const candidateValue = await loadJson(isAbsolute(command.candidatePath) ? command.candidatePath : resolve(options.cwd, command.candidatePath));
+      const candidateResult = TestCandidateSchema.safeParse(candidateValue);
+      if (!candidateResult.success) return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "HANDOFF_CANDIDATE_INVALID: candidate file does not satisfy TestCandidate" };
+      const datasetVersion = command.datasetVersion ?? candidateResult.data.datasetVersion;
+      const evidenceValue = command.evidencePath
+        ? await loadJson(isAbsolute(command.evidencePath) ? command.evidencePath : resolve(options.cwd, command.evidencePath))
+        : {};
+      if (evidenceValue === null || typeof evidenceValue !== "object" || Array.isArray(evidenceValue)) {
+        return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "HANDOFF_EVIDENCE_INVALID: evidence file must contain a JSON object" };
+      }
+      try {
+        const manifest = await exportHandoff(candidateResult.data.candidateId, {
+          ...(evidenceValue as Record<string, unknown>),
+          candidate: candidateResult.data,
+          datasetVersion,
+          outputPath: isAbsolute(command.outputRoot) ? command.outputRoot : resolve(options.cwd, command.outputRoot),
+        });
+        return { exitCode: 0, code: "READY", message: "handoff manifest exported", details: { manifestHash: manifest.manifestHash } };
+      } catch (error) {
+        return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: error instanceof Error ? error.message : "handoff manifest could not be exported" };
+      }
+    }
     if (!command.manifestPath) {
       return { exitCode: 2, code: "CAPABILITY_NOT_READY", message: "handoff verification requires --manifest <path>" };
     }
@@ -366,15 +411,17 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
     } catch (error) {
       return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: error instanceof Error ? error.message : "RUNTIME_PROFILE_INVALID" };
     }
-    if (profile.mode !== "live") return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "LIVE_PROFILE_INCOMPLETE: Profile must declare mode=live" };
+    if (profile.mode !== "live" && profile.mode !== "controlled") return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "RUNTIME_PROFILE_INCOMPLETE: Profile must declare mode=live or mode=controlled" };
     if (!command.manifestPath || !command.candidatePath || !command.sampleId) {
       return { exitCode: 2, code: "INVALID_COMMAND", message: "run requires --manifest <frozen-root> --candidate <candidate.json> --sample <sampleId>" };
     }
-    try {
-      if (profile.authPath) await readFile(profile.authPath, "utf8");
-      if (profile.modelsPath) await readFile(profile.modelsPath, "utf8");
-    } catch {
-      return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "LIVE_PROFILE_INCOMPLETE: auth Profile is not readable" };
+    if (profile.mode === "live") {
+      try {
+        if (profile.authPath) await readFile(profile.authPath, "utf8");
+        if (profile.modelsPath) await readFile(profile.modelsPath, "utf8");
+      } catch {
+        return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "LIVE_PROFILE_INCOMPLETE: auth Profile is not readable" };
+      }
     }
     const manifestRoot = isAbsolute(command.manifestPath) ? command.manifestPath : resolve(options.cwd, command.manifestPath);
     const candidateFile = isAbsolute(command.candidatePath) ? command.candidatePath : resolve(options.cwd, command.candidatePath);
@@ -388,6 +435,13 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
       const agentRoot = resolve(outputRoot, "agent");
       const desktop = await loadDesktopComposition(options.cwd);
       if (!desktop) return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "DESKTOP_COMPOSITION_NOT_BUILT: run bun run typecheck before the Live entry" };
+      const controlledProvider = profile.mode === "controlled"
+        ? createControlledProvider([
+          { toolCall: { name: "read_parsed_document", arguments: {} } },
+          { toolCall: { name: "submit_invoice_candidate", arguments: { candidate: controlledCandidateForSample(command.sampleId) } } },
+          { text: "controlled candidate accepted" },
+        ])
+        : undefined;
       const app = desktop.createApplication({
         dataRoot: outputRoot,
         agentRoot,
@@ -405,6 +459,7 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
             ...(profile.modelRef === undefined ? {} : { modelRef: profile.modelRef }),
             ...(profile.authPath === undefined ? {} : { authPath: profile.authPath }),
             ...(profile.modelsPath === undefined ? {} : { modelsPath: profile.modelsPath }),
+            ...(controlledProvider === undefined ? {} : { provider: controlledProvider }),
           };
           return createPiRuntime(runtimeOptions);
         },
@@ -413,14 +468,16 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
         const identity = await app.start({ sampleId: command.sampleId, candidateId: candidateResult.data.candidateId, clientRequestId: `cli-${Date.now()}-${command.sampleId}` });
         const outcome = await app.wait(identity.runId);
         const snapshot = app.getJob({ jobId: identity.jobId });
+        const modeLabel = profile.mode === "controlled" ? "controlled" : "live";
         return {
           exitCode: outcome.kind === "completed" && snapshot.candidates.length > 0 ? 0 : 1,
           code: outcome.kind === "completed" && snapshot.candidates.length > 0 ? "READY" : "CAPABILITY_NOT_READY",
-          message: outcome.kind === "completed" && snapshot.candidates.length > 0 ? "live extraction completed" : `live extraction did not produce an accepted candidate: ${outcome.error ?? outcome.kind}`,
+          message: outcome.kind === "completed" && snapshot.candidates.length > 0 ? `${modeLabel} extraction completed` : `${modeLabel} extraction did not produce an accepted candidate: ${outcome.error ?? outcome.kind}`,
           details: { jobId: identity.jobId, runId: identity.runId, candidateId: candidateResult.data.candidateId, errorsList: outcome.error ? [outcome.error] : [] },
         };
       } finally {
         await app.close();
+        controlledProvider?.close();
       }
     } catch (error) {
       return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: error instanceof Error ? error.message : "live extraction could not start" };

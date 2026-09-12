@@ -10,7 +10,8 @@ const config: CandidateConfig = {
   lockHash: hash("lock"),
   runtimeLockHash: hash("runtime"),
   datasetVersion: "p0-fixture",
-  modelProfileHash: hash("model"),
+  modelRef: { provider: "flowmate-controlled", modelId: "controlled" },
+  modelConfigHash: hash("model"),
   promptHash: hash("prompt"),
   toolVersions: { read_parsed_document: "1", read_evidence: "1", submit_invoice_candidate: "1" },
   extensionVersions: {},
@@ -19,7 +20,7 @@ const config: CandidateConfig = {
   eligibility: "test",
 };
 const input: PreflightInput = { sampleId: "SYN-001", datasetVersion: "p0-fixture", inputHash: hash("input"), allowed: true };
-const profile: RuntimeProfile = { profileId: "offline-fixture", environment: "local-test", modelProfileHash: hash("model"), available: true };
+const profile: RuntimeProfile = { profileId: "offline-fixture", environment: "local-test", modelConfigHash: hash("model"), modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, available: true };
 
 describe("candidate freezing and preflight", () => {
   it("derives a stable candidate id from the immutable configuration", () => {
@@ -37,7 +38,7 @@ describe("candidate freezing and preflight", () => {
     const result = preflight(freezeCandidate(config), input, {
       ...profile,
       mode: "live",
-      modelRef: { provider: "flowmate-test", modelId: "model-from-file" },
+      modelRef: { provider: "flowmate-controlled", modelId: "controlled" },
       modelsPath: "D:/flowmate/private/llm/models.json",
     });
     expect(result).toMatchObject({ eligible: true, environment: "local-test" });
@@ -46,7 +47,8 @@ describe("candidate freezing and preflight", () => {
   it.each([
     ["production", { ...profile, environment: "production" as const }, input, "PRODUCTION_FORBIDDEN"],
     ["missing profile", { ...profile, available: false }, input, "PROFILE_UNAVAILABLE"],
-    ["model drift", { ...profile, modelProfileHash: hash("other") }, input, "PROFILE_MISMATCH"],
+    ["model drift", { ...profile, modelConfigHash: hash("other") }, input, "PROFILE_MISMATCH"],
+    ["model reference drift", { ...profile, modelRef: { provider: "other", modelId: "model" } }, input, "MODEL_REF_MISMATCH"],
     ["dataset drift", profile, { ...input, datasetVersion: "other" }, "DATASET_MISMATCH"],
   ])("rejects %s before model execution", (_name, profileValue, inputValue, expected) => {
     const candidate = freezeCandidate(config);

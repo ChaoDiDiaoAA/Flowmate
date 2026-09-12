@@ -4,6 +4,9 @@ import { persistRuntimeEvent } from "../evidence/events.js";
 
 export type ControlledRuntime = {
   readonly sessionId?: string;
+  /** Optional Pi-resolved model evidence exposed by runtime-pi. */
+  readonly modelRef?: { provider: string; modelId: string };
+  readonly modelConfigHash?: string;
   run(context: { taskPrompt: string }, onEvent?: (event: RuntimeEvent) => void): Promise<{ kind: "completed" | "aborted" | "failed"; sessionId: string; error?: string }>;
   abort(): Promise<void>;
   close(): Promise<void>;

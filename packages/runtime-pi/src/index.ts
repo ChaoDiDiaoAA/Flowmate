@@ -1,4 +1,5 @@
 export * from "./session.js";
+export * from "./model-config.js";
 export * from "./provider.js";
 export * from "./tools.js";
 export * from "./resources.js";
@@ -12,3 +13,6 @@ export * from "./subagent/registry.js";
 export * from "./subagent/child-tools.js";
 export * from "./subagent/tool-hook.js";
 export * from "./subagent/adapter.js";
+export * from "./memory/index.js";
+export * from "./memory/policy.js";
+export * from "./memory/history.js";

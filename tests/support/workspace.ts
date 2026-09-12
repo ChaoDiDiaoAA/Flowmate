@@ -12,6 +12,7 @@ export type SourceFixtureKind =
   | "missing-page"
   | "unstable"
   | "mixed-label"
+  | "array-parsed"
   | "unsupported-format";
 
 export type SourceFixture = {
@@ -24,7 +25,7 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function writeSample(root: string, sampleId: string, options: { empty?: boolean; hashMismatch?: boolean; missingPage?: boolean; mixedLabel?: boolean; unsupported?: boolean } = {}): Promise<void> {
+async function writeSample(root: string, sampleId: string, options: { empty?: boolean; hashMismatch?: boolean; missingPage?: boolean; mixedLabel?: boolean; arrayParsed?: boolean; unsupported?: boolean } = {}): Promise<void> {
   const original = `RAW INVOICE ${sampleId}`;
   const originalPath = join(root, "original", `${sampleId}.pdf`);
   const parsedExtension = options.unsupported ? "txt" : "json";
@@ -58,7 +59,10 @@ async function writeSample(root: string, sampleId: string, options: { empty?: bo
   if (options.mixedLabel) {
     document.json_annotation = { answer: "GOLD_SENTINEL_71", source_locator: "labels/SYN-001.json" };
   }
-  await writeFile(parsedPath, JSON.stringify(document), "utf8");
+  const parsed = options.arrayParsed
+    ? [{ type: "text", text: `Invoice No: ${sampleId}`, bbox: [1, 2, 30, 40], page_idx: 0 }]
+    : document;
+  await writeFile(parsedPath, JSON.stringify(parsed), "utf8");
   if (options.mixedLabel) {
     await writeFile(join(root, "labels", `${sampleId}.json`), JSON.stringify({ answer: "GOLD_SENTINEL_71" }), "utf8");
   }
@@ -77,6 +81,7 @@ export async function withSourceFixture<T>(kind: SourceFixtureKind, fn: (fixture
     hashMismatch: kind === "hash-mismatch",
     missingPage: kind === "missing-page",
     mixedLabel: kind === "mixed-label",
+    arrayParsed: kind === "array-parsed",
     unsupported: kind === "unsupported-format",
   });
   if (kind === "missing-original") {

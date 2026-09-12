@@ -7,7 +7,6 @@ import { describe, expect, it } from "vitest";
 import { makeInvoiceCandidate } from "../../packages/contracts/src/invoice.ts";
 import { freezeDataset, inspectSource } from "../../packages/data/src/index.ts";
 import { freezeCandidate } from "../../packages/core/src/configuration/candidate.ts";
-import { hashModelProfile, type ModelProfile } from "../../packages/core/src/configuration/model-profile.ts";
 import { parseP0Args, runP0Command } from "../../scripts/p0.ts";
 import { withSourceFixture } from "../support/workspace.js";
 
@@ -33,18 +32,7 @@ async function listen(server: ReturnType<typeof createServer>): Promise<number> 
   return address.port;
 }
 
-const modelProfile: ModelProfile = {
-  profileId: "p0-cli-loopback",
-  version: "1",
-  modelRef: { provider: "flowmate-cli-loopback", modelId: "invoice-model" },
-  api: "openai-completions",
-  baseUrl: "http://127.0.0.1:1/v1",
-  capabilities: { contextWindow: 32_000, maxOutputTokens: 2_048, inputTypes: ["text"], toolCalling: true, streaming: true },
-  generation: { temperature: 0, topP: 1, thinking: "none" },
-  credential: { profileId: "p0-cli-env", source: "env", envVar: "FLOWMATE_TEST_LLM_KEY" },
-  budget: { maxModelRequests: 6, maxToolCalls: 12, wallTimeMs: 30_000, maxKnownTokens: null, maxKnownCost: null, unknownUsagePolicy: "stop" },
-  purpose: { environment: "local-test", roles: ["invoice-extractor"], allowedSampleIds: ["SYN-001"] },
-};
+const modelRef = { provider: "flowmate-cli-loopback", modelId: "invoice-model" };
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -85,8 +73,7 @@ describe("P0 live CLI entry", () => {
         mode: "live" as const,
         environment: "local-test" as const,
         available: true,
-        modelRef: modelProfile.modelRef,
-        modelProfile: { ...modelProfile, baseUrl: `http://127.0.0.1:${portRef.value}/v1` },
+        modelRef,
         modelsPath: "models.json",
         authPath: "auth.json",
         allowedSampleIds: ["SYN-001"],
@@ -98,7 +85,7 @@ describe("P0 live CLI entry", () => {
       await writeFile(join(root, "auth.json"), "{}\n", "utf8");
       const candidateFile = freezeCandidate({
         schemaVersion: "1", appSourceHash: digest("app"), lockHash: digest("lock"), runtimeLockHash: digest("runtime"), datasetVersion: manifest.datasetVersion,
-        modelProfileHash: hashModelProfile(profile.modelProfile), promptHash: digest("prompt"), toolVersions: { read_parsed_document: "1", read_evidence: "1", submit_invoice_candidate: "1" }, extensionVersions: {}, environment: "local-test", budget: { maxModelRequests: 6, maxToolCalls: 12, wallTimeMs: 30_000 }, eligibility: "test",
+        modelRef, modelConfigHash: digest("loopback-model-config"), promptHash: digest("prompt"), toolVersions: { read_parsed_document: "1", read_evidence: "1", submit_invoice_candidate: "1" }, extensionVersions: {}, environment: "local-test", budget: { maxModelRequests: 6, maxToolCalls: 12, wallTimeMs: 30_000 }, eligibility: "test",
       });
       const candidatePath = join(root, "candidate.json");
       await writeFile(candidatePath, JSON.stringify(candidateFile), "utf8");

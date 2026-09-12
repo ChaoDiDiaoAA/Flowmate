@@ -5,6 +5,7 @@ import type { Application } from "./composition.js";
 import { IPC_CHANNELS, registerIpcHandlers } from "./ipc.js";
 import { shutdownApplication } from "./shutdown.js";
 import { loadDesktopApplication } from "./startup.js";
+import { loadDotEnv } from "@flowmate/core";
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | undefined;
@@ -23,7 +24,7 @@ function unavailableApplication(): Application {
     wait: unavailable,
     getJob: unavailable,
     getEvidence: unavailable,
-    getDiagnostics: () => ({ activeRunCount: 0, datasetVersion: "unavailable", candidateId: "unavailable", profileId: "unavailable" }),
+    getDiagnostics: () => ({ activeRunCount: 0, datasetVersion: "unavailable", candidateId: "unavailable", profileId: "unavailable", modelRef: null, modelConfigHash: null }),
     close: async () => {},
   } as unknown as Application;
 }
@@ -70,6 +71,7 @@ export async function closeMainWindow(): Promise<void> {
 }
 
 export async function bootstrap(applicationFactory?: () => Promise<Application>): Promise<void> {
+  await loadDotEnv(join(process.cwd(), ".env"));
   await app.whenReady();
   const configuredFactory = applicationFactory ?? (process.env.FLOWMATE_DESKTOP_CONFIG
     ? () => loadDesktopApplication(process.env.FLOWMATE_DESKTOP_CONFIG!) : undefined);

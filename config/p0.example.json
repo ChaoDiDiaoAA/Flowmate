@@ -1,15 +1,15 @@
 {
-  "sourceRoot": "./FlowmateData/source",
+  "sourceRoot": "D:/paper/Invoice",
   "roleMap": {
-    "sourceId": "project-invoice-source",
-    "parserVersion": "existing-parser-1",
+    "sourceId": "voxel51-invoice-ocr",
+    "parserVersion": "mineru@3.4.5",
     "encoding": "utf8",
-    "sampleIdRegex": "(?:^|/)(?<sampleId>[^/]+)\\.[^.]+$",
+    "sampleIdRegex": "(?:^|/)voxel51/(?<sampleId>[^/]+)/(?:original|content|pages|fields)\\.[^/]+$",
     "roles": {
-      "original": { "patterns": ["original/**/*.{pdf,jpg,jpeg,png}"] },
-      "parsed": { "patterns": ["parsed/**/*.{json,md,markdown}"] },
-      "metadata": { "patterns": ["metadata/**/*.json"] },
-      "labels": { "patterns": ["labels/**/*.json"] }
+      "original": { "patterns": ["voxel51/*/original.{pdf,jpg,jpeg,png}"] },
+      "parsed": { "patterns": ["voxel51/*/content.json"] },
+      "metadata": { "patterns": ["voxel51/*/pages.json"] },
+      "labels": { "patterns": ["voxel51/*/fields.json"] }
     }
   }
 }

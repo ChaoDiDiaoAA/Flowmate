@@ -31,6 +31,17 @@ describe("source inspection and parsed import", () => {
     });
   });
 
+  it("imports MinerU-style array blocks and converts zero-based page indexes", async () => {
+    await withSourceFixture("array-parsed", async ({ root, roleMap }) => {
+      const report = await inspectSource(root, roleMap);
+      const result = await importParsed(report.validEntries[0]!);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.blocks[0]).toMatchObject({ kind: "text", text: "Invoice No: SYN-001", evidence: { page: 1, bbox: [1, 2, 30, 40] } });
+      }
+    });
+  });
+
   it.each([
     ["empty", "EMPTY_CONTENT"],
     ["missing-original", "SOURCE_PAIR_MISSING"],

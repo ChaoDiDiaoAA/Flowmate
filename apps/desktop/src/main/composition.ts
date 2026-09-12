@@ -10,7 +10,14 @@ export type StartCommand = { sampleId: string; candidateId: string; clientReques
 export type RebuildCommand = { jobId: string; clientRequestId: string };
 export type StartResult = RunIdentity;
 export type SampleSummary = { sampleId: string; sourceId: string; purpose: string; parserVersion: string };
-export type ApplicationDiagnostics = { activeRunCount: number; datasetVersion: string; candidateId: string; profileId: string };
+export type ApplicationDiagnostics = {
+  activeRunCount: number;
+  datasetVersion: string;
+  candidateId: string;
+  profileId: string;
+  modelRef: { provider: string; modelId: string } | null;
+  modelConfigHash: string | null;
+};
 export type EvidenceView = { assetId: string; sampleId: string; blocks: Array<{ id: string; text: string; page: number | null }> };
 
 export type RuntimeFactory = (options: { identity: RunIdentity; gateway: ReturnType<typeof createGateway>; projection: InputProjection; context: ReturnType<typeof buildContext>; cwd: string; agentDir: string; budget: BudgetLedger }) => Promise<ControlledRuntime>;
@@ -65,6 +72,7 @@ export function createApplication(config: ApplicationConfig): Application {
   const activeSamples = new Map<string, string>();
   const pendingSamples = new Set<string>();
   const pendingLaunches = new Set<Promise<StartResult>>();
+  let resolvedModel: { provider: string; modelId: string; configHash: string } | undefined;
   let closing = false;
   let closePromise: Promise<void> | undefined;
 
@@ -89,6 +97,13 @@ export function createApplication(config: ApplicationConfig): Application {
     const gateway = createGateway({ store, input: { sampleId, parsed: projection.parsed, allowedAssetIds: projection.allowedAssetIds }, budget });
     try {
       const runtime = await config.runtimeFactory({ identity, gateway, projection, context, cwd: join(config.dataRoot, "runtime", run.runId, "cwd"), agentDir: join(config.dataRoot, "runtime", run.runId, "agent"), budget });
+      if (runtime.modelRef && (runtime.modelRef.provider !== config.candidate.modelRef.provider || runtime.modelRef.modelId !== config.candidate.modelRef.modelId)) {
+        await runtime.close().catch(() => undefined);
+        throw new Error("MODEL_REF_MISMATCH");
+      }
+      if (runtime.modelRef && runtime.modelConfigHash) {
+        resolvedModel = { ...runtime.modelRef, configHash: runtime.modelConfigHash };
+      }
       const handle = jobService.start({ runtime, identity, context });
       activeSamples.set(sampleId, run.runId);
       void handle.done.finally(() => {
@@ -148,7 +163,16 @@ export function createApplication(config: ApplicationConfig): Application {
       if (!value.allowedAssetIds.includes(command.assetId)) throw new Error("ASSET_NOT_ALLOWED");
       return { assetId: command.assetId, sampleId: snapshot.job.sampleId, blocks: value.parsed.blocks.map((block) => ({ id: block.id, text: block.text, page: block.evidence.page })) };
     },
-    getDiagnostics() { return { activeRunCount: jobService.activeRunCount(), datasetVersion: config.manifest.datasetVersion, candidateId: config.candidate.candidateId, profileId: config.profile.profileId }; },
+    getDiagnostics() {
+      return {
+        activeRunCount: jobService.activeRunCount(),
+        datasetVersion: config.manifest.datasetVersion,
+        candidateId: config.candidate.candidateId,
+        profileId: config.profile.profileId,
+        modelRef: resolvedModel ? { provider: resolvedModel.provider, modelId: resolvedModel.modelId } : null,
+        modelConfigHash: resolvedModel?.configHash ?? null,
+      };
+    },
     async close() {
       closing = true;
       closePromise ??= (async () => {

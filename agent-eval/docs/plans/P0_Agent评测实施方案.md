@@ -10,7 +10,7 @@
 
 **Spec:** [Agent 评测总方案](../spec/01_Flowmate_Agent评测总方案.md)、[P0 目标方案](../../../docs/spec/P0_目标方案.md)、[P0 产品实施计划](../../../docs/plans/P0_实施计划.md)。
 
-更新日期：2026-09-13。状态：方案已编写；用例编号、配额、评分器、命令均为实施约定，尚未完成资产制作、编码或实际评测。产品任务编号 T01–T16 来自 P0 产品实施计划；本方案评测任务编号为 E01–E10。
+更新日期：2026-09-13。状态：E01–E06 评测设施已落地并通过离线自检；P0 真实 Case/Gold、Live 主模型和正式 Benchmark 尚未执行。产品任务编号 T01–T16 来自 P0 产品实施计划；本方案评测任务编号为 E01–E10。
 
 **本阶段唯一委派链路：** 父 Provider → 实际 Pi Loop → 插件原生 `Agent` 工具（Flowmate tool_call Hook 校验）→ 实际子 Session → 受控工具 → 原生前台结果 → 父循环。P0 固定 run_in_background=false；Adapter 只记录与取消，不创建/自动重试。Runner 不调用 subagents:rpc:spawn 或 manager.spawn；底层单测不能替代本阶段整链 F。现有 37 个 Runtime 场景族保留编号，新增边界作为相应 SUB/EXT/工具案例变体，不通过删除原用例降低覆盖。
 
@@ -75,7 +75,7 @@ P0 的“完整链”仅指解析输入到候选接受和保存的最小通路�
 
 ### 2.2 当前依赖与范围固定
 
-当前尚无 P0 产品实现。用户已指定来源根 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51`，原始发票与已有解析保留原位。目录存在且已列举 000001 文件；数量、完整性、配对和可用范围以产品 T03/T04 的盘点与冻结报告为准。评测 Case/Gold 留在 agent-eval/data/p0，不将来源 annotation/fields 或其他答案元数据交给被测模型。已知的包候选版本不作为实际锁：以产品 T01 输出的 config/runtime-lock.json、发布包摘要、Node/Electron/插件适配和实际入口为准。
+P0 产品已有部分工程实现，当前按修订基线继续验收。实际来源根为 `D:\paper\Invoice`，数据集目录为 `voxel51`，原始发票与已有解析保留原位。T03 已盘点 1510 个样本、0 个隔离项，T04 已冻结 000001–000003 的开发输入；正式 Case/Gold、Live 主模型和 Parser 兼容仍按产品 T15/T13 与本方案执行。评测 Case/Gold 留在 agent-eval/data/p0，不将来源 annotation/fields 或其他答案元数据交给被测模型。已知的包候选版本不作为实际锁：以产品 T01 输出的 config/runtime-lock.json、发布包摘要、Node/Electron/插件适配和实际入口为准。
 
 | 准备或执行 | 最早前置 | 不具备时的状态 |
 |---|---|---|
@@ -412,7 +412,7 @@ SUB-05-I 同时制作“主模型没有 Agent 调用”和“工具调用被策�
 
 ### 6.1 文件与运行数据布局
 
-目录遵循[项目总方案 §17.1](../../../docs/spec/00_Flowmate完整方案.md)。P0 不新增 workspace 包，评测源码固定放 agent-eval/src 并通过 agent-eval/tsconfig.json 纳入根 typecheck，测试放 agent-eval/tests；不平行生成 packages/evals。当前只迁移已有文档，下面的源码、测试、配置和数据在 E01–E10 实施时建立。所有评测内容统一归 agent-eval/；共享产品契约用包 exports；原生测试驱动由产品 tests/runtime 维护。以后确需迁包，先更新主方案目录与受影响阶段计划；执行前检查并补齐已有文件，不覆盖已有实现。
+目录遵循[项目总方案 §17.1](../../../docs/spec/00_Flowmate完整方案.md)。P0 不新增 workspace 包，评测源码固定放 agent-eval/src 并通过 agent-eval/tsconfig.json 纳入根 typecheck，测试放 agent-eval/tests；不平行生成 packages/evals。E01–E06 的 Schema、资产冻结、证据绑定、字段/Runtime Grader、顺序 Runner、统计、报告、Good/Bad 归因和 Quality Decision 已建立并有设施自测；E07–E10 的真实资产、正式运行、归因记录和联合退出仍依赖产品 Live/Parser/真实数据条件。所有评测内容统一归 agent-eval/；共享产品契约用包 exports；原生测试驱动由产品 tests/runtime 维护。以后确需迁包，先更新主方案目录与受影响阶段计划；执行前检查并补齐已有文件，不覆盖已有实现。
 
 ```text
 agent-eval/README.md
@@ -739,21 +739,22 @@ QualityDecision：有有效证据证明硬门槛失败→FAIL；没有已证实�
 
 ## 10. 执行入口、检查点和交付
 
-以下命令由 E05 实现后才可用；本方案写作没有执行这些命令。根 scripts 统一入口 `eval:p0`，默认 run 只复用/执行离线 F；带 `--live` 且选获准 Profile 才调用真实模型。
+当前 `eval:smoke`、`eval:p0 check-assets`、`freeze`、`check-readiness` 和 `plan` 已可执行；正式 Trial、评分和结论命令仍按 E07–E10 在真实资产与产品交接具备后开放。根 scripts 统一入口 `eval:p0`，默认设施检查不访问外部服务；带 `--live` 且选获准 Profile 才允许真实模型。
 
 | 命令 | 作用 | 模式 | 前置条件 | P0 状态 |
 |---|---|---|---|---|
-| `bun run test agent-eval/tests` | 运行评测资产、驱动、评分器和报告契约测试 | 离线 | E01–E04 设施代码已实现 | 规划中 |
-| `bun run eval:p0 check-assets` | 检查 Case、Gold、Rubric 和 Benchmark 的版本、用途、引用和复核状态 | 资产检查 | 资产目录已登记 | 规划中 |
-| `bun run eval:p0 check-readiness` | 检查候选、环境、数据、驱动、预算和必需资产 | 运行预检 | 被测组合和范围已选择 | 规划中 |
-| `bun run eval:p0 freeze` | 冻结本次评测的 Case/Gold、Grader、Benchmark、切片和执行配置 | 资产冻结 | 资产检查通过；负责人确认用途和范围 | 规划中 |
+| `bun run test agent-eval/tests` | 运行评测资产、驱动、评分器和报告契约测试 | 离线 | E01–E06 设施代码已实现 | 已通过 |
+| `bun run eval:p0 check-assets` | 检查 Case、Gold、Rubric 和 Benchmark 的版本、用途、引用和复核状态 | 资产检查 | 目录清单已登记；真实 Gold 仍待制作 | 已通过结构检查 |
+| `bun run eval:p0 check-readiness --manifest <manifest> --candidate <candidate>` | 检查候选、环境、数据、驱动、预算和必需资产 | 运行预检 | 被测组合和范围已选择 | 已通过离线入口；缺真实资产或 Live 明确阻断 |
+| `bun run eval:p0 freeze --input <authoring-dir> --output <manifest>` | 冻结本次评测的 Case/Gold、Grader、Benchmark、切片和执行配置 | 资产冻结 | 资产检查通过；负责人确认用途和范围 | 已通过离线入口；真实批次待人工冻结 |
+| `bun run eval:p0 plan --manifest <manifest> --candidate <candidateId> --output <plan>` | 生成顺序 Trial、重复次数和预算计划 | 运行计划 | 资产清单和候选已冻结 | 已通过离线入口；不启动模型 |
 | `bun run eval:p0 run --scope functional` | 执行确定性功能 F 和集成 F，收集实际证据 | F / 集成 | 对应产品功能和 F 驱动可运行 | 规划中 |
 | `bun run eval:p0 run --scope agent --live --profile <liveProfile>` | 对指定 Runtime/员工范围执行真实模型行为评测 | A / Live | Live Profile、样本用途、预算和模型授权已确认 | 规划中 |
 | `bun run eval:p0 cancel --eval-run <evalRunId>` | 停止未开始的 Trial，并请求产品停止本批拥有的运行 | 运行控制 | EvalRun 属于当前调用者且可取消 | 规划中 |
 | `bun run eval:p0 grade` | 使用代码评分器、人工复核或已校准的模型裁判评分 | 评分 | Trial 证据完整；评分器版本已冻结 | 规划中 |
 | `bun run eval:p0 report` | 生成模块、模式、失败类型、成本和时延报告 | 报告 | 评分完成或缺项已登记 | 规划中 |
 | `bun run eval:p0 decide` | 根据门槛、证据完整性和限制形成质量结论 | 结论 | 报告、归因和争议复核完成 | 规划中 |
-| `bun run eval:smoke` | 快速检查评测设施和种子资产，不访问真实业务系统 | 快速回归 | `eval:p0` 离线驱动已实现 | 规划中 |
+| `bun run eval:smoke` | 快速检查评测设施和种子资产，不访问真实业务系统 | 快速回归 | `eval:p0` 离线设施已实现 | 已通过 |
 | `bun run eval:full` | 执行 P0 冻结的完整 Benchmark 流程 | 完整评测 | P0 Runner、资产和适用环境就绪 | 规划中 |
 
 `freeze` 后 CLI 必须使用本地配置中明确选定的 benchmarkVersion/evalRunId，缺值报错，不自动选“最新一批”。`grade/report/decide` 消费同一不可变 Trial 清单；`cancel --eval-run` 只取消本批拥有的运行；重评分另生成 gradeRunId。业务原始数据不经命令行全文传递。

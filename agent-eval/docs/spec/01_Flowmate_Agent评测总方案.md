@@ -867,7 +867,7 @@ P0/P1 可先准备现有解析文件的抽取 Case、可核验字段 Gold，以�
 
 ### 5.3 从现有 Invoice 数据中选样和整理材料
 
-1. 从 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51` 的登记记录中按 sample_id 选样，记录来源、允许用途、原图和解析引用、版本与摘要；不凭目录数量断定样本已就绪。
+1. 从 `D:\paper\Invoice\voxel51` 的登记记录中按 sample_id 选样，记录来源、允许用途、原图和解析引用、版本与摘要；不凭目录数量断定样本已就绪。
 2. 原文由 `original.jpg` 提供；解析输入从 `content.json`、`content.md`、`pages.json` 取得。按 `parse.json` 的文件清单检查文件是否存在、正文是否非空、页数是否完整，登记这次采用的解析版本。
 3. 将 `annotation.json` 和 `fields.json` 作为人工核验的参考。检查 `fields.<字段>.value/status/source_locator`、明细和 provenance；`provided` 只表示提供方给了值，`missing` 不代表原文不存在，`ambiguous` 不能强行归成确定答案。
 4. 注意 `source_locator` 可能指向提供方标注 JSON 的路径，并非票据页码或原文位置。人工应另外记录可核验的页码、原文片段和区域；没有坐标可写“第 1 页 Total 行”，不要编造 geometry。
@@ -1220,21 +1220,22 @@ EvalRun 记录候选/基线 ID、BenchmarkDefinition 版本、冻结集与切片
 
 ### 10.1.1 评测执行命令矩阵
 
-评测命令统一从仓库根目录通过 Bun 执行。命令只负责选择已登记的资产、环境和运行模式，不能通过命令行直接传入业务原文、绕过产品权限或替代人工核验。下表中的“规划中”表示总方案约定的接口，只有对应阶段实现 Runner 后才能加入根脚本并写入 README 的“可执行命令”部分。
+评测命令统一从仓库根目录通过 Bun 执行。命令只负责选择已登记的资产、环境和运行模式，不能通过命令行直接传入业务原文、绕过产品权限或替代人工核验。下表中的“规划中”表示总方案约定的接口，只有对应阶段实现 Runner 后才能加入根脚本并写入 README 的“可执行命令”部分；当前离线准备命令已按 E01–E06 落地，真实 Trial、评分和结论仍受前置条件控制。
 
 | 命令 | 作用 | 评测模式 | 适用阶段 | 前置条件 | 当前状态 |
 |---|---|---|---|---|---|
-| `bun run test agent-eval/tests` | 运行评测资产、驱动、评分器和报告契约测试 | 离线 | P0–P6 | 评测测试目录和依赖已实现 | 规划中 |
-| `bun run eval:p0 check-assets` | 检查 Case、Gold、Rubric 和 Benchmark 的版本、用途、引用和复核状态 | 资产检查 | P0–P6 | 质量资产目录已登记 | 规划中 |
-| `bun run eval:p0 check-readiness` | 检查候选、环境、数据、驱动、预算和必需资产是否具备 | 运行预检 | P0–P6 | 被测组合和执行范围已选择 | 规划中 |
-| `bun run eval:p0 freeze` | 冻结本次评测的 Benchmark、Case/Gold、Grader、切片和执行配置 | 资产冻结 | P0–P6 | 资产检查通过；负责人确认用途和范围 | 规划中 |
+| `bun run test agent-eval/tests` | 运行评测资产、驱动、评分器和报告契约测试 | 离线 | P0–P6 | 评测测试目录和依赖已实现 | 已通过离线自检 |
+| `bun run eval:p0 check-assets` | 检查 Case、Gold、Rubric 和 Benchmark 的版本、用途、引用和复核状态 | 资产检查 | P0–P6 | 质量资产目录已登记 | 已通过结构检查；待制作资产单列 |
+| `bun run eval:p0 check-readiness --manifest <manifest> --candidate <candidate>` | 检查候选、环境、数据、驱动、预算和必需资产是否具备 | 运行预检 | P0–P6 | 被测组合和执行范围已选择 | 已通过离线入口；缺真实资产/Live 明确阻断 |
+| `bun run eval:p0 freeze --input <authoring-dir> --output <manifest>` | 冻结本次评测的 Benchmark、Case/Gold、Grader、切片和执行配置 | 资产冻结 | P0–P6 | 资产检查通过；负责人确认用途和范围 | 已通过离线入口；真实批次待人工冻结 |
+| `bun run eval:p0 plan --manifest <manifest> --candidate <candidateId> --output <plan>` | 生成本次评测的顺序 Trial、重复次数和预算计划 | 运行计划 | P0–P6 | Case/Gold 清单和候选已冻结 | 已通过离线入口；不启动模型 |
 | `bun run eval:p0 run --scope functional` | 执行已实现功能入口的确定性 F/集成测试并收集证据 | F / 集成 | P0–P6 | 产品功能和对应 F 驱动可运行 | 规划中 |
 | `bun run eval:p0 run --scope agent --live --profile <liveProfile>` | 对指定 Runtime/员工范围执行真实模型行为评测 | A / Live | P0–P6 | Live Profile、样本用途、预算和模型授权已确认 | 规划中 |
 | `bun run eval:p0 cancel --eval-run <evalRunId>` | 停止本批次尚未开始的 Trial，并请求产品停止其拥有的运行 | 运行控制 | P0–P6 | EvalRun 属于当前调用者且可取消 | 规划中 |
 | `bun run eval:p0 grade` | 使用代码评分器、人工复核或已校准的模型裁判评分 | 评分 | P0–P6 | Trial 证据完整；评分器版本已冻结 | 规划中 |
 | `bun run eval:p0 report` | 按模块、模式、Case、失败类型、成本和时延生成报告 | 报告 | P0–P6 | 评分完成或缺项已明确登记 | 规划中 |
 | `bun run eval:p0 decide` | 根据 Benchmark 门槛、证据完整性和限制形成质量结论 | 结论 | P0–P6 | 报告、归因和人工争议处理完成 | 规划中 |
-| `bun run eval:smoke` | 执行不访问真实业务系统的评测设施快速自检 | 快速回归 | P0–P6 | `eval:p0` 资产检查和离线驱动已实现 | 规划中 |
+| `bun run eval:smoke` | 执行不访问真实业务系统的评测设施快速自检 | 快速回归 | P0–P6 | `eval:p0` 资产检查和离线驱动已实现 | 已通过离线自检 |
 | `bun run eval:full` | 执行当前阶段冻结的完整 Benchmark 流程 | 完整评测 | P1–P6 | `eval:p0` 全部子命令、资产和适用环境已就绪 | 规划中 |
 
 `eval:smoke` 和 `eval:full` 是面向开发者的简短入口；详细的资产冻结、预检、运行、评分、报告和结论仍以 `eval:p0` 子命令及其运行记录为准。真实模型模式必须显式选择 Profile，默认评测不得因本机存在环境变量而访问外部服务。未实现或缺前置条件的命令必须返回未就绪状态，不得伪造零样本通过。

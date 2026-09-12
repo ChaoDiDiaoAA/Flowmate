@@ -17,7 +17,7 @@ Flowmate 交付基于 Pi SDK 二次开发的企业数字员工平台，以及首
 
 旧方案及旧教程已在迁移复核完成后删除。[归档审查与迁移记录](docs/archive/2026-09-10-spec-review/04_旧方案迁移清单.md)仅用于追溯，其章节落点属于归档时版本；当前项目范围与评测安排分别以两份总方案为准。
 
-发票来源根 sourceRoot 已由用户指定为 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51`，位于代码仓库外；原始发票和已有解析保留原位。已确认目录存在并列举 000001 样本文件，完整配对、摘要和可用子集仍由 P0 接入核验。当前代码按方案继续补齐 P0，历史命令与成绩不能代替当前验证。
+发票来源根 sourceRoot 已核验为 `D:\paper\Invoice`，其中 `voxel51` 是数据集目录，位于代码仓库外；原始发票和已有解析保留原位。当前盘点发现 1510 个样本、0 个隔离项；P0 已冻结 000001–000003 的开发输入，完整业务 Gold、Live 模型和 Parser 兼容仍需独立完成。
 
 ## 前置条件
 
@@ -68,15 +68,22 @@ Flowmate 不需要 Longbridge CLI，也不使用截图中的 `FINAGENT_*` 环境
 | `bun run p0 -- parser --profile <parserProfile> --input <original> --sample <sampleId> --source-id <sourceId>` | 对没有解析产物的新原图执行 Parser 试验 | Parser、模型缓存、输入格式和 Profile 可用 | 入口可执行，真实环境待接入 |
 | `bun run p0 -- plugin-probe` | 验证 Pi 原生扩展、Agent 工具和子 Session | Pi SDK、扩展和子 Agent 插件可加载 | 可执行 |
 | `bun run p0 -- run --profile <liveProfile> --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 通过正式 Application/Pi Runtime 执行一次真实字段抽取 | Live Profile、冻结输入、候选和 Provider 已获准 | 入口可执行，真实环境待接入 |
+| `bun run p0 -- run --profile config/controlled-profile.example.json --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 通过受控 Provider 跑通完整产品抽取链，用于离线回归 | 冻结输入和 Test Candidate；不访问外部模型 | 可执行 |
+| `bun run p0 -- handoff --export --candidate <candidate> --evidence <evidence.json> --output <manifest.json>` | 从产品功能证据导出质量侧可验证的 handoff manifest | 固定候选和产品证据已生成 | 可执行 |
+| `bun run p0 -- handoff --manifest <manifest.json>` | 校验 handoff manifest 的关联和完整性 | handoff 文件已生成 | 可执行 |
 | `bun run verify:handoff <manifest>` | 验证功能证据交接文件 | 交接文件已生成 | 可执行 |
 
-模型接入目标为完全复用 Pi 原生 Provider、模型配置与认证；内置模型使用原生模型引用和认证，自定义服务使用可选的 [`Pi models 示例`](config/pi-models.example.json)。`.env` 由启动工具加载，变量必须被 Pi 原生机制支持或引用。Flowmate 只管理业务授权、预算及运行证据。现有 `ModelProfile` 代码及重复模板尚待按 [P0 实施计划 §2.2.1](docs/plans/P0_实施计划.md) 收敛，本次方案修订不代表代码迁移完成。Parser 模板仍见 [`config/parser-profile.example.json`](config/parser-profile.example.json)；缺少真实数据、Live 授权或 MinerU 时，命令须明确返回未就绪。
+模型接入完全复用 Pi 原生 Provider、模型配置与认证；内置模型使用原生模型引用和认证，自定义服务使用可选的 [`Pi models 示例`](config/pi-models.example.json)。`.env` 由启动工具加载，变量必须被 Pi 原生机制支持或引用。Flowmate 只管理业务授权、预算及运行证据，并从实际 Pi 模型生成脱敏运行快照。Parser 模板仍见 [`config/parser-profile.example.json`](config/parser-profile.example.json)；缺少真实数据、Live 授权或 MinerU 时，命令须明确返回未就绪。
 
 ## Agent 评测与发布命令
 
 | 命令 | 说明 | 适用阶段 | 状态 |
 |---|---|---|---|
-| `bun run eval:smoke` | 快速检查评测设施、种子 Case/Gold 和评分器，不访问真实业务系统 | P0–P6 | 评测 Runner 实现后启用 |
+| `bun run eval:smoke` | 快速检查评测设施、种子 Case/Gold 和评分器，不访问真实业务系统 | P0–P6 | 已通过离线自检 |
+| `bun run eval:p0 check-assets` | 校验 P0 Runtime/集成种子目录的 Case、Owner、变体和映射 | P0 | 可执行；真实 Case/Gold 待人工冻结 |
+| `bun run eval:p0 freeze --input <authoring-dir> --output <manifest.json>` | 将人工核验的 Case/Gold 制作批次冻结为评测清单 | P0–P6 | 可执行；只接收已核验资产 |
+| `bun run eval:p0 check-readiness --manifest <manifest.json> --candidate <candidate.json>` | 检查评测清单、候选和待运行资产是否具备离线执行条件 | P0–P6 | 可执行；缺 Live/Gold 时明确阻断 |
+| `bun run eval:p0 plan --manifest <manifest.json> --candidate <candidateId> --output <plan.json>` | 按固定清单生成顺序、重复次数和预算计划 | P0–P6 | 可执行；不启动模型请求 |
 | `bun run eval:full` | 执行当前阶段冻结的完整 Agent Benchmark、评分、报告和结论 | P1–P6 | 后续阶段实现 |
 | `bun run release:check` | 汇总类型、边界、测试、E2E、构建和质量结论门禁 | P1–P6 | 后续阶段实现 |
 | `bun run release:package` | 生成经批准的桌面发布包 | P5–P6 | 后续阶段实现 |
