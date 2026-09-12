@@ -1,7 +1,7 @@
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { execFile } from "node:child_process";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -18,8 +18,8 @@ export type EnvironmentCheck = {
 
 export type EnvironmentReport = {
   node: { version: string; supported: boolean };
-  npm: { version: string; available: boolean };
-  electron: { version: string | null; available: boolean };
+  bun: { version: string; available: boolean };
+  electron: { version: string | null; available: boolean; binaryAvailable: boolean };
   sqlite: { driverVersion: string | null; sqliteVersion: string | null; available: boolean };
   dependencies: Record<string, string | null>;
   checks: EnvironmentCheck[];
@@ -90,13 +90,8 @@ export async function inspectEnvironment(options: DoctorOptions = {}): Promise<E
   const env = { ...process.env, ...(options.env ?? {}) };
   const nodeVersion = process.version;
   const nodeMajor = Number.parseInt(nodeVersion.slice(1).split(".")[0] ?? "0", 10);
-  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-  const npmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-  const npmVersion = await commandVersion(
-    process.platform === "win32" && await readable(npmCli) ? process.execPath : npmCommand,
-    process.platform === "win32" && await readable(npmCli) ? [npmCli, "--version"] : ["--version"],
-    env,
-  );
+  const bunCommand = process.platform === "win32" ? "bun.exe" : "bun";
+  const bunVersion = await commandVersion(bunCommand, ["--version"], env);
   const checks: EnvironmentCheck[] = [];
   const dependencyNames = [
     "@earendil-works/pi-ai",
@@ -114,6 +109,8 @@ export async function inspectEnvironment(options: DoctorOptions = {}): Promise<E
   ];
   const dependencies = Object.fromEntries(await Promise.all(dependencyNames.map(async (name) => [name, await packageVersion(cwd, name)] as const)));
   const electronVersion = dependencies.electron;
+  const electronBinary = join(cwd, "node_modules", "electron", "dist", process.platform === "win32" ? "electron.exe" : process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : "electron");
+  const binaryAvailable = await readable(electronBinary);
   const sqlite = await probeSqlite(cwd);
   let runtimeCompatibility: { packages: Record<string, string | null>; errors: string[] } | null = null;
   try {
@@ -132,10 +129,10 @@ export async function inspectEnvironment(options: DoctorOptions = {}): Promise<E
   });
   checks.push({
     id: "lockfile",
-    status: await readable(`${cwd}/package-lock.json`) ? "ready" : "warning",
-    message: await readable(`${cwd}/package-lock.json`)
-      ? "npm lockfile is readable"
-      : "npm lockfile is not present yet",
+    status: await readable(`${cwd}/bun.lock`) ? "ready" : "warning",
+    message: await readable(`${cwd}/bun.lock`)
+      ? "Bun lockfile is readable"
+      : "Bun lockfile is not present yet",
   });
 
   const manifestPath = `${cwd}/package.json`;
@@ -156,8 +153,8 @@ export async function inspectEnvironment(options: DoctorOptions = {}): Promise<E
   });
   checks.push({
     id: "electron",
-    status: electronVersion ? "ready" : "blocked",
-    message: electronVersion ? `Electron package ${electronVersion} is readable` : "Electron package is unavailable",
+    status: electronVersion && binaryAvailable ? "ready" : "blocked",
+    message: electronVersion && binaryAvailable ? `Electron ${electronVersion} package and executable are readable; window launch is verified by test:desktop` : "Electron package or executable is missing; run bunx install-electron --no in the project",
   });
   checks.push({
     id: "sqlite",
@@ -176,8 +173,8 @@ export async function inspectEnvironment(options: DoctorOptions = {}): Promise<E
 
   return {
     node: { version: nodeVersion, supported: nodeMajor >= 22 },
-    npm: { version: npmVersion ?? "unavailable", available: npmVersion !== null },
-    electron: { version: electronVersion ?? null, available: electronVersion !== null },
+    bun: { version: bunVersion ?? "unavailable", available: bunVersion !== null },
+    electron: { version: electronVersion ?? null, available: Boolean(electronVersion && binaryAvailable), binaryAvailable },
     sqlite,
     dependencies,
     checks,
@@ -186,7 +183,7 @@ export async function inspectEnvironment(options: DoctorOptions = {}): Promise<E
 
 function printReport(report: EnvironmentReport): void {
   console.log(`Node: ${report.node.version} (${report.node.supported ? "supported" : "unsupported"})`);
-  console.log(`npm: ${report.npm.version}`);
+  console.log(`Bun: ${report.bun.version}`);
   console.log(`Electron: ${report.electron.version ?? "unavailable"}`);
   console.log(`SQLite: ${report.sqlite.sqliteVersion ?? "unavailable"} (better-sqlite3 ${report.sqlite.driverVersion ?? "unavailable"})`);
   for (const check of report.checks) {
@@ -197,7 +194,7 @@ function printReport(report: EnvironmentReport): void {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const report = await inspectEnvironment();
   printReport(report);
-  if (!report.node.supported || !report.npm.available || report.checks.some((check) => check.status === "blocked")) {
+  if (!report.node.supported || !report.bun.available || report.checks.some((check) => check.status === "blocked")) {
     process.exitCode = 1;
   }
 }

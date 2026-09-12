@@ -1,0 +1,19 @@
+{
+  "providers": {
+    "flowmate-provider": {
+      "baseUrl": "https://provider.example.invalid/v1",
+      "api": "openai-completions",
+      "apiKey": "$FLOWMATE_LLM_API_KEY",
+      "models": [
+        {
+          "id": "replace-model",
+          "name": "Flowmate P0 model",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32000,
+          "maxTokens": 2048
+        }
+      ]
+    }
+  }
+}

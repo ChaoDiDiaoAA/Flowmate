@@ -4,12 +4,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Application } from "./composition.js";
 import { IPC_CHANNELS, registerIpcHandlers } from "./ipc.js";
 import { shutdownApplication } from "./shutdown.js";
+import { loadDesktopApplication } from "./startup.js";
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | undefined;
 let currentApplication: Application | undefined;
 let unregisterIpc: (() => void) | undefined;
 let quitting = false;
+let closing: Promise<void> | undefined;
 
 function unavailableApplication(): Application {
   const unavailable = async (): Promise<never> => { throw new Error("DESKTOP_NOT_READY"); };
@@ -34,7 +36,7 @@ export async function createMainWindow(application?: Application): Promise<Brows
     minWidth: 960,
     minHeight: 640,
     webPreferences: {
-      preload: join(currentDir, "../preload/index.js"),
+      preload: join(currentDir, "../preload/index.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -43,38 +45,67 @@ export async function createMainWindow(application?: Application): Promise<Brows
   unregisterIpc = registerIpcHandlers(mainWindow, currentApplication);
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   mainWindow.webContents.on("will-navigate", (event, url) => {
-    const allowed = url.startsWith("file://") || url.startsWith("http://localhost");
-    if (!allowed) event.preventDefault();
+    if (url !== mainWindow?.webContents.getURL()) event.preventDefault();
   });
+  mainWindow.on("close", (event) => {
+    event.preventDefault();
+    void closeMainWindow().catch(reportStartupError);
+  });
+  mainWindow.on("closed", () => { unregisterIpc?.(); unregisterIpc = undefined; mainWindow = undefined; });
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
   if (rendererUrl) await mainWindow.loadURL(rendererUrl);
   else await mainWindow.loadFile(join(currentDir, "../renderer/index.html"));
-  mainWindow.on("closed", () => { unregisterIpc?.(); unregisterIpc = undefined; mainWindow = undefined; });
   return mainWindow;
 }
 
 export async function closeMainWindow(): Promise<void> {
-  if (!mainWindow) return;
-  await shutdownApplication(currentApplication);
-  mainWindow.destroy();
-  currentApplication = undefined;
+  if (closing) return closing;
+  closing = (async () => {
+    const result = await shutdownApplication(currentApplication);
+    if (result.status === "incomplete") throw new Error(`DESKTOP_CLEANUP_INCOMPLETE: ${result.reason}`);
+    currentApplication = undefined;
+    mainWindow?.destroy();
+  })();
+  try { await closing; } finally { closing = undefined; }
 }
 
-async function bootstrap(): Promise<void> {
+export async function bootstrap(applicationFactory?: () => Promise<Application>): Promise<void> {
   await app.whenReady();
-  await createMainWindow();
-  app.on("activate", () => { if (!mainWindow) void createMainWindow(currentApplication); });
+  const configuredFactory = applicationFactory ?? (process.env.FLOWMATE_DESKTOP_CONFIG
+    ? () => loadDesktopApplication(process.env.FLOWMATE_DESKTOP_CONFIG!) : undefined);
+  app.on("activate", () => {
+    if (!mainWindow && !closing) void (async () => createMainWindow(configuredFactory ? await configuredFactory() : undefined))().catch(reportStartupError);
+  });
   app.on("before-quit", (event) => {
     if (quitting) return;
     event.preventDefault();
     quitting = true;
-    void closeMainWindow().finally(() => app.quit());
+    void closeMainWindow().then(() => app.quit()).catch((error: unknown) => { quitting = false; reportStartupError(error); });
   });
   app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+  const application = configuredFactory ? await configuredFactory() : undefined;
+  await createMainWindow(application);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  void bootstrap();
+function reportStartupError(error: unknown): void {
+  console.error("Flowmate desktop failed:", error instanceof Error ? error.message : "unknown error");
+}
+
+const entryFile = fileURLToPath(import.meta.url);
+const invokedWithEntryFile = process.argv.slice(1).some((argument) => {
+  try {
+    return fileURLToPath(pathToFileURL(argument)) === entryFile;
+  } catch {
+    return false;
+  }
+});
+
+if (invokedWithEntryFile) {
+  void bootstrap().catch(async (error: unknown) => {
+    reportStartupError(error);
+    await shutdownApplication(currentApplication);
+    app.exit(1);
+  });
 }
 
 export { IPC_CHANNELS };

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -16,6 +16,40 @@ describe("native Pi session integration", () => {
         agentDir: join(root, "agent"),
         identity: { jobId: "job", runId: "run", generation: 1, candidateId: "candidate" },
       })).rejects.toThrow("MODEL_CONFIGURATION_REQUIRED");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("loads a custom model from the explicit Pi models path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "flowmate-pi-models-path-"));
+    const modelsPath = join(root, "models.json");
+    const authPath = join(root, "auth.json");
+    await writeFile(modelsPath, JSON.stringify({
+      providers: {
+        "flowmate-test": {
+          baseUrl: "https://flowmate.invalid/v1",
+          api: "openai-completions",
+          apiKey: "test-key",
+          models: [{ id: "model-from-file", contextWindow: 32_000, maxTokens: 1_024 }],
+        },
+      },
+    }));
+    await writeFile(authPath, "{}\n");
+    try {
+      const runtime = await createPiRuntime({
+        cwd: join(root, "cwd"),
+        agentDir: join(root, "agent"),
+        identity: { jobId: "job", runId: "run", generation: 1, candidateId: "candidate" },
+        modelRef: { provider: "flowmate-test", modelId: "model-from-file" },
+        modelsPath,
+        authPath,
+      });
+      try {
+        expect(runtime.sessionId).toMatch(/^flowmate-/);
+      } finally {
+        await runtime.close();
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }

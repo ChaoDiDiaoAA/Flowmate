@@ -7,7 +7,7 @@ export { IPC_CHANNELS } from "../shared/channels.js";
 
 function assertTrustedSender(event: IpcMainInvokeEvent, window: BrowserWindow): void {
   if (event.sender !== window.webContents) throw new Error("IPC_SENDER_REJECTED");
-  if (event.senderFrame && event.senderFrame.url && !event.senderFrame.url.startsWith("file://") && !event.senderFrame.url.startsWith("http://localhost")) {
+  if (!event.senderFrame || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== window.webContents.getURL()) {
     throw new Error("IPC_FRAME_REJECTED");
   }
 }

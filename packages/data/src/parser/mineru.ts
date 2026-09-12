@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
-import { extname, resolve } from "node:path";
+import { extname, isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { z } from "zod";
 import type { AssetRef, ParsedDocument } from "@flowmate/contracts";
 import { ParsedDocumentSchema } from "@flowmate/contracts";
 import { mapParserOutput } from "./output-map.js";
@@ -20,8 +21,66 @@ export type ParserProfile = {
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
+  modelCachePath?: string;
+  allowedInputExtensions?: string[];
   timeoutMs: number;
 };
+
+const ParserProfileFileSchema = z.object({
+  profileId: z.string().min(1),
+  mode: z.enum(["controlled", "live"]),
+  environment: z.enum(["local-test", "production"]),
+  available: z.boolean(),
+  executable: z.string().min(1),
+  parserName: z.string().min(1),
+  parserVersion: z.string().min(1),
+  outputRoot: z.string().min(1),
+  args: z.array(z.string()).optional(),
+  cwd: z.string().min(1).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  modelCachePath: z.string().min(1).optional(),
+  allowedInputExtensions: z.array(z.string().regex(/^\.?[a-z0-9]+$/i)).min(1).optional(),
+  timeoutMs: z.number().int().positive(),
+}).strict();
+
+export type ParserProfileFile = z.infer<typeof ParserProfileFileSchema>;
+
+function resolveExecutable(value: string, profileDirectory: string): string {
+  // Bare commands such as `mineru` must be resolved through PATH by spawn;
+  // only an explicit file path is anchored to the Profile directory.
+  return isAbsolute(value) || value.includes("/") || value.includes("\\")
+    ? (isAbsolute(value) ? value : resolve(profileDirectory, value))
+    : value;
+}
+
+/** Parse the on-disk Parser Profile used by the explicit P0 CLI entry. */
+export function parseParserProfile(value: unknown, profileDirectory: string): ParserProfile & { profileId: string; mode: "controlled" | "live"; environment: "local-test" | "production"; available: boolean } {
+  const parsed = ParserProfileFileSchema.safeParse(value);
+  if (!parsed.success) throw new Error("PARSER_PROFILE_INVALID");
+  const record = parsed.data;
+  if (record.mode === "live" && record.environment !== "local-test") {
+    throw new Error("PARSER_PROFILE_INVALID: live Parser Profiles must use local-test");
+  }
+  if (record.mode === "live" && !record.available) {
+    throw new Error("PARSER_PROFILE_INCOMPLETE: Parser Profile is unavailable");
+  }
+  return {
+    profileId: record.profileId,
+    mode: record.mode,
+    environment: record.environment,
+    available: record.available,
+    executable: resolveExecutable(record.executable, profileDirectory),
+    parserName: record.parserName,
+    parserVersion: record.parserVersion,
+    outputRoot: isAbsolute(record.outputRoot) ? record.outputRoot : resolve(profileDirectory, record.outputRoot),
+    ...(record.args === undefined ? {} : { args: [...record.args] }),
+    ...(record.cwd === undefined ? {} : { cwd: isAbsolute(record.cwd) ? record.cwd : resolve(profileDirectory, record.cwd) }),
+    ...(record.env === undefined ? {} : { env: { ...record.env } }),
+    ...(record.modelCachePath === undefined ? {} : { modelCachePath: isAbsolute(record.modelCachePath) ? record.modelCachePath : resolve(profileDirectory, record.modelCachePath) }),
+    ...(record.allowedInputExtensions === undefined ? {} : { allowedInputExtensions: record.allowedInputExtensions.map((item) => item.replace(/^\./, "").toLowerCase()) }),
+    timeoutMs: record.timeoutMs,
+  };
+}
 
 export type ParseAttempt = {
   attemptId: string;
@@ -48,6 +107,8 @@ function configHash(profile: ParserProfile): string {
     parserName: profile.parserName,
     parserVersion: profile.parserVersion,
     args: profile.args ?? [],
+    modelCachePath: profile.modelCachePath ? profile.modelCachePath.replaceAll("\\", "/") : null,
+    allowedInputExtensions: profile.allowedInputExtensions ?? [],
     timeoutMs: profile.timeoutMs,
   }));
 }
@@ -108,6 +169,18 @@ export async function parseOriginal(input: ParserInputRef, profile: ParserProfil
     document: null,
     error: null,
   };
+  const extension = extname(input.path).replace(/^\./, "").toLowerCase();
+  if (profile.allowedInputExtensions && !profile.allowedInputExtensions.includes(extension)) {
+    return { ...base, endedAt: new Date().toISOString(), error: { code: "PARSER_INPUT_FORMAT_UNSUPPORTED", message: `Input extension .${extension || "(none)"} is not allowed by the Parser Profile`, retryable: false } };
+  }
+  if (profile.modelCachePath) {
+    try {
+      const cacheStat = await stat(profile.modelCachePath);
+      if (!cacheStat.isDirectory()) throw new Error("model cache is not a directory");
+    } catch {
+      return { ...base, endedAt: new Date().toISOString(), error: { code: "PARSER_MODEL_CACHE_UNAVAILABLE", message: "Parser model cache is not readable", retryable: false } };
+    }
+  }
   const inputRead = await readStable(input.path);
   if ("error" in inputRead) return { ...base, endedAt: new Date().toISOString(), error: { code: "PARSER_INPUT_UNSTABLE", message: inputRead.error, retryable: true } };
   if (inputRead.hash !== input.sha256) return { ...base, inputHash: inputRead.hash, endedAt: new Date().toISOString(), error: { code: "PARSER_INPUT_HASH_MISMATCH", message: "input digest differs from the approved AssetRef", retryable: false } };
@@ -124,6 +197,7 @@ export async function parseOriginal(input: ParserInputRef, profile: ParserProfil
   });
   let killed = false;
   let timedOut = false;
+  let spawnError: string | undefined;
   const terminate = () => {
     if (killed) return;
     killed = true;
@@ -136,7 +210,7 @@ export async function parseOriginal(input: ParserInputRef, profile: ParserProfil
   const exitCode = await new Promise<number | null>((resolveExit) => {
     child.stdout.on("data", (chunk: Buffer) => { base.stdout = appendBounded(base.stdout, chunk); });
     child.stderr.on("data", (chunk: Buffer) => { base.stderr = appendBounded(base.stderr, chunk); });
-    child.once("error", (error) => { base.stderr = appendBounded(base.stderr, Buffer.from(error.message)); resolveExit(null); });
+    child.once("error", (error) => { spawnError = error.message; base.stderr = appendBounded(base.stderr, Buffer.from(error.message)); resolveExit(null); });
     child.once("close", (code) => resolveExit(code));
   });
   clearTimeout(timeout);
@@ -144,6 +218,7 @@ export async function parseOriginal(input: ParserInputRef, profile: ParserProfil
   const endedAt = new Date().toISOString();
   if (timedOut) return { ...base, endedAt, exitCode, error: { code: "PARSER_TIMEOUT", message: "Parser process exceeded its deadline", retryable: true } };
   if (signal?.aborted || killed) return { ...base, endedAt, exitCode, error: { code: "PARSER_CANCELLED", message: "Parser process was cancelled", retryable: true } };
+  if (spawnError) return { ...base, endedAt, exitCode, error: { code: "PARSER_EXECUTABLE_UNAVAILABLE", message: "Parser executable could not be started", retryable: false } };
   if (exitCode !== 0) return { ...base, endedAt, exitCode, error: { code: "PARSER_EXIT_NONZERO", message: "Parser exited with code " + String(exitCode), retryable: true } };
   const outputPath = await findOutput(outputRoot);
   if (!outputPath) return { ...base, endedAt, exitCode, error: { code: "PARSER_OUTPUT_INVALID", message: "Parser returned no JSON/Markdown output", retryable: false } };

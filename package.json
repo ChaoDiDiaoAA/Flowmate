@@ -3,17 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "bun@1.4.0",
   "workspaces": [
     "apps/*",
     "packages/*"
   ],
   "scripts": {
     "dev": "electron-vite dev --config apps/desktop/electron.vite.config.ts",
-    "build": "npm run typecheck && electron-vite build --config apps/desktop/electron.vite.config.ts",
+    "build": "bun run typecheck && electron-vite build --config apps/desktop/electron.vite.config.ts",
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:runtime": "vitest run tests/runtime",
-    "test:desktop": "npm run build && playwright test --config playwright.config.ts",
+    "test:desktop": "bun run build && playwright test --config playwright.config.ts",
     "test:live": "vitest run --config vitest.live.config.ts",
     "doctor": "tsx scripts/doctor.ts",
     "check:boundaries": "tsx scripts/check-boundaries.ts",

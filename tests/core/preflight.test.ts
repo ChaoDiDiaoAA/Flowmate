@@ -33,6 +33,16 @@ describe("candidate freezing and preflight", () => {
     expect(preflight(freezeCandidate(config), input, profile)).toMatchObject({ eligible: true, environment: "local-test" });
   });
 
+  it("allows a custom live model when its explicit models file supplies the credential binding", () => {
+    const result = preflight(freezeCandidate(config), input, {
+      ...profile,
+      mode: "live",
+      modelRef: { provider: "flowmate-test", modelId: "model-from-file" },
+      modelsPath: "D:/flowmate/private/llm/models.json",
+    });
+    expect(result).toMatchObject({ eligible: true, environment: "local-test" });
+  });
+
   it.each([
     ["production", { ...profile, environment: "production" as const }, input, "PRODUCTION_FORBIDDEN"],
     ["missing profile", { ...profile, available: false }, input, "PROFILE_UNAVAILABLE"],

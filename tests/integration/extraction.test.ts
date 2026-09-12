@@ -6,7 +6,7 @@ import { inspectSource, freezeDataset } from "../../packages/data/src/index.ts";
 import { withSourceFixture } from "../support/workspace.js";
 import { freezeCandidate, type CandidateConfig } from "../../packages/core/src/configuration/candidate.ts";
 import { createControlledProvider, createPiRuntime } from "../../packages/runtime-pi/src/index.ts";
-import { createApplication } from "../../apps/desktop/src/main/composition.ts";
+import { createApplication, createPiRuntimeFactory } from "../../apps/desktop/src/main/composition.ts";
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 const config: CandidateConfig = {
@@ -50,7 +50,7 @@ describe("P0 extraction application", () => {
         { toolCall: { name: "submit_invoice_candidate", arguments: { candidate: candidateForSample() } } },
         { text: "candidate accepted" },
       ]);
-      const app = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelProfileHash: hash("model"), available: true }, runtimeFactory: ({ identity, gateway, cwd, agentDir }) => createPiRuntime({ identity, gateway, cwd, agentDir, provider }) });
+      const app = createApplication({ dataRoot: join(root, "app-data"), agentRoot: join(root, "app-agent"), manifest, candidate, profile: { profileId: "fixture", environment: "local-test", modelProfileHash: hash("model"), available: true }, runtimeFactory: createPiRuntimeFactory({ provider }) });
       const started = await app.start({ sampleId: "SYN-001", candidateId: candidate.candidateId, clientRequestId: "click-1" });
       const duplicate = await app.start({ sampleId: "SYN-001", candidateId: candidate.candidateId, clientRequestId: "click-1" });
       expect(duplicate.runId).toBe(started.runId);
@@ -59,6 +59,7 @@ describe("P0 extraction application", () => {
       expect(completed.job.status).toBe("candidate_ready");
       expect(completed.candidates).toHaveLength(1);
       expect(completed.runs[0]?.sessionId).toBeTruthy();
+      expect(provider.requests[0]?.context.systemPrompt).toContain("Flowmate's invoice extraction agent");
       await expect(app.getEvidence({ jobId: started.jobId, assetId: "original:fixture-source:SYN-001" })).resolves.toMatchObject({ assetId: "original:fixture-source:SYN-001" });
       await app.close();
       provider.close();

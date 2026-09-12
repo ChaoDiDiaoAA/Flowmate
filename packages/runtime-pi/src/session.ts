@@ -38,6 +38,7 @@ export type RuntimeOutcome =
 export type RuntimeBudget = {
   reserveModelRequest(): void;
   reserveToolCall(): void;
+  recordUsage?(sample: { inputTokens: number | null; outputTokens: number | null }): void;
 };
 
 export type AgentRuntime = {
@@ -60,6 +61,8 @@ export type PiRuntimeOptions = {
   modelRuntime?: ModelRuntime;
   /** Explicit credential store for a Live Profile; never supplied by Renderer input. */
   authPath?: string;
+  /** Explicit Pi models.json path for custom or OpenAI-compatible providers. */
+  modelsPath?: string | null;
   provider?: ControlledProvider;
   customTools?: ToolDefinition[];
   gateway?: GatewayInvoker;
@@ -78,6 +81,11 @@ function lastAssistantText(session: AgentSession): string | undefined {
   const last = [...messages].reverse().find((message) => message.role === "assistant");
   if (!last || last.role !== "assistant") return undefined;
   return last.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+}
+
+function lastAssistantMessage(session: AgentSession): Extract<AgentSession["messages"][number], { role: "assistant" }> | undefined {
+  const message = [...session.messages].reverse().find((item) => item.role === "assistant");
+  return message?.role === "assistant" ? message : undefined;
 }
 
 let activeSubagentRuntime = false;
@@ -103,7 +111,11 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
   }
   const provider = options.provider;
   try {
-    const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({ authPath: options.authPath ?? join(options.agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+    const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({
+      authPath: options.authPath ?? join(options.agentDir, "auth.json"),
+      modelsPath: options.modelsPath ?? null,
+      refreshOnCreate: false,
+    });
     if (provider) modelRuntime.registerNativeProvider(provider.provider);
     const model = options.model
       ?? (provider ? provider.model : options.modelRef ? modelRuntime.getModel(options.modelRef.provider, options.modelRef.modelId) : undefined);
@@ -178,6 +190,16 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
               // Business tools are charged by the Gateway. The native Agent
               // tool has no Gateway request, so charge it at its execution edge.
               if (event.type === "tool_execution_start" && event.toolName === "Agent") options.budget.reserveToolCall();
+              // Pi's finalized assistant message is the authoritative usage
+              // record. Streaming updates are deliberately ignored so a
+              // provider's cumulative usage is not counted twice.
+              if (event.type === "message_end" && event.message.role === "assistant") {
+                const usage = event.message.usage;
+                options.budget.recordUsage?.({
+                  inputTokens: Number.isFinite(usage.input) ? usage.input : null,
+                  outputTokens: Number.isFinite(usage.output) ? usage.output : null,
+                });
+              }
             } catch (error) {
               budgetError = error instanceof Error ? error : new Error("runtime budget exceeded");
               void session.abort();
@@ -189,6 +211,11 @@ export async function createPiRuntime(options: PiRuntimeOptions): Promise<AgentR
           await session.prompt(context.taskPrompt);
           if (aborted) return { kind: "aborted", sessionId: session.sessionId };
           if (budgetError) return { kind: "failed", sessionId: session.sessionId, error: budgetError.message };
+          const assistant = lastAssistantMessage(session);
+          if (assistant?.stopReason === "error") {
+            return { kind: "failed", sessionId: session.sessionId, error: assistant.errorMessage ?? "Pi model request failed" };
+          }
+          if (assistant?.stopReason === "aborted") return { kind: "aborted", sessionId: session.sessionId };
           const text = lastAssistantText(session);
           return text === undefined ? { kind: "completed", sessionId: session.sessionId } : { kind: "completed", sessionId: session.sessionId, lastAssistantText: text };
         } catch (error) {

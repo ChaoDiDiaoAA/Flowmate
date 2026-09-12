@@ -20,6 +20,11 @@ describe("P0 command entry", () => {
     await expect(runP0Command(parseP0Args(["run", "--profile", "live-main"]), { cwd: process.cwd() })).resolves.toMatchObject({ code: "CAPABILITY_NOT_READY", exitCode: 1 });
   });
 
+  it("uses the Bun environment check for the default inspect command", async () => {
+    const result = await runP0Command(parseP0Args(["inspect"]), { cwd: process.cwd() });
+    expect(result.code).toBe("READY");
+  });
+
   it("runs the native Agent plugin probe without business data", async () => {
     const command = parseP0Args(["plugin-probe"]);
     const result = await runP0Command(command, { cwd: process.cwd() });
@@ -27,4 +32,5 @@ describe("P0 command entry", () => {
     expect(result.code).toBe("READY");
     expect(result.exitCode).toBe(0);
   });
+
 });

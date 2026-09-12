@@ -1,0 +1,5 @@
+[install]
+# Workspace packages and Electron/Vite are resolved from the repository root.
+# Hoisting keeps the Bun install layout compatible with Node-based tooling that
+# runs under tsx, Electron, Playwright, and Vite.
+linker = "hoisted"

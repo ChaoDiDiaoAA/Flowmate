@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -58,6 +58,41 @@ describe("Parser contract", () => {
       const pending = parseOriginal(fixture.input, { executable: process.execPath, parserName: "fixture", parserVersion: "1", outputRoot: join(fixture.root, "attempts-cancel"), args: [fixture.scriptPath], timeoutMs: 5_000 }, controller.signal);
       setTimeout(() => controller.abort(), 50);
       await expect(pending).resolves.toMatchObject({ error: { code: "PARSER_CANCELLED" } });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an input format outside the verified Parser Profile before spawning", async () => {
+    const fixture = await fixtureRoot("process.exit(0);");
+    try {
+      const result = await parseOriginal(fixture.input, {
+        executable: process.execPath,
+        parserName: "fixture",
+        parserVersion: "1",
+        outputRoot: join(fixture.root, "attempts-format"),
+        args: [fixture.scriptPath],
+        timeoutMs: 5_000,
+        allowedInputExtensions: ["pdf"],
+      }, undefined);
+      expect(result.error?.code).toBe("PARSER_INPUT_FORMAT_UNSUPPORTED");
+      await expect(access(result.outputRoot)).rejects.toThrow();
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes an unavailable Parser executable from a parser process failure", async () => {
+    const fixture = await fixtureRoot("process.exit(0);");
+    try {
+      const result = await parseOriginal(fixture.input, {
+        executable: join(fixture.root, "missing-mineru.exe"),
+        parserName: "fixture",
+        parserVersion: "1",
+        outputRoot: join(fixture.root, "attempts-missing-executable"),
+        timeoutMs: 5_000,
+      });
+      expect(result.error?.code).toBe("PARSER_EXECUTABLE_UNAVAILABLE");
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

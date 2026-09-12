@@ -5,6 +5,8 @@ export * from "./jobs/repository.js";
 export * from "./jobs/service.js";
 export * from "./configuration/candidate.js";
 export * from "./configuration/preflight.js";
+export * from "./configuration/profile.js";
+export * from "./configuration/model-profile.js";
 export * from "./context/build-context.js";
 export * from "./tools/registry.js";
 export * from "./tools/gateway.js";

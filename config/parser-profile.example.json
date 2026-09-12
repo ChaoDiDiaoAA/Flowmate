@@ -1,0 +1,12 @@
+{
+  "profileId": "parser-live",
+  "mode": "live",
+  "environment": "local-test",
+  "available": false,
+  "executable": "mineru",
+  "parserName": "mineru",
+  "parserVersion": "replace-after-mineru-doctor",
+  "outputRoot": "../private/parser-attempts",
+  "allowedInputExtensions": ["jpg", "jpeg", "png", "pdf"],
+  "timeoutMs": 300000
+}

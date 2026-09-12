@@ -6,6 +6,8 @@ describe("P0 runtime lock", () => {
     const report = await verifyRuntimeLock({ cwd: process.cwd() });
 
     expect(report.nodeSupported).toBe(true);
+    expect(report.bunSupported).toBe(true);
+    expect(report.bunVersion).toMatch(/^\d+\.\d+\.\d+/);
     expect(report.mismatches).toEqual([]);
     expect(report.checkedPackages).toContain("@earendil-works/pi-coding-agent");
     expect(report.checkedPackages).toContain("@tintinweb/pi-subagents");

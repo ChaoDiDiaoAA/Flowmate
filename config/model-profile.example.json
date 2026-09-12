@@ -1,0 +1,40 @@
+{
+  "profileId": "llm-main",
+  "version": "1",
+  "modelRef": {
+    "provider": "flowmate-provider",
+    "modelId": "replace-model"
+  },
+  "api": "openai-completions",
+  "baseUrl": "https://provider.example.invalid/v1",
+  "capabilities": {
+    "contextWindow": 32000,
+    "maxOutputTokens": 2048,
+    "inputTypes": ["text"],
+    "toolCalling": true,
+    "streaming": true
+  },
+  "generation": {
+    "temperature": 0,
+    "topP": 1,
+    "thinking": "none"
+  },
+  "credential": {
+    "profileId": "llm-env",
+    "source": "env",
+    "envVar": "FLOWMATE_LLM_API_KEY"
+  },
+  "budget": {
+    "maxModelRequests": 6,
+    "maxToolCalls": 12,
+    "wallTimeMs": 120000,
+    "maxKnownTokens": null,
+    "maxKnownCost": null,
+    "unknownUsagePolicy": "stop"
+  },
+  "purpose": {
+    "environment": "local-test",
+    "roles": ["invoice-extractor"],
+    "allowedSampleIds": ["replace-after-freeze"]
+  }
+}

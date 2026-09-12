@@ -19,4 +19,66 @@ Flowmate 交付基于 Pi SDK 二次开发的企业数字员工平台，以及首
 
 用户已更正使用项目内的数据，实际子目录在 P0 接入前核验；总方案中的外部数据路径属于待同步的历史位置。旧实现与工程配置已清理，当前代码按新方案迁移并继续补齐 P0；旧教程中的命令及成绩不作为当前基线。
 
-当前可运行的检查入口：`npm run doctor`、`npm run typecheck`、`npm test`、`npm run build`、`npm run p0 -- plugin-probe`。数据冻结必须显式指定角色映射和用途，例如 `npm run p0 -- freeze -- --root <sourceRoot> --role-map <role-map.json> --output <frozenRoot> --purpose <sampleId>=test`；不会默认把目录中的全部文件纳入模型输入。真实主模型入口在具备 Live Profile、候选和冻结清单后使用 `npm run p0 -- run -- --profile live-main --manifest <frozenRoot> --candidate <candidate.json> --sample <sampleId>`，缺条件时返回明确未就绪错误。
+## 前置条件
+
+| 项目 | 要求 | 用途 |
+|---|---|---|
+| Bun | 1.4 或更高版本 | 安装依赖和运行全部根脚本 |
+| Node.js | 22 或更高版本 | Pi SDK、脚本和原生依赖兼容 |
+| Electron | 项目锁定版本及可执行文件 | 开发模式和桌面 E2E |
+| SQLite | `better-sqlite3` 可加载 | Job、Run、候选和事件持久化 |
+| Pi 运行时 | Pi SDK 原生包和 `@tintinweb/pi-subagents` | Agent Session、扩展和子 Session |
+| 真实模型 | Live Profile、Provider 配置和本机凭证 | P0 真实字段抽取；默认测试不会自动调用 |
+| 新原图 Parser | 已核验的 MinerU 可执行文件、模型缓存和 Parser Profile | 没有预存解析结果的新原图试验 |
+
+Flowmate 不需要 Longbridge CLI，也不使用截图中的 `FINAGENT_*` 环境变量。默认开发和测试使用受控 Provider；真实模型只通过显式 Live Profile 运行。
+
+## 安装与开发
+
+| 命令 | 说明 | 适用阶段 | 状态 |
+|---|---|---|---|
+| `bun install --frozen-lockfile` | 按锁定版本安装工作区依赖 | P0–P6 | 可执行 |
+| `bunx install-electron --no` | Electron 二进制缺失时补齐本机文件 | P0 | 按需执行 |
+| `bun run doctor` | 检查 Bun、Node、Electron、SQLite、Pi SDK、插件和目录 | P0–P6 | 可执行 |
+| `bun run dev` | 启动 Electron 开发模式 | P0–P6 | 可执行 |
+| `$env:FLOWMATE_DESKTOP_CONFIG='<desktop-config>'; bun run dev` | 使用指定桌面配置启动开发模式（PowerShell） | P0–P6 | 可执行 |
+
+桌面配置格式见 [`config/desktop.example.json`](config/desktop.example.json)，桌面主进程和凭证边界见[桌面说明](apps/desktop/README.md)。
+
+## 检查、测试与构建
+
+| 命令 | 说明 | 适用阶段 | 状态 |
+|---|---|---|---|
+| `bun run typecheck` | 检查所有工作区、脚本和测试的 TypeScript | P0–P6 | 可执行 |
+| `bun run lint` | 执行代码风格和静态质量检查 | P1–P6 | P1 起启用 |
+| `bun run check:boundaries` | 检查 contracts、core、Runtime 与 Renderer 的依赖方向 | P0–P6 | 可执行 |
+| `bun run verify:runtime-lock` | 检查运行时和锁定版本 | P0–P6 | 可执行 |
+| `bun run test` | 运行离线单元、契约和集成测试 | P0–P6 | 可执行 |
+| `bun run test:runtime` | 运行 Pi Runtime、工具、扩展和子 Agent F | P0–P6 | 可执行 |
+| `bun run test:desktop` | 构建并启动真实 Electron，运行 Playwright E2E | P0–P6 | 可执行 |
+| `bun run test:live` | 执行显式 Live 测试，不混入默认测试 | P0–P6 | 具备入口，按条件启用 |
+| `bun run build` | 构建工作区包、CLI、主进程、preload 和 Renderer | P0–P6 | 可执行 |
+
+## P0 数据与运行
+
+| 命令 | 说明 | 前置条件 | 状态 |
+|---|---|---|---|
+| `bun run p0 -- inspect --root <sourceRoot> --role-map <roleMap>` | 盘点原始文件和已有解析结果，输出有效项及隔离项 | 数据根与角色映射已核验 | 可执行 |
+| `bun run p0 -- freeze --root <sourceRoot> --role-map <roleMap> --output <frozenRoot> --purpose <sampleId>=test` | 冻结明确指定用途的输入 | `inspect` 通过；用途已确认 | 可执行 |
+| `bun run p0 -- parser --profile <parserProfile> --input <original> --sample <sampleId> --source-id <sourceId>` | 对没有解析产物的新原图执行 Parser 试验 | Parser、模型缓存、输入格式和 Profile 可用 | 入口可执行，真实环境待接入 |
+| `bun run p0 -- plugin-probe` | 验证 Pi 原生扩展、Agent 工具和子 Session | Pi SDK、扩展和子 Agent 插件可加载 | 可执行 |
+| `bun run p0 -- run --profile <liveProfile> --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 通过正式 Application/Pi Runtime 执行一次真实字段抽取 | Live Profile、冻结输入、候选和 Provider 已获准 | 入口可执行，真实环境待接入 |
+| `bun run verify:handoff <manifest>` | 验证功能证据交接文件 | 交接文件已生成 | 可执行 |
+
+模型契约模板见 [`config/model-profile.example.json`](config/model-profile.example.json)，Parser 模板见 [`config/parser-profile.example.json`](config/parser-profile.example.json)。模板不包含真实凭证；缺少真实数据、Live Profile 或 MinerU 时，命令必须明确返回未就绪。
+
+## Agent 评测与发布命令
+
+| 命令 | 说明 | 适用阶段 | 状态 |
+|---|---|---|---|
+| `bun run eval:smoke` | 快速检查评测设施、种子 Case/Gold 和评分器，不访问真实业务系统 | P0–P6 | 评测 Runner 实现后启用 |
+| `bun run eval:full` | 执行当前阶段冻结的完整 Agent Benchmark、评分、报告和结论 | P1–P6 | 后续阶段实现 |
+| `bun run release:check` | 汇总类型、边界、测试、E2E、构建和质量结论门禁 | P1–P6 | 后续阶段实现 |
+| `bun run release:package` | 生成经批准的桌面发布包 | P5–P6 | 后续阶段实现 |
+
+评测命令的模式、Case/Gold、Benchmark、归因和阶段边界见 [Agent 评测总方案](docs/spec/01_Flowmate_Agent评测总方案.md)；未实现的命令不会作为当前验收结果。

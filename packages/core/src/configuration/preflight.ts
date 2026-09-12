@@ -1,4 +1,5 @@
 import { Sha256Schema, TestCandidateSchema, type TestCandidate } from "@flowmate/contracts";
+import type { ModelProfile } from "./model-profile.js";
 
 export type PreflightInput = {
   sampleId: string;
@@ -16,6 +17,8 @@ export type RuntimeProfile = {
   mode?: "controlled" | "live";
   modelRef?: { provider: string; modelId: string };
   authPath?: string;
+  modelsPath?: string;
+  modelProfile?: ModelProfile;
   allowedSampleIds?: string[];
 };
 
@@ -32,8 +35,8 @@ export function preflight(candidate: TestCandidate, input: PreflightInput, profi
   if (!checked.success) return reject(profile.environment, "CANDIDATE_INVALID", "candidate does not satisfy the fixed test contract");
   if (profile.environment !== "local-test") return reject(profile.environment, "PRODUCTION_FORBIDDEN", "P0 candidates may run only in local-test");
   if (!profile.available) return reject(profile.environment, "PROFILE_UNAVAILABLE", "selected runtime profile is unavailable");
-  if (profile.mode === "live" && (!profile.modelRef?.provider || !profile.modelRef.modelId || !profile.authPath)) {
-    return reject(profile.environment, "PROFILE_INCOMPLETE", "a Live Profile needs provider, model, and auth path");
+  if (profile.mode === "live" && (!profile.modelRef?.provider || !profile.modelRef.modelId || (!profile.authPath && !profile.modelsPath))) {
+    return reject(profile.environment, "PROFILE_INCOMPLETE", "a Live Profile needs provider, model, and an explicit auth or models path");
   }
   if (profile.allowedSampleIds && !profile.allowedSampleIds.includes(input.sampleId)) {
     return reject(profile.environment, "SAMPLE_NOT_ALLOWED", "sample is outside the selected profile allowlist");

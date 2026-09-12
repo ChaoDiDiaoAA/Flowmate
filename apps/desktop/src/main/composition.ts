@@ -45,7 +45,15 @@ export type Application = {
 export function createPiRuntimeFactory(
   runtimeOptions: Omit<PiRuntimeOptions, "identity" | "gateway" | "cwd" | "agentDir" | "budget"> = {},
 ): RuntimeFactory {
-  return ({ identity, gateway, cwd, agentDir, budget }) => createPiRuntime({ ...runtimeOptions, identity, gateway, cwd, agentDir, budget });
+  return ({ identity, gateway, context, cwd, agentDir, budget }) => createPiRuntime({
+    ...runtimeOptions,
+    identity,
+    gateway,
+    cwd,
+    agentDir,
+    budget,
+    systemPrompt: runtimeOptions.systemPrompt ?? context.systemPrompt,
+  });
 }
 
 const activeStatuses = new Set(["created", "running", "cancelling"]);
@@ -55,8 +63,12 @@ export function createApplication(config: ApplicationConfig): Application {
   const startRequests = new Map<string, Promise<StartResult>>();
   const jobService = createJobService(store);
   const activeSamples = new Map<string, string>();
+  const pendingSamples = new Set<string>();
+  const pendingLaunches = new Set<Promise<StartResult>>();
+  let closing = false;
+  let closePromise: Promise<void> | undefined;
 
-  const launch = async (sampleId: string, candidateId: string, existingJobId?: string): Promise<StartResult> => {
+  const launchRun = async (sampleId: string, candidateId: string, existingJobId?: string): Promise<StartResult> => {
     if (candidateId !== config.candidate.candidateId) throw new Error("CANDIDATE_NOT_FOUND");
     if (!existingJobId && activeSamples.has(sampleId)) throw new Error("RUN_BUSY");
     const projection = await createProjection(config.manifest, sampleId);
@@ -90,9 +102,22 @@ export function createApplication(config: ApplicationConfig): Application {
     }
   };
 
+  const launch = (sampleId: string, candidateId: string, existingJobId?: string): Promise<StartResult> => {
+    if (closing) return Promise.reject(new Error("APPLICATION_CLOSED"));
+    if (pendingSamples.has(sampleId) || activeSamples.has(sampleId)) return Promise.reject(new Error("RUN_BUSY"));
+    // Reserve before the first await: concurrent IPC calls must not both pass preflight.
+    pendingSamples.add(sampleId);
+    const request = launchRun(sampleId, candidateId, existingJobId);
+    pendingLaunches.add(request);
+    const release = () => { pendingSamples.delete(sampleId); pendingLaunches.delete(request); };
+    void request.then(release, release);
+    return request;
+  };
+
   return {
-    listSamples() { return config.manifest.cases.map((item) => ({ sampleId: item.sampleId, sourceId: item.sourceId, purpose: item.purpose, parserVersion: item.parserVersion })); },
+    listSamples() { return config.manifest.cases.filter((item) => !config.profile.allowedSampleIds || config.profile.allowedSampleIds.includes(item.sampleId)).map((item) => ({ sampleId: item.sampleId, sourceId: item.sourceId, purpose: item.purpose, parserVersion: item.parserVersion })); },
     start(command) {
+      if (closing) return Promise.reject(new Error("APPLICATION_CLOSED"));
       const existing = startRequests.get(command.clientRequestId);
       if (existing) return existing;
       const request = launch(command.sampleId, command.candidateId);
@@ -100,6 +125,7 @@ export function createApplication(config: ApplicationConfig): Application {
       return request;
     },
     async rebuild(command) {
+      if (closing) throw new Error("APPLICATION_CLOSED");
       const snapshot = store.getJob(command.jobId);
       if (snapshot.runs.some((run) => activeStatuses.has(run.status))) throw new Error("RUN_BUSY");
       return launch(snapshot.job.sampleId, snapshot.job.candidateId, command.jobId);
@@ -124,8 +150,14 @@ export function createApplication(config: ApplicationConfig): Application {
     },
     getDiagnostics() { return { activeRunCount: jobService.activeRunCount(), datasetVersion: config.manifest.datasetVersion, candidateId: config.candidate.candidateId, profileId: config.profile.profileId }; },
     async close() {
-      await jobService.close("application_close");
-      if (!config.store) store.close();
+      closing = true;
+      closePromise ??= (async () => {
+        await Promise.allSettled([...pendingLaunches]);
+        const cleanup = await jobService.close("application_close");
+        if (cleanup.status !== "complete") throw new Error(`APPLICATION_CLEANUP_INCOMPLETE: ${cleanup.reason}`);
+        if (!config.store) store.close();
+      })();
+      try { await closePromise; } catch (error) { closePromise = undefined; throw error; }
     },
   };
 }

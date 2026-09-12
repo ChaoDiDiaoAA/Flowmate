@@ -1,9 +1,9 @@
 import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, extname, isAbsolute, resolve } from "node:path";
 import { inspectEnvironment } from "./doctor.js";
-import { freezeDataset, inspectSource, loadFrozenDataset, type SourceRoleMap } from "@flowmate/data";
+import { freezeDataset, inspectSource, loadFrozenDataset, parseOriginal, parseParserProfile, type ParserInputRef, type SourceRoleMap } from "@flowmate/data";
 import { TestCandidateSchema, type DatasetPurpose } from "@flowmate/contracts";
-import { verifyHandoff, type RuntimeProfile } from "@flowmate/core";
+import { parseRuntimeProfile, verifyHandoff } from "@flowmate/core";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -22,6 +22,8 @@ export type P0Command = {
   manifestPath: string | null;
   candidatePath: string | null;
   outputRoot: string | null;
+  inputPath: string | null;
+  sourceId: string | null;
   sampleId: string | null;
   purposes: Array<{ sampleId: string; purpose: DatasetPurpose }>;
 };
@@ -40,6 +42,11 @@ export type P0CommandResult = {
     runId?: string;
     candidateId?: string;
     errorsList?: string[];
+    attemptId?: string;
+    inputHash?: string;
+    outputRoot?: string;
+    outputRefs?: number;
+    parser?: { name: string; version: string; configHash: string };
   };
 };
 
@@ -56,12 +63,16 @@ export function parseP0Args(args: string[]): P0Command {
   const manifestIndex = rest.indexOf("--manifest");
   const candidateIndex = rest.indexOf("--candidate");
   const outputIndex = rest.indexOf("--output");
+  const inputIndex = rest.indexOf("--input");
+  const sourceIdIndex = rest.indexOf("--source-id");
   const sampleIndex = rest.indexOf("--sample");
   const sourceRoot = rootIndex >= 0 ? rest[rootIndex + 1] ?? null : null;
   const roleMapPath = roleMapIndex >= 0 ? rest[roleMapIndex + 1] ?? null : null;
   const manifestPath = manifestIndex >= 0 ? rest[manifestIndex + 1] ?? null : null;
   const candidatePath = candidateIndex >= 0 ? rest[candidateIndex + 1] ?? null : null;
   const outputRoot = outputIndex >= 0 ? rest[outputIndex + 1] ?? null : null;
+  const inputPath = inputIndex >= 0 ? rest[inputIndex + 1] ?? null : null;
+  const sourceId = sourceIdIndex >= 0 ? rest[sourceIdIndex + 1] ?? null : null;
   const sampleId = sampleIndex >= 0 ? rest[sampleIndex + 1] ?? null : null;
   const purposes: Array<{ sampleId: string; purpose: DatasetPurpose }> = [];
   for (let index = 0; index < rest.length; index += 1) {
@@ -73,7 +84,7 @@ export function parseP0Args(args: string[]): P0Command {
     if (sampleId && (purpose === "development" || purpose === "test" || purpose === "holdout")) purposes.push({ sampleId, purpose });
   }
   const consumed = new Set<number>();
-  for (const index of [profileIndex, rootIndex, roleMapIndex, manifestIndex, candidateIndex, outputIndex, sampleIndex]) {
+  for (const index of [profileIndex, rootIndex, roleMapIndex, manifestIndex, candidateIndex, outputIndex, inputIndex, sourceIdIndex, sampleIndex]) {
     if (index >= 0) {
       consumed.add(index);
       if (index + 1 < rest.length) consumed.add(index + 1);
@@ -81,7 +92,7 @@ export function parseP0Args(args: string[]): P0Command {
   }
   for (let index = 0; index < rest.length; index += 1) if (rest[index] === "--purpose") { consumed.add(index); consumed.add(index + 1); }
   const positional = rest.filter((arg, index) => arg !== "--live" && !consumed.has(index));
-  return { kind, live, profile, positional, sourceRoot, roleMapPath, manifestPath, candidatePath, outputRoot, sampleId, purposes };
+  return { kind, live, profile, positional, sourceRoot, roleMapPath, manifestPath, candidatePath, outputRoot, inputPath, sourceId, sampleId, purposes };
 }
 
 export type P0CommandOptions = { cwd: string; sourceRoot?: string; roleMap?: SourceRoleMap };
@@ -98,12 +109,21 @@ type DesktopCompositionModule = {
 };
 
 async function loadDesktopComposition(cwd: string): Promise<DesktopCompositionModule | null> {
-  try {
-    const modulePath = resolve(cwd, "apps", "desktop", "dist", "main", "composition.js");
-    return await import(pathToFileURL(modulePath).href) as unknown as DesktopCompositionModule;
-  } catch {
-    return null;
+  const modulePaths = [
+    resolve(cwd, "apps", "desktop", "dist", "main", "composition.js"),
+    // `p0` is a Bun/tsx entry. The source fallback keeps the explicit CLI
+    // usable after a clean checkout without requiring generated package output;
+    // the normal build still prefers the checked TypeScript output above.
+    resolve(cwd, "apps", "desktop", "src", "main", "composition.ts"),
+  ];
+  for (const modulePath of modulePaths) {
+    try {
+      return await import(pathToFileURL(modulePath).href) as unknown as DesktopCompositionModule;
+    } catch {
+      // Try the next known workspace entry, then report a single clear state.
+    }
   }
+  return null;
 }
 
 async function loadRoleMap(path: string): Promise<SourceRoleMap | null> {
@@ -135,43 +155,21 @@ async function profilePath(cwd: string, profile: string): Promise<string | null>
   return null;
 }
 
-function runtimeProfile(value: unknown, cwd: string): RuntimeProfile | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const allowedKeys = new Set(["profileId", "mode", "environment", "available", "modelProfileHash", "modelRef", "authPath", "allowedSampleIds"]);
-  if (Object.keys(record).some((key) => !allowedKeys.has(key))) return null;
-  if (typeof record.profileId !== "string" || typeof record.modelProfileHash !== "string" || typeof record.available !== "boolean") return null;
-  if (!/^[a-f0-9]{64}$/.test(record.modelProfileHash)) return null;
-  if (record.environment !== "local-test" && record.environment !== "production") return null;
-  const modelValue = record.modelRef;
-  const modelProvider = modelValue && typeof modelValue === "object" && !Array.isArray(modelValue)
-    ? (modelValue as Record<string, unknown>).provider
-    : undefined;
-  const modelId = modelValue && typeof modelValue === "object" && !Array.isArray(modelValue)
-    ? (modelValue as Record<string, unknown>).modelId
-    : undefined;
-  const modelRef = typeof modelProvider === "string" && typeof modelId === "string"
-    ? { provider: modelProvider, modelId }
-    : undefined;
-  const mode = record.mode === "live" || record.mode === "controlled" ? record.mode : undefined;
-  const authPath = typeof record.authPath === "string" ? record.authPath : undefined;
-  const allowedSampleIds = Array.isArray(record.allowedSampleIds) && record.allowedSampleIds.every((item) => typeof item === "string")
-    ? record.allowedSampleIds as string[]
-    : undefined;
-  return {
-    profileId: record.profileId,
-    environment: record.environment,
-    modelProfileHash: record.modelProfileHash,
-    available: record.available,
-    ...(mode === undefined ? {} : { mode }),
-    ...(modelRef === undefined ? {} : { modelRef }),
-    ...(authPath === undefined ? {} : { authPath: isAbsolute(authPath) ? authPath : resolve(cwd, authPath) }),
-    ...(allowedSampleIds === undefined ? {} : { allowedSampleIds }),
-  };
-}
-
 function hashJson(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function mediaTypeForPath(path: string): string {
+  switch (extname(path).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".png": return "image/png";
+    case ".pdf": return "application/pdf";
+    case ".webp": return "image/webp";
+    case ".tif":
+    case ".tiff": return "image/tiff";
+    default: return "application/octet-stream";
+  }
 }
 
 export async function runP0Command(command: P0Command, options: P0CommandOptions): Promise<P0CommandResult> {
@@ -207,7 +205,7 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
       }
     }
     const report = await inspectEnvironment({ cwd: options.cwd });
-    const blocked = !report.node.supported || !report.npm.available || report.checks.some((check) => check.status === "blocked");
+    const blocked = !report.node.supported || !report.bun.available || report.checks.some((check) => check.status === "blocked");
     return { exitCode: blocked ? 1 : 0, code: blocked ? "CAPABILITY_NOT_READY" : "READY", message: blocked ? "environment is not ready" : "environment is ready" };
   }
   if (command.kind === "freeze") {
@@ -295,21 +293,86 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
     }
   }
   if (command.kind === "parser") {
-    return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "PARSER_ENV_NOT_READY: a verified local Parser Profile and an unparsed original are required" };
+    if (!command.profile) return { exitCode: 2, code: "LIVE_PROFILE_REQUIRED", message: "parser requires an explicit --profile" };
+    if (!command.inputPath || !command.sampleId) {
+      return { exitCode: 2, code: "INVALID_COMMAND", message: "parser requires --input <original> and --sample <sampleId>" };
+    }
+    const selectedProfilePath = await profilePath(options.cwd, command.profile);
+    if (!selectedProfilePath) return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "PARSER_ENV_NOT_READY: Parser Profile file was not found" };
+    let profile;
+    try {
+      profile = parseParserProfile(await loadJson(selectedProfilePath), dirname(selectedProfilePath));
+    } catch (error) {
+      return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: error instanceof Error ? error.message : "PARSER_PROFILE_INVALID" };
+    }
+    if (profile.mode !== "live") return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "PARSER_ENV_NOT_READY: Parser Profile must declare mode=live" };
+    const inputFile = isAbsolute(command.inputPath) ? command.inputPath : resolve(options.cwd, command.inputPath);
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(inputFile);
+    } catch {
+      return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "PARSER_INPUT_NOT_FOUND: original file is not readable" };
+    }
+    const sampleId = command.sampleId;
+    const sourceId = command.sourceId ?? "original";
+    const input: ParserInputRef = {
+      assetId: `original:${sourceId}:${sampleId}`,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      mediaType: mediaTypeForPath(inputFile),
+      path: inputFile,
+      sampleId,
+      sourceId,
+    };
+    try {
+      const attempt = await parseOriginal(input, profile);
+      if (attempt.error || !attempt.document) {
+        return {
+          exitCode: 1,
+          code: "CAPABILITY_NOT_READY",
+          message: `${attempt.error?.code ?? "PARSER_OUTPUT_INVALID"}: ${attempt.error?.message ?? "Parser did not return a valid document"}`,
+          details: {
+            attemptId: attempt.attemptId,
+            inputHash: attempt.inputHash,
+            outputRoot: attempt.outputRoot,
+            outputRefs: attempt.outputRefs.length,
+            parser: attempt.parser,
+            errorsList: attempt.error ? [attempt.error.message] : ["document is missing"],
+          },
+        };
+      }
+      return {
+        exitCode: 0,
+        code: "READY",
+        message: `Parser completed: ${attempt.document.blocks.length} blocks`,
+        details: {
+          attemptId: attempt.attemptId,
+          inputHash: attempt.inputHash,
+          outputRoot: attempt.outputRoot,
+          outputRefs: attempt.outputRefs.length,
+          parser: attempt.parser,
+        },
+      };
+    } catch (error) {
+      return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: error instanceof Error ? error.message : "Parser execution failed" };
+    }
   }
   if (command.kind === "run") {
     if (!command.profile) return { exitCode: 2, code: "LIVE_PROFILE_REQUIRED", message: "run requires an explicit --profile" };
     const selectedProfilePath = await profilePath(options.cwd, command.profile);
     if (!selectedProfilePath) return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "LIVE_PROFILE_INCOMPLETE: selected Profile file was not found" };
-    const profile = runtimeProfile(await loadJson(selectedProfilePath), options.cwd);
-    if (!profile || profile.mode !== "live" || !profile.modelRef || !profile.authPath) {
-      return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "LIVE_PROFILE_INCOMPLETE: Profile must declare mode=live, modelRef and authPath" };
+    let profile;
+    try {
+      profile = parseRuntimeProfile(await loadJson(selectedProfilePath), dirname(selectedProfilePath));
+    } catch (error) {
+      return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: error instanceof Error ? error.message : "RUNTIME_PROFILE_INVALID" };
     }
+    if (profile.mode !== "live") return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "LIVE_PROFILE_INCOMPLETE: Profile must declare mode=live" };
     if (!command.manifestPath || !command.candidatePath || !command.sampleId) {
       return { exitCode: 2, code: "INVALID_COMMAND", message: "run requires --manifest <frozen-root> --candidate <candidate.json> --sample <sampleId>" };
     }
     try {
-      await readFile(profile.authPath, "utf8");
+      if (profile.authPath) await readFile(profile.authPath, "utf8");
+      if (profile.modelsPath) await readFile(profile.modelsPath, "utf8");
     } catch {
       return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "LIVE_PROFILE_INCOMPLETE: auth Profile is not readable" };
     }
@@ -324,22 +387,24 @@ export async function runP0Command(command: P0Command, options: P0CommandOptions
       const outputRoot = command.outputRoot ? (isAbsolute(command.outputRoot) ? command.outputRoot : resolve(options.cwd, command.outputRoot)) : resolve(manifestRoot, "runs");
       const agentRoot = resolve(outputRoot, "agent");
       const desktop = await loadDesktopComposition(options.cwd);
-      if (!desktop) return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "DESKTOP_COMPOSITION_NOT_BUILT: run npm run typecheck before the Live entry" };
+      if (!desktop) return { exitCode: 1, code: "CAPABILITY_NOT_READY", message: "DESKTOP_COMPOSITION_NOT_BUILT: run bun run typecheck before the Live entry" };
       const app = desktop.createApplication({
         dataRoot: outputRoot,
         agentRoot,
         manifest,
         candidate: candidateResult.data,
         profile,
-        runtimeFactory: ({ identity, gateway, cwd, agentDir, budget }: { identity: PiRuntimeOptions["identity"]; gateway: NonNullable<PiRuntimeOptions["gateway"]>; cwd: string; agentDir: string; budget: NonNullable<PiRuntimeOptions["budget"]> }) => {
+        runtimeFactory: ({ identity, gateway, context, cwd, agentDir, budget }: { identity: PiRuntimeOptions["identity"]; gateway: NonNullable<PiRuntimeOptions["gateway"]>; context: { systemPrompt: string }; cwd: string; agentDir: string; budget: NonNullable<PiRuntimeOptions["budget"]> }) => {
           const runtimeOptions: PiRuntimeOptions = {
             identity,
             gateway,
             cwd,
             agentDir,
             budget,
+            systemPrompt: context.systemPrompt,
             ...(profile.modelRef === undefined ? {} : { modelRef: profile.modelRef }),
             ...(profile.authPath === undefined ? {} : { authPath: profile.authPath }),
+            ...(profile.modelsPath === undefined ? {} : { modelsPath: profile.modelsPath }),
           };
           return createPiRuntime(runtimeOptions);
         },

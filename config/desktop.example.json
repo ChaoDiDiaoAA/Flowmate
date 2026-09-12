@@ -1,0 +1,6 @@
+{
+  "manifestRoot": "../private/frozen",
+  "candidatePath": "../private/candidate.json",
+  "profilePath": "./profiles/live-main.json",
+  "dataRoot": "../private/desktop-data"
+}
