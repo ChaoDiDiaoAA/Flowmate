@@ -19,9 +19,9 @@ async function withDesktop(fn: (config: string, root: string) => Promise<void>) 
       environment: "local-test", budget: { maxModelRequests: 12, maxToolCalls: 20, wallTimeMs: 30_000 }, eligibility: "test",
     });
     await writeFile(join(root, "candidate.json"), JSON.stringify(candidate));
-    await writeFile(join(root, "profile.json"), JSON.stringify({ profileId: "desktop-controlled", environment: "local-test", available: true, mode: "controlled", modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, modelConfigHash: hash("controlled") }));
+    const profile = { profileId: "desktop-controlled", environment: "local-test", available: true, mode: "controlled", modelRef: { provider: "flowmate-controlled", modelId: "controlled" }, modelConfigHash: hash("controlled") };
     const config = join(root, "desktop.json");
-    await writeFile(config, JSON.stringify({ manifestRoot: "frozen", candidatePath: "candidate.json", profilePath: "profile.json", dataRoot: "state" }));
+    await writeFile(config, JSON.stringify({ manifestRoot: "frozen", candidatePath: "candidate.json", profile, dataRoot: "state" }));
     await fn(config, root);
   });
 }

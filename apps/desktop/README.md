@@ -7,11 +7,11 @@ Electron 主进程组装 Application 并通过受限 preload IPC 提供 P0 操�
 ```powershell
 bunx install-electron --no
 bun run build
-$env:FLOWMATE_DESKTOP_CONFIG = 'D:\code\Flowmate\config\desktop.local.json'
+$env:FLOWMATE_DESKTOP_CONFIG = 'D:\code\Flowmate\config\flowmate.local.json'
 bunx electron out/main/index.js
 ```
 
-按 `config/desktop.example.json` 准备本地配置，指向已冻结的数据清单、TestCandidate、Live Profile 和可写数据目录。配置中的路径相对于配置文件所在目录；Profile 中的 authPath/modelsPath 相对于 Profile 文件所在目录。Profile 必须明确 mode=live、environment=local-test、available=true 和 modelRef；内置 Provider 可以只使用 Pi 原生环境认证，自定义 Provider 才需要 `modelsPath`。`modelsPath` 用于 Pi 的自定义 Provider/模型配置，其中的 `apiKey` 可以引用本机环境变量。凭证文件只由主进程使用。Runtime 会从 Pi 实际解析的模型生成脱敏配置快照和摘要，作为运行证据，不要求在 Flowmate Profile 重复填写 Provider/API/能力。
+按 `config/flowmate.example.json` 准备本地配置，指向已冻结的数据清单、TestCandidate、运行 Profile 和可写数据目录。统一配置中的路径相对于配置文件所在目录；`profile` 区块的 authPath/modelsPath 也相对于该文件目录。桌面实际运行必须把 `profile.mode` 设为 `live`、`environment` 设为 `local-test`、`available` 设为 `true` 并填写 `modelRef`；内置 Provider 可以只使用 Pi 原生环境认证，自定义 Provider 才需要 `modelsPath`。`modelsPath` 指向用户自己的 Pi 原生模型配置，其中的认证引用可使用本机环境变量。凭证文件只由主进程使用。Runtime 会从 Pi 实际解析的模型生成脱敏配置快照和摘要，作为运行证据，不要求在 Flowmate Profile 重复填写 Provider/API/能力。
 
 未设置配置时显示空样本与 unavailable；设置了无效配置时启动失败并返回非零退出码，不退回受控模型。业务样本还必须通过候选/数据/授权检查。
 

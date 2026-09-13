@@ -18,14 +18,23 @@ const RuntimeProfileFileSchema = z.object({
 
 export type RuntimeProfileFile = z.infer<typeof RuntimeProfileFileSchema>;
 
+function unwrapProfile(value: unknown): unknown {
+  if (value && typeof value === "object" && !Array.isArray(value) && "profile" in value) {
+    return (value as { profile?: unknown }).profile;
+  }
+  return value;
+}
+
 /**
- * Parse the on-disk Profile format once for CLI and Electron. Relative
+ * Parse the on-disk Profile format once for CLI and Electron. The profile may
+ * be the top-level JSON object or the `profile` section of the unified
+ * Flowmate config. Relative
  * credential/model paths are always resolved from the Profile file directory,
  * so changing the caller's working directory cannot select another secret or
  * model configuration. Provider and credential semantics remain Pi-owned.
  */
 export function parseRuntimeProfile(value: unknown, profileDirectory: string): RuntimeProfile {
-  const parsed = RuntimeProfileFileSchema.safeParse(value);
+  const parsed = RuntimeProfileFileSchema.safeParse(unwrapProfile(value));
   if (!parsed.success) throw new Error("RUNTIME_PROFILE_INVALID");
   const record = parsed.data;
   if (record.mode === "live" && !record.modelRef) throw new Error("RUNTIME_PROFILE_INCOMPLETE: live Profile needs modelRef");

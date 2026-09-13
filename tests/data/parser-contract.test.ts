@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { parseOriginal, type ParserInputRef } from "../../packages/data/src/parser/mineru.ts";
+import { parseOriginal, parseParserProfile, type ParserInputRef } from "../../packages/data/src/parser/mineru.ts";
 
 const hash = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
 
@@ -19,6 +19,26 @@ async function fixtureRoot(scriptBody: string) {
 }
 
 describe("Parser contract", () => {
+  it("reads the parser section from the unified Flowmate config shape", () => {
+    expect(parseParserProfile({
+      manifestRoot: "frozen",
+      parser: {
+        profileId: "parser-fixture",
+        mode: "controlled",
+        environment: "local-test",
+        available: true,
+        executable: process.execPath,
+        parserName: "fixture",
+        parserVersion: "1",
+        outputRoot: "attempts",
+        timeoutMs: 5_000,
+      },
+    }, "D:/flowmate/config")).toMatchObject({
+      profileId: "parser-fixture",
+      outputRoot: resolve("D:/flowmate/config", "attempts"),
+    });
+  });
+
   it("maps a fresh Parser output into ParsedDocument with input evidence", async () => {
     const script = "const fs = require('node:fs'); const out = process.argv[process.argv.indexOf('-o') + 1]; fs.mkdirSync(out, { recursive: true }); fs.writeFileSync(require('node:path').join(out, 'content_list.json'), JSON.stringify([{ type: 'text', text: 'Invoice No: SYN-001', page_idx: 0 }]));";
     const fixture = await fixtureRoot(script);

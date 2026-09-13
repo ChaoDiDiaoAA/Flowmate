@@ -41,9 +41,9 @@ Flowmate 不需要 Longbridge CLI，也不使用截图中的 `FINAGENT_*` 环境
 | `bunx install-electron --no` | Electron 二进制缺失时补齐本机文件 | P0 | 按需执行 |
 | `bun run doctor` | 检查 Bun、Node、Electron、SQLite、Pi SDK、插件和目录 | P0–P6 | 可执行 |
 | `bun run dev` | 启动 Electron 开发模式 | P0–P6 | 可执行 |
-| `$env:FLOWMATE_DESKTOP_CONFIG='<desktop-config>'; bun run dev` | 使用指定桌面配置启动开发模式（PowerShell） | P0–P6 | 可执行 |
+| `$env:FLOWMATE_DESKTOP_CONFIG='<flowmate-config>'; bun run dev` | 使用指定 Flowmate 配置启动开发模式（PowerShell） | P0–P6 | 可执行 |
 
-桌面配置格式见 [`config/desktop.example.json`](config/desktop.example.json)，桌面主进程和凭证边界见[桌面说明](apps/desktop/README.md)。
+统一配置格式见 [`config/flowmate.example.json`](config/flowmate.example.json)，桌面主进程和凭证边界见[桌面说明](apps/desktop/README.md)。
 
 ## 检查、测试与构建
 
@@ -65,15 +65,17 @@ Flowmate 不需要 Longbridge CLI，也不使用截图中的 `FINAGENT_*` 环境
 |---|---|---|---|
 | `bun run p0 -- inspect --root <sourceRoot> --role-map <roleMap>` | 盘点原始文件和已有解析结果，输出有效项及隔离项 | 数据根与角色映射已核验 | 可执行 |
 | `bun run p0 -- freeze --root <sourceRoot> --role-map <roleMap> --output <frozenRoot> --purpose <sampleId>=test` | 冻结明确指定用途的输入 | `inspect` 通过；用途已确认 | 可执行 |
-| `bun run p0 -- parser --profile <parserProfile> --input <original> --sample <sampleId> --source-id <sourceId>` | 对没有解析产物的新原图执行 Parser 试验 | Parser、模型缓存、输入格式和 Profile 可用 | 入口可执行，真实环境待接入 |
+| `bun run p0 -- parser --profile <flowmate-config> --input <original> --sample <sampleId> --source-id <sourceId>` | 对没有解析产物的新原图执行 Parser 试验 | 统一配置的 `parser` 区块、模型缓存、输入格式和 Profile 可用 | 入口可执行，真实环境待接入 |
 | `bun run p0 -- plugin-probe` | 验证 Pi 原生扩展、Agent 工具和子 Session | Pi SDK、扩展和子 Agent 插件可加载 | 可执行 |
-| `bun run p0 -- run --profile <liveProfile> --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 通过正式 Application/Pi Runtime 执行一次真实字段抽取 | Live Profile、冻结输入、候选和 Provider 已获准 | 入口可执行，真实环境待接入 |
-| `bun run p0 -- run --profile config/controlled-profile.example.json --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 通过受控 Provider 跑通完整产品抽取链，用于离线回归 | 冻结输入和 Test Candidate；不访问外部模型 | 可执行 |
+| `bun run p0 -- run --profile <flowmate-config> --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 通过正式 Application/Pi Runtime 执行一次真实字段抽取 | 统一配置的 `profile` 区块为 Live、冻结输入、候选和 Provider 已获准 | 入口可执行，真实环境待接入 |
+| `bun run p0 -- run --profile config/flowmate.example.json --manifest <frozenRoot> --candidate <candidate> --sample <sampleId>` | 使用统一配置中的受控 Profile 跑通完整产品抽取链，用于离线回归 | 冻结输入和 Test Candidate；不访问外部模型 | 可执行 |
 | `bun run p0 -- handoff --export --candidate <candidate> --evidence <evidence.json> --output <manifest.json>` | 从产品功能证据导出质量侧可验证的 handoff manifest | 固定候选和产品证据已生成 | 可执行 |
 | `bun run p0 -- handoff --manifest <manifest.json>` | 校验 handoff manifest 的关联和完整性 | handoff 文件已生成 | 可执行 |
 | `bun run verify:handoff <manifest>` | 验证功能证据交接文件 | 交接文件已生成 | 可执行 |
 
-模型接入完全复用 Pi 原生 Provider、模型配置与认证；内置模型使用原生模型引用和认证，自定义服务使用可选的 [`Pi models 示例`](config/pi-models.example.json)。`.env` 由启动工具加载，变量必须被 Pi 原生机制支持或引用。Flowmate 只管理业务授权、预算及运行证据，并从实际 Pi 模型生成脱敏运行快照。Parser 模板仍见 [`config/parser-profile.example.json`](config/parser-profile.example.json)；缺少真实数据、Live 授权或 MinerU 时，命令须明确返回未就绪。
+模型接入完全复用 Pi 原生 Provider、模型配置与认证；内置模型使用原生模型引用和认证，自定义服务把用户自己的 Pi `models.json` 路径填写到统一配置的 `profile.modelsPath`。`.env` 由启动工具加载，变量必须被 Pi 原生机制支持或引用。Flowmate 只管理业务授权、预算及运行证据，并从实际 Pi 模型生成脱敏运行快照。统一配置的 `parser` 区块承载 Parser Profile；缺少真实数据、Live 授权或 MinerU 时，命令须明确返回未就绪。
+
+统一模板默认使用 `controlled` Profile 供离线闭环；真实模型或桌面运行时，复制到本机私有配置后将 `profile.mode` 改为 `live` 并按 Pi 原生方式补齐模型和认证路径。
 
 ## Agent 评测与发布命令
 

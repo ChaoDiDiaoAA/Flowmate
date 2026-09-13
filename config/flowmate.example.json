@@ -1,0 +1,30 @@
+{
+  "manifestRoot": "../private/frozen",
+  "candidatePath": "../private/candidate.json",
+  "dataRoot": "../private/desktop-data",
+  "profile": {
+    "profileId": "p0-controlled",
+    "mode": "controlled",
+    "environment": "local-test",
+    "available": true,
+    "modelRef": {
+      "provider": "flowmate-controlled",
+      "modelId": "controlled"
+    },
+    "authPath": "../private/pi-auth.json",
+    "modelsPath": "../private/pi-models.json",
+    "allowedSampleIds": ["replace-after-freeze"]
+  },
+  "parser": {
+    "profileId": "parser-live",
+    "mode": "live",
+    "environment": "local-test",
+    "available": false,
+    "executable": "mineru",
+    "parserName": "mineru",
+    "parserVersion": "replace-after-mineru-doctor",
+    "outputRoot": "../private/parser-attempts",
+    "allowedInputExtensions": ["jpg", "jpeg", "png", "pdf"],
+    "timeoutMs": 300000
+  }
+}

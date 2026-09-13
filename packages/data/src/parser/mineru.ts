@@ -45,6 +45,13 @@ const ParserProfileFileSchema = z.object({
 
 export type ParserProfileFile = z.infer<typeof ParserProfileFileSchema>;
 
+function unwrapParserProfile(value: unknown): unknown {
+  if (value && typeof value === "object" && !Array.isArray(value) && "parser" in value) {
+    return (value as { parser?: unknown }).parser;
+  }
+  return value;
+}
+
 function resolveExecutable(value: string, profileDirectory: string): string {
   // Bare commands such as `mineru` must be resolved through PATH by spawn;
   // only an explicit file path is anchored to the Profile directory.
@@ -53,9 +60,9 @@ function resolveExecutable(value: string, profileDirectory: string): string {
     : value;
 }
 
-/** Parse the on-disk Parser Profile used by the explicit P0 CLI entry. */
+/** Parse the on-disk Parser Profile, including the unified config's `parser` section. */
 export function parseParserProfile(value: unknown, profileDirectory: string): ParserProfile & { profileId: string; mode: "controlled" | "live"; environment: "local-test" | "production"; available: boolean } {
-  const parsed = ParserProfileFileSchema.safeParse(value);
+  const parsed = ParserProfileFileSchema.safeParse(unwrapParserProfile(value));
   if (!parsed.success) throw new Error("PARSER_PROFILE_INVALID");
   const record = parsed.data;
   if (record.mode === "live" && record.environment !== "local-test") {

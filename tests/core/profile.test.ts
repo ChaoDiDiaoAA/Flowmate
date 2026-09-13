@@ -36,6 +36,23 @@ describe("runtime profile configuration", () => {
     }, "D:/flowmate/config")).toMatchObject({ modelRef: { provider: "anthropic", modelId: "claude-test" } });
   });
 
+  it("reads an inline profile from the unified Flowmate config shape", () => {
+    expect(parseRuntimeProfile({
+      manifestRoot: "frozen",
+      profile: {
+        profileId: "unified",
+        mode: "controlled",
+        environment: "local-test",
+        available: true,
+        modelRef: { provider: "flowmate-controlled", modelId: "controlled" },
+        authPath: "private/auth.json",
+      },
+    }, "D:/flowmate/config")).toMatchObject({
+      profileId: "unified",
+      authPath: resolve("D:/flowmate/config", "private/auth.json"),
+    });
+  });
+
   it("rejects unknown fields and a live profile without a model reference", () => {
     expect(() => parseRuntimeProfile({
       profileId: "bad",

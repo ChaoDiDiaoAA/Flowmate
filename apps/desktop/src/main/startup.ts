@@ -24,8 +24,12 @@ export async function loadDesktopApplication(configFile: string, injectedFactory
   await loadDotEnv(resolve(base, ".env"), resolve(base, "..", ".env"), resolve(process.cwd(), ".env"));
   const config = object(JSON.parse(await readFile(configFile, "utf8")));
   const path = (key: string) => resolve(base, required(config, key));
-  const profileFile = path("profilePath");
-  const profile = parseRuntimeProfile(JSON.parse(await readFile(profileFile, "utf8")), dirname(profileFile));
+  const inlineProfile = "profile" in config;
+  const profileFile = inlineProfile ? undefined : path("profilePath");
+  const profile = parseRuntimeProfile(
+    inlineProfile ? config.profile : JSON.parse(await readFile(profileFile!, "utf8")),
+    inlineProfile ? base : dirname(profileFile!),
+  );
   if (profile.mode !== "live" && !(injectedFactory && profile.mode === "controlled")) throw new Error("DESKTOP_LIVE_PROFILE_REQUIRED");
   if (profile.environment !== "local-test" || profile.available !== true) throw new Error("PROFILE_UNAVAILABLE");
   if (profile.mode === "live") {
