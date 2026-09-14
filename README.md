@@ -6,7 +6,7 @@
 
 ## 方案入口
 
-- [产品总方案](docs/spec/00_Flowmate完整方案.md)：按 Agent 工程化路线重写的 24 章总方案，涵盖原生机制与产品职责、业务链、37 表设计、逐目录说明和 P0–P13 Harness 建设路线。
+- [产品总方案](docs/spec/00_Flowmate完整方案.md)：按 Agent 工程化路线重写的 24 章总方案，涵盖原生机制与产品职责、业务链、Workspace 业务边界、38 表设计、逐目录说明和 P0–P13 Harness 建设路线。
 - [Agent 评测总方案](agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md)：按模块定义评测、Case/Gold、Benchmark 与阶段交付。
 - [领域术语](CONTEXT.md)。
 
