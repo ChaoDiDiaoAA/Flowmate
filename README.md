@@ -18,6 +18,6 @@ P0 基础契约 → P1 Agent Runtime → P2 工具 → P3 事件 → P4 会话 �
 
 ## 数据
 
-原始发票与已有解析文件保留于 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51`；该路径本身已包含 voxel51。
+外部导入来源为 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51`。P0 计划按白名单整理去重后的原票、已有解析及必要图片到 `data/invoices/voxel51/`，重建元数据和清单；提供方标签单独保存到 `agent-eval/data/source-labels/voxel51/`。完成后产品 sourceRoot 使用项目内数据，外部来源副本保留。该目录约定不代表数据准备已经完成。
 
-本地 `FlowmateData/` 及可能存在的 `agent-eval/data/` 私有数据予以保留并继续 Git 忽略。历史运行数据不代表新的 P0 已经通过。`docs/archive/` 仅为历史审查记录。
+项目 `data/invoices/`、本地 `FlowmateData/` 及可能存在的 `agent-eval/data/` 私有数据予以保留并继续 Git 忽略。历史运行数据不代表新的 P0 已经通过。`docs/archive/` 仅为历史审查记录。
