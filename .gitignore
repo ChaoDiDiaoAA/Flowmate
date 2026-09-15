@@ -49,3 +49,5 @@ Thumbs.db
 
 # Private Agent evaluation assets and run output
 /agent-eval/data/
+/data/invoices/
+/data/.preparation-stage/
