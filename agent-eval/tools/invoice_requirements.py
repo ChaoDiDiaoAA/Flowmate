@@ -14,61 +14,340 @@ SPEC_PATHS = ('docs/spec/00_Flowmate完整方案.md',
 RETIRED_REQUIREMENTS = {'MOD-10', 'MOD-14', 'MOD-22'}
 
 
+# Explicit source anchors preserve historical identities independently of row order.
+# Whitespace and Markdown emphasis are presentation, not requirement identity.
+LEGACY_CRITICAL_REGISTRY = (
+    ('3.6.1', '公共组装与 CLI 独立运行；主方案20.3.2', 'CRIT-3.6.1-01'),
+    ('3.6.1', '装载核验、RuntimeSnapshot与binding-ready；主方案2.4/19.1', 'CRIT-3.6.1-02'),
+    ('3.6.1', 'StepAttempt终态历史与后续失效；主方案12.5.3/18.3', 'CRIT-3.6.1-03'),
+    ('3.6.1', '换generation后的人工waiting；主方案12.5.4/18.3', 'CRIT-3.6.1-04'),
+    ('3.6.1', '同逻辑步骤/有效输入的活动尝试唯一性；主方案12.5.2/18.3', 'CRIT-3.6.1-05'),
+    ('3.6.1', '全部活动/等待步骤视图；主方案12.5.5', 'CRIT-3.6.1-06'),
+    ('3.6.1', '页面/异步故障后的控制可达性；主方案3.2/3.6', 'CRIT-3.6.1-07'),
+    ('3.6.1', 'Electron/preload/IPC信任边界；主方案20.4', 'CRIT-3.6.1-08'),
+    ('3.6.1', 'CLI/桌面同实例单控制者；主方案20.3.2', 'CRIT-3.6.1-09'),
+    ('3.6.1', '日志独立落盘与单写者；主方案18.5.1/18.5.3', 'CRIT-3.6.1-10'),
+    ('3.6.1', '实例日志总配额与重启占用；主方案18.5.3', 'CRIT-3.6.1-11'),
+    ('3.6.1', '日志安全保留、有界授权查询/导出；主方案18.5.2–18.5.4', 'CRIT-3.6.1-12'),
+    ('3.6.1', '日志故障与降级；主方案18.5.4', 'CRIT-3.6.1-13'),
+    ('3.22.1', 'Prompt注入', 'CRIT-3.22.1-01'),
+    ('3.22.1', '越权', 'CRIT-3.22.1-02'),
+    ('3.22.1', '隐私泄露', 'CRIT-3.22.1-03'),
+    ('3.22.1', '高风险操作', 'CRIT-3.22.1-04'),
+    ('3.22.1', '工具滥用', 'CRIT-3.22.1-05'),
+    ('3.22.1', '“高风险前确认”以有效授权为准：确认人必须有相应权限，确认内容须', 'CRIT-3.22.1-06'),
+    ('3.22.1', '客户记录或内部数据并非一律禁止访问；以Case中明确的身份、用途', 'CRIT-3.22.1-07'),
+    ('3.22.2', '安全Case在第5.2.1节六项骨架上增加或引用：攻击入口及来源', 'CRIT-3.22.2-01'),
+    ('3.22.2', '每类适用攻击配正常或边界对照：无恶意内容的同类文档、有权限的查询', 'CRIT-3.22.2-02'),
+    ('3.22.2', '按能力增长增加传播链测试：工具返回→历史/记忆→压缩摘要→后续模', 'CRIT-3.22.2-03'),
+    ('3.22.3', '同一安全Trial至少关联三个结论：模型是否遵守授权和数据边界、', 'CRIT-3.22.3-01'),
+    ('3.22.3', '注入在进入模型前被可靠隔离，可以证明该入口的防护有效，但不能据此', 'CRIT-3.22.3-02'),
+    ('3.22.3', '确定性Grader优先核验权限、对象、动作、受控数据标记及权威状', 'CRIT-3.22.3-03'),
+    ('3.22.4', '使用合成客户记录、无效测试密钥、可追踪的测试标记和受控接收目标，', 'CRIT-3.22.4-01'),
+    ('3.22.4', 'P0核验资产、秘密和目录隔离F；P1起在真实模型输入中执行适用A', 'CRIT-3.22.4-02'),
+    ('3.22.4', '适用安全Case和已修复安全缺陷纳入持续回归，模型、Prompt', 'CRIT-3.22.4-03'),
+    ('3.22.4', 'Workspace安全变体按3.23执行：伪造空间身份、错误对象', 'CRIT-3.22.4-04'),
+    ('3.23.1', '默认空间持久化', 'CRIT-3.23.1-01'),
+    ('3.23.1', '可信身份与权限交集', 'CRIT-3.23.1-02'),
+    ('3.23.1', '数据库归属一致', 'CRIT-3.23.1-03'),
+    ('3.23.1', '查询、输入与Context', 'CRIT-3.23.1-04'),
+    ('3.23.1', '清单、Scope与证据绑定', 'CRIT-3.23.1-05'),
+    ('3.23.2', 'active只表示可接受准入，不等于业务动作已授权。paused', 'CRIT-3.23.2-01'),
+    ('3.23.2', 'P8在已启用Workflow范围核验空间状态与继续/恢复，P12', 'CRIT-3.23.2-02'),
+    ('3.23.2', 'P13核验archived仅在无活动绑定、在途动作及未解决恢复事', 'CRIT-3.23.2-03'),
+    ('3.23.3', 'runtime/<runId>/work/', 'CRIT-3.23.3-01'),
+    ('3.23.3', 'runtime/<runId>/agent/', 'CRIT-3.23.3-02'),
+    ('3.23.3', 'SQLite sessions + memories', 'CRIT-3.23.3-03'),
+    ('3.23.3', 'runs/<runId>/与inputs/<projectionHash>/', 'CRIT-3.23.3-04'),
+    ('3.23.3', 'P1–P3检查临时资源及内存模式标记，不承诺重启恢复。P4增加完', 'CRIT-3.23.3-05'),
+    ('3.23.3', 'P11核验插件真实创建的子Session与父Job同空间，子Ru', 'CRIT-3.23.3-06'),
+    ('3.23.3', '清理按“停止新调用→核验主子Session/工具/扩展实际停止及', 'CRIT-3.23.3-07'),
+    ('3.23.3', 'P0–P11不实现自动Session清除，默认保留。P13按独立', 'CRIT-3.23.3-08'),
+    ('3.23.4', '身份、归属、状态迁移、访问/写入、资源清理和备份映射以确定性Gr', 'CRIT-3.23.4-01'),
+    ('3.23.4', 'Case模板可以声明逻辑空间角色和初态，由正式受控初始化绑定实际', 'CRIT-3.23.4-02'),
+)
+
+STORAGE_REQUIREMENT_REGISTRY = (
+    ('3.24', '文件清单与运行绑定', 'manifest-binding'),
+    ('3.24', '输入与数据集', 'input-dataset'),
+    ('3.24', 'Session生命周期与恢复', 'session-lifecycle'),
+    ('3.24', '原生Memory与Compaction', 'native-memory'),
+    ('3.24', '上下文快照独立存储', 'context-snapshot'),
+    ('3.24', '持久提交与活动绑定', 'persistence-binding'),
+    ('3.24', '父子委派', 'child-delegation'),
+    ('3.24', '候选、修订与校验依据', 'assessment-basis'),
+    ('3.24', '会话输入受理', 'session-input'),
+    ('3.24', '人工业务交互', 'human-interaction'),
+    ('3.24', '正式提交审批', 'formal-approval'),
+    ('3.24', '提交动作派发与恢复', 'action-dispatch'),
+    ('3.24.1', '跨Job动作防重；18.2.13', 'action-dedup'),
+    ('3.24.1', 'AssessmentSnapshot并发一致性；18.2.10', 'assessment-consistency'),
+    ('3.24.1', 'Session身份及原生历史完整性；18.2.3/18.2.4/18.2.8', 'session-integrity'),
+    ('3.24.1', 'Context实际调用归属；18.2.5/18.2.7', 'context-attribution'),
+    ('3.24.1', '多子Agent委派身份；18.2.6', 'delegation-identity'),
+)
+
+# Each atomic definition has an independent semantic identity. Its source remains
+# the complete original row: these descriptions are interpretations, not quotes.
+STORAGE_ATOMS = {
+    'manifest-binding': (
+        ('hash-and-ownership', '拒绝摘要不符、缺失或错空间的ExecutionManifest文件'),
+        ('immutable-run', '历史Job/Run固定清单与实际RuntimeSnapshot，不随文件替换漂移'),
+        ('current-controls', '旧清单不能绕过当前发布及撤销控制'),
+    ),
+    'input-dataset': (
+        ('immutable-input', '输入配对、摘要、清单版本及Workspace归属在恢复后重新核验'),
+        ('missing-or-replaced', '文件缺失或替换不得沿用原输入身份'),
+    ),
+    'session-lifecycle': (
+        ('identity', '产品session_id与唯一pi_session_id、header格式版本一致并准确映射原生事件'),
+        ('initialization', 'header、初始entries及当前位置原子登记成功前不得发布active或执行'),
+        ('full-recovery', '从SQLite装载完整header与全部entry树并显式恢复current entry'),
+        ('pagination', '恢复遍历全部页并核验数量及sequence连续性'),
+        ('sqlite-authority', 'SQLite是唯一持久化权威，原生sessions/JSONL关闭且不参与恢复裁决'),
+    ),
+    'native-memory': (
+        ('canonical-hash', '重新计算规范化entry_hash，核对entry类型、ID、父ID与正文一致'),
+        ('idempotency', '同ID同内容幂等，同ID不同内容拒绝'),
+        ('tree-and-order', '父链无环且sequence顺序合法'),
+        ('references', '非空历史引用与当前位置仅指向同Session有效entry'),
+        ('legal-root', '合法null根及branch_summary.fromId=root哨兵和普通扩展字符串不误拒'),
+        ('batch-atomicity', '批量新增核验完整集合后提交，非法集合无部分接受'),
+        ('native-roundtrip', '全部原生条目、树、cursor及工具关联恢复不丢失'),
+    ),
+    'context-snapshot': (
+        ('hash-and-identity', '快照正文、身份及snapshot_hash一致且同ID写入幂等'),
+        ('atomic-publication', '插入快照与Run指针更新同事务核验binding及代次，失败不发布'),
+        ('actual-call', '工具调用快照取自可信实际模型请求交付关联，不取最新指针或模型自报身份'),
+        ('immutable-history', '后续快照不改写历史工具、候选或RuntimeSnapshot依据'),
+        ('no-hash-cycle', 'Context不反向包含RuntimeSnapshot摘要'),
+        ('database-recovery', '无需ContextSnapshot文件即可从数据库恢复完整投影'),
+    ),
+    'persistence-binding': (
+        ('commit-boundary', '最外层同步公开历史变更完成即原子提交，不等异步Loop结束或仅依赖事件'),
+        ('single-binding-cas', '每次写恰有一个有效binding并校验expectedStorageVersion'),
+        ('cursor-version', '仅移动当前位置也提交storage_version'),
+        ('title-atomicity', '原生session_info与产品标题同事务保存'),
+        ('poison', '保存失败poison绑定、阻断新工具并请求abort'),
+        ('last-committed', '恢复仅从last committed状态开始，不自动重放未知动作'),
+    ),
+    'child-delegation': (
+        ('pending-first', 'Agent工具准入先登记pending子Run并关联真实来源工具调用'),
+        ('slot-identity', '同父Run/工具调用/槽位幂等，不同槽位独立'),
+        ('trusted-binding', '插件及Session按明确槽位和身份补齐，不猜最近Session'),
+        ('failure-retention', '启动失败或失联保留原pending身份及失败待核对事实'),
+        ('no-replay', '仅LLM Agent工具触发委派，产品及Eval恢复不补发'),
+    ),
+    'assessment-basis': (
+        ('immutable-snapshot', 'AssessmentSnapshot不可变并绑定Revision与fieldsHash'),
+        ('merge-cas', '同版本结果合并后CAS更新，冲突重读且旧结果不得覆盖新结论'),
+        ('unknown-checks', '完整有界结果中未检查项明确unknown'),
+        ('changed-basis', '字段变化新Revision，证据变化更新快照并失效旧确认'),
+        ('full-basis', 'basis_hash覆盖字段、评估、目标、载荷及规则'),
+    ),
+    'session-input': (
+        ('request-idempotency', '相同请求键同内容幂等，不同内容拒绝'),
+        ('delivery-state', '受理或排队不冒充consumed，崩溃后核对交付证据'),
+        ('no-blind-redelivery', 'delivery_unknown恢复不盲目重发或补造消费'),
+        ('ownership', 'Job/Session/Run错归属输入拒绝'),
+    ),
+    'human-interaction': (
+        ('response-history', '有效回答幂等，更正追加且保留原回复'),
+        ('atomic-adoption', '采纳与修订、步骤、Job及审计同事务'),
+        ('clarification', '歧义继续澄清，旧依据和重复回复不推进新事实'),
+        ('not-approval', '字段确认不能成为提交许可'),
+    ),
+    'formal-approval': (
+        ('frozen-action', '仅审批冻结Action并校验可信主体、basis_hash、期限和版本'),
+        ('atomic-decision', '审批决定、未发送动作状态及审计同事务保存'),
+        ('immutable-attempt', 'Attempt保留发送时approval_id，后续审批不改写历史决定或结果'),
+        ('stale-denial', '错Action或迟到旧批准不推进ready，撤销及新修订阻断新发送'),
+        ('typed-command', 'inputId、interactionId或同意文字不得冒用正式审批'),
+    ),
+    'action-dispatch': (
+        ('logical-identity', '可信业务命令生成目标环境/组织、业务对象和动作类型的逻辑键'),
+        ('cross-job-uniqueness', '同逻辑动作跨Job至多一个受保护Action，不误拒不同业务对象'),
+        ('claim-not-permission', '领取不等于发送许可，崩溃及重复派发不重获同Attempt许可'),
+        ('unknown-reconciliation', 'UNKNOWN先核对，暂未找到不能盲重发'),
+        ('safe-retry', '安全重试需未生效证明或目标幂等契约、当前准入及旧执行权失效'),
+        ('active-attempt', '同动作至多一个活动Attempt，退出旧资格与关联新尝试同事务'),
+        ('retain-late-receipt', '保留旧UNKNOWN及迟到回执，Attempt审批身份不随当前指针改变'),
+    ),
+    'action-dedup': (
+        ('cross-job', '并发Job、成功后新Job及UNKNOWN换载荷或随机键均不能重复生效'),
+        ('legal-controls', '合法独立动作及满足条件的安全重试不误拦截'),
+        ('authoritative-effects', '以独立目标业务生效记录核验防重，不以请求次数替代'),
+    ),
+    'assessment-consistency': (
+        ('concurrent-results', '并发有效结果不丢失，CAS冲突重读且旧结果不覆盖'),
+        ('unknown-state', '未检查项不得冒充通过'),
+        ('approval-invalidation', '证据变化使旧确认失效，重新确认后可合法准入'),
+    ),
+    'session-integrity': (
+        ('invalid-history', '篡改摘要、列值冲突、非法父链顺序或跨会话悬空引用拒绝且无部分提交'),
+        ('identity-initialization', '产品/Pi身份错配或初始化失败不发布可执行会话'),
+        ('cursor-title-transaction', '指针提交版本及标题同步具备原子事务证据'),
+        ('legal-roundtrip', '合法空根、哨兵、扩展内容、幂等写及完整恢复不误拒'),
+        ('poison-on-failure', '持久保存失败按poison规则停止绑定'),
+    ),
+    'context-attribution': (
+        ('request-a-after-b', 'Run切到B后返回的A请求工具仍绑定实际A'),
+        ('reject-forged-or-cross-run', '拒绝模型自报快照身份与跨Run引用'),
+        ('failed-publication', '失败快照不发布且不改写既有工具、候选和RuntimeSnapshot'),
+        ('recovery-stability', '重启后历史调用依据不随最新指针改写且无循环摘要'),
+    ),
+    'delegation-identity': (
+        ('distinct-slots', '同工具调用不同子槽位独立，同槽位重复登记幂等'),
+        ('out-of-order-binding', '乱序插件身份按槽位准确绑定Session，不猜最近创建记录'),
+        ('failure-recovery', '部分失败及pending后崩溃保留身份，恢复不补发委派'),
+    ),
+}
+
+CHAPTER_FOUR_REGISTRY = (
+    ('4', 'Case 定义输入、目标、初态与约束', 'asset-definitions'),
+    ('4', 'EvalCase', 'case-record'),
+    ('4', 'GoldRecord / Oracle', 'gold-oracle-record'),
+    ('4', 'Rubric / Grader', 'grader-record'),
+    ('4', 'BenchmarkDefinition', 'benchmark-record'),
+    ('4', 'EvalRun / EvalTrial', 'trial-record'),
+    ('4', '身份按实际阶段建立', 'phased-identities'),
+    ('4', 'P0即记录真实默认Workspace', 'workspace-evidence'),
+    ('4', '生命周期为草案', 'append-only-lifecycle'),
+    ('4', '本次产品存储及评测方案同步不修改data', 'controlled-spec-refresh'),
+    ('4', '业务字段Gold来自原文', 'gold-authority'),
+    ('4', 'P0准备输入、Schema', 'phased-preparation'),
+    ('4.1', '金额用十进制字符串并保留原值', 'field-fidelity'),
+    ('4.1', 'development、regression、acceptance', 'sampling-isolation'),
+)
+
+NEW_PARAGRAPH_REGISTRY = (
+    ('3.6.1', '下表将产品已承诺、不能由模块总分替代的不变量', 'coverage-accounting'),
+    ('3.6.1', '以上每项分别进入其首次阶段的适用分母', 'evidence-authority'),
+    ('3.23.1', '数据库F应包含', 'database-isolation-contract'),
+    ('3.24', '本节对齐主方案第18章存储', 'scope'),
+    ('3.24', '以上断言继承3.6.1与3.23', 'inherited-constraints'),
+    ('3.24.1', '下列五组均为既有机制F', 'scoring'),
+    ('3.24.1', '覆盖登记复用上表的MOD/RT', 'regression'),
+)
+
+
+def _requirement_anchor(text):
+    return re.sub(r'[\s`*]', '', text)
+
+
 def load_requirements(project):
     project = Path(project)
     sources = {}
     for relative in SPEC_PATHS:
         raw = (project / relative).read_bytes()
-        sources[relative] = {'path':relative, 'sha256':hashlib.sha256(raw).hexdigest()}
+        sources[relative] = {'path': relative, 'sha256': hashlib.sha256(raw).hexdigest()}
     lines = (project / SPEC_PATHS[1]).read_text(encoding='utf-8-sig').splitlines()
-    result, seen, critical_counts = [], set(), Counter()
-    section = ''
+    registry = list(LEGACY_CRITICAL_REGISTRY)
+    registry += [(section, anchor, f'CRIT-{section}-{slug}')
+                 for section, anchor, slug in STORAGE_REQUIREMENT_REGISTRY + NEW_PARAGRAPH_REGISTRY]
+    registry += [(section, anchor, f'CRIT-{section}-{slug}')
+                 for section, anchor, slug in CHAPTER_FOUR_REGISTRY]
+    result, seen, unregistered = [], set(), []
+    section, fence = '', None
     for number, line in enumerate(lines, 1):
-        heading = re.match(r'^#{2,6}\s+(\d+(?:\.\d+)+)\b', line)
+        stripped = line.strip()
+        fence_match = re.match(r'^(`{3,}|~{3,})', stripped)
+        if fence_match:
+            marker = fence_match.group(1)[0]
+            fence = None if fence == marker else marker if fence is None else fence
+            continue
+        if fence is not None:
+            continue
+        heading = re.match(r'^ {0,3}#{1,6}\s+(.*)', line)
         if heading:
-            section = heading.group(1)
-        match = re.match(r'^\|\s*((?:MOD|RTC|RTX|RT)-\d+(?:-\d+)?)\s+([^|]+)\|',line)
-        kind = None
+            # Every heading ends the previous section, including chapter roots
+            # and unnumbered headings. Never inherit a stale subsection.
+            numbered = re.match(r'(\d+(?:\.\d+)*)(?:\.(?=\s)|(?=\s|$))', heading.group(1))
+            section = numbered.group(1) if numbered else ''
+            continue
+        if not stripped:
+            continue
+        table = stripped.startswith('|')
+        cells = [cell.strip() for cell in stripped.strip('|').split('|')]
+        if table and all(re.fullmatch(r'[-: ]*', cell) for cell in cells):
+            continue
+        match = re.match(r'^\|\s*((?:MOD|RTC|RTX|RT)-\d+(?:-\d+)?)\s+([^|]+)\|', stripped)
         if match:
             rid, title = match.groups()
             kind = rid.split('-')[0]
-        elif re.match(r'^\| P(?:[0-9]|1[0-3]) ',line) and section == '1.4':
-            phase = re.match(r'^\| (P\d+) ',line).group(1)
-            rid, title, kind = 'DrivingTask-'+phase, line.split('|')[1].strip(), 'DrivingTask'
-        elif section == '3.6.1' or section.startswith(('3.22.','3.23.')):
-            # Register individual normative rows and paragraphs, excluding table
-            # column headers. Exact text and locations survive source revisions.
-            table = line.startswith('|')
-            cells = [c.strip() for c in line.strip('|').split('|')]
-            header = table and (all(re.fullmatch(r'[-: ]*',c) for c in cells) or cells[0] in
-                {'产品子能力与依据','类型','覆盖项','资源'})
-            if not line.strip() or line.startswith('#') or header:
-                continue
-            if section in {'3.6.1','3.23.1'} and not table:
-                continue
-            critical_counts[section] += 1
-            rid = f'CRIT-{section}-{critical_counts[section]:02d}'
-            title, kind = cells[0] if table else line[:100], 'critical'
+        elif section == '1.4' and table and re.match(r'^P(?:1[0-3]|[0-9])\s', cells[0]):
+            rid, title, kind = 'DrivingTask-' + cells[0].split()[0], cells[0], 'DrivingTask'
         else:
+            candidate = _requirement_anchor(cells[0] if table else stripped)
+            matches = [(anchor, rid) for sec, anchor, rid in registry if sec == section and
+                       (candidate == _requirement_anchor(anchor) if table else
+                        candidate.startswith(_requirement_anchor(anchor)))]
+            if not matches:
+                headers = {'产品子能力与依据', '类型', '覆盖项', '资源', '存储边界', '约束与产品依据', '资产'}
+                if section in {sec for sec, _, _ in registry} and not (table and cells[0] in headers):
+                    unregistered.append({'section': section, 'lineStart': number, 'verbatim': line,
+                                         'status': 'requires_source_review'})
+                continue
+            if len(matches) != 1:
+                raise ValueError(f'Ambiguous requirement source anchor at line {number}')
+            _, rid = matches[0]
+            title, kind = cells[0] if table else stripped[:100], 'critical'
+        if rid in RETIRED_REQUIREMENTS:
             continue
-        if rid in RETIRED_REQUIREMENTS or rid in seen:
-            continue
+        if rid in seen:
+            raise ValueError(f'Duplicate requirement identity: {rid}')
         seen.add(rid)
-        phases = re.findall(r'\bP(?:1[0-3]|[0-9])\b',line)
-        result.append({'id':rid,'kind':kind,'title':title.strip(), 'section':section,
-            'source':{**sources[SPEC_PATHS[1]],'lineStart':number,'lineEnd':number,'verbatim':line},
-            'productSpec':sources[SPEC_PATHS[0]],
-            'requiredModes': ['F'],
-            'additionalModeApplicability':{'A':'review_against_enabled_variant','B':'review_against_business_scope'},
-            'modeApplicability':'per_enabled_capability_and_spec_variant; unadopted mode needs closure evidence',
-            'firstPhaseMention':phases[0] if phases else None,
-            'acceptanceStatus':'not_evaluated'})
-    for kind, count in [('MOD',31),('RT',17),('RTC',90),('RTX',6)]:
-        actual = sum(r['kind']==kind for r in result)
-        if actual != count:
-            raise ValueError(f'{kind} catalog changed: expected {count}, found {actual}; review parser and specs')
-    return {'schemaVersion':1,'sourceHashes':sources,'requirements':result,
-            'interpretation':'Requirement identities and exact source passages; no execution or compliance claim.'}
+        phases = re.findall(r'\bP(?:1[0-3]|[0-9])\b', line)
+        record = {'id': rid, 'kind': kind, 'title': title.strip(), 'section': section,
+            'source': {**sources[SPEC_PATHS[1]], 'lineStart': number, 'lineEnd': number, 'verbatim': line},
+            'productSpec': sources[SPEC_PATHS[0]], 'requiredModes': ['F'],
+            'additionalModeApplicability': {'A': 'review_against_enabled_variant', 'B': 'review_against_business_scope'},
+            'modeApplicability': 'per_enabled_capability_and_spec_variant; unadopted mode needs closure evidence',
+            'firstPhaseMention': phases[0] if phases else None, 'acceptanceStatus': 'not_evaluated'}
+        result.append(record)
+        slug = next((slug for sec, anchor, slug in STORAGE_REQUIREMENT_REGISTRY
+                     if rid == f'CRIT-{sec}-{slug}'), None)
+        if slug:
+            atoms = []
+            for key, description in STORAGE_ATOMS[slug]:
+                atomic = {**deepcopy(record), 'id': rid + '/' + key, 'kind': 'atomic',
+                          'title': description, 'description': description,
+                          'parentRequirementId': rid, 'semanticKey': key,
+                          'interpretation': 'Atomic interpretation of the cited source row; no execution claim.'}
+                atoms.append(atomic)
+                seen.add(atomic['id'])
+                result.append(atomic)
+            record['atomicRequirements'] = deepcopy(atoms)
+    expected = {
+        'MOD': {f'MOD-{i:02d}' for i in range(1, 35)} - RETIRED_REQUIREMENTS,
+        'RT': {f'RT-{i:02d}' for i in range(1, 18)},
+        'RTC': {f'RTC-{i:02d}-{j:02d}' for i in range(1, 18)
+                for j in range(1, 11 if i == 6 else 6)},
+        'RTX': {f'RTX-{i:02d}' for i in range(1, 7)},
+        'DrivingTask': {f'DrivingTask-P{i}' for i in range(14)},
+        'critical': {rid for _, _, rid in registry},
+    }
+    for kind, identities in expected.items():
+        actual = {record['id'] for record in result if record['kind'] == kind}
+        if actual != identities:
+            raise ValueError(f'{kind} catalog changed: missing={sorted(identities - actual)}, '
+                             f'unexpected={sorted(actual - identities)}; review parser and specs')
+    chapter_aliases = {
+        '03': 'asset-definitions', '05': 'case-record', '06': 'gold-oracle-record',
+        '07': 'grader-record', '08': 'benchmark-record', '09': 'trial-record',
+        '10': 'phased-identities', '11': 'workspace-evidence', '12': 'append-only-lifecycle',
+        '13': 'gold-authority', '14': 'phased-preparation',
+    }
+    aliases = [{'oldId': 'CRIT-3.23.4-' + old, 'requirementId': 'CRIT-4-' + slug,
+                'status': 'migrated',
+                'reason': 'Chapter 4 was previously attributed to 3.23.4 because chapter headings were not recognized.'}
+               for old, slug in chapter_aliases.items()]
+    aliases.append({'oldId': 'CRIT-3.23.4-04', 'requirementId': None, 'status': 'retired',
+                    'reason': 'The source is the chapter 4 table column header, not a normative requirement.'})
+    return {'schemaVersion': 2, 'sourceHashes': sources, 'requirements': result,
+            'requirementAliases': sorted(aliases, key=lambda item: item['oldId']),
+            'unregisteredPassages': unregistered,
+            'interpretation': 'Requirement identities and exact source passages; atomic definitions are partial interpretations, not execution or compliance claims.'}
 
 
 BASE_REFS = {

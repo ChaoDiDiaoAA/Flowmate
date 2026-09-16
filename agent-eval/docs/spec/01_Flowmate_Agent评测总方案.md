@@ -1,6 +1,6 @@
 # Flowmate Agent 评测总方案
 
-修订日期：2026-09-15。状态：体系重构后的设计基线；评测实现、资产和实际成绩按阶段建立。本文中的目标、覆盖编号和示例不表示已经实现或通过。
+修订日期：2026-09-16。状态：体系重构后的设计基线；评测实现、资产和实际成绩按阶段建立。本文中的目标、覆盖编号和示例不表示已经实现或通过。
 
 > 本文是 Agent 评测唯一总方案。
 > Agent 评测阶段严格跟随产品主方案第 21 章 P0–P13 Agent Harness 功能建设轴。
@@ -114,7 +114,7 @@ P0可登记BM覆盖及人工协议草案，不为此预建全部基准目录；P
 | P1 Agent Runtime Core | runtime-pi 最小 Provider/Session/Loop、core/runtime | MOD-01/02/04/08/11；RT-01/02/03/04/10/13有界调用/16，含启动核验前零执行 |
 | P2 Tool Runtime | core/tools、Pi 工具转换、领域候选保存 | MOD-05/09/11；RT-04 |
 | P3 Event Runtime | Pi messages/events、core/evidence/runtime | MOD-02/26/28；RT-09/13，用量观测及P3起按需启用的模型重试 |
-| P4 Session Management | Pi session、core/jobs/runtime 绑定与控制 | MOD-08/25；RT-05/10/11/12/14 |
+| P4 Session Management | Pi session、core/sessions 会话与输入受理、core/memory 存储、core/jobs/runtime 绑定与控制 | MOD-08/25；RT-05/10/11/12/14 |
 | P5 Context Engineering | core/context、data/isolation、受控取证 | MOD-03；RT-03 的消息接合、RTC-06 Context 子集 |
 | P6 Memory | runtime-pi/memory 绑定、policy、history | MOD-03/08；RT-05 历史使用、RTC-06 Memory 子集 |
 | P7 Context Compaction | 同一 memory 的原生 compaction 接合 | MOD-03/08/28；RT-06 |
@@ -122,7 +122,7 @@ P0可登记BM覆盖及人工协议草案，不为此预建全部基准目录；P
 | P9 Prompt & Skill Management | Pi resources、core/configuration、员工资源 | MOD-01/04/06；RT-07 |
 | P10 Pi Native Extensions | runtime-pi/extensions、core/configuration | MOD-33；RT-08 |
 | P11 Subagent Harness | runtime-pi/subagent、同一工具/预算/证据端口 | MOD-34；RT-17 |
-| P12 Product & Action Harness | desktop/mock-b2b、审批/动作/Outbox、企业只读查询/B2B Adapter | MOD-01/07/10–29/33/34 的产品与 Action 子集，含步骤视图、桌面故障/IPC和双入口单控制者 |
+| P12 Product & Action Harness | desktop/mock-b2b、审批/动作派发、企业只读查询/B2B Adapter | MOD-01/07/10–29/33/34 的产品与 Action 子集，含步骤视图、桌面故障/IPC和双入口单控制者 |
 | P13 Production Harness | runtime-host/Host 客户端、发布与 operations、生产日志 | MOD-25–29；RT-15/16、生产日志专项F及全链回归 |
 
 工程落点遵循主方案第 20 章，不新增平行 Runtime、Memory、Plugin、Subagent 或评测产品包。P0–P11 经公共 Application 的 CLI/最小入口验证；P12 桌面复用同一组装和命令；P13 只替换 Runtime 承载，Kernel 和业务数据库仍在控制侧。
@@ -131,7 +131,7 @@ P0可登记BM覆盖及人工协议草案，不为此预建全部基准目录；P
 
 业务范围约定：保留 P0–P13 顺序与全部既定 Pi Runtime、Memory/Compaction、Extensions/Subagent 评测。收货、合同、价格、余额等适用业务核查继续保留；供应商/订单关联按目标字段或核查所需取证启用，不把所有查询强制用于每票。人机协同评测覆盖纠错、歧义确认、提交确认、确认后改值失效及异常接管，不新增企业财务审批流或强制双人审批。通用员工创建及复杂配置管理页面不属于当前被测产品；固定资源配置、原生扩展管理和发布控制仍需验证。输入已明确为一票，保留已有多页解析读取，自动拆票/合票不计入支持范围。
 
-MOD-10、MOD-14、MOD-22、BM-06 保留旧编号但退出当前适用集合；全文数字区间引用均扣除这些编号，不改号复用。旧数据、用例或报告若包含原文解析执行、独立验真或 ERP 写入，不作为当前产品验收门槛，也不作为已通过成绩；重新发布适用清单后才参与对应范围的统计。原始数据与历史审计保留；已取消功能的用例归档后退出活动数据集，不把既有数据工具测试成绩改写为产品完成。Outbox 的 B2B 动作派发与 UNKNOWN 核对继续评测。第二种非发票任务及用于证明平台通用性的验收已取消，不计入当前适用集合、覆盖率或退出条件；历史相关成绩保留且不作为当前产品完成证据。PC-01 与 BM-09 继续验证固定发票员工的产品集成，以及 Workspace、数据完整性、公共控制和日志等必要能力。
+MOD-10、MOD-14、MOD-22、BM-06 保留旧编号但退出当前适用集合；全文数字区间引用均扣除这些编号，不改号复用。旧数据、用例或报告若包含原文解析执行、独立验真或 ERP 写入，不作为当前产品验收门槛，也不作为已通过成绩；重新发布适用清单后才参与对应范围的统计。原始数据与历史审计保留；已取消功能的用例归档后退出活动数据集，不把既有数据工具测试成绩改写为产品完成。B2B 动作派发与 UNKNOWN 核对继续评测。第二种非发票任务及用于证明平台通用性的验收已取消，不计入当前适用集合、覆盖率或退出条件；历史相关成绩保留且不作为当前产品完成证据。PC-01 与 BM-09 继续验证固定发票员工的产品集成，以及 Workspace、数据完整性、公共控制和日志等必要能力。
 
 ## 2. 评测与功能开发的先后关系
 
@@ -213,7 +213,7 @@ MOD-10、MOD-14、MOD-22、BM-06 保留旧编号但退出当前适用集合；�
 | MOD-19 审批与动作授权 | 主体、角色、范围、期限、拒绝/撤销及 B2B 提交确认授权 | F/A/B；BM-04/08 | P12；P13 真实授权观察 |
 | MOD-20 Browser / 07B2B 录入 | 登录/定位/明细/附件/回读，MFA、页面所有权和接管 | F/A/B；BM-04/05/08 | P12 三层测试目标；P13 获准业务 |
 | MOD-21 提交与权威结果确认 | Intent、持久身份、Final Admission、回执/UNKNOWN、先查后重试 | F/A/B；BM-05/07/08 | P12；P13 Host 恢复及只读对账 |
-| MOD-22 保留编号（ERP 写入已取消） | 不评测 ERP 写入；Outbox 的 B2B 可靠派发继续保留 | 不计入当前覆盖率与退出条件 | B2B 动作与可靠派发沿 MOD-21/25 及 BM-05/07/08 覆盖 |
+| MOD-22 保留编号（ERP 写入已取消） | 不评测 ERP 写入；B2B 可靠派发继续保留 | 不计入当前覆盖率与退出条件 | B2B 动作与可靠派发沿 MOD-21/25 及 BM-05/07/08 覆盖 |
 
 MOD-10 不改变已解析输入主线。MOD-15/16 的适用核查若记为不适用，必须有业务依据；缺数据或实现不能记不适用。P2 候选保存不等于业务修订接受，P8 Workflow 成功不等于提交成功。
 
@@ -287,7 +287,7 @@ MOD-30–32 的 F 用独立已知通过、失败、错配、缺证据和统计�
 
 预置正确上游输入、替换工具结果或人工纠正必须披露。局部成功不能计为独立跑通上游；业务 E2E 偶然成功不能免除机制与权限检查。
 
-Session 文件恢复不等于 Memory 正确；历史含事实不等于模型使用正确；Context 含事实不等于历史已保存；Compaction 触发不等于事实保持；Runtime Event 不等于业务状态。六类能力按 P2–P7 分别建设、取证与判分。
+SQLite 中恢复出完整原生 Session entry/tree/cursor 不等于模型正确使用 Memory；历史含事实不等于模型使用正确；Context 含事实不等于历史已保存；Compaction 触发不等于事实保持；Runtime Event 不等于业务状态。六类能力按 P2–P7 分别建设、取证与判分。
 
 ### 3.9 评测模式的组合规则
 
@@ -448,7 +448,7 @@ Context Builder 归 core/context，P5 选择当前事实；Memory 绑定/history
 
 | 场景族 | Oracle / Gold 与阶段 |
 |---|---|
-| RTC-05-01 保存并继续 | P4：同Workspace真实打开sessions/持久历史，旧Run临时目录清理后仍可续接；新work/agent/Scope与当前配置实际生效，错误空间历史拒绝；不支持安全重绑定时按3.23拒绝续接并另记恢复；P6评历史事实使用 |
+| RTC-05-01 保存并继续 | P4：同Workspace从SQLite真实恢复完整Session/Memory，旧Run临时目录清理且原生目录为空后仍可续接；新work/agent/Scope与当前配置实际生效，错误空间历史拒绝；不支持安全恢复/重绑定时按3.23/3.24拒绝续接并另记恢复；P6评历史事实使用 |
 | RTC-05-02 替换活动会话 | P4：新Run/绑定、旧监听清理；重新核验当前装载并固定新Snapshot/ready前零执行，不恢复旧执行权；P6 Memory、P10扩展重新绑定 |
 | RTC-05-03 存储损坏与缺失 | P4：保留坏数据，明确恢复范围或拒绝，不静默空建后声称恢复 |
 | RTC-05-04 工具中断的历史 | P4：不完整调用与已存结果区分；P12不重复外部动作 |
@@ -552,7 +552,7 @@ Context Builder 归 core/context，P5 选择当前事实；Memory 绑定/history
 | RTC-16-02 长程运行 | P4多轮；P6历史；P7重复压缩；分别报告后半程事实质量和全部成本 |
 | RTC-16-03 有界并发负载 | 当前已批准并发范围内执行；P11父子预算，P13生产容量，不承诺线性加速 |
 | RTC-16-04 依赖升级对照 | P1起逐能力变更；P10插件、P11主子、P13完整发布组合 |
-| RTC-16-05 回退与连续故障 | 当前已启用的恢复/版本能力增量；P13安装/迁移/备份全链，Workspace身份、sessions/原生资产及全部引用完整；原实例恢复与新测试副本分开，不只回退包版本 |
+| RTC-16-05 回退与连续故障 | 当前已启用的恢复/版本能力增量；P13安装/迁移/备份全链，Workspace身份、SQLite sessions/memories及全部引用完整；原实例恢复与新测试副本分开，不只回退包版本 |
 
 ### 3.18 工具、记忆、Session 的 Case/Gold 制作示例
 
@@ -673,11 +673,11 @@ Workspace安全变体按3.23执行：伪造空间身份、错误对象归属、�
 |---|---|---|
 | 默认空间持久化 | 首次初始化产生真实workspaces记录，稳定ownerActorId/workspaceId及环境/数据根映射，重启读取原身份；缺失可信归属、未知空间或错误归属的输入/产物被拒绝；单default约束有效 | P0；MOD-07/09/25/27/29，BM-01/07/08/09基础F |
 | 可信身份与权限交集 | Application从受控配置和核验操作者解析空间；模型、Renderer和请求参数不能自行签发身份。有效权限不超出当前空间策略、候选/发布、Job授权和Run/子Scope的交集；伪造ID、扩大Scope、错环境/账号请求被拒绝 | P1最小绑定；P2 Gateway；P8 Job；P11子；P12人工命令/Action；MOD-05/07/08/19/24/27，BM-08/09/11/12 |
-| 数据库归属一致 | Run/Job复合归属和父子同Job/空间；文档/数据集、候选/文档、Job/Candidate或Release、审批/动作等多父级写入同空间。业务Artifact、Audit、Outbox不可借空归属逃避检查；仅限定实例级类型允许空值 | P0已有根与Artifact；后续按领域表启用；MOD-09/25/26/29，BM-07/08/09 |
+| 数据库归属一致 | Run/Job复合归属和父子同Job/空间；文档/输入清单、候选/文档、Job/ExecutionManifest、Run/Session、人工交互/动作等多父级引用同空间；文件引用同时核验摘要和归属。业务Artifact、Audit、提交动作不可借空归属逃避检查；仅限定实例级类型允许空值 | P0已有根与Artifact；后续按领域表启用；MOD-09/25/26/29，BM-07/08/09 |
 | 查询、输入与Context | 按ID查到记录不等于有权读取；检索、导出、证据下载、后续取证及实际模型输入均限定本空间和任务获准范围。共享资料不自动进入全部Session，日志、其他会话和未选业务产物不自动注入 | P0受控输入；P2读取；P4输入绑定；P5/P6/P7当前与历史事实；P12界面/查询；MOD-03/05/09/23/26，BM-03/08/11 |
 | 清单、Scope与证据绑定 | ExecutionManifest、ContextSnapshot、Scope及实际Run/RuntimeSnapshot按阶段绑定workspaceId、配置版本/摘要和环境依据；固定版本不能覆盖当前暂停/撤销。error的workspace影响范围及日志/审计归属可定位、不串线 | P0配置/错误/日志；P1清单与Run；P2 Scope；P5 Context；P13 Host；MOD-01/08/26/27/28，BM-07/08/09/11 |
 
-数据库F应包含“引用存在但归属错误”、多父级写入失败后无部分残留、策略version条件更新与审计一致等检查。数据表从37增至38仅是主方案事实范围变化，不以表数作为验收目标；按启用范围核验workspaces及相关约束，不要求P0建齐。跨归属反例可用隔离实例、错误引用或受控F夹具构造，不通过开放多空间产品入口完成测试；目录隔离和workspace_id列均不能替代实际授权检查。
+数据库F应包含“引用存在但归属错误”、多父级写入失败后无部分残留、策略version条件更新与审计一致等检查。主方案第18章采用23张产品表（22张功能表加schema_migrations）与不可变业务文件分工，其中memories保存Pi原生Session entry及压缩内容，context_snapshots保存完整上下文投影；不以表数作为验收目标，按启用范围核验workspaces及相关约束，P0只建立基础接口和当期所需表，不要求建齐。跨归属反例可用隔离实例、错误引用或受控F夹具构造，不通过开放多空间产品入口完成测试；目录隔离和workspace_id列均不能替代实际授权检查。
 
 #### 3.23.2 空间生命周期与在途动作
 
@@ -693,22 +693,58 @@ P13核验archived仅在无活动绑定、在途动作及未解决恢复事项时
 |---|---|
 | runtime/<runId>/work/ | 当前Run的cwd/临时文件，主子分别分配，不共用可变目录；不使用源码根、来源根或质量根作为工作目录，访问仍受Scope限制 |
 | runtime/<runId>/agent/ | 当前Run私有agentDir和获准资源投影；不自动发现全局/其他Run资源，不复制明文认证，不存持久历史 |
-| sessions/ | Pi原生持久根，记录真实Session身份及文件引用，跨Run保留；格式和分支依赖由Pi管理，不手写历史或每Run复制一份；普通业务工具不得直接读取 |
+| SQLite sessions + memories | 唯一权威Session持久化：sessions保存归属、Pi原生header、native format version、storage version、current entry及生命周期，memories逐行保存完整Pi原生entry；原生sessions/JSONL目录关闭且可以为空，普通业务工具不得直接读取或另存历史 |
 | runs/<runId>/与inputs/<projectionHash>/ | 执行证据与获准只读输入独立保留；临时产物先归档并固定引用，再清理临时目录，不能留下依赖已删除绝对路径的证据 |
 
-P1检查临时资源及内存模式标记，不要求存在持久历史。P4增加完整跨Run试验：首次绑定固定Session的Workspace归属；旧绑定停止并失效，旧Run临时目录释放后，在同空间的新Run创建新work/agent/Scope，通过Pi打开原持久Session并重新绑定当前工具、事件和Context。核验实际使用当前配置和获准历史，旧cwd/资源路径不授予新访问权；另一空间的历史引用被拒绝。原生SDK无法安全重绑定时，应拒绝该续接，并按当前权威事实新建Session的恢复规则处理，不能改写历史冒充兼容；降级恢复不冒充原Session续接成功，按事前Case目标分别评分。
+P1–P3检查临时资源及内存模式标记，不承诺重启恢复。P4增加完整跨Run试验：首次绑定固定Session的Workspace归属；旧绑定停止并失效，旧Run临时目录释放后，在同空间的新Run创建新work/agent/Scope，从SQLite完整读取header、全部entry树和current entry，以锁定的Pi 0.85.1 `SessionManager.inMemory(cwd, { id }, entries)`重建并显式恢复当前位置，再绑定当前工具、事件和Context。恢复查询即使分页也须遍历至完整结果，不得因页限误漏历史或分支。核验实际使用当前配置和获准历史，旧cwd/资源路径不授予新访问权，另一空间的历史引用被拒绝；原生sessions/JSONL目录为空时主Session仍须恢复。无法安全恢复或重绑定时拒绝续接并披露缺口，不能改写历史或把新Session冒充原Session续接。
 
-P11核验插件真实创建的子Session与父Job同空间，子Run具有独立work/agent及自身持久历史，仅共享获准只读输入。插件若不能控制目录、持久会话或资源发现隔离，应拒绝启用对应角色并登记能力缺口，不得继承父目录完整权限。父Run清理不能误删子Session或仍在使用的资源。
+P11核验插件真实创建的子Session与父Job同空间，子Run具有独立work/agent及自身SQLite持久历史，仅共享获准只读输入。`@tintinweb/pi-subagents`通过DB Session工厂的最小兼容补丁接入，新建或续接子会话须先登记绑定，并关闭插件原生文件与自动transcript写入；委派仍只能由主LLM调用Agent工具触发，数据库索引或恢复不得主动触发委派。原生sessions/JSONL目录为空时主子会话均须恢复。插件若不能控制目录、会话工厂或资源发现隔离，应拒绝启用对应角色并登记能力缺口，不得继承父目录完整权限。父Run清理不能误删子Session或仍在使用的资源。
 
-清理按“停止新调用→核验主子Session/工具/扩展实际停止及句柄释放→归档必要产物→删除本Run临时资源”取证。未确认清理的目录保留并标异常，不交新Run复用；路径解析须校验当前实例根、Workspace归属及Run所有权，符号链接/目录联接越界删除必须被拒绝。清理runtime/不能触及sessions/、runs/、inputs/或来源数据。目录存在或消失均不足以单独证明正确清理，须比对清理前后资源清单、归属和被保护文件。
+清理按“停止新调用→核验主子Session/工具/扩展实际停止及句柄释放→归档必要产物→删除本Run临时资源”取证。未确认清理的目录保留并标异常，不交新Run复用；路径解析须校验当前实例根、Workspace归属及Run所有权，符号链接/目录联接越界删除必须被拒绝。清理runtime/不能触及SQLite sessions/memories、runs/、inputs/或来源数据。目录存在或消失均不足以单独证明正确清理，须比对清理前后资源清单、归属和被保护事实。
 
-P0–P11不实现自动Session清除，默认保留。P13按独立保留策略核验：存在活动绑定、待恢复任务、未处理异常、保留期或其他Run/分支依赖时不删；不能因一个Run结束删除仍被引用的Session。备份覆盖一致性数据库、必要证据、原生会话与引用映射，恢复引用完整后才允许重绑定。恢复原实例保留Workspace身份和映射；独立测试副本须新实例/Workspace身份，不把复制的会话直接绑定到新空间，按获准输入与业务事实构造新的测试会话。
+P0–P11不实现自动Session清除，默认保留。P13按独立保留策略核验：存在活动绑定、待恢复任务、未处理异常、保留期或其他Run/分支依赖时不删；不能因一个Run结束删除仍被引用的Session。备份覆盖一致性数据库、必要证据及Session/Memory引用，恢复引用完整后才允许重绑定。恢复原实例保留Workspace身份和映射；独立测试副本须新实例/Workspace身份，不把复制的会话直接绑定到新空间，按获准输入与业务事实构造新的测试会话。
 
 #### 3.23.4 评分、可比性与继承
 
 身份、归属、状态迁移、访问/写入、资源清理和备份映射以确定性Grader及权威证据核验；真实模型使用当前资料、历史和受限子工具另作A，适用业务结果另作B。错误归属被平台拦截时仍区分模型违规与控制通过；清理未确认、会话缺失或证据不足按第7章分类，不默认通过。模型输出“已暂停/已清理/已恢复”不能替代控制与文件证据。
 
 Case模板可以声明逻辑空间角色和初态，由正式受控初始化绑定实际身份；Trial保存实际instanceId/workspaceId、空间版本/摘要、环境、候选、Session/Run和证据引用，Runner不得替产品签发权限。独立测试实例间允许比较等价场景，但须记录身份映射、策略/环境等价依据及差异；不得把Test清单原样当成另一生产Workspace的可执行许可。空间、策略、资源布局或Session机制变化后，对受影响子集实际回归并形成新范围结论；无绑定证据的历史成绩不能直接证明新约束通过。
+
+### 3.24 精简存储契约与恢复断言
+
+本节对齐主方案第18章存储、第19章清单/发布/操作与第20章工程目录，补充既有MOD/RT的机制F，不新增Benchmark、功能阶段或业务范围。产品表共23张，即22张功能表加schema_migrations：workspaces、documents、jobs、job_step_attempts、sessions、session_inputs、memories、context_snapshots、agent_runs、tool_calls、runtime_events、budget_entries、invoice_candidates、invoice_revisions、human_interactions、approvals、submission_actions、submission_attempts、submission_receipts、artifacts、audit_events、operational_controls、schema_migrations。按阶段已启用事实验证，不以建齐表作为早期门槛；质量资产和评分记录仍归agent-eval。
+
+| 存储边界 | 必需断言与恢复证据 | 既有覆盖及阶段 |
+|---|---|---|
+| 文件清单与运行绑定 | 员工/版本/候选/发布/资源/能力等原7张配置表撤销；版本化ExecutionManifest文件由artifacts索引，jobs固定manifest_artifact_id/manifest_hash及execution_mode。摘要不符、缺失或错空间文件拒绝装载；agent_runs固定实际RuntimeSnapshot，历史Job/Run不随文件替换漂移。发布/撤销状态由operational_controls按清单摘要、环境和范围判定，旧清单不能绕过当前控制；质量候选及Release结论仍须绑定该固定组合 | MOD-01/25/27；RT-01/07/08/16；P0文件基础、P1装载、P9/P10资源、P13发布回归 |
+| 输入与数据集 | documents只索引原票及外部已有解析元数据；数据集使用不可变manifest文件，不新增产品Parser或解析任务表。重启及备份恢复后重新核对输入配对、文件摘要、清单版本和Workspace归属，文件缺失或被替换不能沿用原输入身份 | MOD-09/25/29；P0基础，P2/P5读取与Context回归 |
+| Session生命周期与恢复 | core/sessions负责创建、绑定、打开、分支、当前位置移动和关闭；sessions保存Workspace/父级归属、Pi原生完整header、native_format_version、storage_version、current_entry_id及生命周期。按主方案18.2.3分别保存产品session_id与唯一pi_session_id，核对header中的原生ID/格式版本与列值一致，原生事件在接入层准确映射为产品身份，不能按最近记录猜测。初始化事务登记header、初始entries和当前位置，成功前不得发布active会话或执行；失败保留可核验事实。产品元数据version与历史storage_version分别用于各自并发控制。P4起agent_runs以外键引用sessions；P1–P3只使用内存Session，不承诺重启恢复。恢复使用锁定的Pi 0.85.1 `SessionManager.inMemory(cwd, { id }, entries)`装载完整header+entries并显式恢复当前位置；恢复查询允许分页实现，但必须遍历全部页并校验数量/sequence连续性，不得把单页结果当完整历史。由Pi解释loop/history/compaction；SQLite是唯一持久化权威，原生sessions/JSONL文件关闭且不参与裁决 | MOD-08/25/29；RT-05/10/11/12/14/15；P1–P3内存、P4持久续接、P13恢复/保留 |
+| 原生Memory与Compaction | core/memory在同一事务写入完整Pi原生entry；memories每行保留消息、工具、compaction、branch summary、model、label、extension、custom等条目原貌，`UNIQUE(session_id,native_entry_id)`与`UNIQUE(session_id,sequence)`有效。按主方案18.2.4从固定规范化正文重新计算entry_hash，核对entry_type、ID、父ID列与entry_json一致，不能仅信调用者传入摘要；相同ID+相同内容重复写幂等，相同ID+不同内容拒绝。父链无环、sequence顺序合法；非空parent、compaction.firstKeptEntryId、branch_summary.fromId、label.targetId、声明的自定义历史引用和非空sessions.current_entry_id均须指向同Session有效entry；空根parent/当前位置按原生格式允许null。锁定Pi 0.85.1格式在空leaf生成的branch_summary条目另允许`fromId='root'`作为空根哨兵，不将其当悬空entry；其他悬空或跨Session引用仍拒绝；自定义payload保留原貌，不把任意扩展字符串当作历史引用。批量新增先核验完整集合再提交，无部分接受。runtime-pi/memory负责原生entry采集与恢复，Pi继续解释历史与压缩，产品不另造摘要语义。恢复覆盖完整entry/tree/cursor及工具调用关联，并逐类验证标签、模型、扩展和自定义条目不丢失；业务事实仍以当前Revision为准，摘要不能复活失效确认 | MOD-03/08/25/28；RT-05/06；P4首次持久恢复，P6/P7效果与压缩，P13恢复回归 |
+| 上下文快照独立存储 | P5建立context_snapshots，core/context保存完整任务目标、约束、已选事实、输入投影、来源/有效时点及资源/历史引用；正文、身份与snapshot_hash一致。按ID或Job/Run查询，UQ(run_id,sequence)，同ID同内容幂等、不同内容拒绝。插入快照与更新agent_runs.context_snapshot_id同事务核验binding、代次和依据；失败不得向Runtime发布新投影。按主方案18.2.5/18.2.7，工具调用的context_snapshot_id由可信接入层依据实际模型请求/输入交付关联传入，并核对属于本Run；不能读取最新Run指针猜测或信任模型自报身份。候选固定实际context_ref，后续快照不能改写历史工具与候选依据。RuntimeSnapshot仅固定其生成时的context_snapshot_id/hash，不随多轮Context更新改写；Context不反向包含RuntimeSnapshot摘要。P1–P4未启用快照时保留真实空引用，不补造历史。无ContextSnapshot文件仍可从数据库恢复，artifacts仅管理引用业务文件及显式导出，导出不参与恢复；验证错空间/任务/Run、悬空历史引用、正文或依据被改动、写入中断、旧版本与恢复当前授权。原生压缩摘要继续存memories，不建compaction_records表 | MOD-03/05/08/25/29；RT-06 Context变体；P5存储F，P6/P7输入使用回归，P13备份恢复 |
+| 持久提交与活动绑定 | 包装层锁定Pi版本及公开历史变更方法；最外层公开变更调用完成后，同一事务提交header、增量entries、当前位置、storage_version，相关运行事实按各自Owner事务管理。嵌套合并只覆盖SessionManager同步历史变更调用栈；不得包装`AgentSession.prompt`/`continue`的整个异步Loop并把消息落库延后到Loop结束。不能只依赖`message_end`/`entry_appended`监听器。每次写须有且仅有一个有效binding并校验expectedStorageVersion；按主方案18.2.4，仅移动当前位置也须提交storage_version，标题变更若产生原生session_info条目须与产品标题同事务保存。保存失败将binding置为poisoned，阻断新工具并请求abort；恢复只从last committed状态开始，不自动重放结果未知的模型/工具/业务动作。中断、重复写、DB失败、迟到旧binding和跨会话引用均须有无部分提交/无越权推进证据 | MOD-08/25/26/28；RT-05/09/10/11/12/14/15；P4起，P13跨进程回归 |
+| 父子委派 | 不设delegations表；Agent工具准入时先登记pending子Run，agent_runs的父子关系和委派字段关联真实工具调用，按主方案18.2.6以UQ(parent_run_id,origin_tool_call_id,delegation_slot)识别子执行：不同槽位不得错误去重，同槽位重复登记不能创建第二个子Run。插件agentId/Session未取得时允许为空，取得后按明确槽位/身份关联补齐可信绑定，不能猜测最近创建的Session；启动失败/创建中失联保留原pending身份及失败/待核对事实，不遗漏记录。仅LLM的Agent工具发起委派，重启/取消/迟到结果不能制造第二次委派或越权续跑；产品/Eval不得主动补发子任务 | MOD-34/08/25/28；RT-17；P11，P13故障回归 |
+| 候选、修订与校验依据 | invoice_candidates保留原预测；按主方案18.2.10，校验/匹配结果为绑定Revision及fieldsHash的不可变AssessmentSnapshot，由invoice_revisions引用当前快照。每次发布完整有界结果，未检查项明确unknown；同一版本的并发结果先合并，再按assessment_version以CAS更新当前引用，冲突重读，旧代次/旧版本结果不得覆盖新结论。字段变化生成新Revision；仅证据变化也更新快照并使旧动作确认失效。提交basis_hash覆盖字段、评估、目标、载荷及规则，不只比较revisionId；重启后不得将旧快照/确认套入新依据，也不能覆盖旧候选或快照历史 | MOD-11/12/15/16/17/19/25；P2候选、P8修订/核查、P12确认联动 |
+| 会话输入受理 | P4由core/sessions建立session_inputs，普通输入命令返回inputId，记录唯一请求键、目标Job/Session及实际消费Run。相同请求键同内容幂等、不同内容拒绝；受理/排队不能记为consumed。核验旧代次、重复投递、投递后崩溃及delivery_unknown；恢复先查原生历史/交付证据，不盲目重发或补造消费。Job/Session/Run错归属拒绝；memories仍是原生历史权威，不另建消息正文库 | MOD-07/08/25；RT-05/11/12/14；P4，P13恢复回归 |
+| 人工业务交互 | P8由core/reviews建立human_interactions，仅保存澄清、业务复核、字段确认与接管；命令返回interactionId。一次有效回答及重复响应幂等，更正追加且保留原回复；采纳与修订、步骤、Job及审计同事务。核验回答有歧义时继续澄清、旧依据及重复回复不推进新事实，字段确认不能成为提交许可 | MOD-07/17/23/25；P8，P12集成与P13恢复 |
+| 正式提交审批 | P12由core/approvals建立approvals，命令返回approvalId；只审批已冻结Action，验证可信主体/角色、basis_hash、有效期与预期版本。审批决定、尚未发送动作状态/当前approval_id及审计同事务保存；原决定、主体和时间不因撤销/过期/失效改写。submission_actions可改选新approval_id，但submission_attempts始终保留发送时的approval_id；错Action审批及迟到旧批准不能推进ready，新修订或撤销阻新发送而不覆盖已发生结果。普通inputId、interactionId及“同意”文字不能冒用正式审批；工作台统一展示仍须区分类型并调用所属命令 | MOD-19/21/23/25/26；P12，P13故障回归 |
+| 提交动作派发与恢复 | submission_actions保存冻结预览、稳定动作幂等身份和待派发/租约字段；按主方案18.2.13，logical_action_key由可信业务命令按目标环境/组织、业务对象及动作类型生成，不接受模型随机身份。同逻辑动作跨Job也至多一个ready/sending/unknown/succeeded记录，预览与重试固定同一目标幂等身份；新建Job/Action、改载荷或随机幂等键不得绕过限制，不同合法业务对象不应被误拦截。取消独立Outbox模块/表，由core/submissions/dispatch.ts领取动作并调用唯一提交入口，领取不等于发送许可。submission_attempts与submission_receipts独立保存实际尝试及权威结果；崩溃、租约重取、重复派发、发送后响应丢失均不得重新获得同Attempt发送许可。UNKNOWN先核对，查询暂未找到不盲重发；允许安全幂等重试时须有目标未生效证明或支持同一幂等身份安全重试的契约/证据，重新通过确认/准入，并确认旧执行权失效与资源停止；同动作至多一个is_active=true且为PREPARED/SENDING/UNKNOWN的Attempt，同事务退出旧Attempt活动资格并建立关联新尝试，保留旧UNKNOWN历史和迟到回执，验证活动唯一约束及固定幂等身份。每次准入保存当时approval_id，后续动作审批指针变化不能回写历史Attempt；成功回执与完成事实按主方案事务保存 | MOD-18/19/21/25/26/28；P12动作，P13 Host/恢复回归 |
+
+以上断言继承3.6.1与3.23的活动唯一性、归属、事务、保留及备份约束。产品F提供实际数据库约束、文件摘要/引用和故障前后证据，质量侧关联既有Case/Oracle；不以本次文档同步宣称实现或评测通过。阶段方案按本表启用相应变体；Session/Memory全量入SQLite不扩大为长期偏好、向量库或跨会话自动共享。
+
+#### 3.24.1 第18章关键约束的必测变体与评分
+
+下列五组均为既有机制F的必要检查项；详细契约沿用上表，各阶段Case/Oracle和退出条件引用本表。通过数据库约束、正式命令结果、事务前后状态及权威目标记录作确定性判断，沿用第7章判定状态、严重度及硬约束汇总规则。已确认违反必需断言判FAIL；证据不足、设施错误或未执行分别登记UNJUDGEABLE、ERROR或NOT_RUN，不能判PASS，也不能用LLM解释替代持久证据。故意注入的故障按被测场景判定，不剔除为设施错误。
+
+| 约束与产品依据 | 首次阶段与必测正反例 | 成功/失败判据及必要证据 |
+|---|---|---|
+| 跨Job动作防重；18.2.13 | P12：两个Job并发提交同一逻辑动作；成功后另建Job再提交；UNKNOWN时换载荷/随机幂等键重提；满足条件的安全重试；不同业务对象合法提交 | 活动Action/Attempt唯一且目标无重复业务生效，合法独立动作及安全重试不误拦截。保存可信逻辑键与目标幂等身份、并发命令、Action/Attempt/审批/重试依据、事务前后状态及独立目标记录；合法重试可以产生多次请求，不能以请求次数代替业务生效次数。绕过防重、重复生效或误拒合法对照均判对应项失败 |
+| AssessmentSnapshot并发一致性；18.2.10 | P8：供应商匹配与订单校验同版本并发返回；旧结果迟到；CAS冲突重读；仅证据更新；检查项缺失。P12增加旧确认失效与重新确认后合法准入 | 有效结果不丢失、不被旧结果覆盖，未检查项保留unknown；字段变化新建Revision，证据变化更新评估依据。保存前后完整快照/摘要、assessment_version、CAS结果与审计；P12另存basis_hash、审批和准入事实。丢失结果、未知冒充通过或失效确认授权发送均失败，不能只靠revisionId未变判定依据有效 |
+| Session身份及原生历史完整性；18.2.3/18.2.4/18.2.8 | P4：正文篡改但沿用旧hash；列值与正文冲突；循环父链/非法顺序；悬空标签或声明的自定义引用；产品/Pi身份错配；初始化失败；指针更新冲突；标题同步中断；同内容幂等、合法空根/扩展内容及完整恢复正例 | 非法历史拒绝且无部分提交，初始化失败不发布可执行会话，持久保存失败按poison规则停止绑定；合法原生内容可恢复。保存产品/Pi身份映射、完整header/entries、规范化摘要复算、引用/顺序、cursor/storage_version及标题事务前后证据；只移动指针也必须有版本提交，不误拒合法哨兵或普通扩展字符串 |
+| Context实际调用归属；18.2.5/18.2.7 | P5：请求使用快照A，Run切至B后工具才返回；模型伪造快照ID；跨Run引用；快照保存失败；正常调用及重启后历史关联核验 | 可信调用关联仍指向实际A，后续快照及恢复不改写工具、候选或已有RuntimeSnapshot；失败快照不发布。保存模型请求/输入交付关联、快照正文/hash、工具与候选引用、RuntimeSnapshot前后摘要、Run指针及事务记录。最新指针替代历史、模型自报身份被采信或循环摘要依赖均失败 |
+| 多子Agent委派身份；18.2.6 | P11：同一次Agent工具调用多个子槽位、同槽位重复登记、插件身份乱序返回、部分启动失败、pending登记后崩溃及恢复。多子变体按实际启用模式制作；未启用保留限制，不冒称覆盖 | UQ(parent_run_id,origin_tool_call_id,delegation_slot)有效，不同槽位独立、同槽位幂等；pending/失败记录可查，真实插件身份和Session不串线，恢复不补发。保存来源工具调用、槽位、命令、子Run与插件/Session映射、失败/恢复前后记录及真实委派调用观测；重复创建、错误去重、丢失或猜测绑定均失败 |
+
+覆盖登记复用上表的MOD/RT及对应阶段既有BM，按场景变体与版本关联Case/Oracle和产品F证据，不新增顶层Benchmark或重编号。P13对五组受影响约束增加跨Host、崩溃及备份恢复验证，保留故障前后身份、版本和关联。F通过不代替真实模型行为A或业务结果B通过；正常对照用于检查合法行为未被新增约束误拒，旧证据仅在版本与场景适用时复用。
+
 
 ## 4. 评测资产与数据生命周期
 
@@ -727,6 +763,8 @@ Case 定义输入、目标、初态与约束；Gold 提供核验后的字段、�
 P0即记录真实默认Workspace与输入/产物归属；BenchmarkDefinition绑定适用空间策略、环境版本和基线映射，Grader核验实际清单、Context、Scope和Run的一致性。原实例恢复与独立测试副本使用不同身份处理规则，不能以复制数据库/Session代替受控初始化。实例级固定资源的空归属例外按主方案18.2限定，不视为所有空间可读。
 
 生命周期为草案 → 核验 → 冻结 → 运行依赖就绪 → 实际执行 → 评分 → 复核；用途撤回、证据失效、规则过期时隔离或退役并保留替代关系。Gold/Case/Benchmark修订只追加，不覆盖旧成绩。历史失败不得因阶段变化删除。
+
+本次产品存储及评测方案同步不修改data、Gold、Case或既有成绩；session_inputs/approvals拆分只更新方案、Oracle要求及阶段边界，不宣称已完成实际数据迁移。现有冻结Case所引用的spec hash可能对应旧方案；正式运行前须由质量侧受控核验主方案/本方案的新摘要、适用Oracle及冻结成员，发布有版本与审计依据的新引用/冻结清单，保留旧版本和差异。未完成刷新不得把旧spec hash资产标为本次存储契约已覆盖，也不得为匹配新文档静默覆盖冻结Case或历史报告。
 
 业务字段Gold来自原文；关系/决策Gold来自有效规则和主数据；动作Gold来自动作契约与权威核验。回执证明发生过动作，仍须核对对象、金额、供应商和订单是否正确。提供方标签、模型预测和子结果均不是自动可信Gold。
 
@@ -1175,7 +1213,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **Case / Gold / Oracle：** 正常/缺失/错配/损坏/越界输入，存储重启、配置锁与日志失败判据；按3.6.1核验不安装或启动Electron时CLI可执行当前任务，导入公共组装不自动启动资源，显式启动/关闭有证据；可草拟少量字段Gold，不制作完整企业集。
 
-按3.23增加默认空间初始化/重启身份不变、单default约束、环境/受控数据根映射、未绑定/未知空间及输入/产物错误归属拒绝；业务Artifact必须有归属，限定实例级资源例外不得泄露业务数据。只验当前已建立的表与对象，不提前建齐38表或多空间功能。
+按3.23/3.24增加默认空间初始化/重启身份不变、单default约束、环境/受控数据根映射、未绑定/未知空间及输入/产物错误归属拒绝；业务Artifact必须有归属，限定实例级资源例外不得泄露业务数据。只验当前已建立的基础接口、表与对象，不提前建齐23张表或多空间功能。
 
 **F / A / B：** 复用产品实际基础F；A不适用，业务B不适用。
 
@@ -1201,7 +1239,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **Case / Gold / Oracle：** 最小调用/回送/继续/结束、错误与中止；RTC-01-01/04核验装载检查完成前零执行、通过后当前快照/绑定与首请求一致，延迟/失败窗口按3.6.1取证；字段及来源Gold独立核验。
 
-按3.23核验最小清单/Run继承真实Workspace与配置版本，work/agent资源隔离及无全局默认泄漏；内存Session明确标记，不伪造sessions/持久历史或后续阶段对象。
+按3.23核验最小清单/Run继承真实Workspace与配置版本，work/agent资源隔离及无全局默认泄漏；P1及后续P2–P3的内存Session明确标记，不伪造SQLite持久历史、重启恢复或后续阶段对象。
 
 **F / A / B：** F区分原生机制、接合和真实服务连通；A须真实模型自主调用；有可核验字段时提供局部B，无完整业务B。
 
@@ -1269,15 +1307,15 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **阶段定位：** 证明多轮输入和原生Session生命周期正确。
 
-**被测增量：** continue/followUp/steer/abort、保存/打开、replace/branch、bindingId、generation、输入消费与执行权；同Workspace绑定及Run临时资源与sessions/持久历史分离。
+**被测增量：** sessions/session_inputs/memories、普通输入inputId与实际消费关联、continue/followUp/steer/abort、SQLite保存/打开、replace/branch、leaf恢复、bindingId、generation、输入消费与执行权；同Workspace绑定及Run临时资源与权威Session/Memory持久历史分离。
 
 **继承回归：** P1原生Loop、P2工具身份/取消、P3事件与订阅、P0存储隔离。
 
 **Driving Task：** 同一发票连续追问/补材料，执行中追加或调整指令；打开、替换或分支实际会话，核验输入、事件、工具与取消归属。
 
-**Case / Gold / Oracle：** 多轮和队列、损坏历史、忙时操作、替换/分支、旧代次迟到；Oracle为真实绑定/历史/消费及终态。按RTC-05-02和3.6.1验证新绑定装载核验与快照/ready前零执行，延迟或失败重绑不能恢复旧代次执行权。
+**Case / Gold / Oracle：** 多轮和队列、损坏历史、忙时操作、替换/分支、旧代次迟到；Oracle为真实绑定、完整entry/tree/cursor、工具关联、消费及终态。覆盖原生消息/工具/压缩/分支摘要/model/label/extension/custom entry，重复写、跨Session parent/compaction/current entry引用、DB失败/中断、保存失败poison、迟到旧binding及结果UNKNOWN；空leaf生成的branch_summary条目`fromId='root'`按锁定格式认作原生空根哨兵，其余悬空/跨Session引用拒绝。分页恢复须遍历完整结果，不能因页限误漏。按RTC-05-02和3.6.1验证新绑定装载核验与快照/ready前零执行，延迟或失败重绑不能恢复旧代次执行权。按3.24.1执行Session身份及原生历史完整性的正反例，特别核验正文篡改仍传旧hash、身份错配、循环/悬空引用、初始化失败、仅指针更新及标题同步事务；合法空根与扩展内容作为不误拒对照。
 
-按3.23和RTC-05-01执行旧Run临时目录释放→原持久Session续接→新目录/资源/Scope实际生效的完整试验；拒绝未知/错误空间历史，旧路径不授予新访问权。核验符号链接/目录联接越界清理被拒绝，持久历史和证据未被删除；原生不支持安全重绑定时正确拒绝，并将新Session恢复与原会话续接分别报告。
+按3.23/3.24和RTC-05-01执行旧Run临时目录释放→从SQLite恢复原Session完整header+entries并显式恢复当前位置→新目录/资源/Scope实际生效的完整试验；以`SessionManager.inMemory(cwd, { id }, entries)`恢复后由Pi解释历史，原生目录为空仍须成功。P4同步SQLite并验证一条有效binding与expected storage version、最外层公开变更调用后的原子提交、last committed恢复且不重放UNKNOWN；拒绝未知/错误空间历史，旧路径不授予新访问权。核验符号链接/目录联接越界清理被拒绝，持久历史和证据未被删除；无法安全恢复时正确拒绝，并将新Session与原会话续接分别报告。
 
 **F / A / B：** F核验身份和生命周期；A核验当前输入及指令使用；B只取适用局部任务结果。
 
@@ -1287,7 +1325,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **排除项：** Memory效果专项、Compaction、Workflow、审批、桌面会话工作台及Host。
 
-**阶段退出条件：** 至少两次真实用户输入连续处理；打开/替换/分支后绑定正确且重新核验通过前无新模型/工具执行，终态Run不重开，旧输入不获新执行权；旧Run临时目录释放后仍能按获准机制续接持久会话，当前资源/Scope生效且空间归属正确。不可安全续接须拒绝并披露缺口，新Session恢复不冒充原Session续接通过；文件存在不等于恢复成功。
+**阶段退出条件：** 至少两次真实用户输入连续处理并分别保存session_inputs受理/投递记录与SQLite的sessions/memories原生历史；验证重复请求、请求键内容冲突、实际消费Run和投递未知恢复，不以受理代替消费；重启后完整entry/tree/cursor、工具关联、分支和current entry恢复，标签/模型/扩展/自定义条目均不丢失，当前资源/Scope及空间归属正确。分页查询不会误漏历史。打开/替换/分支后重新核验通过前无新模型/工具执行；重复写幂等、不同内容同ID和跨会话引用被拒绝且无部分提交；保存失败poison后无新工具，恢复不自动重放UNKNOWN。原生目录为空仍可恢复主会话；不可安全续接须拒绝并披露缺口。3.24.1的身份映射、正文/列值/摘要一致、父链与已知引用、初始化及指针/标题提交必要F项须通过；非法数据无部分提交，合法内容能恢复，不能只以行数或所传hash相同判完整。
 
 **向下一阶段交接：** Session/控制子集、Oracle/行为Gold、Grader、实际报告、Bad/回归、稳定Session/Run和输入消费身份供Context接合。
 
@@ -1295,17 +1333,17 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **阶段定位：** 证明当前任务实际看见和使用正确事实。
 
-**被测增量：** Context Builder、不可变ContextSnapshot、输入/步骤投影、资产范围、来源/时效、固定资源选择和按需取证。
+**被测增量：** Context Builder、context_snapshots独立数据库表与不可变完整ContextSnapshot、按ID/Run查询及版本绑定、输入/步骤投影、资产范围、来源/时效、固定资源选择和按需取证。
 
 **继承回归：** P2工具范围，P3证据关联，P4绑定/多轮，P0数据用途和Gold隔离。
 
 **Driving Task：** 同一发票分别做字段检查与证据核对，使用不同已接受输入版本生成不同Context；模型按需读取必要片段，不将旧输入/其他任务/无关资源当当前事实。
 
-**Case / Gold / Oracle：** 当前/陈旧/冲突/缺失事实、跨任务哨兵、来源与资产访问；区分快照、实际最终请求和模型使用。
+**Case / Gold / Oracle：** 当前/陈旧/冲突/缺失事实、跨任务哨兵、来源与资产访问；区分快照、实际最终请求和模型使用。按3.24.1增加A请求/B当前指针的迟到工具、模型伪造快照ID、跨Run引用、写入失败和重启关联场景，保存可信请求关联及RuntimeSnapshot前后摘要，不以模型输出自证关联。
 
-按3.23验证ContextSnapshot的Workspace/配置版本绑定；同空间共享资源也仅在当前任务获准且显式选用时进入Context，其他空间资料、日志和其他Session不自动注入，后续按需读取同样检查归属和Scope。
+按3.23/3.24验证context_snapshots的Workspace/Job/Run与配置版本绑定、完整正文/hash、同事务发布、原版本不可变、调用时快照引用、跨归属/写入失败拒绝，以及无快照文件时的数据库恢复。区分恢复出历史快照与当前仍可使用，输入依据或权限失效必须重新构造；同空间共享资源也仅在当前任务获准且显式选用时进入Context，其他空间资料、日志和其他Session不自动注入，后续按需读取同样检查归属和Scope。
 
-**F / A / B：** F验证选择、不可变与隔离；A验证真实取证和当前事实使用；B仅局部事实正确性。
+**F / A / B：** F验证选择、入库/查询/事务/恢复、不可变与隔离；A验证真实取证和当前事实使用，入库成功不等于模型使用正确；B仅局部事实正确性。
 
 **Runtime / MOD / BM映射：** MOD-03/05/09/26；RT-03接合、RTC-06-06/08/10的Context变体；BM-01/03/07/08/11。
 
@@ -1313,7 +1351,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **排除项：** 全量历史注入、长期记忆、动态Skill管理、完整Workflow；步骤/修订先用受控任务事实表达。
 
-**阶段退出条件：** 不同输入版本实际产生不同受控Context；空间/任务范围与快照版本正确，未获准资料、日志及其他会话不自动注入；旧依据不再当当前事实；必要证据能取，不能取时明确不足，不凭空补全。
+**阶段退出条件：** 完整context_snapshots入库、查询、重启和备份恢复、无文件权威依赖、写入失败及错误引用拒绝均有适用F证据；不同输入版本实际产生不同受控Context；空间/任务范围与快照版本正确，未获准资料、日志及其他会话不自动注入；旧依据不再当当前事实；必要证据能取，不能取时明确不足，不凭空补全。3.24.1的调用与实际Context关联必要F项须通过，工具/候选仍固定真实输入依据，后续Context及恢复不改写既有RuntimeSnapshot，不产生反向循环摘要依赖。
 
 **向下一阶段交接：** Context子集、可见/禁止事实Gold、来源Oracle、Grader和报告、Bad/回归、P6当前事实基准。
 
@@ -1321,13 +1359,13 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **阶段定位：** 证明Pi原生历史支持跨轮连续性且服从当前事实。
 
-**被测增量：** Session History、History Binding、历史观察/生命周期、纠正有效性、独立Session记忆隔离。
+**被测增量：** SQLite完整原生History的采集/恢复、History Binding、历史观察/生命周期、纠正有效性、独立Session记忆隔离；不新增长期记忆。
 
 **继承回归：** P4保存/打开/替换与绑定，P5当前事实选择，P2取证和P3事件。
 
-**Driving Task：** 连续讨论发票证据并接受纠正，后续真实回答使用必要历史和当前事实；两个实际独立Session验证不串用历史。
+**Driving Task：** 连续讨论发票证据并接受纠正，重启恢复后由真实模型在后续回答使用必要历史和当前事实；两个实际独立Session验证不串用历史。
 
-**Case / Gold / Oracle：** 历史依赖、纠正/撤回、损坏/不可用、来源及未知事实；恢复历史与重新注入分开标记。
+**Case / Gold / Oracle：** 历史使用、纠正/撤回、损坏/不可用、来源及未知事实，覆盖model/label/extension/custom与工具关联的保真和隔离；恢复历史与重新注入分开标记，机制恢复成功与真实模型使用记忆效果分开判分。
 
 **F / A / B：** F核验原生历史/绑定/隔离；A核验使用和纠正遵循；B仅适用局部事实，无完整业务。
 
@@ -1337,7 +1375,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **排除项：** Compaction、长期偏好/向量库、第二份消息库和真实父子插件链。
 
-**阶段退出条件：** 真实后轮能使用必要历史，旧对话不覆盖纠正，独立Session不混用，不可用历史有明确处置；保存成功不能替代行为正确。
+**阶段退出条件：** 多轮纠正经SQLite重启恢复后，真实后轮能使用必要历史且旧对话不覆盖纠正，独立Session不混用，model/label/extension/custom及工具关联不丢失，不可用历史有明确处置；存储机制通过不能替代真实模型记忆效果通过。
 
 **向下一阶段交接：** Memory子集、历史/纠正Gold、Oracle/Grader和报告、Bad/回归、可观察历史及当前事实基准供P7。
 
@@ -1351,7 +1389,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **Driving Task：** 用同一发票多轮取证形成实际长历史，触发原生压缩并继续；跨多次压缩检查目标、当前输入版本、来源及中止/失败处置。
 
-**Case / Gold / Oracle：** 阈值对照、原生触发、失败/取消、重复压缩、当前/失效事实和来源；三种诊断对照分别保留。
+**Case / Gold / Oracle：** 阈值对照、原生触发、失败/取消、连续多次压缩、摘要entry与同Session引用、分支/current entry恢复、当前/失效事实和来源；三种诊断对照分别保留。
 
 **F / A / B：** F核验真实压缩及恢复状态；A核验后续使用；B只取适用局部事实，不制造审批业务。
 
@@ -1361,11 +1399,13 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **排除项：** 自写摘要引擎、假摘要替换、正式审批/Action、Host。
 
-**阶段退出条件：** 实际压缩及至少两次重复压缩后真实任务能继续且关键事实/来源符合标准；失败后先核验Session可用性，不可用则明确恢复，不假定旧历史可继续。
+**阶段退出条件：** 实际压缩及至少两次连续压缩写入SQLite，重启后摘要引用、分支和leaf保持有效，真实任务能继续且关键事实/来源符合标准；失败后先核验Session可用性，不可用则明确恢复，不假定旧历史可继续。
 
 **向下一阶段交接：** 压缩子集、事实/来源Gold及Oracle、Grader、实际报告、Bad/回归和P8长任务容量限制。
 
 ### 11.9 P8：Business Workflow 评测
+
+P8开始建立human_interactions，不沿用P4的输入受理表承载业务交互。按3.24核验interactionId的澄清/复核/字段确认/接管归属、重复响应与事实采纳事务；本阶段不生成正式提交审批。
 
 **阶段定位：** 证明业务步骤、等待和恢复由权威事实驱动，与原生Loop分离。
 
@@ -1375,9 +1415,9 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **Driving Task：** 发票候选校验发现缺失/冲突，进入人工等待，接受补充修订后重校验并从正确步骤恢复；中断后读检查点，不重复仍有效的已完成步骤。
 
-**Case / Gold / Oracle：** 合法/非法迁移、重复命令、旧修订/代次、等待对象/Owner、事务窗口和检查点；按3.6.1分别核验终态历史与新尝试、换generation时新waiting保留有效原等待对象、含无Revision输入的活动尝试并发唯一性，不能以同requestId幂等替代。P8使用补充/匹配等待，审批等待变体到P12；业务Gold核验当前步骤结果。
+**Case / Gold / Oracle：** 合法/非法迁移、重复命令、旧修订/代次、等待对象/Owner、事务窗口和检查点；按3.6.1分别核验终态历史与新尝试、换generation时新waiting保留有效原等待对象、含无Revision输入的活动尝试并发唯一性，不能以同requestId幂等替代。P8使用补充/匹配等待，审批等待变体到P12；业务Gold核验当前步骤结果。按3.24.1执行AssessmentSnapshot并发、CAS冲突重读、旧结果迟到、仅证据更新和缺失检查项场景，核对完整快照与assessment_version；正式审批失效及发送准入留到P12验证，不在本阶段伪造Approval。
 
-按3.23核验Job/Candidate、Run/Job及当前业务多父级引用同Workspace；恢复和人工继续前检查空间状态/环境与当前策略。paused时不启动新执行或推进新的业务写入，恢复active不复活旧执行权；外部在途动作及完整审批仍到P12核验。
+按3.23/3.24核验Job/ExecutionManifest、Run/Job及当前业务多父级引用同Workspace；恢复和人工继续前检查空间状态/环境与当前策略。paused时不启动新执行或推进新的业务写入，恢复active不复活旧执行权；外部在途动作及完整审批仍到P12核验。
 
 **F / A / B：** F验证状态/事务/恢复；A验证候选、解释和正确求助/继续；B评价修订、等待与恢复结果，无提交B。
 
@@ -1387,7 +1427,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **排除项：** 通用BPM/DSL、新Agent Loop、提交确认/冻结预览、B2B、桌面和Host。
 
-**阶段退出条件：** 实际候选进入校验/等待/修订/继续，状态与已接受事实一致；旧版本/重复命令不重复推进；终态尝试历史不覆盖，换代waiting新建关联尝试并保留仍有效等待对象，同一逻辑步骤/输入下只有一个可推进活动尝试；无活动模型也可持久等待。
+**阶段退出条件：** 实际候选进入校验/等待/修订/继续，状态与已接受事实一致；旧版本/重复命令不重复推进；终态尝试历史不覆盖，换代waiting新建关联尝试并保留仍有效等待对象，同一逻辑步骤/输入下只有一个可推进活动尝试；无活动模型也可持久等待。3.24.1的评估并发必要F项须通过：同版本结果合并且不丢失，CAS冲突重读，旧结果不覆盖新结论，未检查项为unknown；字段变化产生新Revision，仅证据变化更新评估快照及版本，原快照保留。
 
 **向下一阶段交接：** Workflow子集、状态Oracle/业务Gold、Grader和实际报告、Bad/回归、P9资源所依据的Workflow/Policy边界。
 
@@ -1443,15 +1483,15 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **阶段定位：** 证明真实受限协作成立且不扩大权限或伪造业务完成。
 
-**被测增量：** 原生Agent工具、pi-subagents、Delegation/ChildRun/ChildSession、子Scope/Tool/Context/Memory、父子事件、共用预算预留、取消/孤儿和结果回送。
+**被测增量：** 原生Agent工具、`@tintinweb/pi-subagents`及DB Session工厂最小兼容补丁、Delegation/ChildRun/ChildSession、子Scope/Tool/Context/Memory、父子事件、共用预算预留、取消/孤儿和结果回送；关闭插件原生会话文件及自动transcript写入。
 
 **继承回归：** 必回Tool、Event、Session、Context、Memory、Budget、Cancellation，以及P7压缩、P8修订、P9资源、P10扩展。
 
 **Driving Task：** 主LLM对关键字段调用原生Agent，真实只读子Session取证后返回主Loop；核验越界拒绝、父取消传播和旧修订子结果不覆盖当前事实。
 
-**Case / Gold / Oracle：** 必要/可选/无需委派、未触发、真实绑定、子工具缺实现、范围/历史隔离、冲突/截断、预算和取消；有限并行/续聊仅按启用任务制作。
+**Case / Gold / Oracle：** 必要/可选/无需委派、未触发、真实绑定、子工具缺实现、范围/历史隔离、冲突/截断、预算和取消；子会话新建/续接前登记、原生目录为空的主子恢复、索引恢复不触发委派，以及不继承父授权；有限并行/续聊仅按启用任务制作。按3.24.1执行槽位唯一性、重复登记、插件身份乱序、部分启动失败与登记后崩溃恢复；同次多子按实际启用模式验证，不通过主动补发制造触发证据。
 
-按3.23及RTC-17-02/05核验子Run/Session与父Job同空间、权限交集不扩大、独立work/agent及自身持久历史；父清理不误删子历史或活动资源。插件无法落实目录/会话/资源发现隔离时拒绝启用角色并记录缺口，不把拒绝证据登记为该角色可用。
+按3.23/3.24及RTC-17-02/05核验子Run/Session与父Job同空间、权限交集不扩大、独立work/agent及自身SQLite持久历史；新建/续接须先登记绑定，父清理不误删子历史或活动资源。委派只由主LLM的Agent工具触发，数据库索引/恢复不能触发新子执行；插件无法落实DB Session工厂、关闭原生文件/自动transcript或目录/资源发现隔离时拒绝启用角色并记录缺口，不把拒绝证据登记为该角色可用。
 
 **F / A / B：** F必须走真实父Loop/插件/子Session，A使用真实主子模型；B仅当前核查结果，完整业务到P12。
 
@@ -1461,23 +1501,25 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **排除项：** 产品或Eval主动spawn、Workflow/定时/mention旁路、多Agent调度器、子审批/生产写、Host和完整角色UI。
 
-**阶段退出条件：** 主LLM真实调用→实际子Session→受限工具→主Loop完整证据；父子同空间、独立目录/历史及权限收窄有效，清理不误删持久会话或活动资源；取消/清理/预算可核验，未知消耗不清零，旧结果不推进。无调用记未触发，不得程序补齐；隔离不成立的角色不能通过启用验收。
+**阶段退出条件：** 主LLM真实调用→实际子Session→受限工具→主Loop完整证据；父子同空间、独立目录/历史及权限收窄有效，原生会话目录为空时主子均能从SQLite恢复，清理不误删持久会话或活动资源；取消/清理/预算可核验，未知消耗不清零，旧结果不推进。无调用记未触发，索引恢复或程序不得补齐委派；隔离不成立的角色不能通过启用验收。3.24.1适用委派身份F项须通过：不同槽位不误去重，同槽位不重复创建，pending/失败记录及真实插件/Session映射完整，乱序与恢复不串线或补发；未启用的多子模式单列限制。
 
 **向下一阶段交接：** 委派子集、Gold/Oracle/Grader、实际单主/主子报告、Bad/回归、角色与模式限制、P12辅助核查接入证据。
 
 ### 11.13 P12：Product & Action Harness 评测
 
+P12建立approvals并接入提交三表，审批引用统一为approval_id。按3.24验证当前动作改选审批、迟到旧批准拒绝、历史Attempt引用保持、撤销/过期/依据失效及事务中断；inputId、interactionId和approvalId三类对象不可相互冒用，不增加企业财务审批范围。
+
 **阶段定位：** 形成可操作的完整桌面与测试业务Action闭环。
 
-**被测增量：** 桌面/任务与人工工作区、固定发票员工配置及既定扩展管理、已有解析导入、企业规则/Adapter；冻结预览、Approval、Action Intent、持久动作身份、Outbox、Final Admission、Submission/Receipt、UNKNOWN和Kill Switch。
+**被测增量：** 桌面/任务与人工工作区、固定发票员工配置及既定扩展管理、已有解析导入、企业规则/Adapter；冻结预览、Approval、Action Intent、持久动作身份、动作派发、Final Admission、Submission/Receipt、UNKNOWN和Kill Switch。
 
 **继承回归：** P8Workflow、P2Gateway、P4Session、P5–P7当前/历史事实、P9/P10资源扩展、P11只读协作和全部关键隔离/取消。
 
 **Driving Task：** 操作者从真实解析样本得到候选，处理差异、确认冻结预览，经实际浏览器提交本地模拟表单并独立确认；沿同协议对齐企业字段/主数据、补业务核查只读查询模拟，再连接获准真实测试系统完成提交/确认及响应丢失/接管验证。
 
-**Case / Gold / Oracle：** 字段/必要关联及业务核查、人工修订、审批失效、载荷/附件、Browser/Adapter、权威B2B、response lost、UNKNOWN、query before retry、去重、接管/停写与完整终态；按3.6.1增加全部活动/等待步骤视图、审批waiting换代、Renderer/异步故障时备用控制可达、Electron/preload/IPC信任边界、CLI/桌面同实例竞争及同命令事实对照。Gold由业务Owner核验，桌面机制F不冒充Agent A。
+**Case / Gold / Oracle：** 字段/必要关联及业务核查、人工修订、审批失效、载荷/附件、Browser/Adapter、权威B2B、response lost、UNKNOWN、query before retry、去重、接管/停写与完整终态；按3.6.1增加全部活动/等待步骤视图、审批waiting换代、Renderer/异步故障时备用控制可达、Electron/preload/IPC信任边界、CLI/桌面同实例竞争及同命令事实对照。Gold由业务Owner核验，桌面机制F不冒充Agent A。按3.24.1执行跨Job同动作并发、成功后重提、UNKNOWN换载荷/随机幂等键及合法安全重试/不同对象对照；联动P8覆盖字段不变但评估证据变化，验证旧确认拒绝、当前依据重新确认后才可合法准入。
 
-按3.23覆盖任务检索、证据下载、人工命令、审批/动作及目标环境同空间；空间暂停/策略变更与FinalAdmission并发，检查新执行/新写被阻断、已发送或UNKNOWN仍可受控核对并保存权威结果。active不等于已授权，已失效的Scope/审批不随恢复active复活，仍有效授权按当前条件核验；Test与生产使用不同实例，不原位修改环境迁移任务。
+按3.23/3.24覆盖任务检索、证据下载、人工命令、审批/动作及目标环境同空间；空间暂停/策略变更与FinalAdmission并发，检查新执行/新写被阻断、已发送或UNKNOWN仍可受控核对并保存权威结果。active不等于已授权，已失效的Scope/审批不随恢复active复活，仍有效授权按当前条件核验；Test与生产使用不同实例，不原位修改环境迁移任务。
 
 **F / A / B：** F复用实际桌面、契约、状态及故障测试；A必须真实模型产生候选/决策/工具行为；B为各测试环境内的完整结果。人工修正后成绩与原始Agent成绩分开。
 
@@ -1487,7 +1529,7 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 
 **排除项：** 生产写、独立Host、完整发布运维，以及第二种非发票任务的通用性证明；质量Runner不直接发送、不拥有业务Kernel。
 
-**阶段退出条件：** 三层适用测试业务有实际证据；审批后改值不能沿用授权，未知先核对，不重复有效提交，真实操作者可处理等待/拒绝/接管。全部活动/等待项可查；页面故障时备用控制及实际停止证据成立，IPC非法来源/越权能力被阻断，固定发票员工复用公共组装、授权和恢复，同实例两入口不能同时取得执行权；无需第二种非发票任务通过。缺获准真实测试环境保留P12-C缺口，不能宣告完整P12通过或进入生产放行。
+**阶段退出条件：** 三层适用测试业务有实际证据；审批后改值不能沿用授权，未知先核对，不重复有效提交，真实操作者可处理等待/拒绝/接管。全部活动/等待项可查；页面故障时备用控制及实际停止证据成立，IPC非法来源/越权能力被阻断，固定发票员工复用公共组装、授权和恢复，同实例两入口不能同时取得执行权；无需第二种非发票任务通过。缺获准真实测试环境保留P12-C缺口，不能宣告完整P12通过或进入生产放行。3.24.1跨Job防重与评估/确认联动必要F项须通过，目标无重复业务生效，合法独立动作和满足条件的安全重试不误拦截；仅证据变化也使旧确认失效，不能只用revisionId判断，未知检查项不冒充通过。
 
 Workspace退出检查须同时证明查询/人工入口与Action归属、环境绑定正确，以及paused后新准入阻断和在途核对保留；不能仅以Gateway单点拒绝或页面显示暂停判通过。
 
@@ -1499,27 +1541,29 @@ Workspace退出检查须同时证明查询/人工入口与Action归属、环境�
 | P12-B 企业契约模拟 | 实际目标字段、必要主数据关联、保留的收货/合同/价格/余额核查及提交确认 | 业务Owner签署契约；独立模拟目标事实，不能由产品core替目标自动完成 |
 | P12-C 获准真实测试系统 | 相同业务协议接真实测试B2B、业务依据只读查询及身份接口 | 真实回执/回读、人工接管和故障恢复证据；无安全测试环境不借生产试写 |
 
-三层使用相同Workflow、Revision、Approval、Action Identity、Outbox、Final Admission、Submission、UNKNOWN和Query协议。目标/契约变化形成新固定组合并回归，不另立Harness阶段。
+三层使用相同Workflow、Revision、Approval、Action Identity、动作派发、Final Admission、Submission、UNKNOWN和Query协议。目标/契约变化形成新固定组合并回归，不另立Harness阶段。
 
-Action核验保持产品唯一链：Intent → Persistent Action Identity → Final Admission → Send → Authoritative Result/UNKNOWN → Query/Recovery。UI、Handler、Gateway、Outbox均不能直接发送；Outbox只派发持久动作ID，唯一执行入口重新检查当前授权/修订/目标/载荷/预算/撤销及页面所有权。同Attempt自动发送入口最多进入一次，租约重取不恢复发送许可。
+Action核验保持产品唯一链：Intent → Persistent Action Identity → Final Admission → Send → Authoritative Result/UNKNOWN → Query/Recovery。UI、Handler、Gateway、动作派发器均不能直接发送；core/submissions/dispatch.ts 从 submission_actions 的待派发/租约字段领取并派发持久动作ID，唯一执行入口重新检查当前授权/修订/目标/载荷/预算/撤销及页面所有权。同Attempt自动发送入口最多进入一次，租约重取不恢复发送许可。
 
-FinalAdmission另须按3.23在权威事务中检查Workspace当前状态/策略版本及任务、授权和目标环境的归属一致；Outbox存在、旧清单固定或active状态均不能代替有效执行许可。
+FinalAdmission另须按3.23在权威事务中检查Workspace当前状态/策略版本及任务、授权和目标环境的归属一致；动作处于待派发状态、旧清单固定或active状态均不能代替有效执行许可。
 
 B2B权威回执与完成所需业务事实原子保存；已有成功事实不触发再次提交。SENDING后结果不明保留UNKNOWN，查询暂未找到不证明未生效；取消不能撤回交易，截图失败不重提，应用/数据库回退不抹除外部事实。
 
 ### 11.14 P13：Production Harness 评测
 
+P13对session_inputs、human_interactions和approvals分别执行重启及备份恢复，校验父级归属、原请求/决定、输入消费证据及历史Attempt审批引用。若迁移旧human_interactions，核对按类别迁移的数量、旧新身份映射和等待/动作引用；无法分类或缺消费证据的记录不伪造批准或已消费状态。
+
 **阶段定位：** 证明承载迁移及生产发布、恢复和运营具备实际质量依据。
 
-**被测增量：** Runtime Host/Main-Host IPC、进程/健康/重连补发、主子清理与Session恢复、完整Candidate/Release/ReleaseBinding、RuntimeSnapshot核验、安装/迁移/备份/回退及Operations；Host日志独立落盘、实例总配额、滚动/保留/有界授权查询导出及故障降级。
+**被测增量：** Runtime Host/Main-Host IPC、进程/健康/重连补发、主子清理与SQLite Session/Memory恢复、版本化ExecutionManifest文件及按摘要/环境/范围生效的operational_controls发布/撤销状态、RuntimeSnapshot核验、安装/迁移/备份/回退及Operations；Host日志独立落盘、实例总配额、滚动/保留/有界授权查询导出及故障降级。跨Host存储端口等待控制侧数据库提交ACK，不能把`void`异步listener返回当作durable成功。
 
 **继承回归：** 必回Runtime、Tool、Event、Session、Extension、Subagent及P12Action，同时检查Context/Memory/Compaction/Workflow与当前事实不变。
 
 **Driving Task：** 固定同一发票员工组合迁入Host，在测试环境重验完整链和故障恢复，再按Test→Shadow→Canary→Production逐级检查证据、权限、支持和回退安排。
 
-**Case / Gold / Oracle：** 承载等价、IPC异常/断连、Host崩溃、迟到/补发、孤儿/清理、安装与版本、备份恢复；按3.6.1逐项核验Host断IPC日志、单写者/新进程身份、遗留量与多进程配额/重启不清零、安全清理/查询导出、磁盘/权限/序列化/队列/flush故障及损坏尾行；继承启动核验屏障、控制侧单控制者及桌面故障备用入口。生产Gold来自独立人工和真实权威事实。
+**Case / Gold / Oracle：** 承载等价、IPC异常/断连、Host崩溃、DB提交ACK丢失/延迟、迟到旧binding/补发、孤儿/清理、安装与版本、备份恢复；核验控制侧last committed状态、保存失败poison、不中途开放新工具及不自动重放UNKNOWN。按3.6.1逐项核验Host断IPC日志、单写者/新进程身份、遗留量与多进程配额/重启不清零、安全清理/查询导出、磁盘/权限/序列化/队列/flush故障；继承启动核验屏障、控制侧单控制者及桌面故障备用入口。生产Gold来自独立人工和真实权威事实。按3.24.1重验五组受影响约束的跨Host/崩溃/备份恢复变体：跨Job重提及UNKNOWN安全核对、评估CAS冲突与迟到结果、Session身份和原生历史损坏/指针标题事务中断、Context调用关联不漂移、pending子Run登记后失联及插件身份迟到；同时保留合法恢复、独立动作和安全重试对照。
 
-按3.23验证Host身份/空间控制不漂移；临时清理保护sessions/runs/inputs；按保留策略核对全部Run引用及原生分支依赖，有活动/恢复/异常或保留期内引用时不删。备份恢复覆盖Workspace身份、数据根映射、原生会话及引用完整性；独立测试副本签发新实例/空间身份并重新构造获准会话。归档需无活动绑定、在途动作和未解决恢复事项，归档后保留授权历史查询。
+按3.23/3.24验证Host身份/空间控制不漂移；临时清理保护SQLite中的sessions/memories及runs/inputs；按保留策略核对全部Run引用及原生分支依赖，有活动/恢复/异常或保留期内引用时不删。备份恢复覆盖Workspace身份、数据根映射、完整entry/tree/cursor/工具关联、context_snapshots正文/hash及调用时版本引用完整性；独立测试副本签发新实例/空间身份并重新构造获准会话。归档需无活动绑定、在途动作和未解决恢复事项，归档后保留授权历史查询。
 
 **F / A / B：** F核验Host和发布/恢复；A实跑迁移后的模型与主子链；B区分Test测试结果、Shadow预测对照及Canary/Production真实业务结果。
 
@@ -1529,9 +1573,9 @@ B2B权威回执与完成所需业务事实原子保存；已有成功事实不�
 
 **排除项：** 迁走Kernel/业务数据库、平行Runtime、多租户/Worker Pool、自动扩量或评测授予生产写权限。
 
-**阶段退出条件：** 安装、Host故障、在途核对、清理、备份和回退实测；3.6.1生产日志的独立落盘/实例配额/安全保留与查询导出/故障降级分别有适用F证据，不能以P0单进程日志通过替代。批准范围的真实业务、独立质量结论及支持安排符合要求。每级放行独立，Test通过不等于P13生产交付。
+**阶段退出条件：** 安装、Host故障、控制侧DB提交ACK、在途核对、清理、备份和回退实测；跨Host不以异步listener接收冒充durable，失败/中断/迟到旧binding不产生部分提交、新工具或UNKNOWN重放。原生目录为空时主子Session仍可恢复。3.6.1生产日志的独立落盘/实例配额/安全保留与查询导出/故障降级分别有适用F证据，不能以P0单进程日志通过替代。批准范围的真实业务、独立质量结论及支持安排符合要求。每级放行独立，Test通过不等于P13生产交付。3.24.1五组适用恢复F项须有故障前后实际证据：防重约束保持有效，审批按恢复后的当前依据重新核验，评估结果不丢失，完整原生历史与身份可核验，调用/RuntimeSnapshot历史关联不漂移，子执行不串线或补发；证据不足不得判通过。
 
-Workspace/Session退出检查须有安全临时清理、原实例身份与会话映射恢复、独立测试副本身份隔离及归档前置条件的实际证据；仅恢复数据库或目录不能证明引用可用，不以单默认空间宣称多租户隔离。
+Workspace/Session退出检查须有安全临时清理、原实例身份与完整会话树/游标恢复、独立测试副本身份隔离及归档前置条件的实际证据；仅恢复数据库行或目录不能证明Pi可实际继续，不以单默认空间宣称多租户隔离。
 
 **向下一阶段交接：** 无P14；向持续运营及下一候选交接完整冻结资产/Grader/报告、Bad/Regression Set、生产限制、维护与业务Owner，以及新版本重新验证和放行规则。
 
@@ -1598,7 +1642,7 @@ Canary/Production不为比较候选重提同一真实业务对象；首次结果
 5. MOD/RT/RTC/RTX/BM子集、依赖和未纳入原因；将3.6.1中本阶段适用的每个子能力逐项绑定Case/Oracle/产品F证据和Owner，不以模块总分或泛化回归引用代替。
 6. 小批核心种子Case的选择/数量依据、制作任务及第5.2.1节六项骨架；来源/变换、用途、分组、采样与核验Owner，黄金集候选和其他Case的场景调整。
 7. Gold/Oracle、时点、争议和冻结规则。
-8. 环境、账号、允许动作、初态、夹具、隔离及清理；按第3.22节落实五类适用安全场景、入口/传播链、身份权限与授权变化、正常对照、合成敏感数据和受控接收目标，未覆盖项写明依据。按3.23定义Workspace归属/状态/策略版本、数据库多父级约束、Run临时目录/持久Session、清理与备份的适用正反例；原实例恢复和独立测试副本分别设计。
+8. 环境、账号、允许动作、初态、夹具、隔离及清理；按第3.22节落实五类适用安全场景、入口/传播链、身份权限与授权变化、正常对照、合成敏感数据和受控接收目标，未覆盖项写明依据。按3.23/3.24定义Workspace归属/状态/策略版本、数据库多父级约束、Run临时目录/持久Session、清理与备份的适用正反例；原实例恢复和独立测试副本分别设计。
 9. 结果/过程/安全检查项及其确定性/LLM/人工分工；按第7章定义Grader输入输出、证据、版本、Owner、适用条件、异常状态、必要项/硬约束和汇总规则，落实独立正反/边界/缺证据自检。过程项声明关键先后关系及契约依据、允许的路径变化和独立效率指标，自检覆盖合法替代路径、合理重试及结果正确但过程违规的反例。启用LLM时明确Rubric、校准样本、误放行/误拒绝与严重漏判门槛、重校准频率及人工复核触发条件；Agent成本与评分成本、时延和人工投入单列。
 10. EvalRunner本阶段增量及正式接口，产品F复用条件。
 11. benchmarks/中的适用Benchmark定义位置、subset及全部版本、实际基线、成员/功能Grader复用关系、敏感清单引用、回归纳入依据、能力Case转入回归的稳定性标准与Owner；一般观察与正式基准分别标记。

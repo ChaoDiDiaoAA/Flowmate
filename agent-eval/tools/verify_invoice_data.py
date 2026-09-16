@@ -65,14 +65,33 @@ def indexed_jsonl(path, identity='caseId'):
 
 def verify_current_artifacts(product, evaluation, cases, catalog, splits):
     index = {c['id']: c for c in cases}
-    if (evaluation/'manifests/scope-sync.json').exists():
+    migrated = (evaluation/'manifests/harness-migration.json').exists()
+    if migrated:
+        from migrate_harness_data import verify_migration
+        verify_migration(evaluation)
+    elif (evaluation/'manifests/scope-sync.json').exists():
         from sync_invoice_scope import verify_scope_manifest
         verify_scope_manifest(evaluation, cases)
     for entry in catalog['cases']:
         case = index[entry['id']]
-        require(entry['path'] == f'cases/{case["category"]}/{case["id"]}.json', 'Noncanonical current case')
+        from harness_paths import canonical_case_path
+        require(entry['path'] == canonical_case_path(case), 'Noncanonical current case')
         require(all(case.get(k) == v for k, v in entry.items() if k != 'path'), 'Catalog differs from current case')
     requirements = load(evaluation/'manifests/requirements.json')
+    if migrated:
+        from migrate_harness_data import validate_new_contracts
+        from harness_modules import module_catalog as build_module_catalog
+        from invoice_requirements import load_requirements
+        extracted = load_requirements(product.resolve().parents[2])
+        source_rows = [{k:v for k,v in r.items() if k not in {'harnessModule','harnessModules'}}
+                       for r in requirements['requirements'] if r['kind'] != 'case_contract']
+        require(source_rows == extracted['requirements'], 'Source requirements differ from current extraction')
+        require(requirements.get('requirementAliases') == extracted.get('requirementAliases')
+                and requirements.get('unregisteredPassages') == extracted.get('unregisteredPassages'),
+                'Requirement migration or source review index differs')
+        validate_new_contracts(cases,requirements)
+        require(load(evaluation/'manifests/module-catalog.json') == build_module_catalog(cases,requirements),
+                'Module coverage differs from actual case/check membership')
     for source in requirements['sourceHashes'].values():
         require(sha(resolve(product.resolve().parents[2], source['path'])) == source['sha256'], 'Requirements reference stale specs')
     audit = load(evaluation/'manifests/audit/audit-report.json')
@@ -81,8 +100,11 @@ def verify_current_artifacts(product, evaluation, cases, catalog, splits):
             and audit['caseCatalogSha256'] == sha(evaluation/'manifests/case-catalog.json'), 'Audit references stale assets')
     from audit_invoice_assets import case_eligible
     prior = {'gold': set(), 'business': set(), 'cases': set()}
-    for batch, expected in zip(load(evaluation/'manifests/audit/batches.json')['batches'],
-                               REVIEW_BATCHES, strict=True):
+    batch_record = load(evaluation/'manifests/audit/batches.json')
+    targets = batch_record.get('targets', REVIEW_BATCHES)
+    if migrated:
+        require(targets[-1] == [1200, 600, len(cases)], 'Final batch must contain all current cases')
+    for batch, expected in zip(batch_record['batches'], targets, strict=True):
         members = {kind: set(batch[kind]) for kind in prior}
         require(all(len(batch[kind]) == len(members[kind]) == count for kind, count in zip(prior, expected)), 'Batch budgets differ')
         require(all(prior[kind] <= members[kind] for kind in prior), 'Review batches are not cumulative')
@@ -99,7 +121,7 @@ def verify_current_artifacts(product, evaluation, cases, catalog, splits):
     for identity, row in records.items():
         case = index[identity]
         require(row['caseVersion'] == case['version'] and row['familyId'] == case['familyId']
-                and row['sourceCaseSha256'] == sha(evaluation/f'cases/{case["category"]}/{identity}.json'), 'Materialization references stale case')
+                and row['sourceCaseSha256'] == sha(evaluation/canonical_case_path(case)), 'Materialization references stale case')
         counts[case['category']+'/'+row['status']] += 1
         if identity in fixtures:
             fixture = fixtures[identity]
@@ -111,6 +133,10 @@ def verify_current_artifacts(product, evaluation, cases, catalog, splits):
     require(report['caseCount'] == len(index) and report['fixtureCount'] == len(fixtures)
             and report['counts'] == dict(counts) and report['actualProductRuns'] == 0, 'Materialization report contradicts artifacts')
     views = load(evaluation/'manifests/views.json')
+    if migrated:
+        from harness_modules import MODULES
+        require(views.get('modules') == {m:[c['id'] for c in cases if c['harnessModule']==m] for m in MODULES},
+                'Stale Harness module views')
     for stage, members in views['stages'].items():
         require(set(members) == {c['id'] for c in cases if c['stage'] == stage}, 'Stale phase view')
     for benchmark, members in views['benchmarks'].items():
@@ -271,7 +297,11 @@ def verify(product, evaluation):
         require(case['initialEnvironment']['networkPolicy']['actualEnterpriseWrites'] == 'forbidden', 'Real business writes enabled')
         if case['sampleRole'] == 'allocation_anchor_only':
             require(case['inputAssets'] == [] and (current or case['semanticScenarioKey'] == case['familyId']), 'Unrelated invoice injected into mechanism fixture')
-        require(case['split'] == by_sample[case['sampleId']]['split'], 'Case split mismatch')
+        if case['sampleRole'] == 'synthetic_only':
+            require(case['sampleId'] is None and case['inputAssets'] == [] and case['split']=='development',
+                    'Synthetic mechanism must not borrow invoice or claim held-out acceptance')
+        else:
+            require(case['split'] == by_sample[case['sampleId']]['split'], 'Case split mismatch')
         require(case['executionStatus'] == 'not_run' and (current or case['reviewStatus'] == 'pending')
                 and case['eligibleForAcceptance'] is False, 'False case readiness or results')
         if not current:
@@ -299,14 +329,22 @@ def verify(product, evaluation):
             resolve(evaluation, case['initialEnvironment']['fixtureBaseRef'])
         if case['oracle']['fieldGoldRef']:
             resolve(evaluation, case['oracle']['fieldGoldRef'])
-        if case['category'] == 'isolation':
+        if case['category'] == 'isolation' and not case.get('harnessScenarioId'):
             if not current or case.get('scenarioRole') != 'control':
                 require(case['normalControlFamily'] in families, 'Security case lacks declared normal control family')
                 require(int(families[case['normalControlFamily']]['phase'][1:]) <= int(case['stage'][1:]), 'Normal control requires a later stage')
         for value in walk(case):
             if isinstance(value, str):
                 require(value not in ('$sampleId', '$businessId', '$caseId', '$split', '$invoiceNumber', '$total', '$supplierId'), 'Unexpanded parameter')
-    require(counts == EXPECTED, f'Case quotas differ: {counts}')
+    if (evaluation/'manifests/harness-migration.json').exists():
+        from harness_modules import MODULES
+        module_catalog = load(evaluation/'manifests/module-catalog.json')
+        require({r['id'] for r in module_catalog['modules']} == set(MODULES), 'Harness module registry differs')
+        require(module_catalog['caseCount'] == len(ids), 'Harness catalog denominator differs')
+        require(all(row['caseCount'] == len(row['caseIds']) and set(row['caseIds']) <= ids
+                    for row in module_catalog['modules']), 'Invalid module members')
+    else:
+        require(counts == EXPECTED, f'Case quotas differ: {counts}')
     for split, members in splits['members'].items():
         require(len(members['cases']) == case_splits[split], 'Case split view mismatch')
         require(all(case_id in ids for case_id in members['cases']), 'Split references nonexistent Case')

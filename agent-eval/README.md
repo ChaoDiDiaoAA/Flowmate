@@ -19,7 +19,11 @@
 
 当前已有 `docs/`、`data/`、`src/`、`tests/`、`tools/` 五类目录。已实现部分离线输入物化、可信证据加载接口、评分和设施自检；尚无完整产品/SDK 执行器，也没有实际 Agent 成绩。
 
-本次范围同步已完成，当前为 1,200 份 Gold 候选、600 套模拟业务资料及 5,577 个用例实例：从旧 6,000 例退役 9 个场景族的 423 例，不补数。实际发布状态以 `data/manifests/preparation-report.json` 和 `scope-sync.json` 为准。用户对旧 7,801 项资产的批量审核声明已登记于 `manifests/reviews/user-confirmation-20260915T145419376406Z.json`，其中原票审核声明为 1,200 份；声明及绑定旧内容必须保留。它不是逐字段答案与证据的结构化 Gold，后者发布计数和实际产品运行数仍为 0。修改后的业务资料、用例及政策重新进入待复核状态，不能继承旧确认；未改 Gold 和来源保留原身份与内容。材料生成、内容审核、夹具物化、真实执行和评测通过分别记录。
+当前共享资产为 2,902 份去重原票、1,414 份来源标签、1,200 份已发布且有人类审核依据的结构化 Gold、600 套模拟业务资料。Harness 重组保留既有 5,577 个用例的身份和业务语义，再补充具体机制与边界场景；当前总数、十五个模块分布、审核与执行状态以 `data/manifests/preparation-report.json`、`module-catalog.json` 和 `harness-migration.json` 为准。原票、Gold、业务包和历史审核内容不复制成版本目录。
+
+本次交付为 5,807 个 Case，其中新增 230 个具体场景，共 407 个场景族、3,746 个语义键。90 个 RTC、6 个 RTX 和 77 个存储原子条款均有直接判据；26 项设施与治理规范单独记录限制。完整数量与验证记录见 [实施记录](docs/data/data-alignment-plan.md#七本次交付记录2026-09-16)。
+
+目录组织、细项准备覆盖、内容审核、离线物化、真实运行和通过分别统计。Gold 发布不等于产品成绩；新增或改版的 Case 重新进入待复核，不能继承旧内容确认。现有用户审核声明及其所绑定的历史内容继续保留。
 
 ### 2.1 已有目录
 
@@ -43,13 +47,21 @@ agent-eval/
 │  ├─ gold/
 │  ├─ business/
 │  ├─ cases/
-│  │  ├─ extraction/
-│  │  ├─ matching/
-│  │  ├─ approval/
-│  │  ├─ submission/
-│  │  ├─ runtime/
-│  │  ├─ isolation/
-│  │  └─ platform/
+│  │  ├─ foundation/
+│  │  ├─ agent-runtime/
+│  │  ├─ tools/
+│  │  ├─ events/
+│  │  ├─ sessions/
+│  │  ├─ context/
+│  │  ├─ memory/
+│  │  ├─ compaction/
+│  │  ├─ workflow/
+│  │  ├─ prompt-skills/
+│  │  ├─ extensions/
+│  │  ├─ subagents/
+│  │  ├─ actions/
+│  │  ├─ operations/
+│  │  └─ eval-infrastructure/
 │  ├─ manifests/
 │  │  ├─ audit/
 │  │  ├─ materialization/
@@ -140,23 +152,31 @@ agent-eval/
 
 原始发票及配对解析保存在项目 `data/invoices/voxel51/`，由质量数据引用，不复制进本目录。模拟业务资料的金额和状态属于合成输入，不能作为原图抽取答案；原票理解链和模拟业务链分别评分。
 
-### 4.2 cases：按能力保存用例
+### 4.2 cases：按十五个 Harness 功能模块保存用例
 
-Case 是固定输入、初态、触发、允许与禁止行为、证据要求和判据的组合。`cases/` 保存定义，不保存实际执行结果。全文包含评分信息，不能整个交给业务 Agent。
+Case 是固定输入、初态、触发、允许与禁止行为、证据和判据的组合。物理目录由唯一 `harnessModule` 决定；`relatedHarnessModules` 记录协作模块，Case 不重复落盘。`category` 保留旧业务/机制分派含义，不能再拼接为数据路径。按 `case-catalog.json` 的 path 查找资产。
 
-| 文件夹 | 同步后实例数 | 被测能力与用途 |
-|---|---:|---|
-| `data/cases/extraction/` | 1,200 | 票头、买卖方、金额、明细及证据定位；每票一个完整抽取例 |
-| `data/cases/matching/` | 890 | 按需匹配供应商、订单与收货；检查合同价格、数量、订单余额、金额及重复记录 |
-| `data/cases/approval/` | 487 | 人工修订、澄清、具体 B2B 提交确认、拒绝、撤销、过期、内容变化失效及接管 |
-| `data/cases/submission/` | 800 | B2B 提交、权威回读、UNKNOWN 核对、幂等及故障恢复 |
-| `data/cases/runtime/` | 1,000 | Provider、工具、Session、上下文、压缩、取消、扩展、子 Agent 和 Host 机制 |
-| `data/cases/isolation/` | 800 | 获准读取、越界访问、不可信输入、权限撤销及独立合法对照 |
-| `data/cases/platform/` | 400 | 数据接入、完整性、工作区、控制者竞争、备份迁移和评测设施正确性 |
+| 目录 / 中文职责 | 对应 MOD / RT | 输入、触发与检查证据 | 当前实例 |
+|---|---|---|---|
+| `cases/foundation/`：基础契约与输入接入；配置、启动屏障、输入身份、Workspace 与公共组装 | MOD-01, MOD-07, MOD-09, MOD-25, MOD-29, RT-01 | 输入：员工配置、解析文件与 Workspace 初态；触发：触发初始化、导入或组装失败；证据：核对 ready 屏障、输入摘要及持久化身份 | 见 module-catalog |
+| `cases/agent-runtime/`：模型运行与任务决策；Provider、原生 Loop、任务理解及整票抽取 | MOD-02, MOD-04, MOD-11, RT-02, RT-03, RT-16 | 输入：任务输入、Provider 参数与获准原票；触发：调用真实模型并推进原生 Loop；证据：核对模型请求、工具回送、结束原因和字段/澄清输出 | 见 module-catalog |
+| `cases/tools/`：工具注册与准入；Spec/Handler、Gateway、参数、结果及权限边界 | MOD-05, MOD-09, RT-04 | 输入：ToolSpec、权限和带边界的工具参数；触发：调用、取消或拒绝工具；证据：核对 Gateway 决定、实际执行、副作用及结构化结果 | 见 module-catalog |
+| `cases/events/`：事件与证据；消息投影、事件序号、Trace 与诊断日志 | MOD-02, MOD-26, RT-09 | 输入：订阅者、事件序列与流式消息；触发：重复投递、断流或订阅者失败；证据：核对事件次序、身份、投影与 Trace；不靠最终文本推断过程 | 见 module-catalog |
+| `cases/sessions/`：会话生命周期；身份、输入交付、队列、续接、分支及绑定 | MOD-08, MOD-25, RT-05, RT-10, RT-11, RT-12, RT-14 | 输入：Session 身份、绑定、待消费输入和分支点；触发：恢复、续接、steer、followUp、取消或关闭；证据：核对消费次序、generation、分支历史与实际取消传播 | 见 module-catalog |
+| `cases/context/`：上下文工程；当前资料选择、允许输入和快照实际调用关联 | MOD-03, MOD-05, RT-03 | 输入：当前资料选择、权限与版本；触发：构建 Context 并调用模型；证据：核对获准快照、当前事实及本次实际模型调用的关联 | 见 module-catalog |
+| `cases/memory/`：原生历史与记忆；完整原生历史持久化、完整性、恢复及历史使用 | MOD-03, MOD-08, MOD-25, RT-05 | 输入：数据库中的完整原生历史与来源引用；触发：写入、恢复、损坏或修订后续接；证据：核对历史完整性、权威来源及实际读取；不手写 SDK 成功历史 | 见 module-catalog |
+| `cases/compaction/`：原生上下文压缩；触发、重复压缩、失败取消及事实保持 | MOD-03, MOD-08, MOD-28, RT-06 | 输入：原生会话、压缩阈值和当前事实；触发：触发重复压缩、失败或取消；证据：核对原生压缩事件、保留事实及后续模型输入 | 见 module-catalog |
+| `cases/workflow/`：业务工作流与复核；步骤、匹配校验、等待、人工修订及评估快照 | MOD-07, MOD-12, MOD-13, MOD-15, MOD-16, MOD-17, MOD-23 | 输入：模拟发票、供应商、订单、收货及步骤初态；触发：校验匹配、人工修订或并发推进；证据：核对差额、候选、StepAttempt、Waiting 和业务修订 | 见 module-catalog |
+| `cases/prompt-skills/`：Prompt 与 Skill 管理；目标决策、SOP、资源装载、版本与资源注入 | MOD-01, MOD-04, MOD-06, RT-07 | 输入：任务目标、Prompt、Skill/SOP 与资源版本；触发：选择适用资源或处理冲突和注入；证据：核对装载清单、版本、工具决策与证据不足时的处理 | 见 module-catalog |
+| `cases/extensions/`：原生扩展；扩展装载、Hook、命令、停用及清理 | MOD-33, RT-08 | 输入：扩展清单、Hook 与命令配置；触发：装载、转换、失败、停用或清理；证据：核对实际 Hook 调用、工具准入和扩展生命周期 | 见 module-catalog |
+| `cases/subagents/`：子 Agent 协作；真实委派、槽位、身份、只读范围及父子取消预算 | MOD-34, MOD-08, MOD-28, RT-17 | 输入：父子会话、命名槽位、只读范围和共享预算；触发：真实委派、冲突、父取消或父恢复；证据：核对子会话身份、实际调用、权限交集和资源释放 | 见 module-catalog |
+| `cases/actions/`：业务动作与结果核对；预览、正式审批、Browser/B2B、防重与权威结果 | MOD-18, MOD-19, MOD-20, MOD-21, MOD-23 | 输入：预览载荷、附件、目标、确认与目标系统台账；触发：确认、发送、响应丢失、接管或 UNKNOWN 核对；证据：核对 payloadHash、授权事实、持久动作、防重与权威回读 | 见 module-catalog |
+| `cases/operations/`：运行维护与恢复；Host、环境凭证、发布、预算停写、备份与清理 | MOD-24, MOD-25, MOD-26, MOD-27, MOD-28, MOD-29, RT-13, RT-15, RT-16 | 输入：Host、凭证、发布、预算与备份初态；触发：断连、停写、恢复、迁移失败或清理；证据：核对故障传播、版本绑定、恢复结果与受保护资产 | 见 module-catalog |
+| `cases/eval-infrastructure/`：评测设施；数据契约、Trial、评分、对照和报告 | MOD-30, MOD-31, MOD-32 | 输入：Case/Gold、Trial 调度和观测证据；触发：执行设施自检、缺证据评分或重算报告；证据：核对成员、摘要、分母、可信证据与判定；自检不计产品成绩 | 见 module-catalog |
 
-当前共 177 个场景族：extraction 1、matching 16、approval 13、submission 16、runtime 63、isolation 39、platform 29。匹配按业务需要触发；不要求产品内 OCR/Parser 执行、外部验真、ERP 回写、自动拆合票、额度/多级财务审批、强制两人分离、通用员工创建/复杂配置 UI 或第二任务证明。外部解析导入、原件证据、ERP 只读资料、原生 Runtime/Memory/Extension/Subagent 和平台基础验证保留。
+每例以 `caseSummary.input/trigger/expected` 给出中文摘要，以 `subcapabilityRefs` 和检查项关联原方案条款。原生 Session、事件、Memory 和压缩必须取得真实 SDK/产品证据；构造输入不是执行结果。目录归属和 MOD 标签均不意味着全模块完成，细项缺口、F/A/B 模式和阶段适用范围由 coverage 单独报告。
 
-开发、回归、验收属于用途划分，P0–P13 和 BM 属于阶段或基准引用；这些维度通过清单关联同一资产，不再复制文件。多个实例引用同票或同场景时，不能按实例数宣称同样数量的独立业务样本。
+开发、回归、验收、P0–P13 和 Benchmark 均通过清单引用同一资产。新增纯机制例使用 `sampleRole=synthetic_only`、`sampleId=null`，无需关联无关发票。原票抽取仍依赖已发布 Gold，模拟业务金额不能作为原图真值。
 
 ### 4.3 manifests：统一索引与质量管理
 
@@ -235,6 +255,11 @@ Grader 按能力复用，同一实现可以被多个 Benchmark 引用，不按 B
 |---|---|
 | `prepare_invoice_data.py` | 首次盘点、去重、导入和候选生成；也提供审核与审计仍在使用的文件及摘要公共函数 |
 | `finalize_invoice_data.py` | 首次合并历史机器草案；不能覆盖已有人工审核或运行历史 |
+| `migrate_harness_data.py` | 核验基线、暂存十五目录与新增场景、保存历史并验证后发布；stage/publish/verify 分离 |
+| `harness_modules.py` / `harness_paths.py` | 模块职责、主责映射和唯一物理路径；不靠目录成员伪造覆盖 |
+| `harness_scenarios.py` / `harness_documentation.py` | 新增场景的结构化初态/操作/故障/逐项判据；从当前资产刷新完整数据手册 |
+| `harness_runtime_supplement.py` / `harness_storage_supplement.py` | 补齐 RTC 子能力、空间归属、临时目录与保留恢复场景，保存精确断言引用和中文参数说明 |
+| `harness_governance.py` | 单独登记评测治理要求、设施验证入口和待完成事项；不生成产品成绩或假覆盖 |
 | `sync_invoice_scope.py` | 核验旧清单，在暂存根同步已批准范围，保存旧内容归档及迁移记录，检查后发布唯一当前数据 |
 | `invoice_case_catalog.py` | 场景族及条件定义，供制作、物化和自检复用 |
 | `invoice_requirements.py` | 从主方案提取要求、关联用例检查并生成或验证覆盖信息 |
@@ -316,4 +341,4 @@ python -m unittest discover -s agent-eval/tests -v
 
 评测沿用产品主方案第 21 章 P0–P13 建设轴：P0 验证基础契约与存储，P1 开始真实 Agent 接入，P12 验证完整桌面与模拟/真实测试业务链，P13 建立 Host 及 Test → Shadow → Canary → Production 质量放行。每阶段评测本次新增能力并回归受影响的前序能力，历史阶段标签和成绩不能直接作为新阶段验收依据。
 
-工作空间和资源生命周期按评测总方案第 3.23 节核验，包括默认空间身份、策略交集、暂停/归档、同空间绑定，以及产品 runtime 下 work、agent 与 sessions 历史的分离。首版单默认空间不代表多租户隔离已实现。模型重试从 P3 起按需评测，P10 原生扩展与 P11 子 Agent 插件分别启用；启动屏障、公共组装、StepAttempt、桌面故障/IPC和生产日志等要求按总方案相应条目落实。这些都是适用要求，完成情况须由实际证据证明。
+工作空间和资源生命周期按评测总方案第 3.23 节核验，包括默认空间身份、策略交集、暂停/归档、同空间绑定，以及 work、agent 工作目录与数据库中完整原生会话历史的职责分离。首版单默认空间不代表多租户隔离已实现。模型重试从 P3 起按需评测，P10 原生扩展与 P11 子 Agent 插件分别启用；启动屏障、公共组装、StepAttempt、桌面故障/IPC和生产日志等要求按总方案相应条目落实。这些都是适用要求，完成情况须由实际证据证明。

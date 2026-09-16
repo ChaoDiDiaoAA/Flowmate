@@ -17,6 +17,7 @@ import unicodedata
 from PIL import Image, ImageOps
 
 from prepare_invoice_data import block_text, digest, read_json, safe_relative, write_new
+from harness_paths import canonical_case_path, list_current_case_paths
 
 VERSION = 'invoice-asset-audit-v1'
 from invoice_scope import REVIEW_BATCHES as TARGETS
@@ -129,7 +130,7 @@ def candidate_groups(features, pairs):
 
 
 def case_eligible(case, gold, business):
-    if case['sampleRole'] == 'allocation_anchor_only':
+    if case['sampleRole'] in ('allocation_anchor_only', 'synthetic_only'):
         return True
     sid = case['sampleId']
     if sid not in gold:
@@ -291,7 +292,7 @@ def run(project, output, image_neighbors=10):
     for sample in splits['samples']:
         sample['hasPublisherLabels'] = feature_index[sample['sampleId']]['hasPublisherLabels']
     catalog = read_json(quality / 'manifests/case-catalog.json')
-    cases = [read_json(safe_relative(quality, c['path'])) for c in catalog['cases']]
+    cases = [read_json(path) for path in list_current_case_paths(quality)]
     batches = build_batches(splits['samples'], cases)
     output.mkdir(parents=True, exist_ok=False)
     write_new(output / 'sample-features.json', {'version': VERSION, 'samples': features})
@@ -342,7 +343,7 @@ def run(project, output, image_neighbors=10):
                     seen.add(key)
                     if kind == 'cases':
                         case = case_index[asset_id]
-                        split, ref = case['split'], f"cases/{case['category']}/{asset_id}.json"
+                        split, ref = case['split'], canonical_case_path(case)
                     else:
                         split, ref = sample_index[asset_id]['split'], f'{kind}/{asset_id}.json'
                     writer.writerow({'assetKind': kind, 'assetId': asset_id, 'firstBatch': batch['batchId'],

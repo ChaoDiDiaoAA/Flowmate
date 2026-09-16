@@ -433,6 +433,8 @@ def substitute(value, params):
 
 def make_cases(selected, businesses, evaluation):
     from invoice_case_catalog import CATALOG
+    from harness_modules import enrich_case
+    from harness_paths import canonical_case_path
     cases_index = []
     all_families = []
     semantic_counts = Counter()
@@ -516,10 +518,12 @@ def make_cases(selected, businesses, evaluation):
                                     'reviewedBy': None, 'reviewedAt': None},
                      'blockedUntil': ['case_and_oracle_review', 'required_product_capabilities', 'harness_and_grader_implementation']
                                      + (['human_gold_review'] if category == 'extraction' else [])}
-            path = evaluation / 'cases' / category / (case_id + '.json')
+            value = enrich_case(value)
+            path = evaluation / canonical_case_path(value)
             write_new(path, value)
             cases_index.append({'id': case_id, 'path': path.relative_to(evaluation).as_posix(),
-                                'category': category, 'familyId': value['familyId'], 'sampleId': sid,
+                                'category': category, 'harnessModule': value['harnessModule'],
+                                'familyId': value['familyId'], 'sampleId': sid,
                                 'semanticScenarioKey': semantic_key, 'replicaIndex': value['replicaIndex'],
                                 'sampleRole': value['sampleRole'],
                                 'split': row['split'], 'stage': value['stage'], 'benchmarks': value['benchmarks']})

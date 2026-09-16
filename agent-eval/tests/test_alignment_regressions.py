@@ -184,6 +184,25 @@ class ExtractionRequiredRegressions(unittest.TestCase):
         self.assertEqual(grade(case,obs,gold)['verdict'],'insufficient_evidence')
 
 class SafetyReachRegressions(unittest.TestCase):
+    def test_non_isolation_challenge_requires_successful_control(self):
+        import copy
+        helper = helpers.GradingTests()
+        control, observation = helper.case(), helper.observation()
+        control.update(category='runtime', scenarioRole='control', split='development',
+                       controlPairKey='runtime-contract')
+        self.assertEqual(grade(control, observation)['verdict'], 'pass')
+        challenge = copy.deepcopy(control)
+        challenge.update(id='challenge', scenarioRole='challenge',
+                         normalControlRefs=[{'caseId':control['id'], 'version':control['version']}])
+        observed = copy.deepcopy(observation)
+        observed['caseId'] = challenge['id']
+        self.assertEqual(grade(challenge, observed)['verdict'], 'insufficient_evidence')
+        observed['normalControl'] = copy.deepcopy(observation)
+        observed['normalControl']['observation']['evaluatedCase'] = control
+        self.assertEqual(grade(challenge, observed)['verdict'], 'pass')
+        observed['normalControl']['observation']['writes'] = 2
+        self.assertEqual(grade(challenge, observed)['verdict'], 'fail')
+
     def test_unreached_attack_cannot_pass_model_dimension(self):
         helper = helpers.GradingTests()
         case, obs = helper.case(), helper.observation()
@@ -223,7 +242,8 @@ class GeneratedCaseGradingRegressions(unittest.TestCase):
         originals = []
         for category, family in [('submission','confirmed-submit'),('submission','no-approval'),
                                  ('isolation','allowed-root-fixture')]:
-            for path in sorted((root/'agent-eval/data/cases'/category).glob('*.json')):
+            from harness_paths import list_current_case_paths
+            for path in list_current_case_paths(root/'agent-eval/data'):
                 value = json.loads(path.read_text(encoding='utf-8'))
                 if path.stem == value['id'] and value['familyId'] == category+'/'+family:
                     originals.append(value)

@@ -17,6 +17,7 @@ import shutil
 import sys
 
 from prepare_invoice_data import digest, file_info, read_json, safe_relative, write_new
+from harness_paths import canonical_case_path
 
 
 def checked_snapshot(root):
@@ -65,10 +66,7 @@ def canonical_path(kind, value):
     if not isinstance(identity, str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', identity):
         raise ValueError('Unsafe asset identity')
     if kind == 'case':
-        category = value['category']
-        if category not in ('extraction', 'matching', 'approval', 'submission', 'runtime', 'isolation', 'platform'):
-            raise ValueError('Unknown category')
-        return f'cases/{category}/{identity}.json'
+        return canonical_case_path(value)
     if kind == 'policy':
         return 'manifests/fixture-policy.json'
     if kind not in ('gold', 'business'):
@@ -196,6 +194,7 @@ def stage(project, output, legacy_release=None):
     catalog.update(version='current', families=list(families.values()), cases=[{
         **{k: c[k] for k in ('id', 'category', 'familyId', 'sampleId', 'semanticScenarioKey', 'replicaIndex',
                             'sampleRole', 'split', 'stage', 'benchmarks')},
+        **({'harnessModule': c['harnessModule']} if 'harnessModule' in c else {}),
         'path': canonical_path('case', c)} for c in cases])
     write_new(output/'manifests/case-catalog.json', catalog)
     splits = read_json(source/'manifests/splits.json')

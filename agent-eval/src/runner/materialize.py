@@ -17,6 +17,7 @@ import zlib
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'agent-eval' / 'tools'))
 from invoice_case_catalog import CATALOG
+from harness_paths import list_current_case_paths
 
 BUSINESS_KEYS = {'invoice', 'suppliers', 'purchaseOrders', 'goodsReceipts',
                  'historicalEntries', 'approval', 'targetSystems', 'workspace'}
@@ -236,6 +237,9 @@ def materialize(case: dict, business: dict | None = None, product_root: Path | N
     extraction and native SDK fixtures remain unsupported by this offline builder.
     """
     try:
+        if case.get('harnessScenarioId'):
+            from harness_scenarios import materialize_scenario
+            return materialize_scenario(case)
         category, slug = case['familyId'].split('/', 1)
         spec = next((s for s in CATALOG.get(category, []) if s['id'] == slug), None)
         if not spec or category != case['category']:
@@ -338,7 +342,7 @@ def audit(root: Path, output: Path | None = None, release: str | None = None, da
     if release:
         members = sorted(identity for kind, identity in release_index if kind == 'case')
     else:
-        members = sorted((quality_root / 'cases').glob('*/*.json'))
+        members = list_current_case_paths(quality_root)
     for member in members:
         if release:
             resolved = resolve_asset(root, release, 'case', member, release_index)
@@ -350,13 +354,15 @@ def audit(root: Path, output: Path | None = None, release: str | None = None, da
             if path.stem != case['id']:
                 continue  # Versioned siblings are selected only by a release.
         business = None
-        if case['category'] in {'matching', 'approval', 'submission'}:
+        if case.get('inputMode') == 'simulated_structured_invoice':
             business = json.loads((quality_root / 'business' / (case['sampleId'] + '.json')).read_text(encoding='utf-8'))
             if release:
                 business = resolve_asset(root, release, 'business', business['id'], release_index)['value']
         result = materialize(case, business)
         records.append({'caseId': case['id'], 'caseVersion': case['version'],
             'familyId': case['familyId'], 'category': case['category'],
+            'harnessModule': case.get('harnessModule'),
+            'casePath': path.relative_to(quality_root).as_posix(),
             'sourceCaseSha256': hashlib.sha256(path.read_bytes()).hexdigest(),
             'status': result['status'], 'limitations': result['limitations'],
             'inputSha256': _digest(result['input']), 'harnessSha256': _digest(result['harness'])})
@@ -370,6 +376,9 @@ def audit(root: Path, output: Path | None = None, release: str | None = None, da
             'fixtureCount': len(fixtures), 'caseCount': len(records),
             'counts': {category + '/' + status: value for (category, status), value in counts.items()},
             'unsupportedFamilies': dict(unsupported)}
+    report['adapterPlanCount'] = sum(f['harness'].get('materializationStatus') == 'adapter_plan_only' for f in fixtures)
+    report['concreteFixtureCount'] = len(fixtures) - report['adapterPlanCount']
+    report['materializationSemantics'] = 'fixtureCount includes offline adapter plans; no product/SDK execution or captured native state is implied.'
     if output is not None:
         output.mkdir(parents=True)
         for filename, values in [('cases.jsonl', records), ('fixtures.jsonl', fixtures)]:

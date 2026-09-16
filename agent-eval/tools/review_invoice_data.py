@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 
 from prepare_invoice_data import digest, file_info, read_json, safe_relative, write_new
+from harness_paths import canonical_case_path, list_current_case_paths
 
 HEADER_FIELDS = ('invoice_number', 'invoice_date', 'due_date', 'buyer_name', 'buyer_address',
                  'buyer_tax_id', 'seller_name', 'seller_address', 'seller_tax_id', 'currency',
@@ -352,7 +353,7 @@ def publish_asset_revisions(project, changes, base_release, release_id, reason):
         if kind == 'case':
             need(value.get('category') == prior['value']['category'] and value.get('split') == prior['value']['split'], 'Case category or split changed without a split migration')
             value.update(materialStatus='draft_generated', reviewStatus='pending', executionStatus='not_run', eligibleForAcceptance=False)
-            folder = 'cases/' + value['category']
+            folder = Path(canonical_case_path(value)).parent.as_posix()
         elif kind == 'business':
             need(value.get('split') == prior['value']['split'], 'Business split changed')
             value.update(status='review_pending', humanVerified=False)
@@ -511,6 +512,7 @@ def _replace_json(path, value):
 def current_asset_index(project):
     inventory = verify_current_inventory(project)
     root = quality_root(project)
+    case_paths = {p.relative_to(root).as_posix() for p in list_current_case_paths(root)}
     index = {}
     for entry in inventory['files']:
         relative = entry['path']
@@ -519,6 +521,8 @@ def current_asset_index(project):
                 'case' if re.fullmatch(r'cases/[^/]+/[^/]+\.json', relative) else
                 'policy' if relative == 'manifests/fixture-policy.json' else None)
         if kind:
+            if kind == 'case':
+                need(relative in case_paths, 'Inventory case is absent from current catalog')
             value = read_json(root/relative)
             identity = value.get('sampleId') if kind == 'gold' else value.get('id')
             need(identity and (kind, identity) not in index, 'Missing or duplicate asset identity')
@@ -668,7 +672,7 @@ def validate_current_assets(root, product):
     import hashlib
     root, product = Path(root), Path(product)
     assets = list((root/'gold').glob('*.json')) + list((root/'business').glob('*.json'))
-    assets += list((root/'cases').glob('*/*.json'))
+    assets += list_current_case_paths(root)
     if (root/'manifests/fixture-policy.json').exists():
         assets.append(root/'manifests/fixture-policy.json')
     for path in assets:
