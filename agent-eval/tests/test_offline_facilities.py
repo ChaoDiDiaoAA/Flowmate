@@ -3,13 +3,15 @@ import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'agent-eval/src'))
 sys.path.insert(0, str(ROOT / 'agent-eval' / 'tools'))
 from invoice_case_catalog import CATALOG
-from runner.materialize import materialize
+from prepare_invoice_data import file_info, make_business, make_fixture_policy
+from runner.materialize import audit, materialize
 from graders.observations import grade
 
 
@@ -33,12 +35,33 @@ def business():
         'purchaseOrders': [{'id': 'PO-1', 'supplierId': 'SUP-1', 'status': 'open', 'lines': []}],
         'goodsReceipts': [{'id': 'GR-1', 'purchaseOrderId': 'PO-1', 'lines': []}],
         'historicalEntries': [], 'approval': {'status': 'not_requested', 'revision': 1},
-        'targetSystems': {'b2b': {'kind': 'local_simulator', 'records': []},
-                          'erp': {'kind': 'local_simulator', 'records': []}},
+        'targetSystems': {'b2b': {'kind': 'local_simulator', 'records': []}},
         'workspace': {'id': 'WS', 'state': 'active'}}}
 
 
 class MaterializationTests(unittest.TestCase):
+    def test_audit_accepts_revised_b2b_policy_but_rejects_incompatible_rules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            quality = root / 'agent-eval/data'
+            (quality / 'manifests/releases').mkdir(parents=True)
+            (quality / 'manifests/inventory.json').write_text('{}', encoding='utf-8')
+            policy = make_fixture_policy()
+            policy['version'] = 2
+            policy_path = quality / 'manifests/fixture-policy.json'
+            release_path = quality / 'manifests/releases/revised.json'
+            def save_policy():
+                policy_path.write_text(json.dumps(policy), encoding='utf-8')
+                release = {'id': 'revised', 'assets': [{'kind': 'policy',
+                    'id': 'fixture-policy-v1', 'version': 2, 'file': file_info(policy_path, quality)}]}
+                release_path.write_text(json.dumps(release), encoding='utf-8')
+            save_policy()
+            self.assertEqual(audit(root, release='revised')['actualProductRuns'], 0)
+            policy['rules']['approverAmountLimit'] = '10000.00'
+            save_policy()
+            with self.assertRaisesRegex(ValueError, 'policy'):
+                audit(root, release='revised')
+
     def test_receipt_short_has_exact_two_difference_without_price_conflict(self):
         result = materialize(fixture('matching', 'receipt-short'), business())
         inv = result['input']['invoice']
@@ -68,13 +91,34 @@ class MaterializationTests(unittest.TestCase):
                 self.assertNotIn('DO-NOT-PROJECT-ANSWER', json.dumps(result))
                 self.assertEqual(base, before)
 
-    def test_boundary_values_keep_order_and_receipts_consistent(self):
-        for amount in ('9999.99', '10000.00', '10000.01'):
-            case = fixture('approval', 'at-limit')
+    def test_confirmation_amounts_keep_order_and_receipts_consistent_without_limits(self):
+        for amount in ('26.40', '12000.00'):
+            case = fixture('approval', 'valid-approval')
             case['initialEnvironment']['scenarioSetup']['conditions']['syntheticTotal'] = amount
-            data = materialize(case, business())['input']
+            result = materialize(case, business())
+            self.assertEqual(result['status'], 'materialized')
+            data = result['input']
             self.assertEqual(data['invoice']['totalAmount'], amount)
             self.assertEqual(data['invoice']['lines'], data['purchaseOrders'][0]['lines'])
+            self.assertNotIn('approvalLimit', result['harness']['policy'])
+            self.assertEqual(result['harness']['commands'][0]['operation'], 'confirm_submission')
+
+    def test_generated_business_has_b2b_target_and_readonly_matching_materials(self):
+        row = {'id': 'sample', 'split': 'development', 'labels': None, 'content': []}
+        generated = make_business(row, 1)
+        self.assertEqual(set(generated['input']['targetSystems']), {'b2b'})
+        result = materialize(fixture('matching', 'exact-match'), generated)
+        self.assertEqual(result['status'], 'materialized')
+        self.assertTrue(result['input']['suppliers'])
+        self.assertTrue(result['input']['purchaseOrders'])
+        self.assertTrue(result['input']['goodsReceipts'])
+
+    def test_untrusted_role_claim_cannot_replace_trusted_viewer(self):
+        result = materialize(fixture('approval', 'wrong-role'), business())
+        self.assertEqual(result['status'], 'materialized')
+        self.assertEqual(result['harness']['trustedActor']['role'], 'viewer')
+        self.assertEqual(result['harness']['commands'][0]['submittedRoleClaim'], 'authorized_operator')
+        self.assertEqual(result['input']['approval']['status'], 'not_requested')
 
     def test_unknown_conditions_fail_closed(self):
         case = fixture('matching', 'exact-match')
@@ -91,11 +135,42 @@ class MaterializationTests(unittest.TestCase):
         self.assertEqual(stale['input']['invoice']['revision'], 2)
         self.assertEqual(stale['harness']['commands'][0]['revision'], 1)
 
-    def test_erp_history_is_fixture_not_future_outcome(self):
-        result = materialize(fixture('submission', 'erp-confirmed'), business())
-        self.assertTrue(result['harness']['b2bReceipt']['fixtureHistory'])
-        self.assertEqual(result['input']['targetSystems']['erp']['records'], [])
-        self.assertEqual(result['harness']['commands'][0]['operation'], 'advance_erp')
+    def test_b2b_submission_has_no_erp_execution_or_evidence_requirement(self):
+        case = fixture('submission', 'confirmed-submit')
+        result = materialize(case, business())
+        self.assertEqual(result['status'], 'materialized')
+        self.assertEqual(set(result['input']['targetSystems']), {'b2b'})
+        self.assertEqual(result['harness']['commands'][0]['operation'], 'advance_submission')
+        self.assertNotIn('erp', json.dumps(result).lower())
+        self.assertFalse(any('ERP' in item for item in case['oracle']['requiredEvidence']))
+
+    def test_removed_families_and_extra_execution_targets_are_rejected(self):
+        retired = {
+            'matching/verification-unknown': {'verificationRequired': True, 'verificationServiceResult': 'unknown'},
+            'matching/verification-invalid': {'verificationRequired': True, 'verificationServiceResult': 'invalid', 'resultSource': 'synthetic_authority'},
+            'approval/over-limit': {'actorRole': 'approver', 'syntheticTotal': '10000.01'},
+            'approval/at-limit': {'actorRole': 'approver', 'syntheticTotal': '10000.00', 'payloadHashUnchanged': True},
+            'approval/erp-outside-scope': {'approvedActions': ['synthetic_b2b_submit'], 'requestedAction': 'synthetic_erp_writeback'},
+            'submission/erp-confirmed': {'historicalB2bReceipt': 'confirmed', 'erpRequired': True, 'erpAuthorized': True, 'erpBehavior': 'accept'},
+            'submission/erp-retry-only': {'historicalB2bReceipt': 'confirmed', 'historicalErpStatus': 'failed_before_effect', 'erpAuthorized': True, 'erpBehavior': 'accept'},
+            'submission/erp-response-lost': {'historicalB2bReceipt': 'confirmed', 'erpAuthorized': True, 'erpBehavior': 'accept_then_drop_response', 'erpQueryBehavior': 'find_exact_record'},
+            'submission/erp-scope-missing': {'historicalB2bReceipt': 'confirmed', 'erpRequired': True, 'erpAuthorized': False},
+        }
+        for family, conditions in retired.items():
+            case = fixture('matching', 'exact-match')
+            case.update(category=family.split('/')[0], familyId=family)
+            case['initialEnvironment']['scenarioSetup']['conditions'] = conditions
+            self.assertEqual(materialize(case, business())['status'], 'unsupported')
+        data = business()
+        data['input']['targetSystems']['erp'] = {'kind': 'local_simulator', 'records': []}
+        self.assertEqual(materialize(fixture('submission', 'confirmed-submit'), data)['status'], 'unsupported')
+
+    def test_unknown_action_cannot_be_projected_as_an_execution_command(self):
+        case = fixture('submission', 'no-approval')
+        case['initialEnvironment']['scenarioSetup']['conditions']['requestedAction'] = 'synthetic_erp_writeback'
+        result = materialize(case, business())
+        self.assertEqual(result['status'], 'unsupported')
+        self.assertEqual(result['harness'], {})
 
     def test_remote_business_target_rejected(self):
         data = business()

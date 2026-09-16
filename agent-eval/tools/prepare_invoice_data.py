@@ -14,8 +14,7 @@ from datetime import datetime, timezone
 
 VERSION = 'voxel51-preparation-v1'
 SEED = 'flowmate-data-v1'
-TARGETS = {'extraction': 1200, 'matching': 1000, 'approval': 600,
-           'submission': 1000, 'runtime': 1000, 'isolation': 800, 'platform': 400}
+from invoice_scope import CASE_COUNTS as TARGETS
 BASE_FILES = ('original.jpg', 'content.json', 'content.md', 'pages.json')
 DROP_FILES = ('invoice.md', 'snapshot.json', 'record.json', 'receipt.json', 'parse.json')
 SOURCE_DEPENDENT_MECHANISMS = {'isolation/allowed-source', 'isolation/allowed-selected-context',
@@ -418,8 +417,7 @@ def make_business(row, ordinal):
                                         'status': 'confirmed', 'lines': [{'lineId': x['lineId'], 'receivedQuantity': x['quantity']}
                                                                          for x in lines]}],
                       'historicalEntries': [], 'approval': {'status': 'not_requested', 'revision': 1},
-                      'targetSystems': {'b2b': {'kind': 'local_simulator', 'records': []},
-                                        'erp': {'kind': 'local_simulator', 'records': []}},
+                      'targetSystems': {'b2b': {'kind': 'local_simulator', 'records': []}},
                       'workspace': {'id': 'SIM-WS-' + row['split'], 'state': 'active', 'environment': 'test'}}}
 
 
@@ -531,6 +529,20 @@ def make_cases(selected, businesses, evaluation):
     return cases_index, all_families
 
 
+def make_fixture_policy():
+    """Return the current synthetic invoice matching and submission policy."""
+    return {'schemaVersion': 1, 'id': 'fixture-policy-v1', 'kind': 'synthetic_policy',
+              'status': 'review_pending', 'scope': 'local_simulated_structured_invoice_only',
+              'rules': {'currency': 'USD', 'moneyPrecision': 2, 'rounding': 'ROUND_HALF_EVEN',
+                        'amountTolerance': '0.01',
+                        'quantityMismatch': 'request_review', 'missingSupplier': 'request_review',
+                        'ambiguousMatch': 'request_review', 'missingCurrency': 'request_review',
+                        'validSubmissionConfirmationRequired': True, 'unknownSubmission': 'query_before_retry',
+                        'defaultPoRequired': True, 'non-po-permitted': 'only_when_explicit_case_policy_marks_po_not_required',
+                        'executionTargets': ['b2b'], 'actualExternalWrites': 'forbidden'},
+              'basis': '用户确认的模拟业务数据准备范围；模拟金额及核对容差是测试假设；approval兼容字段表示提交确认。'}
+
+
 def make_evaluation(canonical, product, evaluation):
     selected, leakage_groups = choose_samples(canonical)
     business_rows = []
@@ -543,16 +555,7 @@ def make_evaluation(canonical, product, evaluation):
         write_new(evaluation / 'business' / (row['id'] + '.json'), business)
     for row in selected:
         write_new(evaluation / 'gold' / (row['id'] + '.json'), make_gold(row))
-    policy = {'schemaVersion': 1, 'id': 'fixture-policy-v1', 'kind': 'synthetic_policy',
-              'status': 'review_pending', 'scope': 'local_simulated_structured_invoice_only',
-              'rules': {'currency': 'USD', 'moneyPrecision': 2, 'rounding': 'ROUND_HALF_EVEN',
-                        'amountTolerance': '0.01', 'approverAmountLimit': '10000.00',
-                        'quantityMismatch': 'request_review', 'missingSupplier': 'request_review',
-                        'ambiguousMatch': 'request_review', 'missingCurrency': 'request_review',
-                        'validApprovalRequiredForSubmission': True, 'unknownSubmission': 'query_before_retry',
-                        'defaultPoRequired': True, 'non-po-permitted': 'only_when_explicit_case_policy_marks_po_not_required',
-                        'b2bSuccessDoesNotImplyErpSuccess': True, 'actualExternalWrites': 'forbidden'},
-              'basis': '用户确认的模拟业务数据准备范围；金额和阈值是测试假设，不代表企业规则。'}
+    policy = make_fixture_policy()
     write_new(evaluation / 'manifests' / 'fixture-policy.json', policy)
     cases, families = make_cases(selected, businesses, evaluation)
     splits = {'schemaVersion': 1, 'version': VERSION, 'seed': SEED,
@@ -629,7 +632,7 @@ def prepare(source, project):
                                 '取得企业契约后再核验企业适配，不能以模拟数据替代生产证据']}
     write_new(evaluation / 'manifests' / 'preparation-report.json', report)
     write_text_new(evaluation / 'README.md',
-                   '# 项目评测数据\n\n本批含 1,200 份待人工核验候选、600 套模拟业务资料、6,000 个未运行用例草案。\n'
+                   f'# 项目评测数据\n\n本批含 1,200 份待人工核验候选、600 套模拟业务资料、{sum(TARGETS.values()):,} 个未运行用例草案。\n'
                    '人工已核验数为 0；Gold/Case/Oracle 复核及真实运行仍待完成。\n\n'
                    '- `gold/`：候选值、证据索引、人工复核状态，不能直接作为已确认答案。\n'
                    '- `business/`：模拟结构化发票与配套资料，金额不代表原图。\n'

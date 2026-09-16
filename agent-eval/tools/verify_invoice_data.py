@@ -9,8 +9,7 @@ import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 
-EXPECTED = {'extraction': 1200, 'matching': 1000, 'approval': 600, 'submission': 1000,
-            'runtime': 1000, 'isolation': 800, 'platform': 400}
+from invoice_scope import CASE_COUNTS as EXPECTED, REVIEW_BATCHES, RETIRED_FAMILIES
 
 
 def load(path):
@@ -66,6 +65,9 @@ def indexed_jsonl(path, identity='caseId'):
 
 def verify_current_artifacts(product, evaluation, cases, catalog, splits):
     index = {c['id']: c for c in cases}
+    if (evaluation/'manifests/scope-sync.json').exists():
+        from sync_invoice_scope import verify_scope_manifest
+        verify_scope_manifest(evaluation, cases)
     for entry in catalog['cases']:
         case = index[entry['id']]
         require(entry['path'] == f'cases/{case["category"]}/{case["id"]}.json', 'Noncanonical current case')
@@ -80,7 +82,7 @@ def verify_current_artifacts(product, evaluation, cases, catalog, splits):
     from audit_invoice_assets import case_eligible
     prior = {'gold': set(), 'business': set(), 'cases': set()}
     for batch, expected in zip(load(evaluation/'manifests/audit/batches.json')['batches'],
-                               ((100, 50, 500), (500, 250, 2500), (1200, 600, 6000)), strict=True):
+                               REVIEW_BATCHES, strict=True):
         members = {kind: set(batch[kind]) for kind in prior}
         require(all(len(batch[kind]) == len(members[kind]) == count for kind, count in zip(prior, expected)), 'Batch budgets differ')
         require(all(prior[kind] <= members[kind] for kind in prior), 'Review batches are not cumulative')
@@ -212,10 +214,16 @@ def verify(product, evaluation):
                     require(f['candidateValue'] == labels['fields'][key]['value'], 'Provider candidate changed')
     require(gold_splits == {'development': 600, 'regression': 200, 'acceptance': 400}, 'Gold split quotas differ')
     business_files = sorted(p for p in (evaluation / 'business').glob('*.json') if re.fullmatch(r'\d{6}\.json', p.name))
+    from prepare_invoice_data import make_fixture_policy
+    expected_policy = make_fixture_policy()
+    policy = load(evaluation/'manifests/fixture-policy.json')
+    require(all(policy.get(k) == expected_policy[k] for k in ('kind','scope','rules')), 'Unsupported or retired fixture policy')
     require(len(business_files) == 600, 'Business fixture count differs')
     business_splits = Counter()
     for path in business_files:
         b = load(path)
+        require(set(b['input']['targetSystems']) == {'b2b'}, 'Business execution targets must be B2B only')
+        require(b['input']['targetSystems']['b2b'] == {'kind':'local_simulator','records':[]}, 'Invalid B2B base target')
         business_splits[b['split']] += 1
         require(b['kind'] == 'synthetic_business_fixture' and (current or b['humanVerified'] is False), 'Misrepresented fixture origin')
         require(b['split'] == by_sample[b['sampleId']]['split'], 'Business split mismatch')
@@ -254,6 +262,8 @@ def verify(product, evaluation):
         require(combination not in combinations, 'Repeated family/source instance')
         combinations.add(combination)
         require(case['familyId'] in families, 'Unknown scenario family')
+        require(case['familyId'] not in RETIRED_FAMILIES, 'Retired scenario in active data')
+        require('BM-06' not in case['benchmarks'], 'Retired benchmark in active data')
         counts[case['category']] += 1
         case_splits[case['split']] += 1
         semantic_counts[case['semanticScenarioKey']] += 1
@@ -324,6 +334,10 @@ def verify(product, evaluation):
         require(not any(re.search(r'(?:^|/)(?:audit|materialization)-v\d+|\.v\d+\.json$', x) for x in actual_eval),
                 'Parallel versioned assets remain in current dataset')
         require(not workflow_path.exists() and not (evaluation/'manifests/releases').exists(), 'Parallel release inventories remain')
+    publication_ref=report.get('goldAnswerPreparation',{}).get('publicationReport')
+    if publication_ref:
+        from publish_gold_answers import verify_publication
+        verify_publication(evaluation,load(resolve(evaluation,publication_ref)))
     return {'status': 'file_and_reference_checks_passed', 'uniqueOriginals': len(sample_index),
             'publisherLabels': len(label_manifest['samples']), 'productFiles': len(actual_product),
             'qualityFiles': len(actual_eval), 'imageAssets': images, 'goldCandidates': len(gold_files),

@@ -19,7 +19,7 @@ from PIL import Image, ImageOps
 from prepare_invoice_data import block_text, digest, read_json, safe_relative, write_new
 
 VERSION = 'invoice-asset-audit-v1'
-TARGETS = [(100, 50, 500), (500, 250, 2500), (1200, 600, 6000)]
+from invoice_scope import REVIEW_BATCHES as TARGETS
 IDENTITY_FIELDS = ('invoice_number', 'seller_name', 'invoice_date', 'total_amount')
 
 

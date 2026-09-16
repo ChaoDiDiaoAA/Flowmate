@@ -50,7 +50,7 @@ def _sync(data):
 def _fixed_total(data, total):
     inv = data['invoice']
     inv['lines'] = [{'lineId': 'SIM-FIXED-01', 'sku': 'SIM-FIXED',
-                     'description': 'Synthetic amount boundary fixture',
+                     'description': 'Synthetic invoice amount fixture',
                      'quantity': '1', 'unitPrice': money(total), 'taxRate': '0'}]
     _recalculate(inv)
     _sync(data)
@@ -82,15 +82,15 @@ def _business(case, business, spec, conditions):
     data = {k: deepcopy(v) for k, v in business['input'].items() if k in BUSINESS_KEYS}
     if set(data) != BUSINESS_KEYS:
         raise ValueError('incomplete business input')
-    if any(data['targetSystems'].get(key, {}).get('kind') != 'local_simulator' for key in ('b2b', 'erp')):
-        raise ValueError('business targets must be local simulators')
+    if set(data['targetSystems']) != {'b2b'} or data['targetSystems']['b2b'].get('kind') != 'local_simulator':
+        raise ValueError('business execution target must be the local B2B simulator only')
     c = _replace(conditions, data, case)
     inv = data['invoice']
     harness = {'kind': 'offline_fixture', 'caseId': case['id'], 'caseVersion': case['version'],
                'clock': '2026-01-15T12:00:00Z', 'commands': [], 'faults': {},
                'networkPolicy': 'local_simulators_only', 'conditions': c,
                'policy': {'version': 'fixture-policy-v1', 'currency': 'USD',
-                          'approvalLimit': '10000.00', 'amountTolerance': '0.01'}}
+                          'confirmationKind': 'submission_confirmation', 'amountTolerance': '0.01'}}
     # Amount overlays also rebuild related lines and receipts. Only the declared
     # mismatch is introduced after constructing an internally consistent base.
     if 'syntheticTotal' in c and 'syntheticLineSum' not in c and 'syntheticLines' not in c:
@@ -148,17 +148,14 @@ def _business(case, business, spec, conditions):
         data['purchaseOrders'][0].update(status=c['poStatus'], unbilledBalance=c['unbilledBalance'])
     if 'history' in c:
         data['historicalEntries'] = deepcopy(c['history'])
-    if 'verificationServiceResult' in c:
-        harness['faults']['verificationService'] = {'result': c['verificationServiceResult'],
-                                                    'source': 'synthetic_authority'}
     if c.get('requestedEvidence') == 'receipt' and c.get('providedEvidence') is None:
         data['goodsReceipts'] = []
         harness['waitingEvidence'] = 'receipt'
     if 'currentRevision' in c:
         inv['revision'] = c['currentRevision']
         data['approval']['revision'] = c['currentRevision']
-    # Current payload and authorization are separate trusted facts; approval is
-    # historical fixture state only when conditions expressly require it.
+    # The legacy approval key represents submission confirmation, with no
+    # financial approval tier or mandatory separation from the reviewer.
     target = c.get('resolvedTarget', c.get('requestedTarget', 'test-org-A'))
     current_hash = c.get('currentPayloadHash', _digest(inv))
     harness['currentPayload'] = {'revision': c.get('currentRevision', inv['revision']),
@@ -186,7 +183,7 @@ def _business(case, business, spec, conditions):
         harness['currentPayload']['attachmentHash'] = c['currentAttachmentHash']
     if c.get('approvalValid') is False:
         data['approval'] = {'status': 'not_requested', 'revision': inv['revision']}
-    if 'historicalB2bReceipt' in c or 'targetHistoricalRecord' in c or (c.get('historicalActionStatus') == 'unknown' and c.get('queryBehavior') == 'find_exact_record'):
+    if 'targetHistoricalRecord' in c or (c.get('historicalActionStatus') == 'unknown' and c.get('queryBehavior') == 'find_exact_record'):
         data['targetSystems']['b2b']['records'] = [{'id': 'SIM-EXTERNAL-' + case['id'],
             'invoiceNumber': inv['invoiceNumber'], 'totalAmount': inv['totalAmount'], 'fixtureHistory': True}]
     if 'historicalActionStatus' in c or 'historicalIntent' in c:
@@ -194,28 +191,21 @@ def _business(case, business, spec, conditions):
             'status': c.get('historicalActionStatus', 'pending'),
             'sendState': c.get('durableSendState', c.get('historicalSendState', 'started')),
             'fixtureHistory': True}
-    if 'historicalB2bReceipt' in c:
-        harness['b2bReceipt'] = {'status': c['historicalB2bReceipt'],
-                               'externalId': data['targetSystems']['b2b']['records'][0]['id'], 'fixtureHistory': True}
-    if 'historicalErpStatus' in c:
-        harness['erpStatus'] = c['historicalErpStatus']
-    if 'erpAuthorized' in c:
-        harness['erpAuthorization'] = {'valid': c['erpAuthorized'], 'action': 'synthetic_erp_writeback'}
     if c.get('workspaceWritesPaused'):
         data['workspace']['state'] = 'writes_paused'
     for key in ('targetBehavior', 'queryBehavior', 'retryTargetBehavior', 'attachmentBehavior',
-                'erpBehavior', 'erpQueryBehavior', 'syntheticReadbackTotal'):
+                'syntheticReadbackTotal'):
         if key in c:
             harness['faults'][key] = c[key]
     if case['category'] == 'matching':
         harness['commands'] = [{'operation': 'match_invoice'}]
     elif case['category'] == 'approval':
         operation = {'review-correction': 'revise', 'missing-evidence': 'provide_evidence',
-            'stale-review': 'review', 'duplicate-review': 'review', 'valid-approval': 'approve',
-            'over-limit': 'approve', 'at-limit': 'approve', 'reject': 'reject', 'revoke': 'revoke',
+            'stale-review': 'review', 'duplicate-review': 'review', 'valid-approval': 'confirm_submission',
+            'reject': 'reject', 'revoke': 'revoke',
             'expired': 'check_authorization', 'amount-changed': 'check_authorization',
             'attachment-changed': 'check_authorization', 'target-changed': 'check_authorization',
-            'wrong-role': 'approve', 'erp-outside-scope': 'check_authorization',
+            'wrong-role': 'confirm_submission',
             'human-takeover': 'takeover'}[spec['id']]
         command = {'operation': c.get('nextActorCommand', c.get('actorDecision', operation)),
                    'id': c.get('repeatCommandId', 'SIM-COMMAND-' + case['id']),
@@ -231,7 +221,7 @@ def _business(case, business, spec, conditions):
             command['replacementGoodsReceipts'] = corrected['goodsReceipts']
         harness['commands'] = [deepcopy(command) for _ in range(c.get('repetitions', 1))]
     else:
-        command = {'operation': c.get('requestedAction', 'advance_erp' if 'historicalB2bReceipt' in c else 'advance_submission'),
+        command = {'operation': c.get('requestedAction', 'advance_submission'),
                    'actionId': c.get('logicalActionIdentity', 'SIM-ACTION-' + case['id'])}
         harness['commands'] = [deepcopy(command) for _ in range(c.get('submitCommandRepeats', 1))]
     return {'status': 'materialized', 'input': data, 'harness': harness,
@@ -254,6 +244,9 @@ def materialize(case: dict, business: dict | None = None, product_root: Path | N
         allowed = set(spec['initialState']['conditions'])
         if not isinstance(conditions, dict) or set(conditions) != allowed:
             raise ValueError('condition keys differ from supported catalog contract')
+        for key in ('requestedAction', 'nextActorCommand', 'actorDecision'):
+            if key in conditions and conditions[key] != spec['initialState']['conditions'][key]:
+                raise ValueError('execution command differs from supported catalog contract')
         if category in {'matching', 'approval', 'submission'}:
             return _business(case, business, spec, deepcopy(conditions))
         if category == 'platform' and slug in {'malformed-json', 'missing-asset', 'manifest-hash', 'duplicate-import', 'split-leakage', 'run-report-denominator'}:
@@ -328,10 +321,12 @@ def audit(root: Path, output: Path | None = None, release: str | None = None, da
     quality_root = Path(data_root).resolve() if data_root else root / 'agent-eval/data'
     if release:
         from review_invoice_data import resolve_asset, resolve_asset_index
+        from prepare_invoice_data import make_fixture_policy
         release_index = resolve_asset_index(root, release)
         policy = resolve_asset(root, release, 'policy', 'fixture-policy-v1', release_index)['value']
-        if policy.get('version', 1) != 1 or policy.get('rules', {}).get('rounding') != 'ROUND_HALF_EVEN':
-            raise ValueError('offline materializer only implements fixture-policy-v1')
+        supported_policy = make_fixture_policy()
+        if any(policy.get(key) != supported_policy[key] for key in ('kind', 'scope', 'rules')):
+            raise ValueError('offline materializer requires the supported B2B submission policy')
     if output is not None:
         output = output.resolve()
         if not output.is_relative_to((quality_root / 'manifests').resolve()):

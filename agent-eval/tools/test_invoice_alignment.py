@@ -5,8 +5,9 @@ from invoice_requirements import load_requirements, enrich_cases, build_coverage
 class AlignmentTests(unittest.TestCase):
     def test_exact_spec_catalog(self):
         req = load_requirements(Path(__file__).resolve().parents[2])
-        for kind, count in [('MOD',34),('RT',17),('RTC',90),('RTX',6)]:
+        for kind, count in [('MOD',31),('RT',17),('RTC',90),('RTX',6)]:
             self.assertEqual(sum(r['kind']==kind for r in req['requirements']), count)
+        self.assertFalse({'MOD-10', 'MOD-14', 'MOD-22'} & {r['id'] for r in req['requirements']})
         for r in req['requirements']:
             self.assertEqual(len(r['source']['sha256']),64)
             self.assertTrue(r['source']['verbatim'])
@@ -23,6 +24,17 @@ class AlignmentTests(unittest.TestCase):
 
 
 class EnrichmentTests(unittest.TestCase):
+    def test_mapping_refresh_does_not_reassign_existing_runtime_families(self):
+        req = load_requirements(Path(__file__).resolve().parents[2])
+        current = enrich_cases(self.fixture_cases(), req)
+        refreshed = enrich_cases(current, req, redistribute=False)
+        self.assertEqual([(c['id'], c['familyId'], c['split']) for c in current],
+                         [(c['id'], c['familyId'], c['split']) for c in refreshed])
+        self.assertEqual([c['initialEnvironment'] for c in current],
+                         [c['initialEnvironment'] for c in refreshed])
+        self.assertEqual([c['requirementRefs'] for c in current],
+                         [c['requirementRefs'] for c in refreshed])
+
     @staticmethod
     def fixture_cases():
         from copy import deepcopy

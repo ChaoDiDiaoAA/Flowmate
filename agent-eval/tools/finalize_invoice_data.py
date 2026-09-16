@@ -242,7 +242,7 @@ QUALITY_README = '''# Flowmate 质量数据
 - `source-labels/`：提供方标签，不能当成人工答案。
 - `gold/`：1,200 份字段核验候选，等待实际人工核验。
 - `business/`：600 套模拟资料，金额不能用作原票答案。
-- `cases/`：七类共 6,000 个固定用例，未声称实际执行。
+- `cases/`：七类当前用例，数量以 manifests/preparation-report.json 为准，未声称实际执行。
 - `manifests/inventory.json`：所有质量文件的唯一摘要清单。
 - `manifests/requirements.json`、`coverage.json`：主方案条目及检查级覆盖和缺口。
 - `manifests/audit/`：近重复线索、累计核验批次和综合任务单。
@@ -252,7 +252,7 @@ QUALITY_README = '''# Flowmate 质量数据
 
 业务 Agent 只能读取当前用例投影的获准输入，不能遍历此目录。
 使用 `python agent-eval/tools/verify_invoice_data.py --project .` 检查；
-制作流程和各目录职责见 `docs/data-preparation.md`。
+制作流程和各目录职责见 `agent-eval/docs/data/data-preparation.md`。
 '''
 
 

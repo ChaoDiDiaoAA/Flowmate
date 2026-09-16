@@ -2,7 +2,7 @@
 
 `agent-eval/` 是 Flowmate 的独立质量工程目录，保存评测方案、质量数据、评测设施和设施自检。它用于准备与审核数据、装配测试条件、核验运行证据、评分和比较版本效果。
 
-本 README 解释每个文件夹的职责、用途、相互关系和建设状态。数据文件的完整字段与参数见 [数据使用手册](D:/code/Flowmate/agent-eval/data/README.md)，来源整理和制作流程见 [数据制作方案](D:/code/Flowmate/docs/data-preparation.md)。
+本 README 解释每个文件夹的职责、用途、相互关系和建设状态。数据文件的完整字段与参数见 [数据使用手册](D:/code/Flowmate/agent-eval/data/README.md)，来源整理和制作流程见 [数据制作方案](D:/code/Flowmate/agent-eval/docs/data/data-preparation.md)。
 
 ## 一、从哪里开始阅读
 
@@ -11,7 +11,7 @@
 | 产品需要实现什么 | [产品总方案](D:/code/Flowmate/docs/spec/00_Flowmate完整方案.md) |
 | 评测什么、怎样判定、按什么阶段推进 | [Agent 评测总方案](D:/code/Flowmate/agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md) |
 | 每个评测文件夹做什么 | 本 README |
-| 数据如何选择、制作和审核 | [数据制作方案](D:/code/Flowmate/docs/data-preparation.md) |
+| 数据如何选择、制作和审核 | [数据制作方案](D:/code/Flowmate/agent-eval/docs/data/data-preparation.md) |
 | 数据字段、场景参数、审核命令如何使用 | [数据使用手册与参数字典](D:/code/Flowmate/agent-eval/data/README.md) |
 | 当前物化、证据加载和评分接口 | [离线评测设施说明](D:/code/Flowmate/agent-eval/src/README.md) |
 
@@ -19,7 +19,7 @@
 
 当前已有 `docs/`、`data/`、`src/`、`tests/`、`tools/` 五类目录。已实现部分离线输入物化、可信证据加载接口、评分和设施自检；尚无完整产品/SDK 执行器，也没有实际 Agent 成绩。
 
-当前准备预算为 1,200 份待人工核验 Gold 候选、600 套模拟业务资料及 6,000 个用例实例。实际完成状态以 `data/manifests/preparation-report.json` 为准；当前人工核验数和实际产品运行数均为 0。材料生成、内容审核、夹具物化、真实执行和评测通过是不同状态。
+本次范围同步已完成，当前为 1,200 份 Gold 候选、600 套模拟业务资料及 5,577 个用例实例：从旧 6,000 例退役 9 个场景族的 423 例，不补数。实际发布状态以 `data/manifests/preparation-report.json` 和 `scope-sync.json` 为准。用户对旧 7,801 项资产的批量审核声明已登记于 `manifests/reviews/user-confirmation-20260915T145419376406Z.json`，其中原票审核声明为 1,200 份；声明及绑定旧内容必须保留。它不是逐字段答案与证据的结构化 Gold，后者发布计数和实际产品运行数仍为 0。修改后的业务资料、用例及政策重新进入待复核状态，不能继承旧确认；未改 Gold 和来源保留原身份与内容。材料生成、内容审核、夹具物化、真实执行和评测通过分别记录。
 
 ### 2.1 已有目录
 
@@ -27,8 +27,11 @@
 agent-eval/
 ├─ README.md
 ├─ docs/
-│  └─ spec/
-│     └─ 01_Flowmate_Agent评测总方案.md
+│  ├─ spec/
+│  │  └─ 01_Flowmate_Agent评测总方案.md
+│  └─ data/
+│     ├─ data-preparation.md
+│     └─ data-alignment-plan.md
 ├─ data/
 │  ├─ README.md
 │  ├─ source-labels/
@@ -51,6 +54,7 @@ agent-eval/
 │  │  ├─ audit/
 │  │  ├─ materialization/
 │  │  ├─ review-forms/
+│  │  ├─ reviews/
 │  │  └─ <统一清单、政策、需求映射和覆盖报告>
 │  └─ runs/
 │     └─ README.md
@@ -68,6 +72,7 @@ agent-eval/
 └─ tools/
    ├─ prepare_invoice_data.py
    ├─ finalize_invoice_data.py
+   ├─ sync_invoice_scope.py
    ├─ invoice_case_catalog.py
    ├─ invoice_requirements.py
    ├─ audit_invoice_assets.py
@@ -85,10 +90,10 @@ agent-eval/
 | `docs/plans/` | 进入对应 P0–P13 阶段时 | 保存该阶段评测实施方案、适用范围、执行与退出要求 |
 | `benchmarks/` | 某项基准协议开始具体落地时 | 集中保存可版本化的基准定义及获准引用 |
 | `config/` | 执行设施需要具体配置时 | 保存非秘密运行配置、环境模板和适配器配置 |
-| `data/manifests/reviews/` | 首次提交真实人工审核时 | 保存审核记录、所审内容、依据和身份声明 |
+| `data/manifests/reviews/`（已建立） | 已收到用户批量审核确认 | 当前保存用户声明及逐资产摘要；逐字段正式提交记录按需补齐 |
 | `data/runs/<runId>/` | 实际执行发生时 | 保存本次运行记录、证据引用、评分和报告 |
 
-以上目录按需创建，不提前铺空目录，也不以 V1、V2 等名称复制整套数据根。
+表中尚未建立的目录按需创建，不提前铺空目录，也不以 V1、V2 等名称复制整套数据根。
 
 ## 三、docs：评测方案与实施约定
 
@@ -103,6 +108,15 @@ agent-eval/
 保存全项目评测总方案。当前文件 `01_Flowmate_Agent评测总方案.md` 定义模块覆盖、Case/Gold/Oracle、Benchmark、评分、归因和 P0–P13 路线。
 
 产品总方案决定被测行为，评测总方案决定如何取得证据并判断该行为。两者通过明确的要求与检查项关联；数据中的 `requirements.json` 和 `coverage.json` 用于记录这些映射及尚未覆盖的部分。
+
+### `docs/data/`
+
+集中保存评测数据的制作与对齐文档，与实际质量资产目录 `agent-eval/data/` 分工：这里说明制作和修订方法，后者保存数据、审核记录与运行结果。
+
+| 文件 | 作用 |
+|---|---|
+| [data-preparation.md](D:/code/Flowmate/agent-eval/docs/data/data-preparation.md) | 数据范围、选样划分、制作与审核要求、目录及检查命令 |
+| [data-alignment-plan.md](D:/code/Flowmate/agent-eval/docs/data/data-alignment-plan.md) | 与主方案对齐的修订范围、退役规则、实施顺序和接收依据 |
 
 ### `docs/plans/`（按阶段建立）
 
@@ -130,15 +144,17 @@ agent-eval/
 
 Case 是固定输入、初态、触发、允许与禁止行为、证据要求和判据的组合。`cases/` 保存定义，不保存实际执行结果。全文包含评分信息，不能整个交给业务 Agent。
 
-| 文件夹 | 当前实例预算 | 被测能力与用途 |
+| 文件夹 | 同步后实例数 | 被测能力与用途 |
 |---|---:|---|
 | `data/cases/extraction/` | 1,200 | 票头、买卖方、金额、明细及证据定位；每票一个完整抽取例 |
-| `data/cases/matching/` | 1,000 | 供应商、订单、收货、金额、重复记录和模拟验真；判断继续、阻断或转人工 |
-| `data/cases/approval/` | 600 | 人工修订、角色、额度、拒绝、撤销、过期及审批后内容变化 |
-| `data/cases/submission/` | 1,000 | B2B 提交、回读、UNKNOWN 核对、幂等、ERP 独立回写及故障恢复 |
+| `data/cases/matching/` | 890 | 按需匹配供应商、订单与收货；检查合同价格、数量、订单余额、金额及重复记录 |
+| `data/cases/approval/` | 487 | 人工修订、澄清、具体 B2B 提交确认、拒绝、撤销、过期、内容变化失效及接管 |
+| `data/cases/submission/` | 800 | B2B 提交、权威回读、UNKNOWN 核对、幂等及故障恢复 |
 | `data/cases/runtime/` | 1,000 | Provider、工具、Session、上下文、压缩、取消、扩展、子 Agent 和 Host 机制 |
 | `data/cases/isolation/` | 800 | 获准读取、越界访问、不可信输入、权限撤销及独立合法对照 |
 | `data/cases/platform/` | 400 | 数据接入、完整性、工作区、控制者竞争、备份迁移和评测设施正确性 |
+
+当前共 177 个场景族：extraction 1、matching 16、approval 13、submission 16、runtime 63、isolation 39、platform 29。匹配按业务需要触发；不要求产品内 OCR/Parser 执行、外部验真、ERP 回写、自动拆合票、额度/多级财务审批、强制两人分离、通用员工创建/复杂配置 UI 或第二任务证明。外部解析导入、原件证据、ERP 只读资料、原生 Runtime/Memory/Extension/Subagent 和平台基础验证保留。
 
 开发、回归、验收属于用途划分，P0–P13 和 BM 属于阶段或基准引用；这些维度通过清单关联同一资产，不再复制文件。多个实例引用同票或同场景时，不能按实例数宣称同样数量的独立业务样本。
 
@@ -160,7 +176,8 @@ Case 是固定输入、初态、触发、允许与禁止行为、证据要求和
 | `review-forms/` | 保存待填写的逐票字段草表；正式审核按工具要求导出完整外层表单后提交 |
 | `audit/` | 保存机器特征、近重复候选、累计核验批次及综合任务单 |
 | `materialization/` | 保存离线构造的输入、可信控制配置及每例支持状态 |
-| `reviews/`（按需） | 保存真实审核决定、父内容、依据和审核者声明，保留历史追溯 |
+| `reviews/` | 已保存用户批量审核确认与逐资产摘要；后续逐字段提交记录保留父内容、依据及审核者声明 |
+| `history/*.zip` / `scope-sync.json` | 保留范围同步前审核绑定的旧内容，并记录退役、修订及新旧摘要；不是另一套可变当前数据 |
 
 `audit/` 中 `sample-features.json` 提供采样与相似性线索；`near-duplicate-pairs.jsonl` 和 `near-duplicate-groups.json` 供人工判断是否同票；`batches.json` 用于累计分批接收；综合 `review-queue.csv` 同时管理 Gold、业务资料和 Case，区别于父目录的原票队列；`audit-report.json` 汇总机器审计情况。近重复候选不自动证明同票，也不自动冻结用途划分。
 
@@ -217,7 +234,8 @@ Grader 按能力复用，同一实现可以被多个 Benchmark 引用，不按 B
 | 文件 | 作用与使用时机 |
 |---|---|
 | `prepare_invoice_data.py` | 首次盘点、去重、导入和候选生成；也提供审核与审计仍在使用的文件及摘要公共函数 |
-| `finalize_invoice_data.py` | 将历史机器草案整理为一套当前数据的整合工具；当前已整合数据拒绝重复整理 |
+| `finalize_invoice_data.py` | 首次合并历史机器草案；不能覆盖已有人工审核或运行历史 |
+| `sync_invoice_scope.py` | 核验旧清单，在暂存根同步已批准范围，保存旧内容归档及迁移记录，检查后发布唯一当前数据 |
 | `invoice_case_catalog.py` | 场景族及条件定义，供制作、物化和自检复用 |
 | `invoice_requirements.py` | 从主方案提取要求、关联用例检查并生成或验证覆盖信息 |
 | `audit_invoice_assets.py` | 提取机器特征、发现近重复线索、组织累计审核批次；校验器复用其批次规则 |
@@ -252,7 +270,7 @@ Benchmark 是标准化测量协议；Baseline 是按固定协议实际执行得�
 | 项目位置 | 与 agent-eval 的关系 |
 |---|---|
 | `docs/spec/00_Flowmate完整方案.md` | 定义产品行为及建设阶段，是评测要求的来源 |
-| `docs/data-preparation.md` | 说明选样、制作、审核和交接方法 |
+| `agent-eval/docs/data/data-preparation.md` | 说明选样、制作、审核和交接方法 |
 | `data/invoices/voxel51/` | 提供唯一原票、解析和来源摘要，质量侧按稳定引用访问 |
 | `agent-eval/tools/` | 提供来源整理、场景定义、需求映射、机器审计、人工审核及完整性检查；部分公共函数仍被评测设施使用 |
 | 产品源码与项目根 `tests/` | 提供被测能力和产品机制证据；产品代码不得反向依赖 agent-eval 实现 |

@@ -19,8 +19,8 @@ HEADER_FIELDS = ('invoice_number', 'invoice_date', 'due_date', 'buyer_name', 'bu
                  'buyer_tax_id', 'seller_name', 'seller_address', 'seller_tax_id', 'currency',
                  'net_amount', 'tax_amount', 'tax_rate', 'total_amount', 'discount_amount')
 LINE_FIELDS = ('description', 'quantity', 'unit', 'unit_price', 'net_amount', 'tax_rate', 'tax_amount', 'total_price')
-STATES = {'confirmed', 'source_not_provided', 'unreadable', 'ambiguous', 'not_applicable'}
-AVAILABILITY = {'present', 'omitted', 'unreadable', 'not_applicable'}
+STATES = {'confirmed', 'source_not_provided', 'unreadable', 'ambiguous', 'not_applicable', 'clarification_required'}
+AVAILABILITY = {'present', 'omitted', 'unreadable', 'not_applicable', 'unknown'}
 
 
 def need(condition, reason):
@@ -79,6 +79,10 @@ def validate_reviewers(reviewers, attestation='attestsOriginalImageReview'):
 def validate_field(value, sid, product):
     need(isinstance(value, dict) and value.get('valueState') in STATES, 'Field has not been reviewed')
     need(value.get('inputAvailability') in AVAILABILITY, 'Input availability not reviewed')
+    if value['valueState'] == 'clarification_required':
+        need(value.get('expectedAction') == 'request_clarification' and
+             isinstance(value.get('clarificationReason'), str) and value['clarificationReason'].strip(),
+             'Clarification Gold requires an explicit expected action and reason')
     if value['valueState'] == 'confirmed':
         need(isinstance(value.get('rawValue'), str) and isinstance(value.get('normalizedValue'), str)
              and value['rawValue'].strip() and value['normalizedValue'].strip(), 'Confirmed field needs raw and normalized strings')
@@ -131,6 +135,12 @@ def validate_review(form, base, product_root):
         need(set(line.get('fields', {})) == set(LINE_FIELDS), 'Line review is incomplete')
         for value in line['fields'].values():
             validate_field(value, base['sampleId'], Path(product_root))
+    if form.get('lineItemsExpectation'):
+        expectation = form['lineItemsExpectation']
+        need(expectation.get('state') == 'clarification_required' and
+             expectation.get('expectedAction') == 'request_clarification' and
+             isinstance(expectation.get('reason'), str) and expectation['reason'].strip(),
+             'Unresolved line items require an explicit clarification expectation')
     return True
 
 
@@ -542,20 +552,16 @@ def _review_evidence(root, evidence):
         need(path.is_file() and digest(path) == entry.get('sha256'), 'Evidence bytes changed or missing')
 
 
-def submit_asset_review(project, submission, base_release=None, release_id=None):
-    """Record declared human review of exact current content, without authenticating it."""
-    if not is_current_dataset(project):
-        need(submission.get('kind') == 'human_gold_review' and base_release and release_id,
-             'Legacy intake requires explicit gold review and parent release')
-        return publish_review(project, submission, base_release, release_id)
+def build_asset_review_record(project, submission, prior):
+    """Validate a pinned review and build its record without mutating the dataset."""
     root = quality_root(project)
-    index = current_asset_index(project)
     form = copy.deepcopy(submission)
     need(form.get('kind') == 'human_asset_review', 'Explicit content review form required')
     kind, identity = form.get('assetKind'), form.get('assetId')
     need(kind in CURRENT_CHECKS, 'Unsupported asset kind')
-    prior = resolve_asset(project, None, kind, identity, index)
     need(form.get('target') == prior['file'], 'Review target or parent hash differs')
+    need(file_info(root/prior['file']['path'],root) == prior['file'] and
+         read_json(root/prior['file']['path']) == prior['value'], 'Pinned review base changed')
     record_id = valid_id(form.get('recordId'))
     record_path = root/'manifests/reviews'/(record_id+'.json')
     need(not record_path.exists(), 'Review record already exists')
@@ -595,6 +601,10 @@ def submit_asset_review(project, submission, base_release=None, release_id=None)
              'Gold and content reviewer identities differ')
         value.update(fields=copy.deepcopy(gold_form['fields']), lineItems=copy.deepcopy(gold_form['lineItems']),
                      reviewSubmission=gold_form, sourceSnapshot=snapshot, eligibleForFieldScoring=decision == 'accept')
+        if gold_form.get('lineItemsExpectation'):
+            value['lineItemsExpectation'] = copy.deepcopy(gold_form['lineItemsExpectation'])
+        else:
+            value.pop('lineItemsExpectation', None)
     value.update(version=value.get('version', 1)+1, parentAsset=prior['file'],
                  humanVerified=decision == 'accept', reviewStatus='accepted' if decision == 'accept' else decision,
                  status='human_reviewed' if decision == 'accept' else 'review_pending',
@@ -615,6 +625,22 @@ def submit_asset_review(project, submission, base_release=None, release_id=None)
               'resultValue':value, 'submission':form, 'sourceSnapshot':snapshot,
               'createdAt':datetime.now(timezone.utc).isoformat(),
               'identityVerification':'submitter_attestation_only', 'formalAcceptanceEligible':False}
+    return record
+
+
+def submit_asset_review(project, submission, base_release=None, release_id=None):
+    """Record declared human review of exact current content, without authenticating it."""
+    if not is_current_dataset(project):
+        need(submission.get('kind') == 'human_gold_review' and base_release and release_id,
+             'Legacy intake requires explicit gold review and parent release')
+        return publish_review(project, submission, base_release, release_id)
+    root = quality_root(project)
+    index = current_asset_index(project)
+    kind, identity = submission.get('assetKind'), submission.get('assetId')
+    prior = resolve_asset(project, None, kind, identity, index)
+    record = build_asset_review_record(project, submission, prior)
+    value = record['resultValue']
+    record_path = root/value['reviewRecord']
     report_path = root/'manifests/preparation-report.json'
     report = None
     if kind == 'gold' and report_path.exists():
@@ -714,6 +740,8 @@ def validate_current_assets(root, product):
             validate_review(form.get('goldReview', {}), parent, product)
             need(value['fields'] == form['goldReview']['fields'] and value['lineItems'] == form['goldReview']['lineItems'],
                  'Gold fields differ from attested values')
+            need(value.get('lineItemsExpectation') == form['goldReview'].get('lineItemsExpectation'),
+                 'Line clarification differs from attested expectation')
             need(value.get('eligibleForFieldScoring') == (form['decision'] == 'accept') and
                  [r['reviewerId'] for r in form['goldReview']['reviewers']] == value['reviewedBy'],
                  'Gold scoring eligibility or reviewers differ')

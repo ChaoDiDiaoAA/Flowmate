@@ -104,7 +104,13 @@ def _extraction(case, observation, gold):
     if not isinstance(prediction, dict) or not isinstance(prediction.get('fields'), dict):
         return _result('insufficient_evidence', 'actual extracted fields unavailable')
     checks = []
-    allowed_states = {'confirmed', 'source_not_provided', 'unreadable', 'ambiguous', 'not_applicable'}
+    allowed_states = {'confirmed', 'source_not_provided', 'unreadable', 'ambiguous', 'not_applicable', 'clarification_required'}
+
+    def asked(target):
+        requests = prediction.get('clarificationRequests', [])
+        return isinstance(requests, list) and any(
+            isinstance(item, dict) and item.get('target') == target and
+            isinstance(item.get('question'), str) and item['question'].strip() for item in requests)
 
     def fields(expected, actual, prefix):
         if not isinstance(actual, dict):
@@ -120,6 +126,14 @@ def _extraction(case, observation, gold):
                 raise TypeError('predicted field must be object')
             state_ok = candidate.get('valueState') == field['valueState']
             value_ok = _strict_equal(candidate.get('normalizedValue'), field.get('normalizedValue'))
+            if field['valueState'] == 'clarification_required':
+                if field.get('expectedAction') != 'request_clarification' or field.get('normalizedValue') is not None:
+                    raise ValueError('invalid clarification Gold contract')
+                # Missing evidence is not invented as a precise locator. The
+                # trusted observation must record an actual targeted question.
+                checks.append({'path': prefix + '.' + name, 'passed': state_ok and value_ok and asked(prefix + '.' + name),
+                               'reason': 'must_request_clarification_without_guessing'})
+                continue
             evidence = candidate.get('evidence')
             # Exact reviewed locators can be checked here. Semantic support from
             # different locations requires a separate reviewed evidence grader.
@@ -140,6 +154,9 @@ def _extraction(case, observation, gold):
         actual_lines = prediction.get('lineItems')
         if not isinstance(expected_lines, list):
             raise TypeError('gold lineItems must be array')
+        if gold.get('lineItemsExpectation', {}).get('state') == 'clarification_required':
+            checks.append({'path':'lineItems.clarification', 'passed':asked('lineItems'),
+                           'reason':'missing_lines_require_a_question'})
         if not isinstance(actual_lines, list):
             checks.append({'path': 'lineItems', 'passed': None})
             actual_lines = None
