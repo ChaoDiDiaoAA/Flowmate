@@ -139,11 +139,21 @@ def verify_current_artifacts(product, evaluation, cases, catalog, splits):
                 'Stale Harness module views')
     for stage, members in views['stages'].items():
         require(set(members) == {c['id'] for c in cases if c['stage'] == stage}, 'Stale phase view')
-    for benchmark, members in views['benchmarks'].items():
-        require(set(members) == {c['id'] for c in cases if benchmark in c['benchmarks']}, 'Stale benchmark view')
+    if (evaluation/'manifests/benchmarks/index.json').exists():
+        from prepare_benchmarks import verify_preparation
+        verify_preparation(product.resolve().parents[2])
+        require(views.get('benchmarkMembershipSource') == 'manifests/benchmarks/index.json',
+                'Benchmark views must derive from pinned member manifests')
+    else:
+        for benchmark, members in views['benchmarks'].items():
+            require(set(members) == {c['id'] for c in cases if benchmark in c['benchmarks']}, 'Stale benchmark view')
 
 
 def verify(product, evaluation):
+    marker = Path(evaluation) / 'manifests/active-dataset.json'
+    if marker.exists() and load(marker).get('format') == 'initial-agent-evaluation':
+        from initial_dataset import verify as verify_initial
+        return verify_initial(Path(evaluation).resolve().parents[1])
     product, evaluation = Path(product), Path(evaluation)
     manifest = load(resolve(product, 'manifest.json'))
     sample_index = {entry['sampleId']: entry for entry in manifest['samples']}
@@ -184,6 +194,16 @@ def verify(product, evaluation):
             load(path)
     actual_eval = {p.relative_to(evaluation).as_posix() for p in evaluation.rglob('*') if p.is_file()}
     extension_paths = set()
+    # The current rebuild inventory intentionally covers only the active fixed
+    # quality materials. Provider labels, human-facing README files, immutable
+    # replaced-material history and the publication pointer are preserved beside
+    # that snapshot and validated by their own manifests/receipts.
+    if (evaluation / 'manifests/active-dataset.json').exists():
+        extension_paths.update(p.relative_to(evaluation).as_posix() for p in evaluation.rglob('*')
+                               if p.is_file() and (p.relative_to(evaluation).as_posix() in {
+                                   'README.md', 'runs/README.md', 'manifests/active-dataset.json'}
+                                   or p.relative_to(evaluation).as_posix().startswith(
+                                       ('source-labels/', 'manifests/history/'))))
     workflow_path = evaluation / 'manifests/workflow-inventory.json'
     if workflow_path.exists():
         workflow = load(workflow_path)
@@ -204,6 +224,18 @@ def verify(product, evaluation):
         require(sample_index[entry['canonicalSampleId']]['originalSha256'] == entry['originalSha256'], 'Label/original mismatch')
         for f in entry['files']:
             check_descriptor(evaluation, f)
+
+    if (evaluation / 'manifests/active-dataset.json').exists():
+        from rebuild_dataset import verify_asset_snapshot
+        snapshot = {relative: (evaluation / relative).read_bytes()
+                    for relative in inventory_paths + ['manifests/inventory.json']}
+        verified = verify_asset_snapshot(evaluation.parents[1], snapshot)
+        active = load(evaluation / 'manifests/active-dataset.json')
+        require(active['counts'] == {'gold': 100, 'business': 80, 'cases': 548,
+                                     'imageAnnotatedGold': 100}, 'Active counts differ')
+        return {'status': 'verified_current_rebuild', **verified,
+                'publisherLabels': len(label_manifest['samples']),
+                'materialSha256': active['materialSha256']}
 
     splits = load(evaluation / 'manifests/splits.json')
     by_sample = {x['sampleId']: x for x in splits['samples']}

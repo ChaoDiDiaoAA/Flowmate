@@ -92,7 +92,7 @@ def scenario_case(spec, requirements):
         'semanticScenarioKey':family,'replicaIndex':1,'coverageContribution':'specific_condition_variant',
         'leakageGroup':'synthetic-'+(spec.get('normalControlId') or spec['id']),
         'split':'development','splitRationale':'公开制作和审查的合成种子，不冒充未暴露验收样本。',
-        'title':spec['title'],'stage':stage,'benchmarks':spec.get('benchmarks',['BM-11','BM-07']),
+        'title':spec['title'],'stage':stage,'benchmarks':spec.get('benchmarks',[]),
         'materialStatus':'structure_checked','reviewStatus':'pending','humanVerified':False,
         'executionStatus':'not_run','eligibleForAcceptance':False,'formalAcceptanceEligible':False,
         'inputMode':'harness_synthetic_contract','trigger':spec['trigger'],

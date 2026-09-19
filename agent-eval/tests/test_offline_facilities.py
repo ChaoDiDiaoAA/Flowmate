@@ -258,6 +258,7 @@ class GradingTests(unittest.TestCase):
         case['oracle']['fieldGoldVersion'] = 2
         loc = {'asset': 's1/content.json', 'pageNumber': 1, 'pointer': '/0', 'note': 'Human annotation'}
         gold = {'sampleId': 's1', 'version': 2, 'humanVerified': True,
+                'eligibleForFieldScoring': True,
                 'reviewedBy': ['reviewer'], 'reviewedAt': '2026-01-15T12:00:00Z',
                 'sourceEvidence': [{'sha256': 'a'*64}], 'lineItems': [],
                 'fields': {'total': {'normalizedValue': '100.00', 'valueState': 'confirmed', 'evidence': [loc]}}}
@@ -276,6 +277,62 @@ class GradingTests(unittest.TestCase):
         gold['fields']['total']['evidence'] = [page_only]
         obs['observation']['extraction']['fields']['total']['evidence'] = [page_only]
         self.assertEqual(grade(case, obs, gold)['verdict'], 'insufficient_evidence')
+
+    def test_schema3_extraction_reports_four_metrics_and_rejects_wrong_or_missing_evidence(self):
+        kinds = ['actual-model-input', 'original-extraction-candidate', 'candidate-source-locators']
+        case = {'id': 'extract-1', 'version': 3, 'category': 'extraction', 'sampleId': 's1',
+                'oracle': {'fieldGoldVersion': 2, 'requiredEvidence': kinds,
+                    'checks': [{'checkId': 'extract-1:' + key, 'metricId': 'MOD-11.' + key,
+                                'required': True, 'ruleStatus': 'implemented'}
+                               for key in ('fields', 'lines', 'evidence', 'uncertainty')]}}
+        locator = {'kind': 'parsed', 'pageNumber': 1, 'pointer': '/3/text', 'quote': '100.00'}
+        field = {'valueState': 'confirmed', 'normalizedValue': '100.00', 'evidence': [locator]}
+        line_field = {'valueState': 'confirmed', 'normalizedValue': '2.00',
+                      'evidence': [{'kind': 'parsed', 'pageNumber': 1,
+                                    'pointer': '/7/table_body', 'tableRow': 1, 'tableCell': 2,
+                                    'quote': '2'}]}
+        gold = {'sampleId': 's1', 'version': 2, 'humanVerified': True,
+                'eligibleForFieldScoring': True, 'reviewedBy': ['reviewer'],
+                'reviewedAt': '2026-01-15T12:00:00Z',
+                'sourceEvidence': {'original': {'sha256': 'a' * 64}},
+                'fields': {'total_amount': field},
+                'lineItems': [{'lineId': 'line-1', 'rowOrdinal': 1,
+                               'fields': {'quantity': line_field}}]}
+        predicted_field = {'valueState': 'confirmed', 'normalizedValue': '100.00',
+                           'evidence': [{'asset': 's1/content.json', 'pageNumber': 1,
+                                        'pointer': '/3/text'}]}
+        predicted_line_field = {'valueState': 'confirmed', 'normalizedValue': '2.00',
+                                'evidence': [{'asset': 's1/content.json', 'pageNumber': 1,
+                                             'pointer': '/7/table_body', 'tableRow': 1,
+                                             'tableCell': 2}]}
+        observation = {'caseId': 'extract-1', 'caseVersion': 3,
+            'source': {'kind': 'grader_self_test', 'runId': 'grader-fixture', 'adapterVersion': 'self-test'},
+            'evidence': [{'kind': kind, 'artifact': kind + '.json', 'sha256': 'b' * 64}
+                         for kind in kinds],
+            'observation': {'extraction': {'fields': {'total_amount': predicted_field},
+                'lineItems': [{'lineId': 'line-1', 'rowOrdinal': 1,
+                               'fields': {'quantity': predicted_line_field}}],
+                'clarificationRequests': []}}}
+        result = grade(case, observation, gold)
+        self.assertEqual('pass', result['verdict'], result)
+        self.assertEqual({'PASS'}, {item['status'] for item in result['checks']})
+        self.assertEqual({'extract-1:fields', 'extract-1:lines', 'extract-1:evidence',
+                          'extract-1:uncertainty'}, {item['checkId'] for item in result['checks']})
+        self.assertEqual(1.0, next(x for x in result['checks']
+                                  if x['checkId'].endswith(':lines'))['metrics']['f1'])
+
+        wrong = copy.deepcopy(observation)
+        wrong['observation']['extraction']['lineItems'][0]['fields']['quantity']['normalizedValue'] = '3.00'
+        failed = grade(case, wrong, gold)
+        self.assertEqual('fail', failed['verdict'])
+        self.assertEqual('FAIL', next(x for x in failed['checks']
+                                     if x['checkId'].endswith(':lines'))['status'])
+
+        missing = copy.deepcopy(observation)
+        missing['evidence'] = missing['evidence'][:-1]
+        unresolved = grade(case, missing, gold)
+        self.assertEqual('insufficient_evidence', unresolved['verdict'])
+        self.assertTrue(all(x['status'] == 'UNJUDGEABLE' for x in unresolved['checks']))
 
 
 if __name__ == '__main__':

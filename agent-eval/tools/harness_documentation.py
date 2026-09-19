@@ -317,6 +317,9 @@ def refresh_documents(output, cases, requirements, report):
         raise ValueError('README case count differs from preparation report')
     target = Path(output) / 'README.md'
     text = target.read_text(encoding='utf-8-sig').replace('\r\n', '\n')
+    benchmark_marker = '\n## Benchmark 定义、成员与参数\n'
+    has_benchmarks = benchmark_marker in text or (Path(output)/'manifests/benchmarks/index.json').exists()
+    text = text.split(benchmark_marker, 1)[0]
     from harness_paths import canonical_case_path
     for case in cases:
         text = text.replace(f"cases/{case['category']}/{case['id']}.json", canonical_case_path(case))
@@ -370,4 +373,7 @@ python agent-eval/tools/migrate_harness_data.py verify --project . --output data
 
 `stage` 只写新的项目内暂存根；`verify` 检查所选数据根；`publish` 在校验后发布唯一当前根。`--project` 是项目根，`--output` 是暂存数据根。重复执行前先检查迁移记录，不覆盖已有审核、发布或运行历史。
 '''
+    if has_benchmarks:
+        from prepare_benchmarks import benchmark_manual
+        text = text.rstrip() + benchmark_marker + '\n' + benchmark_manual()
     target.write_text(text, encoding='utf-8', newline='\n')

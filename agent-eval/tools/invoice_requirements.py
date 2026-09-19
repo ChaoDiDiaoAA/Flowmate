@@ -221,6 +221,15 @@ CHAPTER_FOUR_REGISTRY = (
 )
 
 NEW_PARAGRAPH_REGISTRY = (
+    ('3.24', '**数据库与文件存储补充覆盖（主方案第 18 章）：**', 'storage-supplement-scope'),
+    ('3.24', '阶段结构与负责人', 'storage-phase-ownership'),
+    ('3.24', '正文与引用', 'storage-body-references'),
+    ('3.24', '事务与通知', 'storage-transaction-notification'),
+    ('3.24', 'Host持久化确认', 'storage-host-commit-ack'),
+    ('3.24', '联合备份与较早恢复', 'storage-earlier-backup-recovery'),
+    ('3.24', '迁移与清理', 'storage-migration-retention'),
+    ('3.24', '审批关联与未知结果', 'storage-approval-unknown'),
+    ('3.24', '机制验证分别报告保存、恢复与重新执行资格', 'storage-evidence-layer-boundary'),
     ('3.6.1', '下表将产品已承诺、不能由模块总分替代的不变量', 'coverage-accounting'),
     ('3.6.1', '以上每项分别进入其首次阶段的适用分母', 'evidence-authority'),
     ('3.23.1', '数据库F应包含', 'database-isolation-contract'),
@@ -272,6 +281,18 @@ def load_requirements(project):
         if table and all(re.fullmatch(r'[-: ]*', cell) for cell in cells):
             continue
         match = re.match(r'^\|\s*((?:MOD|RTC|RTX|RT)-\d+(?:-\d+)?)\s+([^|]+)\|', stripped)
+        # Later metric/ownership crosswalks mention these identities again.
+        # Only their definition tables establish a requirement, never the first
+        # occurrence of an ID in an arbitrary table elsewhere in the document.
+        if match:
+            definition_kind = match.group(1).split('-')[0]
+            definition_section = (
+                definition_kind == 'MOD' and section in {'3.2', '3.3', '3.4', '3.5', '3.14'} or
+                definition_kind == 'RT' and section == '3.12' or
+                definition_kind == 'RTC' and section.startswith('3.17.') or
+                definition_kind == 'RTX' and section == '3.19')
+            if not definition_section:
+                match = None
         if match:
             rid, title = match.groups()
             kind = rid.split('-')[0]
@@ -283,7 +304,7 @@ def load_requirements(project):
                        (candidate == _requirement_anchor(anchor) if table else
                         candidate.startswith(_requirement_anchor(anchor)))]
             if not matches:
-                headers = {'产品子能力与依据', '类型', '覆盖项', '资源', '存储边界', '约束与产品依据', '资产'}
+                headers = {'产品子能力与依据', '类型', '覆盖项', '资源', '存储边界', '约束与产品依据', '资产', '覆盖方向'}
                 if section in {sec for sec, _, _ in registry} and not (table and cells[0] in headers):
                     unregistered.append({'section': section, 'lineStart': number, 'verbatim': line,
                                          'status': 'requires_source_review'})
@@ -615,8 +636,13 @@ def validate_coverage(cases, requirements, coverage=None):
                     raise ValueError('normal control begins after attack phase: '+label)
                 if case.get('controlEquivalence') and case['controlEquivalence'] != control.get('controlEquivalence'):
                     raise ValueError('normal control object/target/policy mismatch: '+label)
-    if coverage is not None and coverage != build_coverage(cases,requirements):
-        raise ValueError('coverage differs from authoritative recomputation')
+    if coverage is not None:
+        compared = dict(coverage)
+        if 'benchmarkCoverageRef' in compared:
+            if compared.pop('benchmarkCoverageRef') != 'manifests/benchmarks/index.json':
+                raise ValueError('unknown Benchmark coverage reference')
+        if compared != build_coverage(cases,requirements):
+            raise ValueError('coverage differs from authoritative recomputation')
     return {'status':'structural_checks_passed','caseCount':len(cases),
             'formalAcceptanceEligible':False}
 

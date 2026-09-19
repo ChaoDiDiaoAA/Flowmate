@@ -231,12 +231,25 @@ def _business(case, business, spec, conditions):
 
 
 def materialize(case: dict, business: dict | None = None, product_root: Path | None = None) -> dict:
+    if case.get('kind') == 'agent_task' and case.get('schemaVersion') == 1:
+        from runner.initial_dataset import materialize_task
+        project = Path(product_root).resolve().parents[2] if product_root is not None else ROOT
+        plan = materialize_task(case, project, project / 'agent-eval/data')
+        return {'status': plan['status'], **plan['fixture'], 'executionEligibility': 'blocked'}
     """Construct a fresh fixture, without mutating case/business or reading Gold.
 
-    product_root is reserved for an adapter's read-only source projection. Source
-    extraction and native SDK fixtures remain unsupported by this offline builder.
+    product_root is the invoice source root for an exact read-only extraction
+    projection. Native SDK history is never fabricated by this offline builder.
     """
     try:
+        if 'scenarioProtocol' in case:
+            if not isinstance(case['scenarioProtocol'], dict):
+                raise ValueError('Invalid scenario protocol')
+            if case['scenarioProtocol'].get('kind') == 'fresh_invoice_extraction':
+                from rebuild_extraction import materialize_extraction
+                return materialize_extraction(case, product_root, business)
+            from rebuild_fixtures import materialize_episode
+            return materialize_episode(case, business)
         if case.get('harnessScenarioId'):
             from harness_scenarios import materialize_scenario
             return materialize_scenario(case)
@@ -311,7 +324,7 @@ def materialize(case: dict, business: dict | None = None, product_root: Path | N
                 'limitations': ['Adapter must create files inside an isolated temporary root and enforce actual grants.',
                                 'Normal control must run; no product outcome is implied.']}
         raise ValueError('requires actual product/SDK or reviewed source projection; native state is not fabricated')
-    except (KeyError, TypeError, ValueError, IndexError, ArithmeticError) as exc:
+    except (KeyError, TypeError, ValueError, IndexError, ArithmeticError, OSError) as exc:
         return {'status': 'unsupported', 'input': {}, 'harness': {}, 'limitations': [str(exc)]}
 
 
@@ -354,11 +367,17 @@ def audit(root: Path, output: Path | None = None, release: str | None = None, da
             if path.stem != case['id']:
                 continue  # Versioned siblings are selected only by a release.
         business = None
-        if case.get('inputMode') == 'simulated_structured_invoice':
+        if case.get('inputMode') == 'controlled_business_episode':
+            from rebuild_business_projection import load_business
+            if release:
+                business = resolve_asset(root, release, 'business', case['businessRef']['id'], release_index)['value']
+            else:
+                business = load_business(quality_root, case.get('businessRef'))
+        elif case.get('inputMode') == 'simulated_structured_invoice':
             business = json.loads((quality_root / 'business' / (case['sampleId'] + '.json')).read_text(encoding='utf-8'))
             if release:
                 business = resolve_asset(root, release, 'business', business['id'], release_index)['value']
-        result = materialize(case, business)
+        result = materialize(case, business, product_root=root / 'data/invoices/voxel51')
         records.append({'caseId': case['id'], 'caseVersion': case['version'],
             'familyId': case['familyId'], 'category': case['category'],
             'harnessModule': case.get('harnessModule'),

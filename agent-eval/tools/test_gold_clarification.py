@@ -48,7 +48,7 @@ class ClarificationGoldTests(unittest.TestCase):
                 'evidence':[{'asset':'s1/original.jpg','pageNumber':1,'note':'Whole page; value unresolved.'}]}
 
     def grade(self, actual, requests):
-        gold={'sampleId':'s1','version':2,'humanVerified':True,'reviewedBy':['TEST human'],
+        gold={'sampleId':'s1','version':2,'humanVerified':True,'eligibleForFieldScoring':True,'reviewedBy':['TEST human'],
               'reviewedAt':'2026-01-01','sourceEvidence':{'original':'s1/original.jpg'},
               'fields':{'currency':self.field()},'lineItems':[]}
         obs={'observation':{'extraction':{'fields':{'currency':actual},'lineItems':[],
@@ -81,7 +81,7 @@ class ClarificationGoldTests(unittest.TestCase):
         self.assertNotEqual(self.grade(self.field(),[{'target':'fields.seller_name','question':'Who?'}])['verdict'],'pass')
 
     def test_missing_line_items_requires_question_not_empty_success(self):
-        gold={'sampleId':'s1','version':2,'humanVerified':True,'reviewedBy':['TEST human'],
+        gold={'sampleId':'s1','version':2,'humanVerified':True,'eligibleForFieldScoring':True,'reviewedBy':['TEST human'],
               'reviewedAt':'2026-01-01','sourceEvidence':{'original':'s1/original.jpg'},
               'fields':{'currency':self.field()},'lineItems':[],
               'lineItemsExpectation':{'state':'clarification_required','expectedAction':'request_clarification'}}

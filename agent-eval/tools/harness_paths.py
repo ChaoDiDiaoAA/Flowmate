@@ -21,6 +21,8 @@ def _identity(value):
 
 def canonical_case_path(case):
     identity = _identity(case.get('id'))
+    if case.get('kind') == 'agent_task' and case.get('schemaVersion') == 1:
+        return f'cases/{identity}.json'
     if 'harnessModule' in case:
         folder = case['harnessModule']
         allowed = MODULES
@@ -50,6 +52,22 @@ def _catalog_paths(root):
             raise ValueError('Invalid case catalog member')
         identity = _identity(entry.get('id'))
         relative = entry.get('path')
+        if entry.get('kind') == 'product_contract':
+            continue  # Suite variants are resolved by the unified asset catalog, not the task-only API.
+        if entry.get('kind') == 'agent_task':
+            from rebuild_sources import contained
+            import hashlib
+            if relative != f'cases/{identity}.json':
+                raise ValueError('Invalid flat task path')
+            path = contained(root, relative)
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != entry['sha256'] or identity in paths:
+                raise ValueError('Task pin drift or duplicate identity')
+            case = json.loads(raw)
+            if case['id'] != identity or canonical_case_path(case) != relative:
+                raise ValueError('Task identity mismatch')
+            paths[identity] = path
+            continue
         if not isinstance(relative, str):
             raise ValueError('Missing case catalog path')
         parts = PurePosixPath(relative).parts

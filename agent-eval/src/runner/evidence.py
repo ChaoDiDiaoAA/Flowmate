@@ -65,9 +65,22 @@ def load_evidence(run_root: Path, manifest: dict, trusted_adapters: dict) -> dic
     value = {**identity, 'source': deepcopy(source), 'evidence': deepcopy(evidence),
              'observation': primary['observation']}
     # Control envelopes must pass this same boundary independently.
-    control = manifest.get('normalControl')
-    if control is not None:
+    if 'normalControl' in manifest and 'normalControls' in manifest:
+        raise ValueError('ambiguous normal control envelopes')
+    if 'normalControls' in manifest:
+        controls = manifest['normalControls']
+        if not isinstance(controls, list) or not all(is_verified(c) for c in controls):
+            raise ValueError('normal controls must be independently verified')
+        value['normalControls'] = [deepcopy(dict(c)) for c in controls]
+    elif 'normalControl' in manifest:
+        control = manifest['normalControl']
         if not is_verified(control):
             raise ValueError('normal control must be independently verified')
         value['normalControl'] = deepcopy(dict(control))
+    if 'comparisonPeers' in manifest:
+        peers = manifest['comparisonPeers']
+        if (not isinstance(peers, list) or not peers
+                or not all(is_verified(peer) for peer in peers)):
+            raise ValueError('comparison peers must be independently verified')
+        value['comparisonPeers'] = [deepcopy(dict(peer)) for peer in peers]
     return VerifiedObservation(value, _TOKEN)

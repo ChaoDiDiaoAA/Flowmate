@@ -23,9 +23,13 @@ class HarnessMigrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.requirements=load_requirements(ROOT)
-        catalog=json.loads((ROOT/'agent-eval/data/manifests/case-catalog.json').read_text(encoding='utf-8'))
-        row=next(c for c in catalog['cases'] if c['id']=='runtime-00012')
-        cls.case=json.loads((ROOT/'agent-eval/data'/row['path']).read_text(encoding='utf-8'))
+        # This module verifies the retired schema-2 migration path.  Its fixture
+        # must come from protected history, never from the current 548 Cases.
+        archived=list((ROOT/'agent-eval/data/manifests/history').rglob(
+            'cases/sessions/runtime-00012.json'))
+        if not archived:
+            raise AssertionError('Protected legacy migration fixture is missing')
+        cls.case=json.loads(archived[0].read_text(encoding='utf-8'))
 
     def test_all_legacy_families_have_explicit_owner(self):
         self.assertEqual(len(FAMILY_MODULE),177)

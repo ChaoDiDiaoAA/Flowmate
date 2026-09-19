@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -45,6 +46,44 @@ def empty_field(candidate=None):
 
 
 def make_review_form(base):
+    if base.get('schemaVersion') == 3 and str(base.get('id', '')).startswith('gold-fresh-'):
+        def decision(value):
+            return {'decision': 'pending', 'candidate': copy.deepcopy(value),
+                    'replacement': None, 'reviewNote': ''}
+        return {
+            'schemaVersion': 3,
+            'kind': 'fresh_gold_human_review',
+            'sampleId': base['sampleId'],
+            'baseVersion': base['version'],
+            'reviewers': [],
+            'coverage': {
+                'originalImageReviewed': False,
+                'headerReviewed': False,
+                'lineItemsReviewed': False,
+                'totalsReviewed': False,
+                'sourceParseCompared': False,
+                'uncertaintyReviewed': False,
+            },
+            'fieldReviews': {key: decision(value) for key, value in base['fields'].items()},
+            'extraFieldReviews': {key: decision(value) for key, value in base.get('extraFields', {}).items()},
+            'lineItemReviews': [{
+                'lineId': line['lineId'],
+                'rowOrdinal': line['rowOrdinal'],
+                'originalRowLabel': line.get('originalRowLabel'),
+                'decision': 'pending',
+                'fields': {key: decision(value) for key, value in line['fields'].items()},
+                'replacement': None,
+                'reviewNote': '',
+            } for line in base['lineItems']],
+            'lineCountDecision': 'pending',
+            'replacementLineItems': None,
+            'documentDecision': 'pending',
+            'documentNotes': '',
+            'disputes': [],
+            'instructions': (
+                '实际核验人员必须查看原图，逐字段和逐行选择accept或replace；'
+                '完成全部coverage后才能提交。候选仅供参考，禁止自动批量确认。'),
+        }
     form = {'schemaVersion': 2, 'kind': 'human_gold_review', 'sampleId': base['sampleId'],
             'baseVersion': base['version'], 'reviewers': [],
             'coverage': {'headerReviewed': False, 'lineItemsReviewed': False,
@@ -448,7 +487,11 @@ CURRENT_CHECKS = {
 
 
 def is_current_dataset(project):
-    return read_json(quality_root(project)/'manifests/inventory.json').get('kind') == 'single_current_dataset'
+    root = quality_root(project)
+    inventory = read_json(root/'manifests/inventory.json')
+    return (inventory.get('kind') == 'single_current_dataset' or
+            (inventory.get('schemaVersion') == 3 and
+             (root/'manifests/active-dataset.json').is_file()))
 
 
 def _checked_inventory(project, authorized_paths=()):
@@ -476,6 +519,18 @@ def _checked_inventory(project, authorized_paths=()):
 
 
 def verify_current_inventory(project):
+    root = quality_root(project)
+    inventory = read_json(root/'manifests/inventory.json')
+    if inventory.get('schemaVersion') == 3 and (root/'manifests/active-dataset.json').is_file():
+        # The controlled rebuild inventory covers only active core materials;
+        # source labels, history, runs and README intentionally remain outside
+        # it.  Reuse the publisher's full marker/digest verification instead of
+        # the legacy whole-directory enumeration.
+        from rebuild_publication import read_quality_snapshot
+        snapshot = read_quality_snapshot(root)
+        need(snapshot.get('manifests/inventory.json') == (root/'manifests/inventory.json').read_bytes(),
+             'Current rebuild inventory differs from the published snapshot')
+        return inventory
     return _checked_inventory(project)[0]
 
 
@@ -542,6 +597,63 @@ def make_asset_review_form(project, kind, asset_id, index=None):
     if kind == 'gold':
         form['goldReview'] = make_review_form(base['value'])
     return form
+
+
+def export_current_gold_review_batch(project, output):
+    """Export exact blank forms without changing the published dataset."""
+    project, output = Path(project).resolve(), Path(output).resolve()
+    root = quality_root(project)
+    need(is_current_dataset(project), 'Batch export requires the controlled current dataset')
+    need(not output.is_relative_to(root), 'Write blank review forms outside the published data root')
+    need(not output.exists(), 'Review batch output already exists')
+    index = current_asset_index(project)
+    gold_ids = sorted(identity for kind, identity in index if kind == 'gold')
+    need(len(gold_ids) == 100, 'Current Gold review batch must contain exactly 100 candidates')
+    output.mkdir(parents=True)
+    marker = read_json(root/'manifests/active-dataset.json')
+    rows, items = [], []
+    for identity in gold_ids:
+        form = make_asset_review_form(project, 'gold', identity, index)
+        relative = identity + '.review.json'
+        write_new(output/relative, form)
+        gold = read_json(root/form['target']['path'])
+        original_path = gold['sourceEvidence']['original']
+        original_pin = next(pin for pin in gold['sourceSnapshot'] if pin['path'].endswith('/original.jpg'))
+        item = {
+            'sampleId': identity,
+            'split': gold['split'],
+            'goldTarget': copy.deepcopy(form['target']),
+            'form': relative,
+            'originalPath': original_path,
+            'originalSha256': original_pin['sha256'],
+            'fieldCount': len(gold['fields']) + len(gold.get('extraFields', {})),
+            'lineCount': len(gold['lineItems']),
+            'status': 'pending_human_review',
+        }
+        items.append(item)
+        rows.append([identity, gold['split'], relative, original_path,
+                     form['target']['sha256'], item['fieldCount'], item['lineCount'], item['status']])
+    batch = {
+        'schemaVersion': 1,
+        'kind': 'fresh_gold_human_review_batch',
+        'materialSha256': marker['materialSha256'],
+        'goldCount': len(items),
+        'humanReviewsPerformed': 0,
+        'instructions': [
+            '逐份打开originalPath指向的原图，并核对表单中的全部票头、额外字段和明细。',
+            '每个字段选择accept或replace；不得以批量脚本自动确认。',
+            '完成coverage、reviewers、documentDecision及争议记录后再提交受控发布。',
+        ],
+        'items': items,
+    }
+    write_new(output/'index.json', batch)
+    with (output/'index.csv').open('x', encoding='utf-8-sig', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['sampleId', 'split', 'form', 'originalPath', 'goldSha256',
+                         'fieldCount', 'lineCount', 'status'])
+        writer.writerows(rows)
+    return {'output': str(output), 'goldReviewForms': len(items),
+            'materialSha256': marker['materialSha256'], 'humanReviewsPerformed': 0}
 
 
 def _nonblank(value):
@@ -639,6 +751,9 @@ def submit_asset_review(project, submission, base_release=None, release_id=None)
              'Legacy intake requires explicit gold review and parent release')
         return publish_review(project, submission, base_release, release_id)
     root = quality_root(project)
+    inventory = read_json(root/'manifests/inventory.json')
+    need(inventory.get('kind') == 'single_current_dataset',
+         'Controlled rebuild materials cannot be edited in place; validate and publish the review through the rebuild workflow')
     index = current_asset_index(project)
     kind, identity = submission.get('assetKind'), submission.get('assetId')
     prior = resolve_asset(project, None, kind, identity, index)
@@ -681,6 +796,14 @@ def validate_current_assets(root, product):
                  or value.get('status') == 'human_reviewed' or value.get('eligibleForFieldScoring') is True)
         need(value.get('formalAcceptanceEligible') is not True and value.get('eligibleForAcceptance') is not True,
              'Content review cannot assert formal product acceptance')
+        if value.get('humanReviewRef'):
+            from rebuild_gold_reviews import validate_human_review_record
+            from rebuild_publication import read_quality_snapshot
+            snapshot = read_quality_snapshot(root)
+            validate_human_review_record(value, snapshot, root.parents[1], root)
+            need(claim and not value.get('reviewRecord'),
+                 'Controlled Gold review must use its immutable humanReviewRef only')
+            continue
         need(not claim or value.get('reviewRecord'), 'Human review claim has no attested record')
         if not value.get('reviewRecord'):
             continue
@@ -763,6 +886,8 @@ if __name__ == '__main__':
     export.add_argument('--kind', choices=list(CURRENT_CHECKS), default='gold')
     export.add_argument('--asset')
     export.add_argument('--output', type=Path, required=True)
+    export_batch = sub.add_parser('export-batch')
+    export_batch.add_argument('--output', type=Path, required=True)
     submit = sub.add_parser('submit')
     submit.add_argument('--review', type=Path, required=True)
     submit.add_argument('--base-release')
@@ -773,6 +898,8 @@ if __name__ == '__main__':
         result = initialize(args.project)
     elif args.command == 'register-workflow':
         result = {'workflowArtifacts': len(register_workflow_files(args.project)['files'])}
+    elif args.command == 'export-batch':
+        result = export_current_gold_review_batch(args.project, args.output)
     elif args.command == 'export-form':
         if is_current_dataset(args.project):
             form = make_asset_review_form(args.project, args.kind, args.asset or args.sample)
@@ -780,9 +907,10 @@ if __name__ == '__main__':
             resolved = resolve_release(args.project, args.release)
             need(args.sample in resolved['gold'], 'Unknown sample in release')
             form = make_review_form(resolved['gold'][args.sample])
+        if is_current_dataset(args.project):
+            need(not args.output.resolve().is_relative_to(quality_root(args.project)),
+                 'Write blank review forms outside the published data root')
         write_new(args.output, form)
-        if is_current_dataset(args.project) and args.output.resolve().is_relative_to(quality_root(args.project)):
-            refresh_inventory(args.project, [args.output.resolve().relative_to(quality_root(args.project)).as_posix()])
         result = {'templateWritten': str(args.output), 'humanReviewPerformed': False}
     elif args.command in ('inspect', 'inspect-release'):
         resolved = resolve_release(args.project, args.release)

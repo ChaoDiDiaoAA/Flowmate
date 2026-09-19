@@ -1,4 +1,14 @@
 """Check aggregation shared by offline graders. Missing work never hides a failure."""
+import hashlib
+import json
+
+
+def case_sha256(case):
+    """Digest the quality-side Case definition, not a run's claimed verdict."""
+    return hashlib.sha256(json.dumps(case, sort_keys=True, ensure_ascii=False,
+                                    separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+
 def aggregate_checks(checks):
     required = [c for c in checks if c.get('required', True) and c.get('applicable', True)]
     states = {c['status'] for c in required}

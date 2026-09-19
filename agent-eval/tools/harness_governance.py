@@ -96,8 +96,9 @@ GOVERNANCE_REQUIREMENTS = {
         '故意注入产品故障的真实执行尚缺适配器；设施自检不能替代其持久证据。']),
     'CRIT-4-asset-definitions': _obligation('资产分工、集中Benchmark定义与真实Baseline', [
         ('agent-eval/tools/verify_invoice_data.py', 'verify'),
+        ('agent-eval/tools/rebuild_benchmarks.py', 'verify'),
         ('agent-eval/tools/review_invoice_data.py', 'validate_current_assets')], [
-        '当前目录尚无正式benchmarks/定义和实际执行Baseline；BM标签及views不等于已冻结Benchmark。']),
+        '11项Benchmark已有定义与候选成员，内容审核、正式冻结及真实执行Baseline仍未完成；准备材料不是成绩。']),
     'CRIT-4-case-record': _obligation('Case身份、版本、初态、模式和依赖记录', [
         ('agent-eval/tools/verify_invoice_data.py', 'verify'),
         ('agent-eval/tools/invoice_requirements.py', 'validate_coverage'),
@@ -114,9 +115,11 @@ GOVERNANCE_REQUIREMENTS = {
         (ALIGNMENT, 'test_unimplemented_required_rule_blocks_whole_case')], [
         '逐Grader的Owner、版本冻结、适用条件和校准签署尚不完整；代码测试不自动补足治理记录。']),
     'CRIT-4-benchmark-record': _obligation('冻结Benchmark成员和执行比较协议', [
-        ('agent-eval/tools/verify_invoice_data.py', 'verify_current_artifacts')], [
-        '尚未发布正式BenchmarkDefinition及subset版本、冻结成员、基线、预算k、重试/重置和比较协议。',
-        '阶段/BM视图只是检索视图，不能作为完整Benchmark定义或成绩。']),
+        ('agent-eval/tools/verify_invoice_data.py', 'verify_current_artifacts'),
+        ('agent-eval/src/runner/benchmarks.py', 'validate_bundle'),
+        ('agent-eval/tests/test_rebuild_benchmarks.py', 'test_rebuilding_same_inputs_changes_no_bytes')], [
+        '候选定义及精确成员已有引用，预算/k/门槛、环境与Owner仍待阶段方案确认后审核冻结。',
+        '真实产品/采证适配器及实际Baseline仍缺失，设施统计自检不计作产品执行。']),
     'CRIT-4-trial-record': _obligation('真实批次尝试、运行资源、证据和成本身份', [
         ('agent-eval/src/runner/evidence.py', 'load_evidence'),
         (ALIGNMENT, 'test_case_and_run_mismatch_rejected')], [

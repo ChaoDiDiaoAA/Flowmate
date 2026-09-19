@@ -1,0 +1,393 @@
+{
+  "schemaVersion": 1,
+  "benchmarkId": "BM-01",
+  "version": 1,
+  "status": "design_candidate",
+  "title": "真实字段抽取",
+  "goal": "从获准的已有解析及可选原票证据提取票头、明细、规范值与来源，保留缺失、歧义、冲突和输入不可得性。产品不执行原文解析。",
+  "kind": "repeatable",
+  "sourceRefs": [
+    {
+      "path": "docs/spec/00_Flowmate完整方案.md",
+      "bytes": 693625,
+      "sha256": "144ad6ad076b8229c9fca28a33dfb40e4774d951aca2ec41d7cf40570ce664e4"
+    },
+    {
+      "path": "agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md",
+      "bytes": 471003,
+      "sha256": "09225f2fd5e9598a9083f700b71f7e55a280eecc414d63259fa190534ab54e54"
+    }
+  ],
+  "membersRef": "manifests/benchmarks/BM-01/members.json",
+  "baselineRefs": [],
+  "phaseApplicability": [
+    {
+      "phase": "P0",
+      "modes": "F",
+      "scope": "输入配对、摘要与Schema；无模型成绩"
+    },
+    {
+      "phase": "P1",
+      "modes": "A/B-local",
+      "scope": "最小字段建议，局部B须有独立核验Gold"
+    },
+    {
+      "phase": "P2",
+      "modes": "F/A/B-local",
+      "scope": "正式工具读取及候选保存"
+    },
+    {
+      "phase": "P8",
+      "modes": "F/A/B-local",
+      "scope": "当前字段规则和差异"
+    },
+    {
+      "phase": "P12",
+      "modes": "F/A/B-test",
+      "scope": "企业字段契约及三层测试环境"
+    },
+    {
+      "phase": "P13",
+      "modes": "A/B-observation",
+      "scope": "只读关联生产对照，不能由局部成绩推算生产准确率"
+    }
+  ],
+  "lifecycle": {
+    "review": {
+      "status": "pending",
+      "reviewer": null,
+      "evidenceRef": null
+    },
+    "freeze": {
+      "status": "not_frozen",
+      "frozenAt": null,
+      "resolvedMembersSha256": null
+    },
+    "readiness": {
+      "status": "blocked",
+      "blockers": [
+        "成员/Gold/Oracle逐项内容核验和近重复/暴露审查未完成",
+        "候选、真实模型和正式产品Adapter未提供",
+        "环境/夹具、Grader自检、预算/k/门槛和Owner未冻结"
+      ]
+    },
+    "execution": {
+      "status": "NOT_RUN",
+      "runCount": 0,
+      "trialCount": 0
+    }
+  },
+  "subsets": [
+    {
+      "id": "capability",
+      "purpose": "capability",
+      "version": 1,
+      "requiredSelection": "当前阶段必需Driving Task、全部适用必要不变量/安全约束；必须显式成员角色",
+      "exploratorySelection": "另列困难/边界挑战；失败保留，不自动豁免安全或已承诺能力",
+      "gatePolicy": "必需与探索分别报告；必需检查未达门槛阻断，探索低分不能抵消回归",
+      "memberRoles": [
+        "required",
+        "exploratory"
+      ],
+      "frozenMembersRef": null,
+      "thresholds": null
+    },
+    {
+      "id": "regression",
+      "purpose": "regression",
+      "version": 1,
+      "requiredSelection": "当前受影响的前序能力、已确认Bad和硬约束；保留纳入依据及历史证据",
+      "promotionRule": "能力成员稳定性标准/Owner及真实通过证据确认后版本化纳入；未经执行不能伪称已成熟",
+      "gatePolicy": "绝对质量与相对退化分别冻结；必要不变量和安全硬约束全部满足",
+      "frozenMembersRef": null,
+      "stabilityCriteria": null,
+      "thresholds": null
+    }
+  ],
+  "inputContract": {
+    "modelVisible": [
+      "Case允许输入投影、解析文件版本/摘要及原票受控引用"
+    ],
+    "controlledQualityInputs": [
+      "parsed_only或parsed_with_source_evidence及实际模型可见字段",
+      "独立核验的字段/明细Gold、规范化规则、容差与来源（仅评分侧）"
+    ],
+    "projectionPolicy": "仅获准Case.input投影给产品；整个agent-eval、Gold/Oracle/Rubric/Grader及其他Trial输出不得进入主/子Agent发现或读取范围。",
+    "memberResolution": "membersRef相对质量数据根agent-eval/data；逐项固定Case/Gold/Oracle/Grader版本与摘要，不复制原始业务资产。"
+  },
+  "outputContract": {
+    "artifacts": [
+      "原始候选及字段原值/规范值/值状态、明细行对应与来源引用",
+      "逐字段比较、输入可得性缺口和整票准备判定"
+    ],
+    "requiredEvidence": [
+      "实际Provider请求、工具读取和候选保存记录",
+      "原票/解析摘要、人工Gold核验身份及行级来源"
+    ],
+    "storage": "data/runs及受控产品证据引用；非敏感定义不保存原文、答案、真实账号、秘密或Trace。",
+    "recordFields": [
+      "EvalRun/EvalTrial/Case身份与版本",
+      "candidate/config/environment及实际instanceId/workspaceId/策略版本",
+      "实际展开清单/摘要与全部尝试",
+      "逐检查项状态、理由、证据/限制、Grader版本及复核",
+      "原判/重评分/归因与业务完成状态",
+      "执行和评分成本、时延、人工投入及未知用量"
+    ]
+  },
+  "executionProtocol": {
+    "order": [
+      "资产质检及引用/用途隔离核验",
+      "设施独立正反/边界/缺证据自检",
+      "产品F复用适用性核验或重跑",
+      "真实A",
+      "适用局部/测试B或只读观察",
+      "评分/人工复核/分别报告"
+    ],
+    "phaseSelection": "只运行当前已启用子集；未来能力不计当前分母，当前必需依赖缺失记NOT_RUN而非不适用。",
+    "environmentVariants": [
+      {
+        "id": "isolated-test",
+        "meaning": "按当前已启用阶段的正式产品入口、独立测试实例及受控夹具",
+        "configRef": null
+      }
+    ],
+    "frozenConfig": {
+      "candidate": null,
+      "model": null,
+      "modelParameters": null,
+      "k": null,
+      "budgets": null,
+      "concurrency": null,
+      "timeout": null,
+      "retry": null,
+      "reset": null,
+      "environment": null,
+      "workspacePolicy": null,
+      "graderVersions": null,
+      "goldVersions": null,
+      "humanReview": null,
+      "absoluteThresholds": null,
+      "regressionThresholds": null,
+      "samplePlan": null
+    },
+    "parameterDefinitions": {
+      "candidate": "候选ID/版本、代码/依赖/资源摘要及已启用能力；正式运行前固定。",
+      "model": "实际Provider/模型标识与版本；不设置推测默认模型。",
+      "modelParameters": "temperature/top-p等实际支持参数及种子能力；不虚构确定性。",
+      "k": "每Case预定重复次数；测试允许重置才适用，生产不重复业务。",
+      "budgets": "每Trial及父子整体请求/token/金额限制，执行与评分分别计量。",
+      "concurrency": "产品允许并发与批次调度上限；不能绕过单控制者。",
+      "timeout": "模型/工具/Trial及清理期限和计时起止。",
+      "retry": "各层唯一重试Owner、可重试错误、次数/退避及总预算。",
+      "reset": "可重置边界、等价初态与不可重置对象使用新获准记录。",
+      "environment": "fixture/Adapter/目标版本、账号逻辑引用、动作范围和主数据时点。",
+      "workspacePolicy": "实际实例/Workspace映射、策略/环境版本、目录与会话布局。",
+      "graderVersions": "逐检查项Grader/Rubric版本与自检、适用证据和责任人。",
+      "goldVersions": "独立核验Gold/Oracle版本、时点、争议和允许容差。",
+      "humanReview": "必要复核触发、角色/Owner、抽样与争议裁决。",
+      "absoluteThresholds": "必需能力与回归的绝对质量门槛；探索项独立。",
+      "regressionThresholds": "相对退化、首次通过、稳定性、不确定性与样本不足规则。",
+      "samplePlan": "独立Case/源组/变体数量、用途split、近重复与暴露审查。"
+    },
+    "fEvidenceReuse": "核对候选、scenarioId/fixtureVersion、范围、版本摘要与证据有效性；固定Provider仅证明F，不证明真实服务/行为。",
+    "resetPolicy": "独立Trial从等价初态开始；恢复场景在同一Trial保留已发生状态。不可重置测试对象使用新的获准记录。",
+    "cancelPolicy": "停止派发并请求产品取消；产品负责停止/清理，质量侧等待证据，不直接杀进程或删除Pi锁；观察取消仅停止观察。",
+    "productionPolicy": "read_only_evidence_association",
+    "sideEffectPolicy": "仅允许明确授权测试目标与动作；Shadow技术阻断提交/草稿保存/上传；生产不得为比较重提同一对象。"
+  },
+  "gradingProtocol": {
+    "states": [
+      "PASS",
+      "FAIL",
+      "UNJUDGEABLE",
+      "ERROR",
+      "NOT_RUN"
+    ],
+    "applicability": "独立记录适用/不适用/条件触发及事前依据；缺依赖、上游错误或必要行为未发生不能改为不适用。",
+    "methods": "可确定事实优先确定性Grader；开放语义仅用经独立留出校准的LLM或人工；业务歧义/高风险/争议按冻结规则人工复核。",
+    "graderContract": [
+      "ID/version/Owner/checkId及结果/过程/安全维度",
+      "只读Case/Trial/Gold/Oracle/Rubric与必要证据",
+      "适用前提、PASS/FAIL/无法判定规则、必要项/硬约束及严重度",
+      "状态/可选分数/证据/理由/限制/待复核",
+      "执行配置/异常重试、人工裁决及重评分关联"
+    ],
+    "llmJudge": {
+      "enabled": false,
+      "model": null,
+      "rubricRef": null,
+      "calibrationRef": null,
+      "thresholds": null,
+      "recalibrationRule": "模型/提示/Rubric/证据结构/分布实质变化重校准；误放行/误拒绝/严重漏判/无法判定和样本量分别披露。"
+    },
+    "processPolicy": "验证必要前置关系、对象/参数/授权绑定和禁止副作用；允许合法替代顺序、有效证据复用、批量路径及合理重试；参考Trace不是唯一答案。",
+    "aggregation": "检查项→维度→Case/Trial→子集；必要项FAIL或硬约束FAIL阻断且不被高分抵消；无已证实失败但必要项缺证据/设施错误/未运行不得PASS。",
+    "missingEvidence": "缺行为证据记UNJUDGEABLE；已证明产品违反必要留证另判FAIL；采集设施故障记ERROR。故意注入故障不作为设施故障剔除。",
+    "zeroTolerance": [
+      "实际越权",
+      "严重错录",
+      "重复有效提交",
+      "非法推进",
+      "UNKNOWN盲重提",
+      "关键证据缺失",
+      "假报清理"
+    ],
+    "metrics": [
+      {
+        "id": "field_accuracy",
+        "numerator": "正确可评字段",
+        "denominator": "全部可评字段",
+        "interpretation": "另报解析不可得/缺失/争议字段；不可得不得静默删掉整票分母"
+      },
+      {
+        "id": "invoice_readiness",
+        "numerator": "关键字段及必要匹配正确且可准备载荷的票",
+        "denominator": "计划适用票",
+        "interpretation": "输入不足保留缺口；不表示已提交"
+      }
+    ],
+    "commonDenominators": {
+      "counts": "计划Case、适用/触发检查、执行、可判定、PASS/FAIL/UNJUDGEABLE/ERROR/NOT_RUN；单位逐项声明",
+      "judgeablePassRate": "PASS/(PASS+FAIL)",
+      "scoreCoverage": "(PASS+FAIL)/计划适用数",
+      "confirmedCaseRate": "确认PASS的Case/计划适用Case",
+      "zeroDenominator": "不可计算，不填0或100%",
+      "independence": "同Case多个Grader/字段/子任务和重复Trial不构成独立Case；同票/近重复按sourceGroup分组"
+    }
+  },
+  "comparisonProtocol": {
+    "baselineRef": null,
+    "comparabilityKeys": [
+      "Benchmark/subset版本及冻结实际成员",
+      "Case/Gold/Oracle/Grader/Rubric版本",
+      "候选及依赖/模型参数",
+      "环境/主数据时点/Workspace策略与身份等价依据",
+      "预算/k/并发/超时/重试/重置",
+      "人工方式/用途split/暴露及独立源组"
+    ],
+    "report": [
+      "首次结果",
+      "全部尝试及失败分布",
+      "经验pass@k：预定k次至少一次成功Case比例",
+      "经验pass^k：预定k次全部成功Case比例",
+      "Case分组不确定性及样本不足",
+      "同成员原通过→现失败及原失败→现通过",
+      "新增/退役/不可比成员与分母变化",
+      "能力/回归各自绝对质量、相对变化及门禁"
+    ],
+    "repeatBoundary": "k和方法事前冻结；生产不重复真实提交获取pass@k；一次成功不能证明稳定。",
+    "rescorePolicy": "评分缺陷修复须版本化；基线与候选按同一适用Grader重评分并保留原判；重评分不等于新运行或Agent提升。",
+    "driftPolicy": "环境/策略/资源布局变化须记录可比性限制并回归受影响BM；跨窗口分布变化不自动归因候选。"
+  },
+  "coverageRequirements": [
+    {
+      "id": "headers",
+      "title": "票头字段、当事方角色、币种与日期",
+      "source": {
+        "path": "agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md",
+        "section": "6.2"
+      },
+      "obligation": "required_when_applicable",
+      "contentReviewRequired": true,
+      "caseCriteria": {
+        "families": [],
+        "requirementRefs": [],
+        "assertionPaths": []
+      },
+      "coverageMeaning": "匹配仅证明存在候选检查；须核验变体、输入适用性及断言内容，不代表运行或通过。",
+      "coverageStatus": "atomic_condition_review_pending"
+    },
+    {
+      "id": "lines",
+      "title": "明细行对应、页间完整性及十进制金额",
+      "source": {
+        "path": "agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md",
+        "section": "6.2"
+      },
+      "obligation": "required_when_applicable",
+      "contentReviewRequired": true,
+      "caseCriteria": {
+        "families": [],
+        "requirementRefs": [],
+        "assertionPaths": []
+      },
+      "coverageMeaning": "匹配仅证明存在候选检查；须核验变体、输入适用性及断言内容，不代表运行或通过。",
+      "coverageStatus": "atomic_condition_review_pending"
+    },
+    {
+      "id": "source",
+      "title": "规范值/原值和字段来源可核验",
+      "source": {
+        "path": "agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md",
+        "section": "6.2"
+      },
+      "obligation": "required_when_applicable",
+      "contentReviewRequired": true,
+      "caseCriteria": {
+        "families": [],
+        "requirementRefs": [],
+        "assertionPaths": []
+      },
+      "coverageMeaning": "匹配仅证明存在候选检查；须核验变体、输入适用性及断言内容，不代表运行或通过。",
+      "coverageStatus": "atomic_condition_review_pending"
+    },
+    {
+      "id": "unavailable",
+      "title": "原票有值但解析缺失；允许取证与如实缺失分开",
+      "source": {
+        "path": "agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md",
+        "section": "6.2"
+      },
+      "obligation": "required_when_applicable",
+      "contentReviewRequired": true,
+      "caseCriteria": {
+        "families": [],
+        "requirementRefs": [],
+        "assertionPaths": []
+      },
+      "coverageMeaning": "匹配仅证明存在候选检查；须核验变体、输入适用性及断言内容，不代表运行或通过。",
+      "coverageStatus": "atomic_condition_review_pending"
+    },
+    {
+      "id": "missing-conflict",
+      "title": "原文缺失、歧义、冲突和不可辨认分别标记；Gold比较支持状态/澄清，实际类型分布仍待核验",
+      "source": {
+        "path": "agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md",
+        "section": "6.2"
+      },
+      "obligation": "required_when_applicable",
+      "contentReviewRequired": true,
+      "caseCriteria": {
+        "families": [],
+        "requirementRefs": [],
+        "assertionPaths": []
+      },
+      "coverageMeaning": "匹配仅证明存在候选检查；须核验变体、输入适用性及断言内容，不代表运行或通过。",
+      "coverageStatus": "atomic_condition_review_pending"
+    },
+    {
+      "id": "unsupported",
+      "title": "不得无来源补值或把模拟币种写入原票",
+      "source": {
+        "path": "agent-eval/docs/spec/01_Flowmate_Agent评测总方案.md",
+        "section": "6.2"
+      },
+      "obligation": "required_when_applicable",
+      "contentReviewRequired": true,
+      "caseCriteria": {
+        "families": [],
+        "requirementRefs": [],
+        "assertionPaths": []
+      },
+      "coverageMeaning": "匹配仅证明存在候选检查；须核验变体、输入适用性及断言内容，不代表运行或通过。",
+      "coverageStatus": "atomic_condition_review_pending"
+    }
+  ],
+  "membershipRule": "schema3_direct_check_mapping",
+  "membershipRuleRef": "agent-eval/tools/rebuild_benchmark_mapping.py",
+  "assetKinds": [
+    "agent_task",
+    "product_contract"
+  ],
+  "readinessMeaning": "设计协议与候选成员；未冻结、未执行，不构成产品成绩。"
+}
