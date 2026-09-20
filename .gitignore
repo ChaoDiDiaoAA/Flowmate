@@ -56,3 +56,7 @@ Thumbs.db
 
 # Local execution-plan ledger and review artifacts
 .superpowers/
+
+# Local planning and specification documents
+/agent-eval/docs/
+/docs/
