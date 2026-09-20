@@ -1,0 +1,108 @@
+{
+  "schemaVersion": "p0-frozen-review/v1",
+  "version": "p0-product-structural/v1",
+  "checks": [
+    {
+      "checkId": "P0-F01/full-source-structure/v1",
+      "caseVariantId": "full-current-manifest",
+      "required": true,
+      "applicable": true,
+      "requiredStatus": "PASS",
+      "evidencePaths": ["inspect-summary.json", "source-verification.json"],
+      "assertions": [
+        {"path": "inspect-summary.json", "pointer": "/expectedSamples", "equals": 2902},
+        {"path": "inspect-summary.json", "pointer": "/inspectedSamples", "equals": 2902},
+        {"path": "inspect-summary.json", "pointer": "/issueCount", "equals": 0},
+        {"path": "inspect-summary.json", "pointer": "/checkedFiles", "equals": 16475},
+        {"path": "source-verification.json", "pointer": "/result", "equals": "PASS"},
+        {"path": "source-verification.json", "pointer": "/originals", "equals": 2902},
+        {"path": "source-verification.json", "pointer": "/publisherLabels", "equals": 1414},
+        {"path": "source-verification.json", "pointer": "/verifiedSourceFiles", "equals": 19376}
+      ]
+    },
+    {
+      "checkId": "P0-F03/full-publication/v1",
+      "caseVariantId": "fresh-instance",
+      "required": true,
+      "applicable": true,
+      "requiredStatus": "PASS",
+      "evidencePaths": ["sqlite-facts.json"],
+      "assertions": [
+        {"path": "sqlite-facts.json", "pointer": "/availableDocuments", "equals": 2902},
+        {"path": "sqlite-facts.json", "pointer": "/pendingDocuments", "equals": 0},
+        {"path": "sqlite-facts.json", "pointer": "/parsedDocuments", "equals": 2902},
+        {"path": "sqlite-facts.json", "pointer": "/datasetManifests", "equals": 1}
+      ]
+    },
+    {
+      "checkId": "P0-F04/full-read-evidence-restart/v1",
+      "caseVariantId": "all-documents-plus-capture",
+      "required": true,
+      "applicable": true,
+      "requiredStatus": "PASS",
+      "evidencePaths": ["read-summary.json", "restart-summary.json"],
+      "assertions": [
+        {"path": "read-summary.json", "pointer": "/expectedDocuments", "equals": 2902},
+        {"path": "read-summary.json", "pointer": "/readDocuments", "equals": 2902},
+        {"path": "read-summary.json", "pointer": "/uniqueEvidence", "equals": 4755},
+        {"path": "read-summary.json", "pointer": "/evidenceRead", "equals": 4755},
+        {"path": "read-summary.json", "pointer": "/failureCount", "equals": 0},
+        {"path": "restart-summary.json", "pointer": "/restartRead", "equals": true}
+      ]
+    },
+    {
+      "checkId": "P0-F12/file-finalization/v1",
+      "caseVariantId": "file-finalization-temporary-fixture",
+      "required": true,
+      "applicable": true,
+      "requiredStatus": "PASS",
+      "evidencePaths": ["fault-summary.json"],
+      "assertions": [
+        {"path": "fault-summary.json", "pointer": "/allPass", "equals": true},
+        {"path": "fault-summary.json", "pointer": "/scenarios/0/status", "equals": "PASS"},
+        {"path": "fault-summary.json", "pointer": "/scenarios/0/retrySucceeded", "equals": true},
+        {"path": "fault-summary.json", "pointer": "/scenarios/0/oldPublicationReadable", "equals": true}
+      ]
+    },
+    {
+      "checkId": "P0-F13/database-commit/v1",
+      "caseVariantId": "database-commit-temporary-fixture",
+      "required": true,
+      "applicable": true,
+      "requiredStatus": "PASS",
+      "evidencePaths": ["fault-summary.json"],
+      "assertions": [
+        {"path": "fault-summary.json", "pointer": "/scenarios/1/status", "equals": "PASS"},
+        {"path": "fault-summary.json", "pointer": "/scenarios/1/retrySucceeded", "equals": true},
+        {"path": "fault-summary.json", "pointer": "/scenarios/1/pendingAfterFailure", "equals": 0}
+      ]
+    },
+    {
+      "checkId": "P0-F13/audit-insert/v1",
+      "caseVariantId": "audit-insert-temporary-fixture",
+      "required": true,
+      "applicable": true,
+      "requiredStatus": "PASS",
+      "evidencePaths": ["fault-summary.json"],
+      "assertions": [
+        {"path": "fault-summary.json", "pointer": "/scenarios/2/status", "equals": "PASS"},
+        {"path": "fault-summary.json", "pointer": "/scenarios/2/retrySucceeded", "equals": true},
+        {"path": "fault-summary.json", "pointer": "/scenarios/2/pendingAfterFailure", "equals": 0}
+      ]
+    },
+    {
+      "checkId": "P0-F14/response-loss/v1",
+      "caseVariantId": "response-loss-temporary-fixture",
+      "required": true,
+      "applicable": true,
+      "requiredStatus": "PASS",
+      "evidencePaths": ["fault-summary.json"],
+      "assertions": [
+        {"path": "fault-summary.json", "pointer": "/scenarios/3/status", "equals": "PASS"},
+        {"path": "fault-summary.json", "pointer": "/scenarios/3/retrySucceeded", "equals": true},
+        {"path": "fault-summary.json", "pointer": "/scenarios/3/responseReplaySame", "equals": true},
+        {"path": "fault-summary.json", "pointer": "/scenarios/3/oldPublicationReadable", "equals": true}
+      ]
+    }
+  ]
+}

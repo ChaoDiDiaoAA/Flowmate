@@ -53,3 +53,6 @@ Thumbs.db
 /agent-eval/.initial-publication/
 /data/invoices/
 /data/.preparation-stage/
+
+# Local execution-plan ledger and review artifacts
+.superpowers/

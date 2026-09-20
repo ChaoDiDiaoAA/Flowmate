@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "p0-product-restart-summary/v1",
+  "projection": {
+    "artifactId": "a_29a2065b1c790a1f66c3d8c32fe2c1d3de2d7b6d02f9aebc",
+    "workspaceId": "w_82116f565bf3800a83afba981d4dea212cfef60750c13744",
+    "sha256": "e967955d27047eed7bc85b69bbdecb6d4a8958e7069965116a2b1cdea418cccc",
+    "sizeBytes": 5616,
+    "kind": "input/projection"
+  },
+  "document": {
+    "documentId": "d_701514b83e5784c5d14644e2efe63f76cd99a204fd7ff78e",
+    "workspaceId": "w_82116f565bf3800a83afba981d4dea212cfef60750c13744",
+    "version": "701514b83e5784c5d14644e2efe63f76cd99a204fd7ff78e0128dc02c8c13d73",
+    "originalSha256": "2c4cd305a510de6ddb573e81067e5ed8a6af4fcaf0a7fc678f52f914702e6a60",
+    "parseHash": "477a37412a06f3e9868aa76e4756080be51e8e2fb6c4dc7c3defe8e249760f1f"
+  },
+  "contentHash": "2795934698307e549a02841ba9ca8640ce871bd309047c69dafdfbc929eb6510",
+  "restartRead": true,
+  "processInstanceIds": [
+    "p_8f8d47140f9b4d899a8b069e58c07638",
+    "p_ec35689092864558b78097d3fe9a645a"
+  ]
+}

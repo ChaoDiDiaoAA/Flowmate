@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "p0-source-verification/v1",
+  "checkedAt": "2026-09-20T10:30:22+08:00",
+  "command": "python -B -c import json,sys; from pathlib import Path; sys.path.insert(0,'agent-eval/tools'); from initial_dataset import verify_sources; print(json.dumps(verify_sources(Path('.')), ensure_ascii=False, sort_keys=True))",
+  "result": "PASS",
+  "originals": 2902,
+  "publisherLabels": 1414,
+  "verifiedSourceFiles": 19376,
+  "scope": "immutable source and source-label descriptors; does not prove OCR/business semantics or product publication"
+}

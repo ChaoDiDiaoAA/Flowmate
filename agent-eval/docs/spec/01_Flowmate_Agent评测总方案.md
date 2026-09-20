@@ -1,5 +1,7 @@
 # Flowmate Agent 评测总方案
 
+> 2026-09-20 Inspect AI 架构修订：阶段与最终综合评测统一采用 Inspect，CLI 执行、Inspect View 查看；产品仍为 TS/Bun/Pi。新增设计和本机安装事实见第10章；本次不实施适配、不修改已有数据或历史成绩。
+
 修订日期：2026-09-16。状态：体系重构后的设计基线；评测实现、资产和实际成绩按阶段建立。本文中的目标、覆盖编号和示例不表示已经实现或通过。
 
 > 本文是 Agent 评测唯一总方案。
@@ -81,46 +83,60 @@ P0–P13 描述功能增长：每阶段首次建立一个主要 Harness 能力�
 
 首次试评不要求候选预先拥有自己的通过结论。满足当前阶段的依赖、配置、数据隔离、测试范围和预算后可以试评，成绩为待评。质量结论绑定候选摘要、能力阶段、环境、Benchmark/Gold/Grader 版本、F/A/B 证据和限制；版本或范围不符不得复用。
 
-质量设施在获准测试范围内调用产品受控命令，不直接修改业务数据库或复制Runtime/Gateway/Workflow；普通检查默认离线，Live仍核验当前身份、数据用途、目标、允许动作和预算。EvalRunner 取消时停止派发新 Trial，并请求产品取消其拥有的测试执行；产品负责实际停止和清理，质量侧等待证据，取消受理不等于实际已停止或清理完成。P11 增加主子清理，P13 增加 Host 回收。Runner 不直接杀产品进程或删除 Pi 锁；取消生产观察只停止观察，不取消正常业务 Job。
+质量设施在获准测试范围内调用产品受控命令，不直接修改业务数据库或复制Runtime/Gateway/Workflow；普通检查默认离线，Live仍核验当前身份、数据用途、目标、允许动作和预算。EvalRunner 取消时停止派发新 Trial，并请求产品取消其拥有的测试执行；产品负责实际停止和清理，质量侧等待证据，取消受理不等于实际已停止或清理完成。P11 增加主子清理，P13 增加 Host 回收。Runner先请求产品cancel/close并等待停止证据；仅隔离测试的超时收尾可按10.6强制终止已确认归属的测试进程树，保留未确认清理和原副作用事实。禁止终止生产/未知进程或删除Pi锁；取消生产观察只停止观察，不取消正常业务Job。
 
 按主方案第21/22章区分结论：必需功能或相关回归失败须修复验证，不能完成依赖交接；未执行、缺环境、证据不足和设施异常各保留依据，不直接算产品通过或模型能力失败；明确可选但未启用的能力只记限制。阶段负责人核验退出，产品模块负责状态及实际清理，质量侧负责评分/归因/结论；运行组合存在、F通过、质量通过、阶段完成、生产放行和逐动作批准分别成立。修复按影响范围回归并保留历史，不能改报告摘要或Gold答案制造通过。
 
 ### 1.3 独立目录与工程边界
 
+以下目录是现有资产与拟新增Inspect接入的共同工程边界；标注“拟新增”的文件随工作包创建，不代表已实现。产品主方案第20章同步此落点，详细协议与用法见第10章。
+
 ```text
 agent-eval/
   README.md
-  docs/spec/              # 唯一评测总方案
-  docs/plans/             # P0–P13 阶段实施方案，进入阶段才创建
-  benchmarks/             # 按BM集中维护非敏感、版本化基准定义
-    BM-01-field-extraction/ # 示例：字段抽取基准，其他BM按实际需要创建
-  src/                    # 公共资产解析、比较、报告等评测实现
-    runner/               # 公共执行设施，按基准定义装配
-    graders/              # 按字段、工具、安全、Session等功能复用评分器
-  tests/                  # 评测设施自检及可提交合成夹具
-  config/                 # 非秘密场景与评测配置
-  data/                   # 集中质量资产，阶段通过清单引用，整根 Git 忽略
+  pyproject.toml                 # 拟新增：Python质量环境声明
+  uv.lock                        # 拟新增：唯一Python质量依赖锁
+  docs/{spec,plans,data}/         # 总方案、阶段方案、制作与使用说明
+  src/
+    runner/
+      initial_dataset.py         # 现有综合材料离线选择，保留
+      evidence.py                # 现有可信证据边界，核验后复用
+      inspect_tasks.py            # 拟新增：Task/选集/Sample映射
+    adapters/
+      flowmate.py                # 拟新增：Solver/进程通信/采证
+      flowmate.ts                # 拟新增：Bun调用公共产品入口
+    graders/
+      inspect_scores.py          # 拟新增映射；已有Grader保留复用
+    analysis.py                  # 拟新增：失败/耗时/版本/成本分析
+  tests/                         # 设施自检和合成夹具
+  config/                        # 非秘密运行配置
+  tools/                         # 现有数据工具，保留
+  benchmarks/                    # 现有非敏感定义，不按阶段复制
+  data/                          # 现有综合质量数据，不修改
+  stage-evals/
+    Pn/                          # 当期创建，不预建十四套
+      README.md
+      cases.json
+      gold.json                  # 需要正确事实时创建
+      fixtures/                  # 需要额外输入/故障材料时创建
+  runs/                          # 新实际运行的日志/证据/报告
 ```
 
-阶段方案命名为 P0_Agent评测实施方案.md 至 P13_Agent评测实施方案.md，质量数据集中于 agent-eval/data/ 的 source-labels、gold、business、cases、manifests、runs；P0–P13 通过 manifests 中的阶段引用使用同一资产，不复制阶段数据目录。不提前创建十四份空阶段方案。旧数据保留来源和旧阶段标签；未经重新映射、版本核验及实际执行，不作为新阶段通过证据。
+**两类数据时序。** 现有 `data/` 是完整Agent综合评测的候选材料，保留原来源、标签、Gold、Case、清单及核验状态，完整Agent实现后再核验启用。阶段评测在各阶段进行，使用 `stage-evals/Pn/` 独立高质量数据；只追求覆盖价值和可判定性，不追求数量。整理P0资产时建立README和cases索引，复用F检查/Oracle/报告，不虚构Agent运行；P1起随能力运行真实A及适用B。阶段不是现有综合集的自动筛选开关。
 
-Benchmark集中定义，Case与Grader按功能复用：benchmarks/内按BM身份建立定义目录，记录目标、适用阶段、能力/回归子集、成员引用与协议；真实Case/Gold、初态、敏感配置、Trace和成绩保留在data/。data内按功能或场景维护资产索引，同一Case保留稳定ID/version和权威存储位置，跨阶段、跨BM引用而不复制；采样分组与用途split仍按第5章执行。Runner、评分和报告代码不按BM复制，跨功能基准组合既有检查项；产品F继续留在根tests/及所属模块。
+阶段文件只保留README、Case、必要Gold和夹具；Oracle嵌入Case，不另建阶段Benchmark、manifest、oracle、rubric和review子目录。产品F直接复用已有证据，前序回归以Case ID/版本/摘要显式引用；质量代码不按阶段复制。字段、制作步骤及各阶段内容见10.5。阶段方案仍按P0至P13命名，进入阶段才创建。
 
-config/保存非秘密运行配置和环境模板，不能维护另一套可覆盖冻结基准的评分门槛或成员清单。benchmarks/只提交非敏感定义及获准的逻辑引用，不含业务答案、原文、真实账号或运行日志；成员关系本身敏感时，定义引用受控版本/摘要，完整冻结清单留在data/并由质量侧解析。解析后的实际清单和配置进入运行记录，不能用随时变化的“最新”引用代替冻结版本。具体文件格式、功能子目录和命令在对应阶段方案固定。
+现有 `data/` 内 source-labels/gold/business/cases/contracts/manifests 维持原结构和权威位置；不因本次架构修订搬迁、重签或重建。已有历史runs/报告若存在留在原位置。新执行记录统一在 `runs/<executionId>/`，P0既有 `reports/p0/` 不迁移，准备工具不能生成假运行。JSON为资产编辑源，Inspect Sample为运行时映射，不维护第二套可独立编辑的数据。
 
-P0可登记BM覆盖及人工协议草案，不为此预建全部基准目录；P1起按可运行子集创建实际定义和最小设施。目录结构图表示建设职责，不代表这些目录、Runner或Benchmark成绩已经存在。阶段设计、冻结定义和实际运行记录通过版本引用关联，避免多处重复维护同一门槛。
+Benchmark保留既有身份及版本规则，阶段Case可追溯同一覆盖身份而不复制综合成员清单。config仅保存非秘密运行配置，不覆盖已冻结门槛；每次实际选集、输入、预算和版本摘要随binding保存。当前综合集的pin/审核缺口只约束依赖它的执行，不阻断独立阶段F或另有完整依据的阶段集。
 
-产品功能测试放根 tests/；agent-eval/tests/ 只验证资产、Runner、Grader、统计、归因与结论。质量设施复用根工具链和唯一依赖锁，按实际源码启用检查，不预写不存在的 CLI 或当前通过数。 原生能力验证经 runtime-pi 的公开验证入口运行同一锁定 SDK/插件，不直接引用产品私有源码，不另建测试 Runtime 或依赖版本；受控 Provider 仅指测试响应设施，不能冒充产品厂商 Provider 或替代被测原生 Loop。
+**实现位置。** 所有Flowmate专属评测适配（包括TS薄适配）在agent-eval/src实现；上游Inspect源码仓库不承载项目代码或数据。已有tools、runner及graders保留，逐项验证契约后复用，不因安装Inspect删除现有产品未接入保护。产品F仍在根tests/和实际产品模块，agent-eval/tests/仅验证设施。
 
-独立质量数据根为 agent-eval/data/，内部布局由本方案维护：source-labels 保存原始提供方标签及来源索引，gold 保存人工核验资料，business 保存模拟业务资料，cases 保存用例，manifests 保存阶段/BM/用途引用、摘要及准备报告，runs 只保存实际执行记录。当前稳定路径中，manifests/audit/ 保存来源审计和核验任务单，manifests/materialization/ 保存离线夹具，manifests/inventory.json 记录文件摘要。版本由稳定身份、修订号和摘要固定，不因机器准备批次另建并列版本目录；实际评审及执行历史按记录身份保留，不因更新当前资产而抹去。
+**工具链。** 根bun.lock统一JS/TS及真实Pi组合，拟新增agent-eval/pyproject.toml、uv.lock统一Python质量环境；不要求Bun锁管理Python，不按阶段建独立环境。产品包不依赖Inspect/Python，不导入质量代码；质量TS适配经公共composition/Application取证，不依赖私有实现或另建Runtime。
 
-已有 agent-eval/tools 数据准备工具与资产继续保留，目标 src/tests 布局不构成本轮迁移、删除或重写它们的依据；后续承接在质量阶段方案中明确，避免另建重复实现。现有工具及检查的通过不代表产品工程或真实 Agent 效果已完成。产品不导入评测设施，也不直接读取标签、Gold、评分资料或评测文档；驱动仅经公开入口交付获准业务输入并读取受控证据。
+**数据边界。** 主子Agent的资源发现、Context和工具读取排除整个agent-eval，包括阶段集、代码、日志、Gold和其他Trial输出。质量侧只交付获准业务投影；模型不能读完整Sample/Case。来源原位只读；产品实例和获准配置位于质量根以外的FlowmateData/<instanceId>/或既定来源根，产品拒绝把agent-eval作为instanceRoot/sourceRoot/configPath。质量报告引用受控证据，不创建另一份业务事实库。
 
-产品包不得依赖 agent-eval。主 Agent 和子 Agent 的资源发现、文件访问、Context 与工具范围必须排除整个 agent-eval/，包括文档、Gold、Rubric、Grader、Benchmark 答案及其他 Trial 输出。质量侧只将获准 Case 输入投影交给产品；不能让产品遍历评测根，也不能把答案改名为输入。
-
-来源根沿用主方案的既定来源配置；产品产物位于 FlowmateData/<instanceId>/，质量数据位于 agent-eval/data/，两者不嵌套。原文保持原位只读，质量报告通过受控引用关联产品证据，不复制另一套业务事实。安装态数据根在 P13 由配置固定。
-
-业务Workspace是持久归属与权限边界，不等于工程workspace、实例数据根或cwd。首版每实例一个真实持久的默认空间，Test与生产使用不同实例及空间；保持FlowmateData/<instanceId>/布局，不增加workspaces/<id>/目录层，不把同一物理根登记给另一空间。运行目录与Session持久根按主方案20.2.1核验，具体判据见3.23。评测不要求多空间UI、成员/RBAC平台或新Workspace服务，也不能据单空间检查宣称多租户隔离。
+业务Workspace仍是产品持久归属与权限边界，不等于评测cwd、目录或Trial。每实例一个真实默认空间，独立试验隔离实例，同一Trial恢复保留原实例；不新增workspaces目录层或多租户服务，不虚构未启用的Job/Run/Session。
 
 ### 1.4 与产品 Agent 工程模块的对应关系
 
@@ -992,7 +1008,7 @@ F 核验授权规则、拒绝后的零实际副作用、事务及恢复不变量
 
 ## 4. 评测资产与数据生命周期
 
-Case 定义输入、目标、初态与约束；Gold 提供核验后的字段、业务结果和允许/禁止行为；Oracle 定义机制契约与不变量；Rubric 将它们转换为检查项；Benchmark 固定成员或采样协议及运行、评分、比较口径，定义集中在benchmarks/；Baseline必须来自实际执行，结果保存在data/并引用相应定义。
+Case 定义输入、目标、初态与约束；Gold 提供核验后的字段、业务结果和允许/禁止行为；Oracle 定义机制契约与不变量；Rubric 将它们转换为检查项；Benchmark 固定成员或采样协议及运行、评分、比较口径，定义集中在benchmarks/；Baseline必须来自实际执行；新结果保存在runs/<executionId>/并引用相应定义，历史结果原位保留。
 
 | 资产 | 必需记录 |
 |---|---|
@@ -1248,7 +1264,7 @@ BM-10保留线上质量观察的覆盖身份。持续变化的监控指标、临
 
 ### 7.1 Scorer定位与场景分工
 
-Scorer即本方案的Grader，统一沿用Grader命名，不新增平行系统。结果、过程、安全是“评什么”，确定性程序、LLM裁判、人工复核是“如何判”；同一Case可以组合多个Grader。能由可靠证据和明确规则判定的检查优先使用确定性Grader，开放性语义使用经校准的LLM裁判，歧义、争议及重要结论的抽检由人工承担。
+业务判定职责沿用Grader命名；Inspect Scorer是其框架适配接口，映射规则见10.8，不新增平行判据或评分系统。结果、过程、安全是“评什么”，确定性程序、LLM裁判、人工复核是“如何判”；同一Case可以组合多个Grader。能由可靠证据和明确规则判定的检查优先使用确定性Grader，开放性语义使用经校准的LLM裁判，歧义、争议及重要结论的抽检由人工承担。
 
 | Flowmate场景 | 主要评分方式与证据 | 补充判断与边界 |
 |---|---|---|
@@ -1965,6 +1981,8 @@ MOD-10/14/22无活动指标，BM-06不参与汇总。输入接入的技术去重
 
 ## 9. 基准执行、可比性与持续回归
 
+执行载体统一为Inspect；阶段集与完整Agent综合集分别预检并通过同一适配器运行，操作及版本绑定见10.7–10.11。Inspect日志状态、产品结果和质量判定分开，不用框架默认重试/聚合覆盖本章的可比性与失败留存要求。线上原始观察和离线重跑使用不同来源标记。
+
 本章执行口径引用8.2及8.9：先导集只用于建立基线与冻结Q/O门槛，正式验收前固定指标/Case/Grader版本、分母、窗口、独立分组、k、重置、预算、绝对质量和允许退化；未完成冻结只能探索。配对比较使用同一固定成员和证据口径，区间方法与多切片策略事前声明；样本不足或区间跨门槛不以点估计通过。报告逐模块指标、核心切片、首次与全部尝试、缺证据/未运行和运行成本，不反复重跑剔除失败。
 
 运行前冻结候选、基线、资产/Grader、环境、主数据时点、模型参数、预算、并发、重试和人工方式。隔离Trial从等价初态开始；恢复场景在同一Trial保留已发生状态，不能擦掉故障换取通过。新运行与历史重评分分开。
@@ -2056,6 +2074,476 @@ PC-01–PC-06是主方案第22.3节的最终能力维度，按阶段积累证据
 
 PC-06不能改称产品“评测中心”。产品功能通过、质量设施自检通过、员工A/B通过和业务授权四项分别验收。质量侧交付可重建资产、实际报告、覆盖缺口和限制，不以页面完成代替任何一项。
 
+### 10.3 Inspect AI：技术选择、实际基线与责任
+
+本节为 2026-09-20 的架构补充，采用 **Inspect AI 执行阶段评测与完整 Agent 综合评测，CLI 发起执行，Inspect View UI 查看进度和结果**。不开发另一套调度平台或评测 UI，不引入 Langfuse。Inspect 的 Task/Solver/Scorer 是 MOD-30–32 的实现载体，不增加业务模块或质量通过条件。产品仍采用 TypeScript/Bun/Pi，质量适配使用 Python；这是跨进程调用，不要求把产品改写成 Python。
+
+选择原因是项目既需要少量高质量阶段任务，也需要最终组合业务、异常、安全和回归任务；Inspect 提供任务组织、评测日志、评分扩展和分析工具。自行开发同类平台会重复这些工作；代价是需要补齐 Python—TS 生命周期适配和产品内部采证。采用 Langfuse 可以改善集中在线观测体验，但本项目当期先落实真实任务执行和判定，不把服务部署纳入早期门槛。
+
+| 核查对象 | 实际状态与证据范围 |
+|---|---|
+| 本机 Inspect | `inspect --version` 返回 `0.3.266`；`python -B -m pip show inspect_ai` 显示 Editable 安装，源码为 `D:\inspect_ai`，包位于 `D:\miniconda3\Lib\site-packages` |
+| Python／命令入口 | `Python 3.13.12`；`D:\miniconda3\python.exe` 与 `D:\miniconda3\Scripts\inspect.exe`；`inspect view --help` 成功 |
+| 上游源码 | 提交 `ec4dfc6953784dc45b79de3147530c89868c6e26`；核查时无工作区差异；View 的 `src/inspect_ai/_view/dist/index.html` 存在，未启动 UI 验证 |
+| 产品入口 | `apps/composition.ts` 已有 `createProduct(options: StartOptions, testHooks?: ProductTestHooks): Promise<StartedProduct>`；`scripts/p0.ts` 提供 P0 CLI；本次只读核对源码，没有重跑历史 P0 验收 |
+| 当前评测代码 | `src/runner/initial_dataset.py` 的 `assemble_benchmark(...)` 是离线选集；`materialize_task(case, project=None, quality=None)` 分离 input/harness/grading；当前产品评分仍阻断。不能把它们称为已接通的 Inspect Solver |
+| 可信证据／评分 | `src/runner/evidence.py` 已有 `load_evidence(run_root: Path, manifest: dict, trusted_adapters: dict) -> dict`，但没有注册实际产品适配器；`grade_observation(case, observation, gold=None)` 对当前产品任务仍不提供可信产品成绩 |
+| 新架构 | Inspect Task、Python/TS 适配、评分映射、分析模块及 `stage-evals/` 均为拟新增；本次只修订文档，不生成运行、成绩或 Baseline |
+
+上述本机路径只描述本次环境，不是其他机器的必需路径。现有 `pip install -e ".[dev]"` 安装可用于接入验证，无需重新克隆；上游源码开发依赖不是 Flowmate 的生产运行依赖。不得在 `D:\inspect_ai` 放项目适配、Case 或 Gold，也不修改上游源码来适应产品。
+
+### 10.4 架构、依赖与输入隔离
+
+```mermaid
+flowchart LR
+  DS[阶段集或综合集：质量侧] --> T[Inspect Task / Sample]
+  T --> PY[Python Solver / 可信控制器]
+  PY -->|仅获准输入与控制命令| TS[TS 适配进程：Bun]
+  TS --> APP[公共 composition / Application]
+  APP --> P[Pi / 产品工具 / 存储]
+  P -->|输出、事件、受控事实| PY
+  PY --> E[可信证据核验]
+  DS -->|Oracle / Gold 仅供质量侧| G[既有 Grader + Inspect Scorer]
+  E --> G
+  G --> L[Inspect 日志 + 质量报告]
+  L --> V[CLI 分析 / Inspect View]
+```
+
+`src/adapters/flowmate.ts` 可以导入公共 `apps/composition.ts`，不能跨入产品私有模块；共享类型从公共 Contracts 导入。它负责消息映射和生命周期，不实现 Runtime、Workflow、业务授权或另一份 SQLite 状态。`flowmate.py` 负责驱动和采证，不直接修改产品业务库来制造成功结果。故障由测试环境与产品公开测试接点提供；场景配置不能作为用户话术、普通产品请求或模型输入透传。
+
+当前 `createProduct` 会拒绝质量根作为 instanceRoot、sourceRoot 或 configPath。因此所有产品实例、获准配置和输入投影位于独立 `FlowmateData/<instanceId>/` 或已授权产品来源根，**不能放在 `agent-eval/runs/` 下**。可信控制器按白名单从夹具提取必要业务材料，经当前产品允许的方式接入；不得复制整份 Case、Gold 或质量目录。产品仍排除整个 `agent-eval/` 的发现/读取；质量侧 TS 适配器所在路径不是给予 Agent 访问该路径的许可。传入路径必须校验 root、真实路径、摘要、用途和当前授权，拒绝越界及链接绕过。
+
+依赖按运行时分别锁定：根 `bun.lock` 是唯一 JS/TS 锁，Pi 及产品测试使用同一组合；拟新增 `agent-eval/pyproject.toml` 与 `agent-eval/uv.lock` 管理唯一 Python 质量环境，不按阶段创建依赖副本。P1 质量接入负责人以本机 Inspect `0.3.266`／上述源码提交及 Python `3.13.12` 为候选核验 Windows、Bun、取消和日志接口，验证后锁定实际来源、版本和摘要。采用发布包时先核对它与候选源码的差异，不能只凭版本字符串视为同一实现。不自动升级、改动现有 Miniconda 或提交本机绝对路径依赖。产品安装包不包含 Python 评测环境。
+
+首期使用自定义 Solver 调用原生产品入口，**不使用 Agent Bridge、不调用 Inspect 内置 Agent 或 `generate()` 代替 Pi**。Inspect 的控制器 model 配置和产品实际模型分别记录；后者来自产品已生效配置和采集证据。Bridge 会代理模型调用且可能改变参数来源，未来启用须形成受控修订并验证行为等价，不能无声切换。
+
+### 10.5 数据怎样准备、阶段集怎样映射
+
+#### 10.5.1 两类数据与最小目录
+
+现有 `data/` 综合材料原样保留，完整 Agent 实现后再进行适用性、引用、Gold 和运行条件核验并启用；它不是当前阶段 Runner 的默认输入。**这是本次确定的后续使用安排**：既有规范原本允许该集合按阶段筛选，不能改写成“原本只用于最终评测”。保留其身份、摘要、核验状态和历史问题，完整 Agent 实现不自动解除这些问题。
+
+阶段数据使用 `stage-evals/Pn/`，当期准备、能力具备后当期执行，**不等待 Agent 全部完成**。每阶段评测数据集不追求数量，只追求质量；规模由必要覆盖、关键风险和可信判定决定，不设配额。少量高质量 Case 不免除必要失败路径；统计推断所需样本量按8.2事前确定，样本不足就限制结论，不宣称稳定性或准确率已经成立。
+
+| 文件 | 必需内容及制作方法 |
+|---|---|
+| `README.md` | 当期能力及 Driving Task、F/A/B适用范围、来源/用途、环境前提、实际入口、Grader和复核触发、已知缺口及前序回归。不存在的入口标为拟新增 |
+| `cases.json` | 集合头保存schemaVersion、stage、version及共享引用，cases数组保存稳定ID/修订、要求/指标引用、F/A/B、覆盖价值、输入及来源、初态、执行步骤/参数/必要故障点、Oracle、Gold引用、正常对照、证据和清理；沿用第5/7章适用契约，不另建庞大Schema |
+| `gold.json` | 仅有正确事实需求时创建；按goldId与Case的goldRef关联，并绑定输入ID/版本。记录原文与规范值、来源定位、规则/容差/等价答案、歧义或不可辨认等状态、Agent是否可获得该信息、真实核验依据。提供方标签和AI草稿不等于已核验Gold |
+| `fixtures/` | 无法仅靠引用或参数表达的补充输入、初态及故障材料；记录真实/合成/变换来源及适用范围。可引用获准来源，不批量复制综合票据或答案 |
+
+Oracle及简短Rubric就地保存在Case；不另建oracles、rubrics、manifest、coverage、reviews目录。Case核验记录写入Case，Gold核验记录写入Gold；实际输出与证据进入运行记录，不能回填为该次输入。无模型F不填模型/Token参数，无业务动作不填审批流程。
+
+**P0统一规则：整理P0阶段资产时建立 `stage-evals/P0/README.md` 和 `cases.json`，索引现有F测试、固定判据和证据；仅补缺少的夹具，不重复实现测试，不要求模型、真实Agent适配器或业务Gold。** 旧报告保留 `reports/p0/`，索引不改变历史结论。本次只修订规范，不实际创建P0或其他阶段目录，也不把目录整理解释为历史验收已通过。P1起按当期真实能力评测A，B在业务能力及独立证据具备时启用。
+
+#### 10.5.2 各阶段准备什么
+
+下表逐阶段定义制作方向，具体退出条款以第11章及同阶段产品方案为准；不提前实现未来能力，不复制适配器。
+
+| 阶段 | 场景和必要材料 | 来源与制作依据 | Gold使用条件 |
+|---|---|---|---|
+| P0 基础 | 输入缺失/损坏/冲突、权限、发布、存储、重启与失败恢复F | 现有产品契约/测试、获准来源、合成故障夹具；用Case索引复用F | 不要求业务Gold，固定错误/状态用Oracle |
+| P1 Runtime | 最小真实任务、完成/失败/取消、有界执行和模型配置 | 获准输入投影、明确的合成事实、当期Runtime契约 | 回答存在事实真值时建立，缺材料处理用Oracle |
+| P2 工具 | 工具选择、参数、结果、失败及权限边界 | 真实工具契约、受控工具环境和独立结果台账 | 工具任务有事实答案时建立 |
+| P3 事件 | 先后、重复、迟到、取消及可观察状态 | 事件契约及可重放的控制夹具，不伪造产品事件 | 通常使用事件/状态Oracle |
+| P4 会话 | 多轮、续接、分支、切换及重启恢复 | 当期会话端口、受控对话历史与身份映射 | 有待保持/纠正的事实时建立 |
+| P5 Context | 相关/无关、冲突/过期材料和可见范围 | 获准资料、版本快照、任务范围与已知来源 | 固定应依据的事实与来源 |
+| P6 Memory | 写入、检索、纠正、失效、跨任务使用及隔离 | 当期记忆契约、受控历史、当前有效性依据 | 固定正确记忆、版本和有效性 |
+| P7 压缩 | 长历史、关键事实/工具关联保留、压缩失败恢复 | 按真实Session格式制作的历史与原始关联 | 固定必须保留的事实及关联 |
+| P8 Workflow | 规则、主数据、关联、歧义、修订、等待及恢复 | 适用业务规则快照、受控修订和合法状态契约 | 业务/决策事实需要Gold，状态用Oracle |
+| P9 资源 | 发现、选择、版本、权限和当前有效性 | 当期Prompt/Skill资源和来源/版本记录 | 使用资源回答有真值时建立 |
+| P10 扩展 | 装载、生效、停用、兼容、权限和清理 | 受控扩展及生命周期契约、兼容环境 | 按扩展任务的事实需求决定 |
+| P11 子Agent | 委派、输入边界、结果回收、预算、取消及隔离 | 当期委派契约、已知子任务输入和独立结果 | 委派产出有事实真值时建立 |
+| P12 完整业务 | 抽取至复核/审批/提交/B2B核对，分别标记三类环境 | 获准票据、业务规则、主数据、独立目标台账 | 字段、关系、载荷和业务结果Gold |
+| P13 Host/运维 | 安装迁移、恢复、版本、获准生产观察和回归 | 安装/恢复契约、受控备份、获准生产权威记录 | 工程行为用Oracle，业务观察用权威事实 |
+
+#### 10.5.3 如何制作和核验
+
+1. **提取要求。** 读取当期三层方案，列出新能力、退出条件、关键风险、受影响前序能力及历史缺陷；将要求关联至Case，未覆盖项写入README。
+2. **选择场景。** 先正常对照、关键失败/恢复、权限/状态边界和缺陷回归；每例说明新增覆盖价值。参数化变体、独立输入、完整任务及实际Trial分别计数，不凑数。
+3. **准备输入和初态。** 工程机制用契约与合成夹具，业务事实用原始材料/规则/独立台账；记录脱敏或裁剪方式。通过正式产品接口建立业务初态，测试控制不代写业务结果。同源、近重复、已暴露材料据实标记；阶段集不读取综合集答案优化当前候选，不称同源材料为未见样本。
+4. **预先建立判据和Gold。** 确定成功、失败、缺证据和允许的替代行为，固定必要项/硬约束。Gold来自独立事实；不从被测回答倒推，不为过关改答案。Agent无法获得答案时，Oracle须检查合理的不确定性处理。开放语义仅在确有需要时启用经校准的裁判；人工复核沿用7.5，不增加所有Case独立签名门槛。
+5. **核验与试跑。** 核对引用、可执行初态、真实故障触发、可信采证、答案隔离、清理与可重复性；Grader执行正例、反例、边界、缺证据自检。缺产品入口可保存设计，登记NOT_RUN与执行阻断，不制造运行结果。
+6. **冻结版本。** 固定成员、输入、Oracle/Gold、Grader、必要阈值和统计分母，再执行正式批次；数据修正形成新版本，禁止按已见候选成绩调整门槛。
+7. **执行和回归交接。** 区分产品缺陷、Agent行为、数据/判据错误与设施异常，保留失败和争议。只重跑受影响范围，向下阶段交接版本引用、缺陷和证据限制；答案修正不记为Agent能力提升。
+
+分别判定：**数据准备完成**（来源、引用、判据和适用核验齐备）、**可以执行**（入口、能力、环境、用途及采证就绪）、**评测完成**（必要用例实际执行、证据可追溯）、**阶段通过**（必要能力、失败路径、回归和适用F/A/B达到门槛）。四者不是同一状态，设施自检不能替代后两者。
+
+#### 10.5.4 资产如何映射到Inspect
+
+| 资产 | 接入位置与可见范围 |
+|---|---|
+| README | 人阅读的范围和操作说明，不作为Agent输入 |
+| cases.json | Task按固定选集加载，生成Sample；只将用户目标及获准材料投影交给Solver |
+| Case中的Oracle/控制配置 | Oracle由Scorer/Grader读取；初态、互动和故障控制仅由质量控制器执行，不能拼进Prompt |
+| gold.json | 质量注册表按Case ID/版本/摘要关联，在评分阶段使用；不传给被测Agent |
+| fixtures | 可见输入通过白名单物化到质量根外；控制夹具留在质量侧。产品仍做权限、归属和有效性检查 |
+| 运行产物 | 保存到runs，CLI执行与Inspect View查看同批次标识；P0既有报告仍保留reports/p0 |
+
+**Case不是一整份发送给Agent的Prompt。** Sample.metadata中的质量关联也不自动变成产品输入。项目拟新增 `load_cases`、`to_sample`、`flowmate_solver`、`flowmate_scorer` 沿用10.6，具体方法不在阶段复制；P0的F索引可直接引用产品测试与报告，不必经过真实Agent Solver。
+
+`scope=stage` 只读所选阶段及固定的前序回归引用；`scope=comprehensive` 在完整Agent及适用条件成立后读取综合集。前序引用固定caseId、版本和摘要；派生场景另建ID并保留parentRef。同一BM编号不使阶段集继承无关综合集的pin drift。
+
+#### 10.5.5 P0权限拒绝：完整设计示例
+
+以下为待整理的Case索引设计，**不是已发布数据、不是本轮测试结果**。复用现有测试 `tests/product/data-flow.test.ts` 中 `enforces operation and purpose grants from the current workspace policy`；当前测试证明错误返回及策略版本，其他证据要求须先核对实际覆盖，不能仅因测试存在就标齐备。入口依据为 [Application契约](../../../packages/contracts/src/ports.ts)、[产品组装](../../../apps/composition.ts)、[Kernel授权](../../../packages/core/src/kernel.ts)。
+
+| 项目 | 固定设计 |
+|---|---|
+| 身份/依据 | `P0-source-inspect-denied`，version=1，F；§3.23 Workspace边界、§11.1 P0、产品主方案§21.1；指标为MOD-09.availability及ALL.block，定义版本绑定本规范实际摘要，不新增同义指标 |
+| 输入/来源 | 不构造模型对话；sourceKey=`voxel51`，purpose=`development`，manifestSha256为获准测试来源清单实际字节摘要，不填写示意hash |
+| 初态 | 质量根外的独立临时产品实例；沿现有fixture选获准样本并登记来源/用途，或制作同契约合成来源。使用createProduct创建，读取真实workspaceId/ownerActorId/version；不得直接改业务库 |
+| 正常对照 | 在仍具有source.inspect权限的独立等价实例调用inspectSource，取得与输入清单绑定的InspectionReport；正常对照失败时不能仅凭拒绝结果证明权限隔离 |
+| 拒绝操作 | 通过publishPolicy保留policy.publish/evidence.read、去除source.inspect；expectedRevision=读取到的workspace.version，policy.version=该值+1。然后以新requestId和真实workspaceId调用inspectSource，sourceKey/摘要/用途与正常对照相同 |
+| 期望 | Promise拒绝，ProductError.descriptor.code=`OPERATION_DENIED`，category=`authorization`；不返回InspectionReport，不进入DataPort.inspect，不注册Document/Artifact或发布数据 |
+| 证据/Oracle | 固定策略变更成功后的基线；保存请求、真实错误、当前策略/Workspace版本及前后权威事实差异。只读查询验证无新增业务事实；要证明未调用DataPort.inspect须补受控F观测，禁止以缺日志推断未访问。正常对照和必要证据齐备才能确认该检查PASS |
+| 故障/边界 | 操作拒绝由正式策略变更触发，无测试钩子绕过授权。用途变体另建等价实例，或通过publishPolicy恢复source.inspect并保留policy.publish/evidence.read；grant.purposes与source.allowedPurposes均仅允许development，sourceKey及摘要保持一致。先以purpose=`development`验证inspectSource成功，再以新requestId和purpose=`regression`验证OPERATION_DENIED；不能沿用缺source.inspect的初态证明用途隔离。初态未建立时阻断依赖执行；正常对照失败按证据区分产品FAIL、设施ERROR或缺证据UNJUDGEABLE，不当作正确拒绝 |
+| 清理 | finally显式await product.close()，核对closed及cleanupErrors，关闭失败保留证据并停止复用；恢复测试设置的环境变量，只删除已确认关闭的本次临时根，不改原来源 |
+| 核验/Gold | 索引待制作、本轮未执行；Gold不适用。复用历史F前按9章核对代码、配置、输入、环境、覆盖范围和完整证据 |
+
+上述方法的**现有公共签名**如下（节选，不是新增接口）；Request含requestId/workspaceId，主体由组装可信绑定，Case不能伪造actorId注入请求：
+
+```typescript
+// apps/composition.ts
+export async function createProduct(options: StartOptions, testHooks?: ProductTestHooks): Promise<StartedProduct>;
+// packages/contracts/src/ports.ts：Application成员
+getWorkspace(req: Request): Promise<WorkspaceView>;
+publishPolicy(req: Request, input: { expectedRevision: number; policy: WorkspacePolicy }): Promise<WorkspaceView>;
+inspectSource(req: Request, input: { sourceKey: string; manifestSha256: string; purpose: Purpose }): Promise<InspectionReport>;
+// StartedProduct成员；Purpose当前为'development' | 'regression'
+close(): Promise<CloseReport>;
+```
+
+StartOptions的instanceRoot必填且在质量根外，mode=`create`；configPath可选，用于锁定该测试sourceRoot。testHooks本例不传。expectedRevision为当前workspace.version，policy.version为当前值+1；其余source注册保持原有获准值。请求ID每次新建，摘要由实际输入计算，不以固定假值满足校验。
+
+#### 10.5.6 P1有据回答：Case与Gold对应设计
+
+以下是**拟新增阶段数据的文档示例**，非已发布用例或真实成绩。使用明确合成且非原票的输入，避免为演示消费综合集答案。实际进入P1时按第5章核验并冻结字段，本轮不生成文件。
+
+合成输入 `currency-note/v1` 的完整内容为 `票据示例：币种为 CNY。`，UTF-8无BOM、无换行。输入由质量侧记录合成来源，经P1公共输入通道交付；质量路径不得直接传入产品。此例只验证模型利用已交付文本，不证明OCR、字段抽取或工具读取能力。
+
+```json
+{
+  "schemaVersion": "stage-cases/v1", "stage": "P1", "version": 1,
+  "cases": [{
+    "id": "P1-currency-grounded", "version": 1, "evidenceKind": "A",
+    "requirements": ["11.2", "RT-01", "RT-03"],
+    "coverage": "最小真实模型能依据明确可见事实回答，且不增加无依据币种",
+    "input": {"goal": "仅依据以下材料说明币种，并引用支持片段：票据示例：币种为 CNY。", "documentRefs": []},
+    "sourceRefs": [{"id": "currency-note", "version": 1, "kind": "synthetic", "location": "input.goal中的材料段"}],
+    "setup": {"scenario": "fresh-instance", "history": "empty"},
+    "execution": {"entry": "10.6 AdapterCommand.submit", "implementationStatus": "planned"},
+    "oracle": {"checks": [
+      {"id": "correct-currency", "required": true, "metricRefs": ["MOD-11.fields", "MOD-11.evidence"], "rule": "回答CNY或人民币，并引用材料中的支持片段，不提出另一币种", "evidence": ["final-output", "input-binding"]},
+      {"id": "quality-isolation", "required": true, "hardConstraint": true, "metricRefs": ["MOD-30.isolation"], "rule": "被测模型输入不含Gold、Oracle或控制配置", "evidence": ["model-input", "input-binding"]}
+    ]},
+    "goldRef": "P1-gold-currency-v1",
+    "controlRefs": ["P1-currency-missing@1"],
+    "cleanup": "显式close并核对清理结果，只回收本Trial临时实例",
+    "review": {"status": "design_only", "basis": "文档中的合成材料，尚未制作为冻结资产"}
+  }]
+}
+```
+
+```json
+{
+  "schemaVersion": "stage-gold/v1", "stage": "P1", "version": 1,
+  "items": [{
+    "goldId": "P1-gold-currency-v1", "version": 1,
+    "inputRef": {"id": "currency-note", "version": 1},
+    "facts": [{"field": "currency", "raw": "CNY", "normalized": "CNY", "equivalents": ["人民币"], "status": "known", "tolerance": null,
+      "source": {"location": "input.goal中的材料段", "quote": "币种为 CNY"}, "availableToAgent": true}],
+    "review": {"status": "design_only", "basis": "从预先给定的合成文本确定，不来自被测回答"}
+  }]
+}
+```
+
+示例中的design_only是资产制作记录，不是评分状态；正式Loader字段实现仍待I2，不能交给旧initial_contract直接假定通过。schemaVersion用于这一拟新增阶段包装，不更改现有综合集schemaVersion。metricRefs沿用§8定义，定义版本由本规范实际摘要固定；Grader实现及版本在运行绑定中冻结，不用示例占位hash。MOD-11.fields/evidence在此仅覆盖合成文本的单一币种和来源片段，不推断真实发票抽取质量。quality-isolation属于该任务的必要设施F检查，单列MOD-30.isolation及其分母，不计为额外A Trial，也不能用设施通过替代correct-currency行为判定。
+
+| 项目 | 执行和判定要求 |
+|---|---|
+| 入口/参数 | 拟新增stage(stage=`P1`, config=该批次固定配置路径) → flowmate_solver → execute_trial → 10.6的submit(input=上述input)；产品Agent入口尚未实现，缺入口登记NOT_RUN及执行阻断。使用真实Pi模型配置，首期开发探针并发1、epoch1及超时沿10.6；不是质量阈值 |
+| 初态/操作 | 新Trial独立实例、空历史；冻结产品/模型/配置和输入；start取得真实身份，再submit；保存实际模型可见输入、最终回答及版本关联；输入没有工具任务，不强求一次工具调用 |
+| 正常判据 | 独立Gold核对币种和引用；确定性检查事实匹配及来源片段，完整语义中的矛盾/捏造由已登记工程核验人按Oracle复核，记录依据。未完成适用复核不确认通过，不以关键词出现自动PASS，不必为本例启用LLM Judge |
+| 业务缺材料对照 | `P1-currency-missing@1`使用同等独立初态，goal=`当前没有提供票据材料。请说明能否确认币种；不能确认时明确说明。`，documentRefs=[]，无Gold。指标为MOD-11.uncertainty；应说明无法确认且不猜币种，有真实空输入绑定时可通过该对照，不因无法回答直接FAIL |
+| 采证缺失自检 | 使用合成观测或质量侧证据副本移除input-binding，验证Grader返回UNJUDGEABLE；若证据采集器报错则记ERROR并保留归因。这是设施自检，不计真实A Trial，不篡改原始日志 |
+| 禁止副作用 | 不读取质量根、泄漏答案、修改来源或执行业务提交。能否证明禁止行为取决于可信输入/访问/动作证据；必要证据缺失时不确认对应隔离项通过 |
+| 清理/恢复 | 无业务写操作也须close确认；超时按10.7 cancel再close，未确认停止不开始冲突执行。只回收本Trial临时根；保留失败日志。恢复与新Trial不得混计 |
+| 冻结条件 | 同批次制作并固定缺材料对照、Gold与Grader引用；记录实际数据核验和适用复核。文档示例本身不构成可执行集合；不填写不存在的核验人或通过结果 |
+
+#### 10.5.7 版本、依赖与兼容边界
+
+每次运行按9章及10.7固定Case/Gold/输入/Oracle/Grader的版本与摘要、产品提交及工作区差异、配置/模型/依赖锁和环境、范围与分母；实际值写入运行binding记录，不另建阶段manifest。Gold不适用显式记录，不用空文件假装核验。前序F复用必须核对上述绑定、适用范围和证据完整性；数据、判据或评分器修订生成新版本，旧结果保持原依据，跨版本比较说明差异或按固定新版本重跑双方。
+
+三项既有问题按实际依赖处理：综合集Case/Oracle待复核只影响使用该资产的结论；用途not_verified仍需核实当期材料及用途，换目录不解除；11份Benchmark定义pin drift保留为旧集合问题，不自动阻断未依赖它的阶段F。产品业务审批与评测复核也不合并为一个门槛。
+
+以下为2026-09-20对代码的只读核查，本轮没有运行这些命令或修改其实现：
+
+| 当前兼容缺口与依据 | 后续归属及解除条件 |
+|---|---|
+| `src/runner/initial_dataset.py` 的assemble_benchmark仍按现有综合清单装配，--stage筛选该集合；没有stage-evals加载器 | I2建立10.6 load_cases及显式stage/comprehensive入口；合成自检证明stage入口只访问所选阶段和固定前序引用，综合集缺失/漂移不污染无关阶段 |
+| [P0报告脚本](../../../scripts/p0-verify-published.ts)固定写入formal-case-oracle-review-pending、data-use-authorization-not-verified、benchmark-definition-pin-drift | 后续P0报告兼容维护：按实际材料/用途/Oracle/Benchmark依赖生成阻断及依据。测试不依赖旧集的F不继承无关阻断，真正依赖及用途未核实仍保留；与I3的证据复用契约对齐。本轮不删除条件、不重跑发布、不自动升级confirmedPass |
+| 本次规范修改改变规范摘要，旧清单及P0报告仍绑定旧版本 | 复用时由相应阶段负责人记录适用性复核；启用综合集前受控核对pin、Oracle/Gold与运行资格。保留旧报告，不覆盖或重签历史；新判断生成独立记录 |
+
+阶段目录、Inspect安装、离线装配和设施自检均不能证明真实Agent接入。正式适配与真实评测仍由10.12的后续工作包完成。
+
+
+### 10.6 拟新增接口与进程协议
+
+以下是 **Flowmate 项目拟新增接口**，不是 Inspect 自带 API，也不宣称产品已有 Agent 运行方法。实际实现放在第1.3节指定的 src 文件，不为每个阶段新建同名实现。
+
+```python
+# src/runner/inspect_tasks.py；以下模型均为拟新增的项目契约
+from pathlib import Path
+from typing import Literal, TypedDict
+from inspect_ai import Task
+from inspect_ai.dataset import Sample
+from inspect_ai.solver import Solver
+from inspect_ai.scorer import Score, Scorer
+
+class Selection(TypedDict):
+    scope: Literal["stage", "comprehensive"]
+    stage: str | None
+    case_ids: list[str]
+    split: Literal["development", "regression", "acceptance"]
+
+class SelectedCase(TypedDict):
+    case_id: str
+    version: int
+    input_projection: dict[str, object]
+    oracle: dict[str, object]
+    gold: dict[str, object] | None
+    fixed_refs: dict[str, str]
+
+class TrialResult(TypedDict):
+    execution_id: str
+    trial_id: str
+    disposition: Literal["completed", "cancelled", "error"]
+    output: str | None
+    evidence_manifest: Path | None
+    cleanup_confirmed: bool
+
+class TrialContext(TypedDict):
+    execution_id: str
+    trial_id: str
+    instance_root: Path
+    run_root: Path
+    product_config: Path
+    timeout_ms: int
+    stop_grace_ms: int
+
+def load_cases(selection: Selection, *, project_root: Path) -> list[SelectedCase]: ...
+def to_sample(case: SelectedCase) -> Sample: ...
+def stage(stage: str, config: str) -> Task: ...      # 注册为 Inspect @task
+def comprehensive(config: str) -> Task: ...        # 同一执行/评分路径，不另建 Runner
+# src/adapters/flowmate.py
+def flowmate_solver(config: str) -> Solver: ...
+async def execute_trial(case: SelectedCase, context: TrialContext) -> TrialResult: ...
+# src/graders/inspect_scores.py
+def flowmate_scorer() -> Scorer: ...
+def to_inspect_score(check_result: dict[str, object]) -> Score: ...
+```
+
+`to_sample` 使用 Case 的稳定 ID；Sample.input 仅承载投影后的用户输入，Sample.metadata 保存质量关联而非直接拼进 Prompt，Gold/Oracle 在质量注册表中以 Case ID/摘要查找。Solver 每次只取允许的投影字段，禁止把 `state`、Sample.metadata 或完整 SelectedCase 序列化发送给 TS。Scorer 返回值遵循10.8，不直接把项目五态传入 Inspect 内置 accuracy 后假设语义一致。
+
+```typescript
+// src/adapters/flowmate.ts；拟新增的适配契约，产品类型复用公共 Contracts
+type WireVersion = 'flowmate-eval-wire/v1';
+type InputRef = { root: 'approved-source' | 'instance'; relativePath: string; sha256: string };
+type UserInput = { goal: string; documentRefs: readonly InputRef[] };
+type RequestEnvelope = {
+  protocol: WireVersion; executionId: string; trialId: string; requestId: string;
+};
+type AdapterCommand = RequestEnvelope & (
+  | { kind: 'start'; instanceRoot: string; configPath: string; mode: 'create' | 'open' }
+  | { kind: 'submit'; input: UserInput }
+  | { kind: 'cancel'; targetRequestId: string; reason: 'timeout' | 'user' | 'shutdown' }
+  | { kind: 'close' }
+);
+type ArtifactEvidence = {
+  root: 'instance'; relativePath: string; sha256: string; bytes: number;
+};
+type ProductEvent = {
+  eventId: string; kind: string; occurredAt: string; durationMs?: number;
+  correlation: { instanceId: string; workspaceId: string; processInstanceId: string;
+    runId?: string; callId?: string; parentCallId?: string };
+  safeData: Readonly<Record<string, unknown>>;
+};
+type AdapterMessage = RequestEnvelope & { seq: number } & (
+  | { kind: 'ready'; instanceId: string; workspaceId: string; processInstanceId: string }
+  | { kind: 'event'; event: ProductEvent }
+  | { kind: 'result'; output: string; evidence: readonly ArtifactEvidence[] }
+  | { kind: 'cancelled'; targetRequestId: string; stopped: boolean }
+  | { kind: 'closed'; closed: boolean; cleanupErrors: readonly string[] }
+  | { kind: 'error'; code: string; safeMessage: string }
+);
+declare function serveAdapter(): Promise<void>;
+```
+
+`start` 映射现有 `createProduct` 的 `StartOptions`；`close` 调用真实 `StartedProduct.close()`。当前没有 Agent submit/cancel Application 方法，P1 产品工作包必须先提供公开运行/停止契约，适配层再映射；未具备时预检 NOT_RUN，不用 P0 的读取命令冒充 Agent 执行。协议错误由适配层描述，产品错误按现有 ErrorDescriptor 脱敏投影，不能吞掉错误归属。Tool/Session/Workflow 等事件只在对应能力实现后纳入，未知字段不得自动作为获准扩展。
+
+| 参数／约束 | 语义、初始值和校验 |
+|---|---|
+| protocol、executionId、trialId、requestId | 必填；批次/Trial身份由质量控制器生成，requestId关联命令；与实际产品 Run 分开。跨Trial消息、未知协议、重复终结消息拒绝或记录协议故障，不凭字符串自报建立证据信任 |
+| seq、eventId、correlation | seq从1递增，作用域为当前适配进程；产品eventId/实际对象ID保持原值。重启登记新processInstanceId，旧事件不能串入新执行；接收顺序不替代业务因果顺序 |
+| config、instanceRoot、InputRef | config必填，无隐式默认模型；配置路径及输入投影交付到质量根以外。路径先校验再打开，摘要只证明字节，授权/归属/当前状态仍由产品检查 |
+| 并发、重复 | P1工程初始值：Trial并发1、epoch 1；后续在隔离和预算验证后事前冻结。不是稳定性结论或正式样本数门槛 |
+| timeoutMs、stopGraceMs | P1开发探针初始值120000ms、10000ms，正整数且Case覆盖受批次总预算约束；到时发送cancel，等待真实stopped和close。后续长流程按当期预算固定，不能套用P1值判业务失败 |
+| 消息边界 | UTF-8 NDJSON，一行一消息；每帧初始上限1MiB，大输出用受控Artifact。流式读取，不等待EOF才处理取消；stdout额外文本、非法JSON、超限和缺终结分别归设施错误或产品故障证据，不截断后继续评分 |
+| 输出及事件 | 只交付声明的安全字段，禁止凭据、隐藏思维和完整质量材料；未采集的时长/用量留缺口，不填0。Frame和缓冲区限额是工程保护值，实施自检后冻结 |
+
+TS 适配的 `submit` 必须以可并行受理 cancel 的方式调度，不在命令读取循环里串行等待整个 Agent 完成；每实例只允许当期产品契约许可的活动执行。`close` 幂等，收尾放在 finally；强制终止仅针对控制器拥有且确认身份的测试进程及子进程，记录未确认清理，不能据退出码声称外部业务动作未发生。Windows 进程树终止和 Bun 资源释放是P1实测项，不假设 POSIX 信号行为。
+
+### 10.7 执行、恢复及异常路径
+
+```mermaid
+sequenceDiagram
+  participant Q as Inspect/质量控制器
+  participant A as TS适配
+  participant P as 产品Application/Pi
+  participant E as 证据与评分
+  Q->>Q: 固定选集、版本、输入、预算；预检
+  Q->>A: start（独立产品实例与获准配置）
+  A->>P: createProduct
+  A-->>Q: ready（真实身份）
+  Q->>A: submit（仅获准投影）
+  A->>P: 当期公开执行入口
+  P-->>A: 实际事件、输出及持久事实引用
+  A-->>Q: event/result
+  alt 超时或用户取消
+    Q->>A: cancel
+    A->>P: 请求停止并核验实际状态
+    A-->>Q: cancelled（是否实际停止）
+  end
+  Q->>A: close
+  A->>P: 显式关闭、flush及资源释放
+  A-->>Q: closed/cleanupErrors
+  Q->>E: 固定采集窗口、核验原始证据及缺口
+  E-->>Q: 检查项判定、Inspect日志与报告
+```
+
+每个独立 Trial 从隔离初态启动，不共享可写实例；同一 Trial 的多轮、纠正及重启恢复保留产品状态，通过产品公开入口进行。Inspect sample/epoch不能直接当产品runId；一个Trial可能对应多个合法产品Run，按实际阶段记录一对多关联。P0没有Run/Session时不补造。
+
+| 失败点 | 行为与判定边界 |
+|---|---|
+| 配置/能力/来源预检不成立 | 记录执行资格blocked和NOT_RUN，缺口范围可见，不隐式切模型或过滤必需Case |
+| 真实工具故障、错误行为、合法预算耗尽 | 保留产品事件，按Case预设条件评分；被测故障不自动归为设施ERROR |
+| 协议损坏、采集器故障或进程未能启动 | 记录ERROR及来源，其他有充分证据的检查仍保留；不声称模型能力失败 |
+| result到达但证据不全/身份错配 | 缺证据UNJUDGEABLE；若采集器故障为ERROR；确认产品违反必须留存约束时另项FAIL。result不是提交证明 |
+| 提交响应丢失/业务UNKNOWN | 用原动作身份经产品查询核对，不因Inspect重试重发；合法保留UNKNOWN可满足恢复检查但不计业务完成 |
+| cancel无实际停止或close失败 | 保留清理缺口，阻断该实例复用/冲突执行；独立核验是否产品违反停止契约，不只检查ACK |
+| 中断后续跑 | 核对批次、代码/数据/判据版本、Case稳定身份及未完成副作用；已完成样本仅在同一固定组合复用，业务恢复与新的独立试验分开 |
+
+首期样本/任务自动重试关闭，`eval-set`只允许一次尝试且保留失败日志；后续有界设施重试须预先声明幂等和初态重建条件。模型重试、工具重试和Inspect任务重试分别记录，不能选最好一次作为原始成绩。缓存、清理及续跑策略进入配置锁，版本改变新建executionId，不在原日志目录“续跑”不同候选。
+
+### 10.8 评分映射、证据与报告
+
+Scorer复用第7章Grader职责，不新增平行判据。先由受信采集器核验文件摘要、Case/Trial/产品身份、完整观察窗口及控制器登记，再交给Grader。现有 `load_evidence` 的 `trusted_adapters` 注册由质量代码控制，模型输出不能指定可信回调；文件摘要正确本身不证明来源可信。旧接口缺乏新字段时增加显式版本适配与正反自检，不能绕过 `VerifiedObservation` 封装或删除当前产品未接入保护。
+
+Inspect原生日志状态success/error/cancelled只表明评测执行状态；产品进程exit=0只表明命令结束；二者均不等于Case PASS。拟采用 `Score.value` 保存项目判定字符串，`metadata`保存checks、适用性、缺口、证据引用和原始数值，`answer`保存实际可披露输出，`explanation`给判定理由。示例：
+
+```python
+# 拟新增评分映射示意，非一次实际判定；不使用内置accuracy解释项目五态
+Score(value="UNJUDGEABLE", answer="已保存", explanation="缺少提交后的持久事实证据",
+      metadata={"applicable": True, "required": True, "checkId": "durable-save",
+                "evidenceRefs": [], "numericScore": None})
+```
+
+不适用通过 `metadata.applicable=false` 标记，显示层可用“N/A”但不是新增业务判定状态。执行阻断用executionEligibility/blockers，尚未执行检查为NOT_RUN。自定义metric按第7.7/8章分别计算计划、适用、执行、可判定、确认通过和各异常计数；禁止对这些字符串调用通用平均/正确率并把未知值算0。Inspect日志中途失败而未到Scorer时，报告以预检冻结的计划清单补列未完成项，不能遗漏样本。Case所需人工复核只在第7.5的适用触发条件成立时要求，不新增全体Case必须独立人工签名。
+
+原始数据集不保存成绩。新运行使用 `runs/<executionId>/`：Inspect `.eval` 日志、`binding.json`（版本/计划/范围）、`evidence/`（质量采集凭证或受控引用）、`report.json`（完整判定）为最小布局。生成报告只从固定日志和核验证据计算，Inspect View消费同一日志；更改评分器产生新的评分修订和原结果关联，不覆盖历史。已有P0的 `reports/p0/` 保持原位置和摘要，不迁移或重写。
+
+binding至少固定代码commit及dirty差异摘要、Bun/Python依赖锁与实际源码版本、产品/评测规范、模型/参数/Prompt/资源配置、Case/Gold/Oracle/Grader/适配器版本、输入清单、OS/运行时、环境、实例/空间及采集窗口。秘密只记录安全身份/版本，不记录值。正式接口schema和字段必需性在P1随类型验证固定，报告模板不填虚构通过值。
+
+### 10.9 CLI 操作手册：现在与实施后
+
+**现在可执行的只读检查**（项目根PowerShell；不调用模型、不发布数据）：
+
+```powershell
+python -B --version
+python -B -m pip show inspect_ai
+inspect --version
+inspect eval --help
+inspect eval-set --help
+inspect view --help
+```
+
+这些命令验证安装及命令入口，不证明Flowmate适配完成。旧 `initial_dataset.py` 仅用于综合材料的离线选择/核验，不能作为新阶段的实际执行命令；prepare/publish不是评测启动步骤，本次不运行。
+
+**实施后使用**：I1工作包建立锁定的质量环境，开发可使用已核验的本机安装；正式运行必须匹配锁定环境。I2/I3创建下述Task、配置与评分后，I4才开放执行。以下是假定创建 `config/p1.json` 和 `config/comprehensive.json` 后的命令模板，**现在不能用于获得产品成绩**：
+
+```powershell
+# 从 D:/code/Flowmate 执行；先在已锁定质量环境中激活 inspect
+# 单阶段：stage()/flowmate_solver()由I2创建；并发/重复为P1开发初始值
+inspect eval agent-eval/src/runner/inspect_tasks.py@stage -T stage=P1 -T config=agent-eval/config/p1.json --model mockllm/model --max-samples 1 --epochs 1 --log-dir agent-eval/runs/p1-development-001
+# 完整Agent实现、综合材料及测试条件核验后，运行正式套件
+inspect eval-set agent-eval/src/runner/inspect_tasks.py@comprehensive -T config=agent-eval/config/comprehensive.json --model mockllm/model --max-samples 1 --max-tasks 1 --epochs 1 --retry-attempts 0 --incomplete-action error --no-retry-cleanup --log-dir agent-eval/runs/comprehensive-001
+```
+
+`mockllm/model`仅是Inspect控制器需要的显式本地占位配置，**不是被测模型、替身Agent或A成绩来源**。自定义Solver不调用Inspect `generate()`，实际模型由Flowmate配置启动并以产品证据绑定；设施自检必须断言控制器模型请求数为0。若发生占位模型调用即视为适配错误，不能静默以其输出评分。报告和UI中明确 `executionMode=external-product`、实际 productModel，并展示控制器标记，禁止将Inspect model列直接作为产品模型统计。后续启用LLM Judge时另设明确模型角色、预算及费用，不能复用占位配置。
+
+Task在装配阶段执行预检；`config`必填，解析为绝对路径，只允许质量侧配置字段，不交给产品直接加载。最小配置保存scope、stage、case选择/split、允许测试环境、实际产品配置引用、模型和输入绑定、并发、epoch、timeoutMs、stopGraceMs、消息上限、重试策略及预算。模型凭据从执行环境安全注入，不写入JSON、命令行或日志。预算在首次Live前由P1质量/产品负责人冻结，缺费用单价可测Token但费用保持未知；缺执行预算则不发起Live，不靠无限默认值运行。
+
+本机0.3.266默认即时重试模式下，`--retry-attempts 0`才表示零次额外任务重试；`1`会允许额外一次。`--incomplete-action error`用于避免直接把中断样本当成可重试，但不是副作用保护的全部依据：初次执行的log-dir必须不存在，控制器以排他方式创建；发现既存中断日志先拒绝普通启动，受控恢复经10.7核验后另行执行，不能依赖框架阈值回退策略自动恢复。I2自检覆盖该前置检查。
+
+`--model`不会替外部Flowmate切换模型；比较模型/候选必须分别创建固定的产品配置和executionId。运行ID示例只说明命名，真实命令使用新的唯一ID；继续同批次必须满足10.7。Python依赖通过 `uv sync --locked --project agent-eval` 等命令恢复仅在I1创建锁之后可用，不将现在的安装环境冒充已锁定。
+
+### 10.10 Inspect View：查看而非另建执行平台
+
+I4产生实际 `.eval` 日志后，使用已核验的Inspect环境执行：
+
+```powershell
+inspect view --log-dir D:/code/Flowmate/agent-eval/runs --recursive
+```
+
+默认本地地址为 `http://127.0.0.1:7575`。按运行ID/任务选择日志，查看完成样本及正在执行的进度；进入样本查看Messages、Scoring、Metadata，依据checkId和证据引用复核失败。评分元数据保留实际产品模型、版本和环境；外部进程内部事件只有经适配器采集并通过Inspect公开日志接口记录后才可见，不能承诺自动显示全部工具树。未转换的事件保留受控证据引用并说明UI展示缺口。
+
+Inspect View中的评分调整不能静默改变正式报告；采用重评分修订保留原判。证据链接只允许绑定批次中的受控资源，不开放任意本地文件浏览；离线导出前按数据用途与脱敏范围审核。VS Code扩展可选，不是使用前提；本地端口占用时选择另一端口，不主动终止用户已有查看器。UI为空只说明没有可见评测日志，不能据此判产品没有失败。
+
+### 10.11 分析：失败、耗时、版本质量与成本
+
+Inspect已有 `evals_df()`、`samples_df()`、`events_df()`，分析落在拟新增 `src/analysis.py`，不另建分析服务。原生评测字段按锁定版本读取，产品字段从已核验的report/binding关联；不是假设所有外部产品用量已自动进入Inspect原生model_usage。
+
+```python
+# 官方读取API；只有存在真实Inspect日志后才有可分析数据
+from inspect_ai.analysis import evals_df, samples_df, events_df
+evaluations = evals_df("agent-eval/runs")
+samples = samples_df("agent-eval/runs")
+events = events_df("agent-eval/runs")
+```
+
+I4由analysis.py将产品证据和评分映射为两个只读分析视图，不另存可独立修改的成绩：`trials`含trial_id/case_id/版本、task_type、verdict、applicable、产品/设施错误、时间窗、tokens及费用口径；`calls`含trial_id/call_id/parent_call_id、kind/name、duration_ms及采集完整性。`load_trial_analysis(run_root: Path)`、`load_call_analysis(run_root: Path)`拟返回Pandas DataFrame；缺必需字段报缺口，不以默认0补齐。以下为基于这些**拟新增视图**的查询示例：
+
+```python
+# 示例查询，无实测输出；trials/calls由受信报告映射产生
+status_counts = trials.groupby(["product_version", "task_type", "verdict"]).size()
+latency = calls.groupby(["kind", "name"])["duration_ms"].agg(["count", "median", "max"])
+failures = trials.loc[trials["verdict"] == "FAIL", ["case_id", "trial_id", "product_version"]]
+```
+
+失败分析同时报告计划/适用/执行分母和ERROR、UNJUDGEABLE、NOT_RUN，不只选日志success样本。耗时区分调用持续时间、重试累计、排队/人工等待与端到端墙钟时间；并行及父子调用不能重复累加为任务耗时。成本用模型实际输入/输出/缓存用量与价格版本估算，Agent与Judge分列；缺单价或用量标unknown，实际账单另作对账，不把Token数叫费用。
+
+版本比较固定Case/Gold/评分及环境，保留同一Case的重复轮次和统计区间；质量变化与数据分布变化分别解释。线上分析需P13获准的只读采集及留存，记录`production-original`和`evaluation-replay`来源；事后重跑不能代表原线上执行。产品没有导出内部事件、真实业务结果或费用时，Inspect不能自行推断这些事实。
+
+### 10.12 实施工作包与验收
+
+以下是后续接入工作，不由本次文档修订代为完成；代码文件仅按需要创建。
+
+| 工作包／归属 | 交付及接口 | 完成条件 |
+|---|---|---|
+| I1，P1质量接入负责人 | pyproject/uv锁、版本/环境预检，验证本机候选及Windows/Bun组合 | 环境可复现、import/CLI/View兼容；无秘密；产品Bun锁不分叉；记录真实验证结果 |
+| I2，P1产品与质量负责人 | 产品公开Agent执行/取消入口；inspect_tasks.py、flowmate.py/.ts、版本化消息与输入投影 | 经真实Pi执行单Trial；输入隔离；正常关闭、超时取消、stdout污染/大消息、身份错配与重启均有证据；无Inspect占位模型请求 |
+| I3，P1质量负责人 | inspect_scores.py、可信采证注册、自定义metric与报告 | 正例、反例、合法替代路径、缺证据、错误及零分母自检；硬约束不被平均；不能伪造来源；设施成绩不算A/B |
+| I4，P1起按能力增加 | CLI/Inspect View流程、analysis.py、真实日志与报告 | 运行/查看同一批次；失败可定位、原始失败保留；外部模型/用量来源明确；版本漂移拒绝复用 |
+| I5，P2–P13增量 | 当期任务/Gold、事件与多轮、工作流、子Agent、综合套件及后续生产只读观察 | 各阶段按第11章新增和回归；最终综合集启用前核验，不提前要求未来能力 |
+
+验收必须包含：正常真实任务；业务错误；缺证据；摘要/身份/版本错配；Gold/质量路径泄漏；故障注入与设施错误区分；超时取消/未释放进程；响应丢失与禁止重复副作用；任务重试保留原失败；固定集版本比较。只有在相应产品能力存在时执行相关场景，不能通过扩展评测框架提前实现后期产品功能。
+
+阶段数据和运行产物包含质量答案或业务材料，I1同步项目忽略规则：stage-evals和runs默认私有，Python环境不提交；可提交合成夹具集中于tests/fixtures。配置模板不含秘密。本次没有创建数据/环境目录，也不改用户已有.gitignore。
+
+本次规范修订会改变规范文件摘要。现有综合清单和P0历史报告保留原绑定；未来启用或复用时进行受控适用性复核，不能自动重签清单消除pin drift，也不能因为旧综合集未对齐而阻断不依赖它的阶段F。修订文档不等于Inspect已接入、不改变历史P0通过/待复核事实、不产生生产写权限。
+
+
 ## 11. P0–P13：Agent Harness 功能模块驱动的评测能力增量
 
 每阶段以下“量化指标与门禁”引用第8章集中定义，首次适用不表示该模块全部子能力已具备；按现有阶段边界及启用模式展开。ALL覆盖、状态/链路、当前安全、成本/时延适用于当期实际对象，P0不生成模型/Run/Session指标。Q指标同时保留能力探索、必需交付和回归子集；首次引入LLM裁判时增加MOD-32.false-pass、MOD-32.false-reject、MOD-32.evidence校准门禁，不设固定提前阶段。
@@ -2065,6 +2553,8 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 每阶段交接包统一包含：冻结Case、Gold/Oracle、适用Grader或人工判据、Benchmark subset及版本、实际报告、Bad Case、Regression Set、已知限制与Owner。尚不适用的资产明确注明；P0不补造Runner、Runtime Benchmark或Agent成绩。
 
 ### 11.1 P0：Harness Foundation 评测
+
+Inspect架构适用性：P0继续复用真实产品F和资产核验，不把Inspect安装、适配或模型执行设为P0退出条件。整理P0阶段资料时建立README.md和cases.json，索引必要F/Oracle及证据；仅补缺少夹具，旧reports/p0保留，A/B不适用，不改变历史结论。现有综合集不用于启动P0评测。
 
 **核心指标与测法：** 按8.1.4“输入接入”、8.1.5“基础组装与公共入口／数据库、文件与Host／日志与审计／备份、保留与清理”的当期部分及8.1.6“评测资产与隔离”执行；P0不运行后期Host和模型能力。 验收须按8.1.2核对准备、实际执行、评分证据和冻结目标；安全场景随当期入口执行8.1.7。
 
@@ -2111,6 +2601,8 @@ PC-06不能改称产品“评测中心”。产品功能通过、质量设施自
 **向下一阶段交接：** 基础Case/Oracle、人工核验与产品F报告、输入/配置锁及隔离约束、默认Workspace身份/环境映射与归属判据、Bad Case和P1回归种子；Grader实现及Agent Benchmark注明未建立。
 
 ### 11.2 P1：Agent Runtime Core 评测
+
+设施实施采用10.12的I1–I4最小范围：锁定Inspect环境，打通真实TS/Bun产品入口、单Trial、确定性Scorer、日志和显式关闭；使用stage-evals/P1当期数据。后续能力只增加Case/采证/判据，复用同一框架。尚无真实适配时保留NOT_RUN，不从旧离线装配中制造A成绩。
 
 **核心指标与测法：** 按8.1.3“配置与版本绑定／模型调用与Agent循环／Agent任务理解与完成”、8.1.4字段局部任务及8.1.6执行器、评分器方法执行；只检验本阶段可用入口与证据。 验收须按8.1.2核对准备、实际执行、评分证据和冻结目标；安全场景随当期入口执行8.1.7。
 
@@ -2892,6 +3384,8 @@ Workspace横切证据从P0身份/映射继承至清单、Scope、Context、Job/S
 
 ### 11.16 阶段连续性与回归继承
 
+每阶段当期建立stage-evals/Pn，质量优先、按必要覆盖制作，具体内容与Gold需求见10.5。Agent完整实现后才启用现有data综合材料，使用同一Inspect Task/Solver/Scorer及Eval Sets组织最终套件；这不延后开发期阶段评测，也不把完整Agent实现等同于生产放行。
+
 | 交接 | 必须保持的连续性 |
 |---|---|
 | P0→P1→P2 | P0以真实文档/清单引用验证输入和基础存储，不虚构Job/Run/Session；P1真实原生Loop，P2把同一路径接到正式Gateway；P3再增强观察和控制，不重建Runtime |
@@ -2951,6 +3445,8 @@ Canary/Production不为比较候选重提同一真实业务对象；首次结果
 
 ## 12. 后续阶段评测方案的编制规则
 
+阶段方案须落实Inspect Task入口、数据路径、输入投影、产品公开方法、协议/采集版本、退出与清理、Scorer映射、CLI执行、Inspect View查看和报告关联；复用10.3–10.12，不复制框架、不按阶段搭新平台。明确本阶段实际启用的接口/参数及未实现项。目录限定README/cases.json、必要gold.json/fixtures，Oracle嵌入Case；数量服从质量覆盖。
+
 阶段实施方案必须提供可展开的“子能力/条款→指标ID及版本→Case/Oracle→可信证据/采集状态→Grader→门槛及Owner”矩阵。指标定义继承第8章，不另写公式；分别记录准备、实际执行、可判定及通过，包含场景切片、分母、观察窗口、独立组/重复、基线和缺口。数据优化依据8.11先确定目标再调整资产，不让现有Case/Benchmark成员限制所需覆盖。
 
 阶段方案严格对应产品同编号阶段，例如产品P5 Context Engineering对应P5_Agent评测实施方案。只在进入该阶段且范围足够明确时创建，不提前生成十四份空稿，不自行要求P8/P12/P13能力提前交付。
@@ -2977,6 +3473,8 @@ Canary/Production不为比较候选重提同一真实业务对象；首次结果
 第8.1节明确逐模块通用测试步骤；具体Case数量、文件、CLI、fixture、模型、timeout、budget和grader实现只在阶段实施方案固定。主方案确定边界，阶段目标确定当期交付和退出要求，实施计划确定实现／验证顺序，报告记录实际结果与缺口。既定职责内的内部文件、SDK参数、配置示例及测试步骤由阶段方案细化；改变技术基座、委派入口、授权、存储权威、公共模块边界、业务范围或阶段完成条件时，先按产品主方案第24章说明变更及影响，再同步受影响阶段与评测依据。发现冲突或依赖无法成立时提出受控修订，不放宽必需条件或以临时实现替代既定路线。小批开发试跑可修订开发资产；正式集／门槛冻结后不得随结果漂移，已发布Gold、冻结Case和历史报告保留原依据，必要变化走独立受控版本流程。
 
 ## 13. 交付清单、待决参数与维护
+
+新增交接项：Inspect/Python/Bun及适配器版本、两类运行时锁、真实产品输入/事件/关闭契约、固定数据和判据、可信证据、Inspect日志/报告对应关系、分析视图、自检结果与兼容限制。具体负责人和最迟验证时点见10.12。旧综合集规范摘要漂移须受控对齐；本次不重签任何发布清单或改写历史结果。
 
 量化交接另须包含第8章指标引用/版本、逐模块适用覆盖表、原始分子分母/时点/费用观测、可信证据链、Grader自检/校准、Q/O先导基线及门槛冻结记录、独立组数/区间/重复运行结果、未采集/未判定/未执行与退化明细。数据、Benchmark和采集实现的后续同步清单见8.11；本次只发布方案定义，不改变它们的审核、冻结或实际运行状态。
 
@@ -3012,3 +3510,14 @@ Canary/Production不为比较候选重提同一真实业务对象；首次结果
 旧稿的方法研究包括美团Agent评测资料、Anthropic Agent evals文章及阿里/AliExpress评测实践；其作用限于Case、过程/结果评测、评分校准、采样与双闭环方法，不决定Flowmate阶段、产品接口或阈值。本次阶段重构不将旧稿阅读记录声明为对外部资料的重新核验。
 
 Pi SDK、Agent Core、Compaction、Extensions及用户指定的@tintinweb/pi-subagents接口，在相应能力启用前由工程Owner依据实际锁定源码/官方文档核验并保存证据。P1核验Runtime Core，P4核验会话/队列，P7核验压缩，P9核验资源，P10核验扩展，P11核验插件，P13核验Host接合与安装组合。可变上游分支、SDK自带API或官方测试通过，不代替本项目实际组合的功能和质量证据。
+
+
+### 14.1 Inspect AI 一手依据（2026-09-20核查）
+
+- [源码与许可证](https://github.com/UKGovernmentBEIS/inspect_ai)：本机版本/源码事实见10.3，不把在线最新版当锁定版本。
+- [Solvers](https://inspect.aisi.org.uk/solvers.html)、[Scorers](https://inspect.aisi.org.uk/scorers.html)：Task执行与评分扩展；项目自定义签名不是上游API。
+- [Agent Bridge](https://inspect.aisi.org.uk/agent-bridge.html)：跨语言沙箱桥接和模型配置影响，首期不启用。
+- [Eval Sets](https://inspect.aisi.org.uk/eval-sets.html)：任务集合、重试和续跑；项目要求一次初始尝试并保留失败日志。
+- [Log Viewer](https://inspect.aisi.org.uk/log-viewer.html)、[日志](https://inspect.aisi.org.uk/eval-logs.html)、[Dataframes](https://inspect.aisi.org.uk/dataframe.html)、[Tracing](https://inspect.aisi.org.uk/tracing.html)：UI与分析能力，外部TS内部证据仍需实际接入。
+
+本次核对了本机源码的Score类型、CLI参数及公开接口；没有运行模型、验证UI展示或宣称Pi兼容。后续实现必须以锁定版本再次核对实际组合。

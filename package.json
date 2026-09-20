@@ -1,0 +1,27 @@
+{
+  "name": "flowmate",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "bun": ">=1.4.0",
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:p0": "vitest run --config vitest.config.ts",
+    "p0": "bun run scripts/p0.ts",
+    "p0:fault-probe": "bun run scripts/p0-fault-probe.ts",
+    "p0:source-audit": "python -B agent-eval/tools/p0_source_audit.py",
+    "p0:verify": "bun run scripts/p0-verify-published.ts",
+    "p0:review": "python -B agent-eval/tools/review_p0_report.py",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2",
+    "vitest": "5.0.1"
+  }
+}

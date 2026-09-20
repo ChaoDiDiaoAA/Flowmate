@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "p0-product-inspection-summary/v1",
+  "expectedSamples": 2902,
+  "inspectedSamples": 2902,
+  "checkedFiles": 16475,
+  "issueCount": 0,
+  "reportHash": "65c616d784b06997640ab1d7ef38f8b2b1ba093142a59007e351511906076388",
+  "sourceManifestSha256": "0668d44b8d91ba69df8ae83821ff646c6268597a17fd59f2367d2df469c0da5f"
+}

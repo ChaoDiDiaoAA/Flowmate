@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "p0-product-read-summary/v1",
+  "expectedDocuments": 2902,
+  "readDocuments": 2902,
+  "uniqueEvidence": 4755,
+  "evidenceRead": 4755,
+  "failureCount": 0,
+  "failures": []
+}

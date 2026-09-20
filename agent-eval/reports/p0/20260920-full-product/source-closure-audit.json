@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "p0-source-audit/v1",
+  "checkedAt": "2026-09-20T03:39:36.485054Z",
+  "sourceManifestSha256": "0668d44b8d91ba69df8ae83821ff646c6268597a17fd59f2367d2df469c0da5f",
+  "sourceModified": false,
+  "counters": {
+    "samples": 2902,
+    "metadataChecked": 2902,
+    "sourceFilesChecked": 16474,
+    "parseArraysChecked": 2902,
+    "parsePairsValid": 2902,
+    "imageDescriptors": 7768,
+    "imageRefs": 4866,
+    "imageRefsResolved": 4866,
+    "imageBytesDecoded": 7768,
+    "imageDecodeFailures": 0,
+    "sampleIdentityMatches": 2902,
+    "originalDigestMatches": 2902
+  },
+  "sourceRecordId": {
+    "unique": 2902,
+    "duplicateGroups": 0,
+    "duplicates": {}
+  },
+  "parseVariants": {
+    "originalGroups": 2902,
+    "multipleParseGroups": 0,
+    "groups": {}
+  },
+  "imageClosure": {
+    "status": "PASS",
+    "referenced": 4866,
+    "resolved": 4866,
+    "descriptorDecodeFailures": 0
+  },
+  "semanticPairing": {
+    "status": "NOT_ESTABLISHED",
+    "structuralIdentityChecks": [
+      "manifest.sampleId↔metadata.sampleId",
+      "manifest.originalSha256↔metadata.originalSha256",
+      "sourceRecordId presence/uniqueness",
+      "page/block correspondence",
+      "image reference closure"
+    ],
+    "businessMeaningChecks": [
+      "original invoice text/image agrees with parsed fields",
+      "same invoice identity is semantically confirmed",
+      "OCR/parser field correctness"
+    ],
+    "humanVerifiedGold": 0,
+    "reason": "No human or independently authorized semantic annotation was present; machine structure cannot establish business truth."
+  },
+  "errors": [],
+  "errorCount": 0,
+  "status": "PASS_STRUCTURAL_ONLY",
+  "window": {
+    "startedAt": "2026-09-20T03:39:28.567443Z",
+    "endedAt": "2026-09-20T03:39:36.485054Z"
+  }
+}

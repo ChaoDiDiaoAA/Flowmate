@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "p0-fault-probe/v1",
+  "checkedAt": "2026-09-20T03:09:58.500Z",
+  "scope": "temporary one-sample product instances; no repository source, Gold, published list or history mutation",
+  "allPass": true,
+  "scenarios": [
+    {
+      "checkId": "P0-F12/file-finalization/v1",
+      "caseVariantId": "file-finalization-temporary-fixture",
+      "status": "PASS",
+      "scenario": "file-finalization",
+      "inputManifestSha256": "56640de17c63f29f6c68aece68fb206d6ba2c5e251560fc751308b690282fd54",
+      "requestId": "1a29932b-85c5-4d55-bd0a-5e6ecfad1855",
+      "triggered": true,
+      "failureMessage": "injected before-content-finalize",
+      "receiptAfterFailure": false,
+      "availableAfterFailure": 1,
+      "pendingAfterFailure": 0,
+      "retrySucceeded": true,
+      "oldPublicationReadable": true,
+      "responseReplaySame": false
+    },
+    {
+      "checkId": "P0-F13/database-commit/v1",
+      "caseVariantId": "database-commit-temporary-fixture",
+      "status": "PASS",
+      "scenario": "database-commit",
+      "inputManifestSha256": "56640de17c63f29f6c68aece68fb206d6ba2c5e251560fc751308b690282fd54",
+      "requestId": "3108c1aa-77d0-4c22-a863-284768583bc1",
+      "triggered": true,
+      "failureMessage": "injected before-commit",
+      "receiptAfterFailure": false,
+      "availableAfterFailure": 1,
+      "pendingAfterFailure": 0,
+      "retrySucceeded": true,
+      "oldPublicationReadable": true,
+      "responseReplaySame": false
+    },
+    {
+      "checkId": "P0-F13/audit-insert/v1",
+      "caseVariantId": "audit-insert-temporary-fixture",
+      "status": "PASS",
+      "scenario": "audit-insert",
+      "inputManifestSha256": "56640de17c63f29f6c68aece68fb206d6ba2c5e251560fc751308b690282fd54",
+      "requestId": "d982535e-33e0-4129-815a-9a0fe8589a23",
+      "triggered": true,
+      "failureMessage": "injected before-audit-insert",
+      "receiptAfterFailure": false,
+      "availableAfterFailure": 1,
+      "pendingAfterFailure": 0,
+      "retrySucceeded": true,
+      "oldPublicationReadable": true,
+      "responseReplaySame": false
+    },
+    {
+      "checkId": "P0-F14/response-loss/v1",
+      "caseVariantId": "response-loss-temporary-fixture",
+      "status": "PASS",
+      "scenario": "response-loss",
+      "inputManifestSha256": "56640de17c63f29f6c68aece68fb206d6ba2c5e251560fc751308b690282fd54",
+      "requestId": "cac9539e-fee8-4e49-bfa1-675b259b2e34",
+      "triggered": true,
+      "failureMessage": "injected before-response",
+      "receiptAfterFailure": true,
+      "availableAfterFailure": 2,
+      "pendingAfterFailure": 0,
+      "retrySucceeded": true,
+      "oldPublicationReadable": true,
+      "responseReplaySame": true
+    }
+  ]
+}

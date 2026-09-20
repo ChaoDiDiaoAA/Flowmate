@@ -1,6 +1,6 @@
-# 初始评测数据的离线设施
+# Agent评测设施：现有离线工具与拟新增Inspect接入
 
-当前处于方案设计阶段。新任务和契约采用 `schemaVersion: 1`；实际数量以 `data/manifests/active-dataset.json` 为准。装配不会创建真实 Trial、调用模型或提交业务，真实产品运行数与 Baseline 均为 0。
+现有代码主要提供离线装配和评分设施；Inspect接入仍为设计，已有P0产品工程不等于真实Agent适配。新任务和契约采用 `schemaVersion: 1`；实际数量以 `data/manifests/active-dataset.json` 为准。装配不会创建真实 Trial、调用模型或提交业务，真实产品运行数与 Baseline 均为 0。
 
 ## 当前入口
 
@@ -13,7 +13,7 @@ python agent-eval/src/runner/initial_dataset.py BM-03 --project . --capability t
 ```
 
 - `verify` 核对格式、身份、引用、摘要、用途和当前文件库存，以及原票、提供方标签的完整性。
-- `--stage` 筛选当前阶段，`--split` 选择数据用途，`--subset` 选择 capability 或 regression 测量目的。
+- `--stage` 仅按阶段标签筛选现有综合集，不能读取stage-evals/Pn；`--split`选择数据用途，`--subset`选择capability或regression测量目的。这些是旧离线入口的行为说明，当前阶段评测不据此启动综合集。
 - `--capability`、`--task-type` 根据任务标签筛选，必要对照仍按依赖关系闭合。
 - `--output` 仅导出模型允许接收的输入 JSONL，不导出整份 Case、Gold 或评分断言。项目内导出限定在 `.cache/exports/`，拒绝覆盖已有文件。
 - `prepare` 是首次迁移发布入口；当前格式已发布后再次执行只核验，返回 `changed: false`。它不恢复旧数据，不积累历史快照，也不是任意修改 Case 后自动重签清单的入口。
@@ -61,3 +61,25 @@ python -m pytest agent-eval/tests/test_initial_tasks.py agent-eval/tests/test_in
 这些检查验证格式、物化、引用闭合、阻断、评分自检及发布回滚，不是产品运行成绩。
 
 详细字段与数量见 [数据 README](../data/README.md)，使用流程见 [数据使用方案](../docs/data/data-usage-guide.md)。
+
+
+## Inspect接入落点（拟新增，P1实施）
+
+| 文件 | 职责 |
+|---|---|
+| runner/inspect_tasks.py | 阶段/综合入口、预检、固定选集及Sample映射 |
+| adapters/flowmate.py | 自定义Solver；驱动Bun、进程生命周期、版本化消息和可信采证 |
+| adapters/flowmate.ts | 经公共composition/Application调用真实产品；不实现业务规则 |
+| graders/inspect_scores.py | 复用已核验Grader、映射五态/适用性与自定义指标 |
+| analysis.py | 同批次日志/报告的失败、耗时、质量/成本分析 |
+
+CLI执行，Inspect View消费相同日志。现有initial_dataset/evidence/graders保留，契约适配先自检，不能删除product_adapter_required就宣称接通；不伪造VerifiedObservation。新版产品接口只能在其实际阶段映射。整个质量根、Sample元数据和Gold不得直接交给Agent；只传获准投影。产品实例根和配置必须位于agent-eval之外。
+
+现有data综合集完整Agent后核验启用；stage-evals/Pn当期执行，数据质量优先，代码不按阶段复制。精确签名、协议、命令、状态、版本锁及I1–I5工作包见[主方案第10章](../docs/spec/01_Flowmate_Agent评测总方案.md#10-评测设施与工程对接)，本目录不维护第二份接口规范。
+
+
+## 阶段资产与兼容交接
+
+阶段README/Case、按需Gold/fixtures的字段与制作集中于[主方案§10.5](../docs/spec/01_Flowmate_Agent评测总方案.md#105-数据怎样准备阶段集怎样映射)。整理P0也建立索引，复用F测试/Oracle/历史证据，无需Agent Solver或业务Gold。P1起拟新增load_cases/to_sample分离Sample可见输入与控制/评分资料；Scorer读取质量注册表，产品不读取Case/Gold。阶段包装示例不能直接交给旧initial_contract假定兼容。
+
+后续I2用合成自检验证stage入口不访问无关综合资产；P0报告固定阻断的依赖范围适配另列§10.5.7，不在本次修改。运行记录绑定Case/Gold/输入/判据/Grader/产品/配置和环境；修订生成新版本，旧结果保留原依据。规范更新不等于适配完成，也不自动解除实际数据用途问题。
