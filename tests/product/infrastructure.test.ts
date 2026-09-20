@@ -10,7 +10,7 @@ afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root,
 
 describe('P0 controlled infrastructure', () => {
   it('rejects traversal, Windows device and alternate separator paths', () => {
-    for (const value of ['../secret', 'a/../../secret', 'C:/secret', '\\\\server\\share', 'CON.txt', 'a\\b', 'a/thing:stream']) {
+    for (const value of ['../secret', 'a/../../secret', 'C:/secret', '\\\\server\\share', 'CON.txt', 'a\\b', 'a/thing:stream', 'a/file.', 'a/file ', '//server/share', '/absolute', '', 'https://invalid.example/file']) {
       expect(() => validateRelativePath(value)).toThrow();
     }
     expect(validateRelativePath('assets/images/file.jpg')).toBe('assets/images/file.jpg');
@@ -32,7 +32,7 @@ describe('P0 controlled infrastructure', () => {
   });
 
   it('rejects an actual Windows junction component before reading bytes', async () => {
-    if (process.platform !== 'win32') return;
+    if (process.platform !== 'win32') throw new Error('[P0_FACILITY] Windows junction case requires Windows; must not report a no-op PASS');
     const root = await mkdtemp(join(process.env.TEMP ?? '.', 'flowmate-links-'));
     roots.push(root);
     const source = join(root, 'source');
@@ -42,7 +42,7 @@ describe('P0 controlled infrastructure', () => {
     await mkdir(join(outside, 'dir'), { recursive: true });
     const bytes = new TextEncoder().encode('canary');
     await writeFile(join(outside, 'dir', 'file.txt'), bytes);
-    await symlink(join(outside, 'dir'), join(source, 'linked-dir'), 'junction');
+    await symlink(join(outside, 'dir'), join(source, 'linked-dir'), 'junction').catch(error => { throw new Error('[P0_FACILITY] Cannot create Windows junction', { cause: error }); });
     const store = new InstanceFileStore({ sourceRoot: source, instanceRoot: instance });
     await expect(store.readVerified({ root: 'source', relativePath: 'linked-dir/file.txt', expectedSha256: sha256Bytes(bytes), expectedBytes: bytes.byteLength, maxBytes: 1024 }))
       .rejects.toMatchObject({ descriptor: { code: 'REPARSE_POINT_DENIED' } });

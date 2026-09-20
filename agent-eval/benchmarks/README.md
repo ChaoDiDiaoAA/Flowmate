@@ -15,7 +15,7 @@
 ## 使用
 
 ```powershell
-python agent-eval/tools/initial_dataset.py verify --project .
+python agent-eval/tools/comprehensive/initial_dataset.py verify --project .
 python agent-eval/src/runner/initial_dataset.py BM-08 --project . --stage P2 --split development --subset capability
 ```
 

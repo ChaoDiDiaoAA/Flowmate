@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createProduct } from '../apps/composition.ts';
+import { assertNoLinkedAncestors } from '../packages/core/src/storage/file-store.ts';
+import { readRecoveryCheckpoint } from '../apps/recovery.ts';
 import type { ArtifactRef, DocumentRef, ParseSelection, Purpose } from '../packages/contracts/src/index.ts';
 
 type Args = Record<string, string | boolean>;
@@ -9,8 +11,10 @@ async function main(argv: string[]): Promise<void> {
   const [command = '', ...rest] = argv;
   const args = parseArgs(rest);
   const instanceRoot = required(args, 'instance-root');
+  if (command === 'checkpoint') { print(await readRecoveryCheckpoint(instanceRoot)); return; }
   const mode = command === 'init' ? 'create' : 'open';
-  const product = await createProduct({ instanceRoot, mode, ...(typeof args.config === 'string' ? { configPath: args.config } : {}) });
+  const recoveryCheckpoint = typeof args['recovery-checkpoint'] === 'string' ? await readJson<import('../packages/contracts/src/index.ts').RecoveryCheckpoint>(args['recovery-checkpoint']) : undefined;
+  const product = await createProduct({ instanceRoot, mode, ...(typeof args.config === 'string' ? { configPath: args.config } : {}), ...(recoveryCheckpoint ? { recoveryCheckpoint } : {}) });
   try {
     const requestId = String(args['request-id'] ?? crypto.randomUUID());
     const req = { requestId, workspaceId: product.workspaceId };
@@ -46,7 +50,7 @@ async function main(argv: string[]): Promise<void> {
       case 'read-captured': {
         const projection = await readJson<ArtifactRef>(required(args, 'projection-ref'));
         const input = await product.application.readCapturedInput(req, { projection, purpose });
-        print({ schemaVersion: input.schemaVersion, document: input.document, contentHash: input.parsed.contentHash, pages: input.parsed.pages.length, evidenceCount: input.evidence.length });
+        print({ schemaVersion: input.schemaVersion, document: input.document, contentHash: input.parsed.contentHash, pages: input.parsed.pages.length, evidenceCount: input.evidence.length, instanceId: product.instanceId, workspaceId: product.workspaceId, processInstanceId: product.processInstanceId, pid: process.pid });
         break;
       }
       case 'workspace-status': {
@@ -70,7 +74,7 @@ async function main(argv: string[]): Promise<void> {
     }
   } finally {
     const closed = await product.close();
-    if (!closed.closed && closed.cleanupErrors.length > 0) throw new Error('Flowmate closed with cleanup errors');
+    if (!closed.closed || closed.cleanupErrors.length > 0) throw Object.assign(new Error('Flowmate closed with cleanup errors'), { cleanupErrors: closed.cleanupErrors });
   }
 }
 
@@ -96,12 +100,14 @@ function required(args: Args, name: string): string {
 async function readJson<T>(path: string): Promise<T> {
   const resolved = resolve(path);
   if (resolved.split(/[\\/]+/).some((part) => part.toLowerCase() === 'agent-eval')) throw new Error('Quality and evaluation files are not valid product command inputs');
+  await assertNoLinkedAncestors(resolved);
   return JSON.parse(await readFile(resolved, 'utf8')) as T;
 }
 function print(value: unknown): void { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
 
 main(process.argv.slice(2)).catch((error) => {
   const descriptor = error && typeof error === 'object' && 'descriptor' in error ? (error as { descriptor: unknown }).descriptor : { code: 'CLI_FAILED', message: error instanceof Error ? error.message : String(error) };
-  process.stderr.write(`${JSON.stringify(descriptor)}\n`);
+  const cleanupErrors = error && typeof error === 'object' && 'cleanupErrors' in error ? error.cleanupErrors : undefined;
+  process.stderr.write(`${JSON.stringify({ ...(descriptor as object), ...(cleanupErrors ? { cleanupErrors } : {}) })}\n`);
   process.exitCode = 1;
 });

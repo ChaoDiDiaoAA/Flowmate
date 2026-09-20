@@ -1,5 +1,32 @@
 # P0 Agent 评测实施方案
 
+> 报告清理说明：旧 P0 报告已按用户要求删除。下文原核查中的数量、PASS 和“本次验证”等表述仅为历史文字记录；已删除的证据不能用于当前阶段验收。当前结论以新运行生成并复核的报告为准。
+
+## 2026-09-20 收尾与评测准备修订（当前执行入口）
+
+本次从提交 `2c464f0694db6a242ec37bc8702febef43d367a0` 的干净工作区继续实施；保留以下历史验证记录的原版本与语境，不能把其“本轮已验证”理解为收尾改动已重跑。当前已建立独立 P0 Case/Oracle 索引，未增加业务 Gold 或Inspect；`bun run p0:eval`只是P0专用编排，不发展为P1后的通用评测平台。可执行命令、参数和当前覆盖范围以 [P0 阶段 README](../../stage-evals/P0/README.md) 为入口；正文旧命令/配置示例属原设计或历史执行说明，不再复制到新运行。
+
+- `p0:verify --case-set` 必填；先以 `--freeze true` 绑定当前源码内容（含未提交文件）、依赖/环境、配置/策略、来源和 Case/Oracle，再执行。运行保存 `cases.frozen.json`、`expected-binding.json` 及 `execution-freeze.json`，不是新增阶段 manifest。
+- 新证据统一进入 `agent-eval/runs/<ExecutionId>/`；旧 P0 报告已按用户要求删除，不能作为当前验收证据。输出拒绝覆盖。Case 逐命名测试/字段判定，产品 F、资产和设施分别计数；套件成功不代表32组全通过。
+- `FlowmateData/<instance>/`是被测产品实例，`agent-eval/runs/<ExecutionId>/`是唯一评测结果目录。P1起统一使用Inspect AI的Task/Solver/Scorer和日志，不把P0命令或每阶段数据目录扩展成第二套平台。
+- 已将旧三项固定阻断改为实际依赖：不读取综合 Case/Gold/Benchmark，新版本地 development F 不再要求手填用途声明，来源许可未核实的事实保留；产品用途策略拒绝、证据缺失/错配仍不通过；不伪造责任人签名。旧报告/原审核状态不更新。
+- 本次修复文件容量错误分类、日志秘密字段过滤/单文件分段、来源祖先/最终链接检查、竞争实例锁误清理及重复关闭失真，补边界测试、迁移事务/未来版本拒绝、整票/页/像素预算、同票解析版本撤回传播和受控恢复checkpoint；严格拒绝未知P0配置字段。当前配置入口只支持 `sourceRoot`，旧完整配置示例尚非已实现API。
+- `p0:verify` 用新 Bun 子进程完成重启重读，并核对发布集合覆盖。故障探针记录清理失败。本次仅静态检查和合成设施自检，产品测试/全量核验/发布/故障评测等待用户执行。
+- 原方案扩大变体与现有自动覆盖的差距见阶段README末节；已将输入预算、闭库当前事实checkpoint、文件角色/链接/canary/别名撤回及异常关闭等必要差距补为实现和Case v2命名探针；尚未执行，不能提前判PASS。requiredCoverageGaps保留登记未来适用缺口的机制，非空则阶段阻断。源文件结构/摘要/图片闭包与业务字段语义真值分开，A/B本期不适用。
+
+当期接口增量（已实现，待用户运行验证）：`StartOptions.recoveryCheckpoint?: RecoveryCheckpoint`；`apps/recovery.ts: readRecoveryCheckpoint(instanceRoot: string): Promise<RecoveryCheckpoint>`仅用于闭库当前权威实例，返回`{schemaVersion: "p0-recovery-checkpoint/v1", instanceId, workspaceId, authoritySha256}`，不导出业务正文。CLI增加`p0 checkpoint --instance-root`及打开时的`--recovery-checkpoint`；checkpoint放质量根外、恢复副本外并由可信调用方保持当前。移位副本缺依据或事实错配拒绝ready；同路径人工回滚无法自动识别，不宣称P13完整备份平台。完整命令见阶段README。
+
+`packages/data/src/source/limits.ts`固定本期64MiB/文件、256MiB/整票、16MiB/manifest、2048文件/整票、200页、40M像素；整票包含metadata自身。当前顺序读取，容量是初始边界不是性能结论。`FoundationDatabase.compareAndSetDocument`事务传播同空间/来源/原票的撤回；注册/发布拒绝复活，Kernel返回/提交前重查状态。不新增表或Agent Runtime。关闭失败保留结构化cleanupErrors及控制锁标记，阻止不明资源状态下重开。
+
+**无交互及技术验收口径修订（2026-09-20）：** `runP0` 删除 readline/TTY/`Options.ask` 和两次提问，停止生成用途确认文件。默认来源和用途、原有检查顺序、独立目录及退出码不变；只运行类型检查和合成设施测试，真实评测由用户执行。
+
+新 P0 `development` 运行采用 `assessmentPolicy: p0-local-f/v2`，在执行前写入 `expected-binding.json`，其摘要绑定 `execution-freeze.json`、执行记录和 F 报告，复核结果同时标明策略。该策略的本地确定性 F 不再以人工用途声明为技术验收前提，不读取或生成 `source-use.json`，不把来源许可 `not_verified` 改成已授权。通过仅表示本次范围内基础功能与资产技术检查通过，不表示来源许可、业务语义、真实 Agent 或生产用途通过。产品用途白名单、主体权限、Workspace 归属、路径隔离及当前有效性继续执行，明确拒绝使用仍阻断；Case/Oracle、证据完整性及必要覆盖不放宽。
+
+新规则仅适用于策略和 `development` 用途同时匹配的新运行；无策略字段的旧证据沿用原规则，仍要求原有真实用途记录，未知策略、用途不匹配或冻结绑定被改动不能通过。旧报告、旧 `source-use.json`、审核状态和综合资产不修改、不重签。仅更新规范不产生新通过结论。
+
+每实现一个阶段，都必须同步根README的状态、环境、操作/验证命令、输出及清理说明；命令可执行不等于已验收。
+
+
 > 文档版本：`p0-plan-v1`；核查日期：2026-09-20（Asia/Shanghai）。本轮已建立可由产品 F 直接驱动的 P0 Application/CLI 与证据契约，并完成当前 2,902 份输入的产品发布/重读验证；没有运行模型、Agent A/B 或完整质量报告，独立资产阻断仍保留。不修改来源数据、已发布清单、Gold、Case及历史结果。配套产品文件：[P0 阶段实施方案](../../../docs/plans/P0_阶段实施方案.md)。
 
 ## 1. 评测对象、真实基线与适用性
@@ -16,7 +43,7 @@ P0首先验证未来Agent所依赖的输入、身份、当前授权、存储与�
 | 业务结果B | 不适用：后续业务阶段 | 本期不输出业务字段准确率、报销/入账成功率或提效收益 | 不以文件完整和存储成功推断业务正确 |
 | 评测设施自检 | 适用的子集 | Schema/引用/隔离/汇总/证据复核器正确性 | 不记作产品F或A/B Baseline |
 
-P0使用产品 F 的确定性断言、来源核验和基础证据，不消费完整 Agent 任务数据集，也不输出 Agent A/B 成绩。这里的 Case/Oracle 仅指 P0 产品 F 的检查项、固定预期和证据判定，不等同于后续真实 Agent 任务的业务 Gold/Oracle。产品侧已有 F 能覆盖的检查直接复核复用，不建立完整 EvalRunner、模型裁判、Dashboard、独立业务状态库或发布服务。P1具备真实Agent入口时接入最小Inspect Task/Solver/Scorer；各阶段当期制作并执行独立阶段集，不等待完整Agent。P0不增加Inspect或模型验收门槛。
+P0使用产品 F 的确定性断言、来源核验和基础证据，不消费完整 Agent 任务数据集，也不输出 Agent A/B 成绩。这里的 Case/Oracle 仅指 P0 产品 F 的检查项、固定预期和证据判定，不等同于后续真实 Agent 任务的业务 Gold/Oracle。产品侧已有 F 能覆盖的检查直接复核复用，不建立Inspect任务、模型裁判、Dashboard、独立业务状态库或发布服务。P1具备真实Agent入口时接入最小Inspect Task/Solver/Scorer；各阶段当期制作并执行独立阶段集，不等待完整Agent。P0不增加Inspect或模型验收门槛。
 
 ### 1.1A 阶段评测数据的生命周期与目录
 
@@ -32,13 +59,13 @@ agent-eval/stage-evals/Pn/
   fixtures/       # 有额外输入/故障材料时创建
 ```
 
-Oracle嵌入Case，不另建oracles/benchmarks/manifest目录。数据不追求数量，只追求必要能力、失败路径、正常对照和关键回归的质量。整理P0阶段资产时建立P0/README.md和cases.json，索引现有F、固定判据与证据；仅补缺少夹具，不重复实现测试，不要求业务Gold、模型或真实Agent适配器，不因索引整理改变历史结论。本次不创建目录；P1开始真实A，各阶段按能力增加适用B。现有data综合集完整Agent实现后再核验启用，保留全部原始材料/摘要/状态。
+Oracle嵌入Case，不另建oracles/benchmarks/manifest目录。数据不追求数量，只追求必要能力、失败路径、正常对照和关键回归的质量。整理P0阶段资产时建立P0/README.md和cases.json，索引现有F、固定判据与证据；仅补缺少夹具，不重复实现测试，不要求业务Gold、模型或真实Agent适配器，不因索引整理改变历史结论。本轮已创建P0索引，实际执行待用户进行；P1开始真实A，各阶段按能力增加适用B。现有data综合集完整Agent实现后再核验启用，保留全部原始材料/摘要/状态。
 
-Inspect统一阶段和最终综合评测，CLI执行、Inspect View查看；Python/TS适配仅在agent-eval/src，实现及协议见评测主方案第10章。上游安装已核查不等于产品适配完成。产品实例和配置在质量根之外，旧P0报告保留reports/p0。本次只同步文档，以下数量与检查结果沿用原P0历史核查，不宣称本轮重跑。
+Inspect统一阶段和最终综合评测，CLI执行、Inspect View查看；Python/TS适配仅在agent-eval/src，实现及协议见评测主方案第10章。上游安装已核查不等于产品适配完成。产品实例和配置在质量根之外，旧P0报告已删除，历史结论仅作文字记录。本次只同步文档，以下数量与检查结果沿用原P0历史核查，不宣称本轮重跑。
 
 数据规范统一引用评测总方案§10.5：P0权限拒绝设计复用现有真实接口与测试；P1例只说明后续Case/Gold及Inspect映射，不属于P0验收。四类状态分别记录：数据准备完成、可以执行、评测完成、阶段通过；评分仍沿用第7章契约，缺证据不能通过。现有综合集原本允许阶段筛选，本次改为完整Agent后核验使用，历史用途与报告不改写。
 
-代码兼容待办见评测总方案§10.5.7：旧离线工具尚不支持阶段目录，P0报告脚本仍固定三项阻断；后续按实际依赖核验并适配，不能直接删除用途检查或重签历史报告。本次仅同步规范，不宣称工具和报告已经调整。
+代码兼容待办见评测总方案§10.5.7：旧离线工具尚不支持阶段目录，P0报告脚本已按实际依赖调整（新执行待验证）；后续按实际依赖核验并适配，不能直接删除用途检查或重签历史报告。本轮已调整P0工具，历史报告保持不变，新执行待用户进行。
 
 ### 1.2 与产品方案共享的版本和现状
 
@@ -47,7 +74,7 @@ Git HEAD=`99ea110dfec0dea909d328f9db17a6687c848b87`；开始时工作区只有�
 | 现状 | 状态标签 | 本次证据及限制 |
 |---|---|---|
 | 产品工程/Application/Kernel/公共CLI/产品SQLite | 已实现且本次验证 | `apps/composition.ts`、`packages/core`、`scripts/p0.ts`、`package.json`/`bun.lock`；`bunx tsc --noEmit`、`bun run test:p0`通过；尚无完整 Agent adapter |
-| 当前来源清单2,902份原票，标签1,414份 | 已实现且本次验证 | `initial_dataset.verify_sources`全量大小/摘要核验成功；verifiedSourceFiles=19,376（来源metadata及文件，不含标签计数），结果保存于`agent-eval/reports/p0/20260920-full-product/source-verification.json` |
+| 当前来源清单2,902份原票，标签1,414份 | 已实现且本次验证 | `initial_dataset.verify_sources`全量大小/摘要核验成功；verifiedSourceFiles=19,376（来源metadata及文件，不含标签计数），原报告已删除，仅保留历史文字记录，当前验收需重新执行 |
 | 全量解析结构/配对/图片引用闭包 | 已实现且本次验证（结构范围） | 产品inspect全量检查JSON、页面/block计数、引用路径和图片结构；独立`p0_source_audit.py`核对2,902份身份、2,902组页/block、4,866个图片引用与7,768个图片描述符；2,902份发布后重读、4,755个唯一图片证据读取通过；不代表OCR/业务字段正确 |
 | 质量设施指定测试 | 已实现且本次验证 | `InitialContractTests` 11 passed；没有由此产生产品F证据 |
 | 完整质量资产发布一致性 | 保留参考，暂不作为P0 Agent评测输入 | initial_dataset verify和coverage_update verify均退出1，`Benchmark definition pin drift`；11个有效Benchmark定义摘要漂移。现有材料不删除、不修复、不用于当前 Agent 评测 |
@@ -324,7 +351,7 @@ Case汇总：有必要FAIL则FAIL；否则有ERROR则ERROR并保留全部缺项�
 W06 已提供下列轻量复核器：
 
 ```python
-# agent-eval/tools/review_p0_report.py，仅离线只读复核
+# agent-eval/tools/p0/review_p0_report.py，仅离线只读复核
 def review_p0_report(report_path: Path, evidence_root: Path,
                      expected_binding: dict, frozen_checks: list[dict]) -> dict:
     """核验固定版本/证据路径/摘要/适用性与确定性汇总；不驱动产品、不读Gold判业务。"""
@@ -332,7 +359,7 @@ def review_p0_report(report_path: Path, evidence_root: Path,
 
 `report_path`/`evidence_root`必须存在、在声明质量取证根内且逐级拒绝链接；`expected_binding`是Q事前冻结记录，不能由待验证报告自己提供；`frozen_checks`来自Q固定Oracle台账，包含checkId、required、applicable、rule、evidenceTypes、normalControlRefs。无隐式默认，不联网、不发布、不自动修复、不写产品库。复核器会重算报告列出的每个证据文件摘要和长度，检查路径、绑定、Case集合、状态和冻结断言，返回复核结论和缺口；最终报告保存由显式外层命令负责。
 
-复核器的目标自检集合仍包含：完整正例PASS；真实违反Oracle的反例FAIL；空必要集不产生PASS；缺单个证据UNJUDGEABLE；文件hash错/绑定错不通过；采集故障ERROR；FAIL+NOT_RUN仍FAIL并保留缺口；仅不适用集合N/A；旧INFRA_ERROR转换；NOT_APPLICABLE缺理由不通过；路径链接拒绝；分母0不可计算。当前 `agent-eval/tests/test_review_p0_report.py` 已覆盖完整正例、摘要篡改、断言不成立和越界路径；复核器已对本次 7 个产品 check 运行并返回结构性 PASS。尚未覆盖的设施自检变体仍不能宣称已通过。该结果只证明报告/证据的一致性，不能替代质量负责人对来源用途、业务语义和冻结 Oracle 的独立签核。
+复核器的目标自检集合仍包含：完整正例PASS；真实违反Oracle的反例FAIL；空必要集不产生PASS；缺单个证据UNJUDGEABLE；文件hash错/绑定错不通过；采集故障ERROR；FAIL+NOT_RUN仍FAIL并保留缺口；仅不适用集合N/A；旧INFRA_ERROR转换；NOT_APPLICABLE缺理由不通过；路径链接拒绝；分母0不可计算。当前 `agent-eval/tests/p0/test_review_p0_report.py` 已覆盖完整正例、摘要篡改、断言不成立和越界路径；复核器已对本次 7 个产品 check 运行并返回结构性 PASS。尚未覆盖的设施自检变体仍不能宣称已通过。该结果只证明报告/证据的一致性，不能替代质量负责人对来源用途、业务语义和冻结 Oracle 的独立签核。
 
 ### 6.2 共享证据类型（拟新增）
 
@@ -408,40 +435,31 @@ status只在applicable=true时填；N/A行不冒充NOT_RUN。asset/facility报�
 以下均从仓库根运行；本次先阅读实现确认verify路径不发布/修复。测试仅在其临时夹具中写入，`-B`避免生成pyc，pytest禁缓存写入。
 
 ```powershell
-python -B agent-eval/tools/initial_dataset.py verify --project .
-python -B agent-eval/tools/coverage_update.py verify --project .
+python -B agent-eval/tools/comprehensive/initial_dataset.py verify --project .
+python -B agent-eval/tools/comprehensive/coverage_update.py verify --project .
 python -B -c "import sys,json; from pathlib import Path; sys.path.insert(0,'agent-eval/tools'); from initial_dataset import verify_sources; print(json.dumps(verify_sources(Path('.')),indent=2))"
-python -B -m pytest agent-eval/tests/test_initial_dataset.py::InitialContractTests -q -p no:cacheprovider
+python -B -m pytest agent-eval/tests/comprehensive/test_initial_dataset.py::InitialContractTests -q -p no:cacheprovider
 ```
 
 本次前两条退出1（Benchmark definition pin drift）；第三条退出0，2902/1414/19376；第四条11 passed。产品侧另完成全量inspect、2,902份临时实例发布/重读和一份跨进程投影重读；未执行质量资产prepare/rebuild/recover/auto-fix。历史cleanup报告与实际残留状态有差异，见产品§1.2；本任务不清理数据。
 
 当前11份有效Benchmark为BM-01～05、BM-07～12；BM-06不在当前有效集合。示例BM-01固定定义hash=`881eacc4cb121372bb5a9f411d818a079a247ed82730cb538d898df1474b57b2`，当前文件hash=`a1ae3c7bf5b0f3cf0e8a89e5f6307d3e29e41841c25dbcee906a5b3cd2ca744d`。不能重新签摘要就认定语义一致，需要质量负责人追溯差异、评审、版本化发布并完整核验。本文记录问题，不改变既有清单。
 
-当前工作树已经提供产品侧`bun run typecheck`、`bun run test:p0`、`bun run p0 -- init/inspect/register-document/publish/capture/read-captured/...`、只读来源闭包审计`bun run p0:source-audit -- --output <证据根>/source-closure-audit.json`、故障探针`bun run p0:fault-probe -- --output-root <证据根>`和只读验证器`bun run p0:verify -- --instance-root <根> --publication-ref <publish输出> --source-manifest-sha256 <hash> --output-root <证据根>`；验证器会真实驱动Application并把来源闭包审计、`fault-summary.json`、可选的Vitest结果和Benchmark摘要漂移清单绑定进`p0-f-evidence/v1`。这些是产品 F 与来源结构证据，不消费现有完整 Agent 数据集，也不能替代未来阶段文件中的Case/Oracle复核。当前产品证据已保存于`agent-eval/reports/p0/20260920-full-product/`，报告的7个产品check均PASS；来源审计仍明确`semanticPairing=NOT_ESTABLISHED`，用途确认和质量pin作为正式质量资产限制保留。具体产品参数以配套方案§7.2为准，不为评测额外发明另一套产品入口。
+当前工作树已经提供产品侧`bun run typecheck`、`bun run test:p0`、`bun run p0 -- init/inspect/register-document/publish/capture/read-captured/...`、只读来源闭包审计`bun run p0:source-audit -- --output <证据根>/source-closure-audit.json`、故障探针`bun run p0:fault-probe -- --output-root <证据根>`和只读验证器`bun run p0:verify --case-set <本次冻结Case> --instance-root <根> --publication-ref <publish输出> --source-manifest-sha256 <hash> --output-root <证据根>`；验证器会真实驱动Application并把来源闭包审计、`fault-summary.json`、可选的Vitest结果和Benchmark摘要漂移清单绑定进`p0-f-evidence/v1`。这些是产品 F 与来源结构证据，不消费现有完整 Agent 数据集，也不能替代未来阶段文件中的Case/Oracle复核。旧报告曾记录7个产品check均PASS，现已按用户要求删除，不能作为当前验收依据；来源审计仍明确`semanticPairing=NOT_ESTABLISHED`，来源许可未核实和质量pin作为适用范围限制保留；新版本地 development F 不以人工用途声明为前提。具体产品参数以配套方案§7.2为准，不为评测额外发明另一套产品入口。
 
-独立结构复核命令（只读，不执行产品、不发布、不修复）：
+旧报告及其固定路径复核命令已删除。新运行的完整命令见 [P0 阶段执行 README](../../stage-evals/P0/README.md)，复核输出位于本次 `runs/<ExecutionId>/stage-review.json`。
 
-```powershell
-python -B agent-eval/tools/review_p0_report.py `
-  --report agent-eval/reports/p0/20260920-full-product/p0-f-evidence-v1.json `
-  --evidence-root agent-eval/reports/p0/20260920-full-product `
-  --expected-binding agent-eval/reports/p0/20260920-full-product/review-expected-binding.json `
-  --frozen-checks agent-eval/reports/p0/20260920-full-product/review-frozen-checks.json `
-  --output agent-eval/reports/p0/20260920-full-product/review-summary.json
-```
-
-本次复核结果为结构性 `PASS`，检查9个证据文件和7个产品 check；其中来源闭包审计、Vitest结果与Benchmark摘要漂移清单只是绑定的支持性观察，不增加产品check，也不能把报告的`confirmedPass`直接改成质量签核，更不能解除用途授权或Benchmark pin阻断。
+历史复核文字记录为结构性 `PASS`（原始报告已删除，不能据此复核或放行），检查9个证据文件和7个产品 check；其中来源闭包审计、Vitest结果与Benchmark摘要漂移清单只是绑定的支持性观察，不增加产品check，也不能把报告的`confirmedPass`直接改成质量签核，更不能解除用途授权或Benchmark pin阻断。
 
 ### 7.3 当前阻断及解除条件
 
 | 阻断/缺口 | 影响范围与当前表示 | 责任人与最迟解除时点 |
 |---|---|---|
 | 完整产品F证据与独立复核未完成 | 产品报告已绑定全量正常链路和F12～F14故障证据；结构复核器已独立重算并返回PASS，但`confirmedPass=0`，表示正式F报告尚无质量责任人签核。它不转化为Agent A/B成绩，也不要求现在复核完整Agent任务集 | W06产品F负责人和Q04质量负责人，补齐P0 F证据签核；Agent Case/Oracle复核随后续阶段数据文件执行 |
-| 无可信产品适配器/采集来源 | 现有离线产品grade保持UNJUDGEABLE；不能导出Baseline | P0不强建完整adapter；W06提供可信F驱动/证据+Q人工复核即满足当期路径，P1再接Runner |
+| 无可信产品适配器/采集来源 | 现有离线产品grade保持UNJUDGEABLE；不能导出Baseline | P0不强建完整adapter；W06提供可信F驱动/证据+Q人工复核即满足当期路径，P1再接Inspect产品适配 |
 | 11份Benchmark定义pin漂移 | 当前完整质量资产发布核验失败；阻止复用这批旧冻结基准结论，但不影响P0产品F证据，也不触碰现有数据集 | 完整Agent后启用综合集前，由质量负责人受控核对旧BM及其固定版本；阶段数据当期独立制作，不依赖这批漂移清单，也不绕过自身校验 |
-| 业务语义/用途资格仍未证实 | 产品结构核查和全量发布/重读已通过，但这不能证明OCR字段正确、业务配对正确或来源许可已核验；P0不把它写成Agent成绩 | 真实来源用于正式开发/回归或后续阶段评测前，数据负责人补充独立语义/用途依据；未确认部分继续按UNJUDGEABLE/BLOCKED记录 |
-| 数据用途来源声明尚未证实 | 技术核验可记录；正式允许用途、尤其生产/外传不能推导 | 数据负责人W03冻结前确认当期开发/回归用途依据；不因Gold/manifest存在默认授权 |
+| 业务语义/用途资格仍未证实 | 产品结构核查和全量发布/重读已通过，但这不能证明OCR字段正确、业务配对正确或来源许可已核验；P0不把它写成Agent成绩 | 后续真实 Agent/业务用途适用时补充独立语义/用途依据；未确认事项限制相应结论，不把它们混入新版本地技术 F 的必需检查，也不推导授权 |
+| 数据用途来源声明尚未证实 | 技术核验可记录；正式允许用途、尤其生产/外传不能推导 | 新本地 development F 无需手填用途依据；其他用途按实际依赖核验，旧无策略证据沿原规则，不因 Gold/manifest 或技术 PASS 默认授权 |
 | 依赖/Windows身份、受控目录、reparse、锁方案未实际验证 | 受影响产品F NOT_RUN；不能预判平台安全通过 | 产品W01负责人，在受控文件接入前解除 |
 | 旧评分枚举兼容 | 若直接套旧aggregate会错误归类/汇总 | Q02按§5显式适配并自检；不改历史报告枚举或重写成绩 |
 | 性能阈值未冻结 | O观察未判门槛，不是产品正确性失败或性能PASS | 若升级为门禁，P/Q在正式批次前冻结；否则保持观察并交P1 |

@@ -70,7 +70,7 @@ type SqliteStatement = {
 };
 
 /** Test-only storage fault points; production composition never supplies this hook. */
-export type FoundationFaultPoint = 'before-commit' | 'before-audit-insert';
+export type FoundationFaultPoint = 'before-commit' | 'before-audit-insert' | 'before-migration-commit';
 
 /** A tiny compatibility surface shared by Bun and Node's built-in SQLite. */
 class SqliteCompat {
@@ -93,7 +93,8 @@ export class FoundationDatabase {
 
   constructor(readonly dbPath: string, private readonly faultInjector?: (point: FoundationFaultPoint) => void) {
     this.db = new SqliteCompat(dbPath);
-    this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;');
+    try { this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;'); }
+    catch (error) { try { this.db.close(); } catch { /* preserve the database initialization error */ } throw error; }
   }
 
   initialize(): void {
@@ -183,6 +184,7 @@ export class FoundationDatabase {
       CREATE INDEX IF NOT EXISTS audit_entity
         ON audit_events(workspace_id, entity_type, entity_id, occurred_at);
     `;
+    this.db.transaction(() => {
     // Bootstrap the migration table before reading its history. This keeps a new
     // SQLite file on the same verified path as a reopened file.
     this.db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -192,6 +194,8 @@ export class FoundationDatabase {
       applied_at TEXT NOT NULL,
       application_version TEXT NOT NULL
     );`);
+    const latest = this.db.query('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number | null };
+    if (latest.version !== null && latest.version > 1) throw productError({ code: 'MIGRATION_FAILED', category: 'storage', source: { component: 'database', operation: 'migrate' }, safeMessage: 'Database schema is newer than this product', impactScope: 'instance', recoveryAction: 'manual_review', correlation: {} });
     const migrationChecksum = sha256Canonical({ version: 1, name: 'foundation', sql });
     const existing = this.db.query('SELECT version, checksum FROM schema_migrations WHERE version = 1').get() as { version: number; checksum: string } | null;
     if (existing && existing.checksum !== migrationChecksum) {
@@ -206,6 +210,8 @@ export class FoundationDatabase {
       this.db.query('INSERT INTO schema_migrations(version,name,checksum,applied_at,application_version) VALUES (1,?,?,?,?)')
         .run('foundation', migrationChecksum, nowUtc(), 'p0-product-v1');
     }
+      this.faultInjector?.('before-migration-commit');
+    })();
   }
 
   close(): void {
@@ -297,6 +303,10 @@ export class FoundationDatabase {
   getArtifact(workspaceId: string, artifactId: string): ArtifactRow | null {
     return this.db.query('SELECT artifact_id,workspace_id,kind,storage_root,relative_path,sha256,size_bytes,mime_type,source_ref FROM artifacts WHERE workspace_id=? AND artifact_id=?').get(workspaceId, artifactId) as ArtifactRow | null;
   }
+
+  isOriginalWithdrawn(workspaceId: string, sourceKey: string, originalSha256: string): boolean {
+    return Boolean(this.db.query("SELECT 1 AS found FROM documents WHERE workspace_id=? AND source_key=? AND original_sha256=? AND status='withdrawn' LIMIT 1").get(workspaceId, sourceKey, originalSha256));
+  }
 }
 
 class DbFoundationTx implements FoundationTx {
@@ -315,6 +325,8 @@ class DbFoundationTx implements FoundationTx {
   }
 
   registerDocument(draft: DocumentDraft, status: DocumentStatus = 'pending'): DocumentView {
+    const original = this.owner.getArtifact(this.workspaceId, draft.originalArtifactId);
+    if (original && this.owner.isOriginalWithdrawn(this.workspaceId, draft.sourceKey, original.sha256)) throw productError({ code: 'DOCUMENT_WITHDRAWN', category: 'state', source: { component: 'database', operation: 'registerDocument' }, safeMessage: 'The source original is withdrawn in this workspace', impactScope: 'call', recoveryAction: 'manual_review', correlation: { workspaceId: this.workspaceId } });
     if (draft.workspaceId !== this.workspaceId || status !== 'pending') throw productError({ code: 'STATE_TRANSITION_INVALID', category: 'state', source: { component: 'database', operation: 'registerDocument' }, safeMessage: 'Documents enter the foundation in pending state', impactScope: 'call', recoveryAction: 'manual_review', correlation: { workspaceId: this.workspaceId } });
     const existing = this.owner.db.query(`SELECT document_id,workspace_id,version,original_sha256,parse_hash,status,state_revision,availability_reason,verification_ref
       FROM documents WHERE workspace_id=? AND source_key=? AND source_record_id=? AND version=?`).get(draft.workspaceId, draft.sourceKey, draft.sourceRecordId, draft.version) as DocumentRow | null;
@@ -332,6 +344,11 @@ class DbFoundationTx implements FoundationTx {
     const result = this.owner.db.query(`UPDATE documents SET status=?,state_revision=state_revision+1,availability_reason=?,verification_ref=?,updated_at=?
       WHERE workspace_id=? AND document_id=? AND version=? AND original_sha256=? AND (parse_hash=? OR (parse_hash IS NULL AND ? IS NULL)) AND status=? AND state_revision=?`).run(change.targetStatus, change.reason, verificationRef ? JSON.stringify(verificationRef) : null, now, ref.workspaceId, ref.documentId, ref.version, ref.originalSha256, ref.parseHash, ref.parseHash, change.expectedStatus, change.expectedRevision);
     if (result.changes !== 1) throw productError({ code: 'STALE_STATE', category: 'state', source: { component: 'database', operation: 'compareAndSetDocument' }, safeMessage: 'The document changed before this operation committed', impactScope: 'call', recoveryAction: 'retry_read', correlation: { workspaceId: ref.workspaceId, documentId: ref.documentId } });
+    if (change.targetStatus === 'withdrawn') {
+      const record = this.owner.getDocumentRecord(ref)!;
+      // Withdrawal is about the source original in this workspace, including its parse versions.
+      this.owner.db.query("UPDATE documents SET status='withdrawn',state_revision=state_revision+1,availability_reason=?,updated_at=? WHERE workspace_id=? AND source_key=? AND original_sha256=? AND status<>'withdrawn'").run(change.reason, now, ref.workspaceId, record.source_key, ref.originalSha256);
+    }
     return this.owner.getDocument(ref)!;
   }
 

@@ -25,6 +25,10 @@ export class Kernel {
     if (scope.document && scope.document.workspaceId !== workspace.workspaceId) {
       throw productError({ code: 'OWNERSHIP_MISMATCH', category: 'authorization', source: { component: 'kernel', operation }, safeMessage: 'The requested object is outside the authorized workspace', impactScope: 'call', recoveryAction: 'correct_input', correlation: { requestId: req.requestId, workspaceId: req.workspaceId, documentId: scope.document.documentId } });
     }
+    if (scope.document && (operation === 'document.read' || operation === 'input.capture')) {
+      const current = this.db.getDocument(scope.document);
+      if (!current || current.status !== 'available') throw productError({ code: current?.status === 'withdrawn' ? 'DOCUMENT_WITHDRAWN' : 'DOCUMENT_UNAVAILABLE', category: 'state', source: { component: 'kernel', operation }, safeMessage: 'The requested document is not currently readable', impactScope: 'call', recoveryAction: 'manual_review', correlation: { requestId: req.requestId, workspaceId: req.workspaceId, documentId: scope.document.documentId } });
+    }
     const activeRequired = !['evidence.read', 'workspace.setStatus', 'policy.publish', 'document.setStatus'].includes(operation);
     if (activeRequired && workspace.status !== 'active') {
       throw productError({ code: 'WORKSPACE_NOT_ACTIVE', category: 'state', source: { component: 'kernel', operation }, safeMessage: 'The workspace is not active for this operation', impactScope: 'workspace', recoveryAction: 'manual_review', correlation: { requestId: req.requestId, workspaceId: req.workspaceId } });
@@ -42,6 +46,7 @@ export class Kernel {
     return this.db.transaction(ctx.actor.actorId, ctx.request.workspaceId, ctx.request.requestId, (tx) => {
       const workspace = tx.getWorkspace(ctx.request.workspaceId);
       if (!workspace || workspace.version !== ctx.workspaceVersion) throw productError({ code: 'STALE_STATE', category: 'state', source: { component: 'kernel', operation: ctx.operation }, safeMessage: 'The workspace policy changed before commit', impactScope: 'call', recoveryAction: 'retry_read', correlation: { requestId: ctx.request.requestId, workspaceId: ctx.request.workspaceId } });
+      this.authorize(ctx.request, ctx.operation, ctx.scope);
       return apply(tx);
     });
   }

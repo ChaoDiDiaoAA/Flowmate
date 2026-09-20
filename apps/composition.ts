@@ -1,6 +1,7 @@
 import { lstat, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Application, StartOptions, StartedProduct, TrustedActor, WorkspacePolicy } from '../packages/contracts/src/index.ts';
 import { productError } from '../packages/contracts/src/errors.ts';
@@ -9,9 +10,11 @@ import { ApplicationService, type ApplicationFaultInjector } from '../packages/c
 import { Kernel } from '../packages/core/src/kernel.ts';
 import { FoundationDatabase } from '../packages/core/src/storage/database.ts';
 import type { FoundationFaultPoint } from '../packages/core/src/storage/database.ts';
-import { InstanceFileStore, type FileStoreFaultInjector } from '../packages/core/src/storage/file-store.ts';
+import { InstanceFileStore, assertNoLinkedAncestors, type FileStoreFaultInjector } from '../packages/core/src/storage/file-store.ts';
 import { Voxel51DataSource } from '../packages/data/src/source/voxel51.ts';
 import { createLogger } from '../packages/logging/src/writer.ts';
+import { verifyRecoveryCheckpoint, requireRecoveryForMovedInstance } from './recovery.ts';
+import { enforceInputLimit, P0_INPUT_LIMITS } from '../packages/data/src/source/limits.ts';
 
 interface InstanceIdentity { schemaVersion: 'p0-instance/v1'; instanceId: string; osBindingHash: string; ownerActorId: string; workspaceId: string; sourceRootRef: string; }
 export interface ProductTestHooks {
@@ -25,6 +28,7 @@ const execFileAsync = promisify(execFile);
 export async function createProduct(options: StartOptions, testHooks?: ProductTestHooks): Promise<StartedProduct> {
   const instanceRoot = resolve(options.instanceRoot);
   if (isEvalRoot(instanceRoot)) throw productError({ code: 'QUALITY_ROOT_DENIED', category: 'authorization', source: { component: 'composition', operation: 'instanceRoot' }, safeMessage: 'The evaluation and quality root cannot host a product instance', impactScope: 'instance', recoveryAction: 'correct_input', correlation: {} });
+  await assertNoLinkedAncestors(instanceRoot);
   await mkdir(instanceRoot, { recursive: true });
   const instanceInfo = await lstat(instanceRoot);
   if (!instanceInfo.isDirectory() || instanceInfo.isSymbolicLink()) throw productError({ code: 'REPARSE_POINT_DENIED', category: 'authorization', source: { component: 'composition', operation: 'instanceRoot' }, safeMessage: 'The instance root must be a real directory', impactScope: 'instance', recoveryAction: 'correct_input', correlation: {} });
@@ -40,8 +44,10 @@ export async function createProduct(options: StartOptions, testHooks?: ProductTe
     let sourceRoot = resolve(process.env.FLOWMATE_SOURCE_ROOT ?? join(process.cwd(), 'data', 'invoices', 'voxel51'));
     if (options.configPath && isEvalRoot(resolve(options.configPath))) throw productError({ code: 'QUALITY_ROOT_DENIED', category: 'authorization', source: { component: 'composition', operation: 'config' }, safeMessage: 'The evaluation and quality root cannot be used as product configuration', impactScope: 'instance', recoveryAction: 'correct_input', correlation: {} });
     if (options.configPath) {
+      await assertNoLinkedAncestors(resolve(options.configPath));
       try {
         const config = JSON.parse(await readFile(resolve(options.configPath), 'utf8')) as { sourceRoot?: string };
+        if (!config || typeof config !== 'object' || Array.isArray(config) || Object.keys(config).some(key => key !== 'sourceRoot') || (config.sourceRoot !== undefined && (typeof config.sourceRoot !== 'string' || !config.sourceRoot.trim()))) throw new Error('Unsupported P0 configuration');
         if (config.sourceRoot) sourceRoot = resolve(config.sourceRoot);
       } catch (error) {
         throw productError({ code: 'CONFIG_LOCK_MISMATCH', category: 'configuration', source: { component: 'composition', operation: 'config' }, safeMessage: 'The product configuration cannot be read or is invalid', impactScope: 'instance', recoveryAction: 'manual_review', correlation: {} }, { cause: error as Error });
@@ -49,6 +55,7 @@ export async function createProduct(options: StartOptions, testHooks?: ProductTe
     }
     if (isEvalRoot(sourceRoot)) throw productError({ code: 'QUALITY_ROOT_DENIED', category: 'authorization', source: { component: 'composition', operation: 'sourceRoot' }, safeMessage: 'The evaluation and quality root cannot be used as a product source', impactScope: 'instance', recoveryAction: 'correct_input', correlation: {} });
     const sourceInfo = await lstat(sourceRoot);
+    await assertNoLinkedAncestors(sourceRoot);
     if (!sourceInfo.isDirectory() || sourceInfo.isSymbolicLink()) throw productError({ code: 'REPARSE_POINT_DENIED', category: 'authorization', source: { component: 'composition', operation: 'sourceRoot' }, safeMessage: 'The approved source root must be a real directory', impactScope: 'instance', recoveryAction: 'correct_input', correlation: {} });
     const manifestPath = join(sourceRoot, 'manifest.json');
     let manifestInfo;
@@ -56,6 +63,7 @@ export async function createProduct(options: StartOptions, testHooks?: ProductTe
       throw productError({ code: 'FILE_MISSING', category: 'input', source: { component: 'composition', operation: 'manifest' }, safeMessage: 'The approved source manifest is missing', impactScope: 'instance', recoveryAction: 'correct_input', correlation: {} }, { cause: error as Error });
     }
     if (manifestInfo.isSymbolicLink()) throw productError({ code: 'REPARSE_POINT_DENIED', category: 'authorization', source: { component: 'composition', operation: 'manifest' }, safeMessage: 'The approved source manifest cannot be a link', impactScope: 'instance', recoveryAction: 'correct_input', correlation: {} });
+    enforceInputLimit(manifestInfo.size, P0_INPUT_LIMITS.maxManifestBytes);
     const manifestBytes = await readFile(manifestPath);
     const manifestSha256 = sha256Bytes(manifestBytes);
     const osBindingHash = await deriveOsBindingHash();
@@ -72,6 +80,11 @@ export async function createProduct(options: StartOptions, testHooks?: ProductTe
     if (options.mode === 'open' && !exists) throw productError({ code: 'INSTANCE_IDENTITY_MISSING', category: 'state', source: { component: 'composition', operation: 'open' }, safeMessage: 'The Flowmate instance has not been initialized', impactScope: 'instance', recoveryAction: 'manual_review', correlation: {} });
     if (identity.schemaVersion !== 'p0-instance/v1' || identity.osBindingHash !== osBindingHash) throw productError({ code: 'IDENTITY_UNTRUSTED', category: 'authorization', source: { component: 'composition', operation: 'identity' }, safeMessage: 'The persisted instance identity does not match this host identity', impactScope: 'instance', recoveryAction: 'manual_review', correlation: { instanceId: identity.instanceId } });
     if (resolve(identity.sourceRootRef) !== sourceRoot) throw productError({ code: 'CONFIG_LOCK_MISMATCH', category: 'configuration', source: { component: 'composition', operation: 'sourceRoot' }, safeMessage: 'The persisted source root does not match the locked configuration', impactScope: 'instance', recoveryAction: 'manual_review', correlation: { instanceId: identity.instanceId } });
+    if (options.mode === 'open') await requireRecoveryForMovedInstance(instanceRoot, options.recoveryCheckpoint);
+    if (options.recoveryCheckpoint) {
+      if (options.mode !== 'open') throw new Error('A recovery checkpoint is only valid for opening an existing instance');
+      await verifyRecoveryCheckpoint(instanceRoot, options.recoveryCheckpoint);
+    }
     if (!exists) await atomicWrite(identityPath, canonicalJson(identity));
 
     const grants = ['source.inspect', 'source.register', 'source.publish', 'document.read', 'input.capture', 'document.setStatus', 'workspace.setStatus', 'policy.publish', 'evidence.read'] as const;
@@ -91,22 +104,22 @@ export async function createProduct(options: StartOptions, testHooks?: ProductTe
     const data = new Voxel51DataSource(sourceRoot, identity.workspaceId, database, files);
     const service = new ApplicationService(database, files, data, kernel, actor, logger, testHooks?.applicationFault);
     const application: Application = service;
-    let closed = false;
-    return { application, instanceId: identity.instanceId, workspaceId: identity.workspaceId, processInstanceId, close: async () => {
-      if (closed) return { closed: true, cleanupErrors: [] };
-      closed = true;
+    let closeTask: Promise<import('../packages/contracts/src/index.ts').CloseReport> | undefined;
+    return { application, instanceId: identity.instanceId, workspaceId: identity.workspaceId, processInstanceId, close: () => closeTask ??= (async () => {
       service.shutdown();
       const cleanupErrors: import('../packages/contracts/src/errors.ts').ErrorDescriptor[] = [];
       try { await logger?.flush(1_000); } catch (error) { cleanupErrors.push(toDescriptor(error, 'flush')); }
       try { await logger?.close(1_000); } catch (error) { cleanupErrors.push(toDescriptor(error, 'logger.close')); }
       try { database?.close(); } catch (error) { cleanupErrors.push(toDescriptor(error, 'database.close')); }
-      try { await lock?.close(); await rm(lockPath, { force: true }); } catch (error) { cleanupErrors.push(toDescriptor(error, 'lock.release')); }
+      try { await lock?.close(); if (!cleanupErrors.length) await rm(lockPath, { force: true }); } catch (error) { cleanupErrors.push(toDescriptor(error, 'lock.release')); }
       return { closed: cleanupErrors.length === 0, cleanupErrors };
-    } };
+    })() };
   } catch (error) {
-    try { await logger?.close(1_000); } catch { /* cleanup best effort */ }
-    try { database?.close(); } catch { /* cleanup best effort */ }
-    try { await lock?.close(); await rm(lockPath, { force: true }); } catch { /* cleanup best effort */ }
+    const cleanupErrors: import('../packages/contracts/src/errors.ts').ErrorDescriptor[] = [];
+    try { await logger?.close(1_000); } catch (failure) { cleanupErrors.push(toDescriptor(failure, 'startup.logger.close')); }
+    try { database?.close(); } catch (failure) { cleanupErrors.push(toDescriptor(failure, 'startup.database.close')); }
+    if (lock) { try { await lock.close(); if (!cleanupErrors.length) await rm(lockPath, { force: true }); } catch (failure) { cleanupErrors.push(toDescriptor(failure, 'startup.lock.release')); } }
+    if (cleanupErrors.length) throw Object.assign(new AggregateError([error], 'Product startup failed and cleanup is incomplete', { cause: error }), { primaryError: error, cleanupErrors });
     throw error;
   }
 }
@@ -133,9 +146,10 @@ async function deriveOsBindingHash(): Promise<string> {
       const result = await execFileAsync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], { windowsHide: true, timeout: 2_000 });
       const sid = result.stdout.match(/S-1-[0-9-]+/)?.[0];
       if (sid) return sha256Text(`windows-sid|${sid}`);
-    } catch { /* fall back to the host-provided account name below */ }
+    } catch { /* No caller-controlled environment fallback for a Windows identity. */ }
+    throw productError({ code: 'IDENTITY_UNTRUSTED', category: 'authorization', source: { component: 'composition', operation: 'osIdentity' }, safeMessage: 'The Windows account identity could not be verified', impactScope: 'instance', recoveryAction: 'manual_review', correlation: {} });
   }
-  const account = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USER ?? process.env.USERNAME ?? '';
+  const account = userInfo().username;
   if (!account) throw productError({ code: 'IDENTITY_UNTRUSTED', category: 'authorization', source: { component: 'composition', operation: 'osIdentity' }, safeMessage: 'The local operating system identity could not be determined', impactScope: 'instance', recoveryAction: 'manual_review', correlation: {} });
   return sha256Text(`${process.platform}|${account}`);
 }

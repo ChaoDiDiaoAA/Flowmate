@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   ArtifactRef,
@@ -17,6 +17,7 @@ import { canonicalJson, nowUtc, sha256Bytes, sha256Canonical } from '../../../sh
 import { requireSha256 } from '../../../shared/src/index.ts';
 import { FoundationDatabase } from '../../../core/src/storage/database.ts';
 import { InstanceFileStore, validateRelativePath } from '../../../core/src/storage/file-store.ts';
+import { enforceSampleBudget, enforceInputLimit, enforceImageBudget, P0_INPUT_LIMITS } from './limits.ts';
 
 interface SourceDescriptor { path: string; bytes: number; sha256: string; }
 interface SourceSample { sampleId: string; originalSha256: string; metadata: SourceDescriptor; }
@@ -46,7 +47,7 @@ export class Voxel51DataSource implements DataPort {
   ) {}
 
   async inspect(_ctx: AuthorizedContext, sourceKey: string, manifestHash: string, _purpose: Purpose): Promise<InspectionReport> {
-    const manifestBytes = await this.readSourceBytes('manifest.json', 16_777_216);
+    const manifestBytes = await this.readSourceBytes('manifest.json', 16_777_216, manifestHash);
     if (sha256Bytes(manifestBytes) !== manifestHash) {
       throw productError({ code: 'FILE_DIGEST_MISMATCH', category: 'input', source: { component: 'voxel51', operation: 'inspect' }, safeMessage: 'The source manifest digest does not match the approved configuration', impactScope: 'call', recoveryAction: 'correct_input', correlation: { workspaceId: this.workspaceId } });
     }
@@ -66,6 +67,7 @@ export class Voxel51DataSource implements DataPort {
           checkedFiles += 1;
           if (isImagePath(descriptor.path)) {
             if (!validImageBytes(bytes, descriptor.path)) issues.push({ sampleId: sample.sampleId, code: 'IMAGE_UNREADABLE', detail: descriptor.path });
+            enforceImageBudget(bytes, descriptor.path);
           }
         }
         const content = files.get('content.json');
@@ -100,6 +102,7 @@ export class Voxel51DataSource implements DataPort {
     const manifest = await this.loadManifest(input.manifestSha256);
     const sample = manifest.samples.find((candidate) => candidate.sampleId === input.sampleId);
     if (!sample) throw productError({ code: 'FILE_MISSING', category: 'input', source: { component: 'voxel51', operation: 'register' }, safeMessage: 'The source sample is not present in the approved manifest', impactScope: 'call', recoveryAction: 'correct_input', correlation: { workspaceId: this.workspaceId } });
+    if (this.db.isOriginalWithdrawn(this.workspaceId, input.sourceKey, sample.originalSha256)) throw this.inputError('DOCUMENT_WITHDRAWN');
     const metadata = await this.readMetadata(sample);
     const original = await this.files.readVerified({ root: 'source', relativePath: `${sample.sampleId}/original.jpg`, expectedSha256: sample.originalSha256, expectedBytes: metadata.files.find((file) => file.path === 'original.jpg')?.bytes ?? 0, maxBytes: 67_108_864 });
     const originalDraft = await this.files.saveImmutable({ workspaceId: this.workspaceId, kind: 'source/original', bytes: original, sha256: sample.originalSha256, mediaType: 'image/jpeg', sourceRef: `${input.sourceKey}/${sample.sampleId}/original.jpg` });
@@ -111,6 +114,7 @@ export class Voxel51DataSource implements DataPort {
 
   async preparePublication(_ctx: AuthorizedContext, input: { sourceKey: string; manifestSha256: string; selection: readonly ParseSelection[]; purpose: Purpose }): Promise<PreparedPublication> {
     const manifest = await this.loadManifest(input.manifestSha256);
+    if (manifest.samples.some(sample => this.db.isOriginalWithdrawn(this.workspaceId, input.sourceKey, sample.originalSha256))) throw this.inputError('DOCUMENT_WITHDRAWN');
     const inspection = await this.inspect(_ctx, input.sourceKey, input.manifestSha256, input.purpose);
     if (inspection.issues.length) throw productError({ code: 'INPUT_INCOMPLETE', category: 'input', source: { component: 'voxel51', operation: 'preparePublication' }, safeMessage: 'The approved source set contains files that are not complete or readable', impactScope: 'call', recoveryAction: 'correct_input', correlation: { workspaceId: this.workspaceId } });
     const selectionByOriginal = new Map(input.selection.map((item) => [item.originalSha256, item]));
@@ -272,7 +276,7 @@ export class Voxel51DataSource implements DataPort {
   }
 
   private async loadManifest(expectedHash: string): Promise<SourceManifest> {
-    const bytes = await this.readSourceBytes('manifest.json', 16_777_216);
+    const bytes = await this.readSourceBytes('manifest.json', 16_777_216, expectedHash);
     requireSha256(expectedHash, 'manifestSha256');
     if (sha256Bytes(bytes) !== expectedHash) throw productError({ code: 'FILE_DIGEST_MISMATCH', category: 'input', source: { component: 'voxel51', operation: 'manifest' }, safeMessage: 'The source manifest is not the approved version', impactScope: 'call', recoveryAction: 'correct_input', correlation: { workspaceId: this.workspaceId } });
     return parseJson<SourceManifest>(bytes, 'manifest');
@@ -281,6 +285,7 @@ export class Voxel51DataSource implements DataPort {
   private async readMetadata(sample: SourceSample): Promise<SampleMetadata> {
     const bytes = await this.files.readVerified({ root: 'source', relativePath: sample.metadata.path, expectedSha256: sample.metadata.sha256, expectedBytes: sample.metadata.bytes, maxBytes: 16_777_216 });
     const metadata = parseJson<SampleMetadata>(bytes, `${sample.sampleId}/metadata`);
+    if (containsQualityAnswers(metadata)) throw this.schemaError(`${sample.sampleId}/metadata/quality-data`);
     if (metadata.sampleId !== sample.sampleId || metadata.originalSha256 !== sample.originalSha256 || !Array.isArray(metadata.files)) throw this.schemaError(`${sample.sampleId}/metadata`);
     const paths = new Set<string>();
     for (const file of metadata.files) {
@@ -291,13 +296,13 @@ export class Voxel51DataSource implements DataPort {
       if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) throw this.schemaError(`${sample.sampleId}/metadata/files`);
     }
     if (!paths.has('original.jpg') || !paths.has('content.json') || !paths.has('pages.json')) throw this.inputError('INPUT_INCOMPLETE');
+    enforceSampleBudget([...metadata.files, { bytes: sample.metadata.bytes }]);
     return metadata;
   }
 
-  private async readSourceBytes(relativePath: string, maxBytes: number): Promise<Uint8Array> {
-    const bytes = await readFile(join(this.sourceRoot, relativePath));
-    if (bytes.byteLength > maxBytes) throw productError({ code: 'INPUT_LIMIT_EXCEEDED', category: 'input', source: { component: 'voxel51', operation: 'readSource' }, safeMessage: 'The source manifest exceeds the configured limit', impactScope: 'call', recoveryAction: 'correct_input', correlation: { workspaceId: this.workspaceId } });
-    return bytes;
+  private async readSourceBytes(relativePath: string, maxBytes: number, expectedSha256: string): Promise<Uint8Array> {
+    const info = await stat(join(this.sourceRoot, relativePath));
+    return this.files.readVerified({ root: 'source', relativePath, expectedSha256, expectedBytes: info.size, maxBytes });
   }
 
   private schemaError(detail: string) { return productError({ code: 'PARSE_SCHEMA_INVALID', category: 'input', source: { component: 'voxel51', operation: 'validate' }, safeMessage: `The approved parsed input is not valid: ${detail}`, impactScope: 'call', recoveryAction: 'correct_input', correlation: { workspaceId: this.workspaceId } }); }
@@ -346,6 +351,8 @@ function computeParseHash(metadata: SampleMetadata, content: Uint8Array, pages: 
 }
 
 function validateParsePair(content: unknown[], pages: unknown[], metadata: SampleMetadata): void {
+  if (containsQualityAnswers(content) || containsQualityAnswers(pages)) throw productError({ code: 'PARSE_SCHEMA_INVALID', category: 'input', source: { component: 'voxel51', operation: 'qualityIsolation' }, safeMessage: 'Quality answer fields cannot be part of a product input', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
+  enforceInputLimit(pages.length, P0_INPUT_LIMITS.maxPages);
   if (content.length === 0 || pages.length === 0) throw productError({ code: 'INPUT_INCOMPLETE', category: 'input', source: { component: 'voxel51', operation: 'validatePair' }, safeMessage: 'The approved parse contains no pages or content blocks', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
   const supportedBlockTypes = new Set(['text', 'header', 'footer', 'page_footnote', 'page_number', 'table', 'image']);
   const pageNumbers = new Set<number>();
@@ -372,6 +379,12 @@ function validateParsePair(content: unknown[], pages: unknown[], metadata: Sampl
     const value = page as { pageNumber: number; blockCount?: number };
     if (value.blockCount !== undefined && value.blockCount !== counts.get(value.pageNumber)) throw productError({ code: 'INPUT_PAIR_MISMATCH', category: 'input', source: { component: 'voxel51', operation: 'validatePair' }, safeMessage: 'Page block counts do not match parsed content', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
   }
+}
+
+function containsQualityAnswers(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(containsQualityAnswers);
+  return Object.entries(value).some(([key, child]) => /^(gold|oracle|rubric|labels?|expected_?answer)$/i.test(key) || containsQualityAnswers(child));
 }
 
 function mapParsed(ref: DocumentRef, metadata: SampleMetadata & { artifactMap: Record<string, string> }, contentBytes: Uint8Array, pagesBytes: Uint8Array, db: FoundationDatabase, _files: InstanceFileStore, verificationRef: ArtifactRef): ParsedDocument {

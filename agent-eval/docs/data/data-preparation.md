@@ -1,12 +1,14 @@
 # Flowmate 初始评测数据制作方案
 
-> **2026-09-20架构修订。** Inspect AI统一阶段及完整Agent综合评测，CLI执行、Inspect View查看。现有 `data/` 综合材料保持不动，完整Agent实现后再核验启用；各阶段当期使用 `stage-evals/Pn/`，不等待整体完成。每阶段只保留README.md、cases.json及必要gold.json/fixtures，Oracle嵌入Case，质量优先、不追求数量。所有适配代码在agent-eval/src；详细接口与使用见[评测主方案第10章](../spec/01_Flowmate_Agent评测总方案.md#10-评测设施与工程对接)。本次不实施适配或生成运行，既有数据的数量/审核/摘要状态不变。
+当前 P0 使用 `bun run p0:eval` 无交互执行；新 development 运行绑定 `p0-local-f/v2`，不要求或生成手填用途确认，技术 PASS 不表示来源许可、业务语义或 Agent 通过。旧无策略证据沿原规则，未知策略/绑定不一致不能通过，历史资产和审核状态不变。P1–P13 同样从配置/环境/参数启动，缺项明确退出；业务人工审批不由评测器代签。详见[评测总方案 §10.5.7](../spec/01_Flowmate_Agent评测总方案.md#1057-版本依赖与兼容边界)。
+
+> **2026-09-20架构修订。** P0使用专用确定性命令；P1起Inspect AI统一阶段及完整Agent综合评测，CLI执行、Inspect View查看。现有 `data/` 综合材料保持不动，完整Agent实现后再核验启用；各阶段当期使用 `stage-evals/Pn/`，不等待整体完成。每阶段只保留README.md、cases.json及必要gold.json/fixtures，Oracle嵌入Case，质量优先、不追求数量。所有适配代码在agent-eval/src；详细接口与使用见[评测主方案第10章](../spec/01_Flowmate_Agent评测总方案.md#10-评测设施与工程对接)。本次不实施适配或生成运行，既有数据的数量/审核/摘要状态不变。
 
 ### 阶段数据制作补充（2026-09-20）
 
 逐阶段材料来源、Gold条件及完整示例以[评测主方案§10.5](../spec/01_Flowmate_Agent评测总方案.md#105-数据怎样准备阶段集怎样映射)为准。制作顺序为：提取要求 → 选择场景 → 准备输入与初态 → 建立Oracle/必要Gold → 核验与试跑 → 冻结版本 → 执行和回归交接。每例说明新增覆盖价值，质量优先、不设配额；参数化数量不能替代覆盖或统计依据。
 
-每阶段README/cases必备，Gold/fixtures按需；整理P0也建立F/Oracle/证据索引，复用根tests与reports/p0，不重复测试、不要求业务Gold或模型。本次不创建文件。业务答案独立取证；同源、近重复、变换与暴露据实记录，不用综合集答案优化当前候选。先固定判据再运行，缺实现只记设计/NOT_RUN；人工复核沿用§7.5触发条件，不增加全员独立签名。
+每阶段README/cases必备，Gold/fixtures按需；整理P0也建立F/Oracle/证据索引，复用根tests并采集新运行证据，不重复测试、不要求业务Gold或模型。本次不创建文件。业务答案独立取证；同源、近重复、变换与暴露据实记录，不用综合集答案优化当前候选。先固定判据再运行，缺实现只记设计/NOT_RUN；人工复核沿用§7.5触发条件，不增加全员独立签名。
 
 Task加载Case，Solver只投影获准输入，Scorer读取Oracle/Gold，初态/故障控制留在质量侧。数据准备、可执行、评测完成和阶段通过分别判断。下文数量及制作工具描述属于现有综合集；该集合原本允许多阶段使用，本次改为完整Agent后核验启用，保留历史用途与结果。
 
@@ -303,12 +305,12 @@ Benchmark 通过成员清单引用任务或契约中的具体 checkId，区分�
 覆盖更新操作在项目根运行：
 
 ```powershell
-python agent-eval/tools/coverage_update.py check --project .
-python agent-eval/tools/coverage_update.py publish --project .
-python agent-eval/tools/coverage_update.py verify --project .
+python agent-eval/tools/comprehensive/coverage_update.py check --project .
+python agent-eval/tools/comprehensive/coverage_update.py publish --project .
+python agent-eval/tools/comprehensive/coverage_update.py verify --project .
 ```
 
-`check` 在内存中复核候选和差异，不修改活动数据；`publish` 在检查通过后更新最新活动材料、覆盖、制作报告及库存；`verify` 对发布后的文件和引用进行核验。当前基础资产校验仍使用 `python agent-eval/tools/initial_dataset.py verify --project .`。不把检查命令当产品运行命令。
+`check` 在内存中复核候选和差异，不修改活动数据；`publish` 在检查通过后更新最新活动材料、覆盖、制作报告及库存；`verify` 对发布后的文件和引用进行核验。当前基础资产校验仍使用 `python agent-eval/tools/comprehensive/initial_dataset.py verify --project .`。不把检查命令当产品运行命令。
 
 ### 10.2 变更维护
 

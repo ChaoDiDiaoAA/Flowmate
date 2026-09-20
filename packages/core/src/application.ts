@@ -155,7 +155,12 @@ export class ApplicationService implements Application {
     this.assertWorkspaceRef(req.workspaceId, input.projection);
     return this.runLogged(req, 'evidence.read', async () => {
       const artifact = this.db.getArtifact(req.workspaceId, input.projection.artifactId);
-      if (!artifact || artifact.kind !== 'input/projection') throw this.evidenceNotFound(req, input.projection);
+      if (!artifact || artifact.kind !== 'input/projection' || artifact.sha256 !== input.projection.sha256 || artifact.size_bytes !== input.projection.sizeBytes) throw this.evidenceNotFound(req, input.projection);
+      const [documentId, version] = artifact.source_ref.split('/');
+      const bound = this.db.getLatestDocumentById(req.workspaceId, documentId);
+      if (!bound || bound.ref.version !== version) throw this.evidenceNotFound(req, input.projection);
+      const boundRecord = this.db.getDocumentRecord(bound.ref);
+      this.authorize(req, 'document.read', { sourceKey: boundRecord?.source_key, document: bound.ref, purpose: input.purpose });
       const bytes = await this.files.readInstanceArtifact(artifact.relative_path, artifact.sha256, artifact.size_bytes, this.files.maxFileBytes);
       let captured: InputProjection;
       try { captured = JSON.parse(new TextDecoder().decode(bytes)) as InputProjection; } catch (error) {

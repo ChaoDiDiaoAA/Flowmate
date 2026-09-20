@@ -63,7 +63,7 @@ async function makeSecondParseVersion(data: { sourceRoot: string; sampleId: stri
   });
 }
 
-async function addParseVariant(data: { sourceRoot: string; sampleId: string }): Promise<string> {
+async function addParseVariant(data: { sourceRoot: string; sampleId: string }, different = true): Promise<string> {
   const manifestPath = join(data.sourceRoot, 'manifest.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { samples: Array<{ sampleId: string; originalSha256: string; metadata: { path: string; bytes: number; sha256: string } }> };
   const original = manifest.samples.find((candidate) => candidate.sampleId === data.sampleId);
@@ -75,7 +75,7 @@ async function addParseVariant(data: { sourceRoot: string; sampleId: string }): 
   const textBlock = content.find((candidate) => typeof candidate.text === 'string');
   if (!textBlock) throw new Error('Fixture sample has no text block to revise');
   textBlock.text = `${String(textBlock.text)} [alternate parse]`;
-  const contentBytes = new TextEncoder().encode(JSON.stringify(content));
+  const contentBytes = different ? new TextEncoder().encode(JSON.stringify(content)) : await readFile(join(data.sourceRoot, data.sampleId, 'content.json'));
   await writeFile(contentPath, contentBytes);
   const metadataPath = join(data.sourceRoot, variantId, 'metadata.json');
   const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as { sampleId: string; sourceRecordId: string; files: Array<{ path: string; bytes: number; sha256: string }> };
@@ -111,6 +111,122 @@ async function approveManifest(product: Awaited<ReturnType<typeof createProduct>
 }
 
 describe('P0 product input lifecycle', () => {
+  it('maps two parsed pages through a real publication and rejects over-budget page sets', async () => {
+    for (const pageCount of [2, 199, 200, 201]) {
+      const data = await fixture();
+      const originalContent = JSON.parse(await readFile(join(data.sourceRoot, data.sampleId, 'content.json'), 'utf8'));
+      if (originalContent.length < 2) throw new Error('[P0_FACILITY] Multiblock fixture required');
+      originalContent.forEach((block: { page_idx: number }, index: number) => { block.page_idx = index % 2; });
+      await rewriteSourceFile(data, 'content.json', () => new TextEncoder().encode(JSON.stringify(originalContent)));
+      const pages = Array.from({ length: pageCount }, (_, index) => ({ pageNumber: index + 1, text: '', blockCount: originalContent.filter((block: { page_idx: number }) => block.page_idx === index).length }));
+      const hash = await rewriteSourceFile(data, 'pages.json', () => new TextEncoder().encode(JSON.stringify(pages)));
+      const p = await createProduct({ instanceRoot: join(data.root, 'instance'), mode: 'create' });
+      try {
+        const req = () => ({ requestId: crypto.randomUUID(), workspaceId: p.workspaceId });
+        const input = { sourceKey: 'voxel51', manifestSha256: hash, purpose: 'development' as const };
+        const inspection = await p.application.inspectSource(req(), input);
+        if (pageCount > 200) {
+          expect(inspection.issues.some(issue => issue.code === 'INPUT_LIMIT_EXCEEDED')).toBe(true);
+          await expect(p.application.publishDataset(req(), { ...input, selection: [] })).rejects.toMatchObject({ descriptor: { code: 'INPUT_INCOMPLETE' } });
+        } else {
+          expect(inspection.issues).toEqual([]);
+          const publication = await p.application.publishDataset(req(), { ...input, selection: [] });
+          const result = await p.application.readDocument(req(), { document: publication.documentRefs[0], manifest: publication.manifest, purpose: 'development' });
+          expect(result.parsed.pages).toHaveLength(pageCount);
+        }
+      } finally { expect((await p.close()).closed).toBe(true); }
+    }
+  }, 120_000);
+  it('rejects missing and changed bytes for every required source file role', async () => {
+    for (const mode of ['missing', 'changed'] as const) {
+      const exemplar = await fixture();
+      const metadata = JSON.parse(await readFile(join(exemplar.sourceRoot, exemplar.sampleId, 'metadata.json'), 'utf8')) as { files: Array<{ path: string }> };
+      const image = metadata.files.find(file => file.path.startsWith('assets/images/'));
+      if (!image) throw new Error('[P0_FACILITY] Source fixture lacks referenced image');
+      for (const path of ['original.jpg', 'content.json', 'pages.json', 'metadata.json', image.path]) {
+        const data = await fixture();
+        const p = await createProduct({ instanceRoot: join(data.root, 'instance'), mode: 'create' });
+        const req = () => ({ requestId: crypto.randomUUID(), workspaceId: p.workspaceId });
+        const input = { sourceKey: 'voxel51', manifestSha256: data.manifestSha256, purpose: 'development' as const };
+        try {
+          expect((await p.application.inspectSource(req(), input)).issues).toEqual([]);
+          const target = join(data.sourceRoot, data.sampleId, path);
+          if (mode === 'missing') await rm(target);
+          else await writeFile(target, new Uint8Array([1, 2, 3]));
+          const inspection = await p.application.inspectSource(req(), input);
+          expect(inspection.issues.some(issue => issue.code === (mode === 'missing' ? 'FILE_MISSING' : 'FILE_DIGEST_MISMATCH'))).toBe(true);
+          await expect(p.application.publishDataset(req(), { ...input, selection: [] })).rejects.toMatchObject({ descriptor: { code: 'INPUT_INCOMPLETE' } });
+        } finally { expect((await p.close()).closed).toBe(true); }
+      }
+    }
+  }, 120_000);
+
+  it('rejects malformed JSON and empty pages with matching fixture digests', async () => {
+    for (const [path, text, expected] of [['content.json', '{', 'PARSE_SCHEMA_INVALID'], ['pages.json', '{', 'PARSE_SCHEMA_INVALID'], ['pages.json', '[]', 'INPUT_INCOMPLETE']] as const) {
+      const data = await fixture();
+      const hash = await rewriteSourceFile(data, path, () => new TextEncoder().encode(text));
+      const p = await createProduct({ instanceRoot: join(data.root, 'instance'), mode: 'create' });
+      try {
+        const req = () => ({ requestId: crypto.randomUUID(), workspaceId: p.workspaceId });
+        const input = { sourceKey: 'voxel51', manifestSha256: hash, purpose: 'development' as const };
+        expect((await p.application.inspectSource(req(), input)).issues.some(issue => issue.code === expected)).toBe(true);
+        await expect(p.application.publishDataset(req(), { ...input, selection: [] })).rejects.toMatchObject({ descriptor: { code: 'INPUT_INCOMPLETE' } });
+      } finally { expect((await p.close()).closed).toBe(true); }
+    }
+  }, 60_000);
+
+  it('rejects quality answer keys and quality path canaries before publication', async () => {
+    for (const mutation of ['oracle', 'quality-path'] as const) {
+      const data = await fixture();
+      const manifestSha256 = await rewriteSourceFile(data, 'content.json', bytes => {
+        const content = JSON.parse(new TextDecoder().decode(bytes));
+        if (mutation === 'oracle') content[0].oracle = { expectedAnswer: 'CANARY_NOT_PRODUCT_INPUT' };
+        else {
+          const block = content.find((row: { img_path?: string }) => row.img_path);
+          if (!block) throw new Error('[P0_FACILITY] Fixture lacks image block');
+          block.img_path = '../agent-eval/gold-canary.json';
+        }
+        return new TextEncoder().encode(JSON.stringify(content));
+      });
+      const p = await createProduct({ instanceRoot: join(data.root, 'instance'), mode: 'create' });
+      try {
+        const req = () => ({ requestId: crypto.randomUUID(), workspaceId: p.workspaceId });
+        const input = { sourceKey: 'voxel51', manifestSha256, purpose: 'development' as const };
+        expect((await p.application.inspectSource(req(), input)).issues.length).toBeGreaterThan(0);
+        await expect(p.application.publishDataset(req(), { ...input, selection: [] })).rejects.toMatchObject({ descriptor: { code: 'INPUT_INCOMPLETE' } });
+      } finally { expect((await p.close()).closed).toBe(true); }
+    }
+  }, 60_000);
+
+  it('withdraws aliases and all parse versions and refuses later reimport', async () => {
+    const data = await fixture();
+    const p = await createProduct({ instanceRoot: join(data.root, 'instance'), mode: 'create' });
+    const req = () => ({ requestId: crypto.randomUUID(), workspaceId: p.workspaceId });
+    try {
+      const first = await p.application.publishDataset(req(), { sourceKey: 'voxel51', manifestSha256: data.manifestSha256, selection: [], purpose: 'development' });
+      const captured = await p.application.captureInput(req(), { document: first.documentRefs[0], manifest: first.manifest, purpose: 'development' });
+      const aliasesHash = await addParseVariant(data, false);
+      await approveManifest(p, data, aliasesHash);
+      const aliased = await p.application.publishDataset(req(), { sourceKey: 'voxel51', manifestSha256: aliasesHash, selection: [], purpose: 'development' });
+      const manifest = JSON.parse(new TextDecoder().decode(await p.application.readEvidence(req(), { artifact: aliased.manifest })));
+      expect(manifest.documents[0].aliases).toHaveLength(1);
+      // Reuse the alias directory as a distinct parsed version; only this isolated source is changed.
+      const nextHash = await rewriteSourceFile({ ...data, sampleId: `${data.sampleId}-parse-variant` }, 'content.json', bytes => {
+        const content = JSON.parse(new TextDecoder().decode(bytes));
+        content.find((row: { text?: string }) => typeof row.text === 'string').text += ' [new parse]';
+        return new TextEncoder().encode(JSON.stringify(content));
+      });
+      await approveManifest(p, data, nextHash);
+      const inspection = await p.application.inspectSource(req(), { sourceKey: 'voxel51', manifestSha256: nextHash, purpose: 'development' });
+      const selected = inspection.variants[0].parseHashes.find(hash => hash !== first.documentRefs[0].parseHash)!;
+      const input = { sourceKey: 'voxel51', manifestSha256: nextHash, selection: [{ originalSha256: data.originalSha256, selectedParseHash: selected, reason: 'fixed alternate', evidenceRef: 'test:alternate' }], purpose: 'development' as const };
+      const next = await p.application.publishDataset(req(), input);
+      await p.application.setDocumentStatus(req(), { document: next.documentRefs[0], change: { expectedStatus: 'available', expectedRevision: 2, targetStatus: 'withdrawn', reason: 'same-source withdrawal' } });
+      for (const publication of [first, aliased, next]) await expect(p.application.readDocument(req(), { document: publication.documentRefs[0], manifest: publication.manifest, purpose: 'development' })).rejects.toMatchObject({ descriptor: { code: 'DOCUMENT_WITHDRAWN' } });
+      await expect(p.application.readCapturedInput(req(), { projection: captured.projection, purpose: 'development' })).rejects.toMatchObject({ descriptor: { code: 'DOCUMENT_WITHDRAWN' } });
+      await expect(p.application.publishDataset(req(), input)).rejects.toMatchObject({ descriptor: { code: 'DOCUMENT_WITHDRAWN' } });
+    } finally { expect((await p.close()).closed).toBe(true); }
+  }, 60_000);
   it('publishes, reads, captures, closes and reopens one real input', async () => {
     const data = await fixture();
     const product = await createProduct({ instanceRoot: join(data.root, 'instance'), mode: 'create' });
@@ -351,6 +467,8 @@ describe('P0 product input lifecycle', () => {
         policy: { schemaVersion: 'p0-policy/v1', version: noInspect.version + 1, grants: [{ actorId: workspace.ownerActorId, operations: ['source.inspect', 'policy.publish', 'evidence.read'], sourceKeys: ['voxel51'], purposes: ['development'] }], sources: [{ ...baseSource, allowedPurposes: ['development'] }] },
       });
       expect(onlyDevelopment.version).toBe(noInspect.version + 1);
+      await expect(product.application.inspectSource(req(), { sourceKey: 'voxel51', manifestSha256: data.manifestSha256, purpose: 'development' }))
+        .resolves.toMatchObject({ inspectedSamples: 1 });
       await expect(product.application.inspectSource(req(), { sourceKey: 'voxel51', manifestSha256: data.manifestSha256, purpose: 'regression' }))
         .rejects.toMatchObject({ descriptor: { code: 'OPERATION_DENIED' } });
     } finally { await product.close(); }

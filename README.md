@@ -2,7 +2,7 @@
 
 基于 Pi SDK 的数字员工产品，首个业务场景是：使用已有合格解析结果和获准原票证据，完成发票字段抽取、适用业务核查、人工复核、具体动作审批、B2B 录入及权威结果核对。
 
-**当前处于方案与分阶段实施准备期，尚无可运行的产品应用。** 仓库已有数据准备、覆盖核验、离线任务选择及评测设施；这些不代表产品 Runtime 已实现，也不代表真实 Agent 或业务验收通过。
+**已有 P0 产品基础实现，当前为收尾与阶段评测准备完成、等待用户执行。** 公共 Application、默认 Workspace、受控文件/SQLite、输入发布读取及无桌面 CLI 已存在；本轮改动仅经过静态检查和合成设施自检，未重跑产品评测。Pi 模型/Agent Loop 属于 P1，尚不能宣称真实 Agent 或业务验收通过。
 
 ## 文档入口
 
@@ -14,7 +14,7 @@
 | 数据如何制作、对齐与使用 | [制作方案](agent-eval/docs/data/data-preparation.md) · [对齐方案](agent-eval/docs/data/data-alignment-plan.md) · [使用指南](agent-eval/docs/data/data-usage-guide.md) |
 | 领域概念 | [领域术语](CONTEXT.md)，具体契约以主方案为准 |
 
-`docs/v1/` 保留逐章修改方案，当前设计及执行依据以 `docs/spec/` 主方案为准。阶段目标和实施计划在进入对应阶段时编写，不提前生成全部阶段文件或空包。
+`docs/v1/` 保留逐章修改方案，当前设计及执行依据以 `docs/spec/` 主方案为准。P1–P13 进入对应阶段后编写产品目标、产品实施计划和 Agent 评测实施方案三份文档；P0 保留既有两份文件，不提前生成空稿或空包。
 
 ## 架构与职责
 
@@ -36,7 +36,7 @@ Session 保存可跨 Run 续接的历史；Run 管一次获准执行；Job 管�
 
 - 最终目标为 **22 张功能表＋1 张迁移表，共 23 张**；各阶段只建立当期需要的结构。
 - SQLite 是会话历史的唯一持久化来源：`sessions` 保存原生头和当前位置，`memories` 保存完整原生条目及压缩内容，`session_inputs` 记录输入受理与投递；业务上下文正文保存在 `context_snapshots`。
-- 当前只实现 Session 会话记忆，复用 Pi 历史与压缩语义；不额外建设跨任务长期记忆、向量检索或自动经验提炼引擎。保存正确与模型正确使用记忆分别验证。
+- 目标只建设 Session 会话记忆，随 P4/P6/P7 接入（P0 尚无会话持久化），复用 Pi 历史与压缩语义；不额外建设跨任务长期记忆、向量检索或自动经验提炼引擎。保存正确与模型正确使用记忆分别验证。
 - 原票、附件、配置清单及文件型证据使用受控文件存储；诊断日志保持独立 JSONL，不能替代数据库业务事实或审计。
 - 目标工程使用 TypeScript、Bun；P1–P12 嵌入 Pi SDK，P12 引入 Electron／React 桌面，P13 将主子会话及插件移入受控 Pi Host，业务数据库留在控制侧。依赖和承载兼容性在对应阶段实际验证。
 
@@ -61,11 +61,15 @@ Session 保存可跨 Run 续接的历史；Run 管一次获准执行；Job 管�
 
 每阶段通过最小真实任务证明增量，同时验证适用失败路径和受影响前序能力。一次成功演示不等于阶段完整通过。
 
+P1–P13 从产品主方案第21章的阶段验收卡开始阅读：明确新增能力、真实任务、必要 F/A/适用 B、失败与回归、退出证据及索引。阶段目标放 `docs/spec/Pn_阶段目标方案.md`，产品实施计划放 `docs/plans/Pn_阶段实施计划.md`，评测方案放 `agent-eval/docs/plans/Pn_Agent评测实施方案.md`。按“核实当前实现与依赖 → 编写阶段目标方案 → 编写产品实施计划及评测方案 → 产品实现与 F 验证 → 完善阶段资产 → 冻结执行依据 → Inspect 执行 A／适用 B 与回归 → 结论及交接”推进，目标方案首页细化阶段卡，计划与评测引用契约，不再另建 Gate Card 或评测目标文件。P4 收尾增加假 Runtime 的最小 IPC 工程探针，P8 按事实接受/人工等待修订/检查点恢复三步推进，P12 按 UI → 本地动作模拟 → 企业契约模拟 → 获准真实测试四个里程碑实施；P13 按承载迁移、故障恢复、安装运维、生产放行四个内部里程碑推进；里程碑进度与 Test/Shadow/Canary/Production 环境分别记录。均是后续设计，不表示已经实现。
+
+P1 起拟由同一 Inspect 适配管理专用测试实例：Case 是任务定义，`FlowmateData/<instanceId>/` 是产品现场，`agent-eval/runs/<executionId>/` 是评测证据与结果，既有 `binding.json` 关联它们。默认 `instanceRetention=preserve_on_failure`：完整通过、产品关闭及评分/独立证据落盘后才清理；异常、未完成、UNKNOWN 或待恢复时保留，调试可选 `preserve_all`。只处理控制器新建的专用评测实例，不影响日常产品、P0 实例或历史目录；详见评测总方案 §10.7.1。失败实例的长期保留和人工清理在 P13.3 细化；此前对已保留失败实例默认保留，不增加自动到期删除，也不影响成功 Trial 正常回收。该规则不改变 P0；P0 无交互入口和技术判定策略见下方操作命令。
+
 P12-A 通用模拟、P12-B 企业契约模拟、P12-C 获准真实测试分别报告。Test → Shadow → Canary → Production 是 P13 内的放行阶梯；工程验证、质量结论、生产放行和逐动作批准不能互相替代。
 
 ## 当前数据与评测状态
 
-**2026-09-20 核对本地制作报告：**
+**2026-09-20 历史本地制作报告盘点（本次收尾未重跑综合集核验）：**
 
 | 项目 | 当前记录 |
 |---|---:|
@@ -75,35 +79,59 @@ P12-A 通用模拟、P12-B 企业契约模拟、P12-C 获准真实测试分别�
 | 模拟业务资料 | 80 套 |
 | 完整 Agent 任务 | 78 个（当前上限 100） |
 | 产品契约 | 14 套／460 个场景 |
-| 真实产品运行／Baseline | 0／0 |
+| 综合集真实 Agent 运行／Agent Baseline | 0／0（不包含 P0 产品 F） |
 
-**当前核验阻断（2026-09-20）：** `initial_dataset.py verify` 与 `coverage_update.py verify` 均报告 `Benchmark definition pin drift`，表示 Benchmark 定义与清单固定摘要不一致，当前材料不能宣称完整核验通过。下列命令可用于复查；本次 README 更新未修改数据或重新发布清单。
+**综合集历史核验阻断（2026-09-20）：** `initial_dataset.py verify` 与 `coverage_update.py verify` 均报告 `Benchmark definition pin drift`，表示 Benchmark 定义与清单固定摘要不一致，当前材料不能宣称完整核验通过。下列命令可用于复查；本次 README 更新未修改数据或重新发布清单。
 
-以上是本次核对的盘点，后续以本地 [制作报告](agent-eval/data/manifests/preparation-report.json) 和当前清单为准。Gold 材料存在不等于人工核验完成；契约场景、字段检查、工具调用和子 Agent 不计作独立 Agent 任务，也不代表已执行成绩。
+以上是历史核对的盘点，后续以本地 [制作报告](agent-eval/data/manifests/preparation-report.json) 和当前清单为准。Gold 材料存在不等于人工核验完成；契约场景、字段检查、工具调用和子 Agent 不计作独立 Agent 任务，也不代表已执行成绩。
 
 产品输入位于 `data/invoices/voxel51/`；外部来源为 `D:\obsidian\data\flowmate-data\Evidence\invoices\voxel51`，保留来源副本，产品运行不依赖该外部路径。提供方标签及 Gold、Case、评分资料在独立 `agent-eval/data/` 根下，产品 Agent、子 Agent、工具发现和 Context 不得读取；仅由可信控制器交付获准输入投影。
 
 `data/invoices/`、`FlowmateData/`、`agent-eval/data/` 和评测运行产物均被 Git 忽略，克隆仓库不会自动取得本地资料。文件准备不代表 P0 的产品读取链路、默认 Workspace 和基础存储已验收。
 
-## 当前可用命令
+产品行为以本次绑定的产品规范为依据，评测总方案负责独立质量判据；测试映射冲突须修正并核验适用性，不能用新工作区文本改写旧运行或借产品优先降低质量要求。具体分工与变更见两份主方案，当前能力以代码和实际证据为准。
 
-需要 Python 和已准备的本地数据。在项目根目录执行以下只读检查；当前没有产品启动命令。
+## 各阶段操作命令
+
+每实现一个阶段，必须同步本节的状态、环境、操作/验证命令、结果位置、清理方式和方案链接。只登记已实现入口；命令能执行不等于该阶段已验收。当前只展开 P0，P1–P13 随实施补充。
+
+### P0：基础输入、身份、存储与确定性 F
+
+状态：已有实现；旧 F 报告已按用户要求删除，仅保留历史文字记录；本次收尾含新修复、新边界测试及独立 Case，**等待用户执行新评测**。历史成绩不自动适用于修改后的源码。P0 不用 Inspect AI，没有模型运行或桌面常驻服务。
+
+工作目录 `D:/code/Flowmate`；Bun ≥1.4、Node ≥24、已有 Python/Pillow/pytest 环境及本地 `data/invoices/voxel51/`。JS 依赖按 `bun.lock` 安装。启动后直接检查，不询问用途依据或记录人，也无需交互终端。
 
 ```powershell
-# 查看当前资产与阻断项
-python agent-eval/tools/initial_dataset.py report --project .
-
-# 检查当前材料结构、引用、计数和隔离
-python agent-eval/tools/initial_dataset.py verify --project .
-
-# 核验当前覆盖修订
-python agent-eval/tools/coverage_update.py verify --project .
-
-# 选择当期评测子集并报告就绪状态，不执行产品
-python agent-eval/src/runner/initial_dataset.py BM-08 --project . --stage P2 --split development --subset capability
+Set-Location D:/code/Flowmate
+# 依赖尚未安装时执行
+bun install --frozen-lockfile
+# 完整 P0 评测：直接执行，无需输入
+bun run p0:eval
 ```
 
-准备或发布资料的写入命令见[评测 README](agent-eval/README.md)及[数据制作方案](agent-eval/docs/data/data-preparation.md)。产品尚未接入时，Runner 的产品执行保持 blocked，不生成真实成绩或 Baseline。旧准备、迁移脚本仍保留在仓库中，当前流程以这些文档指定的入口为准。
+该命令自动创建本次实例和报告目录、固定版本、执行现有测试/来源审计/发布读取/重启重读/故障探针并逐 Case 复核。它不运行模型，也不使用 Inspect AI。底层命令和失败定位见 [P0 阶段执行 README](agent-eval/stage-evals/P0/README.md)。
+
+结果：命令最后直接显示通过、失败或未完成及报告位置。`agent-eval/runs/<实际ExecutionId>/summary.md` 是可读摘要，`stage-review.json` 是逐 Case 正式复核结果，步骤日志用于排错。缺证据、版本错配、必要覆盖缺口或产品策略拒绝仍不能通过。新运行绑定 `p0-local-f/v2`，本地技术 F 不要求人工用途声明；来源许可未核实的事实保留，PASS 不表示数据许可、业务语义、Agent 或生产用途通过。
+
+副作用与关闭：全量发布仅写本次 `FlowmateData/p0-evals/<实际ExecutionId>/`，`capture` 写输入投影与审计；CLI 正常结束显式关闭资源。异常后先确认进程停止与句柄释放，不能盲删锁。测试和故障探针仅修改它们的临时副本；全量实例及报告保留，用户核对后再处理，历史输出不覆盖。
+
+依据：[P0 产品方案](docs/plans/P0_阶段实施方案.md) · [P0 评测方案](agent-eval/docs/plans/P0_Agent评测实施方案.md) · [P0 Case](agent-eval/stage-evals/P0/cases.json)。
+
+如果旧命令还停在提问处，先按 `Ctrl+C` 结束，再重新运行 `bun run p0:eval`。新版创建新目录，不恢复旧进程或覆盖旧结果。P1–P13 同样规定无交互启动；缺必要配置时说明原因并退出，后续命令随实现登记。
+
+### 综合评测集维护（完整 Agent 实现后核验启用）
+
+以下是综合资产报告/维护入口，不是本期 P0 评测命令。旧离线 `--stage` 参数仍筛选综合集，不加载独立阶段目录。
+
+```powershell
+Set-Location D:/code/Flowmate
+python -B agent-eval/tools/comprehensive/initial_dataset.py report --project .
+# 完整 Agent 实现后核验现有综合材料时使用
+python -B agent-eval/tools/comprehensive/initial_dataset.py verify --project .
+python -B agent-eval/tools/comprehensive/coverage_update.py verify --project .
+```
+
+准备或发布资料的写入命令见[评测 README](agent-eval/README.md)及[数据制作方案](agent-eval/docs/data/data-preparation.md)。本次未运行以上综合核验、未改清单/Gold/Benchmark。综合集真实 Agent 运行数为零，不能用来否定已有 P0 产品读取链路；P0 F 通过也不能代替完整 Agent 评测。
 
 ## 业务边界
 

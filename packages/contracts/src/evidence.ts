@@ -25,6 +25,8 @@ export interface CheckObservation {
 }
 
 export interface ProductBinding {
+  /** Omitted in legacy evidence; this policy covers only local development technical F. */
+  assessmentPolicy?: 'p0-local-f/v2';
   codeCommit: string;
   dirtyDiffSha256: Sha256 | null;
   lockSha256: Sha256;

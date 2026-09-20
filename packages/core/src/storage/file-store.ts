@@ -25,6 +25,8 @@ export interface FileStoreOptions {
   maxFileBytes?: number;
   /** Test-only seam; production composition leaves it undefined. */
   faultInjector?: FileStoreFaultInjector;
+  /** Test-only observation immediately before a verified read touches file bytes. */
+  observeRead?: (absolutePath: string) => void;
 }
 
 export class InstanceFileStore implements ControlledFileStore {
@@ -32,12 +34,14 @@ export class InstanceFileStore implements ControlledFileStore {
   readonly instanceRoot: string;
   readonly maxFileBytes: number;
   private readonly faultInjector?: FileStoreOptions['faultInjector'];
+  private readonly observeRead?: FileStoreOptions['observeRead'];
 
   constructor(options: FileStoreOptions) {
     this.sourceRoot = resolve(options.sourceRoot);
     this.instanceRoot = resolve(options.instanceRoot);
     this.maxFileBytes = options.maxFileBytes ?? 67_108_864;
     this.faultInjector = options.faultInjector;
+    this.observeRead = options.observeRead;
   }
 
   async prepare(): Promise<void> {
@@ -62,8 +66,9 @@ export class InstanceFileStore implements ControlledFileStore {
       throw productError({ code: 'FILE_MISSING', category: 'input', source: { component: 'file-store', operation: 'readVerified' }, safeMessage: 'A required input file is missing or unreadable', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} }, { cause: error as Error });
     }
     if (!info.isFile() || info.size !== input.expectedBytes || info.size > Math.min(input.maxBytes, this.maxFileBytes)) {
-      throw productError({ code: info.size > input.maxBytes ? 'INPUT_LIMIT_EXCEEDED' : 'FILE_DIGEST_MISMATCH', category: 'input', source: { component: 'file-store', operation: 'readVerified' }, safeMessage: 'The input file does not match its approved descriptor', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
+      throw productError({ code: info.size > Math.min(input.maxBytes, this.maxFileBytes) ? 'INPUT_LIMIT_EXCEEDED' : 'FILE_DIGEST_MISMATCH', category: 'input', source: { component: 'file-store', operation: 'readVerified' }, safeMessage: 'The input file does not match its approved descriptor', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
     }
+    this.observeRead?.(path);
     const bytes = await readFile(path);
     if (bytes.byteLength !== input.expectedBytes || sha256Bytes(bytes) !== input.expectedSha256) {
       throw productError({ code: 'FILE_DIGEST_MISMATCH', category: 'input', source: { component: 'file-store', operation: 'readVerified' }, safeMessage: 'The input file digest does not match its approved descriptor', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
@@ -126,6 +131,9 @@ export class InstanceFileStore implements ControlledFileStore {
     const normalized = validateRelativePath(relativePath);
     const candidate = resolve(root, normalized);
     const rootResolved = resolve(root);
+    // Check the approved root and its ancestors as well as the relative suffix.
+    // A real leaf directory below a junction must not bypass the path boundary.
+    await assertNoLinkedAncestors(rootResolved);
     const rel = relative(rootResolved, candidate);
     if (rel === '..' || rel.startsWith(`..${sep}`) || resolve(rootResolved, rel) !== candidate) {
       throw productError({ code: 'PATH_FORBIDDEN', category: 'authorization', source: { component: 'file-store', operation: 'resolvePath' }, safeMessage: 'The requested path is outside the approved root', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
@@ -147,6 +155,20 @@ export class InstanceFileStore implements ControlledFileStore {
       }
     }
     return candidate;
+  }
+}
+
+export async function assertNoLinkedAncestors(path: string): Promise<void> {
+  let current = resolve(path);
+  while (true) {
+    try {
+      if ((await lstat(current)).isSymbolicLink()) throw productError({ code: 'REPARSE_POINT_DENIED', category: 'authorization', source: { component: 'file-store', operation: 'resolvePath' }, safeMessage: 'Approved paths and their ancestors cannot be links', impactScope: 'call', recoveryAction: 'correct_input', correlation: {} });
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT')) throw error;
+    }
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
   }
 }
 

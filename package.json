@@ -11,9 +11,10 @@
     "test:p0": "vitest run --config vitest.config.ts",
     "p0": "bun run scripts/p0.ts",
     "p0:fault-probe": "bun run scripts/p0-fault-probe.ts",
-    "p0:source-audit": "python -B agent-eval/tools/p0_source_audit.py",
+    "p0:source-audit": "python -B agent-eval/tools/p0/p0_source_audit.py",
     "p0:verify": "bun run scripts/p0-verify-published.ts",
-    "p0:review": "python -B agent-eval/tools/review_p0_report.py",
+    "p0:review": "python -B agent-eval/tools/p0/review_p0_report.py",
+    "p0:eval": "bun run agent-eval/tools/p0/run_p0.ts",
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {

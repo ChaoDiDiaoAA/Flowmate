@@ -176,6 +176,15 @@ export interface StartOptions {
   instanceRoot: string;
   configPath?: string;
   mode: 'create' | 'open';
+  /** Required by a controlled restore; retain independently of the restored copy. */
+  recoveryCheckpoint?: RecoveryCheckpoint;
+}
+
+export interface RecoveryCheckpoint {
+  schemaVersion: 'p0-recovery-checkpoint/v1';
+  instanceId: Id;
+  workspaceId: Id;
+  authoritySha256: Sha256;
 }
 
 export interface StartedProduct {

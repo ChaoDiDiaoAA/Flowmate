@@ -1,12 +1,14 @@
 # 初始评测集对齐与接收方案
 
-> **2026-09-20架构修订。** Inspect AI统一阶段及完整Agent综合评测，CLI执行、Inspect View查看。现有 `data/` 综合材料保持不动，完整Agent实现后再核验启用；各阶段当期使用 `stage-evals/Pn/`，不等待整体完成。每阶段只保留README.md、cases.json及必要gold.json/fixtures，Oracle嵌入Case，质量优先、不追求数量。所有适配代码在agent-eval/src；详细接口与使用见[评测主方案第10章](../spec/01_Flowmate_Agent评测总方案.md#10-评测设施与工程对接)。本次不实施适配或生成运行，既有数据的数量/审核/摘要状态不变。
+当前 P0 使用 `bun run p0:eval` 无交互执行；新 development 运行绑定 `p0-local-f/v2`，不要求或生成手填用途确认，技术 PASS 不表示来源许可、业务语义或 Agent 通过。旧无策略证据沿原规则，未知策略/绑定不一致不能通过，历史资产和审核状态不变。P1–P13 同样从配置/环境/参数启动，缺项明确退出；业务人工审批不由评测器代签。详见[评测总方案 §10.5.7](../spec/01_Flowmate_Agent评测总方案.md#1057-版本依赖与兼容边界)。
+
+> **2026-09-20架构修订。** P0使用专用确定性命令；P1起Inspect AI统一阶段及完整Agent综合评测，CLI执行、Inspect View查看。现有 `data/` 综合材料保持不动，完整Agent实现后再核验启用；各阶段当期使用 `stage-evals/Pn/`，不等待整体完成。每阶段只保留README.md、cases.json及必要gold.json/fixtures，Oracle嵌入Case，质量优先、不追求数量。所有适配代码在agent-eval/src；详细接口与使用见[评测主方案第10章](../spec/01_Flowmate_Agent评测总方案.md#10-评测设施与工程对接)。本次不实施适配或生成运行，既有数据的数量/审核/摘要状态不变。
 
 ### 新规范与旧工具的兼容边界
 
-本次调整的是现有综合集的后续使用安排，原先可按阶段筛选的历史不改写；阶段规则集中于[评测主方案§10.5](../spec/01_Flowmate_Agent评测总方案.md#105-数据怎样准备阶段集怎样映射)。整理P0时建立README/Case索引复用现有F及报告，不要求业务Gold或真实Agent适配；本次不创建目录。
+本次调整的是现有综合集的后续使用安排，原先可按阶段筛选的历史不改写；阶段规则集中于[评测主方案§10.5](../spec/01_Flowmate_Agent评测总方案.md#105-数据怎样准备阶段集怎样映射)。整理P0时建立README/Case索引复用现有F及报告，不要求业务Gold或真实Agent适配；当前已建立P0索引，其他阶段按需创建。
 
-当前离线assemble_benchmark仍读取综合清单，--stage不是阶段目录加载器；I2须验证新stage入口不依赖无关综合资产。P0报告脚本固定三项阻断，后续按实际材料、用途、Oracle和Benchmark依赖判断；真实用途not_verified不能因换目录解除，旧Case待复核和pin drift也不能无条件阻断无关阶段。详细代码依据及解除条件见§10.5.7，本次不修改实现。
+当前离线assemble_benchmark仍读取综合清单，--stage不是阶段目录加载器；I2须验证新stage入口不依赖无关综合资产。P0报告脚本已按实际材料、用途和阶段Oracle依赖判断，不读取综合Case/Gold/Benchmark；来源许可not_verified不能因换目录或技术PASS解除；新版本地development技术F按上述策略不要求人工声明，旧Case待复核和pin drift也不能无条件阻断无关阶段。详细代码依据及解除条件见§10.5.7；P0必要适配已修改，综合工具和历史结果保持原样。
 
 新运行固定Case/Gold/输入/Oracle/Grader、产品/配置和环境版本及实际摘要，写入运行binding，不增加阶段manifest。规范或判据改变需复核证据适用性；不覆盖、不重签历史清单和报告，不把数据修正计为Agent能力提升。四类完成状态分别记录，不因对齐文档就升级阶段结论。
 
@@ -77,7 +79,7 @@ Agent 任务最多 100 个：抽取 20、匹配 20、人工协同 15、证据取
 | 实际执行/成绩 | 真实产品运行 0、Baseline 0 |
 | 正式验收 | 不具备资格；acceptance 标签不等于冻结 |
 
-最终实际数量不在本方案写死，从[制作报告](../../data/manifests/preparation-report.json)、[当前索引](../../data/manifests/active-dataset.json)、[覆盖清单](../../data/manifests/coverage.json)核对。工具入口是 `python agent-eval/tools/initial_dataset.py prepare|verify|report --project .`（运行时选择一个子命令），详细示例见[使用指南](data-usage-guide.md)。
+最终实际数量不在本方案写死，从[制作报告](../../data/manifests/preparation-report.json)、[当前索引](../../data/manifests/active-dataset.json)、[覆盖清单](../../data/manifests/coverage.json)核对。工具入口是 `python agent-eval/tools/comprehensive/initial_dataset.py prepare|verify|report --project .`（运行时选择一个子命令），详细示例见[使用指南](data-usage-guide.md)。
 
 
 ## 当前覆盖修订（2026-09-19）

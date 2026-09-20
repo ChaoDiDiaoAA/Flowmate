@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { cp, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, readFile, rm, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createProduct } from '../apps/composition.ts';
@@ -23,13 +23,20 @@ type ScenarioResult = {
   oldPublicationReadable: boolean;
   responseReplaySame: boolean;
   error?: string;
+  cleanupError?: string;
+  retainedRoot?: string;
 };
 
 const operations = ['source.inspect', 'source.register', 'source.publish', 'document.read', 'input.capture', 'document.setStatus', 'workspace.setStatus', 'policy.publish', 'evidence.read'] as const;
 const previousSourceRoot = process.env.FLOWMATE_SOURCE_ROOT;
 
 async function main(): Promise<void> {
-  const outputRoot = resolve(parseArgs(process.argv.slice(2))['output-root'] ?? 'agent-eval/reports/p0/20260920-full-product');
+  const requested = parseArgs(process.argv.slice(2))['output-root'];
+  if (!requested) throw new Error('--output-root is required; historical output is never a default');
+  const outputRoot = resolve(requested);
+  const reportPath = join(outputRoot, 'fault-summary.json');
+  try { await access(reportPath); throw new Error('Refusing to overwrite fault-summary.json'); }
+  catch (error) { if (!(error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT')) throw error; }
   await mkdir(outputRoot, { recursive: true });
   const scenarios: ScenarioResult[] = [];
   try {
@@ -46,7 +53,13 @@ async function main(): Promise<void> {
           error: error instanceof Error ? error.message : String(error),
         });
       } finally {
-        await removeTemporaryRoot(fixture.root);
+        try { await removeTemporaryRoot(fixture.root); }
+        catch (error) {
+          const result = scenarios.at(-1)!;
+          result.status = 'FAIL';
+          result.cleanupError = error instanceof Error ? error.message : String(error);
+          result.retainedRoot = fixture.root;
+        }
       }
     }
   } finally {
@@ -57,15 +70,19 @@ async function main(): Promise<void> {
     schemaVersion: 'p0-fault-probe/v1',
     checkedAt: new Date().toISOString(),
     scope: 'temporary one-sample product instances; no repository source, Gold, published list or history mutation',
+    cleanupComplete: scenarios.every(s => !s.cleanupError),
     allPass: scenarios.length === 4 && scenarios.every((scenario) => scenario.status === 'PASS'),
     scenarios,
   };
-  await writeFile(join(outputRoot, 'fault-summary.json'), `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+  await writeFile(join(outputRoot, 'fault-summary.json'), `${JSON.stringify(summary, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
   console.log(JSON.stringify({ outputRoot, allPass: summary.allPass, scenarios: scenarios.map((scenario) => ({ checkId: scenario.checkId, status: scenario.status })) }, null, 2));
   if (!summary.allPass) process.exitCode = 1;
 }
 
 async function removeTemporaryRoot(root: string): Promise<void> {
+  if (!resolve(root).startsWith(resolve(tmpdir()) + (process.platform === 'win32' ? '\\' : '/')) || !root.split(/[\\/]/).at(-1)?.startsWith('flowmate-p0-fault-')) throw new Error('Refusing cleanup outside owned temporary fixture');
+  try { await access(join(root, 'instance', 'instance.lock')); throw new Error(`Unreleased product controller; retain ${root}`); }
+  catch (error) { if (!(error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT')) throw error; }
   let lastError: unknown;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
@@ -79,13 +96,14 @@ async function removeTemporaryRoot(root: string): Promise<void> {
   }
   // The fixture is outside the repository and has no product authority. A
   // transient Windows handle must not erase the already-collected observation.
-  process.stderr.write(`temporary fault fixture cleanup deferred: ${root}; ${lastError instanceof Error ? lastError.message : String(lastError)}\n`);
+  throw new Error(`Temporary fault fixture cleanup failed; retained ${root}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
 async function makeFixture(): Promise<{ root: string; sourceRoot: string; sampleId: string; originalSha256: string; manifestSha256: string }> {
   const root = await mkdtemp(join(tmpdir(), 'flowmate-p0-fault-'));
+  try {
   const sourceRoot = join(root, 'source');
-  const originalRoot = resolve('data/invoices/voxel51');
+  const originalRoot = resolve(previousSourceRoot ?? 'data/invoices/voxel51');
   const sourceManifest = JSON.parse(await readFile(join(originalRoot, 'manifest.json'), 'utf8')) as { samples: Array<{ sampleId: string; originalSha256: string; metadata: { path: string; bytes: number; sha256: string } }> };
   const sample = sourceManifest.samples.find((candidate) => candidate.sampleId === '000001');
   if (!sample) throw new Error('Source sample 000001 is missing');
@@ -96,6 +114,11 @@ async function makeFixture(): Promise<{ root: string; sourceRoot: string; sample
   await writeFile(join(sourceRoot, 'manifest.json'), manifestBytes);
   process.env.FLOWMATE_SOURCE_ROOT = sourceRoot;
   return { root, sourceRoot, sampleId: sample.sampleId, originalSha256: sample.originalSha256, manifestSha256: sha256Bytes(manifestBytes) };
+  } catch (error) {
+    try { await removeTemporaryRoot(root); }
+    catch (cleanup) { throw new AggregateError([error, cleanup], `Fixture setup failed; retained ${root}`); }
+    throw error;
+  }
 }
 
 async function rewriteContent(fixture: { sourceRoot: string; sampleId: string }): Promise<string> {
@@ -138,8 +161,9 @@ async function runScenario(scenario: ScenarioName, fixture: { root: string; sour
   const instanceRoot = join(fixture.root, 'instance');
   const first = await createProduct({ instanceRoot, mode: 'create' });
   const oldInput = { sourceKey: 'voxel51', manifestSha256: fixture.manifestSha256, selection: [], purpose: 'development' as const };
-  const oldPublication = await first.application.publishDataset({ requestId: crypto.randomUUID(), workspaceId: first.workspaceId }, oldInput);
-  await first.close();
+  let oldPublication;
+  try { oldPublication = await first.application.publishDataset({ requestId: crypto.randomUUID(), workspaceId: first.workspaceId }, oldInput); }
+  finally { await closeChecked(first); }
   const nextManifestSha256 = await rewriteContent(fixture);
   let enabled = false;
   let triggered = false;
@@ -163,7 +187,7 @@ async function runScenario(scenario: ScenarioName, fixture: { root: string; sour
     } catch (error) {
       failureMessage = error instanceof Error ? error.message : String(error);
     }
-    await second.close();
+    await closeChecked(second);
     const factsAfterFailure = readDocumentFacts(instanceRoot);
     const reopened = await createProduct({ instanceRoot, mode: 'open' });
     try {
@@ -180,14 +204,19 @@ async function runScenario(scenario: ScenarioName, fixture: { root: string; sour
       }
       const oldRead = await reopened.application.readDocument({ requestId: crypto.randomUUID(), workspaceId: reopened.workspaceId }, { document: oldPublication.documentRefs[0], manifest: oldPublication.manifest, purpose: 'development' });
       oldPublicationReadable = oldRead.document.documentId === oldPublication.documentRefs[0].documentId && oldRead.document.version === oldPublication.documentRefs[0].version;
-    } finally { await reopened.close(); }
+    } finally { await closeChecked(reopened); }
     const expectedFacts = scenario === 'response-loss' ? factsAfterFailure.available === 2 && factsAfterFailure.pending === 0 : factsAfterFailure.available === 1 && factsAfterFailure.pending === 0;
     const expectedReceipt = scenario === 'response-loss' ? receiptAfterFailure : !receiptAfterFailure;
     const status = triggered && Boolean(failureMessage) && expectedFacts && expectedReceipt && retrySucceeded && oldPublicationReadable && (scenario !== 'response-loss' || responseReplaySame) ? 'PASS' : 'FAIL';
     return { checkId: checkIdFor(scenario), caseVariantId: `${scenario}-temporary-fixture`, status, scenario, inputManifestSha256: nextManifestSha256, requestId, triggered, failureMessage, receiptAfterFailure, availableAfterFailure: factsAfterFailure.available, pendingAfterFailure: factsAfterFailure.pending, retrySucceeded, oldPublicationReadable, responseReplaySame };
   } finally {
-    await second.close();
+    await closeChecked(second);
   }
+}
+
+async function closeChecked(product: Awaited<ReturnType<typeof createProduct>>): Promise<void> {
+  const result = await product.close();
+  if (!result.closed || result.cleanupErrors.length) throw new Error(`Product close failed: ${JSON.stringify(result)}`);
 }
 
 function checkIdFor(scenario: ScenarioName): string {

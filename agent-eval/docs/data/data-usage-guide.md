@@ -1,6 +1,8 @@
 # Flowmate 初始评测数据使用指南
 
-> **2026-09-20架构修订。** Inspect AI统一阶段及完整Agent综合评测，CLI执行、Inspect View查看。现有 `data/` 综合材料保持不动，完整Agent实现后再核验启用；各阶段当期使用 `stage-evals/Pn/`，不等待整体完成。每阶段只保留README.md、cases.json及必要gold.json/fixtures，Oracle嵌入Case，质量优先、不追求数量。所有适配代码在agent-eval/src；详细接口与使用见[评测主方案第10章](../spec/01_Flowmate_Agent评测总方案.md#10-评测设施与工程对接)。本次不实施适配或生成运行，既有数据的数量/审核/摘要状态不变。
+当前 P0 使用 `bun run p0:eval` 无交互执行；新 development 运行绑定 `p0-local-f/v2`，不要求或生成手填用途确认，技术 PASS 不表示来源许可、业务语义或 Agent 通过。旧无策略证据沿原规则，未知策略/绑定不一致不能通过，历史资产和审核状态不变。P1–P13 同样从配置/环境/参数启动，缺项明确退出；业务人工审批不由评测器代签。详见[评测总方案 §10.5.7](../spec/01_Flowmate_Agent评测总方案.md#1057-版本依赖与兼容边界)。
+
+> **2026-09-20架构修订。** P0使用专用确定性命令；P1起Inspect AI统一阶段及完整Agent综合评测，CLI执行、Inspect View查看。现有 `data/` 综合材料保持不动，完整Agent实现后再核验启用；各阶段当期使用 `stage-evals/Pn/`，不等待整体完成。每阶段只保留README.md、cases.json及必要gold.json/fixtures，Oracle嵌入Case，质量优先、不追求数量。所有适配代码在agent-eval/src；详细接口与使用见[评测主方案第10章](../spec/01_Flowmate_Agent评测总方案.md#10-评测设施与工程对接)。本次不实施适配或生成运行，既有数据的数量/审核/摘要状态不变。
 
 本指南说明开发者和评测者如何从功能变更选择任务、检查规范覆盖、交付获准输入、读取阻断原因，并在产品接入后开展真实评测。材料如何制作见[制作方案](data-preparation.md)，全部字段见[数据手册](../../data/README.md)。产品责任与阶段依据[产品总方案](../../../docs/spec/00_Flowmate完整方案.md)，指标和判定依据[评测总方案](../spec/01_Flowmate_Agent评测总方案.md)。
 
@@ -147,9 +149,9 @@ P12-A 本地模拟、P12-B 企业契约模拟、P12-C 获准真实测试分别�
 在项目根目录运行覆盖更新：
 
 ```powershell
-python agent-eval/tools/coverage_update.py check --project .
-python agent-eval/tools/coverage_update.py publish --project .
-python agent-eval/tools/coverage_update.py verify --project .
+python agent-eval/tools/comprehensive/coverage_update.py check --project .
+python agent-eval/tools/comprehensive/coverage_update.py publish --project .
+python agent-eval/tools/comprehensive/coverage_update.py verify --project .
 ```
 
 `check` 复核候选、引用、语义审查结构和预期差异，不修改活动数据；`publish` 将通过检查的更新写入当前材料并同步报告/库存；`verify` 核验实际发布文件。不要把 check 的候选报告当作已经发布，也不要把 publish 当作产品执行。
@@ -157,8 +159,8 @@ python agent-eval/tools/coverage_update.py verify --project .
 基础数据校验和当前报告入口保留：
 
 ```powershell
-python agent-eval/tools/initial_dataset.py verify --project .
-python agent-eval/tools/initial_dataset.py report --project .
+python agent-eval/tools/comprehensive/initial_dataset.py verify --project .
+python agent-eval/tools/comprehensive/initial_dataset.py report --project .
 ```
 
 BM 离线选集示例：
@@ -202,11 +204,23 @@ JSON 为唯一编辑源。批量分析需要 JSONL 时，从固定成员和版�
 等待和 UNKNOWN 不是业务完成，请求批准不是正式批准，质量通过不授予生产写权限。只有真实运行及独立评分形成的可复核成绩，才能建立 Baseline 或用于后续版本比较。当前这些产品成绩仍为 0。
 
 
+## P1 起：评测现场保留与阶段执行顺序
+
+Case 在阶段数据中只维护一份；产品现场在 `FlowmateData/<instanceId>/`，评测记录在 `agent-eval/runs/<executionId>/`，通过既有 `binding.json` 关联 Case、Sample/epoch、Trial、实例和实际产品 Run。同一 Trial 的多轮、重启和恢复使用同一现场，不按 Run 结束清理。
+
+P1 拟实现 `instanceRetention=preserve_on_failure`，调试可选 `preserve_all`：完整 Trial 全部必需检查通过、无异常或未完成项、产品停止/关闭确认、判定证据独立保存且评分/日志/绑定落盘后，才回收控制器新建的专用实例。FAIL、ERROR、UNJUDGEABLE、取消、未完成、缺证据、UNKNOWN 或待恢复均保留。必要证据不能只指向已删数据库/文件；删除失败记录设施问题和残留位置，保留原业务评分。Windows 所有权/绝对路径/链接检查及完整流程见评测总方案 §10.7.1。日常产品、共享来源、P0 与历史目录不适用，不修改产品 Session 保留政策；这是后续设计，当前不能据此执行清理。
+
+P1–P13 固定三份文档：`docs/spec/Pn_阶段目标方案.md`、`docs/plans/Pn_阶段实施计划.md`、`agent-eval/docs/plans/Pn_Agent评测实施方案.md`，按“核实当前实现与依赖 → 编写阶段目标方案 → 编写产品实施计划及评测方案 → 产品实现与 F 验证 → 完善阶段资产 → 冻结执行依据 → Inspect 执行 A／适用 B 与回归 → 结论及交接”推进。阶段卡在目标方案首页细化，计划落实内部实现，评测引用目标和实际入口给出判据；不再另拆评测目标文件，P0 保留原两份方案及规则。Case/判据可提前设计，正式运行前冻结。P4 探针仅是产品工程 F，P8 分事实接受/人工等待修订/检查点恢复三步，P12 分 UI/通用模拟/企业契约模拟/获准真实测试四个里程碑；P13 分承载迁移/故障恢复/安装运维/生产放行四个里程碑，实施进度与 Test/Shadow/Canary/Production 环境分别表达；Case 标签区分范围，不复制目录或重建执行平台。
+
+已保留失败实例的长期保留和人工清理在 P13.3 细化，此前默认保留，不增加自动到期删除或无依据天数，不影响正常成功回收。未来清理须确认专用实例所有权、资源释放、独立证据及无 UNKNOWN／未决恢复／核对责任，不改原评分或删除证据；本次不提供清理命令。
+
+产品行为以本次执行绑定的产品规范为依据，质量指标及评分沿评测总方案；测试映射出现冲突时在既有阶段文档登记，修正后复核 Case／Oracle／Grader 和证据适用性，解决前不据冲突判据宣称通过。新依据用于新运行，不以最新文本重签旧报告或覆盖已发布资产，不借产品规范优先降低独立质量要求。
+
 ## 十、Inspect执行和View查看：阶段与综合两条入口
 
 完整操作、拟新增接口、参数与命令集中于[评测主方案10.5–10.11](../spec/01_Flowmate_Agent评测总方案.md#105-数据怎样准备阶段集怎样映射)，此处只给操作导航，避免重复维护参数。
 
-1. 阶段开发：按§10.5逐阶段材料来源及制作流程建立README/cases，必要事实建Gold，额外材料才建fixtures；不设数量配额。整理P0也建立索引复用现有F/Oracle/报告，仅补缺少夹具，不要求业务Gold、模型或真实Agent适配；本次不创建目录。正常对照及关键回归不能省略。
+1. 阶段开发：按§10.5逐阶段材料来源及制作流程建立README/cases，必要事实建Gold，额外材料才建fixtures；不设数量配额。整理P0也建立索引复用现有F/Oracle/报告，仅补缺少夹具，不要求业务Gold、模型或真实Agent适配；当前已建立P0索引，其他阶段按需创建。正常对照及关键回归不能省略。
 2. 质量侧选择拟新增stage入口并预检适用性、输入/版本/预算、Gold隔离；Task生成Sample，Solver只传获准输入，Scorer读取Oracle/Gold，控制配置不传Agent。现有data的BM/--stage命令仍筛选综合材料，不能加载阶段目录；尚未实现的入口记NOT_RUN和执行阻断。
 3. I1–I3完成后，CLI通过Inspect Task驱动Python/TS适配和真实产品，产品原生模型配置不由Inspect --model替换；固定证据后评分，资源关闭后检查清理结果。
 4. 实际日志写入runs，启动 `inspect view --log-dir D:/code/Flowmate/agent-eval/runs --recursive`；选择运行和样本，查看Messages/Scoring/Metadata。默认地址http://127.0.0.1:7575；本机未验证UI显示，空界面不是通过证据。
@@ -218,4 +232,4 @@ JSON 为唯一编辑源。批量分析需要 JSONL 时，从固定成员和版�
 
 阶段Case/Gold的P0权限拒绝和P1有据回答示例见§10.5.5–10.5.6：业务缺材料可按预先规则正确处理；缺证据为UNJUDGEABLE、采证设施故障为ERROR，不视为成功或普通零分。每次运行固定Case/Gold/输入/判据/Grader/产品/配置及环境，数据或判据修订产生新版本，不直接混比旧成绩。数据准备、可执行、评测完成和阶段通过分别记录。
 
-综合集完整Agent后使用是本次新安排，不改写原先跨阶段筛选的历史。P0报告脚本仍固定三项阻断，兼容解除条件见§10.5.7；文档调整不代表脚本已改或历史报告已通过，实际用途问题仍按本次材料核验。
+综合集完整Agent后使用是本次新安排，不改写原先跨阶段筛选的历史。P0报告脚本已按实际依赖调整，当前状态见§10.5.7；新评测待执行，历史报告不变，实际用途问题仍按本次材料核验。
