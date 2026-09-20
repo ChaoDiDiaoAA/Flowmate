@@ -83,9 +83,11 @@ async function removeTemporaryRoot(root: string): Promise<void> {
   if (!resolve(root).startsWith(resolve(tmpdir()) + (process.platform === 'win32' ? '\\' : '/')) || !root.split(/[\\/]/).at(-1)?.startsWith('flowmate-p0-fault-')) throw new Error('Refusing cleanup outside owned temporary fixture');
   try { await access(join(root, 'instance', 'instance.lock')); throw new Error(`Unreleased product controller; retain ${root}`); }
   catch (error) { if (!(error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT')) throw error; }
+  releaseRuntimeResourcesForCleanup();
   let lastError: unknown;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
+      releaseRuntimeResourcesForCleanup();
       await rm(root, { recursive: true, force: true });
       return;
     } catch (error) {
@@ -97,6 +99,15 @@ async function removeTemporaryRoot(root: string): Promise<void> {
   // The fixture is outside the repository and has no product authority. A
   // transient Windows handle must not erase the already-collected observation.
   throw new Error(`Temporary fault fixture cleanup failed; retained ${root}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+}
+
+/**
+ * Release runtime-owned native handles before deleting a temporary P0 fixture.
+ * This is test-facility cleanup only; the product close contract must not
+ * depend on a process-wide garbage collection call.
+ */
+export function releaseRuntimeResourcesForCleanup(): void {
+  if (process.platform === 'win32' && typeof Bun !== 'undefined' && typeof Bun.gc === 'function') Bun.gc(true);
 }
 
 async function makeFixture(): Promise<{ root: string; sourceRoot: string; sampleId: string; originalSha256: string; manifestSha256: string }> {
@@ -243,4 +254,4 @@ function parseArgs(values: string[]): Record<string, string> {
   return result;
 }
 
-main().catch((error) => { process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`); process.exitCode = 1; });
+if (import.meta.main) main().catch((error) => { process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`); process.exitCode = 1; });

@@ -3,7 +3,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createProduct } from '../../apps/composition.ts';
 import { p0AssessmentBinding, requireBindingMatch, readCases, requireSeparateRoots, snapshotCode, writeNewJson, publicationCoverage } from '../../agent-eval/src/runner/p0-binding.ts';
+import * as faultProbe from '../../scripts/p0-fault-probe.ts';
 
 const roots: string[] = [];
 afterEach(async () => { for (const r of roots.splice(0)) await rm(r, { recursive: true, force: true }); });
@@ -26,6 +28,19 @@ describe('P0 quality binding facility', () => {
   });
   it('checks the Python stage reviewer with synthetic evidence', () => {
     execFileSync('python', ['-B', '-m', 'pytest', 'agent-eval/tests/p0/test_p0_stage.py', 'agent-eval/tests/p0/test_review_p0_report.py', '-q', '-p', 'no:cacheprovider'], { windowsHide: true, timeout: 30_000 });
+  });
+  it('releases Bun runtime resources before deleting a closed product instance', async () => {
+    const releaseRuntimeResourcesForCleanup = (faultProbe as { releaseRuntimeResourcesForCleanup?: () => void }).releaseRuntimeResourcesForCleanup;
+    expect(releaseRuntimeResourcesForCleanup).toBeTypeOf('function');
+    if (!releaseRuntimeResourcesForCleanup) return;
+
+    const root = await mkdtemp(join(tmpdir(), 'p0-close-cleanup-')); roots.push(root);
+    const product = await createProduct({ instanceRoot: root, mode: 'create' });
+    const closeResult = await product.close();
+    expect(closeResult.closed).toBe(true);
+    releaseRuntimeResourcesForCleanup();
+    await rm(root, { recursive: true, force: false });
+    roots.splice(roots.indexOf(root), 1);
   });
   it('binds untracked code bytes and refuses output overwrite', async () => {
     const root = await mkdtemp(join(tmpdir(), 'p0-facility-')); roots.push(root);
