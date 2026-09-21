@@ -26,18 +26,13 @@ auth.json
 *.db-shm
 data/raw/
 data/private/
-FlowmateData/
-FlowmateData
 private/
 secrets/
 
 # Temporary probes and Python environments/caches
-.tmp-mineru-probe/
-tools/mineru-mcp-wrapper/.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-tools/mineru-mcp-wrapper/.pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
@@ -50,9 +45,7 @@ Thumbs.db
 # Private Agent evaluation assets and run output
 /agent-eval/data/
 /agent-eval/runs/
-/agent-eval/.initial-publication/
 /data/invoices/
-/data/.preparation-stage/
 
 # Local execution-plan ledger and review artifacts
 .superpowers/
@@ -60,3 +53,9 @@ Thumbs.db
 # Local planning and specification documents
 /agent-eval/docs/
 /docs/
+
+# SQLite sidecars and private stage evaluation assets
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+/agent-eval/stage-evals/
