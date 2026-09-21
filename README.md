@@ -18,4 +18,4 @@ P1 Provider → P2 Agent Loop → P3 Tools → P4 Events → P5 Session → P6 C
 
 评测使用质量目录之外的独立临时 Trial 根及不同名测试库，例如 `<temp>/flowmate-eval/20260921-001/trial-1/data/trial-1.sqlite`。同一 Trial 的恢复继续该测试库，恢复 Session 后创建新 Run；不复制正式用户库。阶段数据在当期制作，综合任务数据在 P13 验收通过后制作。
 
-`docs/` 内原始方案、`docs/v1/` 和历史阶段稿保留阅读，但不作为本轮实施依据。`data/invoices/` 保留原票与已有解析，仅是原始材料，不是已核验新 Gold。旧 Case、Gold、Fixture、清单、中间数据和运行成绩已清理，后续依据三份 v1 主方案重新制作。
+`docs/` 内原始方案和历史阶段稿保留阅读，但不作为本轮实施依据。`data/invoices/` 保留原票与已有解析，仅是原始材料，不是已核验新 Gold。旧 Case、Gold、Fixture、清单、中间数据和运行成绩已清理，后续依据三份 v1 主方案重新制作。
