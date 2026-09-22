@@ -1,0 +1,36 @@
+{
+  "name": "flowmate",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "agent-eval"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:p1:integration": "bun run tests/p1-integration.ts",
+    "cli": "bun run apps/cli/main.ts",
+    "p1:call": "bun run apps/cli/main.ts provider call",
+    "eval": "node --import tsx agent-eval/src/cli.ts",
+    "p1:eval:fixture": "node --import tsx agent-eval/src/cli.ts run --stage P1 --mode fixture",
+    "p1:eval:live": "node --import tsx agent-eval/src/cli.ts run --stage P1 --mode live --case provider-invoice-text",
+    "eval:product": "bun run agent-eval/src/adapters/product-server.ts"
+  },
+  "dependencies": {
+    "@flowmate/contracts": "workspace:*",
+    "@flowmate/core": "workspace:*",
+    "@flowmate/runtime-pi": "workspace:*",
+    "@flowmate/shared": "workspace:*",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "5.8.3",
+    "tsx": "4.23.15",
+    "vitest": "3.2.4"
+  }
+}

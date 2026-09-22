@@ -1,0 +1,12 @@
+{
+  "name": "@flowmate/core",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@flowmate/contracts": "workspace:*",
+    "@flowmate/shared": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

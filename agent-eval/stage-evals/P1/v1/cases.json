@@ -1,0 +1,197 @@
+[
+  {
+    "id": "provider-invoice-text",
+    "version": 1,
+    "name": "真实 Provider 处理合成短发票文本",
+    "stage": "P1",
+    "capability": "direct-provider-request",
+    "related_capabilities": ["model-selection", "usage-recording", "run-persistence"],
+    "eval_types": ["F"],
+    "tags": ["live", "happy-path", "invoice"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "synthetic-invoice-001" },
+    "input": {
+      "goal": "读取下面的发票文本，返回发票号码、开票日期、销售方、购买方和价税合计。仅依据文本回答。",
+      "documents": ["fixtures/invoice-short.txt"],
+      "setup": { "allowed_modes": ["live"], "fault_profile": "none", "budget_profile": "normal" }
+    },
+    "expected": {
+      "product_terminal": "completed",
+      "error_code": null,
+      "evidence_required": ["request-dispatched", "run-query", "output", "configuration"],
+      "checks": [
+        { "id": "bound-run", "rule": "run-binding", "required": true, "hard_constraint": true, "applicable_when": "request dispatched", "pass_when": "requestId and actual runId are bound", "fail_when": "request or run identity is missing", "evidence_refs": ["request-dispatched", "run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "completed", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "provider request started", "pass_when": "run is completed without an error", "fail_when": "run is not completed or has an error", "evidence_refs": ["run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "non-empty-output", "rule": "output", "required": true, "hard_constraint": true, "applicable_when": "run completed", "pass_when": "a non-empty final response is stored", "fail_when": "response is empty or only partial", "evidence_refs": ["output"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "controller-data-hidden", "rule": "input-isolation", "required": true, "hard_constraint": true, "applicable_when": "input projected", "pass_when": "model input contains only goal and documents", "fail_when": "setup or fault metadata is model-visible", "evidence_refs": ["configuration"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["尚未使用真实 Provider 执行"] }
+  },
+  {
+    "id": "provider-invalid-auth",
+    "version": 1,
+    "name": "认证失败且秘密不泄露",
+    "stage": "P1",
+    "capability": "provider-authentication-failure",
+    "related_capabilities": ["error-normalization", "secret-redaction"],
+    "eval_types": ["F"],
+    "tags": ["fixture", "fault", "authentication"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "provider-faults-v1" },
+    "input": { "goal": "验证无效认证配置能够明确失败。", "documents": [], "setup": { "allowed_modes": ["fixture"], "fault_profile": "invalid-auth", "budget_profile": "normal" } },
+    "expected": {
+      "product_terminal": "failed", "error_code": "provider_auth_failed",
+      "evidence_required": ["request-dispatched", "run-query", "redaction-scan"],
+      "checks": [
+        { "id": "auth-terminal", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "fault was triggered", "pass_when": "run fails with provider_auth_failed", "fail_when": "wrong terminal or error code", "evidence_refs": ["run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "bound-run", "rule": "run-binding", "required": true, "hard_constraint": true, "applicable_when": "request dispatched", "pass_when": "request and run identities are bound", "fail_when": "identity is missing", "evidence_refs": ["request-dispatched"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "no-secret", "rule": "evidence", "required": true, "hard_constraint": true, "applicable_when": "artifacts saved", "pass_when": "redaction scan found no configured secret", "fail_when": "a secret appears in evidence", "evidence_refs": ["redaction-scan"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["受控 Fixture 不能证明真实 Provider 认证"] }
+  },
+  {
+    "id": "provider-invalid-model",
+    "version": 1,
+    "name": "模型不存在且不静默替换",
+    "stage": "P1",
+    "capability": "provider-model-validation",
+    "related_capabilities": ["model-selection", "error-normalization"],
+    "eval_types": ["F"],
+    "tags": ["fixture", "fault", "model"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "provider-faults-v1" },
+    "input": { "goal": "验证不存在的模型明确失败且请求模型不被替换。", "documents": [], "setup": { "allowed_modes": ["fixture"], "fault_profile": "invalid-model", "budget_profile": "normal" } },
+    "expected": {
+      "product_terminal": "failed", "error_code": "provider_model_not_found",
+      "evidence_required": ["run-created", "run-query", "configuration"],
+      "checks": [
+        { "id": "model-terminal", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "missing model was requested", "pass_when": "run fails with provider_model_not_found", "fail_when": "wrong terminal or error code", "evidence_refs": ["run-created", "run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "requested-model-retained", "rule": "evidence", "required": true, "hard_constraint": true, "applicable_when": "configuration resolved", "pass_when": "requested model and persisted resolved model agree", "fail_when": "model was silently replaced", "evidence_refs": ["configuration"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["受控 Fixture 仅验证产品收口"] }
+  },
+  {
+    "id": "provider-timeout",
+    "version": 1,
+    "name": "超时后确认实际停止并拒绝迟到结果",
+    "stage": "P1",
+    "capability": "provider-timeout",
+    "related_capabilities": ["cancellation", "late-result-protection"],
+    "eval_types": ["F"],
+    "tags": ["fixture", "fault", "timeout"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "provider-faults-v1" },
+    "input": { "goal": "验证 Provider 长请求在预算到期后收口。", "documents": [], "setup": { "allowed_modes": ["fixture"], "fault_profile": "timeout", "budget_profile": "short" } },
+    "expected": {
+      "product_terminal": "failed", "error_code": "provider_timeout",
+      "evidence_required": ["request-dispatched", "abort-observed", "stopped", "run-query", "late-window-query"],
+      "checks": [
+        { "id": "timeout-terminal", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "hold fault triggered", "pass_when": "run fails with provider_timeout", "fail_when": "wrong terminal or error", "evidence_refs": ["run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "request-stopped", "rule": "stopped", "required": true, "hard_constraint": true, "applicable_when": "timeout requested", "pass_when": "runtime confirms request stopped", "fail_when": "only timer fired or process was killed", "evidence_refs": ["abort-observed", "stopped"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "no-late-overwrite", "rule": "no-late-terminal-change", "required": true, "hard_constraint": true, "applicable_when": "stop confirmed", "pass_when": "late observation window preserves terminal fact", "fail_when": "late output revives or overwrites the run", "evidence_refs": ["late-window-query"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["窗口参数是拟定值，需运行校准"] }
+  },
+  {
+    "id": "provider-cancel",
+    "version": 1,
+    "name": "请求中取消并区分受理与实际停止",
+    "stage": "P1",
+    "capability": "provider-cancellation",
+    "related_capabilities": ["concurrent-control", "late-result-protection"],
+    "eval_types": ["F"],
+    "tags": ["fixture", "fault", "cancel"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "provider-faults-v1" },
+    "input": { "goal": "验证运行中的 Provider 请求可被并行取消。", "documents": [], "setup": { "allowed_modes": ["fixture"], "fault_profile": "cancel", "budget_profile": "normal" } },
+    "expected": {
+      "product_terminal": "cancelled", "error_code": "provider_cancelled",
+      "evidence_required": ["request-dispatched", "cancel-ack", "abort-observed", "stopped", "run-query", "late-window-query"],
+      "checks": [
+        { "id": "cancel-terminal", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "cancel sent after dispatch", "pass_when": "run becomes cancelled", "fail_when": "wrong terminal or cancellation was never delivered", "evidence_refs": ["cancel-ack", "run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "request-stopped", "rule": "stopped", "required": true, "hard_constraint": true, "applicable_when": "cancel acknowledged", "pass_when": "runtime confirms actual stop", "fail_when": "acknowledgement exists without stop", "evidence_refs": ["abort-observed", "stopped"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "no-late-overwrite", "rule": "no-late-terminal-change", "required": true, "hard_constraint": true, "applicable_when": "stop confirmed", "pass_when": "late window preserves cancelled state", "fail_when": "late completion overwrites cancellation", "evidence_refs": ["late-window-query"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["窗口参数是拟定值，需运行校准"] }
+  },
+  {
+    "id": "provider-stream-interrupted",
+    "version": 1,
+    "name": "响应流中断后保存部分事实并失败收口",
+    "stage": "P1",
+    "capability": "provider-stream-interruption",
+    "related_capabilities": ["partial-output", "error-normalization"],
+    "eval_types": ["F"],
+    "tags": ["fixture", "fault", "stream"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "provider-faults-v1" },
+    "input": { "goal": "验证流式响应中断后的终态和部分输出事实。", "documents": [], "setup": { "allowed_modes": ["fixture"], "fault_profile": "stream-interrupted", "budget_profile": "normal" } },
+    "expected": {
+      "product_terminal": "failed", "error_code": "provider_stream_interrupted",
+      "evidence_required": ["response-started", "partial-output", "run-query"],
+      "checks": [
+        { "id": "stream-terminal", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "stream emitted a delta then failed", "pass_when": "run fails with provider_stream_interrupted", "fail_when": "partial stream is recorded as completed", "evidence_refs": ["response-started", "run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "partial-fact-retained", "rule": "evidence", "required": true, "hard_constraint": false, "applicable_when": "a text delta was observed", "pass_when": "partial output is marked partial", "fail_when": "observed delta is lost or presented as final", "evidence_refs": ["partial-output"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["受控 Fixture 不能证明远端断流频率"] }
+  },
+  {
+    "id": "provider-rate-limit",
+    "version": 1,
+    "name": "限流与 Pi 原生重试边界",
+    "stage": "P1",
+    "capability": "provider-native-retry",
+    "related_capabilities": ["rate-limit", "attempt-accounting"],
+    "eval_types": ["F"],
+    "tags": ["fixture", "fault", "rate-limit"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "provider-faults-v1" },
+    "input": { "goal": "验证限流由 Pi 原生重试处理，Flowmate 不叠加第二套重试。", "documents": [], "setup": { "allowed_modes": ["fixture"], "fault_profile": "rate-limit", "budget_profile": "normal" } },
+    "expected": {
+      "product_terminal": "completed", "error_code": null,
+      "evidence_required": ["request-dispatched", "attempts", "output", "run-query"],
+      "checks": [
+        { "id": "retry-terminal", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "first attempt returned 429", "pass_when": "Pi retry reaches a completed run", "fail_when": "wrong terminal or duplicate Flowmate retry", "evidence_refs": ["run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "attempt-accounting", "rule": "attempt-count", "required": true, "hard_constraint": true, "applicable_when": "fault triggered", "pass_when": "attempt count comes from observed provider calls", "fail_when": "attempt evidence is absent", "evidence_refs": ["attempts"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "non-empty-output", "rule": "output", "required": true, "hard_constraint": true, "applicable_when": "run completed", "pass_when": "final output is non-empty", "fail_when": "output is empty or partial", "evidence_refs": ["output"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["需核验锁定 Pi 版本的实际重试事件"] }
+  },
+  {
+    "id": "provider-usage-unknown",
+    "version": 1,
+    "name": "成功响应缺少 usage 时明确记录 unknown",
+    "stage": "P1",
+    "capability": "provider-usage-accounting",
+    "related_capabilities": ["configuration-snapshot", "run-persistence"],
+    "eval_types": ["F"],
+    "tags": ["fixture", "boundary", "usage"],
+    "split": "development",
+    "source": { "kind": "synthetic", "record": "P1-v1-authoring", "group": "provider-faults-v1" },
+    "input": { "goal": "验证成功响应没有 usage 时不会填零冒充真实用量。", "documents": [], "setup": { "allowed_modes": ["fixture"], "fault_profile": "usage-unknown", "budget_profile": "normal" } },
+    "expected": {
+      "product_terminal": "completed", "error_code": null,
+      "evidence_required": ["output", "usage", "configuration", "run-query"],
+      "checks": [
+        { "id": "completed", "rule": "terminal", "required": true, "hard_constraint": true, "applicable_when": "provider returned a valid response", "pass_when": "run completes", "fail_when": "usage absence makes the run fail", "evidence_refs": ["run-query"], "missing_evidence": "UNJUDGEABLE" },
+        { "id": "unknown-not-zero", "rule": "usage-unknown", "required": true, "hard_constraint": true, "applicable_when": "provider omitted usage", "pass_when": "usage is unknown with an explicit source/reason", "fail_when": "missing usage is stored as zero", "evidence_refs": ["usage"], "missing_evidence": "UNJUDGEABLE" }
+      ]
+    },
+    "grader": { "name": "p1-provider-mechanism", "version": 1 },
+    "review": { "status": "pending", "reviewer": null, "reviewed_at": null, "evidence": [], "limitations": ["受控 Fixture 验证缺失字段处理"] }
+  }
+]

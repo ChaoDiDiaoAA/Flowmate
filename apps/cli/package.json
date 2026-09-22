@@ -1,0 +1,10 @@
+{
+  "name": "@flowmate/cli",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@flowmate/contracts": "workspace:*",
+    "@flowmate/core": "workspace:*",
+    "@flowmate/shared": "workspace:*"
+  }
+}

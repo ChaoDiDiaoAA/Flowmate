@@ -1,0 +1,12 @@
+{
+  "name": "@flowmate/runtime-pi",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@flowmate/contracts": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./sdk-probe": "./src/sdk-probe.ts"
+  }
+}

@@ -42,20 +42,18 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Private Agent evaluation assets and run output
-/agent-eval/data/
+# Private Agent evaluation run output
 /agent-eval/runs/
 /data/invoices/
 
 # Local execution-plan ledger and review artifacts
 .superpowers/
 
-# Local planning and specification documents
-/agent-eval/docs/
-/docs/
+# Archived v0 material is retained locally only; current v1 specifications
+# and Pn plans must remain versionable.
+/docs/v0/
 
-# SQLite sidecars and private stage evaluation assets
+# SQLite sidecars
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
-/agent-eval/stage-evals/
