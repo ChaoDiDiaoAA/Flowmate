@@ -57,3 +57,4 @@ Thumbs.db
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
+/docs/
