@@ -52,6 +52,11 @@ export function loadLiveProviderEnvironment(
   }
   const baseUrl = safeBaseUrl(baseUrlText);
   const api = (env.FLOWMATE_LLM_API?.trim() || defaultApi) as ProviderApi;
+  const maxTokensText = required(env, 'FLOWMATE_LLM_MAX_TOKENS');
+  const maxTokens = maxTokensText === null ? undefined : Number(maxTokensText);
+  if (maxTokens !== undefined && (!Number.isSafeInteger(maxTokens) || maxTokens < 1)) {
+    return fail(appError('config_env_invalid', 'input', 'FLOWMATE_LLM_MAX_TOKENS 必须为正安全整数；留空自动选择，已知模型上限将在请求前校验。'));
+  }
   if (!baseUrl || !providerApis.has(api)) {
     return fail(appError(
       'config_env_invalid',
@@ -68,7 +73,7 @@ export function loadLiveProviderEnvironment(
       modelRef: { provider: 'flowmate-env', model },
       native: { authPath: join(paths.runtimeDir, 'pi-auth.json'), modelsPath: null },
       connection: { baseUrl, api },
-      parameters: { maxTokens: 512, maxRetries: 0, maxRetryDelayMs: 1000 },
+      parameters: { ...(maxTokens === undefined ? {} : { maxTokens }), maxRetries: 0, maxRetryDelayMs: 1000 },
     },
   });
 }

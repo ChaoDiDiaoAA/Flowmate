@@ -9,6 +9,7 @@ import {
   ModelsError,
 } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { resolveOutputBudget } from './output-budget.ts';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
   ProviderConfig,
@@ -147,7 +148,10 @@ function mapPiFailure(
   if (!facts.responseStarted && facts.stopReason === 'error') {
     return appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true);
   }
-  if (facts.stopReason === 'length' || facts.stopReason === 'toolUse' || facts.stopReason === 'deferred' || !facts.text) {
+  if (facts.stopReason === 'length') {
+    return appError('provider_incomplete_response', 'provider', 'Provider 达到输出 Token 上限，回复被截断或尚未产生可见文本；请检查本次 maxTokens 配置。');
+  }
+  if (facts.stopReason === 'toolUse' || facts.stopReason === 'deferred' || !facts.text) {
     return appError('provider_incomplete_response', 'provider', 'Provider 未返回完整文本。');
   }
   return appError(
@@ -194,6 +198,18 @@ export class PiProviderAdapter implements ProviderPort {
     }
     const runtimeApiKey = this.dependencies.runtimeApiKey
       ?? (config.modelRef.provider === 'flowmate-env' ? process.env.FLOWMATE_LLM_API_KEY : undefined);
+    // Never infer a gateway alias or reuse limits based only on a matching model name.
+    const candidates = config.connection ? runtime.getModels().filter((item) =>
+      item.id === config.modelRef.model && item.api === config.connection!.api
+      && safeUrl(item.baseUrl)?.replace(/\/$/, '') === safeUrl(config.connection!.baseUrl)?.replace(/\/$/, '')) : [];
+    const catalogModel = config.connection
+      ? (candidates.length === 1 ? candidates[0] : undefined)
+      : runtime.getModel(config.modelRef.provider, config.modelRef.model);
+    const modelMaxTokens = catalogModel && Number.isSafeInteger(catalogModel.maxTokens) && catalogModel.maxTokens > 0
+      ? catalogModel.maxTokens : null;
+    const budget = resolveOutputBudget(config.parameters.maxTokens, modelMaxTokens);
+    if (!budget.ok) return budget;
+    const effectiveConfig: ProviderConfig = { ...config, parameters: { ...config.parameters, maxTokens: budget.data.selectedMaxTokens } };
     try {
       if (config.connection) {
         runtime.registerProvider(config.modelRef.provider, {
@@ -203,9 +219,10 @@ export class PiProviderAdapter implements ProviderPort {
             id: config.modelRef.model,
             name: config.modelRef.model,
             input: ['text'],
-            reasoning: false,
-            contextWindow: 128_000,
-            maxTokens: 2_048,
+            reasoning: catalogModel?.reasoning ?? false,
+            // Zero disables Pi's context estimate when the service limit is unknown.
+            contextWindow: catalogModel?.contextWindow ?? 0,
+            maxTokens: modelMaxTokens ?? budget.data.selectedMaxTokens,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           }],
         });
@@ -237,7 +254,8 @@ export class PiProviderAdapter implements ProviderPort {
       api: model.api,
       endpoint: safeUrl(model.baseUrl),
       sdk: { codingAgent: codingAgentVersion, ai: aiVersion },
-      parameters: config.parameters,
+      parameters: effectiveConfig.parameters,
+      outputBudget: budget.data,
       limits,
       native: {
         authSource: runtimeApiKey ? 'pi-runtime-api-key' : 'pi-native',
@@ -247,7 +265,7 @@ export class PiProviderAdapter implements ProviderPort {
 
     return ok({
       snapshot,
-      execute: async (input, executionSignal, observe) => this.execute(runtime, model, config, input, executionSignal, observe),
+      execute: async (input, executionSignal, observe) => this.execute(runtime, model, effectiveConfig, input, executionSignal, observe),
     });
   }
 
@@ -284,11 +302,14 @@ export class PiProviderAdapter implements ProviderPort {
     let text = '';
     let outputLimitExceeded = false;
     let streamFailed = false;
+    let wireMaxTokens: number | null = null;
     try {
-      const stream = runtime.streamSimple(model, {
-        messages: [{ role: 'user', content: projectUserText(input), timestamp: input.messageTimestamp }],
+      const context = {
+        messages: [{ role: 'user' as const, content: projectUserText(input), timestamp: input.messageTimestamp }],
         tools: [],
-      }, {
+      };
+      observe({ type: 'model_request', at: new Date().toISOString(), monotonicMs: performance.now(), data: context });
+      const stream = runtime.streamSimple(model, context, {
         signal,
         fetch: fetch as FetchFunction,
         maxTokens: config.parameters.maxTokens,
@@ -302,6 +323,13 @@ export class PiProviderAdapter implements ProviderPort {
         onPayload: (payload) => {
           if (payload && typeof payload === 'object') {
             const record = payload as Record<string, unknown>;
+            const generationConfig = record.generationConfig as Record<string, unknown> | undefined;
+            const payloadBudget = record.max_output_tokens ?? record.max_completion_tokens ?? record.max_tokens ?? generationConfig?.maxOutputTokens;
+            wireMaxTokens = typeof payloadBudget === 'number' ? payloadBudget : null;
+            observe({ type: 'request_budget', at: new Date().toISOString(), monotonicMs: performance.now(), data: {
+              selectedMaxTokens: config.parameters.maxTokens,
+              wireMaxTokens: typeof wireMaxTokens === 'number' ? wireMaxTokens : null,
+            } });
             observe({ type: 'request_dispatched', at: new Date().toISOString(), monotonicMs: performance.now(), data: { model: model.id, keys: Object.keys(record).sort() } });
           }
           return undefined;
@@ -338,6 +366,7 @@ export class PiProviderAdapter implements ProviderPort {
       const error = mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, aborted: signal.aborted, stopReason: 'output_limit', text });
       observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: 'output_limit' } });
       return {
+        wireMaxTokens,
         text,
         partial: true,
         stopReason: 'output_limit',
@@ -354,13 +383,14 @@ export class PiProviderAdapter implements ProviderPort {
     if (!message) {
       const error = mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, aborted: signal.aborted, stopReason: 'error', text });
       observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: 'error' } });
-      return { text, partial: text.length > 0, stopReason: 'error', responseId: null, responseModel: null, error, usage: { version: 1, source: 'unknown', reason: 'no-final-message', sdkValues: null, attempts: facts.attempts || null, attemptsComplete: facts.complete, costSource: null, updatedAt: new Date().toISOString() }, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false }, stopped: facts.complete, cleanupErrors: [] };
+      return { wireMaxTokens, text, partial: text.length > 0, stopReason: 'error', responseId: null, responseModel: null, error, usage: { version: 1, source: 'unknown', reason: 'no-final-message', sdkValues: null, attempts: facts.attempts || null, attemptsComplete: facts.complete, costSource: null, updatedAt: new Date().toISOString() }, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false }, stopped: facts.complete, cleanupErrors: [] };
     }
     const finalText = text || normalizeText(message);
     const error = message.stopReason === 'stop' && finalText.length > 0 ? null : mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, aborted: signal.aborted, stopReason: message.stopReason, text: finalText });
     const usage = normalizeUsage(message, facts, config.connection === undefined);
     observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: message.stopReason, responseId: message.responseId ?? null } });
     return {
+      wireMaxTokens,
       text: finalText,
       partial: finalText.length > 0 && error !== null,
       stopReason: message.stopReason,

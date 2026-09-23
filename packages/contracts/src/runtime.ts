@@ -59,7 +59,7 @@ export type ProviderConfig = {
     api: ProviderApi;
   };
   parameters: {
-    maxTokens: number;
+    maxTokens?: number;
     maxRetries: number;
     maxRetryDelayMs: number;
   };
@@ -75,6 +75,9 @@ export type ProviderRequest = {
 
 export type ProviderObservationType =
   | 'run_created'
+  | 'provider_configured'
+  | 'request_budget'
+  | 'model_request'
   | 'request_dispatched'
   | 'response_started'
   | 'text_delta'
@@ -138,6 +141,7 @@ export type InputRecord = {
 
 export type OutputRecord = {
   version: 1;
+  wireMaxTokens?: number | null;
   text: string;
   partial: boolean;
   stopReason: string;

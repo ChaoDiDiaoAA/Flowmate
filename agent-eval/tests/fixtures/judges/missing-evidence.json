@@ -1,0 +1,33 @@
+{
+  "contract": "flowmate-judge-calibration/v1",
+  "id": "missing-evidence",
+  "purpose": "scoring-validation",
+  "agentExecuted": false,
+  "source": {
+    "kind": "synthetic",
+    "record": "independently authored grading example; not an Agent Trial"
+  },
+  "evaluator": {
+    "id": "llm-provider-answer-relevance",
+    "version": 1
+  },
+  "input": {
+    "goal": "Read the invoice text and return its invoice number, date, seller, buyer, and total. Use only the supplied text.",
+    "documents": []
+  },
+  "output": {
+    "execution": {
+      "output": {
+        "text": "The invoice total is CNY 106.00.",
+        "partial": false
+      }
+    }
+  },
+  "reference": {
+    "value": "UNJUDGEABLE",
+    "reason": "No invoice source material is supplied; factual agreement cannot be established.",
+    "status": "pending",
+    "reviewer": null,
+    "reviewedAt": null
+  }
+}

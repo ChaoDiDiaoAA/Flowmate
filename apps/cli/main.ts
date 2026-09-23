@@ -1,12 +1,16 @@
 import type { Application, Result } from '@flowmate/contracts';
+import type { Interface } from 'node:readline';
 import { providerCommand, providerQueryCommand, type CliIo } from './commands/provider.ts';
+import { providerChatCommand } from './commands/chat.ts';
 
 export type MainDependencies = {
   application?: Application;
   createApplication?: () => Promise<Result<Application>>;
+  chatTerminal?: Interface;
 };
 
 function usage(io: CliIo): void {
+  io.err('usage: provider chat [--config <provider-json>] [--timeout-ms <n>] [--stop-grace-ms <n>]');
   io.err('usage: provider call --input <text-file> --goal <text> [--config <provider-json>] [--timeout-ms <n>] [--stop-grace-ms <n>]');
   io.err('usage: provider query --run-id <positive-integer>');
 }
@@ -51,7 +55,7 @@ async function withApplication(
     code = 2;
   }
   const closed = await opened.data.close();
-  if (!closed.ok || !closed.data.closed) {
+  if (!closed.ok || !closed.data.closed || !closed.data.stopped) {
     io.err('runtime_close_failed: 运行资源未确认关闭。');
     return code === 0 ? 2 : code;
   }
@@ -62,6 +66,23 @@ export async function main(argv: readonly string[], io: CliIo, deps: MainDepende
   if (argv[0] !== 'provider') {
     usage(io);
     return 2;
+  }
+  if (argv[1] === 'chat') {
+    if (argv.length === 3 && argv[2] === '--help') { usage(io); return 0; }
+    if (hasUnknownOptions(argv.slice(2), ['--config', '--timeout-ms', '--stop-grace-ms']) || argv.slice(2).some((value, index) => index % 2 === 0 && !value.startsWith('--'))) {
+      usage(io);
+      return 2;
+    }
+    const configFile = option(argv, '--config');
+    const timeout = option(argv, '--timeout-ms');
+    const stopGrace = option(argv, '--stop-grace-ms');
+    const timeoutMs = timeout === undefined ? undefined : Number(timeout);
+    const stopGraceMs = stopGrace === undefined ? undefined : Number(stopGrace);
+    if ((timeout !== undefined && !Number.isInteger(timeoutMs)) || (stopGrace !== undefined && !Number.isInteger(stopGraceMs))) {
+      usage(io);
+      return 2;
+    }
+    return withApplication(deps, io, (application) => providerChatCommand({ configFile, timeoutMs, stopGraceMs }, application, io, deps.chatTerminal));
   }
   if (argv[1] === 'query') {
     if (hasUnknownOptions(argv.slice(2), ['--run-id'])) {
@@ -99,6 +120,13 @@ export async function main(argv: readonly string[], io: CliIo, deps: MainDepende
 }
 
 if (import.meta.main) {
-  const io: CliIo = { out: (text) => console.log(text), err: (text) => console.error(text), signal: new AbortController().signal };
-  void main(process.argv.slice(2), io).then((code) => { process.exitCode = code; });
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+  const io: CliIo = { out: (text) => console.log(text), err: (text) => console.error(text), signal: controller.signal };
+  void main(process.argv.slice(2), io).then((code) => { process.exitCode = code; }).catch(() => {
+    console.error('internal_error: CLI 未正常关闭。');
+    process.exitCode = 2;
+  }).finally(() => { process.off('SIGTERM', stop); process.off('SIGINT', stop); });
 }

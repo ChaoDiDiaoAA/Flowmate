@@ -9,14 +9,14 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:p1:integration": "bun run tests/p1-integration.ts",
+    "test:unit": "bun --no-env-file run scripts/test.ts unit",
+    "test:integration": "bun --no-env-file run scripts/test.ts integration",
+    "test:e2e": "bun --no-env-file run scripts/test.ts e2e",
+    "test": "bun --no-env-file run scripts/test.ts all",
     "cli": "bun run apps/cli/main.ts",
-    "p1:call": "bun run apps/cli/main.ts provider call",
     "eval": "node --import tsx agent-eval/src/cli.ts",
-    "p1:eval:fixture": "node --import tsx agent-eval/src/cli.ts run --stage P1 --mode fixture",
-    "p1:eval:live": "node --import tsx agent-eval/src/cli.ts run --stage P1 --mode live --case provider-invoice-text",
-    "eval:product": "bun run agent-eval/src/adapters/product-server.ts"
+    "eval:smoke": "node --import tsx agent-eval/src/cli.ts run --dataset flowmate-agent-v1 --selection smoke --judge off",
+    "eval:full": "node --import tsx agent-eval/src/cli.ts run --dataset flowmate-agent-v1 --selection full --judge required"
   },
   "dependencies": {
     "@flowmate/contracts": "workspace:*",
@@ -28,9 +28,9 @@
     "zod": "3.25.76"
   },
   "devDependencies": {
+    "@types/node": "24.10.1",
     "@types/bun": "1.4.2",
     "typescript": "5.8.3",
-    "tsx": "4.23.15",
-    "vitest": "3.2.4"
+    "tsx": "4.23.15"
   }
 }

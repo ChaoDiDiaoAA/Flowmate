@@ -8,12 +8,17 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
-    "types": ["bun"]
+    "types": [
+      "bun",
+      "node"
+    ]
   },
   "include": [
     "apps/**/*.ts",
     "agent-eval/src/**/*.ts",
     "packages/**/*.ts",
-    "tests/**/*.ts"
+    "tests/**/*.ts",
+    "agent-eval/tests/**/*.ts",
+    "scripts/**/*.ts"
   ]
 }

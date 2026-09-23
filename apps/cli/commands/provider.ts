@@ -19,7 +19,7 @@ export type ProviderCommandArgs = {
   stopGraceMs?: number;
 };
 
-async function resolveConfig(configFile: string | undefined): Promise<Result<ProviderConfig>> {
+export async function resolveProviderConfig(configFile: string | undefined): Promise<Result<ProviderConfig>> {
   if (configFile) return loadProviderConfig(resolve(configFile));
   const userData = resolveWindowsUserData(process.env);
   if (!userData.ok) return userData;
@@ -34,7 +34,7 @@ function printError(io: CliIo, error: { code: string; message: string }): void {
 }
 
 export async function providerCommand(args: ProviderCommandArgs, app: Application, io: CliIo): Promise<number> {
-  const config = await resolveConfig(args.configFile);
+  const config = await resolveProviderConfig(args.configFile);
   if (!config.ok) {
     printError(io, config.error);
     return 2;

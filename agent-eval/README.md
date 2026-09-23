@@ -1,61 +1,129 @@
-# Flowmate Agent Evaluation
+# Flowmate Agent 评测操作手册
 
-`agent-eval` 是独立质量工程。Langfuse 提供 Dataset、Experiment、Trace、Score 和 UI；Flowmate 负责真实产品执行、Trial 隔离、SQLite 事实、故障注入、确定性判定和证据保留。产品代码不依赖 Langfuse，也不能读取 Case 的 `expected`、`setup` 或评分结果。
+修订：2026-09-23（目录补齐、旧 Dataset 删除与延后制作）。本地 JSON、Runner、自动评分和报告组成统一 Benchmark；Langfuse 仅可选展示。当前业务 Dataset 尚未制作。完整 Agent 实现、真实入口与必要采证接通、工程验证通过后，才依据 01/02 制作首版 50 条任务及 10 条 Smoke 引用。此前只维护方案、制作规范和设施，不制作业务 Case、Gold 或成员清单。运行入口拒绝缺数据或未接通的 Agent，不降级为 Provider 直调。
 
-## 当前状态
-
-- P1 v1 已制作 8 个 Case：7 个 Fixture、1 个 Live，均保留 `review.status=pending`；pending 现在表示尚未完成人工复核与资产冻结，不表示 Case 未执行或执行失败。
-- 2026-09-22 的 Fixture execution `p1-2026-09-22T02-22-15-133Z` 通过 7/7；每例均调用同一 `Application`、Pi SDK、独立 `trial-N.sqlite` 和确定性 Grader，并写入本机 Langfuse。
-- 同日 Live execution `p1-2026-09-22T02-25-18-550Z` 的 `provider-invoice-text/v1` 通过 1/1：实际走 `openai-responses` 到 `https://api.deepseek.com/responses`，模型 `deepseek-flash`，保存完整回复、290 Token 与一次 Provider attempt；费用仍为 unknown/null。
-- P1 只评直接 Provider 请求，类型为 F；A 不适用，B 未启用，LLM-as-Judge 默认关闭。
-
-## 安装与配置
-
-```powershell
-cd D:\code\Flowmate
-Copy-Item .env.example .env
-bun install --frozen-lockfile
-```
-
-在 `.env` 填写本地 Langfuse 的 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 和 `LANGFUSE_BASE_URL`。真实 LLM 则填写 `FLOWMATE_LLM_BASE_URL`、`FLOWMATE_LLM_MODEL`、`FLOWMATE_LLM_API_KEY`，可选 `FLOWMATE_LLM_API`。`BASE_URL` 是 API 根地址，密钥不能写入 Case、Trace、SQLite、日志或提交。
-
-`FLOWMATE_LLM_API` 只选择请求协议，不能填 Base URL 或 Provider 名称。P1 接受：`openai-completions`（默认）、`openai-responses`、`anthropic-messages`、`google-generative-ai`。当前环境加载器明确拒绝其他值；Pi SDK 本身支持的额外 Provider 不能自动视为 Flowmate P1 已接入。
-
-## P1 命令
-
-```powershell
-bun run eval -- doctor
-bun run eval -- sync --stage P1
-bun run p1:eval:fixture
-bun run eval -- run --stage P1 --mode fixture --case provider-cancel
-# 以下命令会产生真实 Provider 请求/费用
-bun run p1:eval:live
-bun run eval -- status --stage P1
-Start-Process http://localhost:3000
-```
-
-本地完整证据保存在 `agent-eval/runs/<executionId>/summary.json` 和 `trials/<caseId>/trial-N/{data,logs,artifacts}`。`agent-eval/logs` 不再作为全局目录；Langfuse 的服务端日志由其部署维护，产品 stderr 位于各 Trial 的 `logs/`。若上传失败，修复连接后可用 `resend --report <绝对summary.json>` 重放保存的评测证据；它不会重新执行产品，UI 中会标记 `replay=true`。
-
-## 在 Langfuse 查看一个完整 Case
-
-1. 执行 `bun run p1:eval:fixture`，终端会打印 `executionId`，并列出每个 Case 的中文名称、能力点、结论、检查项和 Trace 链接。
-2. 打开 `http://localhost:3000`，进入 **Experiments**，按 `executionId` 找到本次实验，再打开一个 Item Run。也可先从 **Datasets → flowmate/P1/v1/fixture** 进入对应成员。
-3. Item Run 的 `input.case` 显示 `id`、中文 `name`、`capability`；`modelInput` 才是实际投给产品的白名单输入。输出保存 Run 终态、错误、输出、用量、证据和每项确定性检查。
-4. **Scores** 的 `Name` 是指标名称，不是 Case 名称：`p1_case_identity` 是身份字段，`p1_case_status` 是五态结论，`p1_case_pass` 是 1/0 汇总，`check_<checkId>` 来自 `cases.json` 中对应的 `expected.checks[].id`。先看 `p1_case_identity` 的 **Value**，它固定显示 `Case ID/v版本 | 中文名称 | 能力点`；每条 Comment 也带相同前缀。稳定 Name 让同一检查可以跨 Case 聚合。
-5. Item Run 下的 P1 子 Observation 名称固定为 `P1 · Fixture|Live · Case ID/v版本 · 中文名称`。最外层 `experiment-item-run` 是 Langfuse SDK 的 Experiment 根节点，不是 Case 名称。
-
-如果 **Tracing** 页面没有内容，先清除筛选条件，将时间范围覆盖本次运行，Environment 选择 `sdk-experiment`，并同时显示 Root 与非 Root Observation。当前 Langfuse v4/events-only 部署在这些条件满足后仍可能不列出 Observation；这不表示 Flowmate 未开启 Trace，直接从 **Experiments/Datasets** 或终端 Trace 链接查看即可。
-
-## 目录
+## 完整目录与职责
 
 ```text
 agent-eval/
-├─ src/                         # TS 控制器、协议、执行器、Grader、Langfuse 适配
-├─ stage-evals/P1/v1/           # P1 Case 与 Fixture 控制资产
-├─ data/v1/                     # P13 完整 Agent 综合数据集契约与未来资产
-├─ benchmarks/                  # smoke/full 成员引用，不复制 Case
-├─ tests/                       # 质量设施自检
-└─ runs/<executionId>/          # 忽略提交的实际结果、Trial DB、日志和证据
+├── README.md
+├── package.json
+├── tsconfig.json
+├── datasets/
+│   └── README.md             # 当前只保留制作说明
+├── src/
+│   ├── README.md
+│   ├── cli.ts
+│   ├── types.ts
+│   ├── datasets/             # 加载、校验、选集与输入投影
+│   ├── execution/            # Runner、独立 Trial、采证与清理
+│   ├── adapters/             # 真实 Agent 产品入口适配（当前待接通）
+│   ├── scoring/
+│   │   ├── types.ts
+│   │   ├── registry.ts
+│   │   ├── evaluate.ts
+│   │   ├── aggregate.ts
+│   │   ├── evaluators/       # 每项确定性评分器一个文件
+│   │   └── judges/           # 每项 Judge 一个文件及公共客户端
+│   ├── reports/              # 本地结果、查询与比较
+│   ├── review/               # 独立人工反馈
+│   └── langfuse/             # 可选导出与人工记录同步
+├── tests/
+│   ├── datasets/
+│   ├── execution/
+│   ├── scoring/
+│   ├── reports/
+│   ├── review/
+│   ├── langfuse/
+│   ├── cli/
+│   ├── fixtures/             # 独立工程测试材料
+│   └── support/
+└── runs/                     # 运行时产生，保留已有记录，不预建成绩
 ```
 
-Fixture 与 Live 是执行模式，不是评分类型。Fixture 仍运行 Flowmate 和 Pi SDK，只把远端服务替换为可控响应，用来稳定验证错误、取消、超时、断流、重试和 usage 缺失；它不能证明真实认证、网络或模型响应。Live 使用 Pi SDK 真实 Provider 请求，用来证明实际连接和响应，不能在失败时自动降级为 Fixture。
+`datasets/` 保存任务数据；当前仅有制作说明，未来 Dataset 子目录在正式制作时创建。`src/datasets/` 是数据读取与校验代码，`tests/fixtures/` 仅服务工程验证，不是业务 Benchmark。`runs/` 是生成目录，保存实际快照与记录；不创建空目录、空成员清单或占位成绩。完整 Agent 适配未接通不等于目录缺失，接口存在也不代表实现完成。
+
+## 命令
+
+在仓库根目录执行，参数中的占位符替换为实际值。
+
+```powershell
+bun run eval -- --help
+bun run eval -- doctor
+```
+
+doctor 默认检查本地配置；零 Dataset 时显示“尚未制作，等待完整 Agent”，`ok` 仅代表配置检查，`benchmark.ready=false`。不会创建数据、执行记录或调用模型。
+
+以下依赖 Dataset 的命令在**制作完成后使用**。当前数据不存在时明确报错并返回非零，不自动生成或回退数据。真实运行还有模型费用，无模拟模型分支：
+
+```powershell
+bun run eval -- dataset validate --dir agent-eval/datasets/flowmate-agent-v1
+bun run eval -- status --dataset flowmate-agent-v1
+bun run eval:smoke
+bun run eval:full
+bun run eval -- run --dataset flowmate-agent-v1 --selection smoke --judge off
+bun run eval -- run --dataset flowmate-agent-v1 --selection full --judge required
+bun run eval -- run --dataset flowmate-agent-v1 --case <CaseID> --judge auto
+bun run eval -- run --dataset flowmate-agent-v1 --dataset-version <版本> --selection full --repeat 1 --config <JSON路径> --execution-id <ID> --backend langfuse --judge required
+```
+
+选集 smoke/full 默认 full，单 Case 选择独立记录；repeat 为 1～20，默认 1。backend 默认 FLOWMATE_EVAL_BACKEND 或 local；judge auto/off/required 默认 auto。Judge auto 配置齐全时可能收费，Smoke 快捷入口关闭 Judge；Full 快捷入口要求 Judge。全量也可显式 judge off，但报告标明未测语义指标。config 是严格 JSON，支持 model、baseUrl、api、maxTokens、repeat、timeoutMs（100～120000）、stopGraceMs（100～10000）、environment；不接受密钥。CLI repeat 优先。
+
+```powershell
+bun run eval -- status --execution-id <ID>
+bun run eval -- compare --left <ID> --right <ID>
+bun run eval -- review add --execution-id <ID> --case <CaseID> --trial <TrialID> --reviewer <姓名> --verdict good --note "<依据>"
+bun run eval -- review status --execution-id <ID>
+```
+
+已有报告的查询、比较、反馈和显式补传不依赖 Dataset 存在。Case 质量命令在**制作完成后使用**：
+
+```powershell
+bun run eval -- review add --dataset flowmate-agent-v1 --case <CaseID> --reviewer <姓名> --verdict good --note "<核验依据>"
+bun run eval -- review status --dataset flowmate-agent-v1
+```
+
+运行反馈与 Case 质量记录互斥选择目标；多次重复时指定实际 TrialID。verdict 允许 good/bad，需真实审核人及备注。内容 hash 绑定版本；没有人工反馈显示 none，普通反馈不等于 Gold 已认可或正式验收。
+
+## 评分与结果
+
+整个 Trial 到达预定终点才评分；中间一轮 Run 结束不等于整个任务结束。失败、超时、中止、未启动不调用质量评分器或 Judge；保存原始轨迹与运行事实。已启动业务失败/任务预算耗尽记 FAIL，设施错误、中止、未执行单列。
+
+确定性评分须适用且证据齐全；Judge 还须选中、独立配置齐全且预算允许，分数高低不控制其触发。必要约束失败优先；未知证据与错误是 null，不能写成零分或忽略。Judge 总输出预算 15000 Token，首次 50×256=12800；重复计划超额在启动前拒绝。无重试/切模/自动人工审批。
+
+未来制作时，解释、澄清等依赖语义的任务通过清单 `scoring.judges[].requiredFor` 登记必要 Judge，仍每 Trial 最多一次。auto 缺配置时选中它们会在 Agent 启动前拒绝；显式 off 只执行确定性部分，必要 Judge 为 NOT_RUN/null，任务不能 PASS。其他任务的 Judge 为辅助，full 快捷入口则要求全部选中任务的 Judge。
+
+runs/<executionId>/ 保存 summary.json、snapshot.json、source.json 和各 Trial/execution.json。每个 Task 的多轮、恢复和子 Run 仍只属于一个 Trial；重复另建 Trial。报告区分 smoke/holdout、计划/启动/完成与五态，Agent 原始候选和模拟用户编辑后的候选不得混算。正式验收状态始终与自动通过独立。
+
+退出码：0 必要自动检查通过；1 失败、错误或未完成；2 必要评分未完成。人工反馈和导出不影响自动成绩。旧契约报告仅 status 只读展示，不重评分或导出为新版本。
+
+## 可选 Langfuse
+
+local 不初始化 SDK、不验证平台密钥、不请求平台。启用时读取 LANGFUSE_*，先保存本地结果，再导出；失败不改分、不重跑模型。
+
+```powershell
+bun run eval -- doctor --backend langfuse
+bun run eval -- resend --report <绝对summary.json路径>
+bun run eval -- review setup --backend langfuse
+bun run eval -- review enqueue --execution-id <ID> --backend langfuse
+bun run eval -- review import --execution-id <ID> --backend langfuse
+bun run eval -- review sync --execution-id <ID> --backend langfuse
+```
+
+review apply 已退役；导入使用 review import。平台反馈导入绑定原 Trace、版本、审核人；补传复用 Observation/Score ID，不调用 Agent/Judge。Trace 为“Agent · 任务名”，Score 使用指标名称，身份及版本在 metadata，environment 可在运行配置或 .env 的 FLOWMATE_EVAL_ENVIRONMENT 中设置。平台不承担 Case 来源、实验编排或原生 Judge。
+
+## 测试、迁移与限制
+
+`bun run typecheck`、`bun run test:unit`、`bun run test:integration` 均为设施验证，不调用模型。产品阶段测试继续在 tests/；旧 Provider 控制器、阶段 Dataset、阶段命令已移除。sync、dataset publish、--version、--wait-seconds、--stage、--mode 返回迁移错误。
+
+材料不可用不回退；完整 Agent、环境场景处理器和领域采证尚待接入。当前通用事实比较器不是全部领域指标已实现的证明。Gold、语义参考和 Judge 的真实校准待人工核验。未升级依赖、不恢复历史成绩、不修改平台数据。
+
+[源码职责](src/README.md) · [任务与材料](datasets/README.md) · [Judge](src/scoring/judges/README.md) · [总方案](../docs/eval/01_Flowmate_Agent评测总方案_v1.md)
+
+## 当前状态与历史边界
+
+旧 `datasets/flowmate-agent-v1` 已删除，包括 50 条草稿、dataset.json 与专属 README，不保留归档副本或空清单。先前“内容版本 2、16 类已分配、草稿暂存”的记录均已被本次决定替代；不据此认定当前已有数据。历史修订依据见 [核对表](../docs/eval/04_统一评测修订核对表.md)。原始发票来源、独立测试夹具、评分代码和已有运行记录保留，未操作 Langfuse。
+
+正式制作以完整 [01 总方案](../docs/eval/01_Flowmate_Agent评测总方案_v1.md) 和详细 [02 手册](../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md) 为依据，在完整 Agent、真实入口与必要采证接通、工程验证通过后开始。首版 50 条、Smoke 引用 10 条是未来规模，不是已有成员。当前通用比较器与 Judge Rubric 保留，不表示领域采证、Gold 核验、真实 Judge 校准或正式冻结已完成。
+
+设施测试使用独立最小合成数据，见 [测试说明](tests/README.md)。工程验证与设施通过不能形成 Agent 质量结论；本轮不调用真实 Agent/Judge、不写平台、不生成 Benchmark 成绩。

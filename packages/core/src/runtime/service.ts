@@ -90,6 +90,7 @@ function initialCleanup(): CleanupRecord {
 function outputRecord(outcome: NativeOutcome): OutputRecord {
   return {
     version: 1,
+    wireMaxTokens: outcome.wireMaxTokens ?? null,
     text: outcome.text,
     partial: outcome.partial,
     stopReason: outcome.stopReason,
@@ -257,6 +258,7 @@ export class RuntimeService {
       return fail(started.error, active.runId);
     }
 
+    if (prepared.data.snapshot.outputBudget) observe('provider_configured', { outputBudget: prepared.data.snapshot.outputBudget });
     let work: Promise<NativeOutcome>;
     try {
       work = prepared.data.execute(input, active.controller.signal, (event) => observe(event.type, event.data));

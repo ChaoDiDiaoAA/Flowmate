@@ -1,0 +1,38 @@
+{
+  "contract": "flowmate-judge-calibration/v1",
+  "id": "wrong",
+  "purpose": "scoring-validation",
+  "agentExecuted": false,
+  "source": {
+    "kind": "synthetic",
+    "record": "independently authored grading example; not an Agent Trial"
+  },
+  "evaluator": {
+    "id": "llm-provider-answer-relevance",
+    "version": 1
+  },
+  "input": {
+    "goal": "Read the invoice text and return its invoice number, date, seller, buyer, and total. Use only the supplied text.",
+    "documents": [
+      {
+        "name": "synthetic-invoice.txt",
+        "text": "Synthetic invoice. Number TEST-2026-0001. Date 2026-09-01. Seller Example Cloud. Buyer Example Technology. Total CNY 106.00."
+      }
+    ]
+  },
+  "output": {
+    "execution": {
+      "output": {
+        "text": "Invoice TEST-2026-0001; date 2026-09-01; seller Example Cloud; buyer Example Technology; total CNY 999.00.",
+        "partial": false
+      }
+    }
+  },
+  "reference": {
+    "value": "FAIL",
+    "reason": "The total contradicts the supplied 106.00 amount.",
+    "status": "pending",
+    "reviewer": null,
+    "reviewedAt": null
+  }
+}
