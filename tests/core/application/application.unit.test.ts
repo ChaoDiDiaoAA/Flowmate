@@ -12,7 +12,7 @@ const request = {
     revision: 1,
     modelRef: { provider: 'p', model: 'm' },
     native: { authPath: 'C:\\test\\auth.json', modelsPath: null },
-    parameters: { maxTokens: 1, maxRetries: 0, maxRetryDelayMs: 1 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 1 },
   },
   timeoutMs: 100,
   stopGraceMs: 100,
@@ -46,5 +46,51 @@ describe('Application composition', () => {
     expect(runs.get).toHaveBeenCalledWith(7);
     expect(runtime.close).toHaveBeenCalledTimes(1);
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries an unconfirmed close without releasing storage early and keeps the first failure visible', async () => {
+    let closeAttempts = 0;
+    const runtime = {
+      callProvider: mock(async () => ok({ runId: 7, status: 'failed' as const, text: '', error: null, stopped: false, cleanupErrors: [] })),
+      close: mock(async () => {
+        closeAttempts += 1;
+        return closeAttempts === 1
+          ? { stopped: false, closed: false, errors: [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: '未停止。', retryable: true }] }
+          : { stopped: true, closed: true, errors: [] };
+      }),
+    };
+    const runs = { get: mock(() => ok({} as RunSnapshot)) };
+    const dispose = mock(async () => ({ stopped: true, closed: true, errors: [] }));
+    const app = makeApplication(runtime, runs, dispose);
+
+    const first = await app.close();
+    const second = await app.close();
+    const third = await app.close();
+
+    expect(first).toMatchObject({ ok: true, data: { stopped: false, closed: false, errors: [{ code: 'stop_unconfirmed' }] } });
+    expect(second).toMatchObject({ ok: true, data: { stopped: true, closed: true, errors: [{ code: 'stop_unconfirmed' }] } });
+    expect(third).toEqual(second);
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves a resource disposal failure when a later close succeeds', async () => {
+    const report = { stopped: true, closed: true, errors: [] } satisfies CloseReport;
+    const runtime = { callProvider: mock(async () => ok({} as never)), close: mock(async () => report) };
+    let disposeAttempts = 0;
+    const dispose = mock(async () => {
+      disposeAttempts += 1;
+      if (disposeAttempts === 1) throw new Error('sensitive filesystem detail');
+      return report;
+    });
+    const app = makeApplication(runtime, { get: mock(() => ok({} as RunSnapshot)) }, dispose);
+
+    const first = await app.close();
+    const second = await app.close();
+
+    expect(first).toMatchObject({ ok: true, data: { stopped: true, closed: false, errors: [{ code: 'storage_close_failed' }] } });
+    expect(second).toMatchObject({ ok: true, data: { stopped: true, closed: true, errors: [{ code: 'storage_close_failed' }] } });
+    expect(JSON.stringify([first, second])).not.toContain('sensitive filesystem detail');
+    expect(dispose).toHaveBeenCalledTimes(2);
   });
 });

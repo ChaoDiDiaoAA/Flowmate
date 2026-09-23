@@ -9,7 +9,6 @@ import {
   ModelsError,
 } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { resolveOutputBudget } from './output-budget.ts';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
   ProviderConfig,
@@ -32,6 +31,7 @@ export type PiProviderDependencies = {
   fetch?: FetchLike;
   witness?: (value: Readonly<Record<string, unknown>>) => void;
   runtimeApiKey?: string;
+  runtimeApiKeyFor?: (config: ProviderConfig) => string | undefined;
 };
 
 /** A portable fetch shape; Bun's optional `preconnect` property is not needed by Pi. */
@@ -48,6 +48,10 @@ type FetchFacts = {
 const codingAgentVersion = '0.85.1';
 const aiVersion = '0.85.1';
 const maxOutputBytes = 256 * 1024;
+// Pi's registerProvider model metadata requires maxTokens. Use Pi's catalog
+// value when available; custom endpoints with no catalog entry need this SDK
+// compatibility value. It is not exposed as a Flowmate setting or request option.
+const piCustomModelMaxTokens = 8192;
 
 function safeUrl(value: string): string | null {
   try {
@@ -149,7 +153,7 @@ function mapPiFailure(
     return appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true);
   }
   if (facts.stopReason === 'length') {
-    return appError('provider_incomplete_response', 'provider', 'Provider 达到输出 Token 上限，回复被截断或尚未产生可见文本；请检查本次 maxTokens 配置。');
+    return appError('provider_incomplete_response', 'provider', 'Provider 因模型或服务端输出限制提前结束，未返回完整文本。');
   }
   if (facts.stopReason === 'toolUse' || facts.stopReason === 'deferred' || !facts.text) {
     return appError('provider_incomplete_response', 'provider', 'Provider 未返回完整文本。');
@@ -166,14 +170,45 @@ function projectUserText(input: NativeInput): string {
   return `${input.goal}\n\n${input.text}`;
 }
 
+function appendWithinUtf8Limit(current: string, delta: string, currentBytes: number): { text: string; bytes: number; exceeded: boolean } {
+  const encoder = new TextEncoder();
+  let text = '';
+  let bytes = currentBytes;
+  for (const character of delta) {
+    const characterBytes = encoder.encode(character).byteLength;
+    if (bytes + characterBytes > maxOutputBytes) return { text: current + text, bytes, exceeded: true };
+    text += character;
+    bytes += characterBytes;
+  }
+  return { text: current + text, bytes, exceeded: false };
+}
+
 export class PiProviderAdapter implements ProviderPort {
   private readonly dependencies: PiProviderDependencies;
+  private activeExecutions = 0;
+  private activePreparations = 0;
+  private closed = false;
+  private readonly closeErrors = new Map<string, ReturnType<typeof appError>>();
 
   public constructor(dependencies: PiProviderDependencies = {}) {
     this.dependencies = dependencies;
   }
 
   public async prepare(
+    config: ProviderConfig,
+    limits: { timeoutMs: number; stopGraceMs: number },
+    signal: AbortSignal,
+  ): Promise<Result<PreparedProvider>> {
+    if (this.closed) return fail(appError('provider_closed', 'provider', 'Provider Runtime 已关闭。'));
+    this.activePreparations += 1;
+    try {
+      return await this.prepareInternal(config, limits, signal);
+    } finally {
+      this.activePreparations -= 1;
+    }
+  }
+
+  private async prepareInternal(
     config: ProviderConfig,
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
@@ -196,7 +231,8 @@ export class PiProviderAdapter implements ProviderPort {
     if (runtimeError) {
       return fail(appError('provider_runtime_init_failed', 'provider', 'Provider Runtime 配置失败。', true));
     }
-    const runtimeApiKey = this.dependencies.runtimeApiKey
+    const runtimeApiKey = this.dependencies.runtimeApiKeyFor?.(config)
+      ?? this.dependencies.runtimeApiKey
       ?? (config.modelRef.provider === 'flowmate-env' ? process.env.FLOWMATE_LLM_API_KEY : undefined);
     // Never infer a gateway alias or reuse limits based only on a matching model name.
     const candidates = config.connection ? runtime.getModels().filter((item) =>
@@ -207,9 +243,6 @@ export class PiProviderAdapter implements ProviderPort {
       : runtime.getModel(config.modelRef.provider, config.modelRef.model);
     const modelMaxTokens = catalogModel && Number.isSafeInteger(catalogModel.maxTokens) && catalogModel.maxTokens > 0
       ? catalogModel.maxTokens : null;
-    const budget = resolveOutputBudget(config.parameters.maxTokens, modelMaxTokens);
-    if (!budget.ok) return budget;
-    const effectiveConfig: ProviderConfig = { ...config, parameters: { ...config.parameters, maxTokens: budget.data.selectedMaxTokens } };
     try {
       if (config.connection) {
         runtime.registerProvider(config.modelRef.provider, {
@@ -222,7 +255,7 @@ export class PiProviderAdapter implements ProviderPort {
             reasoning: catalogModel?.reasoning ?? false,
             // Zero disables Pi's context estimate when the service limit is unknown.
             contextWindow: catalogModel?.contextWindow ?? 0,
-            maxTokens: modelMaxTokens ?? budget.data.selectedMaxTokens,
+            maxTokens: modelMaxTokens ?? piCustomModelMaxTokens,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           }],
         });
@@ -254,8 +287,7 @@ export class PiProviderAdapter implements ProviderPort {
       api: model.api,
       endpoint: safeUrl(model.baseUrl),
       sdk: { codingAgent: codingAgentVersion, ai: aiVersion },
-      parameters: effectiveConfig.parameters,
-      outputBudget: budget.data,
+      parameters: config.parameters,
       limits,
       native: {
         authSource: runtimeApiKey ? 'pi-runtime-api-key' : 'pi-native',
@@ -265,8 +297,36 @@ export class PiProviderAdapter implements ProviderPort {
 
     return ok({
       snapshot,
-      execute: async (input, executionSignal, observe) => this.execute(runtime, model, effectiveConfig, input, executionSignal, observe),
+      execute: async (input, executionSignal, observe) => {
+        if (this.closed) return this.closedOutcome();
+        this.activeExecutions += 1;
+        let deferredRelease = false;
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          this.activeExecutions -= 1;
+        };
+        try {
+          return await this.execute(runtime, model, config, input, executionSignal, observe, limits.stopGraceMs, (settled) => {
+            deferredRelease = true;
+            void settled.then(release, release);
+          });
+        } finally {
+          if (!deferredRelease) release();
+        }
+      },
     });
+  }
+
+  private closedOutcome(): NativeOutcome {
+    const error = appError('provider_closed', 'provider', 'Provider Runtime 已关闭。');
+    return {
+      text: '', partial: false, stopReason: 'closed', responseId: null, responseModel: null, error,
+      usage: { version: 1, source: 'not-requested', reason: 'provider-closed', sdkValues: null, attempts: 0, attemptsComplete: true, costSource: null, updatedAt: new Date().toISOString() },
+      tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+      stopped: true, cleanupErrors: [],
+    };
   }
 
   private async execute(
@@ -276,6 +336,8 @@ export class PiProviderAdapter implements ProviderPort {
     input: NativeInput,
     signal: AbortSignal,
     observe: (event: NativeObservation) => void,
+    stopGraceMs: number,
+    deferReleaseUntil: (settled: Promise<unknown>) => void,
   ): Promise<NativeOutcome> {
     const facts: FetchFacts = { attempts: 0, responseStatus: null, requestStarted: false, responseStarted: false, complete: false };
     const baseFetch: FetchLike = this.dependencies.fetch ?? ((request, init) => globalThis.fetch(request, init));
@@ -300,9 +362,14 @@ export class PiProviderAdapter implements ProviderPort {
     let finalMessage: AssistantMessage | undefined;
     let streamError: AssistantMessage | undefined;
     let text = '';
+    let textBytes = 0;
     let outputLimitExceeded = false;
     let streamFailed = false;
     let wireMaxTokens: number | null = null;
+    const requestController = new AbortController();
+    const abortRequest = () => requestController.abort(signal.reason);
+    if (signal.aborted) abortRequest();
+    else signal.addEventListener('abort', abortRequest, { once: true });
     try {
       const context = {
         messages: [{ role: 'user' as const, content: projectUserText(input), timestamp: input.messageTimestamp }],
@@ -310,9 +377,8 @@ export class PiProviderAdapter implements ProviderPort {
       };
       observe({ type: 'model_request', at: new Date().toISOString(), monotonicMs: performance.now(), data: context });
       const stream = runtime.streamSimple(model, context, {
-        signal,
+        signal: requestController.signal,
         fetch: fetch as FetchFunction,
-        maxTokens: config.parameters.maxTokens,
         maxRetries: config.parameters.maxRetries,
         maxRetryDelayMs: config.parameters.maxRetryDelayMs,
         onResponse: (response) => {
@@ -327,7 +393,6 @@ export class PiProviderAdapter implements ProviderPort {
             const payloadBudget = record.max_output_tokens ?? record.max_completion_tokens ?? record.max_tokens ?? generationConfig?.maxOutputTokens;
             wireMaxTokens = typeof payloadBudget === 'number' ? payloadBudget : null;
             observe({ type: 'request_budget', at: new Date().toISOString(), monotonicMs: performance.now(), data: {
-              selectedMaxTokens: config.parameters.maxTokens,
               wireMaxTokens: typeof wireMaxTokens === 'number' ? wireMaxTokens : null,
             } });
             observe({ type: 'request_dispatched', at: new Date().toISOString(), monotonicMs: performance.now(), data: { model: model.id, keys: Object.keys(record).sort() } });
@@ -335,13 +400,50 @@ export class PiProviderAdapter implements ProviderPort {
           return undefined;
         },
       });
-      for await (const event of stream as AsyncIterable<AssistantMessageEvent>) {
-        if (event.type === 'text_delta') {
-          text += event.delta;
-          observe({ type: 'text_delta', at: new Date().toISOString(), monotonicMs: performance.now(), data: { length: event.delta.length } });
-          if (new TextEncoder().encode(text).byteLength > maxOutputBytes) {
-            outputLimitExceeded = true;
+      const iterator = (stream as AsyncIterable<AssistantMessageEvent>)[Symbol.asyncIterator]();
+      let stopDeadline: number | null = null;
+      while (true) {
+        const pending = iterator.next();
+        let next: IteratorResult<AssistantMessageEvent>;
+        if (stopDeadline === null) {
+          next = await pending;
+        } else {
+          const remaining = Math.max(0, stopDeadline - Date.now());
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let settled: { kind: 'event'; value: IteratorResult<AssistantMessageEvent> } | { kind: 'timeout' };
+          try {
+            settled = await Promise.race([
+              pending.then((value) => ({ kind: 'event' as const, value })),
+              new Promise<{ kind: 'timeout' }>((resolve) => { timer = setTimeout(() => resolve({ kind: 'timeout' }), remaining); }),
+            ]);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+          if (settled.kind === 'timeout') {
+            void pending.catch(() => undefined);
+            void iterator.return?.().catch(() => undefined);
+            deferReleaseUntil(stream.result());
             break;
+          }
+          next = settled.value;
+        }
+        if (next.done) {
+          facts.complete = true;
+          break;
+        }
+        const event = next.value;
+        if (event.type === 'text_delta') {
+          if (!outputLimitExceeded) {
+            const appended = appendWithinUtf8Limit(text, event.delta, textBytes);
+            const acceptedLength = appended.text.length - text.length;
+            text = appended.text;
+            textBytes = appended.bytes;
+            observe({ type: 'text_delta', at: new Date().toISOString(), monotonicMs: performance.now(), data: { length: acceptedLength } });
+            if (appended.exceeded) {
+              outputLimitExceeded = true;
+              stopDeadline = Date.now() + stopGraceMs;
+              requestController.abort('output_limit');
+            }
           }
         }
         if (event.type === 'start') facts.responseStarted = true;
@@ -349,7 +451,6 @@ export class PiProviderAdapter implements ProviderPort {
         if (event.type === 'done') finalMessage = event.message;
       }
       if (!outputLimitExceeded) finalMessage ??= await stream.result();
-      facts.complete = !outputLimitExceeded;
     } catch (error) {
       streamFailed = true;
       const fallback = error instanceof Error ? error.message : '';
@@ -359,10 +460,12 @@ export class PiProviderAdapter implements ProviderPort {
         stopReason: signal.aborted ? 'aborted' : 'error', errorMessage: fallback, timestamp: Date.now(),
       };
     }
+    signal.removeEventListener('abort', abortRequest);
 
     if (streamFailed || (!facts.responseStarted && streamError?.stopReason === 'error')) facts.complete = false;
 
     if (outputLimitExceeded) {
+      this.dependencies.witness?.({ type: 'output_limit_stop', stopped: facts.complete, streamFailed, aborted: requestController.signal.aborted });
       const error = mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, aborted: signal.aborted, stopReason: 'output_limit', text });
       observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: 'output_limit' } });
       return {
@@ -375,8 +478,8 @@ export class PiProviderAdapter implements ProviderPort {
         error,
         usage: { version: 1, source: 'unknown', reason: 'output-limit', sdkValues: null, attempts: facts.attempts || null, attemptsComplete: false, costSource: null, updatedAt: new Date().toISOString() },
         tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
-        stopped: false,
-        cleanupErrors: [],
+        stopped: facts.complete,
+        cleanupErrors: facts.complete ? [] : [appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true)],
       };
     }
     const message = finalMessage ?? streamError;
@@ -404,7 +507,13 @@ export class PiProviderAdapter implements ProviderPort {
     };
   }
 
-  public async close(): Promise<{ stopped: boolean; closed: boolean; errors: readonly never[] }> {
-    return { stopped: true, closed: true, errors: [] };
+  public async close(): Promise<{ stopped: boolean; closed: boolean; errors: readonly ReturnType<typeof appError>[] }> {
+    if (this.closed) return { stopped: true, closed: true, errors: [...this.closeErrors.values()] };
+    if (this.activeExecutions + this.activePreparations > 0) {
+      this.closeErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Provider 请求仍在收口。', true));
+      return { stopped: false, closed: false, errors: [...this.closeErrors.values()] };
+    }
+    this.closed = true;
+    return { stopped: true, closed: true, errors: [...this.closeErrors.values()] };
   }
 }

@@ -13,7 +13,7 @@ import { judgeConfig, publicJudgeConfig, type Fetcher } from '../scoring/judges/
 import { saveReport, safeId, type LocalReport } from '../reports/store.ts';
 export const runConfigSchema = z.object({
     model: z.string().min(1).optional(), baseUrl: z.string().url().optional(), api: z.enum(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai']).optional(),
-    maxTokens: z.number().int().positive().optional(), repeat: z.number().int().min(1).max(20).optional(),
+    repeat: z.number().int().min(1).max(20).optional(),
     timeoutMs: z.number().int().min(100).max(120000).optional(), stopGraceMs: z.number().int().min(100).max(10000).optional(),
     environment: z.string().regex(/^[a-z0-9_-]+$/).optional()
 }).strict();

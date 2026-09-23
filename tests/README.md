@@ -8,13 +8,14 @@
 | shared/ | 路径、环境解析、日志 |
 | core/configuration/ | 配置解析 |
 | core/storage/ | SQLite、终态、重开、损坏、单写者 |
-| core/runtime/ | 生命周期、预算、取消竞争、迟到与实际停止 |
+| core/runtime/ | 生命周期、输出限制、取消竞争、迟到与实际停止 |
 | core/application/ | 应用门面与真实组装 |
-| runtime-pi/ | SDK 接合、受控 Provider 的 8 类场景、输出预算 |
+| runtime-pi/ | SDK 接合、受控 Provider 的协议和故障场景 |
 | cli/ | 模拟 Application 的 Unit 与真实进程 E2E |
+| desktop/ | 真实 Electron/Preload/Main/Bun Host、单轮聊天与隔离 SQLite E2E |
 | support/ | 受控请求、临时资源与失败清理 |
 
-使用 `.unit.test.ts`、`.integration.test.ts`、`.e2e.test.ts`。Unit 是局部行为；Integration 是真实组件接合，外部服务使用替身；E2E 经真实 CLI 子进程、composition、Runtime、Pi、受控 HTTP、SQLite，再由另一进程查询。包括成功、认证失败、退出码、查询不调用模型及资源清理。桌面未交付，不声称有 Electron E2E。
+使用 `.unit.test.ts`、`.integration.test.ts`、`.e2e.test.ts`。Unit 是局部行为；Integration 是真实组件接合，外部服务使用替身；CLI E2E 经真实 CLI 子进程、composition、Runtime、Pi、受控 HTTP、SQLite，再由另一进程查询。Desktop E2E 经 Electron、Preload、Main、Bun Host、公共 Application、Pi 和本地合成 HTTP Provider，使用独立临时 userData/SQLite，验证配置保存、每条聊天单独调用和 Run 查询。所有工程测试都不请求真实 Provider，也不运行 Agent 评测。
 
 ```powershell
 bun run typecheck

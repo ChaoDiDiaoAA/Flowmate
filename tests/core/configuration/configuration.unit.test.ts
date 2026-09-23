@@ -11,7 +11,7 @@ const config = {
   revision: 1,
   modelRef: { provider: 'deepseek', model: 'deepseek-v4-flash' },
   native: { authPath: 'C:\\Users\\test\\.pi\\auth.json', modelsPath: null },
-  parameters: { maxTokens: 512, maxRetries: 0, maxRetryDelayMs: 2000 },
+  parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
 };
 
 describe('provider configuration', () => {

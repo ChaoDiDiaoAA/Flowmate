@@ -28,7 +28,7 @@ function harness(call: Application['callProvider'] = async (request) => complete
   const dir = mkdtempSync(join(tmpdir(), 'flowmate-chat-test-'));
   const config = join(dir, 'provider.json');
   writeFileSync(config, JSON.stringify({ version: 1, name: 'test', revision: 1, modelRef: { provider: 'test', model: 'test' },
-    native: { authPath: join(dir, 'auth.json'), modelsPath: null }, parameters: { maxTokens: 100, maxRetries: 0, maxRetryDelayMs: 100 } }));
+    native: { authPath: join(dir, 'auth.json'), modelsPath: null }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 } }));
   const input = new PassThrough();
   const terminal = createInterface({ input, output: new PassThrough(), terminal: false });
   const messages: string[] = [], errors: string[] = [], requests: ProviderRequest[] = [];
@@ -61,18 +61,12 @@ test('interactive command accepts repeated questions, prints replies and keeps P
   expect(h.closed()).toBe(1);
 });
 
-test('shows selected budget provenance and SDK-adjusted wire budget without querying credentials', async () => {
-  const h = harness(async (_request, control) => {
-    const event = { runId: 1, sequence: 1, at: new Date().toISOString(), monotonicMs: 1 };
-    control?.onObservation?.({ ...event, type: 'provider_configured', data: { outputBudget: { selectedMaxTokens: 8192, modelMaxTokens: null, source: 'fallback' } } });
-    control?.onObservation?.({ ...event, sequence: 2, type: 'request_budget', data: { selectedMaxTokens: 8192, wireMaxTokens: 4096 } });
-    return completed('回复');
-  });
+test('does not present a Flowmate output-token budget in the interactive command', async () => {
+  const h = harness(async () => completed('回复'));
   await until(() => h.messages.some((s) => s.includes('P1')));
   h.input.write('你好\n');
   await until(() => h.messages.some((s) => s.includes('LLM >')));
-  expect(h.messages.some((s) => s.includes('8192') && s.includes('兜底值（模型上限未知）'))).toBe(true);
-  expect(h.messages.some((s) => s.includes('Pi 调整后请求预算：4096'))).toBe(true);
+  expect(h.messages.some((s) => s.includes('输出预算'))).toBe(false);
   h.input.write('/exit\n');
   expect(await h.done).toBe(0);
 });

@@ -27,7 +27,7 @@ const config = {
   api: 'openai-completions',
   endpoint: null,
   sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
-  parameters: { maxTokens: 64, maxRetries: 0, maxRetryDelayMs: 2000 },
+  parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
   limits: { timeoutMs: 60_000, stopGraceMs: 5_000 },
   native: { authSource: 'pi-native' as const, modelsSelection: null },
 };
@@ -184,6 +184,22 @@ describe('P1 SQLite storage', () => {
     const corrupt = openDatabase(corruptPaths);
     expect(corrupt.ok).toBe(false);
     if (!corrupt.ok) expect(corrupt.error.code).toBe('storage_open_failed');
+  });
+
+  it('[F-run-json-version] rejects valid JSON with an unsupported Run record version', () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-storage-json-version-'));
+    const opened = openDatabase(makePaths(root));
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const created = opened.data.runs.create({ goal: input.goal, input, config, usage, cleanup, createdAt: '2026-09-21T00:00:00.000Z' });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    opened.data.db.query('UPDATE runs SET input_json=? WHERE id=?').run(JSON.stringify({ ...input, version: 2 }), created.data);
+
+    const queried = opened.data.runs.get(created.data);
+
+    expect(queried).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    opened.data.close();
   });
 
   it('[F-disk-write-failure] reports a real closed-database write failure', () => {

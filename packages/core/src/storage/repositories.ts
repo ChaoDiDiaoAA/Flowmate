@@ -90,6 +90,86 @@ function readJson(value: string, label: string): unknown {
   }
 }
 
+function object(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`invalid_${label}_shape`);
+  return value as Record<string, unknown>;
+}
+
+function versioned(value: unknown, label: string, keys: readonly string[]): Record<string, unknown> {
+  const record = object(value, label);
+  if (record.version !== 1 || keys.some((key) => !(key in record))) throw new Error(`invalid_${label}_version_or_shape`);
+  return record;
+}
+
+function validAppError(value: unknown, label: string, requireVersion: boolean): AppError {
+  const record = object(value, label);
+  if ((requireVersion && record.version !== 1)
+    || typeof record.code !== 'string'
+    || !['provider', 'runtime', 'tool', 'session', 'storage', 'input', 'extension', 'internal'].includes(String(record.category))
+    || typeof record.message !== 'string'
+    || typeof record.retryable !== 'boolean'
+    || (record.runId !== undefined && (!Number.isSafeInteger(record.runId) || Number(record.runId) <= 0))) {
+    throw new Error(`invalid_${label}_shape`);
+  }
+  return record as unknown as AppError;
+}
+
+function validatedInput(value: unknown): Record<string, unknown> {
+  const record = versioned(value, 'input', ['goal', 'text', 'messageTimestamp']);
+  if (typeof record.goal !== 'string' || typeof record.text !== 'string' || typeof record.messageTimestamp !== 'number') throw new Error('invalid_input_shape');
+  return record;
+}
+
+function validatedConfig(value: unknown): Record<string, unknown> {
+  const record = versioned(value, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
+  if (typeof record.name !== 'string' || !Number.isSafeInteger(record.revision) || Number(record.revision) <= 0) throw new Error('invalid_config_shape');
+  const model = (candidate: unknown, label: string) => {
+    if (candidate === null && label === 'resolvedModel') return;
+    const value = object(candidate, label);
+    if (typeof value.provider !== 'string' || typeof value.model !== 'string') throw new Error(`invalid_${label}_shape`);
+  };
+  model(record.requestedModel, 'requestedModel');
+  model(record.resolvedModel, 'resolvedModel');
+  object(record.sdk, 'config_sdk');
+  object(record.parameters, 'config_parameters');
+  object(record.limits, 'config_limits');
+  object(record.native, 'config_native');
+  if (record.outputBudget !== undefined) versioned(record.outputBudget, 'outputBudget', ['policy', 'selectedMaxTokens', 'source']);
+  return record;
+}
+
+function validatedOutput(value: unknown): Record<string, unknown> {
+  const record = versioned(value, 'output', ['text', 'partial', 'stopReason', 'responseId', 'responseModel']);
+  if (typeof record.text !== 'string' || typeof record.partial !== 'boolean' || typeof record.stopReason !== 'string'
+    || (record.wireMaxTokens !== undefined && record.wireMaxTokens !== null && (!Number.isSafeInteger(record.wireMaxTokens) || Number(record.wireMaxTokens) < 1))) throw new Error('invalid_output_shape');
+  return record;
+}
+
+function validatedUsage(value: unknown): UsageRecord {
+  const record = versioned(value, 'usage', ['source', 'reason', 'sdkValues', 'attempts', 'attemptsComplete', 'costSource', 'updatedAt']);
+  if (!['sdk', 'unknown', 'not-requested'].includes(String(record.source))
+    || (record.reason !== null && typeof record.reason !== 'string')
+    || (record.sdkValues !== null && typeof record.sdkValues !== 'object')
+    || (record.attempts !== null && (!Number.isSafeInteger(record.attempts) || Number(record.attempts) < 0))
+    || typeof record.attemptsComplete !== 'boolean'
+    || (record.costSource !== null && typeof record.costSource !== 'string')
+    || typeof record.updatedAt !== 'string') throw new Error('invalid_usage_shape');
+  return record as unknown as UsageRecord;
+}
+
+function validatedCleanup(value: unknown): CleanupRecord {
+  const record = versioned(value, 'cleanup', ['stopped', 'stopReason', 'errors', 'lateObservationRequired']);
+  if (typeof record.stopped !== 'boolean' || (record.stopReason !== null && typeof record.stopReason !== 'string')
+    || !Array.isArray(record.errors) || typeof record.lateObservationRequired !== 'boolean') throw new Error('invalid_cleanup_shape');
+  record.errors.forEach((entry, index) => validAppError(entry, `cleanup_error_${index}`, false));
+  return record as unknown as CleanupRecord;
+}
+
+function validatedError(value: unknown): AppError | null {
+  if (value === null) return null;
+  return validAppError(value, 'error', true);
+}
+
 const usageKeys: readonly (keyof SdkUsageValues)[] = [
   'input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens',
   'costInput', 'costOutput', 'costCacheRead', 'costCacheWrite', 'costTotal',
@@ -216,16 +296,20 @@ export function createRunRepository(db: Database): RunRepository {
       try {
         const row = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (!row) return fail(appError('run_not_found', 'input', 'Run 不存在。', false, runId));
-        const output = row.output_json === null ? null : readJson(row.output_json, 'output');
-        const error = row.error_json === null ? null : readJson(row.error_json, 'error');
+        const output = row.output_json === null ? null : validatedOutput(readJson(row.output_json, 'output'));
+        const error = validatedError(readJson(row.error_json ?? 'null', 'error'));
+        const input = validatedInput(readJson(row.input_json, 'input'));
+        const config = validatedConfig(readJson(row.config_json, 'config'));
+        const usage = validatedUsage(readJson(row.usage_json, 'usage'));
+        const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
         return ok({
           runId: row.id,
           kind: row.kind,
           status: row.status,
-          input: readJson(row.input_json, 'input') as Record<string, unknown>,
-          config: readJson(row.config_json, 'config') as Record<string, unknown>,
+          input,
+          config,
           output: output as Record<string, unknown> | null,
-          usage: readJson(row.usage_json, 'usage') as Record<string, unknown>,
+          usage,
           tokens: {
             inputTokens: row.input_tokens,
             outputTokens: row.output_tokens,
@@ -235,8 +319,8 @@ export function createRunRepository(db: Database): RunRepository {
           },
           durationMs: row.duration_ms,
           toolCallCount: row.tool_call_count,
-          error: error as AppError | null,
-          cleanup: readJson(row.cleanup_json, 'cleanup') as Record<string, unknown>,
+          error,
+          cleanup,
           createdAt: row.created_at,
           startedAt: row.started_at,
           endedAt: row.ended_at,
@@ -250,9 +334,18 @@ export function createRunRepository(db: Database): RunRepository {
 
     supplementUsage(runId, usageValue, tokens) {
       const result = transaction(db, () => {
-        const row = db.query('SELECT usage_json FROM runs WHERE id=? AND status IN (\'completed\',\'failed\',\'cancelled\')').get(runId) as { usage_json: string } | null;
+        const row = db.query('SELECT usage_json,input_tokens,output_tokens,total_tokens,cost FROM runs WHERE id=? AND status IN (\'completed\',\'failed\',\'cancelled\')').get(runId) as { usage_json: string; input_tokens: number | null; output_tokens: number | null; total_tokens: number | null; cost: string | null } | null;
         if (!row) return false;
-        const current = readJson(row.usage_json, 'usage') as UsageRecord;
+        const current = validatedUsage(readJson(row.usage_json, 'usage'));
+        const currentValues = current.sdkValues;
+        const incomingValues = usageValue.sdkValues;
+        const conflicts = usageKeys.some((key) => currentValues?.[key] !== null && currentValues?.[key] !== undefined
+          && incomingValues?.[key] !== null && incomingValues?.[key] !== undefined && currentValues[key] !== incomingValues[key]);
+        const tokenConflicts = (row.input_tokens !== null && tokens.inputTokens !== null && row.input_tokens !== tokens.inputTokens)
+          || (row.output_tokens !== null && tokens.outputTokens !== null && row.output_tokens !== tokens.outputTokens)
+          || (row.total_tokens !== null && tokens.totalTokens !== null && row.total_tokens !== tokens.totalTokens)
+          || (row.cost !== null && tokens.cost !== null && row.cost !== tokens.cost);
+        if (conflicts || tokenConflicts) return false;
         const merged = mergeUsage(current, usageValue);
         const changed = db
           .query(

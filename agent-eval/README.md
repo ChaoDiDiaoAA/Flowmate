@@ -67,7 +67,7 @@ bun run eval -- run --dataset flowmate-agent-v1 --case <CaseID> --judge auto
 bun run eval -- run --dataset flowmate-agent-v1 --dataset-version <版本> --selection full --repeat 1 --config <JSON路径> --execution-id <ID> --backend langfuse --judge required
 ```
 
-选集 smoke/full 默认 full，单 Case 选择独立记录；repeat 为 1～20，默认 1。backend 默认 FLOWMATE_EVAL_BACKEND 或 local；judge auto/off/required 默认 auto。Judge auto 配置齐全时可能收费，Smoke 快捷入口关闭 Judge；Full 快捷入口要求 Judge。全量也可显式 judge off，但报告标明未测语义指标。config 是严格 JSON，支持 model、baseUrl、api、maxTokens、repeat、timeoutMs（100～120000）、stopGraceMs（100～10000）、environment；不接受密钥。CLI repeat 优先。
+选集 smoke/full 默认 full，单 Case 选择独立记录；repeat 为 1～20，默认 1。backend 默认 FLOWMATE_EVAL_BACKEND 或 local；judge auto/off/required 默认 auto。Judge auto 配置齐全时可能收费，Smoke 快捷入口关闭 Judge；Full 快捷入口要求 Judge。全量也可显式 judge off，但报告标明未测语义指标。config 是严格 JSON，支持 model、baseUrl、api、repeat、timeoutMs（100～120000）、stopGraceMs（100～10000）、environment；不接受密钥或 Agent 输出 Token 上限。CLI repeat 优先。
 
 ```powershell
 bun run eval -- status --execution-id <ID>

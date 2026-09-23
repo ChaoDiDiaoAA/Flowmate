@@ -16,7 +16,7 @@ const config: ProviderConfig = {
   revision: 1,
   modelRef: { provider: 'deepseek', model: 'deepseek-v4-flash' },
   native: { authPath: 'C:\\Users\\test\\.pi\\auth.json', modelsPath: null },
-  parameters: { maxTokens: 64, maxRetries: 0, maxRetryDelayMs: 2000 },
+  parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
 };
 
 const request: ProviderRequest = {
@@ -54,6 +54,7 @@ function paths(root: string) {
 }
 
 class ControlledProvider implements ProviderPort {
+  private pending = false;
   public constructor(private readonly behavior: 'success' | 'abort' | 'hang') {}
   public async prepare(): Promise<{ ok: true; data: PreparedProvider }> {
     return {
@@ -61,16 +62,25 @@ class ControlledProvider implements ProviderPort {
       data: {
         snapshot,
         execute: async (_input, signal, observe) => {
+          this.pending = true;
           observe({ type: 'request_dispatched', at: new Date().toISOString(), monotonicMs: performance.now(), data: {} });
-          if (this.behavior === 'success') return success;
-          if (this.behavior === 'hang') await new Promise<void>(() => undefined);
-          await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
-          return { ...success, text: '', partial: true, stopReason: 'aborted', error: { code: 'provider_cancelled', category: 'provider', message: 'Provider 请求已中止。', retryable: false } };
+          try {
+            if (this.behavior === 'success') return success;
+            if (this.behavior === 'hang') await new Promise<void>(() => undefined);
+            await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+            return { ...success, text: '', partial: true, stopReason: 'aborted', error: { code: 'provider_cancelled', category: 'provider', message: 'Provider 请求已中止。', retryable: false } };
+          } finally {
+            this.pending = false;
+          }
         },
       },
     };
   }
-  public async close() { return { stopped: true, closed: true, errors: [] as const }; }
+  public async close() {
+    return this.pending
+      ? { stopped: false, closed: false, errors: [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: 'Provider 请求仍在收口。', retryable: true }] }
+      : { stopped: true, closed: true, errors: [] as const };
+  }
 }
 
 function serviceFor(provider: ProviderPort, runsOverride?: RunRepository) {
@@ -164,12 +174,13 @@ describe('RuntimeService lifecycle', () => {
 
   it('[F-timeout-prepare] applies the total deadline while Provider preparation is still pending', async () => {
     let aborted = false;
+    let preparing = true;
     const provider: ProviderPort = {
       async prepare(_config, _limits, signal) {
         signal.addEventListener('abort', () => { aborted = true; }, { once: true });
         return await new Promise<never>(() => undefined);
       },
-      async close() { return { stopped: true, closed: true, errors: [] as const }; },
+      async close() { return { stopped: !preparing, closed: !preparing, errors: preparing ? [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: 'Provider 初始化仍在收口。', retryable: true }] : [] }; },
     };
     const { db, service } = serviceFor(provider);
 
@@ -182,7 +193,8 @@ describe('RuntimeService lifecycle', () => {
       expect(result.data.stopped).toBe(false);
     }
     expect(aborted).toBe(true);
-    expect((await service.close()).closed).toBe(false);
+    preparing = false;
+    expect((await service.close()).closed).toBe(true);
     db.close();
   });
 
@@ -359,6 +371,32 @@ describe('RuntimeService lifecycle', () => {
     db.close();
   });
 
+  it('[F-cancel-unconfirmed] persists an unconfirmed user cancellation as failed with no stopped timestamp', async () => {
+    const { db, service } = serviceFor(new ControlledProvider('hang'));
+    const controller = new AbortController();
+    const pending = service.callProvider({ ...request, timeoutMs: 10_000, stopGraceMs: 20 }, { signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    const result = await pending;
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data.status).toBe('failed');
+      expect(result.data.stopped).toBe(false);
+      expect(result.data.error?.code).toBe('provider_cancelled');
+      const queried = db.runs.get(result.data.runId);
+      expect(queried.ok).toBe(true);
+      if (queried.ok) {
+        expect(queried.data.status).toBe('failed');
+        expect(queried.data.cancelRequestedAt).not.toBeNull();
+        expect(queried.data.stoppedAt).toBeNull();
+        expect(queried.data.cleanup).toMatchObject({ stopped: false, errors: [{ code: 'stop_unconfirmed' }] });
+      }
+    }
+    expect((await service.callProvider(request)).ok).toBe(false);
+    db.close();
+  });
+
   it('[F-db-finish-failure] blocks reuse when the terminal database write fails', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-finish-failure-'));
     const db = openDatabase(paths(root));
@@ -387,7 +425,7 @@ describe('RuntimeService lifecycle', () => {
     const retry = await service.callProvider(request);
     expect(retry.ok).toBe(false);
     if (!retry.ok) expect(retry.error.code).toBe('runtime_unusable');
-    expect((await service.close()).closed).toBe(false);
+    expect((await service.close()).closed).toBe(true);
     db.data.close();
   });
 
@@ -427,6 +465,19 @@ describe('RuntimeService lifecycle', () => {
     expect(db.ok).toBe(true);
     if (!db.ok) return;
     let release!: () => void;
+    let pendingWork = true;
+    const lateOutcome: NativeOutcome = {
+      ...success,
+      usage: {
+        ...success.usage,
+        source: 'sdk',
+        reason: null,
+        sdkValues: { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5, costInput: null, costOutput: null, costCacheRead: null, costCacheWrite: null, costTotal: null },
+        attempts: 1,
+        attemptsComplete: true,
+      },
+      tokens: { inputTokens: 3, outputTokens: 2, totalTokens: 5, cost: null, usageComplete: true },
+    };
     const provider: ProviderPort = {
       async prepare() {
         return {
@@ -434,13 +485,17 @@ describe('RuntimeService lifecycle', () => {
           data: {
             snapshot,
             execute: async () => {
-              await new Promise<void>((resolve) => { release = resolve; });
-              return success;
+              try {
+                await new Promise<void>((resolve) => { release = resolve; });
+                return lateOutcome;
+              } finally {
+                pendingWork = false;
+              }
             },
           },
         };
       },
-      async close() { return { stopped: true, closed: true, errors: [] as const }; },
+      async close() { return { stopped: !pendingWork, closed: !pendingWork, errors: pendingWork ? [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: 'Provider 请求仍在收口。', retryable: true }] : [] }; },
     };
     const service = new RuntimeService({
       runs: db.data.runs,
@@ -458,6 +513,8 @@ describe('RuntimeService lifecycle', () => {
       expect(result.data.stopped).toBe(false);
       expect(result.data.error?.code).toBe('provider_timeout');
     }
+    const firstClose = await service.close();
+    expect(firstClose.closed).toBe(false);
     release();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(runId).toBeDefined();
@@ -467,8 +524,13 @@ describe('RuntimeService lifecycle', () => {
       if (queried.ok) {
         expect(queried.data.status).toBe('failed');
         expect(queried.data.error?.code).toBe('provider_timeout');
+        expect(queried.data.output).toBeNull();
+        expect(queried.data.tokens).toMatchObject({ inputTokens: 3, outputTokens: 2, totalTokens: 5 });
+        expect(queried.data.usage).toMatchObject({ source: 'sdk', attempts: 1 });
       }
     }
+    const finalClose = await service.close();
+    expect(finalClose).toMatchObject({ stopped: true, closed: true, errors: [{ code: 'stop_unconfirmed' }] });
     db.data.close();
   });
 });

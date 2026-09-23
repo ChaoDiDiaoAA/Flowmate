@@ -10,25 +10,21 @@ const config: ProviderConfig = {
   revision: 1,
   modelRef: { provider: 'deepseek', model: 'deepseek-v4-flash' },
   native: { authPath: 'C:\\Users\\test\\.pi\\auth.json', modelsPath: null },
-  parameters: { maxTokens: 64, maxRetries: 0, maxRetryDelayMs: 2000 },
+  parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
 };
 
 const input = { goal: '返回一句话', text: '合成文本', messageTimestamp: 1789948800000 };
 
 describe('PiProviderAdapter', () => {
-  it('resolves native metadata offline and refuses an oversized explicit budget', async () => {
+  it('resolves Pi model metadata offline without adding a Flowmate output-token setting', async () => {
     const adapter = new PiProviderAdapter({ credentials: new InMemoryCredentialStore(), runtimeApiKey: 'SYNTHETIC_ONLY', fetch: mock<FetchLike>() });
-    const automatic = { ...config, parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
-    const prepared = await adapter.prepare(automatic, { timeoutMs: 10000, stopGraceMs: 5000 }, new AbortController().signal);
+    const prepared = await adapter.prepare(config, { timeoutMs: 10000, stopGraceMs: 5000 }, new AbortController().signal);
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
-    expect(prepared.data.snapshot.outputBudget).toMatchObject({ source: 'model-metadata', selectedMaxTokens: 8192, requestedMaxTokens: null });
-    const ceiling = prepared.data.snapshot.outputBudget!.modelMaxTokens!;
-    expect(ceiling).toBeGreaterThanOrEqual(8192);
-    const rejected = await adapter.prepare({ ...config, parameters: { ...config.parameters, maxTokens: ceiling + 1 } }, { timeoutMs: 10000, stopGraceMs: 5000 }, new AbortController().signal);
-    expect(rejected).toMatchObject({ ok: false, error: { code: 'config_output_budget_invalid' } });
+    expect(prepared.data.snapshot.parameters).toEqual({ maxRetries: 0, maxRetryDelayMs: 2000 });
+    expect(prepared.data.snapshot).not.toHaveProperty('outputBudget');
   });
-  it('reports an output-budget truncation when Responses consumes 512 tokens without visible text', async () => {
+  it('reports a model or service output-limit stop without implying a Flowmate override', async () => {
     const response = { id: 'synthetic-budget-limit', model: 'synthetic-model', status: 'incomplete', output: [],
       incomplete_details: { reason: 'max_output_tokens' },
       usage: { input_tokens: 34, output_tokens: 512, total_tokens: 546, output_tokens_details: { reasoning_tokens: 512 } } };
@@ -36,7 +32,7 @@ describe('PiProviderAdapter', () => {
       { status: 200, headers: { 'content-type': 'text/event-stream' } }));
     const adapter = new PiProviderAdapter({ runtimeApiKey: 'SYNTHETIC_ONLY', fetch });
     const requested: ProviderConfig = { ...config, modelRef: { provider: 'flowmate-env', model: 'synthetic-model' },
-      connection: { baseUrl: 'https://not-contacted.invalid/v1', api: 'openai-responses' }, parameters: { ...config.parameters, maxTokens: 512 } };
+      connection: { baseUrl: 'https://not-contacted.invalid/v1', api: 'openai-responses' } };
     const prepared = await adapter.prepare(requested, { timeoutMs: 10_000, stopGraceMs: 5000 }, new AbortController().signal);
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
@@ -45,7 +41,7 @@ describe('PiProviderAdapter', () => {
     expect(outcome.text).toBe('');
     expect(outcome.tokens.outputTokens).toBe(512);
     expect(outcome.error?.code).toBe('provider_incomplete_response');
-    expect(outcome.error?.message).toContain('Token 上限');
+    expect(outcome.error?.message).toContain('模型或服务端输出限制');
     expect(fetch).toHaveBeenCalledTimes(1);
   });
   it('[F-missing-auth] rejects missing native credentials before an HTTP attempt', async () => {
@@ -74,10 +70,13 @@ describe('PiProviderAdapter', () => {
     expect(native.ok).toBe(true);
     if (!native.ok) return;
     const baseUrl = native.data.snapshot.endpoint!;
-    for (const [url, api, source] of [[baseUrl, 'openai-completions', 'model-metadata'], ['https://gateway.invalid/v1', 'openai-completions', 'fallback'], [baseUrl, 'openai-responses', 'fallback']] as const) {
+    for (const [url, api] of [[baseUrl, 'openai-completions'], ['https://gateway.invalid/v1', 'openai-completions'], [baseUrl, 'openai-responses']] as const) {
       const prepared = await adapter.prepare({ ...config, modelRef: { provider: 'flowmate-env', model: config.modelRef.model }, connection: { baseUrl: url, api }, parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } }, { timeoutMs: 10000, stopGraceMs: 5000 }, new AbortController().signal);
       expect(prepared.ok).toBe(true);
-      if (prepared.ok) expect(prepared.data.snapshot.outputBudget?.source).toBe(source);
+      if (prepared.ok) {
+        expect(prepared.data.snapshot.endpoint).toBe(url);
+        expect(prepared.data.snapshot.parameters).not.toHaveProperty('maxTokens');
+      }
     }
   });
 
@@ -128,7 +127,8 @@ describe('PiProviderAdapter', () => {
 
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
-    expect(prepared.data.snapshot.outputBudget).toMatchObject({ source: 'fallback', modelMaxTokens: null, selectedMaxTokens: 8192 });
+    expect(prepared.data.snapshot).not.toHaveProperty('outputBudget');
+    expect(prepared.data.snapshot.parameters).not.toHaveProperty('maxTokens');
     const outcome = await prepared.data.execute(input, new AbortController().signal, () => undefined);
     const [requestInput, requestInit] = fetch.mock.calls[0] ?? [];
     expect(outcome.wireMaxTokens).toBe(8192);
@@ -149,11 +149,19 @@ describe('PiProviderAdapter', () => {
     const credentials = new InMemoryCredentialStore();
     await credentials.modify('deepseek', async () => ({ type: 'api_key', key: 'FLOWMATE_SYNTHETIC_KEY' }));
     const oversized = 'x'.repeat(256 * 1024 + 1);
-    const fetch = mock<FetchLike>(async () => new Response(
-      `data: ${JSON.stringify({ id: 'fixture-limit', choices: [{ index: 0, delta: { content: oversized }, finish_reason: null }] })}\n\n`,
-      { status: 200, headers: { 'content-type': 'text/event-stream' } },
-    ));
-    const adapter = new PiProviderAdapter({ credentials, fetch });
+    let requestSignal: AbortSignal | undefined;
+    const witnesses: Readonly<Record<string, unknown>>[] = [];
+    const fetch = mock<FetchLike>(async (_request, init) => {
+      requestSignal = init?.signal as AbortSignal | undefined;
+      const encoded = new TextEncoder().encode(`data: ${JSON.stringify({ id: 'fixture-limit', choices: [{ index: 0, delta: { content: oversized }, finish_reason: null }] })}\n\n`);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoded);
+          requestSignal?.addEventListener('abort', () => controller.close(), { once: true });
+        },
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    });
+    const adapter = new PiProviderAdapter({ credentials, fetch, witness: (entry) => witnesses.push(entry) });
     const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 5_000 }, new AbortController().signal);
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
@@ -162,8 +170,44 @@ describe('PiProviderAdapter', () => {
 
     expect(outcome.error?.code).toBe('provider_output_limit');
     expect(outcome.partial).toBe(true);
-    expect(outcome.stopped).toBe(false);
+    expect(new TextEncoder().encode(outcome.text).byteLength).toBeLessThanOrEqual(256 * 1024);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(witnesses).toContainEqual({ type: 'output_limit_stop', stopped: true, streamFailed: false, aborted: true });
+    expect(outcome.stopped).toBe(true);
     expect(outcome.usage.source).toBe('unknown');
+  });
+
+  it('[F-output-limit-stop-unconfirmed] preserves bounded partial text when the transport ignores abort', async () => {
+    const credentials = new InMemoryCredentialStore();
+    await credentials.modify('deepseek', async () => ({ type: 'api_key', key: 'FLOWMATE_SYNTHETIC_KEY' }));
+    const oversized = 'x'.repeat(256 * 1024 + 1);
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let requestSignal: AbortSignal | undefined;
+    const witnesses: Readonly<Record<string, unknown>>[] = [];
+    const fetch = mock<FetchLike>(async (_request, init) => {
+      requestSignal = init?.signal as AbortSignal | undefined;
+      const encoded = new TextEncoder().encode(`data: ${JSON.stringify({ id: 'fixture-limit-hang', choices: [{ index: 0, delta: { content: oversized }, finish_reason: null }] })}\n\n`);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller;
+          controller.enqueue(encoded);
+        },
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    });
+    const adapter = new PiProviderAdapter({ credentials, fetch, witness: (entry) => witnesses.push(entry) });
+    const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 25 }, new AbortController().signal);
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+
+    const outcome = await prepared.data.execute(input, new AbortController().signal, () => undefined);
+
+    expect(outcome.error?.code).toBe('provider_output_limit');
+    expect(new TextEncoder().encode(outcome.text).byteLength).toBeLessThanOrEqual(256 * 1024);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(outcome.stopped).toBe(false);
+    expect(outcome.cleanupErrors.map((entry) => entry.code)).toContain('stop_unconfirmed');
+    expect(witnesses).toContainEqual({ type: 'output_limit_stop', stopped: false, streamFailed: false, aborted: true });
+    bodyController?.close();
   });
 
   it('[F-network-failure] classifies a transport failure before any response as a network error', async () => {

@@ -8,16 +8,6 @@ import type {
   TokenColumns,
 } from './runtime.ts';
 
-export type OutputBudget = {
-  version: 1;
-  policy: 'model-aware/v1';
-  requestedMaxTokens: number | null;
-  selectedMaxTokens: number;
-  modelMaxTokens: number | null;
-  automaticCap: number;
-  source: 'explicit' | 'model-metadata' | 'fallback';
-};
-
 export type SafeConfigSnapshot = {
   version: 1;
   name: string;
@@ -28,7 +18,6 @@ export type SafeConfigSnapshot = {
   endpoint: string | null;
   sdk: { codingAgent: string; ai: string };
   parameters: ProviderConfig['parameters'];
-  outputBudget?: OutputBudget;
   limits: { timeoutMs: number; stopGraceMs: number };
   native: { authSource: 'pi-native' | 'pi-runtime-api-key'; modelsSelection: string | null };
 };

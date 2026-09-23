@@ -57,17 +57,7 @@ export async function providerChatCommand(options: ChatOptions, app: Application
         const request = normalizeProviderRequest({ ...base.data, goal });
         if (!request.ok) { io.err(`${request.error.code}: ${request.error.message}`); return; }
         io.out('LLM 正在回复……（可输入 /cancel）');
-        const result = await app.callProvider(request.data, { signal: controller.signal, onObservation: (event) => {
-          if (event.type === 'provider_configured') {
-            const budget = event.data.outputBudget as { selectedMaxTokens: number; modelMaxTokens: number | null; source: string };
-            const source = budget.source === 'explicit' ? '显式配置' : budget.source === 'model-metadata' ? 'Pi 模型信息 + 产品默认预算' : '兜底值（模型上限未知）';
-            io.out(`本次输出预算：${budget.selectedMaxTokens} Token；来源：${source}；模型上限：${budget.modelMaxTokens ?? '未知'}。`);
-          }
-          if (event.type === 'request_budget' && typeof event.data.wireMaxTokens === 'number'
-            && event.data.wireMaxTokens !== event.data.selectedMaxTokens) {
-            io.out(`Pi 调整后请求预算：${event.data.wireMaxTokens} Token。`);
-          }
-        } });
+        const result = await app.callProvider(request.data, { signal: controller.signal });
         if (!result.ok) { io.err(`${result.error.code}: ${result.error.message}`); return; }
         const outcome = result.data;
         if (outcome.text) io.out(`LLM > ${outcome.text}`);
@@ -106,7 +96,7 @@ export async function providerChatCommand(options: ChatOptions, app: Application
     terminal.on('close', onClose);
     io.signal.addEventListener('abort', onExit, { once: true });
     io.out('Flowmate P1 交互式 LLM：每次提问独立，不携带上一轮历史；回复完成后显示。');
-    io.out(`模型：${config.data.modelRef.model}；输出预算：${config.data.parameters.maxTokens ?? '自动选择（请求时显示数值与来源）'}。`);
+    io.out(`模型：${config.data.modelRef.model}。`);
     io.out(help);
     if (io.signal.aborted) onExit();
     else terminal.prompt();

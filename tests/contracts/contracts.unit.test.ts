@@ -10,16 +10,14 @@ const validRequest = {
     revision: 1,
     modelRef: { provider: 'deepseek', model: 'deepseek-v4-flash' },
     native: { authPath: 'C:\\Users\\test\\.pi\\auth.json', modelsPath: null },
-    parameters: { maxTokens: 512, maxRetries: 0, maxRetryDelayMs: 2000 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
   },
 };
 
 describe('public provider contracts', () => {
-  it('preserves automatic budget selection and allows an override above the old 2048 cap', () => {
-    const request = { ...validRequest, config: { ...validRequest.config, parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } } };
-    const automatic = normalizeProviderRequest(request);
-    expect(automatic.ok && automatic.data.config.parameters.maxTokens).toBeUndefined();
-    expect(normalizeProviderRequest({ ...request, config: { ...request.config, parameters: { ...request.config.parameters, maxTokens: 16384 } } }).ok).toBe(true);
+  it('rejects the retired Flowmate output-token setting at the public Provider boundary', () => {
+    const request = { ...validRequest, config: { ...validRequest.config, parameters: { maxTokens: 16384, maxRetries: 0, maxRetryDelayMs: 1000 } } };
+    expect(normalizeProviderRequest(request)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
   });
   it('normalizes bounded timeout defaults without exposing arbitrary provider options', () => {
     const result = normalizeProviderRequest(validRequest);
@@ -28,7 +26,7 @@ describe('public provider contracts', () => {
     if (!result.ok) return;
     expect(result.data.timeoutMs).toBe(60_000);
     expect(result.data.stopGraceMs).toBe(5_000);
-    expect(result.data.config.parameters.maxTokens).toBe(512);
+    expect(result.data.config.parameters).toEqual({ maxRetries: 0, maxRetryDelayMs: 2000 });
   });
 
   it('rejects a secret-like or unknown request field before a Run exists', () => {

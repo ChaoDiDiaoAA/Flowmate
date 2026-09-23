@@ -1,5 +1,6 @@
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
+  AppError,
   Application,
   CloseReport,
   ProviderControl,
@@ -115,6 +116,9 @@ export class RuntimeService {
   private closing = false;
   private closed = false;
   private poisoned = false;
+  private closeInFlight: Promise<CloseReport> | null = null;
+  private finalCloseReport: CloseReport | null = null;
+  private readonly closeErrors = new Map<string, ReturnType<typeof appError>>();
 
   public constructor(dependencies: RuntimeDependencies) {
     this.dependencies = dependencies;
@@ -258,7 +262,6 @@ export class RuntimeService {
       return fail(started.error, active.runId);
     }
 
-    if (prepared.data.snapshot.outputBudget) observe('provider_configured', { outputBudget: prepared.data.snapshot.outputBudget });
     let work: Promise<NativeOutcome>;
     try {
       work = prepared.data.execute(input, active.controller.signal, (event) => observe(event.type, event.data));
@@ -266,7 +269,15 @@ export class RuntimeService {
       const stop = readStop();
       return this.finish(active, request, input, stop ? errorForStop(stop.reason, active.runId) : appError('provider_runtime_error', 'provider', 'Provider 执行失败。', true, active.runId), null, false, undefined, stop);
     }
-    const workResult = work.then((outcome) => ({ kind: 'work' as const, outcome }));
+    const workResult = work.then((outcome) => {
+      if (active.terminalCommitted && active.poisoned) {
+        const supplemented = this.dependencies.runs.supplementUsage(active.runId, outcome.usage, outcome.tokens);
+        if (!supplemented.ok || !supplemented.data) {
+          try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'warn', component: 'runtime', runId: active.runId, event: 'late_usage_not_applied' }); } catch { /* diagnostics are best effort */ }
+        }
+      }
+      return { kind: 'work' as const, outcome };
+    });
     const stopResult = stopPromise.then((intent) => ({ kind: 'stop' as const, intent }));
     const first = await Promise.race([workResult, stopResult]);
     if (first.kind === 'stop') {
@@ -293,9 +304,10 @@ export class RuntimeService {
   ): Promise<Result<ProviderOutcome>> {
     if (stopIntent) {
       const error = errorForStop(stopIntent.reason, active.runId);
-      return this.finish(active, request, input, error, outcome, outcome.stopped, outcome, stopIntent);
+      const confirmedCancellation = stopIntent.reason === 'user' && outcome.stopped;
+      return this.finish(active, request, input, error, outcome, outcome.stopped, outcome, stopIntent, !outcome.stopped && !confirmedCancellation);
     }
-    if (outcome.error) return this.finish(active, request, input, { ...outcome.error, runId: active.runId }, outcome, outcome.stopped, outcome, undefined);
+    if (outcome.error) return this.finish(active, request, input, { ...outcome.error, runId: active.runId }, outcome, outcome.stopped, outcome, undefined, !outcome.stopped);
     if (!outcome.stopped) return this.finish(active, request, input, appError('provider_stop_unconfirmed', 'provider', 'Provider 停止未确认。', true, active.runId), outcome, false, outcome, undefined, true);
     return this.finish(active, request, input, null, outcome, true, outcome, undefined);
   }
@@ -311,14 +323,19 @@ export class RuntimeService {
     stopIntent: StopIntent | undefined,
     unconfirmed = false,
   ): Promise<Result<ProviderOutcome>> {
-    const status: ProviderOutcome['status'] = stopIntent ? stopStatus(stopIntent.reason) : error ? 'failed' : 'completed';
+    const status: ProviderOutcome['status'] = stopIntent
+      ? (stopIntent.reason === 'user' && stopped ? stopStatus(stopIntent.reason) : 'failed')
+      : error ? 'failed' : 'completed';
     const finalError = error === null && status === 'completed' && rawOutcome ? null : error ?? appError('provider_incomplete_response', 'provider', 'Provider 响应不完整。', false, active.runId);
     const output = rawOutcome ? outputRecord(rawOutcome) : null;
+    const cleanupErrors = new Map<string, AppError>();
+    for (const cleanupError of rawOutcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
+    if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId));
     const cleanup: CleanupRecord = {
       version: 1,
       stopped,
       stopReason: stopIntent?.reason ?? (rawOutcome?.stopReason ?? null),
-      errors: unconfirmed ? [appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId)] : [...(rawOutcome?.cleanupErrors ?? [])],
+      errors: [...cleanupErrors.values()],
       lateObservationRequired: unconfirmed || !stopped,
     };
     const usage = outcomeForUsage?.usage ?? initialUsage(this.dependencies.now());
@@ -363,22 +380,40 @@ export class RuntimeService {
     return ok(productOutcome);
   }
 
-  public async close(): Promise<CloseReport> {
-    if (this.closed) return { stopped: true, closed: true, errors: [] };
+  public close(): Promise<CloseReport> {
+    if (this.finalCloseReport) return Promise.resolve(this.finalCloseReport);
+    if (this.closeInFlight) return this.closeInFlight;
+    this.closeInFlight = this.closeOnce().then((report) => {
+      for (const error of report.errors) this.closeErrors.set(error.code, error);
+      const complete = { ...report, errors: [...this.closeErrors.values()] };
+      if (complete.closed) this.finalCloseReport = complete;
+      return complete;
+    }).finally(() => { this.closeInFlight = null; });
+    return this.closeInFlight;
+  }
+
+  private async closeOnce(): Promise<CloseReport> {
+    if (this.closed) return { stopped: true, closed: true, errors: [...this.closeErrors.values()] };
     this.closing = true;
-    if (this.poisoned) {
-      return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true)] };
-    }
     const active = this.active;
     if (active) {
       active.stop('shutdown');
       const result = await active.completion;
       if (!result.ok || !result.data.stopped) {
-        return { stopped: false, closed: false, errors: [result.ok ? appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId) : result.error] };
+        const error = result.ok ? appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId) : result.error;
+        this.closeErrors.set(error.code, error);
       }
     }
-    const report = await this.dependencies.provider.close();
-    this.closed = report.closed;
-    return report;
+    try {
+      const report = await this.dependencies.provider.close();
+      this.closed = report.closed;
+      this.poisoned = !report.stopped;
+      for (const error of report.errors) this.closeErrors.set(error.code, error);
+      return { stopped: report.stopped, closed: report.closed, errors: [...this.closeErrors.values()] };
+    } catch {
+      const error = appError('provider_close_failed', 'provider', 'Provider 资源关闭失败。', true);
+      this.closeErrors.set(error.code, error);
+      return { stopped: false, closed: false, errors: [...this.closeErrors.values()] };
+    }
   }
 }

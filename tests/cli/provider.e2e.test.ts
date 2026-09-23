@@ -22,7 +22,7 @@ for (const fails of [false, true]) test(`CLI persists ${fails ? 'failure' : 'suc
     PATH: process.env.PATH ?? '', SystemRoot: process.env.SystemRoot ?? 'C:\\Windows', TEMP: root, TMP: root,
     APPDATA: root, HOME: root, USERPROFILE: root, NO_PROXY: '127.0.0.1,localhost',
     FLOWMATE_LLM_BASE_URL: `http://127.0.0.1:${server.port}/v1`, FLOWMATE_LLM_MODEL: 'controlled-model',
-    FLOWMATE_LLM_API_KEY: 'synthetic-e2e-only', FLOWMATE_LLM_API: 'openai-completions', FLOWMATE_LLM_MAX_TOKENS: '32'
+    FLOWMATE_LLM_API_KEY: 'synthetic-e2e-only', FLOWMATE_LLM_API: 'openai-completions'
   };
   const children: ReturnType<typeof Bun.spawn>[] = [];
   async function cli(args: string[]) {

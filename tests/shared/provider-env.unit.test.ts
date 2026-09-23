@@ -28,19 +28,15 @@ describe('Live Provider environment configuration', () => {
     });
     expect(result.data.config.native.authPath).toBe('C:\\Temp\\Flowmate\\runtime\\pi-auth.json');
     expect(result.data.apiKey).toBe('test-live-secret');
-    expect(result.data.config.parameters.maxTokens).toBeUndefined();
+    expect(result.data.config.parameters).toEqual({ maxRetries: 0, maxRetryDelayMs: 1000 });
     expect(JSON.stringify(result.data.config)).not.toContain('test-live-secret');
   });
 
-  test('accepts an explicit output budget and rejects invalid budgets before execution', () => {
+  test('ignores the retired LLM output-token environment variable', () => {
     const env = { FLOWMATE_LLM_BASE_URL: 'https://llm.example.com/v1', FLOWMATE_LLM_MODEL: 'invoice-model', FLOWMATE_LLM_API_KEY: 'test-secret' };
-    const configured = loadLiveProviderEnvironment({ ...env, FLOWMATE_LLM_MAX_TOKENS: '1024' }, paths);
-    expect(configured.ok && configured.data.config.parameters.maxTokens).toBe(1024);
-    expect(loadLiveProviderEnvironment({ ...env, FLOWMATE_LLM_MAX_TOKENS: '16384' }, paths).ok).toBe(true);
-    expect(loadLiveProviderEnvironment({ ...env, FLOWMATE_LLM_MAX_TOKENS: '' }, paths)).toMatchObject({ ok: true });
-    for (const value of ['0', '-1', '9007199254740992', '1.5', 'NaN', '512oops']) {
-      expect(loadLiveProviderEnvironment({ ...env, FLOWMATE_LLM_MAX_TOKENS: value }, paths)).toMatchObject({ ok: false, error: { code: 'config_env_invalid' } });
-    }
+    const result = loadLiveProviderEnvironment({ ...env, FLOWMATE_LLM_MAX_TOKENS: '1024' }, paths);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.data.config.parameters).toEqual({ maxRetries: 0, maxRetryDelayMs: 1000 });
   });
 
   test('rejects an incomplete or unsafe live endpoint before a Provider request starts', () => {

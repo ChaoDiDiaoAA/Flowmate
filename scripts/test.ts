@@ -30,8 +30,9 @@ async function run(args: string[]) {
 }
 if (selected === 'all') await run(['run', 'typecheck']);
 for (const layer of selected === 'all' ? layers : [selected]) {
+  if (layer === 'e2e') await run(['run', 'build:desktop']);
   const tests = discovered.filter(p => p.endsWith(`.${layer}.test.ts`));
   if (!tests.length) throw new Error(`No ${layer} tests found`);
   console.log(`${layer}: ${tests.length} test files`);
-  await run(['test', '--isolate', '--timeout', '15000', ...tests.map(p => './' + p)]);
+  await run(['test', '--isolate', '--timeout', layer === 'e2e' ? '60000' : '15000', ...tests.map(p => './' + p)]);
 }

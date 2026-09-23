@@ -38,7 +38,6 @@ const providerConfigSchema = z
       .optional(),
     parameters: z
       .object({
-        maxTokens: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
         maxRetries: z.number().int().min(0).max(1).default(0),
         maxRetryDelayMs: z.number().int().min(1).max(5000).default(2000),
       })
