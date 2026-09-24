@@ -33,11 +33,11 @@ function harness(call: Application['callProvider'] = async (request) => complete
   const terminal = createInterface({ input, output: new PassThrough(), terminal: false });
   const messages: string[] = [], errors: string[] = [], requests: ProviderRequest[] = [];
   let closed = 0;
-  const application: Application = {
-    async callProvider(request, control) { requests.push(request); return call(request, control); },
+  const application = {
+    async callProvider(request: ProviderRequest, control: Parameters<Application['callProvider']>[1]) { requests.push(request); return call(request, control); },
     async queryRun() { throw new Error('not used'); },
     async close() { closed++; return { ok: true, data: { stopped: true, closed: true, errors: [] } }; },
-  };
+  } as unknown as Application;
   cleanup.push(() => { terminal.close(); input.destroy(); rmSync(dir, { recursive: true, force: true }); });
   const external = new AbortController();
   const done = main(['provider', 'chat', '--config', config], {

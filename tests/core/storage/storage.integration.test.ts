@@ -88,6 +88,7 @@ describe('P1 SQLite storage', () => {
     const queried = opened.data.runs.get(runId);
     expect(queried.ok).toBe(true);
     if (queried.ok) {
+      expect(queried.data).toMatchObject({ kind: 'provider', sessionId: null, scope: null });
       expect(queried.data.status).toBe('completed');
       expect(queried.data.output).toMatchObject({ text: '完成', partial: false });
       expect(queried.data.tokens).toEqual({ inputTokens: 10, outputTokens: 4, totalTokens: 14, cost: '0.001', usageComplete: true });

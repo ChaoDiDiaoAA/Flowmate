@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@flowmate/contracts": "workspace:*"
+    "@flowmate/contracts": "workspace:*",
+    "@flowmate/logging": "workspace:*"
   },
   "exports": {
     ".": "./src/index.ts",

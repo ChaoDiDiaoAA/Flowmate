@@ -1,41 +1,26 @@
 import {
-  InMemoryModelsStore,
   type Api,
   type AssistantMessage,
   type AssistantMessageEvent,
-  type CredentialStore,
   type FetchFunction,
   type Model,
-  ModelsError,
 } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
   ProviderConfig,
   Result,
-  UsageRecord,
-  SdkUsageValues,
-  TokenColumns,
 } from '@flowmate/contracts';
+import { normalizeUsage, prepareModelRuntime, safeUrl } from './model-runtime.ts';
+import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
+export type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import type {
   NativeInput,
   NativeObservation,
   NativeOutcome,
   PreparedProvider,
   ProviderPort,
-  SafeConfigSnapshot,
 } from '@flowmate/contracts';
-
-export type PiProviderDependencies = {
-  credentials?: CredentialStore;
-  fetch?: FetchLike;
-  witness?: (value: Readonly<Record<string, unknown>>) => void;
-  runtimeApiKey?: string;
-  runtimeApiKeyFor?: (config: ProviderConfig) => string | undefined;
-};
-
-/** A portable fetch shape; Bun's optional `preconnect` property is not needed by Pi. */
-export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 type FetchFacts = {
   attempts: number;
@@ -45,93 +30,13 @@ type FetchFacts = {
   complete: boolean;
 };
 
-const codingAgentVersion = '0.85.1';
-const aiVersion = '0.85.1';
 const maxOutputBytes = 256 * 1024;
-// Pi's registerProvider model metadata requires maxTokens. Use Pi's catalog
-// value when available; custom endpoints with no catalog entry need this SDK
-// compatibility value. It is not exposed as a Flowmate setting or request option.
-const piCustomModelMaxTokens = 8192;
-
-function safeUrl(value: string): string | null {
-  try {
-    const url = new URL(value);
-    url.username = '';
-    url.password = '';
-    url.search = '';
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return null;
-  }
-}
-
-function classifyAuthError(error: unknown): boolean {
-  return error instanceof ModelsError && (error.code === 'auth' || error.code === 'oauth');
-}
 
 function normalizeText(message: AssistantMessage): string {
   return message.content
     .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
     .map((part) => part.text)
     .join('');
-}
-
-function emptySdkUsage(): SdkUsageValues {
-  return {
-    input: null,
-    output: null,
-    cacheRead: null,
-    cacheWrite: null,
-    totalTokens: null,
-    costInput: null,
-    costOutput: null,
-    costCacheRead: null,
-    costCacheWrite: null,
-    costTotal: null,
-  };
-}
-
-function normalizeUsage(
-  message: AssistantMessage,
-  facts: FetchFacts,
-  canVerifyCost: boolean,
-): { usage: UsageRecord; tokens: TokenColumns } {
-  const raw = message.usage;
-  const values: SdkUsageValues = {
-    input: Number.isFinite(raw.input) ? raw.input : null,
-    output: Number.isFinite(raw.output) ? raw.output : null,
-    cacheRead: Number.isFinite(raw.cacheRead) ? raw.cacheRead : null,
-    cacheWrite: Number.isFinite(raw.cacheWrite) ? raw.cacheWrite : null,
-    totalTokens: Number.isFinite(raw.totalTokens) ? raw.totalTokens : null,
-    costInput: Number.isFinite(raw.cost.input) ? raw.cost.input : null,
-    costOutput: Number.isFinite(raw.cost.output) ? raw.cost.output : null,
-    costCacheRead: Number.isFinite(raw.cost.cacheRead) ? raw.cost.cacheRead : null,
-    costCacheWrite: Number.isFinite(raw.cost.cacheWrite) ? raw.cost.cacheWrite : null,
-    costTotal: Number.isFinite(raw.cost.total) ? raw.cost.total : null,
-  };
-  const reported = [values.input, values.output, values.cacheRead, values.cacheWrite, values.totalTokens]
-    .some((value) => value !== null && value > 0);
-  const known = reported && facts.complete;
-  const costKnown = known && canVerifyCost && values.costTotal !== null;
-  const usage: UsageRecord = {
-    version: 1,
-    source: known ? 'sdk' : 'unknown',
-    reason: known ? null : facts.requestStarted ? 'sdk-zero-or-missing-presence-proof' : 'request-not-started',
-    sdkValues: known ? values : (facts.requestStarted ? values : null),
-    attempts: facts.attempts > 0 ? facts.attempts : null,
-    attemptsComplete: facts.complete,
-    costSource: costKnown ? 'pi-sdk-model-catalog-estimate' : null,
-    updatedAt: new Date().toISOString(),
-  };
-  const tokens: TokenColumns = {
-    inputTokens: known ? values.input : null,
-    outputTokens: known ? values.output : null,
-    totalTokens: known ? values.totalTokens : null,
-    cost: costKnown ? String(values.costTotal) : null,
-    usageComplete: known,
-  };
-  return { usage, tokens };
 }
 
 function mapPiFailure(
@@ -213,87 +118,9 @@ export class PiProviderAdapter implements ProviderPort {
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
   ): Promise<Result<PreparedProvider>> {
-    let runtime: ModelRuntime;
-    try {
-      runtime = await ModelRuntime.create({
-        credentials: this.dependencies.credentials,
-        authPath: config.native.authPath,
-        modelsPath: config.native.modelsPath,
-        modelsStore: new InMemoryModelsStore(),
-        allowModelNetwork: false,
-        refreshOnCreate: false,
-        signal,
-      });
-    } catch {
-      return fail(appError('provider_runtime_init_failed', 'provider', 'Provider Runtime 初始化失败.', true));
-    }
-    const runtimeError = runtime.getError();
-    if (runtimeError) {
-      return fail(appError('provider_runtime_init_failed', 'provider', 'Provider Runtime 配置失败。', true));
-    }
-    const runtimeApiKey = this.dependencies.runtimeApiKeyFor?.(config)
-      ?? this.dependencies.runtimeApiKey
-      ?? (config.modelRef.provider === 'flowmate-env' ? process.env.FLOWMATE_LLM_API_KEY : undefined);
-    // Never infer a gateway alias or reuse limits based only on a matching model name.
-    const candidates = config.connection ? runtime.getModels().filter((item) =>
-      item.id === config.modelRef.model && item.api === config.connection!.api
-      && safeUrl(item.baseUrl)?.replace(/\/$/, '') === safeUrl(config.connection!.baseUrl)?.replace(/\/$/, '')) : [];
-    const catalogModel = config.connection
-      ? (candidates.length === 1 ? candidates[0] : undefined)
-      : runtime.getModel(config.modelRef.provider, config.modelRef.model);
-    const modelMaxTokens = catalogModel && Number.isSafeInteger(catalogModel.maxTokens) && catalogModel.maxTokens > 0
-      ? catalogModel.maxTokens : null;
-    try {
-      if (config.connection) {
-        runtime.registerProvider(config.modelRef.provider, {
-          baseUrl: config.connection.baseUrl,
-          api: config.connection.api,
-          models: [{
-            id: config.modelRef.model,
-            name: config.modelRef.model,
-            input: ['text'],
-            reasoning: catalogModel?.reasoning ?? false,
-            // Zero disables Pi's context estimate when the service limit is unknown.
-            contextWindow: catalogModel?.contextWindow ?? 0,
-            maxTokens: modelMaxTokens ?? piCustomModelMaxTokens,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          }],
-        });
-      }
-      if (runtimeApiKey) {
-        await runtime.setRuntimeApiKey(config.modelRef.provider, runtimeApiKey, { signal });
-      }
-    } catch {
-      return fail(appError('provider_runtime_init_failed', 'provider', 'Provider Runtime 配置失败。', true));
-    }
-    const model = runtime.getModel(config.modelRef.provider, config.modelRef.model);
-    if (!model) {
-      return fail(appError('provider_model_not_found', 'provider', '请求的模型不存在。'));
-    }
-    try {
-      const auth = await runtime.getAuth(model, { signal });
-      if (!auth) return fail(appError('provider_auth_failed', 'provider', 'Provider 认证未配置。'));
-    } catch (error) {
-      if (classifyAuthError(error)) return fail(appError('provider_auth_failed', 'provider', 'Provider 认证失败。'));
-      return fail(appError('provider_auth_failed', 'provider', 'Provider 认证不可用。', true));
-    }
-
-    const snapshot: SafeConfigSnapshot = {
-      version: 1,
-      name: config.name,
-      revision: config.revision,
-      requestedModel: config.modelRef,
-      resolvedModel: { provider: model.provider, model: model.id },
-      api: model.api,
-      endpoint: safeUrl(model.baseUrl),
-      sdk: { codingAgent: codingAgentVersion, ai: aiVersion },
-      parameters: config.parameters,
-      limits,
-      native: {
-        authSource: runtimeApiKey ? 'pi-runtime-api-key' : 'pi-native',
-        modelsSelection: config.native.modelsPath,
-      },
-    };
+    const prepared = await prepareModelRuntime(config, limits, signal, this.dependencies);
+    if (!prepared.ok) return prepared;
+    const { runtime, model, snapshot } = prepared.data;
 
     return ok({
       snapshot,

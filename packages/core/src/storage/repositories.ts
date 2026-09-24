@@ -1,18 +1,25 @@
 import type { Database } from 'bun:sqlite';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
+  AgentRunSnapshot,
   AppError,
+  ChatScope,
   CleanupRecord,
   DbId,
   InputRecord,
   OutputRecord,
   Result,
   RunSnapshot,
+  SessionCursor,
+  NormalizedListSessionsRequest,
+  NormalizedSessionRunsRequest,
+  SessionStatus,
   SafeConfigSnapshot,
   SdkUsageValues,
   TokenColumns,
   UsageRecord,
 } from '@flowmate/contracts';
+import type { AgentConfigFacts, AgentFacts } from '@flowmate/contracts';
 
 export type NewProviderRun = {
   goal: string;
@@ -23,9 +30,34 @@ export type NewProviderRun = {
   createdAt: string;
 };
 
+export type NewAgentRun = Omit<NewProviderRun, 'config'> & {
+  config: SafeConfigSnapshot & { agent: AgentConfigFacts };
+  sessionId: DbId;
+  scope: ChatScope;
+};
+
+export type SessionRow = {
+  sessionId: DbId;
+  nativeSessionId: string;
+  title: string;
+  status: SessionStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type NewSession = { nativeSessionId: string; title: string; at: string };
+
+export type AgentOutputRecord = OutputRecord & { agent: AgentFacts };
+
+export interface SessionRepository {
+  create(input: NewSession): Result<SessionRow>;
+  get(sessionId: DbId): Result<SessionRow>;
+  list(request: NormalizedListSessionsRequest): Result<{ items: SessionRow[]; next: SessionCursor | null }>;
+}
+
 export type TerminalWrite = {
   status: 'completed' | 'failed' | 'cancelled';
-  output: OutputRecord | null;
+  output: OutputRecord | AgentOutputRecord | null;
   error: AppError | null;
   usage: UsageRecord;
   tokens: TokenColumns;
@@ -33,10 +65,13 @@ export type TerminalWrite = {
   endedAt: string;
   stoppedAt: string | null;
   durationMs: number | null;
+  cancelRequestedAt?: string;
 };
 
 export interface RunRepository {
   create(input: NewProviderRun): Result<DbId>;
+  createAgent(input: NewAgentRun): Result<DbId>;
+  listBySession(request: NormalizedSessionRunsRequest): Result<{ items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null }>;
   start(runId: DbId, config: SafeConfigSnapshot, startedAt: string): Result<void>;
   recordCancel(runId: DbId, requestedAt: string): Result<boolean>;
   finish(runId: DbId, terminal: TerminalWrite): Result<boolean>;
@@ -47,7 +82,9 @@ export interface RunRepository {
 
 type RunRow = {
   id: number;
-  kind: 'provider';
+  kind: 'provider' | 'agent';
+  session_id: number | null;
+  scope_json: string | null;
   status: RunSnapshot['status'];
   goal: string;
   input_json: string;
@@ -120,7 +157,23 @@ function validatedInput(value: unknown): Record<string, unknown> {
   return record;
 }
 
-function validatedConfig(value: unknown): Record<string, unknown> {
+function validatedAgentConfig(value: unknown): Record<string, unknown> {
+  const agent = object(value, 'config_agent');
+  if (agent.policyVersion !== 'p2-invoice-chat-v1'
+    || typeof agent.nativeSessionId !== 'string' || agent.nativeSessionId.length < 1 || agent.nativeSessionId.length > 128
+    || typeof agent.systemPrompt !== 'string'
+    || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(String(agent.thinkingLevel))
+    || agent.resourcePolicy !== 'none'
+    || agent.historyPolicy !== 'memory-only'
+    || agent.maxContextBytes !== 524_288
+    || agent.maxOutputBytes !== 262_144
+    || agent.maxAssistantContentBytes !== 524_288
+    || agent.maxModelCalls !== 1
+    || agent.sessionRetry !== false) throw new Error('invalid_agent_config_shape');
+  return agent;
+}
+
+function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
   const record = versioned(value, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
   if (typeof record.name !== 'string' || !Number.isSafeInteger(record.revision) || Number(record.revision) <= 0) throw new Error('invalid_config_shape');
   const model = (candidate: unknown, label: string) => {
@@ -135,13 +188,36 @@ function validatedConfig(value: unknown): Record<string, unknown> {
   object(record.limits, 'config_limits');
   object(record.native, 'config_native');
   if (record.outputBudget !== undefined) versioned(record.outputBudget, 'outputBudget', ['policy', 'selectedMaxTokens', 'source']);
+  if (kind === 'agent') validatedAgentConfig(record.agent);
+  else if (record.agent !== undefined) throw new Error('unexpected_provider_agent_config');
   return record;
 }
 
-function validatedOutput(value: unknown): Record<string, unknown> {
+function validatedAgentFacts(value: unknown): Record<string, unknown> {
+  const agent = object(value, 'output_agent');
+  if (typeof agent.nativeSessionId !== 'string' || agent.nativeSessionId.length < 1 || agent.nativeSessionId.length > 128
+    || !Number.isSafeInteger(agent.turnCount) || Number(agent.turnCount) < 0
+    || !Number.isSafeInteger(agent.modelCallCount) || Number(agent.modelCallCount) < 0) throw new Error('invalid_agent_output_shape');
+  return agent;
+}
+
+function validatedScope(value: unknown): ChatScope {
+  const record = object(value, 'scope');
+  if (record.version !== 1 || record.mode !== 'chat-text'
+    || !Array.isArray(record.toolNames) || record.toolNames.length !== 0
+    || !Array.isArray(record.resourcePaths) || record.resourcePaths.length !== 0
+    || Object.keys(record).some((key) => !['version', 'mode', 'toolNames', 'resourcePaths'].includes(key))) {
+    throw new Error('invalid_agent_scope_shape');
+  }
+  return record as unknown as ChatScope;
+}
+
+function validatedOutput(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
   const record = versioned(value, 'output', ['text', 'partial', 'stopReason', 'responseId', 'responseModel']);
   if (typeof record.text !== 'string' || typeof record.partial !== 'boolean' || typeof record.stopReason !== 'string'
     || (record.wireMaxTokens !== undefined && record.wireMaxTokens !== null && (!Number.isSafeInteger(record.wireMaxTokens) || Number(record.wireMaxTokens) < 1))) throw new Error('invalid_output_shape');
+  if (kind === 'agent') validatedAgentFacts(record.agent);
+  else if (record.agent !== undefined) throw new Error('unexpected_provider_agent_output');
   return record;
 }
 
@@ -168,6 +244,71 @@ function validatedCleanup(value: unknown): CleanupRecord {
 function validatedError(value: unknown): AppError | null {
   if (value === null) return null;
   return validAppError(value, 'error', true);
+}
+
+function sessionRow(value: unknown): SessionRow {
+  const row = value as {
+    id: number; native_session_id: string; title: string; status: string; created_at: string; updated_at: string;
+  } | null;
+  if (!row || !Number.isSafeInteger(row.id) || row.id <= 0
+    || typeof row.native_session_id !== 'string' || row.native_session_id.length < 1 || row.native_session_id.length > 128
+    || typeof row.title !== 'string' || row.title.trim().length < 1 || [...row.title].length > 120
+    || !['active', 'archived'].includes(row.status)
+    || typeof row.created_at !== 'string' || typeof row.updated_at !== 'string') throw new Error('invalid_session_row');
+  return {
+    sessionId: row.id,
+    nativeSessionId: row.native_session_id,
+    title: row.title,
+    status: row.status as SessionRow['status'],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function snapshotFromRow(row: RunRow): RunSnapshot {
+  const output = row.output_json === null ? null : validatedOutput(readJson(row.output_json, 'output'), row.kind);
+  const error = validatedError(readJson(row.error_json ?? 'null', 'error'));
+  const input = validatedInput(readJson(row.input_json, 'input'));
+  const config = validatedConfig(readJson(row.config_json, 'config'), row.kind);
+  const usage = validatedUsage(readJson(row.usage_json, 'usage'));
+  const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
+  const base = {
+    runId: row.id,
+    status: row.status,
+    input,
+    config,
+    output,
+    usage,
+    tokens: {
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      totalTokens: row.total_tokens,
+      cost: row.cost,
+      usageComplete: row.usage_complete === 1,
+    },
+    durationMs: row.duration_ms,
+    toolCallCount: row.tool_call_count,
+    error,
+    cleanup,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    cancelRequestedAt: row.cancel_requested_at,
+    stoppedAt: row.stopped_at,
+  };
+  if (row.kind === 'provider') {
+    if (row.session_id !== null || row.scope_json !== null) throw new Error('invalid_provider_session_reference');
+    return { ...base, kind: 'provider', sessionId: null, scope: null };
+  }
+  if (!Number.isSafeInteger(row.session_id) || Number(row.session_id) <= 0 || row.scope_json === null) {
+    throw new Error('invalid_agent_session_reference');
+  }
+  return {
+    ...base,
+    kind: 'agent',
+    sessionId: Number(row.session_id),
+    scope: validatedScope(readJson(row.scope_json, 'scope')),
+  };
 }
 
 const usageKeys: readonly (keyof SdkUsageValues)[] = [
@@ -219,6 +360,51 @@ function transaction<T>(db: Database, fn: () => T): Result<T> {
   }
 }
 
+export function createSessionRepository(db: Database): SessionRepository {
+  return {
+    create(input) {
+      return transaction(db, () => {
+        const result = db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at) VALUES (?,?,?,?)')
+          .run(input.nativeSessionId, input.title, input.at, input.at);
+        const id = Number(result.lastInsertRowid);
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_session_id');
+        return sessionRow(db.query('SELECT * FROM sessions WHERE id=?').get(id));
+      });
+    },
+
+    get(sessionId) {
+      try {
+        const row = db.query('SELECT * FROM sessions WHERE id=?').get(sessionId);
+        if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+        return ok(sessionRow(row));
+      } catch {
+        return fail(appError('storage_corrupt', 'storage', 'Session 事实无法读取。'));
+      }
+    },
+
+    list(request) {
+      try {
+        const rows = request.before
+          ? db.query(`SELECT * FROM sessions
+              WHERE updated_at < ? OR (updated_at = ? AND id < ?)
+              ORDER BY updated_at DESC,id DESC LIMIT ?`)
+            .all(request.before.updatedAt, request.before.updatedAt, request.before.sessionId, request.limit + 1)
+          : db.query('SELECT * FROM sessions ORDER BY updated_at DESC,id DESC LIMIT ?').all(request.limit + 1);
+        const mapped = (rows as unknown[]).map(sessionRow);
+        const hasMore = mapped.length > request.limit;
+        const items = hasMore ? mapped.slice(0, request.limit) : mapped;
+        const last = items.at(-1);
+        return ok({
+          items,
+          next: hasMore && last ? { updatedAt: last.updatedAt, sessionId: last.sessionId } : null,
+        });
+      } catch {
+        return fail(appError('storage_corrupt', 'storage', 'Session 列表无法读取。'));
+      }
+    },
+  };
+}
+
 export function createRunRepository(db: Database): RunRepository {
   return {
     create(input) {
@@ -226,8 +412,8 @@ export function createRunRepository(db: Database): RunRepository {
         const inserted = db
           .query(
             `INSERT INTO runs
-              (kind,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
-             VALUES ('provider','created',?,?,?,?,?,?)`,
+              (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+             VALUES ('provider',NULL,NULL,'created',?,?,?,?,?,?)`,
           )
           .run(input.goal, asJson(input.input), asJson(input.config), asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const id = Number(inserted.lastInsertRowid);
@@ -235,6 +421,25 @@ export function createRunRepository(db: Database): RunRepository {
         return id;
       });
       return result;
+    },
+
+    createAgent(input) {
+      const created = transaction(db, () => {
+        const session = db.query('SELECT status FROM sessions WHERE id=?').get(input.sessionId) as { status: string } | null;
+        if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+        if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
+        validatedScope(input.scope);
+        const inserted = db.query(`INSERT INTO runs
+          (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+          VALUES ('agent',?,?,'created',?,?,?,?,?,?)`)
+          .run(input.sessionId, asJson(input.scope), input.goal, asJson(input.input), asJson(input.config),
+            asJson(input.cleanup), asJson(input.usage), input.createdAt);
+        const id = Number(inserted.lastInsertRowid);
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_run_id');
+        db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(input.createdAt, input.sessionId);
+        return ok(id);
+      });
+      return created.ok ? created.data : created;
     },
 
     start(runId, config, startedAt) {
@@ -263,12 +468,14 @@ export function createRunRepository(db: Database): RunRepository {
 
     finish(runId, terminal) {
       const result = transaction(db, () => {
+        const active = db.query("SELECT kind,session_id FROM runs WHERE id=? AND status IN ('created','running')")
+          .get(runId) as { kind: 'provider' | 'agent'; session_id: number | null } | null;
         const changed = db
           .query(
             `UPDATE runs SET
               status=?, output_json=?, error_json=?, cleanup_json=?, usage_json=?,
               input_tokens=?, output_tokens=?, total_tokens=?, cost=?, usage_complete=?,
-              duration_ms=?, ended_at=?, stopped_at=?
+              duration_ms=?, cancel_requested_at=COALESCE(cancel_requested_at,?), ended_at=?, stopped_at=?
              WHERE id=? AND status IN ('created','running')`,
           )
           .run(
@@ -283,10 +490,14 @@ export function createRunRepository(db: Database): RunRepository {
             terminal.tokens.cost,
             terminal.tokens.usageComplete ? 1 : 0,
             terminal.durationMs,
+            terminal.cancelRequestedAt ?? null,
             terminal.endedAt,
             terminal.stoppedAt,
             runId,
           ).changes;
+        if (changed === 1 && active?.kind === 'agent' && active.session_id !== null) {
+          db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(terminal.endedAt, active.session_id);
+        }
         return changed === 1;
       });
       return result.ok ? result : { ...result, ...(result.error && runId !== undefined ? { runId } : {}) };
@@ -296,39 +507,27 @@ export function createRunRepository(db: Database): RunRepository {
       try {
         const row = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (!row) return fail(appError('run_not_found', 'input', 'Run 不存在。', false, runId));
-        const output = row.output_json === null ? null : validatedOutput(readJson(row.output_json, 'output'));
-        const error = validatedError(readJson(row.error_json ?? 'null', 'error'));
-        const input = validatedInput(readJson(row.input_json, 'input'));
-        const config = validatedConfig(readJson(row.config_json, 'config'));
-        const usage = validatedUsage(readJson(row.usage_json, 'usage'));
-        const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
-        return ok({
-          runId: row.id,
-          kind: row.kind,
-          status: row.status,
-          input,
-          config,
-          output: output as Record<string, unknown> | null,
-          usage,
-          tokens: {
-            inputTokens: row.input_tokens,
-            outputTokens: row.output_tokens,
-            totalTokens: row.total_tokens,
-            cost: row.cost,
-            usageComplete: row.usage_complete === 1,
-          },
-          durationMs: row.duration_ms,
-          toolCallCount: row.tool_call_count,
-          error,
-          cleanup,
-          createdAt: row.created_at,
-          startedAt: row.started_at,
-          endedAt: row.ended_at,
-          cancelRequestedAt: row.cancel_requested_at,
-          stoppedAt: row.stopped_at,
-        });
+        return ok(snapshotFromRow(row));
       } catch {
         return fail(appError('storage_corrupt', 'storage', 'Run 事实无法读取。', false, runId));
+      }
+    },
+
+    listBySession(request) {
+      try {
+        const session = db.query('SELECT id FROM sessions WHERE id=?').get(request.sessionId);
+        if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+        const rows = request.beforeRunId === undefined
+          ? db.query("SELECT * FROM runs WHERE session_id=? AND kind='agent' ORDER BY id DESC LIMIT ?")
+            .all(request.sessionId, request.limit + 1)
+          : db.query("SELECT * FROM runs WHERE session_id=? AND kind='agent' AND id<? ORDER BY id DESC LIMIT ?")
+            .all(request.sessionId, request.beforeRunId, request.limit + 1);
+        const mapped = (rows as RunRow[]).map((row) => snapshotFromRow(row) as AgentRunSnapshot);
+        const hasMore = mapped.length > request.limit;
+        const items = hasMore ? mapped.slice(0, request.limit) : mapped;
+        return ok({ items, nextBeforeRunId: hasMore ? items.at(-1)?.runId ?? null : null });
+      } catch {
+        return fail(appError('storage_corrupt', 'storage', 'Session Run 列表无法读取。'));
       }
     },
 

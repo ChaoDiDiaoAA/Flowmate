@@ -7,7 +7,7 @@ function app(): Application {
     callProvider: mock(),
     queryRun: mock(async () => ({ ok: true as const, data: { runId: 4, status: 'failed' } as never })),
     close: mock(async () => ({ ok: true as const, data: { stopped: true, closed: true, errors: [] } })),
-  };
+  } as unknown as Application;
 }
 
 describe('CLI main dispatch', () => {
