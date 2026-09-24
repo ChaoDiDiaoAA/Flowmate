@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import type { DesktopEvent, DesktopState, ModelProfile, ProductSettings, RunSnapshot, SessionSnapshot } from '@flowmate/contracts';
+import type { AgentRunEvent, AgentRunSnapshot, DesktopEvent, DesktopState, ModelProfile, ProductSettings, PromptTraceResult, RunSnapshot, SessionCursor, SessionSnapshot } from '@flowmate/contracts';
 
 type Page = 'model' | 'profile';
 type Notice = { tone: 'good' | 'bad' | 'info'; message: string } | null;
 type ProfileDraft = { displayName: string; theme: 'system' | 'light' | 'dark' };
 type ChatTurn = {
   id: string;
+  sessionId: number;
   runId: number | null;
   prompt: string;
   response: string | null;
@@ -40,15 +41,21 @@ export function App() {
   const [goal, setGoal] = useState('Answer the user clearly and directly.');
   const [text, setText] = useState('');
   const [chatInput, setChatInput] = useState('');
+  const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [sessions, setSessions] = useState<SessionSnapshot[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
-  const [chatTurnsBySession, setChatTurnsBySession] = useState<Record<number, ChatTurn[]>>({});
+  const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
+  const [activeAgentRunId, setActiveAgentRunId] = useState<number | null>(null);
+  const [activeAgentSessionId, setActiveAgentSessionId] = useState<number | null>(null);
+  const [activeRunModel, setActiveRunModel] = useState<{ id: string; name: string; model: string } | null>(null);
+  const [sessionCursor, setSessionCursor] = useState<SessionCursor | null>(null);
+  const [runCursor, setRunCursor] = useState<number | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(false);
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const [run, setRun] = useState<RunSnapshot | null>(null);
+  const [promptTrace, setPromptTrace] = useState<PromptTraceResult | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
-  const [activeAgentRunId, setActiveAgentRunId] = useState<number | null>(null);
-  const [activeRunModel, setActiveRunModel] = useState<{ id: string; name: string; model: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -56,13 +63,81 @@ export function App() {
   const latestFinished = useRef<Extract<DesktopEvent, { type: 'provider_finished' }> | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
   const activeChatTurnId = useRef<string | null>(null);
-  const activeAgentRequestId = useRef<string | null>(null);
+  const activeChatSessionId = useRef<number | null>(null);
   const activeAgentRunIdRef = useRef<number | null>(null);
-  const activeAgentSessionId = useRef<number | null>(null);
   const agentStopRequested = useRef(false);
   const selectedSessionIdRef = useRef<number | null>(null);
+  const sessionCursorRef = useRef<SessionCursor | null>(null);
+  const sessionLoadSequence = useRef(0);
+  const latestAgentFinished = useRef(new Map<number, Extract<AgentRunEvent, { type: 'run_finished' }>>());
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
   const revisionLoaded = useRef<number | null>(null);
+
+  async function loadSessionList(append = false) {
+    const before = append ? sessionCursorRef.current : null;
+    const result = await window.flowmate.listSessions({ limit: 100, ...(before ? { before } : {}) });
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    sessionCursorRef.current = result.data.next;
+    setSessionCursor(result.data.next);
+    setSessions((current) => append ? [...current, ...result.data.items] : result.data.items);
+    if (selectedSessionIdRef.current === null && result.data.items[0]) selectSession(result.data.items[0].sessionId);
+  }
+
+  async function loadSession(sessionId: number) {
+    const sequence = ++sessionLoadSequence.current;
+    const [sessionResult, runsResult] = await Promise.all([
+      window.flowmate.querySession(sessionId),
+      window.flowmate.listSessionRuns({ sessionId, limit: 100 }),
+    ]);
+    if (sequence !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
+    if (!sessionResult.ok) { setNotice({ tone: 'bad', message: errorMessage(sessionResult) }); return; }
+    if (!runsResult.ok) { setNotice({ tone: 'bad', message: errorMessage(runsResult) }); return; }
+    setSelectedSession(sessionResult.data);
+    setRunCursor(runsResult.data.nextBeforeRunId);
+    setChatTurns(runsResult.data.items.slice().reverse().map(turnFromRun));
+  }
+
+  function selectSession(sessionId: number) {
+    selectedSessionIdRef.current = sessionId;
+    setSelectedSessionId(sessionId);
+    setSelectedSession(null);
+    setRunCursor(null);
+    setChatTurns([]);
+    setNotice(null);
+    void loadSession(sessionId);
+  }
+
+  async function createNewSession() {
+    if (!state?.ready || sessionLoading) return;
+    setSessionLoading(true);
+    const created = await window.flowmate.createSession();
+    setSessionLoading(false);
+    if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return; }
+    const session = created.data;
+    selectedSessionIdRef.current = session.sessionId;
+    setSelectedSessionId(session.sessionId);
+    setSelectedSession(session);
+    setChatTurns([]);
+    setChatInput('');
+    setRunCursor(null);
+    setNotice(null);
+    setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
+    void loadSessionList();
+  }
+
+  async function loadMoreSessions() {
+    if (sessionCursorRef.current) await loadSessionList(true);
+  }
+
+  async function loadOlderRuns() {
+    const sessionId = selectedSessionIdRef.current;
+    const beforeRunId = runCursor;
+    if (sessionId === null || beforeRunId === null) return;
+    const result = await window.flowmate.listSessionRuns({ sessionId, beforeRunId, limit: 100 });
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    setRunCursor(result.data.nextBeforeRunId);
+    setChatTurns((current) => [...result.data.items.slice().reverse().map(turnFromRun), ...current]);
+  }
 
   useEffect(() => {
     let alive = true;
@@ -72,14 +147,50 @@ export function App() {
       else if (alive) setNotice({ tone: 'bad', message: errorMessage(result) });
     };
     void refresh();
-    void loadSessions(true).then(() => {
-      const sessionId = selectedSessionIdRef.current;
-      if (sessionId !== null) void loadSessionRuns(sessionId);
-    });
     const unsubscribe = window.flowmate.subscribe((event) => {
       if (!alive) return;
       if (event.type === 'host_state') {
         setState(event.state);
+        return;
+      }
+      if (event.type === 'run_progress') {
+        activeAgentRunIdRef.current = event.runId;
+        activeChatSessionId.current = event.sessionId;
+        setActiveAgentRunId(event.runId);
+        setActiveAgentSessionId(event.sessionId);
+        setBusy(true);
+        if (event.phase === 'created' && selectedSessionIdRef.current === event.sessionId) {
+          setRunId(event.runId);
+          const turnId = activeChatTurnId.current;
+          if (turnId) setChatTurns((turns) => turns.map((turn) => turn.id === turnId ? { ...turn, runId: event.runId } : turn));
+        }
+        if (agentStopRequested.current) {
+          agentStopRequested.current = false;
+          void requestAgentCancellation(event.runId);
+        }
+        return;
+      }
+      if (event.type === 'run_finished') {
+        latestAgentFinished.current.set(event.runId, event);
+        if (selectedSessionIdRef.current === event.sessionId) {
+          setRunId(event.runId);
+          const turnId = activeChatTurnId.current;
+          if (turnId) applyAgentFinish(event, turnId);
+          void loadSession(event.sessionId);
+        }
+        void loadSessionList();
+        void loadRun(event.runId);
+        if (activeAgentRunIdRef.current === event.runId) {
+          activeAgentRunIdRef.current = null;
+          activeChatSessionId.current = null;
+          activeChatTurnId.current = null;
+          setActiveAgentRunId(null);
+          setActiveAgentSessionId(null);
+          setActiveRunModel(null);
+          agentStopRequested.current = false;
+          setBusy(false);
+          setCancelPending(false);
+        }
         return;
       }
       if (event.type === 'provider_observation') {
@@ -95,50 +206,22 @@ export function App() {
         setCancelPending(false);
         if (activeRequestIdRef.current === event.requestId) {
           activeRequestIdRef.current = null;
-          activeChatTurnId.current = null;
           setActiveRequestId(null);
         }
         void loadRun(event.runId);
-        return;
-      }
-      if (event.type === 'agent_observation') {
-        if (activeAgentRequestId.current === event.requestId && event.event.type === 'run_progress') {
-          if (event.event.phase === 'created') {
-            activeAgentRunIdRef.current = event.event.runId;
-            setActiveAgentRunId(event.event.runId);
-            setRunId(event.event.runId);
-          } else if (event.event.phase === 'stopping') setCancelPending(true);
-        }
-        return;
-      }
-      if (event.type === 'agent_finished') {
-        const detail = event.event;
-        if (activeAgentRequestId.current === event.requestId) {
-          const turnId = activeChatTurnId.current;
-          if (turnId) applyChatFinish(event, turnId, detail.sessionId);
-          activeAgentRequestId.current = null;
-          activeAgentRunIdRef.current = null;
-          activeAgentSessionId.current = null;
-          agentStopRequested.current = false;
-          activeChatTurnId.current = null;
-          setActiveAgentRunId(null);
-          setActiveRunModel(null);
-          setBusy(false);
-          setCancelPending(false);
-        }
-        setRunId(detail.runId);
-        void loadRun(detail.runId);
-        void loadSessionRuns(detail.sessionId);
-        void loadSessions(false);
       }
     });
     return () => { alive = false; unsubscribe(); };
   }, []);
 
   useEffect(() => {
+    if (state?.ready) void loadSessionList();
+  }, [state?.ready]);
+
+  useEffect(() => {
     const transcript = chatTranscriptRef.current;
     if (transcript) transcript.scrollTop = transcript.scrollHeight;
-  }, [selectedSessionId, chatTurnsBySession]);
+  }, [chatTurns]);
 
   useEffect(() => {
     if (!state) return;
@@ -159,13 +242,11 @@ export function App() {
   }, [state]);
 
   const persistedModel = state?.settings.models.find((item) => item.id === selectedModelId) ?? null;
-  const selectedSession = sessions.find((item) => item.sessionId === selectedSessionId) ?? null;
-  const chatTurns = selectedSessionId === null ? [] : chatTurnsBySession[selectedSessionId] ?? [];
   const credentialStatus = selectedModelId ? (state?.modelCredentials[selectedModelId] ?? 'missing') : 'missing';
   const isDraftSaved = persistedModel !== null && modelFieldsEqual(draft, persistedModel);
+  const modelReady = Boolean(state?.ready && persistedModel && isDraftSaved && credentialStatus === 'configured');
   const canTest = Boolean(state?.ready && persistedModel && isDraftSaved && credentialStatus === 'configured' && !busy && !saving);
-  const canChat = Boolean(state?.ready && persistedModel && credentialStatus === 'configured' && !saving && !busy
-    && selectedSession?.availability === 'ready');
+  const canChat = Boolean(modelReady && !saving && !busy && selectedSession?.availability === 'ready');
   const savedModels = state?.settings.models ?? [];
   const modelLabel = useMemo(() => draft.model.trim() || 'No model selected', [draft.model]);
 
@@ -243,120 +324,114 @@ export function App() {
     await loadRun(accepted.data.runId);
   }
 
-  async function loadSessions(createIfEmpty: boolean) {
-    const result = await window.flowmate.listSessions({ limit: 100 });
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-    let items = result.data.items;
-    if (items.length === 0 && createIfEmpty) {
-      const created = await window.flowmate.createSession();
-      if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return; }
-      items = [created.data];
-    }
-    setSessions(items);
-    const current = selectedSessionIdRef.current;
-    const next = current !== null && items.some((session) => session.sessionId === current)
-      ? current : items[0]?.sessionId ?? null;
-    selectedSessionIdRef.current = next;
-    setSelectedSessionId(next);
-  }
-
-  async function loadSessionRuns(sessionId: number) {
-    const result = await window.flowmate.listSessionRuns({ sessionId, limit: 100 });
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-    const turns = result.data.items.slice().reverse().map((run): ChatTurn => {
-      const input = run.input as { text?: unknown };
-      const output = run.output as { text?: unknown } | null;
-      return {
-        id: String(run.runId), runId: run.runId,
-        prompt: typeof input.text === 'string' ? input.text : '(message unavailable)',
-        response: typeof output?.text === 'string' && output.text ? output.text : null,
-        error: run.error?.message ?? null,
-        status: run.status === 'completed' ? 'completed' : run.status === 'cancelled' ? 'cancelled' : run.status === 'created' || run.status === 'running' ? 'sending' : 'failed',
-      };
-    });
-    setChatTurnsBySession((previous) => ({ ...previous, [sessionId]: turns }));
-  }
-
-  async function createChatSession() {
-    const created = await window.flowmate.createSession();
-    if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return; }
-    setSessions((previous) => [created.data, ...previous.filter((session) => session.sessionId !== created.data.sessionId)]);
-    selectedSessionIdRef.current = created.data.sessionId;
-    setSelectedSessionId(created.data.sessionId);
-    setChatTurnsBySession((previous) => ({ ...previous, [created.data.sessionId]: [] }));
-    setChatInput('');
-    setNotice(null);
-  }
-
-  function selectChatSession(sessionId: number) {
-    selectedSessionIdRef.current = sessionId;
-    setSelectedSessionId(sessionId);
-    setChatInput('');
-    if (chatTurnsBySession[sessionId] === undefined) void loadSessionRuns(sessionId);
-  }
-
   async function sendChatMessage() {
     const prompt = chatInput.trim();
     const sessionId = selectedSessionId;
     const model = persistedModel;
-    if (!canChat || !sessionId || !selectedModelId || !model || !prompt) return;
+    if (!canChat || !selectedModelId || !model || sessionId === null || !prompt) return;
     const turnId = newId();
-    const requestId = newId();
-    const newTurn: ChatTurn = { id: turnId, runId: null, prompt, response: null, error: null, status: 'sending' };
+    const newTurn: ChatTurn = { id: turnId, sessionId, runId: null, prompt, response: null, error: null, status: 'sending' };
     activeChatTurnId.current = turnId;
-    activeAgentRequestId.current = requestId;
+    activeChatSessionId.current = sessionId;
     activeAgentRunIdRef.current = null;
-    activeAgentSessionId.current = sessionId;
     agentStopRequested.current = false;
     setActiveRunModel({ id: model.id, name: model.name, model: model.model });
     setChatInput('');
-    setChatTurnsBySession((previous) => ({ ...previous, [sessionId]: [...(previous[sessionId] ?? []), newTurn].slice(-100) }));
+    setChatTurns((turns) => [...turns, newTurn]);
     setBusy(true);
     setCancelPending(false);
     setNotice(null);
-    const accepted = await window.flowmate.startAgentRun({ requestId, sessionId, text: prompt, modelId: selectedModelId });
+    const accepted = await window.flowmate.startRun({
+      sessionId,
+      text: prompt,
+      modelId: model.id,
+    });
     if (!accepted.ok) {
-      if (activeAgentRequestId.current === requestId) {
-        setBusy(false);
-        activeAgentRequestId.current = null;
-        activeAgentSessionId.current = null;
-        agentStopRequested.current = false;
-        activeChatTurnId.current = null;
-        setActiveRunModel(null);
-      }
-      setChatTurnsBySession((previous) => ({ ...previous, [sessionId]: (previous[sessionId] ?? []).map((turn) => turn.id === turnId
+      setChatTurns((turns) => turns.map((turn) => turn.id === turnId
         ? { ...turn, status: 'failed', error: errorMessage(accepted) }
-        : turn) }));
+        : turn));
+      if (activeAgentRunIdRef.current === null) {
+        setBusy(false);
+        activeChatTurnId.current = null;
+        activeChatSessionId.current = null;
+        setActiveRunModel(null);
+        agentStopRequested.current = false;
+      }
       return;
     }
-    if (activeAgentRequestId.current === requestId) {
+    const finished = latestAgentFinished.current.get(accepted.data.runId);
+    if (!finished) {
       activeAgentRunIdRef.current = accepted.data.runId;
+      activeChatSessionId.current = sessionId;
       setActiveAgentRunId(accepted.data.runId);
+      setActiveAgentSessionId(sessionId);
+      setBusy(true);
       if (agentStopRequested.current) {
         agentStopRequested.current = false;
         void requestAgentCancellation(accepted.data.runId);
       }
     }
     setRunId(accepted.data.runId);
-    setChatTurnsBySession((previous) => ({ ...previous, [sessionId]: (previous[sessionId] ?? []).map((turn) => turn.id === turnId
+    setChatTurns((turns) => turns.map((turn) => turn.id === turnId
       ? { ...turn, runId: accepted.data.runId }
-      : turn) }));
+      : turn));
+    if (finished) {
+      setBusy(false);
+      setCancelPending(false);
+      activeAgentRunIdRef.current = null;
+      activeChatSessionId.current = null;
+      setActiveAgentRunId(null);
+      setActiveAgentSessionId(null);
+      setActiveRunModel(null);
+      agentStopRequested.current = false;
+      activeChatTurnId.current = null;
+      applyAgentFinish(finished, turnId);
+    }
     await loadRun(accepted.data.runId);
   }
 
-  function applyChatFinish(event: Extract<DesktopEvent, { type: 'agent_finished' }>, turnId: string, sessionId: number) {
-    const result = event.event.result;
-    if (!result.ok) {
-      setChatTurnsBySession((previous) => ({ ...previous, [sessionId]: (previous[sessionId] ?? []).map((turn) => turn.id === turnId
-        ? { ...turn, runId: event.event.runId, status: 'failed', error: errorMessage(result) }
-        : turn) }));
+  function applyAgentFinish(event: Extract<AgentRunEvent, { type: 'run_finished' }>, turnId: string) {
+    if (!event.result.ok) {
+      setChatTurns((turns) => turns.map((turn) => turn.id === turnId
+        ? { ...turn, runId: event.runId, status: 'failed', error: errorMessage(event.result) }
+        : turn));
       return;
     }
-    const outcome = result.data;
-    setChatTurnsBySession((previous) => ({ ...previous, [sessionId]: (previous[sessionId] ?? []).map((turn) => turn.id === turnId
-      ? { ...turn, runId: event.event.runId, response: outcome.text || null, error: outcome.error?.message ?? null,
-        status: outcome.status === 'completed' ? 'completed' : outcome.status === 'cancelled' ? 'cancelled' : 'failed' }
-      : turn) }));
+    const outcome = event.result.data;
+    setChatTurns((turns) => turns.map((turn) => turn.id === turnId
+      ? {
+        ...turn,
+        runId: event.runId,
+        response: outcome.text || null,
+        error: outcome.error?.message ?? null,
+        status: outcome.status === 'completed' ? 'completed' : outcome.status === 'cancelled' ? 'cancelled' : 'failed',
+      }
+      : turn));
+  }
+
+  async function cancelAgentRun() {
+    const runId = activeAgentRunIdRef.current;
+    if (!busy) return;
+    setCancelPending(true);
+    if (runId === null) {
+      agentStopRequested.current = true;
+      setNotice({ tone: 'info', message: 'Stop requested. Waiting for the Agent Run to be accepted.' });
+      return;
+    }
+    await requestAgentCancellation(runId);
+  }
+
+  async function requestAgentCancellation(runId: number) {
+    setCancelPending(true);
+    const result = await window.flowmate.cancelRun(runId);
+    if (!result.ok) {
+      setCancelPending(false);
+      setNotice({ tone: 'bad', message: errorMessage(result) });
+      return;
+    }
+    setNotice({ tone: 'info', message: result.data.accepted
+      ? 'Stop was accepted. Waiting for the Agent to confirm it stopped.'
+      : 'The Run is no longer active. Its saved state remains the source of truth.' });
   }
 
   async function cancelRequest() {
@@ -372,30 +447,12 @@ export function App() {
       : 'No active request was found. The saved Run remains the source of truth.' });
   }
 
-  async function cancelChatRun() {
-    const id = activeAgentRunIdRef.current;
-    if (!busy) return;
-    setCancelPending(true);
-    if (id === null) {
-      agentStopRequested.current = true;
-      setNotice({ tone: 'info', message: 'Stop requested. Waiting for the Agent Run to be accepted.' });
-      return;
-    }
-    await requestAgentCancellation(id);
-  }
-
-  async function requestAgentCancellation(id: number) {
-    const result = await window.flowmate.cancelRun(id);
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-    setNotice({ tone: 'info', message: result.data.accepted
-      ? 'Cancellation was accepted. Waiting for the Agent Run to confirm it stopped.'
-      : 'This Run is already terminal. Its saved state remains the source of truth.' });
-  }
-
   async function loadRun(id: number) {
-    const result = await window.flowmate.queryRun(id);
+    const [result, trace] = await Promise.all([window.flowmate.queryRun(id), window.flowmate.queryPromptTrace(id)]);
     if (result.ok) setRun(result.data);
     else setNotice({ tone: 'bad', message: errorMessage(result) });
+    if (trace.ok) setPromptTrace(trace.data);
+    else setPromptTrace({ availability: 'source-unavailable', calls: [], droppedCalls: null });
   }
 
   async function removeModel() {
@@ -497,7 +554,7 @@ export function App() {
               </div>
             </section>
 
-            {(run || runId !== null) && <RunDetails run={run} runId={runId} onRefresh={() => runId && void loadRun(runId)} />}
+            {(run || runId !== null) && <RunDetails run={run} runId={runId} trace={promptTrace} onRefresh={() => runId && void loadRun(runId)} />}
             <footer className="page-footer"><span>FLOWMATE · LOCAL PROVIDER RUNTIME</span><span>API KEYS STAY ON THIS DEVICE</span></footer>
           </section>
         ) : (
@@ -516,27 +573,36 @@ export function App() {
       <AgentChatPanel
         collapsed={chatCollapsed}
         onToggle={() => setChatCollapsed((collapsed) => !collapsed)}
-        turns={chatTurns}
         sessions={sessions}
         selectedSessionId={selectedSessionId}
-        sessionAvailability={selectedSession?.availability ?? 'none'}
-        onSelectSession={selectChatSession}
-        onCreateSession={() => void createChatSession()}
+        selectedSession={selectedSession}
+        sessionLoading={sessionLoading}
+        hasMoreSessions={sessionCursor !== null}
+        hasOlderRuns={runCursor !== null}
+        onSelectSession={selectSession}
+        onNewSession={() => void createNewSession()}
+        onLoadMoreSessions={() => void loadMoreSessions()}
+        onLoadOlderRuns={() => void loadOlderRuns()}
+        turns={chatTurns}
         transcriptRef={chatTranscriptRef}
         input={chatInput}
         onInputChange={setChatInput}
         onSend={() => void sendChatMessage()}
-        onCancel={() => void (activeAgentRequestId.current !== null ? cancelChatRun() : cancelRequest())}
+        onCancel={() => void (activeAgentRunIdRef.current === null ? cancelRequest() : cancelAgentRun())}
         enabled={canChat}
-        inputEnabled={selectedSession !== null && selectedSession.availability !== 'history-unavailable' && selectedSession.availability !== 'archived'}
         busy={busy}
         cancelPending={cancelPending}
-        models={savedModels}
+        activeAgentRunId={activeAgentRunId}
+        activeAgentSessionId={activeAgentSessionId}
+        activeRunModel={activeRunModel}
         selectedModelId={selectedModelId}
-        onSelectModel={selectModel}
         modelName={persistedModel?.name ?? null}
         modelId={persistedModel?.model ?? null}
-        activeRunModel={activeRunModel}
+        sessionHint={!selectedSession ? 'Create a Session to begin. Creating one does not call the model.'
+          : selectedSession.availability === 'history-unavailable' ? 'This saved Session has no restorable Agent history after restart. Create a new Session to continue; previous Runs remain viewable.'
+            : selectedSession.availability === 'unusable' ? 'This Agent Session cannot continue safely. Create a new Session.'
+              : selectedSession.availability === 'busy' ? 'A Run is active for this Session.'
+                : !modelReady ? 'Save a model route and API Key to start a chat.' : ''}
         onOpenRun={(id) => { setPage('model'); void loadRun(id); }}
       />
     </div>
@@ -548,7 +614,22 @@ function modelFieldsEqual(left: ModelProfile, right: ModelProfile): boolean {
     && left.api === right.api && left.credentialRef === right.credentialRef;
 }
 
-function RunDetails({ run, runId, onRefresh }: { run: RunSnapshot | null; runId: number | null; onRefresh(): void }) {
+function turnFromRun(run: AgentRunSnapshot): ChatTurn {
+  const input = run.input as { text?: unknown };
+  const output = run.output as { text?: unknown } | null;
+  return {
+    id: `run-${run.runId}`,
+    sessionId: run.sessionId,
+    runId: run.runId,
+    prompt: typeof input.text === 'string' ? input.text : 'Input unavailable.',
+    response: typeof output?.text === 'string' && output.text ? output.text : null,
+    error: run.error?.message ?? null,
+    status: run.status === 'completed' ? 'completed' : run.status === 'cancelled' ? 'cancelled'
+      : run.status === 'failed' ? 'failed' : 'sending',
+  };
+}
+
+function RunDetails({ run, runId, trace, onRefresh }: { run: RunSnapshot | null; runId: number | null; trace: PromptTraceResult | null; onRefresh(): void }) {
   if (!run) return <section className="run-panel loading-run"><span className="loader-ring" /><span>Loading the persisted Run…</span><button className="text-button" onClick={onRefresh}>Refresh</button></section>;
   const input = run.input as { goal?: string; text?: string };
   const output = run.output as { text?: string; partial?: boolean; responseModel?: string | null; stopReason?: string } | null;
@@ -556,7 +637,7 @@ function RunDetails({ run, runId, onRefresh }: { run: RunSnapshot | null; runId:
   const usage = run.usage as { source?: string; reason?: string | null; sdkValues?: { input?: number | null; output?: number | null; totalTokens?: number | null; costTotal?: number | null } | null; attempts?: number | null };
   const cleanup = run.cleanup as { stopped?: boolean; stopReason?: string | null; errors?: unknown[] };
   return <section className="run-panel">
-    <div className="run-heading"><div><span className="section-index">PERSISTED {run.kind.toUpperCase()} RUN</span><h2>Run {runId ?? run.runId} <span className={`run-status ${run.status}`}>{run.status}</span></h2></div><button className="quiet-button" onClick={onRefresh}>↻ Refresh facts</button></div>
+    <div className="run-heading"><div><span className="section-index">PERSISTED {run.kind === 'agent' ? 'AGENT' : 'PROVIDER'} RUN</span><h2>Run {runId ?? run.runId} <span className={`run-status ${run.status}`}>{run.status}</span></h2></div><button className="quiet-button" onClick={onRefresh}>↻ Refresh facts</button></div>
     <div className="run-grid">
       <article className="fact-card"><span className="fact-label">MODEL ROUTE</span><strong>{config.resolvedModel?.model ?? config.requestedModel?.model ?? 'Unknown'}</strong><small>{config.api ?? 'API unknown'} · {config.endpoint ?? 'endpoint unavailable'}</small></article>
       <article className="fact-card"><span className="fact-label">USAGE</span><strong>{usage.source === 'sdk' ? `${usage.sdkValues?.totalTokens ?? 'Unknown'} tokens` : 'Unknown'}</strong><small>{usage.reason ?? `Attempts: ${usage.attempts ?? 'unknown'}`}</small></article>
@@ -567,6 +648,20 @@ function RunDetails({ run, runId, onRefresh }: { run: RunSnapshot | null; runId:
       <article className="evidence-block response-block"><span className="fact-label">ACTUAL RESPONSE {output?.partial ? '· PARTIAL' : ''}</span><pre className="response-copy">{output?.text || 'No response text was persisted.'}</pre></article>
     </div>
     {(run.error || (cleanup.errors?.length ?? 0) > 0) && <div className="error-facts"><span className="fact-label">FAILURE / CLEANUP FACTS</span><pre>{stringify({ error: run.error, cleanup })}</pre></div>}
+    <section className="prompt-trace-panel" aria-label="Temporary Prompt Trace">
+      <div className="trace-heading"><div><span className="section-index">TEMPORARY PROMPT TRACE</span><p>One logical model call; this in-memory summary is cleared when the Host exits.</p></div><strong>{trace?.availability ?? 'loading'}</strong></div>
+      {!trace && <p className="trace-empty">Loading trace availability…</p>}
+      {trace && trace.availability !== 'available' && <p className="trace-empty">{trace.availability === 'not-started' ? 'No model call started for this Run.'
+        : trace.availability === 'evicted' ? 'This call summary was evicted from the bounded buffer.'
+          : trace.availability === 'process-exited' ? 'The Host process that owned this in-memory trace has exited.'
+            : trace.availability === 'not-collected' ? 'Prompt Trace was not collected for this Run type.'
+              : 'The trace source is unavailable. Saved Run facts remain available.'}</p>}
+      {trace?.calls.map((call) => <div className="trace-call" key={`${call.runId}-${call.callSequence}`}>
+        <div className="trace-call-heading"><span>CALL {call.callSequence} · {call.state}</span><span>{call.droppedEntries} entries dropped</span></div>
+        <ol>{call.entries.map((entry, index) => <li key={`${entry.at}-${index}`}><time>{new Date(entry.at).toLocaleTimeString()}</time><code>{entry.event}</code><span>{entry.summary}{entry.truncated ? ' · truncated' : ''}</span></li>)}</ol>
+      </div>)}
+      {trace?.availability === 'available' && <small className="trace-retention">{trace.droppedCalls ?? 0} ended call summaries evicted from this Host process.</small>}
+    </section>
     <details className="raw-run"><summary>Full persisted Run record</summary><pre>{stringify(run)}</pre></details>
   </section>;
 }
@@ -574,52 +669,62 @@ function RunDetails({ run, runId, onRefresh }: { run: RunSnapshot | null; runId:
 function AgentChatPanel({
   collapsed,
   onToggle,
-  turns,
   sessions,
   selectedSessionId,
-  sessionAvailability,
+  selectedSession,
+  sessionLoading,
+  hasMoreSessions,
+  hasOlderRuns,
   onSelectSession,
-  onCreateSession,
+  onNewSession,
+  onLoadMoreSessions,
+  onLoadOlderRuns,
+  turns,
   transcriptRef,
   input,
   onInputChange,
   onSend,
   onCancel,
   enabled,
-  inputEnabled,
   busy,
   cancelPending,
-  models,
+  activeAgentRunId,
+  activeAgentSessionId,
+  activeRunModel,
   selectedModelId,
-  onSelectModel,
   modelName,
   modelId,
-  activeRunModel,
+  sessionHint,
   onOpenRun,
 }: {
   collapsed: boolean;
   onToggle(): void;
-  turns: readonly ChatTurn[];
   sessions: readonly SessionSnapshot[];
   selectedSessionId: number | null;
-  sessionAvailability: SessionSnapshot['availability'] | 'none';
+  selectedSession: SessionSnapshot | null;
+  sessionLoading: boolean;
+  hasMoreSessions: boolean;
+  hasOlderRuns: boolean;
   onSelectSession(sessionId: number): void;
-  onCreateSession(): void;
+  onNewSession(): void;
+  onLoadMoreSessions(): void;
+  onLoadOlderRuns(): void;
+  turns: readonly ChatTurn[];
   transcriptRef: RefObject<HTMLDivElement | null>;
   input: string;
   onInputChange(value: string): void;
   onSend(): void;
   onCancel(): void;
   enabled: boolean;
-  inputEnabled: boolean;
   busy: boolean;
   cancelPending: boolean;
-  models: readonly ModelProfile[];
+  activeAgentRunId: number | null;
+  activeAgentSessionId: number | null;
+  activeRunModel: { id: string; name: string; model: string } | null;
   selectedModelId: string | null;
-  onSelectModel(modelId: string): void;
   modelName: string | null;
   modelId: string | null;
-  activeRunModel: { id: string; name: string; model: string } | null;
+  sessionHint: string;
   onOpenRun(runId: number): void;
 }) {
   if (collapsed) {
@@ -629,30 +734,34 @@ function AgentChatPanel({
   }
   return <aside className="agent-chat-panel" data-testid="agent-chat-panel" aria-label="Agent Chat">
     <header className="chat-panel-head">
-      <div><span className="section-index">PROVIDER WORKSPACE</span><h2>Agent Chat</h2></div>
-      <button className="quiet-button chat-new-session" type="button" onClick={onCreateSession}>＋ New</button>
+      <div><span className="section-index">PI NATIVE AGENT</span><h2>Agent Chat</h2></div>
+      <button className="chat-new-session" type="button" onClick={onNewSession} disabled={sessionLoading}>{sessionLoading ? 'Creating…' : '＋ New'}</button>
       <button className="chat-collapse" type="button" onClick={onToggle} aria-label="Collapse Agent Chat" aria-expanded={true} title="Collapse Agent Chat">›</button>
     </header>
-    <label className="chat-picker"><span>SESSION</span><select aria-label="Chat session" value={selectedSessionId ?? ''} onChange={(event) => onSelectSession(Number(event.target.value))} disabled={sessions.length === 0}>
-      {sessions.length === 0 && <option value="">No sessions</option>}
-      {sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.title} · #{session.sessionId}</option>)}
-    </select></label>
-    <label className="chat-picker"><span>MODEL FOR NEXT RUN</span><select aria-label="Model for next Run" value={selectedModelId ?? ''} onChange={(event) => onSelectModel(event.target.value)} disabled={models.length === 0}>
-      {models.length === 0 && <option value="">No model configured</option>}
-      {models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model}</option>)}
-    </select></label>
     <div className="chat-model-row"><span className={`status-dot ${enabled ? 'is-ready' : 'is-error'}`} /><div><strong>{modelName ?? 'No model configured'}</strong><small>{modelId ?? 'Open Model to add a route'}</small></div></div>
-    {sessionAvailability === 'history-unavailable'
-      ? <div className="chat-boundary" role="status">This session's conversation history is unavailable after restart. Create a new session to continue.</div>
-      : <div className="chat-boundary">Each Send starts a new Run in this Session. Its history stays isolated from other sessions and remains in memory only until the app restarts.</div>}
+    <div className="chat-session-select">
+      <label htmlFor="agent-session-select">SESSION</label>
+      <select id="agent-session-select" aria-label="Session" value={selectedSessionId ?? ''} onChange={(event) => { const id = Number(event.target.value); if (Number.isSafeInteger(id) && id > 0) onSelectSession(id); }}>
+        <option value="">Select a Session</option>
+        {sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.title} · #{session.sessionId}</option>)}
+      </select>
+      {hasMoreSessions && <button type="button" className="chat-more" onClick={onLoadMoreSessions}>More</button>}
+    </div>
+    {selectedSession && <div className="chat-session-state"><span className={`status-dot ${selectedSession.availability === 'ready' ? 'is-ready' : selectedSession.availability === 'busy' ? 'is-warning' : 'is-error'}`} />
+      <span>{selectedSession.availability === 'ready' ? 'Ready for another Run' : selectedSession.availability === 'busy' ? 'Run in progress' : selectedSession.availability === 'history-unavailable' ? 'History unavailable after restart' : selectedSession.availability === 'unusable' ? 'Session cannot continue' : selectedSession.availability}</span>
+    </div>}
+    {activeAgentRunId !== null && activeAgentSessionId !== null && activeAgentSessionId !== selectedSessionId
+      && <div className="chat-active-run">Run {activeAgentRunId} continues in Session #{activeAgentSessionId}. Stop remains bound to that Run.</div>}
     {busy && activeRunModel && <div className="chat-run-model">RUNNING WITH · {activeRunModel.name} · {activeRunModel.model}{selectedModelId !== activeRunModel.id && <span>The selected model will be used for the next Run.</span>}</div>}
+    <div className="chat-boundary">Each Send starts a new Run in this native Session. P2 keeps Agent history in memory for this process; saved Session history cannot be restored after restart.</div>
     <div className="chat-transcript" ref={transcriptRef} role="log" aria-live="polite" aria-relevant="additions text">
-      {turns.length === 0 && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>Ask your model a question.</strong><p>Your first message starts a Run in the selected Session.</p></div>}
+      {hasOlderRuns && <button type="button" className="chat-more-runs" onClick={onLoadOlderRuns}>Load older Runs</button>}
+      {turns.length === 0 && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>{selectedSession ? 'Continue this Session.' : 'Create a Session.'}</strong><p>{selectedSession ? 'Send a message to start a new Agent Run.' : 'New Session creates an identity only; it does not call the model.'}</p></div>}
       {turns.map((turn) => <article className="chat-turn" data-testid="chat-turn" key={turn.id}>
         <div className="chat-user-message"><span className="chat-speaker">YOU</span><p>{turn.prompt}</p></div>
         <div className={`chat-assistant-message ${turn.status}`}>
           <span className="chat-speaker">FLOWMATE · {turn.status === 'sending' ? 'RUNNING' : turn.status.toUpperCase()}</span>
-          {turn.status === 'sending' ? <div className="chat-pending"><span className="loader-ring" />Waiting for the Provider response…</div>
+          {turn.status === 'sending' ? <div className="chat-pending"><span className="loader-ring" />Waiting for the Agent Run to finish…</div>
             : turn.response ? <p>{turn.response}</p> : <p>{turn.status === 'cancelled' ? 'Request cancelled.' : 'No response text was returned.'}</p>}
           {turn.error && <p className="chat-error">{turn.error}</p>}
           {turn.runId !== null && <button type="button" className="chat-run-link" onClick={() => onOpenRun(turn.runId!)}>OPEN RUN · {turn.runId}</button>}
@@ -660,11 +769,11 @@ function AgentChatPanel({
       </article>)}
     </div>
     <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend(); }}>
-      {!enabled && <p className="chat-config-hint">Save a model route with an API key to start a chat.</p>}
+      {sessionHint && <p className="chat-config-hint">{sessionHint}</p>}
       <label className="sr-only" htmlFor="agent-chat-input">Message to model</label>
       <textarea id="agent-chat-input" aria-label="Message to model" value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => {
         if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSend(); }
-      }} placeholder="Write a message…" rows={3} disabled={!inputEnabled} />
+      }} placeholder="Write a message…" rows={3} disabled={!enabled || busy} />
       <div className="chat-composer-foot"><span>Enter to send · Shift+Enter for a new line</span>
         {busy ? <button className="secondary-button cancel-button" type="button" onClick={onCancel} disabled={cancelPending}>{cancelPending ? 'Stopping…' : 'Stop'}</button>
           : <button className="primary-button" type="submit" disabled={!enabled || !input.trim()}>Send to model <span aria-hidden="true">↗</span></button>}

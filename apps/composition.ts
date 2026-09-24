@@ -1,8 +1,9 @@
-import { makeApplication, RuntimeService, openDatabase } from '@flowmate/core';
+import { makeApplication, RuntimeService, SessionService, openDatabase } from '@flowmate/core';
+import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger, resolveProductPaths, resolveWindowsUserData } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
-import type { Application, ProductPaths, Result } from '@flowmate/contracts';
+import type { Application, ProductPaths, PromptTraceBuffer, Result } from '@flowmate/contracts';
 import type { AgentPort, ProviderPort } from '@flowmate/contracts';
 import type { SafeLogger } from '@flowmate/shared';
 
@@ -10,6 +11,7 @@ export type ApplicationOptions = {
   paths: ProductPaths;
   provider?: ProviderPort;
   agent?: AgentPort;
+  promptTrace?: PromptTraceBuffer;
   logger?: SafeLogger;
 };
 
@@ -30,18 +32,21 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     return { ok: false, error: appError('logger_init_failed', 'runtime', '运行日志初始化失败。', true) };
   }
   const provider = options.provider ?? new PiProviderAdapter();
-  const agent = options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir });
+  const promptTrace = options.promptTrace ?? createPromptTraceBuffer();
+  const agent = options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace });
   let loggerClosed = false;
   let databaseClosed = false;
+  const now = () => new Date().toISOString();
   const runtime = new RuntimeService({
     runs: database.data.runs,
     sessions: database.data.sessions,
     provider,
     agent,
     log: logger,
-    now: () => new Date().toISOString(),
+    now,
     monotonicNow: () => performance.now(),
   });
+  const sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now);
   return ok(makeApplication(runtime, database.data.runs, async () => {
     const errors = [];
     if (!loggerClosed) {
@@ -57,7 +62,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       if (!released.ok) errors.push(released.error);
     }
     return { stopped: true, closed: loggerClosed && databaseClosed && lockReleased, errors };
-  }));
+  }, sessionService, promptTrace));
 }
 
 export async function createDefaultApplication(): Promise<Result<Application>> {

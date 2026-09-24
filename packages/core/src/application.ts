@@ -1,43 +1,48 @@
-import { appError, ok } from '@flowmate/contracts';
+import {
+  appError,
+  fail,
+  normalizeAgentRunRequest,
+  normalizeCreateSessionRequest,
+  normalizeListSessionsRequest,
+  normalizeSessionRunsRequest,
+  ok,
+} from '@flowmate/contracts';
 import type {
   AgentControl,
   AgentRunRequest,
   Application,
   CloseReport,
   DbId,
+  ListSessionsRequest,
+  NormalizedAgentRunRequest,
   ProviderControl,
   ProviderOutcome,
   ProviderRequest,
+  PromptTraceBuffer,
   Result,
   RunAccepted,
   RunSnapshot,
   RuntimeState,
-  CreateSessionRequest,
-  ListSessionsRequest,
   SessionPage,
   SessionRunsPage,
   SessionRunsRequest,
   SessionSnapshot,
 } from '@flowmate/contracts';
+import type { RunRepository } from './storage/repositories.ts';
+import type { SessionService } from './sessions/service.ts';
 
 export interface RuntimeServicePort {
   callProvider(
     request: ProviderRequest,
     control?: ProviderControl,
   ): Promise<Result<ProviderOutcome>>;
-  createSession(request: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
-  listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
-  querySession(sessionId: DbId): Promise<Result<SessionSnapshot>>;
-  listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>>;
-  startRun(request: AgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
-  cancelRun(runId: DbId): Promise<Result<{ accepted: boolean; runId: DbId }>>;
-  queryRuntimeState(): Promise<Result<RuntimeState>>;
+  start(request: NormalizedAgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
+  cancel(runId: DbId): Result<{ runId: DbId; accepted: boolean }>;
+  state(): RuntimeState;
   close(): Promise<CloseReport>;
 }
 
-export interface RunQueryPort {
-  get(runId: DbId): Result<RunSnapshot>;
-}
+export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunRepository, 'listBySession'>>;
 
 export type DisposeResources = () => Promise<CloseReport>;
 
@@ -50,20 +55,64 @@ export function makeApplication(
   runtime: RuntimeServicePort,
   runs: RunQueryPort,
   dispose: DisposeResources,
+  sessions?: SessionService,
+  promptTrace?: PromptTraceBuffer,
 ): Application {
   let closeInFlight: Promise<Result<CloseReport>> | null = null;
   let finalCloseResult: Result<CloseReport> | null = null;
   const closeErrors = new Map<string, ReturnType<typeof appError>>();
   return {
     callProvider: (request, control) => runtime.callProvider(request, control),
-    createSession: (request) => runtime.createSession(request),
-    listSessions: (request) => runtime.listSessions(request),
-    querySession: (sessionId) => runtime.querySession(sessionId),
-    listSessionRuns: (request) => runtime.listSessionRuns(request),
-    startRun: (request, control) => runtime.startRun(request, control),
-    cancelRun: (runId) => runtime.cancelRun(runId),
-    queryRuntimeState: () => runtime.queryRuntimeState(),
-    queryRun: async (runId) => runs.get(runId),
+    queryRun: async (runId) => isDbId(runId) ? runs.get(runId) : fail(appError('input_invalid', 'input', 'Run ID 无效。')),
+    createSession: async (raw = {}) => {
+      const normalized = normalizeCreateSessionRequest(raw);
+      return normalized.ok ? sessions?.create(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
+    },
+    listSessions: async (raw?: ListSessionsRequest) => {
+      const normalized = normalizeListSessionsRequest(raw);
+      return normalized.ok ? sessions?.list(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
+    },
+    querySession: async (sessionId) => {
+      if (!isDbId(sessionId)) return fail(appError('input_invalid', 'input', 'Session ID 无效。'));
+      return sessions?.get(sessionId) ?? fail(sessionServiceUnavailable());
+    },
+    listSessionRuns: async (raw: SessionRunsRequest) => {
+      const normalized = normalizeSessionRunsRequest(raw);
+      if (!normalized.ok) return normalized;
+      if (!runs.listBySession) return fail(appError('session_runs_unavailable', 'storage', 'Session Run 仓储尚未组装。'));
+      return runs.listBySession(normalized.data);
+    },
+    queryPromptTrace: async (runId, callSequence) => {
+      if (!isDbId(runId) || (callSequence !== undefined && !isDbId(callSequence))) {
+        return fail(appError('input_invalid', 'input', 'Prompt Trace 查询参数无效。'));
+      }
+      const run = runs.get(runId);
+      if (!run.ok) return run;
+      if (run.data.kind === 'provider') return ok({ availability: 'not-collected', calls: [], droppedCalls: null });
+      if (!promptTrace) return ok({ availability: 'not-collected', calls: [], droppedCalls: null });
+      let result;
+      try { result = promptTrace.query(runId, callSequence); }
+      catch { return ok({ availability: 'source-unavailable', calls: [], droppedCalls: null }); }
+      if (result.availability === 'not-started') {
+        const session = sessions?.get(run.data.sessionId);
+        if (session?.ok && session.data.availability === 'history-unavailable') {
+          return ok({ availability: 'process-exited', calls: [], droppedCalls: null });
+        }
+      }
+      return ok(result);
+    },
+    startRun: async (raw: AgentRunRequest, control?: AgentControl) => {
+      const normalized = normalizeAgentRunRequest(raw);
+      return normalized.ok ? runtime.start(normalized.data, control) : normalized;
+    },
+    cancelRun: async (runId) => {
+      if (!isDbId(runId)) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
+      return runtime.cancel(runId);
+    },
+    queryRuntimeState: async () => {
+      try { return ok(runtime.state()); }
+      catch { return fail(appError('runtime_state_unavailable', 'runtime', 'Runtime 状态当前不可读取。', true)); }
+    },
     close: () => {
       if (finalCloseResult) return Promise.resolve(finalCloseResult);
       if (closeInFlight) return closeInFlight;
@@ -107,4 +156,12 @@ export function makeApplication(
     };
     return ok(report);
   }
+}
+
+function isDbId(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function sessionServiceUnavailable() {
+  return appError('session_service_unavailable', 'runtime', 'Agent Session 服务尚未组装。', true);
 }

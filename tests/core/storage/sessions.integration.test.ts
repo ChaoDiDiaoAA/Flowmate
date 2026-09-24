@@ -1,101 +1,252 @@
+import { readFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expect, it } from 'bun:test';
-import { openTestDatabase } from '../../support/database.ts';
-import { mkdtempSync } from '../../support/resources.ts';
+import { Database } from 'bun:sqlite';
+import { describe, expect, it } from 'bun:test';
+import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { createRunRepository } from '../../../packages/core/src/storage/repositories.ts';
+import { normalizeListSessionsRequest, normalizeSessionRunsRequest } from '../../../packages/contracts/src/schemas.ts';
+import type { ProductPaths } from '../../../packages/contracts/src/runtime.ts';
 
-function paths(root: string) {
-  return { root, databaseFile: join(root, 'data', 'test.sqlite'), logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
+function makePaths(root: string): ProductPaths {
+  return {
+    root,
+    databaseFile: join(root, 'data', 'trial.sqlite'),
+    logsDir: join(root, 'logs'),
+    artifactsDir: join(root, 'artifacts'),
+    outputsDir: join(root, 'outputs'),
+    runtimeDir: join(root, 'runtime'),
+  };
 }
 
-it('migrates P1 provider data and keeps Agent session identity separate from Run model facts', () => {
+function withDatabase(test: (paths: ProductPaths) => void) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-sessions-'));
-  const opened = openTestDatabase(paths(root));
-  expect(opened.ok).toBe(true);
-  if (!opened.ok) return;
-  const database = opened.data;
-  const oldProvider = database.runs.create({
-    goal: 'Existing Provider request',
-    input: { version: 1, goal: 'Existing Provider request', text: 'legacy', messageTimestamp: 1 },
-    config: { version: 1, name: 'legacy', revision: 1, requestedModel: { provider: 'p', model: 'm' }, resolvedModel: null, api: null, endpoint: null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: { maxRetries: 0, maxRetryDelayMs: 2000 }, limits: { timeoutMs: 60000, stopGraceMs: 5000 }, native: { authSource: 'pi-native', modelsSelection: null } },
-    usage: { version: 1, source: 'unknown', reason: 'test', sdkValues: null, attempts: null, attemptsComplete: false, costSource: null, updatedAt: new Date(0).toISOString() },
-    cleanup: { version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false },
-    createdAt: new Date(0).toISOString(),
-  });
-  expect(oldProvider.ok).toBe(true);
-  if (oldProvider.ok) {
-    expect(database.runs.start(oldProvider.data, {
-      version: 1, name: 'legacy', revision: 1, requestedModel: { provider: 'p', model: 'm' }, resolvedModel: null,
-      api: null, endpoint: null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
-      limits: { timeoutMs: 60000, stopGraceMs: 5000 }, native: { authSource: 'pi-native', modelsSelection: null },
-    }, new Date(1).toISOString()).ok).toBe(true);
-    const finishedOld = database.runs.finish(oldProvider.data, {
-      status: 'completed', output: { version: 1, text: 'legacy answer', partial: false, stopReason: 'stop', responseId: null, responseModel: 'm' },
-      error: null, usage: { version: 1, source: 'unknown', reason: 'test', sdkValues: null, attempts: 1, attemptsComplete: true, costSource: null, updatedAt: new Date(2).toISOString() },
-      tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
-      cleanup: { version: 1, stopped: true, stopReason: 'native-stop', errors: [], lateObservationRequired: false },
-      endedAt: new Date(2).toISOString(), stoppedAt: new Date(2).toISOString(), durationMs: 1,
+  test(makePaths(root));
+}
+
+const runInput = {
+  version: 1 as const,
+  goal: '理解发票摘要',
+  text: '发票号码 INV-1',
+  messageTimestamp: 1_800_000_000_000,
+};
+const usage = {
+  version: 1 as const,
+  source: 'unknown' as const,
+  reason: 'not-requested',
+  sdkValues: null,
+  attempts: null,
+  attemptsComplete: false,
+  costSource: null,
+  updatedAt: '2026-09-24T00:00:00.000Z',
+};
+const cleanup = {
+  version: 1 as const,
+  stopped: false,
+  stopReason: null,
+  errors: [],
+  lateObservationRequired: false,
+};
+const baseConfig = {
+  version: 1 as const,
+  name: 'fixture',
+  revision: 1,
+  requestedModel: { provider: 'fixture', model: 'fixture-model' },
+  resolvedModel: { provider: 'fixture', model: 'fixture-model' },
+  api: 'openai-completions',
+  endpoint: 'https://fixture.invalid/v1',
+  sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
+  parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
+  limits: { timeoutMs: 60_000, stopGraceMs: 5_000 },
+  native: { authSource: 'pi-runtime-api-key' as const, modelsSelection: null },
+};
+const agentConfig = {
+  ...baseConfig,
+  agent: {
+    policyVersion: 'p2-invoice-chat-v1' as const,
+    nativeSessionId: 'native-session-one',
+    systemPrompt: 'fixture invoice system prompt',
+    thinkingLevel: 'off',
+    resourcePolicy: 'none' as const,
+    historyPolicy: 'memory-only' as const,
+    maxContextBytes: 524_288 as const,
+    maxOutputBytes: 262_144 as const,
+    maxAssistantContentBytes: 524_288 as const,
+    maxModelCalls: 1 as const,
+    sessionRetry: false as const,
+  },
+};
+const scope = { version: 1 as const, mode: 'chat-text' as const, toolNames: [] as [], resourcePaths: [] as [] };
+
+function createLegacyV1(paths: ProductPaths, includeActive = false) {
+  mkdirSync(join(paths.root, 'data'), { recursive: true });
+  const db = new Database(paths.databaseFile, { create: true });
+  db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000; PRAGMA journal_mode=DELETE; PRAGMA locking_mode=EXCLUSIVE;');
+  db.exec(readFileSync(new URL('../../../packages/core/src/storage/migrations/001_provider.sql', import.meta.url), 'utf8'));
+  const insert = db.query(`INSERT INTO runs (
+    id,kind,status,goal,input_json,config_json,output_json,error_json,cleanup_json,usage_json,
+    input_tokens,output_tokens,total_tokens,cost,duration_ms,tool_call_count,usage_complete,
+    created_at,started_at,ended_at,cancel_requested_at,stopped_at
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const stamp = '2026-09-24T00:00:00.000Z';
+  const records = [
+    { id: 11, status: 'completed', output: { version: 1, text: 'legacy complete', partial: false, stopReason: 'stop', responseId: null, responseModel: 'fixture' }, error: null, started: stamp, ended: stamp, cancel: null, stopped: stamp, cleanupValue: { ...cleanup, stopped: true, stopReason: 'native-stop' } },
+    { id: 12, status: 'failed', output: null, error: { version: 1, code: 'provider_failed', category: 'provider', message: 'failed', retryable: true }, started: stamp, ended: stamp, cancel: null, stopped: null, cleanupValue: cleanup },
+    { id: 13, status: 'cancelled', output: { version: 1, text: 'partial', partial: true, stopReason: 'aborted', responseId: null, responseModel: null }, error: { version: 1, code: 'provider_cancelled', category: 'provider', message: 'cancelled', retryable: false }, started: stamp, ended: stamp, cancel: stamp, stopped: stamp, cleanupValue: { ...cleanup, stopped: true, stopReason: 'user' } },
+    ...(includeActive ? [{ id: 14, status: 'running', output: null, error: null, started: stamp, ended: null, cancel: null, stopped: null, cleanupValue: cleanup }] : []),
+  ];
+  for (const record of records) {
+    insert.run(
+      record.id, 'provider', record.status, 'legacy goal', JSON.stringify(runInput), JSON.stringify(baseConfig),
+      record.output === null ? null : JSON.stringify(record.output), record.error === null ? null : JSON.stringify(record.error),
+      JSON.stringify(record.cleanupValue), JSON.stringify(usage), null, null, null, null, null, 0, 0,
+      stamp, record.started, record.ended, record.cancel, record.stopped,
+    );
+  }
+  return db;
+}
+
+const legacyColumns = [
+  'id', 'kind', 'status', 'goal', 'input_json', 'config_json', 'output_json', 'error_json', 'cleanup_json', 'usage_json',
+  'input_tokens', 'output_tokens', 'total_tokens', 'cost', 'duration_ms', 'tool_call_count', 'usage_complete', 'created_at',
+  'started_at', 'ended_at', 'cancel_requested_at', 'stopped_at',
+].join(',');
+
+describe('P2 Session and Agent Run storage', () => {
+  it('migrates a real new database through versions 1 and 2 before exposing repositories', () => withDatabase((paths) => {
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }]);
+    expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    opened.data.close();
+  }));
+
+  it('preserves every legacy column before interrupted-run recovery, then recovers only active rows', () => withDatabase((paths) => {
+    const legacy = createLegacyV1(paths, true);
+    const before = legacy.query(`SELECT ${legacyColumns} FROM runs ORDER BY id`).all();
+    legacy.exec(readFileSync(new URL('../../../packages/core/src/storage/migrations/002_agent_sessions.sql', import.meta.url), 'utf8'));
+    const afterMigration = legacy.query(`SELECT ${legacyColumns} FROM runs ORDER BY id`).all();
+    expect(afterMigration).toEqual(before);
+
+    const runs = createRunRepository(legacy);
+    expect(runs.failInterrupted('2026-09-24T01:00:00.000Z')).toEqual({ ok: true, data: 1 });
+    const recovered = runs.get(14);
+    expect(recovered).toMatchObject({ ok: true, data: { status: 'failed', stoppedAt: null, error: { code: 'runtime_interrupted' } } });
+    expect(legacy.query(`SELECT ${legacyColumns} FROM runs WHERE id=11`).get()).toEqual(before[0]);
+    expect(legacy.query(`SELECT ${legacyColumns} FROM runs WHERE id=12`).get()).toEqual(before[1]);
+    expect(legacy.query(`SELECT ${legacyColumns} FROM runs WHERE id=13`).get()).toEqual(before[2]);
+    legacy.close();
+  }));
+
+  it('rolls back a failed version-2 migration through openDatabase without touching legacy data or recovery state', () => withDatabase((paths) => {
+    const legacy = createLegacyV1(paths, true);
+    legacy.exec('CREATE TABLE runs_v2 (fixture_collision INTEGER);');
+    const before = legacy.query(`SELECT ${legacyColumns} FROM runs ORDER BY id`).all();
+    legacy.close();
+
+    const failedOpen = openDatabase(paths);
+    expect(failedOpen).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+
+    const reopened = new Database(paths.databaseFile);
+    expect(reopened.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }]);
+    expect(reopened.query("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").get()).toBeNull();
+    expect(reopened.query('SELECT fixture_collision FROM runs_v2').all()).toEqual([]);
+    expect(reopened.query(`SELECT ${legacyColumns} FROM runs ORDER BY id`).all()).toEqual(before);
+    const active = reopened.query('SELECT status,ended_at,stopped_at FROM runs WHERE id=14').get();
+    expect(active).toEqual({ status: 'running', ended_at: null, stopped_at: null });
+    reopened.close();
+  }));
+
+  it('persists native Session identities, enforces Agent links, and updates a Session with its Run terminal', () => withDatabase((paths) => {
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const { sessions, runs, db } = opened.data;
+    const first = sessions.create({ nativeSessionId: 'native-session-one', title: 'Invoice A', at: '2026-09-24T00:00:00.000Z' });
+    const second = sessions.create({ nativeSessionId: 'native-session-two', title: 'Invoice B', at: '2026-09-24T00:00:00.000Z' });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(first.data.nativeSessionId).toBe('native-session-one');
+    expect(first.data.sessionId).not.toBe('native-session-one');
+    expect(sessions.create({ nativeSessionId: 'native-session-one', title: 'Duplicate', at: '2026-09-24T00:00:00.000Z' }).ok).toBe(false);
+
+    const pageOneRequest = normalizeListSessionsRequest({ limit: 1 });
+    expect(pageOneRequest.ok).toBe(true);
+    if (!pageOneRequest.ok) return;
+    const pageOne = sessions.list(pageOneRequest.data);
+    expect(pageOne).toMatchObject({ ok: true, data: { items: [{ sessionId: second.data.sessionId }], next: { sessionId: second.data.sessionId } } });
+    if (!pageOne.ok || !pageOne.data.next) return;
+    const pageTwoRequest = normalizeListSessionsRequest({ limit: 1, before: pageOne.data.next });
+    expect(pageTwoRequest.ok).toBe(true);
+    if (!pageTwoRequest.ok) return;
+    expect(sessions.list(pageTwoRequest.data)).toMatchObject({ ok: true, data: { items: [{ sessionId: first.data.sessionId }], next: null } });
+
+    const invalidSession = runs.createAgent({
+      goal: runInput.goal, input: runInput, config: agentConfig, usage, cleanup, createdAt: '2026-09-24T00:01:00.000Z',
+      sessionId: 999, scope,
     });
-    expect(finishedOld.ok && finishedOld.data).toBe(true);
-  }
+    expect(invalidSession).toMatchObject({ ok: false, error: { code: 'session_not_found' } });
 
-  const first = database.sessions.create({ nativeSessionId: 'native-a', title: 'Invoice A', createdAt: '2026-09-24T00:00:00.000Z' });
-  const second = database.sessions.create({ nativeSessionId: 'native-b', title: 'Invoice B', createdAt: '2026-09-24T00:00:01.000Z' });
-  expect(first.ok && second.ok).toBe(true);
-  if (!first.ok || !second.ok) return;
-  expect(first.data.id).not.toBe(second.data.id);
+    const created = runs.createAgent({
+      goal: runInput.goal, input: runInput, config: agentConfig, usage, cleanup, createdAt: '2026-09-24T00:01:00.000Z',
+      sessionId: first.data.sessionId, scope,
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runs.create({ goal: runInput.goal, input: runInput, config: baseConfig, usage, cleanup, createdAt: '2026-09-24T00:02:00.000Z' }))
+      .toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
+    expect(runs.get(created.data)).toMatchObject({
+      ok: true,
+      data: { kind: 'agent', sessionId: first.data.sessionId, scope, config: { agent: { nativeSessionId: 'native-session-one' } } },
+    });
+    const runPageRequest = normalizeSessionRunsRequest({ sessionId: first.data.sessionId });
+    expect(runPageRequest.ok).toBe(true);
+    if (!runPageRequest.ok) return;
+    expect(runs.listBySession(runPageRequest.data)).toMatchObject({
+      ok: true,
+      data: { items: [{ runId: created.data, kind: 'agent' }], nextBeforeRunId: null },
+    });
 
-  const listed = database.sessions.list({ limit: 10 });
-  expect(listed.ok).toBe(true);
-  if (listed.ok) expect(listed.data.items.map((item) => item.id)).toEqual([second.data.id, first.data.id]);
-  if (oldProvider.ok) {
-    const oldRead = database.runs.get(oldProvider.data);
-    expect(oldRead.ok && oldRead.data.kind).toBe('provider');
-    if (oldRead.ok) expect(oldRead.data.sessionId).toBeNull();
-  }
+    const finalized = runs.finish(created.data, {
+      status: 'cancelled',
+      output: { version: 1, text: 'partial answer', partial: true, stopReason: 'aborted', responseId: null, responseModel: 'fixture-model', agent: { nativeSessionId: 'native-session-one', turnCount: 1, modelCallCount: 1 } },
+      error: { code: 'agent_cancelled', category: 'runtime', message: 'cancelled', retryable: false, runId: created.data },
+      usage,
+      tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+      cleanup: { ...cleanup, stopped: true, stopReason: 'user' },
+      endedAt: '2026-09-24T00:03:00.000Z',
+      stoppedAt: '2026-09-24T00:02:59.000Z',
+      durationMs: 120_000,
+      cancelRequestedAt: '2026-09-24T00:02:58.000Z',
+    });
+    expect(finalized).toEqual({ ok: true, data: true });
+    expect(runs.get(created.data)).toMatchObject({ ok: true, data: { status: 'cancelled', cancelRequestedAt: '2026-09-24T00:02:58.000Z' } });
+    expect(sessions.get(first.data.sessionId)).toMatchObject({ ok: true, data: { updatedAt: '2026-09-24T00:03:00.000Z' } });
 
-  const agentConfig = {
-    version: 1 as const, name: 'shared', revision: 1, requestedModel: { provider: 'profile-a', model: 'model-one' },
-    resolvedModel: { provider: 'profile-a', model: 'model-one' }, api: 'openai-responses', endpoint: 'https://one.invalid/v1',
-    sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
-    limits: { timeoutMs: 60000, stopGraceMs: 5000 }, native: { authSource: 'pi-runtime-api-key' as const, modelsSelection: null },
-    agent: { policyVersion: 'p2-invoice-chat-v1' as const, nativeSessionId: 'native-a', systemPrompt: 'invoice summary', thinkingLevel: 'off' as const,
-      resourcePolicy: 'none' as const, historyPolicy: 'memory-only' as const, maxContextBytes: 524288, maxOutputBytes: 262144,
-      maxAssistantContentBytes: 524288, maxModelCalls: 1 as const, sessionRetry: false as const },
-  };
-  const scope = { version: 1 as const, mode: 'chat-text' as const, toolNames: [] as [], resourcePaths: [] as [] };
-  const firstRun = database.runs.createAgent({
-    sessionId: first.data.id, scope, goal: 'invoice summary', input: { version: 1, goal: 'invoice summary', text: 'INV-A', messageTimestamp: 1 },
-    config: agentConfig, usage: { version: 1, source: 'unknown', reason: 'request-not-finished', sdkValues: null, attempts: null, attemptsComplete: false, costSource: null, updatedAt: new Date(3).toISOString() },
-    cleanup: { version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false }, createdAt: new Date(3).toISOString(),
-  });
-  expect(firstRun.ok).toBe(true);
-  if (!firstRun.ok) return;
-  expect(database.runs.start(firstRun.data, agentConfig, new Date(4).toISOString()).ok).toBe(true);
-  const finishedAgent = database.runs.finish(firstRun.data, {
-    status: 'completed', output: { version: 1, text: 'invoice fields', partial: false, stopReason: 'stop', responseId: null, responseModel: 'model-one', agent: { nativeSessionId: 'native-a', turnCount: 1, modelCallCount: 1 } },
-    error: null, usage: { version: 1, source: 'unknown', reason: null, sdkValues: null, attempts: 1, attemptsComplete: true, costSource: null, updatedAt: new Date(5).toISOString() },
-    tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
-    cleanup: { version: 1, stopped: true, stopReason: 'native-stop', errors: [], lateObservationRequired: false }, endedAt: new Date(5).toISOString(), stoppedAt: new Date(5).toISOString(), durationMs: 1,
-  });
-  expect(finishedAgent.ok && finishedAgent.data).toBe(true);
-  const secondModelConfig = { ...agentConfig, revision: 2, requestedModel: { provider: 'profile-b', model: 'model-two' }, resolvedModel: { provider: 'profile-b', model: 'model-two' }, endpoint: 'https://two.invalid/v1' };
-  const secondRun = database.runs.createAgent({
-    sessionId: first.data.id, scope, goal: 'invoice summary', input: { version: 1, goal: 'invoice summary', text: 'INV-A follow-up', messageTimestamp: 6 },
-    config: secondModelConfig, usage: { version: 1, source: 'unknown', reason: 'request-not-finished', sdkValues: null, attempts: null, attemptsComplete: false, costSource: null, updatedAt: new Date(6).toISOString() },
-    cleanup: { version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false }, createdAt: new Date(6).toISOString(),
-  });
-  expect(secondRun.ok).toBe(true);
-  if (secondRun.ok) {
-    const page = database.runs.listBySession({ sessionId: first.data.id, limit: 10 });
-    expect(page.ok).toBe(true);
-    if (page.ok) expect(page.data.items.map((item) => item.runId)).toEqual([secondRun.data, firstRun.data]);
-    const firstSnapshot = database.runs.get(firstRun.data);
-    expect(firstSnapshot.ok && firstSnapshot.data.kind).toBe('agent');
-    if (firstSnapshot.ok) expect(firstSnapshot.data.config.requestedModel).toEqual({ provider: 'profile-a', model: 'model-one' });
-  }
+    expect(() => db.query('DELETE FROM sessions WHERE id=?').run(first.data.sessionId)).toThrow();
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    opened.data.close();
+  }));
 
-  const raw = database.db.query("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1").get() as { version: number };
-  expect(raw.version).toBe(2);
-  expect(database.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  it('enforces Run kind and Session reference combinations with SQLite constraints', () => withDatabase((paths) => {
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const { db, sessions } = opened.data;
+    const session = sessions.create({ nativeSessionId: 'native-session-constraints', title: 'Constraints', at: '2026-09-24T00:00:00.000Z' });
+    expect(session.ok).toBe(true);
+    if (!session.ok) return;
+    const insert = db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+      VALUES (?,?,?,'created','goal','{}','{}','{}','{}','2026-09-24T00:00:00.000Z')`);
+    expect(() => insert.run('unknown', null, null)).toThrow();
+    expect(() => insert.run('provider', session.data.sessionId, null)).toThrow();
+    expect(() => insert.run('agent', null, JSON.stringify(scope))).toThrow();
+    expect(() => insert.run('agent', 99_999, JSON.stringify(scope))).toThrow();
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    opened.data.close();
+  }));
 });

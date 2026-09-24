@@ -3,8 +3,28 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { appError, fail, normalizeListSessionsRequest } from '@flowmate/contracts';
-import type { CreateSessionRequest, DesktopEvent, DesktopState, ListSessionsRequest, ProductSettings, ProviderTestRequest, Result, RunSnapshot, SessionRunsRequest, SessionPage, SessionRunsPage, SessionSnapshot, StartAgentRunInput, StartAgentRunResult, RunAccepted, RuntimeState } from '@flowmate/contracts';
+import {
+  appError,
+  fail,
+  normalizeCreateSessionRequest,
+  normalizeListSessionsRequest,
+  normalizeSessionRunsRequest,
+} from '@flowmate/contracts';
+import type {
+  DesktopAgentRunRequest,
+  DesktopEvent,
+  DesktopState,
+  ProductSettings,
+  ProviderTestRequest,
+  PromptTraceResult,
+  Result,
+  RunAccepted,
+  RunSnapshot,
+  SessionPage,
+  SessionRunsPage,
+  SessionSnapshot,
+  RuntimeState,
+} from '@flowmate/contracts';
 import { defaultProductSettings, validateProductSettings } from '../../../packages/core/src/configuration/settings.ts';
 import { createCredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import type { CredentialStore, SecureStoragePort } from '../../../packages/shared/src/secure-credential-store.ts';
@@ -20,7 +40,8 @@ const channels = {
   listSessions: 'flowmate:list-sessions',
   querySession: 'flowmate:query-session',
   listSessionRuns: 'flowmate:list-session-runs',
-  startAgentRun: 'flowmate:start-agent-run',
+  queryPromptTrace: 'flowmate:query-prompt-trace',
+  startRun: 'flowmate:start-run',
   cancelRun: 'flowmate:cancel-run',
   queryRuntimeState: 'flowmate:query-runtime-state',
   subscribe: 'flowmate:subscribe',
@@ -116,7 +137,7 @@ async function bootstrap(): Promise<void> {
       void broadcastState();
       return;
     }
-    const desktopEvent = event as DesktopEvent;
+    const desktopEvent = event.type === 'agent_run_event' ? event.value : event as DesktopEvent;
     for (const [webContentsId] of subscriptions) {
       const contents = BrowserWindow.getAllWindows().find((window) => window.webContents.id === webContentsId)?.webContents;
       if (contents && !contents.isDestroyed()) contents.send('flowmate:event', desktopEvent);
@@ -215,7 +236,8 @@ function registerIpc(): void {
   handle(channels.listSessions, async (_event, inputRaw) => listSessions(inputRaw));
   handle(channels.querySession, async (_event, sessionIdRaw) => querySession(sessionIdRaw));
   handle(channels.listSessionRuns, async (_event, inputRaw) => listSessionRuns(inputRaw));
-  handle(channels.startAgentRun, async (_event, inputRaw) => startAgentRun(inputRaw));
+  handle(channels.queryPromptTrace, async (_event, runIdRaw, sequenceRaw) => queryPromptTrace(runIdRaw, sequenceRaw));
+  handle(channels.startRun, async (_event, inputRaw) => startRun(inputRaw));
   handle(channels.cancelRun, async (_event, runIdRaw) => cancelRun(runIdRaw));
   handle(channels.queryRuntimeState, async () => queryRuntimeState());
   handle(channels.subscribe, async (event) => {
@@ -346,84 +368,99 @@ async function queryRun(value: unknown): Promise<Result<RunSnapshot>> {
   catch { return fail(appError('host_request_failed', 'runtime', 'Run 查询未能提交给 Bun Host。', true)); }
 }
 
-async function createSession(value: unknown): Promise<Result<SessionSnapshot>> {
-  if (value !== undefined && value !== null && (typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some((key) => key !== 'title')
-    || ('title' in value && (typeof value.title !== 'string' || !value.title.trim() || value.title.length > 120)))) {
-    return fail(appError('input_invalid', 'input', 'Session 创建参数无效。'));
-  }
-  try { return await host.request({ type: 'create_session', ...(value && 'title' in value ? { title: value.title as string } : {}) }) as Result<SessionSnapshot>; }
-  catch { return fail(appError('host_request_failed', 'runtime', 'Session 创建未能提交给 Bun Host。', true)); }
+async function createSession(raw: unknown): Promise<Result<SessionSnapshot>> {
+  const input = normalizeCreateSessionRequest(raw);
+  if (!input.ok) return input;
+  try { return await host.request({ type: 'create_session', input: input.data }) as Result<SessionSnapshot>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'New Session 未能提交给 Bun Host。', true)); }
 }
 
-async function listSessions(value: unknown): Promise<Result<SessionPage>> {
-  const normalized = normalizeListSessionsRequest(value == null ? undefined : value as ListSessionsRequest);
-  if (!normalized.ok) return normalized;
-  try { return await host.request({ type: 'list_sessions', ...normalized.data }) as Result<SessionPage>; }
-  catch { return fail(appError('host_request_failed', 'runtime', 'Session 列表无法读取。', true)); }
+async function listSessions(raw?: unknown): Promise<Result<SessionPage>> {
+  const input = normalizeListSessionsRequest(raw);
+  if (!input.ok) return input;
+  try { return await host.request({ type: 'list_sessions', input: input.data }) as Result<SessionPage>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session 列表暂不可用。', true)); }
 }
 
 async function querySession(value: unknown): Promise<Result<SessionSnapshot>> {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Session ID 无效。'));
   try { return await host.request({ type: 'query_session', sessionId: Number(value) }) as Result<SessionSnapshot>; }
-  catch { return fail(appError('host_request_failed', 'runtime', 'Session 查询未能提交给 Bun Host。', true)); }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session 查询暂不可用。', true)); }
 }
 
-async function listSessionRuns(value: unknown): Promise<Result<SessionRunsPage>> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some((key) => !['sessionId', 'beforeRunId', 'limit'].includes(key))
-    || !Number.isSafeInteger((value as SessionRunsRequest).sessionId) || (value as SessionRunsRequest).sessionId <= 0
-    || ((value as SessionRunsRequest).beforeRunId !== undefined && (!Number.isSafeInteger((value as SessionRunsRequest).beforeRunId) || (value as SessionRunsRequest).beforeRunId! <= 0))
-    || ((value as SessionRunsRequest).limit !== undefined && (!Number.isSafeInteger((value as SessionRunsRequest).limit) || (value as SessionRunsRequest).limit! < 1 || (value as SessionRunsRequest).limit! > 100))) {
-    return fail(appError('input_invalid', 'input', 'Session Run 列表参数无效。'));
+async function listSessionRuns(raw: unknown): Promise<Result<SessionRunsPage>> {
+  const input = normalizeSessionRunsRequest(raw);
+  if (!input.ok) return input;
+  try { return await host.request({ type: 'list_session_runs', input: input.data }) as Result<SessionRunsPage>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session Run 历史暂不可用。', true)); }
+}
+
+async function queryPromptTrace(runIdRaw: unknown, sequenceRaw?: unknown): Promise<Result<PromptTraceResult>> {
+  if (!Number.isSafeInteger(runIdRaw) || Number(runIdRaw) <= 0
+    || (sequenceRaw !== undefined && (!Number.isSafeInteger(sequenceRaw) || Number(sequenceRaw) <= 0))) {
+    return fail(appError('input_invalid', 'input', 'Prompt Trace 查询参数无效。'));
   }
-  try { return await host.request({ type: 'list_session_runs', ...(value as SessionRunsRequest) }) as Result<SessionRunsPage>; }
-  catch { return fail(appError('host_request_failed', 'runtime', 'Session Run 列表无法读取。', true)); }
+  try {
+    return await host.request({ type: 'query_prompt_trace', runId: Number(runIdRaw), ...(sequenceRaw === undefined ? {} : { callSequence: Number(sequenceRaw) }) }) as Result<PromptTraceResult>;
+  } catch {
+    return { ok: true, data: { availability: 'source-unavailable', calls: [], droppedCalls: null } };
+  }
 }
 
-function validStartAgentRun(value: unknown): value is StartAgentRunInput {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const input = value as Partial<StartAgentRunInput>;
-  return Object.keys(value).every((key) => ['requestId', 'sessionId', 'text', 'modelId'].includes(key))
-    && typeof input.requestId === 'string' && /^[a-zA-Z0-9._-]{1,128}$/.test(input.requestId)
-    && Number.isSafeInteger(input.sessionId) && input.sessionId! > 0
-    && typeof input.text === 'string' && new TextEncoder().encode(input.text).byteLength <= 65_536
-    && typeof input.modelId === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(input.modelId);
-}
-
-async function startAgentRun(value: unknown): Promise<Result<StartAgentRunResult>> {
-  if (!validStartAgentRun(value) || !value.text.trim()) return fail(appError('input_invalid', 'input', 'Agent Run 参数无效。'));
+async function startRun(raw: unknown): Promise<Result<RunAccepted & { requestId: string }>> {
+  if (!isDesktopAgentRunRequest(raw)) return fail(appError('input_invalid', 'input', 'Agent Run 参数无效。'));
   const state = await readDesktopState();
   if (!state.ok) return state;
   if (!state.data.ready) return fail(appError(hostErrorCode, 'runtime', 'Bun Host 尚未就绪。', true));
-  const model = state.data.settings.models.find((item) => item.id === value.modelId);
-  if (!model) return fail(appError('model_not_configured', 'input', '所选模型配置不存在。'));
-  const credential = await credentialStore(model.credentialRef).read();
+  const profile = state.data.settings.models.find((item) => item.id === raw.modelId);
+  if (!profile) return fail(appError('model_not_configured', 'input', '所选模型配置不存在。'));
+  const store = credentialStore(profile.credentialRef);
+  const credential = await store.read();
   if (!credential.ok) return credential;
   if (!credential.data) return fail(appError('model_credential_missing', 'input', '请先保存该模型的 API Key。'));
+
+  const requestId = randomUUID();
+  let apiKey = credential.data;
   try {
-    const result = await host.request({
-      type: 'start_agent_run', requestId: value.requestId,
-      input: { sessionId: value.sessionId, text: value.text, modelId: value.modelId },
-      apiKey: credential.data,
-    }, 15_000) as Result<RunAccepted & { accepted: true; requestId: string }>;
-    if (!result.ok) return result;
-    if (!result.data.accepted || result.data.requestId !== value.requestId || result.data.sessionId !== value.sessionId || !Number.isSafeInteger(result.data.runId)) {
+    const value = await host.request({
+      type: 'start_run',
+      requestId,
+      input: raw,
+      apiKey,
+      expectedSettingsRevision: state.data.settings.revision,
+      expectedCredentialRef: profile.credentialRef,
+    }, 15_000) as Result<RunAccepted & { requestId: string }>;
+    if (!value.ok) return value;
+    if (value.data.requestId !== requestId || !Number.isSafeInteger(value.data.runId) || value.data.runId <= 0 || value.data.sessionId !== raw.sessionId) {
       return fail(appError('host_protocol_invalid', 'runtime', 'Bun Host 返回的 Agent Run 关联无效。'));
     }
-    return { ok: true, data: { requestId: result.data.requestId, runId: result.data.runId, sessionId: result.data.sessionId } };
-  } catch { return fail(appError('host_request_failed', 'runtime', 'Agent Run 未能提交给 Bun Host。', true)); }
+    return value;
+  } catch {
+    return fail(appError('operation_result_unknown', 'runtime', 'Agent Run 受理结果未知。请查询 Session Runs 与 Runtime 状态，不要重新发送。', true));
+  } finally {
+    apiKey = '';
+  }
 }
 
 async function cancelRun(value: unknown): Promise<Result<{ accepted: boolean; runId: number }>> {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
   try { return await host.request({ type: 'cancel_run', runId: Number(value) }) as Result<{ accepted: boolean; runId: number }>; }
-  catch { return fail(appError('host_request_failed', 'runtime', 'Run 取消未能提交给 Bun Host。', true)); }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Stop 命令未能提交给 Bun Host。', true)); }
 }
 
 async function queryRuntimeState(): Promise<Result<RuntimeState>> {
   try { return await host.request({ type: 'query_runtime_state' }) as Result<RuntimeState>; }
-  catch { return fail(appError('host_request_failed', 'runtime', 'Runtime 状态无法读取。', true)); }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Runtime 状态暂不可用。', true)); }
+}
+
+function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunRequest {
+  if (!value || typeof value !== 'object') return false;
+  const request = value as Partial<DesktopAgentRunRequest>;
+  return Number.isSafeInteger(request.sessionId) && Number(request.sessionId) > 0
+    && typeof request.text === 'string' && request.text.trim().length > 0
+    && new TextEncoder().encode(request.text).byteLength <= 65_536
+    && typeof request.modelId === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(request.modelId)
+    && (request.timeoutMs === undefined || Number.isInteger(request.timeoutMs) && request.timeoutMs >= 100 && request.timeoutMs <= 120_000);
 }
 
 function credentialStore(reference: string): CredentialStore {

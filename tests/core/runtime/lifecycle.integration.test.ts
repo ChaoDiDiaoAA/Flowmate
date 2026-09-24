@@ -434,10 +434,13 @@ describe('RuntimeService lifecycle', () => {
     const db = openDatabase(paths(root));
     expect(db.ok).toBe(true);
     if (!db.ok) return;
-    const runs: RunRepository = {
-      ...db.data.runs,
-      recordCancel: (runId) => ({ ok: false, error: { code: 'storage_write_failed', category: 'storage', message: '模拟取消记录失败。', retryable: true, runId } }),
-    };
+    const runs: RunRepository = new Proxy(db.data.runs, {
+      get(target, key, receiver) {
+        if (key === 'recordCancel') return (runId: number) => ({ ok: false, error: { code: 'storage_write_failed', category: 'storage', message: '模拟取消记录失败。', retryable: true, runId } });
+        const value = Reflect.get(target, key, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
     const service = new RuntimeService({
       runs,
       provider: new ControlledProvider('abort'),
@@ -461,8 +464,7 @@ describe('RuntimeService lifecycle', () => {
         expect(saved.data.stoppedAt).not.toBeNull();
       }
     }
-    const state = await service.queryRuntimeState();
-    expect(state.ok && state.data.blocked).toBe(false);
+    expect(service.state()).toMatchObject({ blocked: false });
     expect((await service.close()).closed).toBe(true);
     db.data.close();
   });

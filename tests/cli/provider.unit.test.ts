@@ -24,7 +24,7 @@ describe('P1 CLI provider commands', () => {
     const inputFile = join(root, 'invoice.txt');
     await writeFile(configFile, JSON.stringify(config), 'utf8');
     await writeFile(inputFile, '合成发票', 'utf8');
-    const app: Application = {
+    const app = {
       callProvider: mock(async () => ({ ok: true as const, data: { runId: 3, status: 'completed' as const, text: '完成', error: null, stopped: true, cleanupErrors: [] } })),
       queryRun: mock(),
       close: mock(),
@@ -57,7 +57,7 @@ describe('P1 CLI provider commands', () => {
       FLOWMATE_LLM_API: 'openai-completions',
     });
     const callProvider = mock(async () => ({ ok: true as const, data: { runId: 5, status: 'completed' as const, text: '完成', error: null, stopped: true, cleanupErrors: [] } }));
-    const app: Application = {
+    const app = {
       callProvider,
       queryRun: mock(),
       close: mock(),
@@ -87,7 +87,7 @@ describe('P1 CLI provider commands', () => {
     const inputFile = join(root, 'invoice.txt');
     await writeFile(configFile, JSON.stringify(config), 'utf8');
     await writeFile(inputFile, '合成发票', 'utf8');
-    const app: Application = {
+    const app = {
       callProvider: mock(async () => ({ ok: true as const, data: { runId: 4, status: 'failed' as const, text: '', error: { code: 'provider_auth_failed', category: 'provider' as const, message: 'Provider 认证失败。', retryable: false }, stopped: true, cleanupErrors: [] } })),
       queryRun: mock(async () => ({ ok: true as const, data: { runId: 4, status: 'failed' as const, error: { code: 'provider_auth_failed', category: 'provider' as const, message: 'Provider 认证失败。', retryable: false } } as never })),
       close: mock(),

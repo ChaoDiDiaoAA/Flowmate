@@ -2,7 +2,6 @@ import {
   type Api,
   type AssistantMessage,
   type AssistantMessageEvent,
-  type CredentialStore,
   type FetchFunction,
   type Model,
 } from '@earendil-works/pi-ai';
@@ -11,11 +10,10 @@ import { appError, fail, ok } from '@flowmate/contracts';
 import type {
   ProviderConfig,
   Result,
-  UsageRecord,
-  SdkUsageValues,
-  TokenColumns,
 } from '@flowmate/contracts';
-import { prepareModelRuntime, safeModelUrl } from './model-runtime.ts';
+import { normalizeUsage, prepareModelRuntime, safeUrl } from './model-runtime.ts';
+import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
+export type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import type {
   NativeInput,
   NativeObservation,
@@ -23,17 +21,6 @@ import type {
   PreparedProvider,
   ProviderPort,
 } from '@flowmate/contracts';
-
-export type PiProviderDependencies = {
-  credentials?: CredentialStore;
-  fetch?: FetchLike;
-  witness?: (value: Readonly<Record<string, unknown>>) => void;
-  runtimeApiKey?: string;
-  runtimeApiKeyFor?: (config: ProviderConfig) => string | undefined;
-};
-
-/** A portable fetch shape; Bun's optional `preconnect` property is not needed by Pi. */
-export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 type FetchFacts = {
   attempts: number;
@@ -50,63 +37,6 @@ function normalizeText(message: AssistantMessage): string {
     .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
     .map((part) => part.text)
     .join('');
-}
-
-function emptySdkUsage(): SdkUsageValues {
-  return {
-    input: null,
-    output: null,
-    cacheRead: null,
-    cacheWrite: null,
-    totalTokens: null,
-    costInput: null,
-    costOutput: null,
-    costCacheRead: null,
-    costCacheWrite: null,
-    costTotal: null,
-  };
-}
-
-function normalizeUsage(
-  message: AssistantMessage,
-  facts: FetchFacts,
-  canVerifyCost: boolean,
-): { usage: UsageRecord; tokens: TokenColumns } {
-  const raw = message.usage;
-  const values: SdkUsageValues = {
-    input: Number.isFinite(raw.input) ? raw.input : null,
-    output: Number.isFinite(raw.output) ? raw.output : null,
-    cacheRead: Number.isFinite(raw.cacheRead) ? raw.cacheRead : null,
-    cacheWrite: Number.isFinite(raw.cacheWrite) ? raw.cacheWrite : null,
-    totalTokens: Number.isFinite(raw.totalTokens) ? raw.totalTokens : null,
-    costInput: Number.isFinite(raw.cost.input) ? raw.cost.input : null,
-    costOutput: Number.isFinite(raw.cost.output) ? raw.cost.output : null,
-    costCacheRead: Number.isFinite(raw.cost.cacheRead) ? raw.cost.cacheRead : null,
-    costCacheWrite: Number.isFinite(raw.cost.cacheWrite) ? raw.cost.cacheWrite : null,
-    costTotal: Number.isFinite(raw.cost.total) ? raw.cost.total : null,
-  };
-  const reported = [values.input, values.output, values.cacheRead, values.cacheWrite, values.totalTokens]
-    .some((value) => value !== null && value > 0);
-  const known = reported && facts.complete;
-  const costKnown = known && canVerifyCost && values.costTotal !== null;
-  const usage: UsageRecord = {
-    version: 1,
-    source: known ? 'sdk' : 'unknown',
-    reason: known ? null : facts.requestStarted ? 'sdk-zero-or-missing-presence-proof' : 'request-not-started',
-    sdkValues: known ? values : (facts.requestStarted ? values : null),
-    attempts: facts.attempts > 0 ? facts.attempts : null,
-    attemptsComplete: facts.complete,
-    costSource: costKnown ? 'pi-sdk-model-catalog-estimate' : null,
-    updatedAt: new Date().toISOString(),
-  };
-  const tokens: TokenColumns = {
-    inputTokens: known ? values.input : null,
-    outputTokens: known ? values.output : null,
-    totalTokens: known ? values.totalTokens : null,
-    cost: costKnown ? String(values.costTotal) : null,
-    usageComplete: known,
-  };
-  return { usage, tokens };
 }
 
 function mapPiFailure(
@@ -188,9 +118,9 @@ export class PiProviderAdapter implements ProviderPort {
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
   ): Promise<Result<PreparedProvider>> {
-    const preparedModel = await prepareModelRuntime(config, limits, signal, this.dependencies);
-    if (!preparedModel.ok) return preparedModel;
-    const { runtime, model, snapshot } = preparedModel.data;
+    const prepared = await prepareModelRuntime(config, limits, signal, this.dependencies);
+    if (!prepared.ok) return prepared;
+    const { runtime, model, snapshot } = prepared.data;
 
     return ok({
       snapshot,
@@ -242,8 +172,8 @@ export class PiProviderAdapter implements ProviderPort {
       facts.attempts += 1;
       facts.requestStarted = true;
       const requestUrl = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url;
-      this.dependencies.witness?.({ type: 'fetch_entered', attempt: facts.attempts, url: safeModelUrl(requestUrl), at: new Date().toISOString() });
-      observe({ type: 'request_dispatched', at: new Date().toISOString(), monotonicMs: performance.now(), data: { attempt: facts.attempts, url: safeModelUrl(requestUrl) } });
+      this.dependencies.witness?.({ type: 'fetch_entered', attempt: facts.attempts, url: safeUrl(requestUrl), at: new Date().toISOString() });
+      observe({ type: 'request_dispatched', at: new Date().toISOString(), monotonicMs: performance.now(), data: { attempt: facts.attempts, url: safeUrl(requestUrl) } });
       try {
         const response = await baseFetch(request, init);
         facts.responseStatus = response.status;

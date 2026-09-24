@@ -9,6 +9,7 @@
         "@earendil-works/pi-coding-agent": "0.85.1",
         "@flowmate/contracts": "workspace:*",
         "@flowmate/core": "workspace:*",
+        "@flowmate/logging": "workspace:*",
         "@flowmate/runtime-pi": "workspace:*",
         "@flowmate/shared": "workspace:*",
         "proper-lockfile": "4.1.2",
@@ -67,10 +68,17 @@
         "@flowmate/shared": "workspace:*",
       },
     },
+    "packages/logging": {
+      "name": "@flowmate/logging",
+      "dependencies": {
+        "@flowmate/contracts": "workspace:*",
+      },
+    },
     "packages/runtime-pi": {
       "name": "@flowmate/runtime-pi",
       "dependencies": {
         "@flowmate/contracts": "workspace:*",
+        "@flowmate/logging": "workspace:*",
       },
     },
     "packages/shared": {
@@ -248,6 +256,8 @@
     "@flowmate/contracts": ["@flowmate/contracts@workspace:packages/contracts"],
 
     "@flowmate/core": ["@flowmate/core@workspace:packages/core"],
+
+    "@flowmate/logging": ["@flowmate/logging@workspace:packages/logging"],
 
     "@flowmate/runtime-pi": ["@flowmate/runtime-pi@workspace:packages/runtime-pi"],
 

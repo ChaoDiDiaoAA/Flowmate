@@ -82,8 +82,7 @@ export type ProviderObservationType =
   | 'stop_requested'
   | 'cancel_requested'
   | 'native_terminal'
-  | 'stopped'
-  | 'agent_event';
+  | 'stopped';
 
 export type ProviderObservation = {
   runId: DbId;
@@ -146,56 +145,6 @@ export type OutputRecord = {
   stopReason: string;
   responseId: string | null;
   responseModel: string | null;
-  agent?: { nativeSessionId: string; turnCount: number; modelCallCount: number };
-};
-
-export type ChatScope = {
-  version: 1;
-  mode: 'chat-text';
-  toolNames: [];
-  resourcePaths: [];
-};
-
-export type AgentConfigFacts = {
-  policyVersion: 'p2-invoice-chat-v1';
-  nativeSessionId: string;
-  systemPrompt: string;
-  thinkingLevel: 'off';
-  resourcePolicy: 'none';
-  historyPolicy: 'memory-only';
-  maxContextBytes: number;
-  maxOutputBytes: number;
-  maxAssistantContentBytes: number;
-  maxModelCalls: 1;
-  sessionRetry: false;
-};
-
-export type SessionAvailability = 'ready' | 'busy' | 'unusable' | 'history-unavailable' | 'archived';
-
-export type SessionSnapshot = {
-  sessionId: DbId;
-  nativeSessionId: string;
-  title: string;
-  status: 'active' | 'archived';
-  createdAt: string;
-  updatedAt: string;
-  availability: SessionAvailability;
-  activeRunId: DbId | null;
-};
-
-export type CreateSessionRequest = { title?: string };
-export type ListSessionsRequest = { limit?: number; before?: { updatedAt: string; sessionId: DbId } };
-export type SessionPage = { items: SessionSnapshot[]; next: { updatedAt: string; sessionId: DbId } | null };
-export type SessionRunsRequest = { sessionId: DbId; beforeRunId?: DbId; limit?: number };
-export type SessionRunsPage = { items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null };
-export type AgentRunRequest = { sessionId: DbId; text: string; config: ProviderConfig; timeoutMs?: number; stopGraceMs?: number };
-export type NormalizedAgentRunRequest = AgentRunRequest & { timeoutMs: number; stopGraceMs: number; goal: string };
-export type RunAccepted = { runId: DbId; sessionId: DbId };
-export type AgentOutcome = ProviderOutcome & { sessionId: DbId; nativeSessionId: string };
-export type RuntimeState = {
-  active: { runId: DbId; sessionId: DbId | null; kind: 'provider' | 'agent' } | null;
-  blocked: boolean;
-  error: AppError | null;
 };
 
 export type CleanupRecord = {
@@ -214,6 +163,82 @@ export type ProviderOutcome = {
   stopped: boolean;
   cleanupErrors: readonly AppError[];
 };
+
+export type ChatScope = {
+  version: 1;
+  mode: 'chat-text';
+  toolNames: [];
+  resourcePaths: [];
+};
+
+export type SessionAvailability = 'ready' | 'busy' | 'unusable' | 'history-unavailable' | 'archived';
+export type SessionStatus = 'active' | 'archived';
+
+export type BoundModel = {
+  provider: string;
+  model: string;
+  api: string;
+  endpoint: string;
+};
+
+export type SessionSnapshot = {
+  sessionId: DbId;
+  nativeSessionId: string;
+  title: string;
+  status: SessionStatus;
+  createdAt: string;
+  updatedAt: string;
+  availability: SessionAvailability;
+  activeRunId: DbId | null;
+  boundModel: BoundModel | null;
+};
+
+export type CreateSessionRequest = { title?: string };
+
+export type SessionCursor = { updatedAt: string; sessionId: DbId };
+export type ListSessionsRequest = { limit?: number; before?: SessionCursor };
+export type NormalizedListSessionsRequest = { limit: number; before?: SessionCursor };
+export type SessionPage = { items: SessionSnapshot[]; next: SessionCursor | null };
+
+export type AgentRunRequest = {
+  sessionId: DbId;
+  text: string;
+  config: ProviderConfig;
+  timeoutMs?: number;
+  stopGraceMs?: number;
+};
+
+export type NormalizedAgentRunRequest = Omit<AgentRunRequest, 'timeoutMs' | 'stopGraceMs'> & {
+  timeoutMs: number;
+  stopGraceMs: number;
+};
+
+export type RunAccepted = { runId: DbId; sessionId: DbId };
+
+export type AgentOutcome = ProviderOutcome & { sessionId: DbId; nativeSessionId: string };
+
+export type RuntimeState = {
+  active: { runId: DbId; sessionId: DbId | null; kind: 'provider' | 'agent' } | null;
+  blocked: boolean;
+  error: AppError | null;
+};
+
+export type AgentRunEvent = {
+  runId: DbId;
+  sessionId: DbId;
+  nativeSessionId: string;
+  sequence: number;
+  at: string;
+} & (
+  | { type: 'run_progress'; phase: 'created' | 'running' | 'stopping'; reason?: string }
+  | { type: 'run_finished'; result: Result<AgentOutcome> }
+);
+
+export type AgentControl = { onEvent?: (event: AgentRunEvent) => void };
+
+export type SessionRunsRequest = { sessionId: DbId; beforeRunId?: DbId; limit?: number };
+export type NormalizedSessionRunsRequest = { sessionId: DbId; beforeRunId?: DbId; limit: number };
+export type SessionRunsPage = { items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null };
 
 export type RunSnapshotBase = {
   runId: DbId;
@@ -234,8 +259,18 @@ export type RunSnapshotBase = {
   stoppedAt: string | null;
 };
 
-export type ProviderRunSnapshot = RunSnapshotBase & { kind: 'provider'; sessionId: null; scope: null };
-export type AgentRunSnapshot = RunSnapshotBase & { kind: 'agent'; sessionId: DbId; scope: ChatScope };
+export type ProviderRunSnapshot = RunSnapshotBase & {
+  kind: 'provider';
+  sessionId: null;
+  scope: null;
+};
+
+export type AgentRunSnapshot = RunSnapshotBase & {
+  kind: 'agent';
+  sessionId: DbId;
+  scope: ChatScope;
+};
+
 export type RunSnapshot = ProviderRunSnapshot | AgentRunSnapshot;
 
 export type CloseReport = {
@@ -250,25 +285,13 @@ export interface Application {
     control?: ProviderControl,
   ): Promise<Result<ProviderOutcome>>;
   queryRun(runId: DbId): Promise<Result<RunSnapshot>>;
-  createSession(request: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
+  createSession(request?: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
   listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
   querySession(sessionId: DbId): Promise<Result<SessionSnapshot>>;
   listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>>;
+  queryPromptTrace(runId: DbId, callSequence?: number): Promise<Result<import('./diagnostics.ts').PromptTraceResult>>;
   startRun(request: AgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
   cancelRun(runId: DbId): Promise<Result<{ accepted: boolean; runId: DbId }>>;
   queryRuntimeState(): Promise<Result<RuntimeState>>;
   close(): Promise<Result<CloseReport>>;
 }
-
-export type AgentRunEvent = {
-  runId: DbId;
-  sessionId: DbId;
-  nativeSessionId: string;
-  sequence: number;
-  at: string;
-} & (
-  | { type: 'run_progress'; phase: 'created' | 'running' | 'stopping'; reason?: string }
-  | { type: 'run_finished'; result: Result<AgentOutcome> }
-);
-
-export type AgentControl = { onEvent?: (event: AgentRunEvent) => void };

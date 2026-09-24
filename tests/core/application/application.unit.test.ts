@@ -32,6 +32,9 @@ describe('Application composition', () => {
     const report: CloseReport = { stopped: true, closed: true, errors: [] };
     const runtime = {
       callProvider: mock(async () => ok(outcome)),
+      start: mock(async () => ok({ runId: 7, sessionId: 1 })),
+      cancel: mock((runId: number) => ok({ runId, accepted: false })),
+      state: mock(() => ({ active: null, blocked: false, error: null })),
       close: mock(async () => report),
     };
     const runs = { get: mock(() => ok(snapshot)) };
@@ -52,6 +55,9 @@ describe('Application composition', () => {
     let closeAttempts = 0;
     const runtime = {
       callProvider: mock(async () => ok({ runId: 7, status: 'failed' as const, text: '', error: null, stopped: false, cleanupErrors: [] })),
+      start: mock(async () => ok({ runId: 7, sessionId: 1 })),
+      cancel: mock((runId: number) => ok({ runId, accepted: false })),
+      state: mock(() => ({ active: null, blocked: false, error: null })),
       close: mock(async () => {
         closeAttempts += 1;
         return closeAttempts === 1
@@ -76,7 +82,13 @@ describe('Application composition', () => {
 
   it('preserves a resource disposal failure when a later close succeeds', async () => {
     const report = { stopped: true, closed: true, errors: [] } satisfies CloseReport;
-    const runtime = { callProvider: mock(async () => ok({} as never)), close: mock(async () => report) };
+    const runtime = {
+      callProvider: mock(async () => ok({} as never)),
+      start: mock(async () => ok({ runId: 1, sessionId: 1 })),
+      cancel: mock((runId: number) => ok({ runId, accepted: false })),
+      state: mock(() => ({ active: null, blocked: false, error: null })),
+      close: mock(async () => report),
+    };
     let disposeAttempts = 0;
     const dispose = mock(async () => {
       disposeAttempts += 1;
