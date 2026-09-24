@@ -451,11 +451,19 @@ describe('RuntimeService lifecycle', () => {
     controller.abort();
     const result = await pending;
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe('storage_write_failed');
-    const retry = await service.callProvider(request);
-    expect(retry.ok).toBe(false);
-    if (!retry.ok) expect(retry.error.code).toBe('runtime_unusable');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data.status).toBe('cancelled');
+      const saved = db.data.runs.get(result.data.runId);
+      expect(saved.ok).toBe(true);
+      if (saved.ok) {
+        expect(saved.data.cancelRequestedAt).not.toBeNull();
+        expect(saved.data.stoppedAt).not.toBeNull();
+      }
+    }
+    const state = await service.queryRuntimeState();
+    expect(state.ok && state.data.blocked).toBe(false);
+    expect((await service.close()).closed).toBe(true);
     db.data.close();
   });
 

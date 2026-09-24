@@ -1,6 +1,10 @@
 import type {
   AppError,
+  AgentConfigFacts,
+  AgentRunRequest,
+  ChatScope,
   CloseReport,
+  DbId,
   ModelRef,
   ProviderConfig,
   Result,
@@ -29,7 +33,7 @@ export type NativeInput = {
 };
 
 export type NativeObservation = {
-  type: 'model_request' | 'request_budget' | 'request_dispatched' | 'response_started' | 'text_delta' | 'native_terminal';
+  type: 'model_request' | 'request_budget' | 'request_dispatched' | 'response_started' | 'text_delta' | 'native_terminal' | 'agent_event';
   at: string;
   monotonicMs: number;
   data: Readonly<Record<string, unknown>>;
@@ -64,5 +68,22 @@ export interface ProviderPort {
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
   ): Promise<Result<PreparedProvider>>;
+  close(): Promise<CloseReport>;
+}
+
+export type AgentConfigSnapshot = SafeConfigSnapshot & { agent: AgentConfigFacts };
+export type AgentNativeOutcome = NativeOutcome & { agent: { nativeSessionId: string; turnCount: number; modelCallCount: number } };
+export type AgentExecutionInput = NativeInput & { runId: DbId; sessionId: DbId };
+
+export interface PreparedAgent {
+  snapshot: AgentConfigSnapshot;
+  execute(input: AgentExecutionInput, signal: AbortSignal, observe: (event: NativeObservation) => void): Promise<AgentNativeOutcome>;
+}
+
+export interface AgentPort {
+  createSession(): Result<{ nativeSessionId: string }>;
+  inspect(nativeSessionId: string): { availability: 'ready' | 'busy' | 'unusable' | 'missing' };
+  prepare(nativeSessionId: string, config: AgentRunRequest['config'], limits: { timeoutMs: number; stopGraceMs: number }, signal: AbortSignal): Promise<Result<PreparedAgent>>;
+  releaseSession(nativeSessionId: string): Promise<CloseReport>;
   close(): Promise<CloseReport>;
 }

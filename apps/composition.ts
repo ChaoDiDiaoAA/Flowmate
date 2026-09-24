@@ -1,14 +1,15 @@
 import { makeApplication, RuntimeService, openDatabase } from '@flowmate/core';
-import { PiProviderAdapter } from '@flowmate/runtime-pi';
+import { PiAgentAdapter, PiProviderAdapter } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger, resolveProductPaths, resolveWindowsUserData } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
 import type { Application, ProductPaths, Result } from '@flowmate/contracts';
-import type { ProviderPort } from '@flowmate/contracts';
+import type { AgentPort, ProviderPort } from '@flowmate/contracts';
 import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
   paths: ProductPaths;
   provider?: ProviderPort;
+  agent?: AgentPort;
   logger?: SafeLogger;
 };
 
@@ -29,11 +30,14 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     return { ok: false, error: appError('logger_init_failed', 'runtime', '运行日志初始化失败。', true) };
   }
   const provider = options.provider ?? new PiProviderAdapter();
+  const agent = options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir });
   let loggerClosed = false;
   let databaseClosed = false;
   const runtime = new RuntimeService({
     runs: database.data.runs,
+    sessions: database.data.sessions,
     provider,
+    agent,
     log: logger,
     now: () => new Date().toISOString(),
     monotonicNow: () => performance.now(),

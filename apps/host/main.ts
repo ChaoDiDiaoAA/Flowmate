@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline';
 import { appError, fail, normalizeProviderRequest, ok } from '@flowmate/contracts';
 import type { Application, DesktopState, ProductSettings } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings } from '@flowmate/core';
-import { PiProviderAdapter } from '@flowmate/runtime-pi';
+import { PiAgentAdapter, PiProviderAdapter } from '@flowmate/runtime-pi';
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
 import { parseHostCommand } from './protocol.ts';
@@ -64,6 +64,7 @@ async function runHost(userDataRoot: string): Promise<void> {
   const created = await createApplication({
     paths,
     provider: new PiProviderAdapter({ runtimeApiKeyFor: (config) => activeKeys.get(config.modelRef.provider) }),
+    agent: new PiAgentAdapter({ cwd: paths.runtimeDir, runtimeApiKeyFor: (config) => activeKeys.get(config.modelRef.provider) }),
   });
   if (!created.ok) {
     send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> });
@@ -107,6 +108,30 @@ async function runHost(userDataRoot: string): Promise<void> {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryRun(command.runId) });
       return;
     }
+    if (command.type === 'create_session') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.createSession({ ...(command.title ? { title: command.title } : {}) }) });
+      return;
+    }
+    if (command.type === 'list_sessions') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listSessions({ limit: command.limit, before: command.before }) });
+      return;
+    }
+    if (command.type === 'query_session') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.querySession(command.sessionId) });
+      return;
+    }
+    if (command.type === 'list_session_runs') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listSessionRuns(command) });
+      return;
+    }
+    if (command.type === 'query_runtime_state') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryRuntimeState() });
+      return;
+    }
+    if (command.type === 'cancel_run') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.cancelRun(command.runId) });
+      return;
+    }
     if (command.type === 'cancel_provider') {
       const target = active.get(command.targetRequestId);
       if (target && !target.controller.signal.aborted) target.controller.abort();
@@ -136,18 +161,7 @@ async function runHost(userDataRoot: string): Promise<void> {
         return;
       }
       const providerId = `flowmate-profile-${profile.id}`;
-      const config = {
-        version: 1 as const,
-        name: `desktop-${profile.name}`,
-        revision: Math.max(1, currentSettings.revision),
-        modelRef: { provider: providerId, model: profile.model },
-        native: { authPath: authFile, modelsPath: null },
-        connection: { baseUrl: profile.baseUrl, api: profile.api },
-        parameters: {
-          maxRetries: 0,
-          maxRetryDelayMs: 2000,
-        },
-      };
+      const config = configForProfile(profile);
       const normalized = normalizeProviderRequest({
         goal: command.input.goal,
         text: command.input.text,
@@ -186,7 +200,66 @@ async function runHost(userDataRoot: string): Promise<void> {
       }
       return;
     }
+    if (command.type === 'start_agent_run') {
+      if (recentlySeen.has(command.requestId)) {
+        send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('request_duplicate', 'input', '该请求身份已使用，未重复执行。')) });
+        return;
+      }
+      recentlySeen.add(command.requestId);
+      seenOrder.push(command.requestId);
+      if (seenOrder.length > 4096) recentlySeen.delete(seenOrder.shift()!);
+      const profile = currentSettings.models.find((model) => model.id === command.input.modelId);
+      if (!profile) {
+        send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('model_not_configured', 'input', '所选模型配置不存在。')) });
+        return;
+      }
+      const providerId = `flowmate-profile-${profile.id}`;
+      activeKeys.set(providerId, command.apiKey);
+      let accepted = false;
+      const deferred: Array<Extract<HostOutput, { type: 'event' }>['event']> = [];
+      const publish = (event: Extract<HostOutput, { type: 'event' }>['event']) => {
+        if (accepted) send({ version: 1, type: 'event', event });
+        else deferred.push(event);
+      };
+      try {
+        const result = await application.startRun({
+          sessionId: command.input.sessionId,
+          text: command.input.text,
+          config: configForProfile(profile),
+          ...(command.input.timeoutMs === undefined ? {} : { timeoutMs: command.input.timeoutMs }),
+        }, { onEvent(event) {
+          if (event.type === 'run_finished') activeKeys.delete(providerId);
+          publish(event.type === 'run_finished'
+            ? { type: 'agent_finished', requestId: command.requestId, event }
+            : { type: 'agent_observation', requestId: command.requestId, event });
+        } });
+        if (!result.ok) {
+          activeKeys.delete(providerId);
+          send({ version: 1, type: 'response', requestId: command.requestId, value: result });
+          return;
+        }
+        send({ version: 1, type: 'response', requestId: command.requestId, value: ok({ ...result.data, accepted: true, requestId: command.requestId }) });
+        accepted = true;
+        for (const event of deferred) send({ version: 1, type: 'event', event });
+      } catch {
+        if (!accepted) activeKeys.delete(providerId);
+        throw new Error('agent_run_dispatch_failed');
+      }
+      return;
+    }
   };
+
+  function configForProfile(profile: ProductSettings['models'][number]) {
+    return {
+      version: 1 as const,
+      name: `desktop-${profile.name}`,
+      revision: Math.max(1, currentSettings.revision),
+      modelRef: { provider: `flowmate-profile-${profile.id}`, model: profile.model },
+      native: { authPath: authFile, modelsPath: null },
+      connection: { baseUrl: profile.baseUrl, api: profile.api },
+      parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
+    };
+  }
 
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   input.on('line', (line) => {

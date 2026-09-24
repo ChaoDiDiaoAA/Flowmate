@@ -28,7 +28,7 @@ describe('P1 CLI provider commands', () => {
       callProvider: mock(async () => ({ ok: true as const, data: { runId: 3, status: 'completed' as const, text: '完成', error: null, stopped: true, cleanupErrors: [] } })),
       queryRun: mock(),
       close: mock(),
-    };
+    } as unknown as Application;
     const output = io();
 
     const code = await providerCommand({ configFile, inputFile, goal: '概述' }, app, output);
@@ -61,7 +61,7 @@ describe('P1 CLI provider commands', () => {
       callProvider,
       queryRun: mock(),
       close: mock(),
-    };
+    } as unknown as Application;
     const output = io();
     try {
       await expect(providerCommand({ inputFile, goal: '概述' }, app, output)).resolves.toBe(0);
@@ -91,7 +91,7 @@ describe('P1 CLI provider commands', () => {
       callProvider: mock(async () => ({ ok: true as const, data: { runId: 4, status: 'failed' as const, text: '', error: { code: 'provider_auth_failed', category: 'provider' as const, message: 'Provider 认证失败。', retryable: false }, stopped: true, cleanupErrors: [] } })),
       queryRun: mock(async () => ({ ok: true as const, data: { runId: 4, status: 'failed' as const, error: { code: 'provider_auth_failed', category: 'provider' as const, message: 'Provider 认证失败。', retryable: false } } as never })),
       close: mock(),
-    };
+    } as unknown as Application;
     const output = io();
 
     await expect(providerCommand({ configFile, inputFile, goal: '概述' }, app, output)).resolves.toBe(1);

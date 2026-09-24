@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test';
-import { makeApplication } from '../../../packages/core/src/application.ts';
+import { makeApplication, type RuntimeServicePort } from '../../../packages/core/src/application.ts';
 import { ok } from '../../../packages/contracts/src/errors.ts';
 import type { Application, CloseReport, ProviderRequest, RunSnapshot } from '../../../packages/contracts/src/runtime.ts';
 
@@ -37,7 +37,7 @@ describe('Application composition', () => {
     const runs = { get: mock(() => ok(snapshot)) };
     const dispose = mock(async () => report);
 
-    const app: Application = makeApplication(runtime, runs, dispose);
+    const app: Application = makeApplication(runtime as unknown as RuntimeServicePort, runs, dispose);
 
     await expect(app.callProvider(request)).resolves.toEqual({ ok: true, data: outcome });
     await expect(app.queryRun(7)).resolves.toEqual({ ok: true, data: snapshot });
@@ -61,7 +61,7 @@ describe('Application composition', () => {
     };
     const runs = { get: mock(() => ok({} as RunSnapshot)) };
     const dispose = mock(async () => ({ stopped: true, closed: true, errors: [] }));
-    const app = makeApplication(runtime, runs, dispose);
+    const app = makeApplication(runtime as unknown as RuntimeServicePort, runs, dispose);
 
     const first = await app.close();
     const second = await app.close();
@@ -83,7 +83,7 @@ describe('Application composition', () => {
       if (disposeAttempts === 1) throw new Error('sensitive filesystem detail');
       return report;
     });
-    const app = makeApplication(runtime, { get: mock(() => ok({} as RunSnapshot)) }, dispose);
+    const app = makeApplication(runtime as unknown as RuntimeServicePort, { get: mock(() => ok({} as RunSnapshot)) }, dispose);
 
     const first = await app.close();
     const second = await app.close();

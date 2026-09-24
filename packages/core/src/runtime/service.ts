@@ -1,13 +1,31 @@
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
   AppError,
+  AgentControl,
+  AgentExecutionInput,
+  AgentNativeOutcome,
+  AgentOutcome,
+  AgentRunEvent,
+  AgentRunRequest,
+  AgentRunSnapshot,
+  AgentConfigFacts,
+  AgentConfigSnapshot,
+  ChatScope,
+  CreateSessionRequest,
   Application,
   CloseReport,
   ProviderControl,
   ProviderOutcome,
   ProviderRequest,
   Result,
+  RunAccepted,
   RunSnapshot,
+  RuntimeState,
+  SessionPage,
+  SessionRunsPage,
+  SessionRunsRequest,
+  SessionSnapshot,
+  ListSessionsRequest,
 } from '@flowmate/contracts';
 import type {
   CleanupRecord,
@@ -19,11 +37,15 @@ import type {
 } from '@flowmate/contracts';
 import type {
   NativeOutcome,
+  AgentPort,
+  PreparedAgent,
   PreparedProvider,
   ProviderPort,
   SafeConfigSnapshot,
 } from '@flowmate/contracts';
-import type { RunRepository, TerminalWrite } from '../storage/repositories.ts';
+import type { RunRepository, SessionRepository, TerminalWrite } from '../storage/repositories.ts';
+import { SessionService } from '../sessions/service.ts';
+import { INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, normalizeAgentRunRequest, normalizeCreateSessionRequest, normalizeListSessionsRequest } from '@flowmate/contracts';
 
 export interface RuntimeLogger {
   write(event: { at: string; level: 'info' | 'warn' | 'error'; component: string; runId?: number; event: string; code?: string }): void;
@@ -33,6 +55,8 @@ export interface RuntimeLogger {
 export type RuntimeDependencies = {
   runs: RunRepository;
   provider: ProviderPort;
+  agent?: AgentPort;
+  sessions?: SessionRepository;
   log: RuntimeLogger;
   now: () => string;
   monotonicNow: () => number;
@@ -43,6 +67,9 @@ type StopIntent = { reason: StopReason; at: string; monotonicMs: number };
 
 type ActiveCall = {
   runId: number;
+  kind: 'provider' | 'agent';
+  sessionId: number | null;
+  nativeSessionId: string | null;
   controller: AbortController;
   startedAt: number;
   terminalCommitted: boolean;
@@ -71,6 +98,16 @@ function initialSnapshot(request: ProviderRequest): SafeConfigSnapshot {
   };
 }
 
+function initialAgentSnapshot(request: ProviderRequest, nativeSessionId: string): AgentConfigSnapshot {
+  const agent: AgentConfigFacts = {
+    policyVersion: 'p2-invoice-chat-v1', nativeSessionId, systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT,
+    thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
+    maxContextBytes: 512 * 1024, maxOutputBytes: 256 * 1024, maxAssistantContentBytes: 512 * 1024,
+    maxModelCalls: 1, sessionRetry: false,
+  };
+  return { ...initialSnapshot(request), agent };
+}
+
 function initialUsage(now: string): UsageRecord {
   return {
     version: 1,
@@ -97,6 +134,7 @@ function outputRecord(outcome: NativeOutcome): OutputRecord {
     stopReason: outcome.stopReason,
     responseId: outcome.responseId,
     responseModel: outcome.responseModel,
+    ...('agent' in outcome ? { agent: (outcome as AgentNativeOutcome).agent } : {}),
   };
 }
 
@@ -119,12 +157,116 @@ export class RuntimeService {
   private closeInFlight: Promise<CloseReport> | null = null;
   private finalCloseReport: CloseReport | null = null;
   private readonly closeErrors = new Map<string, ReturnType<typeof appError>>();
+  private readonly sessionService?: SessionService;
 
   public constructor(dependencies: RuntimeDependencies) {
     this.dependencies = dependencies;
+    if (dependencies.agent && dependencies.sessions) {
+      this.sessionService = new SessionService({
+        sessions: dependencies.sessions,
+        runs: dependencies.runs,
+        agent: dependencies.agent,
+        active: () => this.active ? { runId: this.active.runId, sessionId: this.active.sessionId } : null,
+      });
+    }
   }
 
   public async callProvider(request: ProviderRequest, control: ProviderControl = {}): Promise<Result<ProviderOutcome>> {
+    return this.runRequest(request, control);
+  }
+
+  public createSession(request: CreateSessionRequest): Promise<Result<SessionSnapshot>> {
+    return Promise.resolve(this.sessionService?.create(request) ?? fail(appError('agent_unavailable', 'runtime', 'Agent Sessions 未配置。')));
+  }
+
+  public listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>> {
+    return Promise.resolve(this.sessionService?.list(request) ?? fail(appError('agent_unavailable', 'runtime', 'Agent Sessions 未配置。')));
+  }
+
+  public querySession(sessionId: number): Promise<Result<SessionSnapshot>> {
+    return Promise.resolve(this.sessionService?.query(sessionId) ?? fail(appError('agent_unavailable', 'runtime', 'Agent Sessions 未配置。')));
+  }
+
+  public listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>> {
+    return Promise.resolve(this.sessionService?.listRuns(request) ?? fail(appError('agent_unavailable', 'runtime', 'Agent Sessions 未配置。')));
+  }
+
+  public startRun(raw: AgentRunRequest, control: AgentControl = {}): Promise<Result<RunAccepted>> {
+    const normalized = normalizeAgentRunRequest(raw);
+    if (!normalized.ok) return Promise.resolve(normalized);
+    if (!this.sessionService || !this.dependencies.agent) return Promise.resolve(fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 未配置。')));
+    const session = this.sessionService.resolve(normalized.data.sessionId);
+    if (!session.ok) return Promise.resolve(session);
+    const request: ProviderRequest = {
+      goal: INVOICE_CHAT_GOAL,
+      text: normalized.data.text,
+      config: normalized.data.config,
+      timeoutMs: normalized.data.timeoutMs,
+      stopGraceMs: normalized.data.stopGraceMs,
+    };
+    let acceptedRunId: number | null = null;
+    let eventSequence = 0;
+    type AgentRunEventPayload =
+      | { type: 'run_progress'; phase: 'created' | 'running' | 'stopping'; reason?: string }
+      | { type: 'run_finished'; result: Result<AgentOutcome> };
+    const emit = (event: AgentRunEventPayload, eventRunId?: number) => {
+      try {
+        if (acceptedRunId === null) return;
+        control.onEvent?.({ ...event, runId: eventRunId ?? acceptedRunId, sessionId: normalized.data.sessionId, nativeSessionId: session.data.nativeSessionId, sequence: ++eventSequence, at: this.dependencies.now() } as AgentRunEvent);
+      } catch { /* a UI listener cannot affect execution */ }
+    };
+    const completion = this.runRequest(request, {
+      onObservation: (event) => {
+        if (event.type === 'run_created') {
+          acceptedRunId = event.runId;
+          emit({ type: 'run_progress', phase: 'created' });
+        } else if (event.type === 'request_budget' || (event.type === 'agent_event' && event.data.eventName === 'agent_start')) {
+          emit({ type: 'run_progress', phase: 'running' });
+        } else if (event.type === 'stop_requested') {
+          emit({ type: 'run_progress', phase: 'stopping', reason: String(event.data.reason ?? 'unknown') });
+        }
+      },
+    }, { sessionId: normalized.data.sessionId, nativeSessionId: session.data.nativeSessionId });
+    if (acceptedRunId === null) {
+      return completion.then((result) => result.ok
+        ? fail(appError('agent_run_not_accepted', 'runtime', 'Agent Run 未能受理。'))
+        : result);
+    }
+    const runId = acceptedRunId;
+    void completion.then((result) => {
+      const agentResult: Result<AgentOutcome> = result.ok
+        ? ok({ ...result.data, sessionId: normalized.data.sessionId, nativeSessionId: session.data.nativeSessionId })
+        : result;
+      emit({ type: 'run_finished', result: agentResult }, runId);
+    });
+    return Promise.resolve(ok({ runId, sessionId: normalized.data.sessionId }));
+  }
+
+  public cancelRun(runId: number): Promise<Result<{ accepted: boolean; runId: number }>> {
+    if (!Number.isSafeInteger(runId) || runId <= 0) return Promise.resolve(fail(appError('run_id_invalid', 'input', 'Run ID 无效。')));
+    if (this.active?.kind === 'agent' && this.active.runId === runId) {
+      this.active.stop('user');
+      return Promise.resolve(ok({ accepted: true, runId }));
+    }
+    const run = this.dependencies.runs.get(runId);
+    if (!run.ok) return Promise.resolve(run);
+    return Promise.resolve(ok({ accepted: false, runId }));
+  }
+
+  public queryRuntimeState(): Promise<Result<RuntimeState>> {
+    const active = this.active ? { runId: this.active.runId, sessionId: this.active.sessionId, kind: this.active.kind } : null;
+    return Promise.resolve(ok({
+      active,
+      blocked: this.poisoned || this.closed || this.closing,
+      error: this.poisoned ? appError('runtime_unusable', 'runtime', '运行实例因未收口或持久化错误而不可复用。', true) : null,
+    }));
+  }
+
+  private async runRequest(
+    request: ProviderRequest,
+    control: ProviderControl = {},
+    agentContext?: { sessionId: number; nativeSessionId: string },
+  ): Promise<Result<ProviderOutcome>> {
     if (this.poisoned) {
       return fail(appError('runtime_unusable', 'runtime', 'Provider 停止未确认，运行实例不可复用。'));
     }
@@ -134,14 +276,19 @@ export class RuntimeService {
 
     const createdAt = this.dependencies.now();
     const input: InputRecord = { version: 1, goal: request.goal, text: request.text, messageTimestamp: Date.now() };
-    const created = this.dependencies.runs.create({
-      goal: request.goal,
-      input,
-      config: initialSnapshot(request),
-      usage: initialUsage(createdAt),
-      cleanup: initialCleanup(),
-      createdAt,
-    });
+    const scope: ChatScope = { version: 1, mode: 'chat-text', toolNames: [], resourcePaths: [] };
+    const created = agentContext
+      ? this.dependencies.runs.createAgent({
+        sessionId: agentContext.sessionId,
+        scope,
+        goal: request.goal,
+        input,
+        config: initialAgentSnapshot(request, agentContext.nativeSessionId),
+        usage: initialUsage(createdAt),
+        cleanup: initialCleanup(),
+        createdAt,
+      })
+      : this.dependencies.runs.create({ goal: request.goal, input, config: initialSnapshot(request), usage: initialUsage(createdAt), cleanup: initialCleanup(), createdAt });
     if (!created.ok) return created;
 
     const runId = created.data;
@@ -165,10 +312,11 @@ export class RuntimeService {
         try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'warn', component: 'runtime', runId, event: 'observation_callback_failed' }); } catch { /* diagnostics are best effort */ }
       }
     };
-    observe('run_created', { status: 'created' });
-
     const active: ActiveCall = {
       runId,
+      kind: agentContext ? 'agent' : 'provider',
+      sessionId: agentContext?.sessionId ?? null,
+      nativeSessionId: agentContext?.nativeSessionId ?? null,
       controller,
       startedAt: this.dependencies.monotonicNow(),
       terminalCommitted: false,
@@ -199,6 +347,7 @@ export class RuntimeService {
     };
     active.stop = requestStop;
     this.active = active;
+    observe('run_created', { status: 'created' });
     const externalAbort = () => requestStop('user');
     control.signal?.addEventListener('abort', externalAbort, { once: true });
     if (control.signal?.aborted) requestStop('user');
@@ -226,21 +375,31 @@ export class RuntimeService {
     if (readStop()) {
       return this.finish(active, request, input, errorForStop(readStop()!.reason, active.runId), null, true, undefined, readStop());
     }
-    let prepared: Result<PreparedProvider>;
+    let prepared: Result<PreparedProvider | PreparedAgent>;
     try {
-      const preparePromise = this.dependencies.provider.prepare(request.config, { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs }, active.controller.signal);
+      const limits = { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs };
+      const preparePromise = active.kind === 'agent'
+        ? this.dependencies.agent!.prepare(active.nativeSessionId!, request.config, limits, active.controller.signal)
+        : this.dependencies.provider.prepare(request.config, limits, active.controller.signal);
       const first = await Promise.race([
         preparePromise.then((value) => ({ kind: 'prepared' as const, value })),
         stopPromise.then((intent) => ({ kind: 'stop' as const, intent })),
       ]);
       if (first.kind === 'stop') {
         const settled = await Promise.race([
-          preparePromise.then(() => ({ kind: 'prepared' as const }), () => ({ kind: 'prepared' as const })),
+          preparePromise.then(
+            (value) => ({ kind: 'prepared' as const, value }),
+            () => ({ kind: 'prepared' as const, value: null }),
+          ),
           new Promise<{ kind: 'grace' }>((resolve) => setTimeout(() => resolve({ kind: 'grace' }), request.stopGraceMs)),
         ]);
         if (settled.kind === 'grace') {
           void preparePromise.catch(() => undefined);
           return this.finish(active, request, input, errorForStop(first.intent.reason, active.runId), null, false, undefined, first.intent, true);
+        }
+        if (settled.value && !settled.value.ok && settled.value.error.code === 'stop_unconfirmed') {
+          active.poisoned = true;
+          return this.finish(active, request, input, { ...settled.value.error, runId: active.runId }, null, false, undefined, first.intent, true);
         }
         return this.finish(active, request, input, errorForStop(first.intent.reason, active.runId), null, true, undefined, first.intent);
       }
@@ -250,7 +409,10 @@ export class RuntimeService {
     }
     if (!prepared.ok) {
       const stop = readStop();
-      return this.finish(active, request, input, stop ? errorForStop(stop.reason, active.runId) : prepared.error, null, true, undefined, stop);
+      const unconfirmed = prepared.error.code === 'stop_unconfirmed';
+      if (unconfirmed) active.poisoned = true;
+      const error = unconfirmed ? { ...prepared.error, runId: active.runId } : stop ? errorForStop(stop.reason, active.runId) : prepared.error;
+      return this.finish(active, request, input, error, null, !unconfirmed, undefined, stop, unconfirmed);
     }
     if (readStop()) {
       return this.finish(active, request, input, errorForStop(readStop()!.reason, active.runId), null, true, undefined, readStop());
@@ -264,7 +426,9 @@ export class RuntimeService {
 
     let work: Promise<NativeOutcome>;
     try {
-      work = prepared.data.execute(input, active.controller.signal, (event) => observe(event.type, event.data));
+      work = active.kind === 'agent'
+        ? (prepared.data as PreparedAgent).execute({ ...input, runId: active.runId, sessionId: active.sessionId! }, active.controller.signal, (event) => observe(event.type, event.data))
+        : (prepared.data as PreparedProvider).execute(input, active.controller.signal, (event) => observe(event.type, event.data));
     } catch {
       const stop = readStop();
       return this.finish(active, request, input, stop ? errorForStop(stop.reason, active.runId) : appError('provider_runtime_error', 'provider', 'Provider 执行失败。', true, active.runId), null, false, undefined, stop);
@@ -405,11 +569,12 @@ export class RuntimeService {
       }
     }
     try {
-      const report = await this.dependencies.provider.close();
-      this.closed = report.closed;
-      this.poisoned = !report.stopped;
-      for (const error of report.errors) this.closeErrors.set(error.code, error);
-      return { stopped: report.stopped, closed: report.closed, errors: [...this.closeErrors.values()] };
+      const providerReport = await this.dependencies.provider.close();
+      const agentReport = await this.dependencies.agent?.close() ?? { stopped: true, closed: true, errors: [] };
+      this.closed = providerReport.closed && agentReport.closed;
+      this.poisoned = !providerReport.stopped || !agentReport.stopped;
+      for (const error of [...providerReport.errors, ...agentReport.errors]) this.closeErrors.set(error.code, error);
+      return { stopped: providerReport.stopped && agentReport.stopped, closed: this.closed, errors: [...this.closeErrors.values()] };
     } catch {
       const error = appError('provider_close_failed', 'provider', 'Provider 资源关闭失败。', true);
       this.closeErrors.set(error.code, error);

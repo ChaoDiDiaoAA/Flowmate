@@ -23,4 +23,18 @@ describe('versioned desktop Host protocol', () => {
     expect(parseHostCommand({ ...value, input: { ...value.input, modelId: '../outside' } })).toBeNull();
     expect(parseHostCommand({ ...value, apiKey: undefined })).toBeNull();
   });
+
+  it('accepts Agent Session commands and only accepts an API key beside a Send', () => {
+    expect(parseHostCommand({ version: 1, requestId: 'session-1', type: 'create_session', title: 'Invoice A' })).toEqual({
+      version: 1, requestId: 'session-1', type: 'create_session', title: 'Invoice A',
+    });
+    const send = {
+      version: 1, requestId: 'agent-1', type: 'start_agent_run',
+      input: { sessionId: 3, text: 'Follow up', modelId: 'model-a' }, apiKey: 'synthetic-key',
+    } as const;
+    expect(parseHostCommand(send)).toEqual(send);
+    expect(parseHostCommand({ ...send, input: { ...send.input, nativeSessionId: 'forged' } })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'list-1', type: 'list_sessions', limit: 50 })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'cancel-1', type: 'cancel_run', runId: 3 })).not.toBeNull();
+  });
 });

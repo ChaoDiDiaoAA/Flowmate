@@ -6,7 +6,7 @@ import { writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../../apps/cli/main.ts';
-import type { Application, ProviderRequest, ProviderOutcome, Result } from '@flowmate/contracts';
+import type { Application, ProviderControl, ProviderRequest, ProviderOutcome, Result } from '@flowmate/contracts';
 
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const close of cleanup.splice(0)) close(); });
@@ -34,10 +34,10 @@ function harness(call: Application['callProvider'] = async (request) => complete
   const messages: string[] = [], errors: string[] = [], requests: ProviderRequest[] = [];
   let closed = 0;
   const application: Application = {
-    async callProvider(request, control) { requests.push(request); return call(request, control); },
+    async callProvider(request: ProviderRequest, control: ProviderControl | undefined) { requests.push(request); return call(request, control); },
     async queryRun() { throw new Error('not used'); },
     async close() { closed++; return { ok: true, data: { stopped: true, closed: true, errors: [] } }; },
-  };
+  } as unknown as Application;
   cleanup.push(() => { terminal.close(); input.destroy(); rmSync(dir, { recursive: true, force: true }); });
   const external = new AbortController();
   const done = main(['provider', 'chat', '--config', config], {

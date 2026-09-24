@@ -35,9 +35,14 @@ export type ProviderTestRequest = {
   timeoutMs?: number;
 };
 
+export type StartAgentRunInput = { requestId: string; sessionId: number; text: string; modelId: string };
+export type StartAgentRunResult = import('./runtime.ts').RunAccepted & { requestId: string };
+
 export type DesktopEvent =
   | { type: 'provider_observation'; requestId: string; runId: number; sequence: number; observation: string; at: string; data: Readonly<Record<string, unknown>> }
   | { type: 'provider_finished'; requestId: string; runId: number; result: import('./runtime.ts').Result<import('./runtime.ts').ProviderOutcome> }
+  | { type: 'agent_observation'; requestId: string; event: import('./runtime.ts').AgentRunEvent }
+  | { type: 'agent_finished'; requestId: string; event: Extract<import('./runtime.ts').AgentRunEvent, { type: 'run_finished' }> }
   | { type: 'host_state'; state: DesktopState };
 
 export type DesktopBridge = {
@@ -46,5 +51,12 @@ export type DesktopBridge = {
   callProvider(input: ProviderTestRequest): Promise<import('./runtime.ts').Result<{ requestId: string; runId: number }>>;
   cancelProvider(requestId: string): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: number | null }>>;
   queryRun(runId: number): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunSnapshot>>;
+  createSession(request?: import('./runtime.ts').CreateSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
+  listSessions(request?: import('./runtime.ts').ListSessionsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionPage>>;
+  querySession(sessionId: number): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
+  listSessionRuns(request: import('./runtime.ts').SessionRunsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionRunsPage>>;
+  startAgentRun(request: StartAgentRunInput): Promise<import('./runtime.ts').Result<StartAgentRunResult>>;
+  cancelRun(runId: number): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: number }>>;
+  queryRuntimeState(): Promise<import('./runtime.ts').Result<import('./runtime.ts').RuntimeState>>;
   subscribe(listener: (event: DesktopEvent) => void): () => void;
 };

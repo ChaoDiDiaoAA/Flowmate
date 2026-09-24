@@ -1,5 +1,7 @@
 import { appError, ok } from '@flowmate/contracts';
 import type {
+  AgentControl,
+  AgentRunRequest,
   Application,
   CloseReport,
   DbId,
@@ -7,7 +9,15 @@ import type {
   ProviderOutcome,
   ProviderRequest,
   Result,
+  RunAccepted,
   RunSnapshot,
+  RuntimeState,
+  CreateSessionRequest,
+  ListSessionsRequest,
+  SessionPage,
+  SessionRunsPage,
+  SessionRunsRequest,
+  SessionSnapshot,
 } from '@flowmate/contracts';
 
 export interface RuntimeServicePort {
@@ -15,6 +25,13 @@ export interface RuntimeServicePort {
     request: ProviderRequest,
     control?: ProviderControl,
   ): Promise<Result<ProviderOutcome>>;
+  createSession(request: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
+  listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
+  querySession(sessionId: DbId): Promise<Result<SessionSnapshot>>;
+  listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>>;
+  startRun(request: AgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
+  cancelRun(runId: DbId): Promise<Result<{ accepted: boolean; runId: DbId }>>;
+  queryRuntimeState(): Promise<Result<RuntimeState>>;
   close(): Promise<CloseReport>;
 }
 
@@ -39,6 +56,13 @@ export function makeApplication(
   const closeErrors = new Map<string, ReturnType<typeof appError>>();
   return {
     callProvider: (request, control) => runtime.callProvider(request, control),
+    createSession: (request) => runtime.createSession(request),
+    listSessions: (request) => runtime.listSessions(request),
+    querySession: (sessionId) => runtime.querySession(sessionId),
+    listSessionRuns: (request) => runtime.listSessionRuns(request),
+    startRun: (request, control) => runtime.startRun(request, control),
+    cancelRun: (runId) => runtime.cancelRun(runId),
+    queryRuntimeState: () => runtime.queryRuntimeState(),
     queryRun: async (runId) => runs.get(runId),
     close: () => {
       if (finalCloseResult) return Promise.resolve(finalCloseResult);

@@ -3,8 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { appError, fail } from '@flowmate/contracts';
-import type { DesktopEvent, DesktopState, ProductSettings, ProviderTestRequest, Result, RunSnapshot } from '@flowmate/contracts';
+import { appError, fail, normalizeListSessionsRequest } from '@flowmate/contracts';
+import type { CreateSessionRequest, DesktopEvent, DesktopState, ListSessionsRequest, ProductSettings, ProviderTestRequest, Result, RunSnapshot, SessionRunsRequest, SessionPage, SessionRunsPage, SessionSnapshot, StartAgentRunInput, StartAgentRunResult, RunAccepted, RuntimeState } from '@flowmate/contracts';
 import { defaultProductSettings, validateProductSettings } from '../../../packages/core/src/configuration/settings.ts';
 import { createCredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import type { CredentialStore, SecureStoragePort } from '../../../packages/shared/src/secure-credential-store.ts';
@@ -16,6 +16,13 @@ const channels = {
   callProvider: 'flowmate:call-provider',
   cancelProvider: 'flowmate:cancel-provider',
   queryRun: 'flowmate:query-run',
+  createSession: 'flowmate:create-session',
+  listSessions: 'flowmate:list-sessions',
+  querySession: 'flowmate:query-session',
+  listSessionRuns: 'flowmate:list-session-runs',
+  startAgentRun: 'flowmate:start-agent-run',
+  cancelRun: 'flowmate:cancel-run',
+  queryRuntimeState: 'flowmate:query-runtime-state',
   subscribe: 'flowmate:subscribe',
   unsubscribe: 'flowmate:unsubscribe',
 } as const;
@@ -204,6 +211,13 @@ function registerIpc(): void {
   handle(channels.callProvider, async (_event, inputRaw) => callProvider(inputRaw));
   handle(channels.cancelProvider, async (_event, requestIdRaw) => cancelProvider(requestIdRaw));
   handle(channels.queryRun, async (_event, runIdRaw) => queryRun(runIdRaw));
+  handle(channels.createSession, async (_event, inputRaw) => createSession(inputRaw));
+  handle(channels.listSessions, async (_event, inputRaw) => listSessions(inputRaw));
+  handle(channels.querySession, async (_event, sessionIdRaw) => querySession(sessionIdRaw));
+  handle(channels.listSessionRuns, async (_event, inputRaw) => listSessionRuns(inputRaw));
+  handle(channels.startAgentRun, async (_event, inputRaw) => startAgentRun(inputRaw));
+  handle(channels.cancelRun, async (_event, runIdRaw) => cancelRun(runIdRaw));
+  handle(channels.queryRuntimeState, async () => queryRuntimeState());
   handle(channels.subscribe, async (event) => {
     const id = event.sender.id;
     subscriptions.set(id, () => undefined);
@@ -330,6 +344,86 @@ async function queryRun(value: unknown): Promise<Result<RunSnapshot>> {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
   try { return await host.request({ type: 'query_run', runId: Number(value) }) as Result<RunSnapshot>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Run 查询未能提交给 Bun Host。', true)); }
+}
+
+async function createSession(value: unknown): Promise<Result<SessionSnapshot>> {
+  if (value !== undefined && value !== null && (typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).some((key) => key !== 'title')
+    || ('title' in value && (typeof value.title !== 'string' || !value.title.trim() || value.title.length > 120)))) {
+    return fail(appError('input_invalid', 'input', 'Session 创建参数无效。'));
+  }
+  try { return await host.request({ type: 'create_session', ...(value && 'title' in value ? { title: value.title as string } : {}) }) as Result<SessionSnapshot>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session 创建未能提交给 Bun Host。', true)); }
+}
+
+async function listSessions(value: unknown): Promise<Result<SessionPage>> {
+  const normalized = normalizeListSessionsRequest(value == null ? undefined : value as ListSessionsRequest);
+  if (!normalized.ok) return normalized;
+  try { return await host.request({ type: 'list_sessions', ...normalized.data }) as Result<SessionPage>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session 列表无法读取。', true)); }
+}
+
+async function querySession(value: unknown): Promise<Result<SessionSnapshot>> {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Session ID 无效。'));
+  try { return await host.request({ type: 'query_session', sessionId: Number(value) }) as Result<SessionSnapshot>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session 查询未能提交给 Bun Host。', true)); }
+}
+
+async function listSessionRuns(value: unknown): Promise<Result<SessionRunsPage>> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).some((key) => !['sessionId', 'beforeRunId', 'limit'].includes(key))
+    || !Number.isSafeInteger((value as SessionRunsRequest).sessionId) || (value as SessionRunsRequest).sessionId <= 0
+    || ((value as SessionRunsRequest).beforeRunId !== undefined && (!Number.isSafeInteger((value as SessionRunsRequest).beforeRunId) || (value as SessionRunsRequest).beforeRunId! <= 0))
+    || ((value as SessionRunsRequest).limit !== undefined && (!Number.isSafeInteger((value as SessionRunsRequest).limit) || (value as SessionRunsRequest).limit! < 1 || (value as SessionRunsRequest).limit! > 100))) {
+    return fail(appError('input_invalid', 'input', 'Session Run 列表参数无效。'));
+  }
+  try { return await host.request({ type: 'list_session_runs', ...(value as SessionRunsRequest) }) as Result<SessionRunsPage>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session Run 列表无法读取。', true)); }
+}
+
+function validStartAgentRun(value: unknown): value is StartAgentRunInput {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const input = value as Partial<StartAgentRunInput>;
+  return Object.keys(value).every((key) => ['requestId', 'sessionId', 'text', 'modelId'].includes(key))
+    && typeof input.requestId === 'string' && /^[a-zA-Z0-9._-]{1,128}$/.test(input.requestId)
+    && Number.isSafeInteger(input.sessionId) && input.sessionId! > 0
+    && typeof input.text === 'string' && new TextEncoder().encode(input.text).byteLength <= 65_536
+    && typeof input.modelId === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(input.modelId);
+}
+
+async function startAgentRun(value: unknown): Promise<Result<StartAgentRunResult>> {
+  if (!validStartAgentRun(value) || !value.text.trim()) return fail(appError('input_invalid', 'input', 'Agent Run 参数无效。'));
+  const state = await readDesktopState();
+  if (!state.ok) return state;
+  if (!state.data.ready) return fail(appError(hostErrorCode, 'runtime', 'Bun Host 尚未就绪。', true));
+  const model = state.data.settings.models.find((item) => item.id === value.modelId);
+  if (!model) return fail(appError('model_not_configured', 'input', '所选模型配置不存在。'));
+  const credential = await credentialStore(model.credentialRef).read();
+  if (!credential.ok) return credential;
+  if (!credential.data) return fail(appError('model_credential_missing', 'input', '请先保存该模型的 API Key。'));
+  try {
+    const result = await host.request({
+      type: 'start_agent_run', requestId: value.requestId,
+      input: { sessionId: value.sessionId, text: value.text, modelId: value.modelId },
+      apiKey: credential.data,
+    }, 15_000) as Result<RunAccepted & { accepted: true; requestId: string }>;
+    if (!result.ok) return result;
+    if (!result.data.accepted || result.data.requestId !== value.requestId || result.data.sessionId !== value.sessionId || !Number.isSafeInteger(result.data.runId)) {
+      return fail(appError('host_protocol_invalid', 'runtime', 'Bun Host 返回的 Agent Run 关联无效。'));
+    }
+    return { ok: true, data: { requestId: result.data.requestId, runId: result.data.runId, sessionId: result.data.sessionId } };
+  } catch { return fail(appError('host_request_failed', 'runtime', 'Agent Run 未能提交给 Bun Host。', true)); }
+}
+
+async function cancelRun(value: unknown): Promise<Result<{ accepted: boolean; runId: number }>> {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
+  try { return await host.request({ type: 'cancel_run', runId: Number(value) }) as Result<{ accepted: boolean; runId: number }>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Run 取消未能提交给 Bun Host。', true)); }
+}
+
+async function queryRuntimeState(): Promise<Result<RuntimeState>> {
+  try { return await host.request({ type: 'query_runtime_state' }) as Result<RuntimeState>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Runtime 状态无法读取。', true)); }
 }
 
 function credentialStore(reference: string): CredentialStore {
