@@ -52,10 +52,11 @@ export type Tool<I, O> = {
 };
 
 export type AgentTool<I, O> = Tool<I, O> & {
+  label?: string;
   execute(input: I, context: ToolExecutionContext): Promise<O>;
 };
 
-export type ToolDefinition<I, O> = AgentTool<I, O> & { label?: string };
+export type ToolDefinition<I, O> = AgentTool<I, O>;
 
 export { toolIdentitySchema };
 export type { DbId };
