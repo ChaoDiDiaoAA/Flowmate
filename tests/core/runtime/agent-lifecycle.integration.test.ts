@@ -111,8 +111,6 @@ function makeAgent(options: {
     createSession: () => ok({ nativeSessionId: 'native-2' }),
     inspect: (nativeSessionId) => options.inspection ?? ({
       availability: nativeSessionId === 'native-1' ? 'ready' : 'missing',
-      boundConfig: null,
-      boundModel: null,
     }),
     prepare: (_nativeSessionId, _config, _limits, signal) => prepare(signal),
     releaseSession: async () => ({ stopped: true, closed: true, errors: [] }),
@@ -298,7 +296,7 @@ describe('RuntimeService Agent lifecycle', () => {
     const service = new RuntimeService({ ...deps, agent: makeAgent({
       prepare: async () => ok({ snapshot: changedSnapshot, execute: async () => nativeOutcome }),
       inspection: {
-      availability: 'ready', boundConfig: { ...config, modelRef: { provider: 'other', model: 'model' } }, boundModel: null,
+        availability: 'ready',
       },
     }) });
     const accepted = await service.start({ ...request, config: changedConfig }, finished);
@@ -310,7 +308,7 @@ describe('RuntimeService Agent lifecycle', () => {
   it('rejects unavailable in-memory history without creating a Run', async () => {
     const { db, deps } = fixture();
     const service = new RuntimeService({ ...deps, agent: makeAgent({ inspection: {
-      availability: 'missing', boundConfig: null, boundModel: null,
+      availability: 'missing',
     } }) });
     expect(await service.start(request)).toMatchObject({ ok: false, error: { code: 'session_history_unavailable' } });
     expect(db.runs.listBySession({ sessionId: 1, limit: 50 })).toMatchObject({ ok: true, data: { items: [] } });

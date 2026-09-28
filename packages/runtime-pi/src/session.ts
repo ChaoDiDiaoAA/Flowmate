@@ -202,17 +202,7 @@ export class PiAgentAdapter implements AgentPort {
     const availability: AgentPortAvailability = !record ? 'missing'
       : record.unusable ? 'unusable'
         : record.preparing || record.running ? 'busy' : 'ready';
-    const model = record?.snapshot?.resolvedModel ?? record?.snapshot?.requestedModel;
-    return {
-      availability,
-      boundConfig: record?.config ? structuredClone(record.config) : null,
-      boundModel: record?.config && model ? {
-        provider: model.provider,
-        model: model.model,
-        api: record.snapshot?.api ?? record.config.connection?.api ?? '',
-        endpoint: record.snapshot?.endpoint ?? record.config.connection?.baseUrl ?? '',
-      } : null,
-    };
+    return { availability };
   }
 
   public async prepare(

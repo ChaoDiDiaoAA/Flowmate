@@ -174,13 +174,6 @@ export type ChatScope = {
 export type SessionAvailability = 'ready' | 'busy' | 'unusable' | 'history-unavailable' | 'archived';
 export type SessionStatus = 'active' | 'archived';
 
-export type BoundModel = {
-  provider: string;
-  model: string;
-  api: string;
-  endpoint: string;
-};
-
 export type SessionSnapshot = {
   sessionId: DbId;
   nativeSessionId: string;
@@ -190,7 +183,6 @@ export type SessionSnapshot = {
   updatedAt: string;
   availability: SessionAvailability;
   activeRunId: DbId | null;
-  boundModel: BoundModel | null;
 };
 
 export type CreateSessionRequest = { title?: string };

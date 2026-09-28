@@ -122,8 +122,6 @@ export interface AgentPort {
   createSession(): Result<{ nativeSessionId: string }>;
   inspect(nativeSessionId: string): {
     availability: AgentPortAvailability;
-    boundConfig: ProviderConfig | null;
-    boundModel: SessionSnapshot['boundModel'];
   };
   prepare(
     nativeSessionId: string,

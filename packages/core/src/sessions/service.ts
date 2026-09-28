@@ -49,7 +49,6 @@ export class SessionService {
     const activeRun = this.runtimeState().active;
     const activeRunId = activeRun?.kind === 'agent' && activeRun.sessionId === row.sessionId ? activeRun.runId : null;
     let availability: SessionAvailability;
-    let boundModel: SessionSnapshot['boundModel'] = null;
     if (row.status === 'archived') availability = 'archived';
     else {
       try {
@@ -57,7 +56,6 @@ export class SessionService {
         availability = activeRunId !== null || inspected.availability === 'busy' ? 'busy'
           : inspected.availability === 'ready' ? 'ready'
             : inspected.availability === 'unusable' ? 'unusable' : 'history-unavailable';
-        boundModel = inspected.boundModel;
       } catch {
         availability = 'history-unavailable';
       }
@@ -71,7 +69,6 @@ export class SessionService {
       updatedAt: row.updatedAt,
       availability,
       activeRunId,
-      boundModel,
     };
   }
 }

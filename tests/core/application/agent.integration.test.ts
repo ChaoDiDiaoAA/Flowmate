@@ -44,7 +44,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
   let created = 0;
   let preparations = 0;
   const released: string[] = [];
-  const records = new Map<string, { config?: ProviderConfig; busy: boolean }>();
+  const records = new Map<string, { busy: boolean }>();
   const agent: AgentPort = {
     createSession() {
       const nativeSessionId = `native-${++created}`;
@@ -53,24 +53,13 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     },
     inspect(nativeSessionId) {
       const record = records.get(nativeSessionId);
-      const bound = record?.config;
-      return {
-        availability: !record ? 'missing' : record.busy ? 'busy' : 'ready',
-        boundConfig: bound ? structuredClone(bound) : null,
-        boundModel: bound ? {
-          provider: bound.modelRef.provider,
-          model: bound.modelRef.model,
-          api: bound.connection?.api ?? '',
-          endpoint: bound.connection?.baseUrl ?? '',
-        } : null,
-      };
+      return { availability: !record ? 'missing' : record.busy ? 'busy' : 'ready' };
     },
     async prepare(nativeSessionId, receivedConfig, limits, signal): Promise<ReturnType<typeof ok<PreparedAgent>> | { ok: false; error: ReturnType<typeof appError> }> {
       preparations += 1;
       if (signal.aborted) return { ok: false, error: appError('agent_cancelled', 'runtime', 'cancelled', false) };
       const record = records.get(nativeSessionId);
       if (!record) return { ok: false, error: appError('session_history_unavailable', 'session', 'missing', false) };
-      record.config ??= structuredClone(receivedConfig);
       const agentFacts: AgentConfigFacts = {
         policyVersion: 'p2-invoice-chat-v1', nativeSessionId, systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT, thinkingLevel: 'off',
         resourcePolicy: 'none', historyPolicy: 'memory-only', maxContextBytes: 524_288, maxOutputBytes: 262_144,
