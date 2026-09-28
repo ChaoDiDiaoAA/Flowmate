@@ -7,6 +7,7 @@ import type {
   NormalizedListSessionsRequest,
   NormalizedSessionRunsRequest,
   ProviderRequest,
+  RenameSessionRequest,
   Result,
 } from './runtime.ts';
 
@@ -91,6 +92,11 @@ function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
+function normalizeSessionTitle(value: string): string | null {
+  const title = value.trim();
+  return title.length > 0 && [...title].length <= 120 && byteLength(title) <= 480 ? title : null;
+}
+
 export function normalizeProviderRequest(raw: unknown): Result<ProviderRequest> {
   const parsed = providerRequestSchema.safeParse(raw);
   if (!parsed.success) {
@@ -137,11 +143,23 @@ export function normalizeProviderConfig(raw: unknown): Result<ProviderRequest['c
 export function normalizeCreateSessionRequest(raw: unknown): Result<CreateSessionRequest> {
   const parsed = createSessionRequestSchema.safeParse(raw ?? {});
   if (!parsed.success) return fail(appError('input_invalid', 'input', 'Session 创建参数无效。'));
-  const title = parsed.data.title === undefined ? 'New Session' : parsed.data.title.trim();
-  if (title.length === 0 || [...title].length > 120 || byteLength(title) > 480) {
-    return fail(appError('input_invalid', 'input', 'Session 标题超过允许长度。'));
-  }
+  const title = parsed.data.title === undefined ? 'New Session' : normalizeSessionTitle(parsed.data.title);
+  if (title === null) return fail(appError('input_invalid', 'input', 'Session 标题无效或超过允许长度。'));
   return ok({ title });
+}
+
+export function normalizeRenameSessionRequest(raw: unknown): Result<RenameSessionRequest> {
+  const parsed = z.object({ sessionId: dbIdSchema, title: z.string() }).strict().safeParse(raw);
+  if (!parsed.success) return fail(appError('input_invalid', 'input', 'Session 重命名参数无效。'));
+  const title = normalizeSessionTitle(parsed.data.title);
+  return title === null
+    ? fail(appError('input_invalid', 'input', 'Session 标题无效或超过允许长度。'))
+    : ok({ sessionId: parsed.data.sessionId, title });
+}
+
+export function normalizeSessionId(raw: unknown): Result<number> {
+  const parsed = dbIdSchema.safeParse(raw);
+  return parsed.success ? ok(parsed.data) : fail(appError('input_invalid', 'input', 'Session ID 无效。'));
 }
 
 export function normalizeListSessionsRequest(raw?: unknown): Result<NormalizedListSessionsRequest> {

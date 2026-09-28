@@ -153,6 +153,20 @@ it('wires the real Host Agent path, rejects stale model state after credential l
       { runId: 2, kind: 'agent', status: 'completed', sessionId: created.data.sessionId },
       { runId: 1, kind: 'agent', status: 'completed', sessionId: created.data.sessionId },
     ] } });
+
+    const renamed = await client.request({ type: 'rename_session', requestId: 'rename-primary-session',
+      input: { sessionId: created.data.sessionId, title: 'Renamed invoice session' } });
+    expect(renamed).toMatchObject({ ok: true, data: { sessionId: created.data.sessionId, title: 'Renamed invoice session' } });
+    const other = await client.request({ type: 'create_session', requestId: 'other-session-create', input: { title: 'Other Session' } }) as { ok: boolean; data?: { sessionId: number } };
+    expect(other.ok).toBe(true);
+    if (!other.data) return;
+    const deleted = await client.request({ type: 'delete_session', requestId: 'delete-other-session', sessionId: other.data.sessionId });
+    expect(deleted).toEqual({ ok: true, data: { deletedSessionId: other.data.sessionId } });
+    expect(await client.request({ type: 'query_session', sessionId: created.data.sessionId })).toMatchObject({ ok: true, data: { sessionId: created.data.sessionId } });
+    expect(await client.request({ type: 'query_session', sessionId: other.data.sessionId })).toMatchObject({ ok: false, error: { code: 'session_not_found' } });
+    expect(await client.request({ type: 'query_run', runId: 1 })).toMatchObject({ ok: true, data: { kind: 'agent', sessionId: created.data.sessionId } });
+    expect(await client.request({ type: 'query_prompt_trace', runId: 2, callSequence: 1 })).toMatchObject({ ok: true, data: { availability: 'available' } });
+    expect(await client.request({ type: 'list_sessions', input: { limit: 10 } })).toMatchObject({ ok: true, data: { items: [{ sessionId: created.data.sessionId }] } });
   } finally {
     const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
     await client.close();

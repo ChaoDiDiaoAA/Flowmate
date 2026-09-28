@@ -129,6 +129,22 @@ async function runHost(userDataRoot: string): Promise<void> {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.createSession(command.input) });
       return;
     }
+    if (command.type === 'rename_session') {
+      if (!claimRequestId(command.requestId)) {
+        send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('request_duplicate', 'input', '该请求身份已使用，未重复执行。')) });
+        return;
+      }
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.renameSession(command.input) });
+      return;
+    }
+    if (command.type === 'delete_session') {
+      if (!claimRequestId(command.requestId)) {
+        send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('request_duplicate', 'input', '该请求身份已使用，未重复执行。')) });
+        return;
+      }
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.deleteSession(command.sessionId) });
+      return;
+    }
     if (command.type === 'list_sessions') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listSessions(command.input) });
       return;

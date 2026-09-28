@@ -257,6 +257,17 @@ h1 { margin-bottom: 0; color: var(--foreground); font-family: var(--font-display
 .chat-session-select { display: flex; align-items: center; gap: 7px; padding: 0 12px 8px; }
 .chat-session-select label { color: var(--foreground-subtle); font-family: var(--font-numeric-stack); font-size: 8px; letter-spacing: .07em; }
 .chat-session-select select { min-width: 0; height: 28px; flex: 1; padding: 0 7px; border: 1px solid var(--input); border-radius: 4px; color: var(--foreground); background: var(--background); font-size: 9px; }
+.chat-session-actions { position: relative; flex: 0 0 auto; }
+.chat-session-actions summary { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 4px; color: var(--foreground-subtle); cursor: pointer; list-style: none; font-size: 12px; }
+.chat-session-actions summary::-webkit-details-marker { display: none; }
+.chat-session-action-menu { position: absolute; z-index: 5; top: 32px; right: 0; min-width: 110px; padding: 4px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); box-shadow: 0 8px 24px rgb(0 0 0 / 18%); }
+.chat-session-action-menu button { width: 100%; padding: 7px 8px; border: 0; border-radius: 3px; color: var(--foreground); background: transparent; text-align: left; font-size: 10px; cursor: pointer; }
+.chat-session-action-menu button:hover { background: var(--surface-muted); }
+.chat-session-action-menu .danger-action { color: var(--danger, #c44); }
+.chat-session-rename { display: flex; gap: 5px; padding: 0 12px 8px; }
+.chat-session-rename input { min-width: 0; flex: 1; height: 28px; padding: 0 7px; border: 1px solid var(--input); border-radius: 4px; color: var(--foreground); background: var(--background); font-size: 10px; }
+.chat-session-rename button { padding: 0 7px; border: 1px solid var(--border); border-radius: 4px; color: var(--foreground); background: var(--surface); font-size: 9px; cursor: pointer; }
+.chat-session-rename button:disabled { opacity: .55; cursor: default; }
 .chat-more { min-height: 27px; padding: 0 7px; border: 1px solid var(--border); border-radius: 4px; color: var(--foreground-muted); background: var(--surface); font-size: 8px; }
 .chat-session-state { display: flex; align-items: center; gap: 7px; padding: 0 14px 8px; color: var(--foreground-subtle); font-size: 9px; }
 .chat-session-state .status-dot { margin: 0; }

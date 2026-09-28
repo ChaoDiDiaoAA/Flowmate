@@ -73,4 +73,19 @@ describe('PromptTraceBuffer', () => {
     expect(buffer.query(70)).toMatchObject({ availability: 'available', calls: [{ runId: 70, state: 'ended', entries: [{ summary: 'first Run' }] }] });
     expect(buffer.query(71)).toMatchObject({ availability: 'available', calls: [{ runId: 71, state: 'active', entries: [{ summary: 'second Run' }] }] });
   });
+
+  it('clears active and ended diagnostic calls for a permanently deleted Session only', () => {
+    const buffer = createPromptTraceBuffer();
+    const removed = reference(80);
+    const retained = { ...reference(81), sessionId: 9 };
+    buffer.begin(removed);
+    buffer.append(removed, entry('text_delta', 'deleted session'));
+    buffer.end(removed);
+    buffer.begin(retained);
+    buffer.append(retained, entry('text_delta', 'other session'));
+    buffer.clearSession(8);
+
+    expect(buffer.query(80)).toMatchObject({ availability: 'not-started', calls: [] });
+    expect(buffer.query(81)).toMatchObject({ availability: 'available', calls: [{ entries: [{ summary: 'other session' }] }] });
+  });
 });

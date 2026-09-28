@@ -2,6 +2,8 @@ import { describe, expect, it } from 'bun:test';
 import {
   normalizeAgentRunRequest,
   normalizeCreateSessionRequest,
+  normalizeRenameSessionRequest,
+  normalizeSessionId,
   normalizeListSessionsRequest,
   normalizeSessionRunsRequest,
 } from '../../packages/contracts/src/schemas.ts';
@@ -29,6 +31,19 @@ describe('session and Agent contracts', () => {
       ok: false,
       error: { code: 'input_invalid' },
     });
+  });
+
+  it('normalizes rename titles and validates delete identities at the boundary', () => {
+    expect(normalizeRenameSessionRequest({ sessionId: 7, title: '  Review  ' })).toEqual({
+      ok: true, data: { sessionId: 7, title: 'Review' },
+    });
+    expect(normalizeRenameSessionRequest({ sessionId: 7, title: '   ' })).toMatchObject({ ok: false });
+    expect(normalizeRenameSessionRequest({ sessionId: 7, title: '😀'.repeat(121) })).toMatchObject({ ok: false });
+    expect(normalizeRenameSessionRequest({ sessionId: 7, title: 'x'.repeat(121) })).toMatchObject({ ok: false });
+    expect(normalizeRenameSessionRequest({ sessionId: 0, title: 'Review' })).toMatchObject({ ok: false });
+    expect(normalizeRenameSessionRequest({ sessionId: 7, title: 'Review', nativeSessionId: 'forged' })).toMatchObject({ ok: false });
+    expect(normalizeSessionId(7)).toEqual({ ok: true, data: 7 });
+    expect(normalizeSessionId('7')).toMatchObject({ ok: false });
   });
 
   it('preserves valid input text, sets bounded execution defaults, and rejects privileged or oversized input', () => {

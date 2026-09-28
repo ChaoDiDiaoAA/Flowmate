@@ -232,6 +232,88 @@ describe('P2 Session and Agent Run storage', () => {
     opened.data.close();
   }));
 
+  it('renames a Session in place without changing its identity', () => withDatabase((paths) => {
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const { sessions } = opened.data;
+    const created = sessions.create({ nativeSessionId: 'native-rename-session', title: 'Before', at: '2026-09-24T00:00:00.000Z' });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const sessionId = created.data.sessionId;
+    const renamed = sessions.rename({ sessionId, title: 'After', at: '2026-09-24T01:00:00.000Z' });
+    expect(renamed).toMatchObject({ ok: true, data: { sessionId, nativeSessionId: 'native-rename-session', title: 'After', updatedAt: '2026-09-24T01:00:00.000Z' } });
+    expect(sessions.get(sessionId)).toMatchObject({ ok: true, data: { nativeSessionId: 'native-rename-session', title: 'After' } });
+    opened.data.close();
+  }));
+
+  it('permanently deletes only the selected Session and its Agent Runs while retaining other Sessions and Provider Runs', () => withDatabase((paths) => {
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const { db, sessions, runs } = opened.data;
+    const firstSession = sessions.create({ nativeSessionId: 'native-delete-all-one', title: 'One', at: '2026-09-24T00:00:00.000Z' });
+    const secondSession = sessions.create({ nativeSessionId: 'native-delete-all-two', title: 'Two', at: '2026-09-24T00:00:00.000Z' });
+    expect(firstSession.ok && secondSession.ok).toBe(true);
+    if (!firstSession.ok || !secondSession.ok) return;
+    const firstRun = runs.createAgent({ goal: runInput.goal, input: runInput, config: agentConfig, usage, cleanup,
+      createdAt: '2026-09-24T00:01:00.000Z', sessionId: firstSession.data.sessionId, scope });
+    expect(firstRun.ok).toBe(true);
+    if (!firstRun.ok) return;
+    const finishAgent = (runId: number, endedAt: string) => runs.finish(runId, {
+      status: 'failed', output: null,
+      error: { code: 'fixture_failed', category: 'runtime', message: 'fixture', retryable: false },
+      usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+      cleanup, endedAt, stoppedAt: null, durationMs: 1,
+    });
+    expect(finishAgent(firstRun.data, '2026-09-24T00:01:30.000Z').ok).toBe(true);
+    const secondRun = runs.createAgent({ goal: runInput.goal, input: runInput, config: agentConfig, usage, cleanup,
+      createdAt: '2026-09-24T00:02:00.000Z', sessionId: secondSession.data.sessionId, scope });
+    expect(secondRun.ok).toBe(true);
+    if (!secondRun.ok) return;
+    expect(finishAgent(secondRun.data, '2026-09-24T00:02:30.000Z').ok).toBe(true);
+    const providerRun = runs.create({ goal: runInput.goal, input: runInput, config: baseConfig, usage, cleanup, createdAt: '2026-09-24T00:03:00.000Z' });
+    expect(providerRun.ok).toBe(true);
+    if (!providerRun.ok) return;
+    expect(runs.finish(providerRun.data, {
+      status: 'failed', output: null,
+      error: { code: 'fixture_failed', category: 'provider', message: 'fixture', retryable: false },
+      usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+      cleanup, endedAt: '2026-09-24T00:05:00.000Z', stoppedAt: null, durationMs: 1,
+    }).ok).toBe(true);
+
+    const activeTarget = runs.createAgent({ goal: runInput.goal, input: runInput, config: agentConfig, usage, cleanup,
+      createdAt: '2026-09-24T00:05:30.000Z', sessionId: secondSession.data.sessionId, scope });
+    expect(activeTarget.ok).toBe(true);
+    if (!activeTarget.ok) return;
+    expect(sessions.prepareDelete(secondSession.data.sessionId, '2026-09-24T00:05:40.000Z')).toMatchObject({ ok: false, error: { code: 'session_busy' } });
+    expect(sessions.get(firstSession.data.sessionId)).toMatchObject({ ok: true, data: { status: 'active' } });
+    expect(sessions.get(secondSession.data.sessionId)).toMatchObject({ ok: true, data: { status: 'active' } });
+    expect(finishAgent(activeTarget.data, '2026-09-24T00:05:50.000Z').ok).toBe(true);
+
+    const activeOther = runs.createAgent({ goal: runInput.goal, input: runInput, config: agentConfig, usage, cleanup,
+      createdAt: '2026-09-24T00:05:55.000Z', sessionId: firstSession.data.sessionId, scope });
+    expect(activeOther.ok).toBe(true);
+    if (!activeOther.ok) return;
+    const prepared = sessions.prepareDelete(secondSession.data.sessionId, '2026-09-24T00:06:00.000Z');
+    expect(prepared).toMatchObject({ ok: true, data: { sessionId: secondSession.data.sessionId, status: 'archived' } });
+    expect(sessions.get(firstSession.data.sessionId)).toMatchObject({ ok: true, data: { status: 'active' } });
+    db.exec("CREATE TRIGGER block_second_session_delete BEFORE DELETE ON sessions WHEN OLD.id=(SELECT id FROM sessions WHERE title='Two') BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;");
+    expect(sessions.delete(secondSession.data.sessionId)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(sessions.get(secondSession.data.sessionId)).toMatchObject({ ok: true, data: { status: 'archived' } });
+    expect(runs.get(firstRun.data)).toMatchObject({ ok: true, data: { kind: 'agent' } });
+    expect(runs.get(secondRun.data)).toMatchObject({ ok: true, data: { kind: 'agent' } });
+    db.exec('DROP TRIGGER block_second_session_delete;');
+    expect(sessions.delete(secondSession.data.sessionId)).toEqual({ ok: true, data: undefined });
+    expect(sessions.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: firstSession.data.sessionId, status: 'active' }] } });
+    expect(runs.get(firstRun.data)).toMatchObject({ ok: true, data: { kind: 'agent', status: 'failed', sessionId: firstSession.data.sessionId } });
+    expect(runs.get(secondRun.data)).toMatchObject({ ok: false, error: { code: 'run_not_found' } });
+    expect(runs.get(activeOther.data)).toMatchObject({ ok: true, data: { kind: 'agent', status: 'created', sessionId: firstSession.data.sessionId } });
+    expect(runs.get(providerRun.data)).toMatchObject({ ok: true, data: { kind: 'provider', sessionId: null } });
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    opened.data.close();
+  }));
+
   it('enforces Run kind and Session reference combinations with SQLite constraints', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);

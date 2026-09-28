@@ -23,6 +23,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_provider'), targetRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_run'), runId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('create_session'), input: z.object({ title: sessionTitle.optional() }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('rename_session'), input: z.object({ sessionId: dbId, title: sessionTitle }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('delete_session'), sessionId: dbId }).strict(),
   z.object({
     version: z.literal(1), requestId, type: z.literal('list_sessions'),
     input: z.object({

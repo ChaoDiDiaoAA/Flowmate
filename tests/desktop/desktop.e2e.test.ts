@@ -59,6 +59,12 @@ it('desktop creates an Agent Session without a request, continues its in-process
     await page.getByRole('combobox', { name: 'Session' }).selectOption({ index: 1 });
     await page.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
     expect(requestCount).toBe(0);
+    await page.locator('.chat-session-actions summary').click();
+    await page.getByRole('button', { name: 'Rename', exact: true }).click();
+    await page.getByRole('textbox', { name: 'Session title' }).fill('A invoice session');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('#agent-session-select option').filter({ hasText: 'A invoice session' }).waitFor({ state: 'attached', timeout: 10_000 });
+    expect(requestCount).toBe(0);
     await page.getByLabel('Display name').fill('Controlled local model');
     await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
     await page.getByLabel('Model ID').fill('desktop-controlled-model');
@@ -97,6 +103,7 @@ it('desktop creates an Agent Session without a request, continues its in-process
         && document.querySelectorAll('[data-testid="chat-turn"]').length === 2;
     }, firstSessionId, { timeout: 20_000 });
     await page.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.locator('#agent-session-select option').filter({ hasText: 'A invoice session' }).waitFor({ state: 'attached', timeout: 10_000 });
     expect(requestCount).toBe(2);
     await page.getByRole('textbox', { name: 'Message to model' }).fill('Does the summary say when it was issued?');
     await page.getByRole('button', { name: 'Send to model' }).click();
@@ -111,16 +118,66 @@ it('desktop creates an Agent Session without a request, continues its in-process
     expect(JSON.stringify(requestBodies[2])).toContain('Desktop connection verified.');
 
     await page.getByRole('button', { name: /New/ }).click();
-    await page.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
+    const composer = page.getByRole('textbox', { name: 'Message to model' });
+    expect(await composer.isDisabled()).toBe(false);
+    expect(await composer.evaluate((element) => document.activeElement === element)).toBe(true);
+    await page.keyboard.type('B_SESSION_ONLY: a different invoice INV-B-77.');
+    expect(await composer.inputValue()).toBe('B_SESSION_ONLY: a different invoice INV-B-77.');
+    await page.waitForFunction((firstId) => {
+      const selector = document.querySelector('select[aria-label="Session"]');
+      return selector instanceof HTMLSelectElement && selector.value !== String(firstId);
+    }, firstSessionId, { timeout: 10_000 });
     const secondSessionId = Number(await sessionSelect.inputValue());
     expect(secondSessionId).not.toBe(firstSessionId);
-    await page.getByRole('textbox', { name: 'Message to model' }).fill('B_SESSION_ONLY: a different invoice INV-B-77.');
+    await page.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
     await page.getByRole('button', { name: 'Send to model' }).click();
     await page.locator('[data-testid="chat-turn"]').filter({ hasText: 'B session isolated response.' }).waitFor({ state: 'visible', timeout: 20_000 });
     expect(requestCount).toBe(4);
     expect(JSON.stringify(requestBodies[3])).toContain('B_SESSION_ONLY');
     expect(JSON.stringify(requestBodies[3])).not.toContain('INV-2048');
     expect(JSON.stringify(requestBodies[3])).not.toContain('Desktop connection verified.');
+    await page.getByRole('textbox', { name: 'Message to model' }).fill('B_SESSION_ONLY: follow up on the second invoice.');
+    await page.getByRole('button', { name: 'Send to model' }).click();
+    await page.waitForFunction(() => document.querySelectorAll('[data-testid="chat-turn"]').length === 2
+      && document.querySelectorAll('[data-testid="chat-turn"] .chat-assistant-message.completed').length === 2, null, { timeout: 20_000 });
+    expect(requestCount).toBe(5);
+    expect(JSON.stringify(requestBodies[4])).toContain('B_SESSION_ONLY: a different invoice INV-B-77.');
+    expect(JSON.stringify(requestBodies[4])).toContain('B_SESSION_ONLY: follow up on the second invoice.');
+    expect(JSON.stringify(requestBodies[4])).not.toContain('INV-2048');
+    await sessionSelect.selectOption(String(firstSessionId));
+    expect(await composer.isDisabled()).toBe(false);
+    expect(await composer.evaluate((element) => document.activeElement === element)).toBe(true);
+    await page.keyboard.type('A_SESSION_ONLY: continue after switching back.');
+    expect(await composer.inputValue()).toBe('A_SESSION_ONLY: continue after switching back.');
+    await page.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.getByRole('button', { name: 'Send to model' }).click();
+    await page.waitForFunction(() => document.querySelectorAll('[data-testid="chat-turn"]').length === 4
+      && [...document.querySelectorAll('[data-testid="chat-turn"]')].at(-1)?.querySelector('.chat-assistant-message.completed'), null, { timeout: 20_000 });
+    expect(requestCount).toBe(6);
+    expect(JSON.stringify(requestBodies[5])).toContain('Invoice summary: INV-2048');
+    expect(JSON.stringify(requestBodies[5])).not.toContain('B_SESSION_ONLY');
+    await page.locator('.chat-session-actions summary').click();
+    await page.getByRole('button', { name: 'Rename', exact: true }).click();
+    const renameInput = page.getByRole('textbox', { name: 'Session title' });
+    expect(await renameInput.evaluate((element) => document.activeElement === element)).toBe(true);
+    await page.keyboard.press('Control+A');
+    await page.keyboard.type('A invoice session renamed');
+    expect(await renameInput.inputValue()).toBe('A invoice session renamed');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('#agent-session-select option').filter({ hasText: 'A invoice session renamed' }).waitFor({ state: 'attached', timeout: 10_000 });
+
+    await sessionSelect.selectOption(String(secondSessionId));
+    await page.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.locator('.chat-session-actions summary').click();
+    const cancelDelete = page.waitForEvent('dialog').then(async (dialog) => {
+      expect(dialog.message()).toContain('New Session');
+      expect(dialog.message()).toContain('only this Session');
+      await dialog.dismiss();
+    });
+    await page.getByRole('button', { name: 'Delete Session', exact: true }).click();
+    await cancelDelete;
+    expect(Number(await sessionSelect.inputValue())).toBe(secondSessionId);
+    expect(await page.locator('[data-testid="chat-turn"]').count()).toBe(2);
 
     await sessionSelect.selectOption(String(firstSessionId));
     await page.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
@@ -128,12 +185,24 @@ it('desktop creates an Agent Session without a request, continues its in-process
     await page.getByRole('button', { name: 'Send to model' }).click();
     await page.getByText('Waiting for the Agent Run to finish…', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
     await sessionSelect.selectOption(String(secondSessionId));
-    await page.getByText(`Run 5 continues in Session #${firstSessionId}. Stop remains bound to that Run.`, { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
+    await page.locator('.chat-session-actions summary').click();
+    const deleteIdleSession = page.waitForEvent('dialog').then(async (dialog) => {
+      expect(dialog.message()).toContain('New Session');
+      expect(dialog.message()).toContain('only this Session');
+      await dialog.accept();
+    });
+    await page.getByRole('button', { name: 'Delete Session', exact: true }).click();
+    await deleteIdleSession;
+    await page.waitForFunction((id) => {
+      const selector = document.querySelector('select[aria-label="Session"]');
+      return selector instanceof HTMLSelectElement && selector.value === String(id);
+    }, firstSessionId, { timeout: 10_000 });
+    await page.getByText('Waiting for the Agent Run to finish…', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
+    expect(requestCount).toBe(7);
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
-    await page.getByText('Run 5 continues in Session', { exact: false }).waitFor({ state: 'detached', timeout: 20_000 });
-    await sessionSelect.selectOption(String(firstSessionId));
+    await page.getByText('Run 7 continues in Session', { exact: false }).waitFor({ state: 'detached', timeout: 20_000 });
     await page.getByText('Request cancelled.', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
-    expect(requestCount).toBe(5);
+    expect(requestCount).toBe(7);
     await page.locator('.chat-run-link').last().waitFor({ state: 'visible', timeout: 5_000 });
     const runIdText = await page.locator('.chat-run-link').nth(1).innerText();
     const runId = Number(runIdText.match(/(\d+)$/)?.[1]);
@@ -144,6 +213,7 @@ it('desktop creates an Agent Session without a request, continues its in-process
     await page.getByText('TEMPORARY PROMPT TRACE', { exact: true }).waitFor({ state: 'visible', timeout: 5_000 });
     await page.getByText('model_request', { exact: true }).waitFor({ state: 'visible', timeout: 5_000 });
     await page.getByRole('button', { name: 'Profile' }).click();
+
     await page.waitForFunction(() => document.querySelector('.desktop-shell')?.classList.contains('theme-system'));
     await page.getByLabel('Appearance').selectOption('dark');
     await page.waitForFunction(() => document.querySelector('.desktop-shell')?.classList.contains('theme-dark'), null, { timeout: 2_000 });
@@ -156,10 +226,10 @@ it('desktop creates an Agent Session without a request, continues its in-process
     await page.getByLabel('Message', { exact: true }).fill('P1 diagnostic request stays independent from Agent history.');
     await page.getByRole('button', { name: /Test connection/ }).click();
     await page.getByText('PERSISTED PROVIDER RUN', { exact: true }).waitFor({ state: 'visible', timeout: 20_000 });
-    expect(requestCount).toBe(6);
-    expect(JSON.stringify(requestBodies[5])).toContain('P1 diagnostic request stays independent');
-    expect(JSON.stringify(requestBodies[5])).not.toContain('INV-2048');
-    expect(JSON.stringify(requestBodies[5])).not.toContain('B_SESSION_ONLY');
+    expect(requestCount).toBe(8);
+    expect(JSON.stringify(requestBodies[7])).toContain('P1 diagnostic request stays independent');
+    expect(JSON.stringify(requestBodies[7])).not.toContain('INV-2048');
+    expect(JSON.stringify(requestBodies[7])).not.toContain('B_SESSION_ONLY');
 
     await electronApp.close();
     electronApp = null;
@@ -175,6 +245,10 @@ it('desktop creates an Agent Session without a request, continues its in-process
       expect(row).toMatchObject({ kind: 'agent', status: 'completed' });
       expect(Number.isSafeInteger(row?.session_id)).toBe(true);
       expect(row?.output_json).toContain('Desktop connection verified.');
+      expect(database.query('SELECT count(*) AS count FROM sessions').get()).toEqual({ count: 1 });
+      expect(database.query('SELECT title FROM sessions WHERE id=?').get(firstSessionId)).toEqual({ title: 'A invoice session renamed' });
+      expect(database.query("SELECT count(*) AS count FROM runs WHERE kind='agent'").get()).toEqual({ count: 5 });
+      expect(database.query("SELECT count(*) AS count FROM runs WHERE kind='provider'").get()).toEqual({ count: 1 });
     } finally { database.close(); }
 
     electronApp = await electron.launch({
@@ -186,13 +260,33 @@ it('desktop creates an Agent Session without a request, continues its in-process
     const restartedPage = await electronApp.firstWindow();
     await restartedPage.getByTestId('agent-chat-panel').waitFor({ state: 'visible', timeout: 20_000 });
     await restartedPage.getByText('History unavailable after restart', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
+    await restartedPage.getByText("This session's conversation history is unavailable after restart. Create a new session to continue.", { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
     expect(await restartedPage.getByRole('textbox', { name: 'Message to model' }).isDisabled()).toBe(true);
-    expect(requestCount).toBe(6);
+    expect(requestCount).toBe(8);
     await restartedPage.locator('.chat-run-link').last().click();
     await restartedPage.getByText('The Host process that owned this in-memory trace has exited.', { exact: true }).waitFor({ state: 'visible', timeout: 5_000 });
-    await restartedPage.getByRole('button', { name: /New/ }).click();
-    await restartedPage.getByText('Ready for another Run').waitFor({ state: 'visible', timeout: 10_000 });
-    expect(requestCount).toBe(6);
+    await restartedPage.locator('.chat-session-actions summary').click();
+    const confirmDelete = restartedPage.waitForEvent('dialog').then(async (dialog) => {
+      expect(dialog.message()).toContain('A invoice session renamed');
+      expect(dialog.message()).toContain('only this Session');
+      await dialog.accept();
+    });
+    await restartedPage.getByRole('button', { name: 'Delete Session', exact: true }).click();
+    await confirmDelete;
+    await restartedPage.waitForFunction(() => {
+      const selector = document.querySelector('select[aria-label="Session"]');
+      return selector instanceof HTMLSelectElement && selector.value === '' && selector.options.length === 1;
+    }, null, { timeout: 10_000 });
+    expect(await restartedPage.locator('[data-testid="chat-turn"]').count()).toBe(0);
+    expect(requestCount).toBe(8);
+    await electronApp.close();
+    electronApp = null;
+    const afterDelete = new Database(databaseFile, { readonly: true });
+    try {
+      expect(afterDelete.query('SELECT count(*) AS count FROM sessions').get()).toEqual({ count: 0 });
+      expect(afterDelete.query("SELECT count(*) AS count FROM runs WHERE kind='agent'").get()).toEqual({ count: 0 });
+      expect(afterDelete.query("SELECT count(*) AS count FROM runs WHERE kind='provider'").get()).toEqual({ count: 1 });
+    } finally { afterDelete.close(); }
   } finally {
     if (electronApp) await electronApp.close().catch(() => undefined);
     server.stop(true);

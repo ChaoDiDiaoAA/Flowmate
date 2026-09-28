@@ -38,12 +38,14 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolean } = {}) {
+function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolean; failSessionRelease?: boolean } = {}) {
   const opened = openTestDatabase(dbPaths(mkdtempSync(join(tmpdir(), 'flowmate-app-agent-'))));
   if (!opened.ok) throw new Error(opened.error.message);
   let created = 0;
   let preparations = 0;
   const released: string[] = [];
+  const clearedTraceSessions: number[] = [];
+  let failSessionRelease = options.failSessionRelease ?? false;
   const records = new Map<string, { busy: boolean }>();
   const agent: AgentPort = {
     createSession() {
@@ -89,7 +91,10 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
       };
       return ok(prepared);
     },
-    async releaseSession(nativeSessionId) { released.push(nativeSessionId); records.delete(nativeSessionId); return { stopped: true, closed: true, errors: [] }; },
+    async releaseSession(nativeSessionId) {
+      if (failSessionRelease) return { stopped: false, closed: false, errors: [appError('fixture_release_failed', 'session', 'fixture', true)] };
+      released.push(nativeSessionId); records.delete(nativeSessionId); return { stopped: true, closed: true, errors: [] };
+    },
     async close() { records.clear(); return { stopped: true, closed: true, errors: [] }; },
   };
   const provider: ProviderPort = {
@@ -102,14 +107,18 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     create: () => ({ ok: false, error: appError('storage_write_failed', 'storage', 'fixture session insert failure', true) }),
     get: (sessionId) => opened.data.sessions.get(sessionId),
     list: (request) => opened.data.sessions.list(request),
+    rename: (input) => opened.data.sessions.rename(input),
+    prepareDelete: (sessionId, at) => opened.data.sessions.prepareDelete(sessionId, at),
+    delete: (sessionId) => opened.data.sessions.delete(sessionId),
   } : opened.data.sessions;
   const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z');
-  const promptTrace: PromptTraceBuffer | undefined = options.failTraceQuery ? {
-    begin() {}, append() {}, end() {},
-    query() { throw new Error('diagnostic source failed'); },
-  } : undefined;
+  const promptTrace: PromptTraceBuffer = {
+    begin() {}, append() {}, end() {}, clearSession(sessionId) { clearedTraceSessions.push(sessionId); },
+    query() { if (options.failTraceQuery) throw new Error('diagnostic source failed'); return { availability: 'not-started', calls: [], droppedCalls: 0 }; },
+  };
   const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService, promptTrace);
-  return { app, db: opened.data, counts: () => ({ created, preparations }), released };
+  return { app, db: opened.data, counts: () => ({ created, preparations }), released, clearedTraceSessions,
+    setReleaseFailure(value: boolean) { failSessionRelease = value; } };
 }
 
 describe('P2 Application Agent entry', () => {
@@ -159,6 +168,37 @@ describe('P2 Application Agent entry', () => {
     expect(await app.listSessions()).toMatchObject({ ok: true, data: { items: [] } });
     expect(counts()).toEqual({ created: 1, preparations: 0 });
     expect(released).toEqual(['native-1']);
+  });
+
+  it('renames without changing native identity or creating a Run', async () => {
+    const { app, counts } = harness();
+    const created = await app.createSession({ title: 'Invoice' });
+    if (!created.ok) throw new Error('fixture session failed');
+    const renamed = await app.renameSession({ sessionId: created.data.sessionId, title: '  Review invoice  ' });
+    expect(renamed).toMatchObject({ ok: true, data: { sessionId: created.data.sessionId, nativeSessionId: 'native-1', title: 'Review invoice' } });
+    expect(counts()).toEqual({ created: 1, preparations: 0 });
+  });
+
+  it('deletes only the target Session and leaves it archived for retry when native release fails', async () => {
+    const { app, clearedTraceSessions, released, setReleaseFailure } = harness({ failSessionRelease: true });
+    const first = await app.createSession({ title: 'First' });
+    const second = await app.createSession({ title: 'Second' });
+    if (!first.ok || !second.ok) throw new Error('fixture sessions failed');
+
+    const deleting = app.deleteSession(second.data.sessionId);
+    expect(await app.createSession()).toMatchObject({ ok: false, error: { code: 'session_delete_in_progress' } });
+    expect(await deleting).toMatchObject({ ok: false, error: { code: 'session_delete_incomplete' } });
+    expect(await app.listSessions({ limit: 10 })).toMatchObject({ ok: true, data: { items: [
+      { sessionId: second.data.sessionId, status: 'archived' },
+      { sessionId: first.data.sessionId, status: 'active' },
+    ] } });
+    expect(clearedTraceSessions).toEqual([]);
+
+    setReleaseFailure(false);
+    expect(await app.deleteSession(second.data.sessionId)).toEqual({ ok: true, data: { deletedSessionId: second.data.sessionId } });
+    expect(await app.listSessions({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: first.data.sessionId, status: 'active' }] } });
+    expect(clearedTraceSessions).toEqual([second.data.sessionId]);
+    expect(released).toEqual(['native-2']);
   });
 
   it('reports an unavailable Trace source without changing the saved Run', async () => {

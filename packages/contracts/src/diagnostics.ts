@@ -45,5 +45,6 @@ export interface PromptTraceBuffer {
   begin(reference: PromptTraceReference): void;
   append(reference: PromptTraceReference, entry: PromptTraceEntry): void;
   end(reference: PromptTraceReference): void;
+  clearSession(sessionId: number): void;
   query(runId: number, callSequence?: number): PromptTraceResult;
 }

@@ -147,6 +147,7 @@ describe('PiAgentAdapter', () => {
       begin() {},
       append() {},
       end() { throw new Error('diagnostic-only trace failure'); },
+      clearSession() {},
       query() { throw new Error('diagnostic-only query failure'); },
     };
     const app = await fixture(undefined, 'fixture-only-key', promptTrace);

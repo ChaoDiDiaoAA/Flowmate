@@ -8,6 +8,8 @@ const bridge: DesktopBridge = {
   callProvider: (input: ProviderTestRequest) => ipcRenderer.invoke('flowmate:call-provider', input),
   cancelProvider: (requestId: string) => ipcRenderer.invoke('flowmate:cancel-provider', requestId),
   createSession: (request = {}) => ipcRenderer.invoke('flowmate:create-session', request),
+  renameSession: (request) => ipcRenderer.invoke('flowmate:rename-session', request),
+  deleteSession: (sessionId) => ipcRenderer.invoke('flowmate:delete-session', sessionId),
   listSessions: (request = {}) => ipcRenderer.invoke('flowmate:list-sessions', request),
   querySession: (sessionId) => ipcRenderer.invoke('flowmate:query-session', sessionId),
   listSessionRuns: (request) => ipcRenderer.invoke('flowmate:list-session-runs', request),

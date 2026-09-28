@@ -8,6 +8,8 @@ import {
   fail,
   normalizeCreateSessionRequest,
   normalizeListSessionsRequest,
+  normalizeRenameSessionRequest,
+  normalizeSessionId,
   normalizeSessionRunsRequest,
 } from '@flowmate/contracts';
 import type {
@@ -37,6 +39,8 @@ const channels = {
   cancelProvider: 'flowmate:cancel-provider',
   queryRun: 'flowmate:query-run',
   createSession: 'flowmate:create-session',
+  renameSession: 'flowmate:rename-session',
+  deleteSession: 'flowmate:delete-session',
   listSessions: 'flowmate:list-sessions',
   querySession: 'flowmate:query-session',
   listSessionRuns: 'flowmate:list-session-runs',
@@ -233,6 +237,8 @@ function registerIpc(): void {
   handle(channels.cancelProvider, async (_event, requestIdRaw) => cancelProvider(requestIdRaw));
   handle(channels.queryRun, async (_event, runIdRaw) => queryRun(runIdRaw));
   handle(channels.createSession, async (_event, inputRaw) => createSession(inputRaw));
+  handle(channels.renameSession, async (_event, inputRaw) => renameSession(inputRaw));
+  handle(channels.deleteSession, async (_event, sessionIdRaw) => deleteSession(sessionIdRaw));
   handle(channels.listSessions, async (_event, inputRaw) => listSessions(inputRaw));
   handle(channels.querySession, async (_event, sessionIdRaw) => querySession(sessionIdRaw));
   handle(channels.listSessionRuns, async (_event, inputRaw) => listSessionRuns(inputRaw));
@@ -373,6 +379,20 @@ async function createSession(raw: unknown): Promise<Result<SessionSnapshot>> {
   if (!input.ok) return input;
   try { return await host.request({ type: 'create_session', input: input.data }) as Result<SessionSnapshot>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'New Session 未能提交给 Bun Host。', true)); }
+}
+
+async function renameSession(raw: unknown): Promise<Result<SessionSnapshot>> {
+  const input = normalizeRenameSessionRequest(raw);
+  if (!input.ok) return input;
+  try { return await host.request({ type: 'rename_session', input: input.data }) as Result<SessionSnapshot>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session 重命名未能提交给 Bun Host。', true)); }
+}
+
+async function deleteSession(raw: unknown): Promise<Result<{ deletedSessionId: number }>> {
+  const sessionId = normalizeSessionId(raw);
+  if (!sessionId.ok) return sessionId;
+  try { return await host.request({ type: 'delete_session', sessionId: sessionId.data }) as Result<{ deletedSessionId: number }>; }
+  catch { return fail(appError('host_request_failed', 'runtime', 'Session could not be submitted for deletion to Bun Host.', true)); }
 }
 
 async function listSessions(raw?: unknown): Promise<Result<SessionPage>> {

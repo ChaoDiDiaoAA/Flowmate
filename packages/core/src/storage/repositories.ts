@@ -53,6 +53,9 @@ export interface SessionRepository {
   create(input: NewSession): Result<SessionRow>;
   get(sessionId: DbId): Result<SessionRow>;
   list(request: NormalizedListSessionsRequest): Result<{ items: SessionRow[]; next: SessionCursor | null }>;
+  rename(input: { sessionId: DbId; title: string; at: string }): Result<SessionRow>;
+  prepareDelete(sessionId: DbId, at: string): Result<SessionRow>;
+  delete(sessionId: DbId): Result<void>;
 }
 
 export type TerminalWrite = {
@@ -401,6 +404,49 @@ export function createSessionRepository(db: Database): SessionRepository {
       } catch {
         return fail(appError('storage_corrupt', 'storage', 'Session 列表无法读取。'));
       }
+    },
+
+    rename(input) {
+      const result = transaction(db, () => {
+        const changed = db.query('UPDATE sessions SET title=?,updated_at=? WHERE id=?')
+          .run(input.title, input.at, input.sessionId).changes;
+        return changed === 1
+          ? ok(sessionRow(db.query('SELECT * FROM sessions WHERE id=?').get(input.sessionId)))
+          : fail(appError('session_not_found', 'session', 'Session 不存在。'));
+      });
+      return result.ok ? result.data : result;
+    },
+
+    prepareDelete(sessionId, at) {
+      const prepared = transaction(db, () => {
+        const row = db.query('SELECT * FROM sessions WHERE id=?').get(sessionId);
+        if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+        if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
+          return fail(appError('session_busy', 'session', 'An Agent Run is active in this Session. Wait for it to finish before deleting this Session.', true));
+        }
+        db.query("UPDATE sessions SET status='archived',updated_at=? WHERE id=? AND status!='archived'").run(at, sessionId);
+        return ok(sessionRow(db.query('SELECT * FROM sessions WHERE id=?').get(sessionId)));
+      });
+      return prepared.ok ? prepared.data : prepared;
+    },
+
+    delete(sessionId) {
+      const deleted = transaction(db, () => {
+        const row = db.query('SELECT status FROM sessions WHERE id=?').get(sessionId) as { status: string } | null;
+        if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+        if (row.status !== 'archived') {
+          return fail(appError('session_delete_not_prepared', 'session', 'Session deletion has not been prepared.'));
+        }
+        if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
+          return fail(appError('session_busy', 'session', 'An Agent Run is active in this Session. Wait for it to finish before deleting this Session.', true));
+        }
+        db.query("DELETE FROM runs WHERE kind='agent' AND session_id=?").run(sessionId);
+        if (db.query('DELETE FROM sessions WHERE id=?').run(sessionId).changes !== 1) {
+          return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+        }
+        return ok(undefined);
+      });
+      return deleted.ok ? deleted.data : deleted;
     },
   };
 }

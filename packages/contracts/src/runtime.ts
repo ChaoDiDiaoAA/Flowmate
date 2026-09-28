@@ -186,6 +186,7 @@ export type SessionSnapshot = {
 };
 
 export type CreateSessionRequest = { title?: string };
+export type RenameSessionRequest = { sessionId: DbId; title: string };
 
 export type SessionCursor = { updatedAt: string; sessionId: DbId };
 export type ListSessionsRequest = { limit?: number; before?: SessionCursor };
@@ -278,6 +279,8 @@ export interface Application {
   ): Promise<Result<ProviderOutcome>>;
   queryRun(runId: DbId): Promise<Result<RunSnapshot>>;
   createSession(request?: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
+  renameSession(request: RenameSessionRequest): Promise<Result<SessionSnapshot>>;
+  deleteSession(sessionId: DbId): Promise<Result<{ deletedSessionId: DbId }>>;
   listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
   querySession(sessionId: DbId): Promise<Result<SessionSnapshot>>;
   listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>>;

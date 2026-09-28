@@ -62,6 +62,12 @@ export function createPromptTraceBuffer(): PromptTraceBuffer {
         }
       }
     },
+    clearSession(sessionId) {
+      for (const [key, call] of active) if (call.sessionId === sessionId) active.delete(key);
+      for (let index = ended.length - 1; index >= 0; index -= 1) {
+        if (ended[index].sessionId === sessionId) ended.splice(index, 1);
+      }
+    },
     query(runId, callSequence) {
       const calls = [...ended, ...active.values()]
         .filter((call) => call.runId === runId && (callSequence === undefined || call.callSequence === callSequence))

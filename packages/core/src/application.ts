@@ -3,6 +3,8 @@ import {
   fail,
   normalizeAgentRunRequest,
   normalizeCreateSessionRequest,
+  normalizeRenameSessionRequest,
+  normalizeSessionId,
   normalizeListSessionsRequest,
   normalizeSessionRunsRequest,
   ok,
@@ -67,6 +69,19 @@ export function makeApplication(
     createSession: async (raw = {}) => {
       const normalized = normalizeCreateSessionRequest(raw);
       return normalized.ok ? sessions?.create(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
+    },
+    renameSession: async (raw) => {
+      const normalized = normalizeRenameSessionRequest(raw);
+      return normalized.ok ? sessions?.rename(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
+    },
+    deleteSession: async (raw) => {
+      const normalized = normalizeSessionId(raw);
+      if (!normalized.ok) return normalized;
+      const deleted = await (sessions?.deleteSession(normalized.data) ?? Promise.resolve(fail(sessionServiceUnavailable())));
+      if (deleted.ok) {
+        try { promptTrace?.clearSession(deleted.data.deletedSessionId); } catch { /* deletion is already committed */ }
+      }
+      return deleted;
     },
     listSessions: async (raw?: ListSessionsRequest) => {
       const normalized = normalizeListSessionsRequest(raw);

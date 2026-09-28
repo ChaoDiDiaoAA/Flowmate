@@ -29,6 +29,10 @@ describe('versioned desktop Host protocol', () => {
       .toEqual({ version: 1, requestId: 'new-1', type: 'create_session', input: { title: 'Invoice' } });
     expect(parseHostCommand({ version: 1, requestId: 'sessions-1', type: 'list_sessions', input: { limit: 20 } })).not.toBeNull();
     expect(parseHostCommand({ version: 1, requestId: 'query-session-1', type: 'query_session', sessionId: 5 })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'rename-session-1', type: 'rename_session', input: { sessionId: 5, title: 'Invoice review' } })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'rename-session-2', type: 'rename_session', input: { sessionId: 5, title: '  ' } })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'delete-1', type: 'delete_session', sessionId: 5 })).toEqual({ version: 1, requestId: 'delete-1', type: 'delete_session', sessionId: 5 });
+    expect(parseHostCommand({ version: 1, requestId: 'delete-2', type: 'delete_session', sessionId: -1 })).toBeNull();
     expect(parseHostCommand({ version: 1, requestId: 'runs-1', type: 'list_session_runs', input: { sessionId: 5, limit: 20 } })).not.toBeNull();
     expect(parseHostCommand({ version: 1, requestId: 'trace-1', type: 'query_prompt_trace', runId: 5, callSequence: 1 })).not.toBeNull();
     expect(parseHostCommand({ version: 1, requestId: 'trace-2', type: 'query_prompt_trace', runId: 5, raw: true })).toBeNull();

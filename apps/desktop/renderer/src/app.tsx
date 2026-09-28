@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import type { AgentRunEvent, AgentRunSnapshot, DesktopEvent, DesktopState, ModelProfile, ProductSettings, PromptTraceResult, RunSnapshot, SessionCursor, SessionSnapshot } from '@flowmate/contracts';
 
 type Page = 'model' | 'profile';
@@ -51,6 +51,7 @@ export function App() {
   const [sessionCursor, setSessionCursor] = useState<SessionCursor | null>(null);
   const [runCursor, setRunCursor] = useState<number | null>(null);
   const [sessionLoading, setSessionLoading] = useState(false);
+  const [sessionMutating, setSessionMutating] = useState(false);
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const [run, setRun] = useState<RunSnapshot | null>(null);
   const [promptTrace, setPromptTrace] = useState<PromptTraceResult | null>(null);
@@ -69,6 +70,9 @@ export function App() {
   const selectedSessionIdRef = useRef<number | null>(null);
   const sessionCursorRef = useRef<SessionCursor | null>(null);
   const sessionLoadSequence = useRef(0);
+  const allowInitialSessionSelection = useRef(true);
+  const focusComposerWhenReady = useRef(false);
+  const chatComposerRef = useRef<HTMLTextAreaElement | null>(null);
   const latestAgentFinished = useRef(new Map<number, Extract<AgentRunEvent, { type: 'run_finished' }>>());
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
   const revisionLoaded = useRef<number | null>(null);
@@ -80,7 +84,9 @@ export function App() {
     sessionCursorRef.current = result.data.next;
     setSessionCursor(result.data.next);
     setSessions((current) => append ? [...current, ...result.data.items] : result.data.items);
-    if (selectedSessionIdRef.current === null && result.data.items[0]) selectSession(result.data.items[0].sessionId);
+    if (allowInitialSessionSelection.current && selectedSessionIdRef.current === null && result.data.items[0]) {
+      selectSession(result.data.items[0].sessionId);
+    }
   }
 
   async function loadSession(sessionId: number) {
@@ -97,7 +103,8 @@ export function App() {
     setChatTurns(runsResult.data.items.slice().reverse().map(turnFromRun));
   }
 
-  function selectSession(sessionId: number) {
+  function selectSession(sessionId: number, focusComposer = false) {
+    focusComposerWhenReady.current = focusComposer && modelReady && !busy;
     selectedSessionIdRef.current = sessionId;
     setSelectedSessionId(sessionId);
     setSelectedSession(null);
@@ -108,21 +115,91 @@ export function App() {
   }
 
   async function createNewSession() {
-    if (!state?.ready || sessionLoading) return;
+    if (!state?.ready || sessionLoading || sessionMutating) return;
+    setChatInput('');
+    focusComposerWhenReady.current = modelReady && !busy;
     setSessionLoading(true);
+    chatComposerRef.current?.focus();
     const created = await window.flowmate.createSession();
     setSessionLoading(false);
     if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return; }
     const session = created.data;
+    focusComposerWhenReady.current = modelReady && !busy;
     selectedSessionIdRef.current = session.sessionId;
     setSelectedSessionId(session.sessionId);
     setSelectedSession(session);
     setChatTurns([]);
-    setChatInput('');
     setRunCursor(null);
     setNotice(null);
     setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
     void loadSessionList();
+  }
+
+  async function renameSession(sessionId: number, title: string): Promise<boolean> {
+    if (sessionMutating) return false;
+    setSessionMutating(true);
+    const result = await window.flowmate.renameSession({ sessionId, title });
+    setSessionMutating(false);
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return false; }
+    if (selectedSessionIdRef.current === sessionId) setSelectedSession(result.data);
+    setSessions((current) => current.map((item) => item.sessionId === result.data.sessionId ? result.data : item)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.sessionId - left.sessionId));
+    setNotice({ tone: 'good', message: 'Session renamed.' });
+    return true;
+  }
+
+  async function deleteSession(sessionId: number): Promise<void> {
+    if (sessionMutating) return;
+    setSessionMutating(true);
+    const result = await window.flowmate.deleteSession(sessionId);
+    if (!result.ok) {
+      const refreshed = await window.flowmate.listSessions({ limit: 100 });
+      if (refreshed.ok) {
+        setSessions(refreshed.data.items);
+        setSessionCursor(refreshed.data.next);
+        sessionCursorRef.current = refreshed.data.next;
+      }
+      if (selectedSessionIdRef.current !== null) {
+        const current = await window.flowmate.querySession(selectedSessionIdRef.current);
+        if (current.ok) setSelectedSession(current.data);
+      }
+      setNotice({ tone: 'bad', message: errorMessage(result) });
+      setSessionMutating(false);
+      return;
+    }
+
+    const refreshed = await window.flowmate.listSessions({ limit: 100 });
+    const remaining = refreshed.ok ? refreshed.data.items : sessions.filter((item) => item.sessionId !== sessionId);
+    const next = remaining.find((item) => item.status === 'active') ?? null;
+    setSessions(remaining);
+    const nextCursor = refreshed.ok ? refreshed.data.next : null;
+    setSessionCursor(nextCursor);
+    sessionCursorRef.current = nextCursor;
+    allowInitialSessionSelection.current = false;
+    selectedSessionIdRef.current = next?.sessionId ?? null;
+    setSelectedSessionId(next?.sessionId ?? null);
+    setSelectedSession(null);
+    setChatInput('');
+    setChatTurns([]);
+    setRunCursor(null);
+    if (run?.kind === 'agent' && run.sessionId === sessionId) {
+      setRun(null);
+      setRunId(null);
+      setPromptTrace(null);
+    }
+    if (activeAgentSessionId === sessionId) {
+      setBusy(false);
+      setCancelPending(false);
+      setActiveAgentRunId(null);
+      setActiveAgentSessionId(null);
+      activeAgentRunIdRef.current = null;
+      activeChatTurnId.current = null;
+      activeChatSessionId.current = null;
+      setActiveRunModel(null);
+    }
+    setNotice({ tone: 'good', message: 'Session and its conversations deleted.' });
+    if (next) void loadSession(next.sessionId);
+    setSessionMutating(false);
   }
 
   async function loadMoreSessions() {
@@ -246,7 +323,16 @@ export function App() {
   const isDraftSaved = persistedModel !== null && modelFieldsEqual(draft, persistedModel);
   const modelReady = Boolean(state?.ready && persistedModel && isDraftSaved && credentialStatus === 'configured');
   const canTest = Boolean(state?.ready && persistedModel && isDraftSaved && credentialStatus === 'configured' && !busy && !saving);
-  const canChat = Boolean(modelReady && !saving && !busy && selectedSession?.availability === 'ready');
+  const inputSessionAvailable = selectedSessionId === null
+    ? sessionLoading
+    : selectedSession === null || selectedSession.availability === 'ready';
+  const inputEnabled = Boolean(modelReady && !saving && !busy && !sessionMutating && inputSessionAvailable);
+  const canChat = Boolean(inputEnabled && !sessionLoading && selectedSession?.availability === 'ready');
+  useLayoutEffect(() => {
+    if (!focusComposerWhenReady.current || !inputEnabled) return;
+    focusComposerWhenReady.current = false;
+    chatComposerRef.current?.focus();
+  }, [inputEnabled, selectedSessionId, sessionLoading]);
   const savedModels = state?.settings.models ?? [];
   const modelLabel = useMemo(() => draft.model.trim() || 'No model selected', [draft.model]);
 
@@ -579,17 +665,22 @@ export function App() {
         sessionLoading={sessionLoading}
         hasMoreSessions={sessionCursor !== null}
         hasOlderRuns={runCursor !== null}
-        onSelectSession={selectSession}
+        onSelectSession={(id) => selectSession(id, true)}
         onNewSession={() => void createNewSession()}
+        onRenameSession={renameSession}
+        onDeleteSession={deleteSession}
+        sessionMutating={sessionMutating}
         onLoadMoreSessions={() => void loadMoreSessions()}
         onLoadOlderRuns={() => void loadOlderRuns()}
         turns={chatTurns}
         transcriptRef={chatTranscriptRef}
         input={chatInput}
+        composerRef={chatComposerRef}
         onInputChange={setChatInput}
         onSend={() => void sendChatMessage()}
         onCancel={() => void (activeAgentRunIdRef.current === null ? cancelRequest() : cancelAgentRun())}
         enabled={canChat}
+        inputEnabled={inputEnabled}
         busy={busy}
         cancelPending={cancelPending}
         activeAgentRunId={activeAgentRunId}
@@ -598,8 +689,9 @@ export function App() {
         selectedModelId={selectedModelId}
         modelName={persistedModel?.name ?? null}
         modelId={persistedModel?.model ?? null}
-        sessionHint={!selectedSession ? 'Create a Session to begin. Creating one does not call the model.'
-          : selectedSession.availability === 'history-unavailable' ? 'This saved Session has no restorable Agent history after restart. Create a new Session to continue; previous Runs remain viewable.'
+        sessionHint={!selectedSession ? selectedSessionId !== null ? 'Loading this Session. You can write while it loads; Send will be available when ready.' : 'Create a Session to begin. Creating one does not call the model.'
+          : selectedSession.availability === 'history-unavailable' ? "This session's conversation history is unavailable after restart. Create a new session to continue."
+            : selectedSession.availability === 'archived' ? 'This Session is pending deletion. Retry Delete to finish removing it.'
             : selectedSession.availability === 'unusable' ? 'This Agent Session cannot continue safely. Create a new Session.'
               : selectedSession.availability === 'busy' ? 'A Run is active for this Session.'
                 : !modelReady ? 'Save a model route and API Key to start a chat.' : ''}
@@ -677,15 +769,20 @@ function AgentChatPanel({
   hasOlderRuns,
   onSelectSession,
   onNewSession,
+  onRenameSession,
+  onDeleteSession,
+  sessionMutating,
   onLoadMoreSessions,
   onLoadOlderRuns,
   turns,
   transcriptRef,
   input,
+  composerRef,
   onInputChange,
   onSend,
   onCancel,
   enabled,
+  inputEnabled,
   busy,
   cancelPending,
   activeAgentRunId,
@@ -707,15 +804,20 @@ function AgentChatPanel({
   hasOlderRuns: boolean;
   onSelectSession(sessionId: number): void;
   onNewSession(): void;
+  onRenameSession(sessionId: number, title: string): Promise<boolean>;
+  onDeleteSession(sessionId: number): Promise<void>;
+  sessionMutating: boolean;
   onLoadMoreSessions(): void;
   onLoadOlderRuns(): void;
   turns: readonly ChatTurn[];
   transcriptRef: RefObject<HTMLDivElement | null>;
   input: string;
+  composerRef: RefObject<HTMLTextAreaElement | null>;
   onInputChange(value: string): void;
   onSend(): void;
   onCancel(): void;
   enabled: boolean;
+  inputEnabled: boolean;
   busy: boolean;
   cancelPending: boolean;
   activeAgentRunId: number | null;
@@ -727,6 +829,20 @@ function AgentChatPanel({
   sessionHint: string;
   onOpenRun(runId: number): void;
 }) {
+  const [renaming, setRenaming] = useState(false);
+  const [renameTitle, setRenameTitle] = useState('');
+  const [editingSessionId, setEditingSessionId] = useState<number | null>(null);
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    setRenaming(false);
+    setEditingSessionId(null);
+    setRenameTitle(selectedSession?.title ?? '');
+  }, [selectedSessionId]);
+  useLayoutEffect(() => {
+    if (!renaming || !renameInputRef.current) return;
+    renameInputRef.current.focus();
+    renameInputRef.current.select();
+  }, [renaming, selectedSessionId]);
   if (collapsed) {
     return <aside className="agent-chat-panel collapsed" data-testid="agent-chat-panel">
       <button className="chat-expand" type="button" onClick={onToggle} aria-label="Expand Agent Chat" aria-expanded={false} title="Expand Agent Chat"><span aria-hidden="true">‹</span><b>CHAT</b></button>
@@ -735,18 +851,42 @@ function AgentChatPanel({
   return <aside className="agent-chat-panel" data-testid="agent-chat-panel" aria-label="Agent Chat">
     <header className="chat-panel-head">
       <div><span className="section-index">PI NATIVE AGENT</span><h2>Agent Chat</h2></div>
-      <button className="chat-new-session" type="button" onClick={onNewSession} disabled={sessionLoading}>{sessionLoading ? 'Creating…' : '＋ New'}</button>
+      <button className="chat-new-session" type="button" onClick={onNewSession} disabled={sessionLoading || sessionMutating}>{sessionLoading ? 'Creating…' : sessionMutating ? 'Working…' : '＋ New'}</button>
       <button className="chat-collapse" type="button" onClick={onToggle} aria-label="Collapse Agent Chat" aria-expanded={true} title="Collapse Agent Chat">›</button>
     </header>
     <div className="chat-model-row"><span className={`status-dot ${enabled ? 'is-ready' : 'is-error'}`} /><div><strong>{modelName ?? 'No model configured'}</strong><small>{modelId ?? 'Open Model to add a route'}</small></div></div>
     <div className="chat-session-select">
       <label htmlFor="agent-session-select">SESSION</label>
-      <select id="agent-session-select" aria-label="Session" value={selectedSessionId ?? ''} onChange={(event) => { const id = Number(event.target.value); if (Number.isSafeInteger(id) && id > 0) onSelectSession(id); }}>
+      <select id="agent-session-select" aria-label="Session" value={selectedSessionId ?? ''} disabled={sessionMutating} onChange={(event) => { const id = Number(event.target.value); if (Number.isSafeInteger(id) && id > 0) onSelectSession(id); }}>
         <option value="">Select a Session</option>
         {sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.title} · #{session.sessionId}</option>)}
       </select>
+      {selectedSession && <details className="chat-session-actions">
+        <summary aria-label="Session actions" title="Session actions">•••</summary>
+        <div className="chat-session-action-menu">
+          <button type="button" onClick={(event) => {
+            setRenameTitle(selectedSession.title);
+            setEditingSessionId(selectedSession.sessionId);
+            setRenaming(true);
+            event.currentTarget.closest('details')?.removeAttribute('open');
+          }} disabled={sessionMutating || selectedSession.status === 'archived'}>Rename</button>
+          <button type="button" className="danger-action" disabled={sessionMutating} onClick={() => {
+            const title = selectedSession.title;
+            if (window.confirm(`Permanently delete only this Session (“${title}”), including its conversations and Agent Runs? Other Sessions and Provider test Runs will be kept. This cannot be undone.`)) void onDeleteSession(selectedSession.sessionId);
+          }}>Delete Session</button>
+        </div>
+      </details>}
       {hasMoreSessions && <button type="button" className="chat-more" onClick={onLoadMoreSessions}>More</button>}
     </div>
+    {renaming && selectedSession && <form className="chat-session-rename" onSubmit={async (event) => {
+      event.preventDefault();
+      if (editingSessionId !== null && await onRenameSession(editingSessionId, renameTitle)) setRenaming(false);
+    }}>
+      <label className="sr-only" htmlFor="agent-session-title">Session title</label>
+      <input ref={renameInputRef} id="agent-session-title" aria-label="Session title" value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} autoFocus />
+      <button type="submit" disabled={sessionMutating}>Save</button>
+      <button type="button" onClick={() => setRenaming(false)} disabled={sessionMutating}>Cancel</button>
+    </form>}
     {selectedSession && <div className="chat-session-state"><span className={`status-dot ${selectedSession.availability === 'ready' ? 'is-ready' : selectedSession.availability === 'busy' ? 'is-warning' : 'is-error'}`} />
       <span>{selectedSession.availability === 'ready' ? 'Ready for another Run' : selectedSession.availability === 'busy' ? 'Run in progress' : selectedSession.availability === 'history-unavailable' ? 'History unavailable after restart' : selectedSession.availability === 'unusable' ? 'Session cannot continue' : selectedSession.availability}</span>
     </div>}
@@ -771,9 +911,9 @@ function AgentChatPanel({
     <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend(); }}>
       {sessionHint && <p className="chat-config-hint">{sessionHint}</p>}
       <label className="sr-only" htmlFor="agent-chat-input">Message to model</label>
-      <textarea id="agent-chat-input" aria-label="Message to model" value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => {
+      <textarea ref={composerRef} id="agent-chat-input" aria-label="Message to model" value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => {
         if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSend(); }
-      }} placeholder="Write a message…" rows={3} disabled={!enabled || busy} />
+      }} placeholder="Write a message…" rows={3} disabled={!inputEnabled || busy} />
       <div className="chat-composer-foot"><span>Enter to send · Shift+Enter for a new line</span>
         {busy ? <button className="secondary-button cancel-button" type="button" onClick={onCancel} disabled={cancelPending}>{cancelPending ? 'Stopping…' : 'Stop'}</button>
           : <button className="primary-button" type="submit" disabled={!enabled || !input.trim()}>Send to model <span aria-hidden="true">↗</span></button>}
