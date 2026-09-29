@@ -27,7 +27,8 @@ export class SessionService {
     if (this.deleting) return deleteInProgress();
     const native = this.agent.createSession();
     if (!native.ok) return native;
-    const row = this.repository.create({ nativeSessionId: native.data.nativeSessionId, title: request.title ?? 'New Session', at: this.now() });
+    const row = this.repository.create({ nativeSessionId: native.data.nativeSessionId, title: request.title ?? 'New Session',
+      at: this.now(), ...(request.expectedRevision === undefined ? {} : { expectedRevision: request.expectedRevision }) });
     if (!row.ok) {
       try { await this.agent.releaseSession(native.data.nativeSessionId); } catch { /* preserve the failed DB insert */ }
       return row;
@@ -56,7 +57,7 @@ export class SessionService {
       try { released = await this.agent.releaseSession(prepared.data.nativeSessionId); }
       catch { return failDeleteSession(); }
       if (!released.stopped || !released.closed) return failDeleteSession();
-      const deleted = this.repository.delete(sessionId);
+      const deleted = this.repository.delete(sessionId, this.now());
       return deleted.ok ? ok({ deletedSessionId: sessionId }) : failDeleteSession();
     } finally {
       this.deleting = false;
@@ -96,6 +97,8 @@ export class SessionService {
       updatedAt: row.updatedAt,
       availability,
       activeRunId,
+      modelUseBlocked: row.modelUseBlocked,
+      hasBusinessHistory: row.hasBusinessHistory,
     };
   }
 }

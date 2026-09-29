@@ -108,8 +108,10 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     get: (sessionId) => opened.data.sessions.get(sessionId),
     list: (request) => opened.data.sessions.list(request),
     rename: (input) => opened.data.sessions.rename(input),
+    isModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId),
+    revokeDocumentUse: (input) => opened.data.sessions.revokeDocumentUse(input),
     prepareDelete: (sessionId, at) => opened.data.sessions.prepareDelete(sessionId, at),
-    delete: (sessionId) => opened.data.sessions.delete(sessionId),
+    delete: (sessionId, at) => opened.data.sessions.delete(sessionId, at),
   } : opened.data.sessions;
   const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z');
   const promptTrace: PromptTraceBuffer = {

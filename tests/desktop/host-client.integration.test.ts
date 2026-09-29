@@ -80,6 +80,12 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const created = await client.request(createCommand) as { ok: boolean; data?: { sessionId: number } };
     expect(created.ok).toBe(true);
     if (!created.ok || !created.data) return;
+    const workspaceBound = await client.request({
+      type: 'update_workspace', requestId: 'bind-primary-session',
+      input: { expectedRevision: 0, change: { kind: 'session', sessionId: created.data.sessionId } },
+    }) as { ok: boolean; data?: { revision: number; sessionId: number } };
+    expect(workspaceBound).toMatchObject({ ok: true, data: { revision: 1, sessionId: created.data.sessionId } });
+    const workspace = { revision: 1, documentRef: null, jobId: null, candidateRef: null, sessionId: created.data.sessionId };
     const duplicateCreate = await client.request(createCommand) as { ok: boolean; error?: { code: string } };
     expect(duplicateCreate).toMatchObject({ ok: false, error: { code: 'request_duplicate' } });
     expect(await client.request({ type: 'list_sessions', input: { limit: 10 } })).toMatchObject({ ok: true, data: { items: [{ sessionId: created.data.sessionId }] } });
@@ -96,7 +102,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
 
     const stale = await client.request({
       type: 'start_run', requestId: 'stale-agent-run',
-      input: { sessionId: created.data.sessionId, text: 'stale config must not dispatch', modelId: 'fixture-model' },
+      input: { sessionId: created.data.sessionId, text: 'stale config must not dispatch', modelId: 'fixture-model', workspace, goalMode: 'answer' },
       apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: saved.data?.revision ?? 1, expectedCredentialRef: 'credential_reference_1234',
     }) as { ok: boolean; error?: { code: string } };
     expect(stale).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
@@ -104,7 +110,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
 
     const firstPending = client.request({
       type: 'start_run', requestId: 'first-agent-run',
-      input: { sessionId: created.data.sessionId, text: '發票摘要：號碼 INV-2048，價稅合計 1060 元，日期缺失。', modelId: 'fixture-model' },
+      input: { sessionId: created.data.sessionId, text: '發票摘要：號碼 INV-2048，價稅合計 1060 元，日期缺失。', modelId: 'fixture-model', workspace, goalMode: 'answer' },
       apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
     }, 30_000) as Promise<{ ok: boolean; data?: { runId: number; sessionId: number } }>;
     const first = await firstPending;
@@ -112,7 +118,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     await waitFor(() => finished.some((event) => event.runId === 1));
     const duplicateStart = await client.request({
       type: 'start_run', requestId: 'first-agent-run',
-      input: { sessionId: created.data.sessionId, text: 'must not replay a completed Run', modelId: 'fixture-model' },
+      input: { sessionId: created.data.sessionId, text: 'must not replay a completed Run', modelId: 'fixture-model', workspace, goalMode: 'answer' },
       apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
     }) as { ok: boolean; error?: { code: string } };
     expect(duplicateStart).toMatchObject({ ok: false, error: { code: 'request_duplicate' } });
@@ -120,7 +126,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
 
     const second = await client.request({
       type: 'start_run', requestId: 'follow-up-agent-run',
-      input: { sessionId: created.data.sessionId, text: '剛才那張發票的價稅合計是多少？', modelId: 'fixture-model' },
+      input: { sessionId: created.data.sessionId, text: '剛才那張發票的價稅合計是多少？', modelId: 'fixture-model', workspace, goalMode: 'answer' },
       apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
     }) as { ok: boolean; data?: { runId: number; sessionId: number } };
     expect(second).toMatchObject({ ok: true, data: { runId: 2, sessionId: created.data.sessionId } });
@@ -131,7 +137,11 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     expect(finished[1].result).toMatchObject({ ok: true, data: { status: 'completed', text: replies[1] } });
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies.every(({ authorization }) => authorization === 'Bearer synthetic-host-agent-key')).toBe(true);
-    expect(requestBodies.every(({ body }) => (body.tools ?? []).length === 0)).toBe(true);
+    expect(requestBodies.map(({ body }) => (body.tools ?? []).map((tool) =>
+      (tool as { function?: { name?: string } }).function?.name).sort())).toEqual([
+      ['calculate_invoice_amounts', 'normalize_invoice_values'],
+      ['calculate_invoice_amounts', 'normalize_invoice_values'],
+    ]);
     expect(JSON.stringify(requestBodies[0].body.messages)).toContain('INV-2048');
     expect(JSON.stringify(requestBodies[1].body.messages)).toContain('INV-2048');
     expect(JSON.stringify(requestBodies[1].body.messages)).toContain(replies[0]);

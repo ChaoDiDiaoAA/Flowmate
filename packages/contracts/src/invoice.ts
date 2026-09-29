@@ -6,7 +6,6 @@ const pageOrNullSchema = pageSchema.nullable();
 const limitSchema = z.number().int().min(1).max(50);
 const blockIdSchema = z.string().regex(/^b[1-9]\d{0,3}$/);
 const decimalTextSchema = z.string().regex(/^-?(0|[1-9][0-9]{0,17})(\.[0-9]{1,6})?$/);
-const boundedTextSchema = z.string().min(1).max(1024);
 
 export const DocumentRefSchema = z.object({
   id: idSchema,
@@ -30,7 +29,9 @@ export const ParsedBlockSchema = z.object({
   text: z.string().max(65_536),
   sourceIndex: z.number().int().min(0).max(1_999),
   sourceType: z.string().min(1).max(128),
-  bbox: z.array(z.number().finite()).max(4).nullable(),
+  bbox: z.tuple([
+    z.number().finite(), z.number().finite(), z.number().finite(), z.number().finite(),
+  ]).nullable(),
 }).strict();
 export type ParsedBlock = z.infer<typeof ParsedBlockSchema>;
 
@@ -228,7 +229,6 @@ const candidateValidationSchema = z.object({
 
 const candidateSummarySchema = z.object({
   candidateId: idSchema,
-  jobId: idSchema,
   runId: idSchema,
   sequence: idSchema,
   issueCount: z.number().int().min(0).max(20_000),
@@ -242,6 +242,7 @@ const candidateIndexSchema = z.object({
 
 const candidateDetailSchema = z.object({
   ...candidateSummarySchema.shape,
+  jobId: idSchema,
   documentRef: DocumentRefSchema,
   toolCallId: idSchema,
   candidate: CandidateDraftSchema,

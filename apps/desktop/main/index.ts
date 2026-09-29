@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
@@ -11,6 +11,11 @@ import {
   normalizeRenameSessionRequest,
   normalizeSessionId,
   normalizeSessionRunsRequest,
+  StartTaskRequestSchema,
+  SelectCandidateRequestSchema,
+  WorkspaceChangeSchema,
+  WorkspaceExpectationSchema,
+  invoiceToolSchemas,
 } from '@flowmate/contracts';
 import type {
   DesktopAgentRunRequest,
@@ -48,6 +53,22 @@ const channels = {
   startRun: 'flowmate:start-run',
   cancelRun: 'flowmate:cancel-run',
   queryRuntimeState: 'flowmate:query-runtime-state',
+  readWorkspace: 'flowmate:read-workspace',
+  updateWorkspace: 'flowmate:update-workspace',
+  startTask: 'flowmate:start-task',
+  queryTaskOperation: 'flowmate:query-task-operation',
+  selectCandidate: 'flowmate:select-candidate',
+  listDocuments: 'flowmate:list-documents',
+  queryDocument: 'flowmate:query-document',
+  listJobs: 'flowmate:list-jobs',
+  queryJob: 'flowmate:query-job',
+  listJobCandidates: 'flowmate:list-job-candidates',
+  queryJobCandidate: 'flowmate:query-job-candidate',
+  listActivity: 'flowmate:list-activity',
+  chooseAndImportInvoice: 'flowmate:choose-and-import-invoice',
+  readDocumentPage: 'flowmate:read-document-page',
+  readDocumentOriginal: 'flowmate:read-document-original',
+  revokeDocumentUse: 'flowmate:revoke-document-use',
   subscribe: 'flowmate:subscribe',
   unsubscribe: 'flowmate:unsubscribe',
 } as const;
@@ -246,6 +267,22 @@ function registerIpc(): void {
   handle(channels.startRun, async (_event, inputRaw) => startRun(inputRaw));
   handle(channels.cancelRun, async (_event, runIdRaw) => cancelRun(runIdRaw));
   handle(channels.queryRuntimeState, async () => queryRuntimeState());
+  handle(channels.readWorkspace, async () => productHostRequest({ type: 'read_workspace' }, 'Workspace 暂不可用。'));
+  handle(channels.updateWorkspace, async (_event, raw) => updateWorkspace(raw));
+  handle(channels.startTask, async (_event, raw) => startTask(raw));
+  handle(channels.queryTaskOperation, async (_event, raw) => queryTaskOperation(raw));
+  handle(channels.selectCandidate, async (_event, raw) => selectCandidate(raw));
+  handle(channels.listDocuments, async (_event, raw) => listDocuments(raw));
+  handle(channels.queryDocument, async (_event, raw) => queryDocument(raw));
+  handle(channels.listJobs, async (_event, raw) => listJobs(raw));
+  handle(channels.queryJob, async (_event, raw) => queryJob(raw));
+  handle(channels.listJobCandidates, async (_event, raw) => listJobCandidates(raw));
+  handle(channels.queryJobCandidate, async (_event, raw) => queryJobCandidate(raw));
+  handle(channels.listActivity, async (_event, raw) => listActivity(raw));
+  handle(channels.chooseAndImportInvoice, async () => chooseAndImportInvoice());
+  handle(channels.readDocumentPage, async (_event, raw) => readDocumentPage(raw));
+  handle(channels.readDocumentOriginal, async (_event, documentId, page) => readDocumentOriginal(documentId, page));
+  handle(channels.revokeDocumentUse, async (_event, raw) => revokeDocumentUse(raw));
   handle(channels.subscribe, async (event) => {
     const id = event.sender.id;
     subscriptions.set(id, () => undefined);
@@ -374,6 +411,143 @@ async function queryRun(value: unknown): Promise<Result<RunSnapshot>> {
   catch { return fail(appError('host_request_failed', 'runtime', 'Run 查询未能提交给 Bun Host。', true)); }
 }
 
+async function updateWorkspace(raw: unknown) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fail(appError('input_invalid', 'input', 'Workspace 更新参数无效。'));
+  const value = raw as Record<string, unknown>;
+  const change = WorkspaceChangeSchema.safeParse(value.change);
+  if (!Number.isSafeInteger(value.expectedRevision) || Number(value.expectedRevision) < 0 || !change.success
+    || Object.keys(value).some((key) => !['expectedRevision', 'change'].includes(key))) {
+    return fail(appError('input_invalid', 'input', 'Workspace 更新参数无效。'));
+  }
+  return productHostRequest({ type: 'update_workspace', input: { expectedRevision: Number(value.expectedRevision), change: change.data } }, 'Workspace 更新未能提交。');
+}
+
+async function startTask(raw: unknown) {
+  const input = StartTaskRequestSchema.safeParse(raw);
+  if (!input.success) return fail(appError('input_invalid', 'input', 'Start Task 参数无效。'));
+  return productHostRequest({ type: 'start_task', input: input.data }, 'Start Task 未能提交。');
+}
+
+async function queryTaskOperation(raw: unknown) {
+  if (!Number.isSafeInteger(raw) || Number(raw) < 1) return fail(appError('input_invalid', 'input', 'Task 操作序号无效。'));
+  return productHostRequest({ type: 'query_task_operation', clientSequence: Number(raw) }, 'Task 操作暂不可用。');
+}
+
+async function selectCandidate(raw: unknown) {
+  const input = SelectCandidateRequestSchema.safeParse(raw);
+  if (!input.success) return fail(appError('input_invalid', 'input', '候选选择参数无效。'));
+  return productHostRequest({ type: 'select_candidate', input: input.data }, '候选选择未能提交。');
+}
+
+async function listDocuments(raw: unknown) {
+  const input = pageInput(raw, []);
+  if (!input) return fail(appError('input_invalid', 'input', 'Document 分页参数无效。'));
+  return productHostRequest({ type: 'list_documents', input }, 'Document 列表暂不可用。');
+}
+
+async function queryDocument(raw: unknown) {
+  if (!validId(raw)) return fail(appError('input_invalid', 'input', 'Document ID 无效。'));
+  return productHostRequest({ type: 'query_document', documentId: raw }, 'Document 查询暂不可用。');
+}
+
+async function listJobs(raw: unknown) {
+  const input = pageInput(raw, ['documentId']);
+  if (!input || 'documentId' in input && !validId(input.documentId)) return fail(appError('input_invalid', 'input', 'Job 分页参数无效。'));
+  return productHostRequest({ type: 'list_jobs', input }, 'Job 列表暂不可用。');
+}
+
+async function queryJob(raw: unknown) {
+  if (!validId(raw)) return fail(appError('input_invalid', 'input', 'Job ID 无效。'));
+  return productHostRequest({ type: 'query_job', jobId: raw }, 'Job 查询暂不可用。');
+}
+
+async function listJobCandidates(raw: unknown) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fail(appError('input_invalid', 'input', 'Candidate 分页参数无效。'));
+  const value = raw as Record<string, unknown>;
+  if (!validId(value.jobId) || value.beforeSequence !== undefined && value.beforeSequence !== null && !validId(value.beforeSequence)
+    || value.limit !== undefined && (!Number.isSafeInteger(value.limit) || Number(value.limit) < 1 || Number(value.limit) > 100)
+    || Object.keys(value).some((key) => !['jobId', 'beforeSequence', 'limit'].includes(key))) {
+    return fail(appError('input_invalid', 'input', 'Candidate 分页参数无效。'));
+  }
+  return productHostRequest({ type: 'list_job_candidates', input: {
+    jobId: value.jobId as number,
+    ...(value.beforeSequence === undefined ? {} : { beforeSequence: value.beforeSequence as number | null }),
+    ...(value.limit === undefined ? {} : { limit: value.limit as number }),
+  } }, 'Candidate 列表暂不可用。');
+}
+
+async function queryJobCandidate(raw: unknown) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fail(appError('input_invalid', 'input', 'Candidate 查询参数无效。'));
+  const value = raw as Record<string, unknown>;
+  if (!validId(value.jobId) || !validId(value.candidateId) || Object.keys(value).some((key) => !['jobId', 'candidateId'].includes(key))) {
+    return fail(appError('input_invalid', 'input', 'Candidate 查询参数无效。'));
+  }
+  return productHostRequest({ type: 'query_job_candidate', input: { jobId: value.jobId, candidateId: value.candidateId } }, 'Candidate 查询暂不可用。');
+}
+
+async function listActivity(raw: unknown) {
+  const input = pageInput(raw, ['jobId', 'documentId']);
+  if (!input || (('jobId' in input) === ('documentId' in input))) return fail(appError('input_invalid', 'input', 'Activity 分页参数无效。'));
+  const id = 'jobId' in input ? input.jobId : input.documentId;
+  if (!validId(id)) return fail(appError('input_invalid', 'input', 'Activity 所属 ID 无效。'));
+  const paging = { ...(input.beforeId === undefined ? {} : { beforeId: input.beforeId }),
+    ...(input.limit === undefined ? {} : { limit: input.limit }) };
+  const filtered = 'jobId' in input ? { ...paging, jobId: id } : { ...paging, documentId: id };
+  return productHostRequest({ type: 'list_activity', input: filtered }, 'Activity 暂不可用。');
+}
+
+async function chooseAndImportInvoice(): Promise<Result<import('@flowmate/contracts').DocumentSnapshot | null>> {
+  if (!mainWindow || mainWindow.isDestroyed()) return fail(appError('desktop_not_ready', 'runtime', '材料选择窗口尚未就绪。', true));
+  const selected = await dialog.showOpenDialog(mainWindow, { title: '选择正式发票材料', properties: ['openDirectory', 'dontAddToRecent'] });
+  if (selected.canceled) return { ok: true, data: null };
+  const sourceDirectory = selected.filePaths[0];
+  if (!sourceDirectory) return fail(appError('input_invalid', 'input', '未选择材料目录。'));
+  return productHostRequest({ type: 'import_invoice_material', sourceDirectory }, '材料导入未能提交。', 120_000);
+}
+
+async function readDocumentPage(raw: unknown) {
+  const input = invoiceToolSchemas.read_invoice_document.input.safeParse(raw);
+  if (!input.success) return fail(appError('input_invalid', 'input', '解析页面参数无效。'));
+  return productHostRequest({ type: 'read_document_page', input: input.data }, '解析页面暂不可用。');
+}
+
+async function readDocumentOriginal(documentIdRaw: unknown, pageRaw: unknown) {
+  if (!validId(documentIdRaw) || pageRaw !== 1) return fail(appError('input_invalid', 'input', '原图查询参数无效。'));
+  const response = await productHostRequest<import('@flowmate/contracts').DocumentOriginalImage>(
+    { type: 'read_document_original', documentId: documentIdRaw, page: 1 }, '原图暂不可用。', 30_000);
+  if (!response.ok) return response;
+  const value = response.data;
+  if (value.documentRef.id !== documentIdRaw || !['image/jpeg', 'image/png'].includes(value.mimeType)
+    || typeof value.base64 !== 'string' || value.base64.length > 14 * 1024 * 1024 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.base64)) {
+    return fail(appError('host_protocol_invalid', 'runtime', 'Host 返回的原图数据无效。'));
+  }
+  return response;
+}
+
+async function revokeDocumentUse(documentIdRaw: unknown) {
+  if (!Number.isSafeInteger(documentIdRaw) || Number(documentIdRaw) < 1) return fail(appError('input_invalid', 'input', 'Document ID 无效。'));
+  return productHostRequest({ type: 'revoke_document_use', documentId: Number(documentIdRaw) }, '材料使用权限撤回失败。');
+}
+
+type MainPageInput = { beforeId?: number; limit?: number; documentId?: number; jobId?: number };
+function pageInput(raw: unknown, extraKeys: readonly string[]): MainPageInput | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  if (Object.keys(value).some((key) => !['beforeId', 'limit', ...extraKeys].includes(key))
+    || value.beforeId !== undefined && !validId(value.beforeId)
+    || value.limit !== undefined && (!Number.isSafeInteger(value.limit) || Number(value.limit) < 1 || Number(value.limit) > 100)
+    || extraKeys.some((key) => key in value && !validId(value[key]))) return null;
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as MainPageInput;
+}
+
+function validId(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0; }
+
+async function productHostRequest<T = unknown>(command: Parameters<HostClient['request']>[0], message: string,
+  timeoutMs = 10_000): Promise<Result<T>> {
+  try { return await host.request(command, timeoutMs) as Result<T>; }
+  catch { return fail(appError(hostErrorCode, 'runtime', message, true)); }
+}
+
 async function createSession(raw: unknown): Promise<Result<SessionSnapshot>> {
   const input = normalizeCreateSessionRequest(raw);
   if (!input.ok) return input;
@@ -476,10 +650,13 @@ async function queryRuntimeState(): Promise<Result<RuntimeState>> {
 function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunRequest {
   if (!value || typeof value !== 'object') return false;
   const request = value as Partial<DesktopAgentRunRequest>;
+  const workspace = WorkspaceExpectationSchema.safeParse(request.workspace);
   return Number.isSafeInteger(request.sessionId) && Number(request.sessionId) > 0
     && typeof request.text === 'string' && request.text.trim().length > 0
     && new TextEncoder().encode(request.text).byteLength <= 65_536
     && typeof request.modelId === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(request.modelId)
+    && workspace.success && workspace.data.sessionId === request.sessionId
+    && (request.goalMode === 'answer' || request.goalMode === 'save-candidate')
     && (request.timeoutMs === undefined || Number.isInteger(request.timeoutMs) && request.timeoutMs >= 100 && request.timeoutMs <= 120_000);
 }
 

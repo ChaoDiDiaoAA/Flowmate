@@ -8,6 +8,14 @@ const pageLimit = z.number().int().min(1).max(100);
 const sessionTitle = z.string().trim().min(1).refine((value) => [...value].length <= 120 && new TextEncoder().encode(value).byteLength <= 480);
 const credentialRef = z.string().regex(/^[a-zA-Z0-9_-]{16,80}$/);
 const boundedText = z.string().refine((value) => new TextEncoder().encode(value).byteLength <= 65_536);
+const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).strict();
+const workspaceChange = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('document'), documentId: dbId.nullable() }).strict(),
+  z.object({ kind: z.literal('job'), jobId: dbId }).strict(),
+  z.object({ kind: z.literal('session'), sessionId: dbId.nullable() }).strict(),
+  z.object({ kind: z.literal('view'), view: z.enum(['original', 'parsed', 'candidate']) }).strict(),
+]);
+const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('get_state') }).strict(),
@@ -22,6 +30,34 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_provider'), targetRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_run'), runId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('read_workspace') }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('update_workspace'), input: z.object({
+    expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), change: workspaceChange,
+  }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('start_task'), input: z.object({
+    clientSequence: dbId, expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), documentRef, goal: z.string().max(4096),
+  }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_task_operation'), clientSequence: dbId }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('select_candidate'), input: z.object({
+    jobId: dbId, candidateId: dbId, expectedCandidateId: dbId.nullable(), expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_documents'), input: pageInput }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_document'), documentId: dbId }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_jobs'), input: pageInput.extend({ documentId: dbId.optional() }) }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_job'), jobId: dbId }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_job_candidates'), input: z.object({
+    jobId: dbId, beforeSequence: dbId.nullable().optional(), limit: pageLimit.optional(),
+  }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_job_candidate'), input: z.object({ jobId: dbId, candidateId: dbId }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_activity'), input: z.union([
+    pageInput.extend({ jobId: dbId }), pageInput.extend({ documentId: dbId }),
+  ]) }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('import_invoice_material'), sourceDirectory: z.string().min(1).max(4096) }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('read_document_page'), input: z.object({
+    documentId: dbId, page: z.number().int().min(1).max(20), afterBlockId: z.string().min(1).max(128).nullable(), limit: z.number().int().min(1).max(100),
+  }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('read_document_original'), documentId: dbId, page: z.literal(1) }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('revoke_document_use'), documentId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('create_session'), input: z.object({ title: sessionTitle.optional() }).strict() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('rename_session'), input: z.object({ sessionId: dbId, title: sessionTitle }).strict() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('delete_session'), sessionId: dbId }).strict(),
@@ -44,6 +80,11 @@ const hostCommandSchema = z.discriminatedUnion('type', [
       sessionId: dbId,
       text: boundedText,
       modelId,
+      workspace: z.object({
+        revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), documentRef: documentRef.nullable(), jobId: dbId.nullable(),
+        candidateRef: z.object({ id: dbId, sequence: dbId }).strict().nullable(), sessionId: dbId,
+      }).strict(),
+      goalMode: z.enum(['answer', 'save-candidate']),
       timeoutMs: z.number().int().min(100).max(120_000).optional(),
     }).strict(),
     apiKey: z.string().min(1).max(4096),

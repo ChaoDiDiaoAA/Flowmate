@@ -4,13 +4,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'bun:test';
-import { InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
+import { InMemoryCredentialStore, InMemoryModelsStore, Type } from '@earendil-works/pi-ai';
 import {
   createAgentSession,
   createExtensionRuntime,
+  defineTool,
   ModelRuntime,
   SessionManager,
   SettingsManager,
+  type ToolDefinition as PiExtensionToolDefinition,
   type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
 
@@ -31,6 +33,8 @@ type CapturedRequest = {
 };
 
 type FetchMode = 'success' | 'error' | 'wait-for-abort';
+
+type RequestedToolCall = { id: string; name: string; arguments: unknown };
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -81,8 +85,26 @@ function successResponse(): Response {
   });
 }
 
+function toolCallsResponse(calls: RequestedToolCall[]): Response {
+  const toolCalls = calls.map((call, index) => ({
+    index,
+    id: call.id,
+    type: 'function',
+    function: { name: call.name, arguments: JSON.stringify(call.arguments) },
+  }));
+  return new Response([
+    responseChunk({ role: 'assistant', tool_calls: toolCalls }),
+    responseChunk({}, 'tool_calls'),
+    'data: [DONE]\n\n',
+  ].join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
 function makeFetchHarness(onRequest?: (signal: AbortSignal | null) => void) {
   const requests: CapturedRequest[] = [];
+  const responses: Response[] = [];
   let nextMode: FetchMode = 'success';
   const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = input instanceof Request ? input.clone() : new Request(input, init);
@@ -108,13 +130,14 @@ function makeFetchHarness(onRequest?: (signal: AbortSignal | null) => void) {
         else signal.addEventListener('abort', abort, { once: true });
       });
     }
-    return successResponse();
+    return responses.shift() ?? successResponse();
   };
 
   return {
     fetch,
     requests,
     setNextMode(mode: FetchMode) { nextMode = mode; },
+    queueToolCalls(calls: RequestedToolCall[]) { responses.push(toolCallsResponse(calls)); },
   };
 }
 
@@ -177,7 +200,13 @@ function createEmptyResourceLoader(systemPrompt: string): ResourceLoader {
   };
 }
 
-async function createFixtureSession(cwd: string, agentDir: string, runtime: ModelRuntime, model: NonNullable<ReturnType<ModelRuntime['getModel']>>) {
+async function createFixtureSession(
+  cwd: string,
+  agentDir: string,
+  runtime: ModelRuntime,
+  model: NonNullable<ReturnType<ModelRuntime['getModel']>>,
+  toolOptions: { tools: string[]; customTools: PiExtensionToolDefinition[] } = { tools: [], customTools: [] },
+) {
   const manager = SessionManager.inMemory(cwd);
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false },
@@ -199,8 +228,8 @@ async function createFixtureSession(cwd: string, agentDir: string, runtime: Mode
     sessionManager: manager,
     settingsManager,
     resourceLoader: createEmptyResourceLoader('You are a controlled Flowmate SDK fixture.'),
-    tools: [],
-    customTools: [],
+    tools: toolOptions.tools,
+    customTools: toolOptions.customTools,
     thinkingLevel: 'off',
   });
   return { session, manager, settingsManager };
@@ -235,6 +264,161 @@ describe('Pi 0.85.1 AgentSession contract', () => {
     expect(findPackageVersion(aiEntry, '@earendil-works/pi-ai')).toBe('0.85.1');
     expect(findPackageVersion(coreEntry, '@earendil-works/pi-agent-core')).toBe('0.85.1');
     expect(typeof createAgentSession).toBe('function');
+  });
+
+  it('validates prepared custom-tool input, preserves execution modes, orders results, and awaits listeners', async () => {
+    const originalFetch = globalThis.fetch;
+    const harness = makeFetchHarness();
+    Reflect.set(globalThis, 'fetch', harness.fetch);
+    const workspace = await createTempWorkspace();
+    const parallelCallsStarted = deferred<void>();
+    const secondParallelCallEnded = deferred<void>();
+    const releaseFirstParallel = deferred<void>();
+    const releaseSecondParallel = deferred<void>();
+    const mixedReadStarted = deferred<void>();
+    const mixedWriteStarted = deferred<void>();
+    const releaseMixedRead = deferred<void>();
+    const releaseMixedWrite = deferred<void>();
+    const agentEndStarted = deferred<void>();
+    const releaseAgentEnd = deferred<void>();
+    const parallelValues: number[] = [];
+    const mixedOrder: string[] = [];
+    const executionEnds: { callId: string; isError: boolean; text: string }[] = [];
+    const resultMessageOrder: string[] = [];
+    let preparationCount = 0;
+    let blockNextAgentEnd = true;
+    let session: Awaited<ReturnType<typeof createFixtureSession>>['session'] | undefined;
+
+    const preparedTool = defineTool({
+      name: 'probe_prepared',
+      label: 'Prepared probe',
+      description: 'Controlled tool used to inspect the installed SDK boundary.',
+      parameters: Type.Object({ value: Type.Integer() }, { additionalProperties: false }),
+      executionMode: 'parallel',
+      prepareArguments(raw: unknown) {
+        preparationCount++;
+        const value = (raw as { rawValue?: string }).rawValue;
+        return { value: Number(value) };
+      },
+      async execute(_toolCallId, params) {
+        if (params.value < 3) {
+          parallelValues.push(params.value);
+          if (parallelValues.length === 2) parallelCallsStarted.resolve();
+          await (params.value === 1 ? releaseFirstParallel.promise : releaseSecondParallel.promise);
+        } else {
+          mixedOrder.push('read');
+          mixedReadStarted.resolve();
+          await releaseMixedRead.promise;
+        }
+        return { content: [{ type: 'text', text: `prepared:${params.value}` }], details: { value: params.value }, isError: true };
+      },
+    });
+    const sequentialTool = defineTool({
+      name: 'probe_sequential',
+      label: 'Sequential probe',
+      description: 'Controlled sequential tool used to inspect the installed SDK boundary.',
+      parameters: Type.Object({ value: Type.Integer() }, { additionalProperties: false }),
+      executionMode: 'sequential',
+      async execute(_toolCallId, params) {
+        mixedOrder.push('write');
+        mixedWriteStarted.resolve();
+        await releaseMixedWrite.promise;
+        return { content: [{ type: 'text', text: `sequential:${params.value}` }], details: { value: params.value } };
+      },
+    });
+    const failingTool = defineTool({
+      name: 'probe_failure',
+      label: 'Failure probe',
+      description: 'Controlled failing tool used to inspect native error conversion.',
+      parameters: Type.Object({ value: Type.Integer() }, { additionalProperties: false }),
+      executionMode: 'parallel',
+      async execute() { throw new Error('controlled-safe-failure'); },
+    });
+
+    try {
+      const fixture = await createFixtureRuntime();
+      const created = await createFixtureSession(workspace.cwd, workspace.agentDir, fixture.runtime, fixture.model, {
+        tools: ['probe_prepared', 'probe_sequential', 'probe_failure'],
+        customTools: [preparedTool, sequentialTool, failingTool],
+      });
+      session = created.session;
+      session.agent.toolExecution = 'parallel';
+      expect(session.getActiveToolNames()).toEqual(['probe_prepared', 'probe_sequential', 'probe_failure']);
+      expect(session.agent.state.tools.map((tool) => [tool.name, tool.executionMode])).toEqual([
+        ['probe_prepared', 'parallel'], ['probe_sequential', 'sequential'], ['probe_failure', 'parallel'],
+      ]);
+
+      session.agent.subscribe(async (event) => {
+        if (event.type === 'tool_execution_end') {
+          executionEnds.push({
+            callId: event.toolCallId,
+            isError: event.isError,
+            text: event.result.content
+              .filter((part: { type: string; text?: string }) => part.type === 'text')
+              .map((part: { type: string; text?: string }) => part.text ?? '').join(''),
+          });
+          if (event.toolCallId === 'parallel-2') secondParallelCallEnded.resolve();
+        }
+        if (event.type === 'message_end' && event.message.role === 'toolResult') {
+          resultMessageOrder.push(event.message.toolCallId);
+        }
+        if (event.type === 'agent_end' && blockNextAgentEnd) {
+          blockNextAgentEnd = false;
+          agentEndStarted.resolve();
+          await releaseAgentEnd.promise;
+        }
+      });
+
+      harness.queueToolCalls([
+        { id: 'parallel-1', name: 'probe_prepared', arguments: { rawValue: '1' } },
+        { id: 'parallel-2', name: 'probe_prepared', arguments: { rawValue: '2' } },
+      ]);
+      let firstPromptSettled = false;
+      const firstPrompt = session.prompt('Run the two controlled probes.', { expandPromptTemplates: false })
+        .then(() => { firstPromptSettled = true; });
+      await parallelCallsStarted.promise;
+      expect(parallelValues).toEqual([1, 2]);
+      releaseSecondParallel.resolve();
+      await secondParallelCallEnded.promise;
+      expect(executionEnds.map((entry) => entry.callId)).toEqual(['parallel-2']);
+      expect(resultMessageOrder).toEqual([]);
+      releaseFirstParallel.resolve();
+      await agentEndStarted.promise;
+      expect(executionEnds.map((entry) => [entry.callId, entry.isError])).toEqual([
+        ['parallel-2', false], ['parallel-1', false],
+      ]);
+      expect(resultMessageOrder).toEqual(['parallel-1', 'parallel-2']);
+      expect(executionEnds.every((entry) => entry.text.startsWith('prepared:'))).toBe(true);
+      expect(preparationCount).toBe(2);
+      expect(session.isIdle).toBe(false);
+      expect(firstPromptSettled).toBe(false);
+      releaseAgentEnd.resolve();
+      await firstPrompt;
+      expect(session.isIdle).toBe(true);
+
+      harness.queueToolCalls([
+        { id: 'mixed-read', name: 'probe_prepared', arguments: { rawValue: '3' } },
+        { id: 'mixed-write', name: 'probe_sequential', arguments: { value: 4 } },
+      ]);
+      const mixedPrompt = session.prompt('Run a mixed batch.', { expandPromptTemplates: false });
+      await mixedReadStarted.promise;
+      expect(mixedOrder).toEqual(['read']);
+      releaseMixedRead.resolve();
+      await mixedWriteStarted.promise;
+      expect(mixedOrder).toEqual(['read', 'write']);
+      releaseMixedWrite.resolve();
+      await mixedPrompt;
+
+      harness.queueToolCalls([{ id: 'native-error', name: 'probe_failure', arguments: { value: 5 } }]);
+      await session.prompt('Run a failing probe.', { expandPromptTemplates: false });
+      expect(executionEnds.at(-1)).toMatchObject({ callId: 'native-error', isError: true, text: 'controlled-safe-failure' });
+      expect(harness.requests).toHaveLength(6);
+    } finally {
+      if (session && !session.isIdle) await session.abort();
+      session?.dispose();
+      Reflect.set(globalThis, 'fetch', originalFetch);
+      await rm(workspace.root, { recursive: true, force: true });
+    }
   });
 
   it('keeps in-memory histories isolated and sends no default tools or discovered resources', async () => {

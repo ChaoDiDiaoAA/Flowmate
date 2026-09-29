@@ -65,11 +65,10 @@ async function runHost(userDataRoot: string): Promise<void> {
   let application: Application;
   const runtimeApiKeyFor = (config: { modelRef: { provider: string } }) => activeKeys.get(config.modelRef.provider);
   const promptTrace = createPromptTraceBuffer();
-  const agent = new PiAgentAdapter({ runtimeApiKeyFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace });
   const created = await createApplication({
     paths,
     provider: new PiProviderAdapter({ runtimeApiKeyFor }),
-    agent,
+    agentFactory: (tools) => new PiAgentAdapter({ runtimeApiKeyFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace, tools }),
     promptTrace,
   });
   if (!created.ok) {
@@ -119,6 +118,74 @@ async function runHost(userDataRoot: string): Promise<void> {
     }
     if (command.type === 'query_run') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryRun(command.runId) });
+      return;
+    }
+    if (command.type === 'read_workspace') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.readWorkspace() });
+      return;
+    }
+    if (command.type === 'update_workspace') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.updateWorkspace(command.input) });
+      return;
+    }
+    if (command.type === 'start_task') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.startTask(command.input) });
+      return;
+    }
+    if (command.type === 'query_task_operation') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryTaskOperation(command.clientSequence) });
+      return;
+    }
+    if (command.type === 'select_candidate') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.selectCandidate(command.input) });
+      return;
+    }
+    if (command.type === 'list_documents') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listDocuments(command.input) });
+      return;
+    }
+    if (command.type === 'query_document') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryDocument(command.documentId) });
+      return;
+    }
+    if (command.type === 'list_jobs') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listJobs(command.input) });
+      return;
+    }
+    if (command.type === 'query_job') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryJob(command.jobId) });
+      return;
+    }
+    if (command.type === 'list_job_candidates') {
+      send({ version: 1, type: 'response', requestId: command.requestId,
+        value: await application.listJobCandidates({ ...command.input, beforeSequence: command.input.beforeSequence ?? undefined }) });
+      return;
+    }
+    if (command.type === 'query_job_candidate') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryJobCandidate(command.input) });
+      return;
+    }
+    if (command.type === 'list_activity') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listActivity(command.input) });
+      return;
+    }
+    if (command.type === 'import_invoice_material') {
+      send({ version: 1, type: 'response', requestId: command.requestId,
+        value: await application.importInvoiceMaterial(command.sourceDirectory) });
+      return;
+    }
+    if (command.type === 'read_document_page') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.readDocumentPage(command.input) });
+      return;
+    }
+    if (command.type === 'read_document_original') {
+      send({ version: 1, type: 'response', requestId: command.requestId,
+        value: await application.readDocumentOriginal(command.documentId, command.page) });
+      return;
+    }
+    if (command.type === 'revoke_document_use') {
+      send({ version: 1, type: 'response', requestId: command.requestId,
+        value: await application.revokeDocumentUse(command.documentId) });
       return;
     }
     if (command.type === 'create_session') {
@@ -212,6 +279,8 @@ async function runHost(userDataRoot: string): Promise<void> {
         sessionId: command.input.sessionId,
         text: command.input.text,
         config,
+        workspace: command.input.workspace,
+        goalMode: command.input.goalMode,
         ...(command.input.timeoutMs === undefined ? {} : { timeoutMs: command.input.timeoutMs }),
       });
       if (!normalized.ok) {

@@ -2,23 +2,46 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { appError, fail, ok } from '@flowmate/contracts';
-import type { ProductPaths, Result } from '@flowmate/contracts';
+import type { CandidateRepository, ProductPaths, Result } from '@flowmate/contracts';
 import { validateProductPaths } from '@flowmate/shared';
-import { createRunRepository, createSessionRepository, type RunRepository, type SessionRepository } from './repositories.ts';
+import {
+  createDocumentRepository,
+  createToolCallRepository,
+  createBusinessEventRepository,
+  createCandidateRepository,
+  createJobRepository,
+  createRunRepository,
+  createSessionRepository,
+  createWorkspaceRepository,
+  type DocumentRepository,
+  type ToolCallRepository,
+  type BusinessEventRepository,
+  type JobRepository,
+  type RunRepository,
+  type SessionRepository,
+  type WorkspaceRepository,
+} from './repositories.ts';
 
 export type DbHandle = {
   db: Database;
   runs: RunRepository;
   sessions: SessionRepository;
+  documents: DocumentRepository;
+  workspace: WorkspaceRepository;
+  jobs: JobRepository;
+  toolCalls: ToolCallRepository;
+  businessEvents: BusinessEventRepository;
+  candidates: CandidateRepository;
   close: () => void;
 };
 
-function migrationSql(version: 1 | 2): string {
-  const file = version === 1 ? '001_provider.sql' : '002_agent_sessions.sql';
+function migrationSql(version: 1 | 2 | 3): string {
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql'][version - 1];
+  if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
 
-function runMigration(db: Database, version: 1 | 2): void {
+function runMigration(db: Database, version: 1 | 2 | 3): void {
   try {
     db.exec(migrationSql(version));
   } catch (error) {
@@ -33,8 +56,10 @@ function migrateToLatest(db: Database): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.length === 1 && versions[0] === 1) runMigration(db, 2);
-  else if (versions.length !== 2 || versions[0] !== 1 || versions[1] !== 2) throw new Error('unsupported_schema_version');
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 3) {
+    throw new Error('unsupported_schema_version');
+  }
+  for (let version = versions.length + 1; version <= 3; version += 1) runMigration(db, version as 2 | 3);
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {
@@ -53,9 +78,15 @@ export function openDatabase(paths: ProductPaths): Result<DbHandle> {
     migrateToLatest(db);
     const runs = createRunRepository(db);
     const sessions = createSessionRepository(db);
+    const documents = createDocumentRepository(db);
+    const workspace = createWorkspaceRepository(db);
+    const jobs = createJobRepository(db);
+    const toolCalls = createToolCallRepository(db);
+    const businessEvents = createBusinessEventRepository(db);
+    const candidates = createCandidateRepository(db);
     const interrupted = runs.failInterrupted(new Date().toISOString());
     if (!interrupted.ok) throw new Error('interrupted_run_recovery_failed');
-    return ok({ db, runs, sessions, close: () => db?.close() });
+    return ok({ db, runs, sessions, documents, workspace, jobs, toolCalls, businessEvents, candidates, close: () => db?.close() });
   } catch (error) {
     try { db?.close(); } catch { /* preserve original error */ }
     if (error instanceof Error && error.message === 'unsupported_schema_version') {

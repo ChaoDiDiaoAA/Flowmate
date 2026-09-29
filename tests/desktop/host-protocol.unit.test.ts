@@ -24,6 +24,13 @@ describe('versioned desktop Host protocol', () => {
     expect(parseHostCommand({ ...value, apiKey: undefined })).toBeNull();
   });
 
+  it('allows only a bounded material identifier for access revocation', () => {
+    expect(parseHostCommand({ version: 1, requestId: 'revoke-1', type: 'revoke_document_use', documentId: 8 }))
+      .toEqual({ version: 1, requestId: 'revoke-1', type: 'revoke_document_use', documentId: 8 });
+    expect(parseHostCommand({ version: 1, requestId: 'revoke-2', type: 'revoke_document_use', documentId: 0 })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'revoke-3', type: 'revoke_document_use', documentId: 8, sessionId: 3 })).toBeNull();
+  });
+
   it('accepts strict session and Agent commands with credentials only on Main-to-Host start', () => {
     expect(parseHostCommand({ version: 1, requestId: 'new-1', type: 'create_session', input: { title: 'Invoice' } }))
       .toEqual({ version: 1, requestId: 'new-1', type: 'create_session', input: { title: 'Invoice' } });
@@ -42,7 +49,10 @@ describe('versioned desktop Host protocol', () => {
       version: 1,
       requestId: 'agent-1',
       type: 'start_run',
-      input: { sessionId: 5, text: 'Invoice summary', modelId: 'profile-1', timeoutMs: 60_000 },
+      input: {
+        sessionId: 5, text: 'Invoice summary', modelId: 'profile-1', timeoutMs: 60_000,
+        workspace: { revision: 0, documentRef: null, jobId: null, candidateRef: null, sessionId: 5 }, goalMode: 'answer',
+      },
       apiKey: 'synthetic-test-key',
       expectedSettingsRevision: 4,
       expectedCredentialRef: 'credential_reference_1234',

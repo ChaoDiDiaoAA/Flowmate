@@ -9,6 +9,29 @@ import type {
   UsageRecord,
   TokenColumns,
 } from './runtime.ts';
+import type { ProductToolContext, ToolCallContext, ToolResult } from './tools.ts';
+import type { CandidateJobDetail, CandidateJobPage, GoalMode, WorkspaceInput } from './workspace.ts';
+import type { ToolCallDelivery } from './activity.ts';
+import type { CandidateSnapshot } from './activity.ts';
+import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput } from './invoice.ts';
+
+export type SaveCandidateRecord = {
+  runId: DbId;
+  sessionId: DbId;
+  nativeToolCallId: string;
+  documentId: DbId;
+  candidate: CandidateDraft;
+  checks: CheckResult[];
+  issues: InvoiceIssue[];
+  at: string;
+};
+export interface CandidateRepository {
+  save(input: SaveCandidateRecord): Result<{ receipt: CandidateReceipt; candidate: CandidateSnapshot; created: boolean }>;
+  listByJob(input: { jobId: DbId; beforeSequence: DbId | null; limit: number }): Result<CandidateJobPage>;
+  readByJob(input: { jobId: DbId; candidateId: DbId }): Result<CandidateJobDetail>;
+  listForRun(input: { runId: DbId; beforeSequence: DbId | null; limit: number }): Result<InvoiceToolOutput<'list_invoice_candidates'>>;
+  readForRun(input: { runId: DbId; candidateId: DbId }): Result<InvoiceToolOutput<'get_invoice_candidate'>>;
+}
 
 export type SafeConfigSnapshot = {
   version: 1;
@@ -44,13 +67,48 @@ export type AgentConfigFacts = {
   sessionRetry: false;
 };
 
-export type AgentFacts = { nativeSessionId: string; turnCount: number; modelCallCount: number };
+export type P3AgentConfigFacts = {
+  policyVersion: 'p3-invoice-tools-v1';
+  nativeSessionId: string;
+  systemPrompt: string;
+  thinkingLevel: string;
+  resourcePolicy: 'none';
+  historyPolicy: 'memory-only';
+  maxContextBytes: 8_388_608;
+  maxOutputBytes: 262_144;
+  maxAssistantContentBytes: 524_288;
+  maxModelCalls: 12;
+  maxToolCalls: 24;
+  toolTimeoutMs: 10_000;
+  sessionRetry: false;
+};
+
+export type RunAgentConfigFacts = AgentConfigFacts | P3AgentConfigFacts;
+
+export type AgentFacts = { nativeSessionId: string; turnCount: number; modelCallCount: number; candidateIds?: DbId[] };
 
 export type AgentPortAvailability = 'ready' | 'busy' | 'unusable' | 'missing';
 
 export type AgentNativeOutcome = NativeOutcome & { agent: AgentFacts };
 
-export type AgentExecutionInput = NativeInput & { runId: DbId; sessionId: DbId };
+export type AgentToolContent = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: 'image/jpeg' | 'image/png' };
+export type AgentToolInvocation = { result: ToolResult<unknown>; fatal: boolean };
+export type AgentToolBinding = {
+  context: ProductToolContext;
+  observeRequest(name: string, raw: unknown, call: ToolCallContext): Result<void>;
+  rejectRequest(name: string, raw: unknown, call: ToolCallContext, error: AppError): Result<void>;
+  recordDelivery(nativeToolCallId: string, delivery: ToolCallDelivery): Result<void>;
+  execute(name: string, input: unknown, call: ToolCallContext): Promise<AgentToolInvocation>;
+  formatResult?(name: string, data: unknown, signal: AbortSignal): Promise<AgentToolContent[]>;
+};
+
+export type AgentExecutionInput = NativeInput & {
+  runId: DbId;
+  sessionId: DbId;
+  workspaceInput?: WorkspaceInput;
+  goalMode?: GoalMode;
+  toolBinding?: AgentToolBinding;
+};
 
 export type AgentNativeEventName =
   | 'agent_start' | 'agent_end' | 'agent_settled'
@@ -110,7 +168,7 @@ export interface ProviderPort {
 }
 
 export interface PreparedAgent {
-  snapshot: SafeConfigSnapshot & { agent: AgentConfigFacts };
+  snapshot: SafeConfigSnapshot & { agent: RunAgentConfigFacts };
   execute(
     input: AgentExecutionInput,
     signal: AbortSignal,
@@ -128,6 +186,7 @@ export interface AgentPort {
     config: ProviderConfig,
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
+    options?: { activeToolNames?: readonly string[] },
   ): Promise<Result<PreparedAgent>>;
   releaseSession(nativeSessionId: string): Promise<CloseReport>;
   close(): Promise<CloseReport>;

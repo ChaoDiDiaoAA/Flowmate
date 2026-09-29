@@ -1,11 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { validateToolArguments } from '@earendil-works/pi-ai';
 import { CandidateDraftSchema, INVOICE_TOOL_NAMES, invoiceToolSchemas } from '../../packages/contracts/src/invoice.ts';
+import { toPiParameters } from '../../packages/runtime-pi/src/schema.ts';
 import { z } from 'zod';
-
-const converterPromise: Promise<{ toPiParameters: (schema: z.ZodTypeAny) => unknown } | null> = import(
-  ['..', '..', 'packages', 'runtime-pi', 'src', 'schema.ts'].join('/')
-).catch(() => null);
 
 const field = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
 const candidate = {
@@ -35,13 +32,9 @@ const examples: Record<(typeof INVOICE_TOOL_NAMES)[number], unknown> = {
 
 describe('Pi argument schema conversion', () => {
   it('preserves all supported strict Zod constraints through the installed Pi validator', async () => {
-    const converter = await converterPromise;
-    expect(converter).not.toBeNull();
-    if (!converter) return;
-
     for (const name of INVOICE_TOOL_NAMES) {
       const schema = invoiceToolSchemas[name].input;
-      const parameters = converter.toPiParameters(schema);
+      const parameters = toPiParameters(schema);
       const piTool = { name, description: name, parameters } as Parameters<typeof validateToolArguments>[0];
       const valid = examples[name];
       expect(schema.safeParse(valid).success).toBe(true);
@@ -54,17 +47,25 @@ describe('Pi argument schema conversion', () => {
   });
 
   it('refuses defaults, coercion, effects and unsupported checks instead of weakening schemas', async () => {
-    const converter = await converterPromise;
-    expect(converter).not.toBeNull();
-    if (!converter) return;
+    expect(() => toPiParameters(z.object({ id: z.number().default(1) }).strict()))
+      .toThrow('tool_schema_unsupported');
+    expect(() => toPiParameters(z.object({ id: z.coerce.number() }).strict()))
+      .toThrow('tool_schema_unsupported');
+    expect(() => toPiParameters(z.object({ id: z.string().transform(Number) }).strict()))
+      .toThrow('tool_schema_unsupported');
+    expect(() => toPiParameters(z.object({ id: z.string().email() }).strict()))
+      .toThrow('tool_schema_unsupported');
+    expect(() => toPiParameters(z.object({ id: z.string().regex(/^a/).regex(/z$/) }).strict()))
+      .toThrow('tool_schema_unsupported');
+  });
 
-    expect(() => converter.toPiParameters(z.object({ id: z.number().default(1) }).strict()))
-      .toThrow('tool_schema_unsupported');
-    expect(() => converter.toPiParameters(z.object({ id: z.coerce.number() }).strict()))
-      .toThrow('tool_schema_unsupported');
-    expect(() => converter.toPiParameters(z.object({ id: z.string().transform(Number) }).strict()))
-      .toThrow('tool_schema_unsupported');
-    expect(() => converter.toPiParameters(z.object({ id: z.string().email() }).strict()))
-      .toThrow('tool_schema_unsupported');
+  it('keeps the strongest repeated string bounds when producing Pi parameters', () => {
+    const schema = z.object({ value: z.string().min(5).min(2).max(6).max(10) }).strict();
+    const piTool = {
+      name: 'bounded', description: 'bounded', parameters: toPiParameters(schema),
+    } as Parameters<typeof validateToolArguments>[0];
+    expect(() => validateToolArguments(piTool, { name: 'bounded', arguments: { value: 'abc' } } as never)).toThrow();
+    expect(() => validateToolArguments(piTool, { name: 'bounded', arguments: { value: '1234567' } } as never)).toThrow();
+    expect(validateToolArguments(piTool, { name: 'bounded', arguments: { value: '12345' } } as never)).toEqual({ value: '12345' });
   });
 });

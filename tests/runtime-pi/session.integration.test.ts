@@ -4,11 +4,12 @@ import { join } from 'node:path';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it } from 'bun:test';
 import { AgentSession, ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { INVOICE_CHAT_GOAL } from '@flowmate/contracts';
-import type { PromptTraceBuffer } from '@flowmate/contracts';
+import { INVOICE_CHAT_GOAL, ok } from '@flowmate/contracts';
+import type { AgentToolBinding, PromptTraceBuffer, ToolDefinition } from '@flowmate/contracts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import type { AgentExecutionInput, NativeObservation } from '../../packages/contracts/src/ports.ts';
 import type { ProviderConfig } from '../../packages/contracts/src/runtime.ts';
+import { z } from 'zod';
 
 const endpoint = 'https://fixture.invalid/v1';
 const fixtureRoots = new Set<string>();
@@ -23,6 +24,13 @@ function sse(delta: Record<string, unknown>, finishReason: string | null = null)
 
 function response(text = 'fixture answer'): Response {
   return new Response(`${sse({ role: 'assistant', content: text })}${sse({}, 'stop')}data: [DONE]\n\n`, {
+    status: 200, headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
+function toolCallResponse(id: string, name: string, args: unknown): Response {
+  return new Response(`${sse({ role: 'assistant', tool_calls: [{ index: 0, id, type: 'function',
+    function: { name, arguments: JSON.stringify(args) } }] })}${sse({}, 'tool_calls')}data: [DONE]\n\n`, {
     status: 200, headers: { 'content-type': 'text/event-stream' },
   });
 }
@@ -50,6 +58,7 @@ async function fixture(
   reply: (request: Request) => Promise<Response> | Response = async () => response(),
   runtimeApiKey: string | null = 'fixture-only-key',
   promptTrace?: PromptTraceBuffer,
+  tools?: readonly ToolDefinition<any, any>[],
 ) {
   const root = await mkdtemp(join(tmpdir(), 'flowmate-p2-agent-'));
   fixtureRoots.add(root);
@@ -72,6 +81,7 @@ async function fixture(
       return reply(native);
     },
     promptTrace,
+    tools,
   });
   fixtureAdapters.add(adapter);
   return { root, cwd, agentDir, requests, adapter };
@@ -95,6 +105,56 @@ const config: ProviderConfig = {
 };
 
 describe('PiAgentAdapter', () => {
+  it('executes an authorized tool in P3 and sends its result in the next model request', async () => {
+    const replies = [toolCallResponse('p3-call-1', 'probe_read', { value: 7 }), response('The checked value is 7.')];
+    const tool: ToolDefinition<{ value: number }, { value: number }> = {
+      name: 'probe_read', version: '1', description: 'Read the controlled test value.', label: 'Read value',
+      inputSchema: z.object({ value: z.number().int() }).strict(),
+      outputSchema: z.object({ value: z.number().int() }).strict(),
+      effect: 'READ', executionMode: 'parallel',
+      async execute(inputValue) { return { value: inputValue.value }; },
+    };
+    const app = await fixture(() => replies.shift() ?? response(), 'fixture-only-key', undefined, [tool]);
+    const events: string[] = [];
+    const binding: AgentToolBinding = {
+      context: { runId: 902, sessionId: 19, scope: { version: 2, allowedTools: ['probe_read'],
+        allowedDocumentIds: [1], allowedArtifactIds: [2], allowedResourcePaths: [] } },
+      observeRequest(name, raw, call) { events.push(`requested:${name}:${call.nativeToolCallId}:${JSON.stringify(raw)}`); return ok(undefined); },
+      rejectRequest(name, raw, call) { events.push(`rejected:${name}:${call.nativeToolCallId}:${JSON.stringify(raw)}`); return ok(undefined); },
+      recordDelivery(id, delivery) { events.push(`delivery:${id}:${delivery.state}:${delivery.includedInCallSequence ?? ''}`); return ok(undefined); },
+      async execute(name, args, call) {
+        events.push(`executed:${name}:${call.nativeToolCallId}:${JSON.stringify(args)}`);
+        return { result: { status: 'succeeded', data: { value: 7 } }, fatal: false };
+      },
+    };
+    const created = app.adapter.createSession();
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
+      { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: ['probe_read'] });
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const runInput: AgentExecutionInput = { ...input(902, 19, 'Use the controlled value.'),
+      workspaceInput: { documentRef: { id: 1, version: 'v1' }, job: null, candidate: null }, goalMode: 'answer', toolBinding: binding };
+    const outcome = await prepared.data.execute(runInput, new AbortController().signal, () => undefined);
+    expect(outcome.error).toBeNull();
+    expect(outcome.text).toBe('The checked value is 7.');
+    expect(outcome.agent.modelCallCount).toBe(2);
+    expect(outcome.usage.version).toBe(2);
+    if (outcome.usage.version === 2) expect(outcome.usage.calls.map((call) => call.callSequence)).toEqual([1, 2]);
+    expect(app.requests).toHaveLength(2);
+    expect(app.requests[0]?.body.tools?.some((entry) => JSON.stringify(entry).includes('probe_read'))).toBe(true);
+    expect(JSON.stringify(app.requests[1]?.body.messages)).toContain('probe_read');
+    expect(JSON.stringify(app.requests[1]?.body.messages)).toContain('7');
+    expect(events).toEqual([
+      'requested:probe_read:p3-call-1:{"value":7}',
+      'executed:probe_read:p3-call-1:{"value":7}',
+      'delivery:p3-call-1:message_observed:',
+      'delivery:p3-call-1:request_observed:2',
+    ]);
+  });
+
   it('creates independent native sessions without requests and preserves same-session context', async () => {
     const app = await fixture();
     const directories = await filesUnder(app.root);

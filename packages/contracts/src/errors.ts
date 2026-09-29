@@ -6,8 +6,15 @@ export function appError(
   message: string,
   retryable = false,
   runId?: number,
+  sessionId?: number,
+  toolCallId?: string,
 ): AppError {
-  return { code, category, message, retryable, ...(runId === undefined ? {} : { runId }) };
+  return {
+    code, category, message, retryable,
+    ...(runId === undefined ? {} : { runId }),
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(toolCallId === undefined ? {} : { toolCallId }),
+  };
 }
 
 export function ok<T>(data: T): Result<T> {

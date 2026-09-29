@@ -27,6 +27,8 @@
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@flowmate/contracts": "workspace:*",
     "@flowmate/core": "workspace:*",
+    "@flowmate/data": "workspace:*",
+    "@flowmate/employee-invoice": "workspace:*",
     "@flowmate/logging": "workspace:*",
     "@flowmate/runtime-pi": "workspace:*",
     "@flowmate/shared": "workspace:*",

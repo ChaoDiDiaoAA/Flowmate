@@ -1,6 +1,6 @@
 # Flowmate 领域词汇
 
-当前设计以 [产品主方案](docs/spec/00_Flowmate完整方案_v1.md)、[评测主方案](docs/eval/01_Flowmate_Agent评测总方案_v1.md)和[数据制作方案](docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)为准。路线是 Agent Engineering + Invoice Product + Agent Evaluation；核心为 Agent Harness / Runtime，不以完整企业后台为目标。
+当前设计以 [产品主方案](docs/spec/00_Flowmate完整方案_v1.md)、[评测主方案](docs/eval/01_Flowmate_Agent评测总方案_v1.md)和[数据制作方案](docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)为准。路线是 Agent Engineering + Invoice Product + Agent Evaluation；核心为 Agent Harness / Runtime，不以完整企业后台为目标。当前工作区已实现 P1–P3 工程能力；P3 受控工程证据已通过，真实模型行为 A20 和正式业务 Benchmark 仍待后续核验，详见 P3 实施计划。
 
 | 词汇 | 定义与边界 |
 |---|---|
@@ -14,7 +14,10 @@
 | Memory | 原生 header/entries/parent/leaf 的持久化与使用；不增加跨任务知识库 |
 | Compaction | Pi 原生历史压缩；真实触发、保存和后续事实使用分别验证 |
 | Tool Call | requested/running/succeeded/failed/cancelled；拒绝以 failed 加原因表达 |
+| Tool / AgentTool / ToolDefinition | 基础描述契约、Pi 执行契约、注入可信产品上下文的业务定义；唯一 Executor 管准入和调用事实 |
+| ToolExecutionMode | 工具声明的 parallel/sequential 调度属性；Pi 调度，P3 为 12 个并行读取/纯计算工具和 1 个串行候选保存工具 |
 | RunScope | 工具及资料允许范围，来自可信产品控制；子范围不得大于父范围 |
+| Model access revocation | 对已使用指定材料的 Session 持久禁用后续模型调用；本地历史仍可查看，显式新 Session 才能用当前授权继续 |
 | Invoice Candidate | 不可变发票字段/明细/来源/问题候选；人工编辑生成新候选 |
 | Accepted Candidate | 用户接受的指定候选；接受是产品事实，不自动证明 Gold 正确性 |
 | Artifact | 受控文件产物，以整数 ID 和实际内容/路径关联，不使用自定义摘要身份 |

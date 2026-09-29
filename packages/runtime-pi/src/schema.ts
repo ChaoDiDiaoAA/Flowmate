@@ -47,9 +47,9 @@ function convert(schema: z.ZodTypeAny, path = 'root'): TSchema {
       let maxLength: number | undefined;
       let pattern: string | undefined;
       for (const check of def.checks ?? []) {
-        if (check.kind === 'min' && typeof check.value === 'number') minLength = check.value;
-        else if (check.kind === 'max' && typeof check.value === 'number') maxLength = check.value;
-        else if (check.kind === 'regex' && check.regex && check.regex.flags === '') pattern = check.regex.source;
+        if (check.kind === 'min' && typeof check.value === 'number') minLength = Math.max(minLength ?? check.value, check.value);
+        else if (check.kind === 'max' && typeof check.value === 'number') maxLength = Math.min(maxLength ?? check.value, check.value);
+        else if (check.kind === 'regex' && check.regex && check.regex.flags === '' && pattern === undefined) pattern = check.regex.source;
         else return unsupported(path);
       }
       return Type.String({ minLength, maxLength, pattern });
@@ -64,11 +64,25 @@ function convert(schema: z.ZodTypeAny, path = 'root'): TSchema {
       for (const check of def.checks ?? []) {
         if (check.kind === 'int' || check.kind === 'finite') integer ||= check.kind === 'int';
         else if (check.kind === 'min' && typeof check.value === 'number') {
-          if (check.inclusive === false) exclusiveMinimum = check.value;
-          else minimum = check.value;
+          const current = exclusiveMinimum === undefined
+            ? minimum === undefined ? undefined : { value: minimum, inclusive: true }
+            : { value: exclusiveMinimum, inclusive: false };
+          const candidate = { value: check.value, inclusive: check.inclusive !== false };
+          const strongest = !current || candidate.value > current.value
+            || (candidate.value === current.value && !candidate.inclusive && current.inclusive)
+            ? candidate : current;
+          minimum = strongest.inclusive ? strongest.value : undefined;
+          exclusiveMinimum = strongest.inclusive ? undefined : strongest.value;
         } else if (check.kind === 'max' && typeof check.value === 'number') {
-          if (check.inclusive === false) exclusiveMaximum = check.value;
-          else maximum = check.value;
+          const current = exclusiveMaximum === undefined
+            ? maximum === undefined ? undefined : { value: maximum, inclusive: true }
+            : { value: exclusiveMaximum, inclusive: false };
+          const candidate = { value: check.value, inclusive: check.inclusive !== false };
+          const strongest = !current || candidate.value < current.value
+            || (candidate.value === current.value && !candidate.inclusive && current.inclusive)
+            ? candidate : current;
+          maximum = strongest.inclusive ? strongest.value : undefined;
+          exclusiveMaximum = strongest.inclusive ? undefined : strongest.value;
         } else return unsupported(path);
       }
       return integer

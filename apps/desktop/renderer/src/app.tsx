@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import type { AgentRunEvent, AgentRunSnapshot, DesktopEvent, DesktopState, ModelProfile, ProductSettings, PromptTraceResult, RunSnapshot, SessionCursor, SessionSnapshot } from '@flowmate/contracts';
+import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelProfile, ProductSettings, PromptTraceResult, RunSnapshot, SessionCursor, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
 
-type Page = 'model' | 'profile';
+type Page = 'workspace' | 'tasks' | 'model' | 'profile';
 type Notice = { tone: 'good' | 'bad' | 'info'; message: string } | null;
 type ProfileDraft = { displayName: string; theme: 'system' | 'light' | 'dark' };
 type ChatTurn = {
@@ -32,7 +32,7 @@ function errorMessage(value: unknown): string {
 function stringify(value: unknown): string { return JSON.stringify(value, null, 2); }
 
 export function App() {
-  const [page, setPage] = useState<Page>('model');
+  const [page, setPage] = useState<Page>('workspace');
   const [state, setState] = useState<DesktopState | null>(null);
   const [draft, setDraft] = useState<ModelProfile>(blankModel);
   const [profileDraft, setProfileDraft] = useState<ProfileDraft>({ displayName: 'Local user', theme: 'system' });
@@ -45,6 +45,17 @@ export function App() {
   const [sessions, setSessions] = useState<SessionSnapshot[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
+  const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null);
+  const [confirmedWorkspaceRevision, setConfirmedWorkspaceRevision] = useState<number | null>(null);
+  const [documents, setDocuments] = useState<DocumentSnapshot[]>([]);
+  const [jobs, setJobs] = useState<JobSnapshot[]>([]);
+  const [candidateSummaries, setCandidateSummaries] = useState<CandidateSummary[]>([]);
+  const [candidateDetail, setCandidateDetail] = useState<CandidateJobDetail | null>(null);
+  const [activity, setActivity] = useState<BusinessEventSnapshot[]>([]);
+  const [parsedPage, setParsedPage] = useState<InvoiceToolOutput<'read_invoice_document'> | null>(null);
+  const [originalImage, setOriginalImage] = useState<DocumentOriginalImage | null>(null);
+  const [taskGoal, setTaskGoal] = useState('Prepare an invoice candidate from this document.');
+  const [goalMode, setGoalMode] = useState<'answer' | 'save-candidate'>('answer');
   const [activeAgentRunId, setActiveAgentRunId] = useState<number | null>(null);
   const [activeAgentSessionId, setActiveAgentSessionId] = useState<number | null>(null);
   const [activeRunModel, setActiveRunModel] = useState<{ id: string; name: string; model: string } | null>(null);
@@ -52,6 +63,7 @@ export function App() {
   const [runCursor, setRunCursor] = useState<number | null>(null);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionMutating, setSessionMutating] = useState(false);
+  const [revokingAccess, setRevokingAccess] = useState(false);
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const [run, setRun] = useState<RunSnapshot | null>(null);
   const [promptTrace, setPromptTrace] = useState<PromptTraceResult | null>(null);
@@ -68,6 +80,7 @@ export function App() {
   const activeAgentRunIdRef = useRef<number | null>(null);
   const agentStopRequested = useRef(false);
   const selectedSessionIdRef = useRef<number | null>(null);
+  const workspaceRef = useRef<WorkspaceSnapshot | null>(null);
   const sessionCursorRef = useRef<SessionCursor | null>(null);
   const sessionLoadSequence = useRef(0);
   const allowInitialSessionSelection = useRef(true);
@@ -87,6 +100,141 @@ export function App() {
     if (allowInitialSessionSelection.current && selectedSessionIdRef.current === null && result.data.items[0]) {
       selectSession(result.data.items[0].sessionId);
     }
+  }
+
+  function acceptWorkspace(snapshot: WorkspaceSnapshot) {
+    const previous = workspaceRef.current;
+    if (previous?.documentRef?.id !== snapshot.documentRef?.id || previous?.documentRef?.version !== snapshot.documentRef?.version) {
+      setParsedPage(null);
+      setOriginalImage(null);
+    }
+    workspaceRef.current = snapshot;
+    setWorkspace(snapshot);
+    if (previous?.revision !== snapshot.revision || previous?.sessionId !== snapshot.sessionId) setConfirmedWorkspaceRevision(null);
+  }
+
+  async function loadWorkspace() {
+    const result = await window.flowmate.readWorkspace();
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return null; }
+    acceptWorkspace(result.data);
+    return result.data;
+  }
+
+  async function loadProductLists() {
+    const [documentsResult, jobsResult] = await Promise.all([
+      window.flowmate.listDocuments({ limit: 50 }),
+      window.flowmate.listJobs({ limit: 50 }),
+    ]);
+    if (documentsResult.ok) setDocuments(documentsResult.data.items);
+    else setNotice({ tone: 'bad', message: errorMessage(documentsResult) });
+    if (jobsResult.ok) setJobs(jobsResult.data.items);
+    else setNotice({ tone: 'bad', message: errorMessage(jobsResult) });
+  }
+
+  async function changeWorkspace(change: WorkspaceChange) {
+    let current = workspaceRef.current;
+    if (!current) current = await loadWorkspace();
+    if (!current) return null;
+    const result = await window.flowmate.updateWorkspace({ expectedRevision: current.revision, change });
+    if (!result.ok) {
+      setNotice({ tone: 'bad', message: errorMessage(result) });
+      if (result.error.code === 'state_conflict') void loadWorkspace();
+      return null;
+    }
+    acceptWorkspace(result.data);
+    return result.data;
+  }
+
+  async function loadProductOverview() {
+    await Promise.all([loadWorkspace(), loadProductLists()]);
+  }
+
+  async function loadDocumentMaterial(documentId: number) {
+    const page = await window.flowmate.readDocumentPage({ documentId, page: 1, afterBlockId: null, limit: 50 });
+    if (page.ok) setParsedPage(page.data);
+    else { setParsedPage(null); setNotice({ tone: 'bad', message: errorMessage(page) }); }
+    const original = await window.flowmate.readDocumentOriginal(documentId, 1);
+    if (original.ok) setOriginalImage(original.data);
+    else setOriginalImage(null);
+  }
+
+  async function importInvoice() {
+    const result = await window.flowmate.chooseAndImportInvoice();
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    if (!result.data) return;
+    setNotice({ tone: 'good', message: `Imported document #${result.data.documentRef.id}. Choose it as the Workspace source.` });
+    await loadProductLists();
+    await selectWorkspaceDocument(result.data.documentRef.id);
+  }
+
+  async function selectWorkspaceDocument(documentId: number | null) {
+    const snapshot = await changeWorkspace({ kind: 'document', documentId });
+    if (!snapshot || documentId === null) return;
+    let doc = documents.find((item) => item.documentRef.id === documentId);
+    if (!doc) {
+      const queried = await window.flowmate.queryDocument(documentId);
+      if (queried.ok) doc = queried.data;
+    }
+    if (doc) await loadDocumentMaterial(documentId);
+  }
+
+  async function startTask() {
+    const current = workspaceRef.current;
+    if (!current?.documentRef || !current.sessionId || !taskGoal.trim()) return;
+    const result = await window.flowmate.startTask({
+      clientSequence: current.nextTaskSequence,
+      expectedRevision: current.revision,
+      documentRef: current.documentRef,
+      goal: taskGoal.trim(),
+    });
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    acceptWorkspace(result.data.workspace);
+    setGoalMode('save-candidate');
+    setNotice({ tone: 'good', message: `Task #${result.data.job.jobId} started. Confirm this Workspace before sending a Run.` });
+    await loadProductLists();
+    await loadTaskDetails(result.data.job.jobId);
+    setPage('tasks');
+  }
+
+  async function loadTaskDetails(jobId: number) {
+    const [candidatesResult, activityResult] = await Promise.all([
+      window.flowmate.listJobCandidates({ jobId, limit: 50 }),
+      window.flowmate.listActivity({ jobId, limit: 50 }),
+    ]);
+    if (candidatesResult.ok) setCandidateSummaries(candidatesResult.data.items);
+    else setNotice({ tone: 'bad', message: errorMessage(candidatesResult) });
+    if (activityResult.ok) setActivity(activityResult.data.items);
+    else setNotice({ tone: 'bad', message: errorMessage(activityResult) });
+  }
+
+  async function openCandidate(jobId: number, candidateId: number) {
+    const result = await window.flowmate.queryJobCandidate({ jobId, candidateId });
+    if (result.ok) setCandidateDetail(result.data);
+    else setNotice({ tone: 'bad', message: errorMessage(result) });
+  }
+
+  async function selectCandidate(jobId: number, candidateId: number) {
+    const current = workspaceRef.current;
+    if (!current) return;
+    const result = await window.flowmate.selectCandidate({
+      jobId,
+      candidateId,
+      expectedCandidateId: jobs.find((job) => job.jobId === jobId)?.currentCandidateId ?? null,
+      expectedRevision: current.revision,
+    });
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    acceptWorkspace(result.data.workspace);
+    setNotice({ tone: 'good', message: `Candidate #${candidateId} is now the selected Workspace candidate.` });
+    await loadProductLists();
+    await loadTaskDetails(jobId);
+  }
+
+  async function openJob(jobId: number) {
+    const snapshot = await changeWorkspace({ kind: 'job', jobId });
+    if (!snapshot) return;
+    setCandidateDetail(null);
+    setGoalMode('save-candidate');
+    await loadTaskDetails(jobId);
   }
 
   async function loadSession(sessionId: number) {
@@ -111,6 +259,7 @@ export function App() {
     setRunCursor(null);
     setChatTurns([]);
     setNotice(null);
+    if (workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
     void loadSession(sessionId);
   }
 
@@ -132,6 +281,7 @@ export function App() {
     setRunCursor(null);
     setNotice(null);
     setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
+    if (workspaceRef.current?.sessionId !== session.sessionId) await changeWorkspace({ kind: 'session', sessionId: session.sessionId });
     void loadSessionList();
   }
 
@@ -198,6 +348,9 @@ export function App() {
       setActiveRunModel(null);
     }
     setNotice({ tone: 'good', message: 'Session and its conversations deleted.' });
+    if (workspaceRef.current?.sessionId === sessionId) {
+      await changeWorkspace({ kind: 'session', sessionId: next?.sessionId ?? null });
+    }
     if (next) void loadSession(next.sessionId);
     setSessionMutating(false);
   }
@@ -292,7 +445,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (state?.ready) void loadSessionList();
+    if (state?.ready) {
+      void loadWorkspace().then((snapshot) => {
+        if (!snapshot) return;
+        void loadSessionList();
+        void loadProductLists();
+      });
+    }
   }, [state?.ready]);
 
   useEffect(() => {
@@ -327,7 +486,11 @@ export function App() {
     ? sessionLoading
     : selectedSession === null || selectedSession.availability === 'ready';
   const inputEnabled = Boolean(modelReady && !saving && !busy && !sessionMutating && inputSessionAvailable);
-  const canChat = Boolean(inputEnabled && !sessionLoading && selectedSession?.availability === 'ready');
+  const workspaceReady = Boolean(workspace && workspace.sessionId === selectedSessionId
+    && confirmedWorkspaceRevision === workspace.revision
+    && (goalMode !== 'save-candidate' || (workspace.documentRef && workspace.jobId)));
+  const canChat = Boolean(inputEnabled && !sessionLoading && selectedSession?.availability === 'ready'
+    && !selectedSession.modelUseBlocked && workspaceReady);
   useLayoutEffect(() => {
     if (!focusComposerWhenReady.current || !inputEnabled) return;
     focusComposerWhenReady.current = false;
@@ -335,6 +498,39 @@ export function App() {
   }, [inputEnabled, selectedSessionId, sessionLoading]);
   const savedModels = state?.settings.models ?? [];
   const modelLabel = useMemo(() => draft.model.trim() || 'No model selected', [draft.model]);
+
+  async function confirmWorkspace() {
+    const latest = await window.flowmate.readWorkspace();
+    if (!latest.ok) { setNotice({ tone: 'bad', message: errorMessage(latest) }); return; }
+    if (latest.data.revision !== workspaceRef.current?.revision || latest.data.sessionId !== selectedSessionId) {
+      acceptWorkspace(latest.data);
+      setNotice({ tone: 'info', message: 'Workspace changed. Review the current source and confirm it again.' });
+      return;
+    }
+    setConfirmedWorkspaceRevision(latest.data.revision);
+    workspaceRef.current = latest.data;
+    setWorkspace(latest.data);
+    setNotice({ tone: 'good', message: `Workspace revision ${latest.data.revision} confirmed for Session #${latest.data.sessionId}.` });
+  }
+
+  async function revokeModelAccess() {
+    const documentId = workspaceRef.current?.documentRef?.id;
+    if (!documentId || revokingAccess) return;
+    if (!window.confirm('Revoke this material for every Session that previously had access? Active Runs will be stopped. Those Sessions will no longer be able to send model requests; local records remain, and copies already sent to a remote model cannot be recalled.')) return;
+    setRevokingAccess(true);
+    const result = await window.flowmate.revokeDocumentUse(documentId);
+    setRevokingAccess(false);
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    await loadSessionList();
+    if (selectedSessionIdRef.current !== null) {
+      const selected = await window.flowmate.querySession(selectedSessionIdRef.current);
+      if (selected.ok) setSelectedSession(selected.data);
+    }
+    setNotice({ tone: result.data.stopRequested ? 'info' : 'good',
+      message: result.data.affectedSessionIds.length === 0
+        ? 'No previous Session was authorized for this material.'
+        : `Model access was revoked for ${result.data.affectedSessionIds.length} Session(s).${result.data.stopRequested ? ' The active Run is stopping.' : ''}` });
+  }
 
   function selectModel(id: string) {
     const item = state?.settings.models.find((model) => model.id === id);
@@ -415,6 +611,19 @@ export function App() {
     const sessionId = selectedSessionId;
     const model = persistedModel;
     if (!canChat || !selectedModelId || !model || sessionId === null || !prompt) return;
+    const current = workspaceRef.current;
+    if (!current || current.sessionId !== sessionId || confirmedWorkspaceRevision !== current.revision) {
+      setConfirmedWorkspaceRevision(null);
+      setNotice({ tone: 'info', message: 'Review and confirm the current Workspace before starting a Run.' });
+      return;
+    }
+    const freshWorkspace = await window.flowmate.readWorkspace();
+    if (!freshWorkspace.ok) { setNotice({ tone: 'bad', message: errorMessage(freshWorkspace) }); return; }
+    if (freshWorkspace.data.revision !== current.revision || freshWorkspace.data.sessionId !== sessionId) {
+      acceptWorkspace(freshWorkspace.data);
+      setNotice({ tone: 'info', message: 'Workspace changed before Send. Review and confirm it again.' });
+      return;
+    }
     const turnId = newId();
     const newTurn: ChatTurn = { id: turnId, sessionId, runId: null, prompt, response: null, error: null, status: 'sending' };
     activeChatTurnId.current = turnId;
@@ -431,6 +640,14 @@ export function App() {
       sessionId,
       text: prompt,
       modelId: model.id,
+      workspace: {
+        revision: current.revision,
+        documentRef: current.documentRef,
+        jobId: current.jobId,
+        candidateRef: current.candidateRef,
+        sessionId,
+      },
+      goalMode,
     });
     if (!accepted.ok) {
       setChatTurns((turns) => turns.map((turn) => turn.id === turnId
@@ -564,6 +781,12 @@ export function App() {
         <div className="brand-lockup"><span className="brand-mark">F</span><span>flowmate</span></div>
         <div className="rail-caption">LOCAL WORKSPACE</div>
         <nav aria-label="Workspace navigation">
+          <button className={`nav-item ${page === 'workspace' ? 'active' : ''}`} aria-current={page === 'workspace' ? 'page' : undefined} onClick={() => setPage('workspace')}>
+            <span className="nav-glyph">▧</span><span>Workspace</span>
+          </button>
+          <button className={`nav-item ${page === 'tasks' ? 'active' : ''}`} aria-current={page === 'tasks' ? 'page' : undefined} onClick={() => { setPage('tasks'); if (workspace?.jobId) void loadTaskDetails(workspace.jobId); }}>
+            <span className="nav-glyph">☷</span><span>Tasks</span>
+          </button>
           <button className={`nav-item ${page === 'model' ? 'active' : ''}`} aria-current={page === 'model' ? 'page' : undefined} onClick={() => setPage('model')}>
             <span className="nav-glyph">◈</span><span>Model</span>
           </button>
@@ -579,11 +802,48 @@ export function App() {
 
       <main className="workspace" data-testid="main-content">
         <header className="topline">
-          <div><span className="crumb">{activeDisplayName}</span><span className="slash">/</span><span>{page === 'model' ? 'Model' : 'Profile'}</span></div>
+          <div><span className="crumb">{activeDisplayName}</span><span className="slash">/</span><span>{{ workspace: 'Workspace', tasks: 'Tasks', model: 'Model', profile: 'Profile' }[page]}</span></div>
           <div className="top-state"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />{state?.ready ? 'LOCAL' : 'OFFLINE'}</div>
         </header>
 
-        {page === 'model' ? (
+        {page === 'workspace' ? (
+          <WorkspacePage
+            workspace={workspace}
+            documents={documents}
+            jobs={jobs}
+            selectedSessionId={selectedSessionId}
+            confirmed={confirmedWorkspaceRevision === workspace?.revision}
+            goalMode={goalMode}
+            taskGoal={taskGoal}
+            parsedPage={parsedPage}
+            originalImage={originalImage}
+            notice={notice}
+            onImport={() => void importInvoice()}
+            onSelectDocument={(id) => void selectWorkspaceDocument(id)}
+            onStartTask={() => void startTask()}
+            onConfirm={() => void confirmWorkspace()}
+            onGoalModeChange={setGoalMode}
+            onTaskGoalChange={setTaskGoal}
+            onChangeView={(view) => void changeWorkspace({ kind: 'view', view })}
+            onRefresh={() => void loadProductOverview()}
+            onRevokeModelAccess={() => void revokeModelAccess()}
+            revokingAccess={revokingAccess}
+          />
+        ) : page === 'tasks' ? (
+          <TasksPage
+            workspace={workspace}
+            jobs={jobs}
+            candidates={candidateSummaries}
+            candidateDetail={candidateDetail}
+            activity={activity}
+            confirmed={confirmedWorkspaceRevision === workspace?.revision}
+            notice={notice}
+            onOpenJob={(jobId) => void openJob(jobId)}
+            onOpenCandidate={(jobId, candidateId) => void openCandidate(jobId, candidateId)}
+            onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)}
+            onConfirm={() => void confirmWorkspace()}
+          />
+        ) : page === 'model' ? (
           <section className="page-content">
             <div className="page-heading">
               <div><div className="eyebrow">PROVIDER WORKBENCH</div><h1>Connect a model.</h1><p>Set the route once, then send an explicit diagnostic request through Flowmate’s Provider runtime.</p></div>
@@ -691,14 +951,148 @@ export function App() {
         modelId={persistedModel?.model ?? null}
         sessionHint={!selectedSession ? selectedSessionId !== null ? 'Loading this Session. You can write while it loads; Send will be available when ready.' : 'Create a Session to begin. Creating one does not call the model.'
           : selectedSession.availability === 'history-unavailable' ? "This session's conversation history is unavailable after restart. Create a new session to continue."
+            : selectedSession.modelUseBlocked ? 'Model access was revoked for this Session. Create a new Session to continue.'
             : selectedSession.availability === 'archived' ? 'This Session is pending deletion. Retry Delete to finish removing it.'
             : selectedSession.availability === 'unusable' ? 'This Agent Session cannot continue safely. Create a new Session.'
               : selectedSession.availability === 'busy' ? 'A Run is active for this Session.'
-                : !modelReady ? 'Save a model route and API Key to start a chat.' : ''}
+                : !modelReady ? 'Save a model route and API Key to start a chat.'
+                  : !workspace ? 'Loading the Workspace.'
+                    : workspace.sessionId !== selectedSessionId ? 'Binding this Session to the Workspace.'
+                      : confirmedWorkspaceRevision !== workspace.revision ? 'Review the Workspace source and confirm it before Send.'
+                        : goalMode === 'save-candidate' && (!workspace.documentRef || !workspace.jobId) ? 'Select a document and start a Task to save a candidate.' : ''}
         onOpenRun={(id) => { setPage('model'); void loadRun(id); }}
       />
     </div>
   );
+}
+
+function WorkspacePage(props: {
+  workspace: WorkspaceSnapshot | null;
+  documents: readonly DocumentSnapshot[];
+  jobs: readonly JobSnapshot[];
+  selectedSessionId: number | null;
+  confirmed: boolean;
+  goalMode: 'answer' | 'save-candidate';
+  taskGoal: string;
+  parsedPage: InvoiceToolOutput<'read_invoice_document'> | null;
+  originalImage: DocumentOriginalImage | null;
+  notice: Notice;
+  onImport(): void;
+  onSelectDocument(id: number | null): void;
+  onStartTask(): void;
+  onConfirm(): void;
+  onGoalModeChange(value: 'answer' | 'save-candidate'): void;
+  onTaskGoalChange(value: string): void;
+  onChangeView(value: 'original' | 'parsed' | 'candidate'): void;
+  onRefresh(): void;
+  onRevokeModelAccess(): void;
+  revokingAccess: boolean;
+}) {
+  const { workspace, documents, jobs, selectedSessionId, confirmed, goalMode, taskGoal, parsedPage, originalImage, notice, revokingAccess } = props;
+  const selectedDocument = documents.find((item) => item.documentRef.id === workspace?.documentRef?.id) ?? null;
+  return <section className="page-content">
+    <div className="page-heading">
+      <div><div className="eyebrow">P3 · FORMAL INPUT</div><h1>Workspace.</h1><p>Choose existing invoice material, review its parsed evidence, then explicitly start a Task.</p></div>
+      <div className="model-stamp"><span className="stamp-label">WORKSPACE REVISION</span><strong>{workspace?.revision ?? '—'}</strong><small>{workspace?.sessionId ? `Session #${workspace.sessionId}` : 'No Session bound'}</small></div>
+    </div>
+    {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
+    <section className="panel model-list-panel">
+      <div className="panel-head"><div><span className="section-index">FORMAL DOCUMENTS</span><h2>Invoice materials</h2></div>
+        <div className="button-row"><button className="secondary-button" onClick={props.onRefresh}>Refresh</button><button className="primary-button" onClick={props.onImport}>＋ Choose and import</button></div>
+      </div>
+      {documents.length === 0 ? <div className="empty-route"><strong>No imported documents</strong><span>Import a directory that contains the existing original and parser output.</span></div> :
+        <div className="model-list">{documents.map((document) => <button key={`${document.documentRef.id}:${document.documentRef.version}`} className={`route-row ${workspace?.documentRef?.id === document.documentRef.id ? 'selected' : ''}`} onClick={() => props.onSelectDocument(document.documentRef.id)}>
+          <span className="route-icon">▧</span><span className="route-name"><strong>Document #{document.documentRef.id}</strong><small>{document.pageCount} pages · {document.parser.name} {document.parser.version}</small></span>
+          <span className={`credential-pill ${document.status === 'available' ? 'ready' : ''}`}>{document.status.toUpperCase()}</span>
+        </button>)}</div>}
+      {workspace?.documentRef && <div className="config-note"><span className="note-mark">i</span><span>Selected source · Document #{workspace.documentRef.id} · revision {workspace.documentRef.version}{selectedDocument?.unavailableReason ? ` · ${selectedDocument.unavailableReason}` : ''}</span></div>}
+      {workspace?.documentRef && <div className="config-actions"><span className="action-spacer" /><button className="danger-action" disabled={revokingAccess} onClick={props.onRevokeModelAccess}>{revokingAccess ? 'Revoking…' : 'Revoke model access'}</button></div>}
+    </section>
+
+    {workspace?.documentRef && <section className="panel config-panel">
+      <div className="panel-head"><div><span className="section-index">SOURCE REVIEW</span><h2>Original and parsed evidence</h2></div><span className="revision-tag">PAGE 1</span></div>
+      <div className="button-row">
+        <button className={workspace.activeView === 'original' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('original')}>Original</button>
+        <button className={workspace.activeView === 'parsed' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('parsed')}>Parsed</button>
+        <button className={workspace.activeView === 'candidate' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('candidate')}>Candidate</button>
+      </div>
+      {workspace.activeView === 'original' && (originalImage
+        ? <figure><img style={{ maxWidth: '100%', maxHeight: '60vh', objectFit: 'contain' }} src={`data:${originalImage.mimeType};base64,${originalImage.base64}`} alt={`Original invoice document page 1`} /><figcaption>Original page shown for user review.</figcaption></figure>
+        : <p className="config-note">Original page is unavailable. The selected document may be missing its source asset.</p>)}
+      {workspace.activeView === 'parsed' && (parsedPage
+        ? <div className="model-list">{parsedPage.blocks.map((block) => <article className="route-row" key={block.id}>
+          <span className="route-icon">{block.kind === 'table' ? '▤' : block.kind === 'image' ? '▧' : '¶'}</span>
+          <span className="route-name"><strong>{block.id} · {block.kind}</strong><small>{block.text || '(no extracted text)'}</small><small>Page {block.source.page} · artifact #{block.source.artifactId}{block.source.quote ? ` · ${block.source.quote}` : ''}</small></span>
+        </article>)}</div>
+        : <p className="config-note">Parsed page could not be loaded.</p>)}
+      {workspace.activeView === 'candidate' && <p className="config-note">Candidate details and source links are available in Tasks after a Run saves a candidate.</p>}
+    </section>}
+
+    <section className="panel profile-panel">
+      <div className="panel-head"><div><span className="section-index">START TASK</span><h2>Freeze this source for a Job</h2></div><span className="revision-tag">NEXT #{workspace?.nextTaskSequence ?? '—'}</span></div>
+      <label className="field full"><span>Task goal</span><textarea value={taskGoal} onChange={(event) => props.onTaskGoalChange(event.target.value)} maxLength={4096} rows={3} placeholder="What should the Agent prepare from this invoice?" /></label>
+      <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace?.documentRef || !selectedSessionId || !taskGoal.trim()} onClick={props.onStartTask}>Start Task</button></div>
+      <p className="config-note">Starting a Task creates the Job from the selected document. Choose or create a Session in Agent Chat first.</p>
+    </section>
+
+    <section className="panel profile-panel">
+      <div className="panel-head"><div><span className="section-index">RUN GATE</span><h2>Confirm current Workspace</h2></div><span className={`credential-pill ${confirmed ? 'ready' : ''}`}>{confirmed ? 'CONFIRMED' : 'REVIEW REQUIRED'}</span></div>
+      <label className="field"><span>Run goal mode</span><select value={goalMode} onChange={(event) => props.onGoalModeChange(event.target.value as 'answer' | 'save-candidate')}>
+        <option value="answer">Answer only</option><option value="save-candidate" disabled={!workspace?.jobId || !workspace?.documentRef}>Prepare and save candidate</option>
+      </select></label>
+      <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace || !selectedSessionId || workspace.sessionId !== selectedSessionId} onClick={props.onConfirm}>{confirmed ? 'Reconfirm Workspace' : 'Confirm Workspace'}</button></div>
+      <p className="config-note">Changing Session, document, Job, view or selected candidate changes the revision and requires confirmation again. Send stays disabled until the current revision and Session match.</p>
+    </section>
+    <footer className="page-footer"><span>MODEL RUNS START ONLY FROM EXPLICIT SEND</span><span>FORMAL INPUT · NO BENCHMARK GOLD</span></footer>
+  </section>;
+}
+
+function TasksPage(props: {
+  workspace: WorkspaceSnapshot | null;
+  jobs: readonly JobSnapshot[];
+  candidates: readonly CandidateSummary[];
+  candidateDetail: CandidateJobDetail | null;
+  activity: readonly BusinessEventSnapshot[];
+  confirmed: boolean;
+  notice: Notice;
+  onOpenJob(jobId: number): void;
+  onOpenCandidate(jobId: number, candidateId: number): void;
+  onSelectCandidate(jobId: number, candidateId: number): void;
+  onConfirm(): void;
+}) {
+  const { workspace, jobs, candidates, candidateDetail, activity, confirmed } = props;
+  const job = jobs.find((item) => item.jobId === workspace?.jobId) ?? null;
+  return <section className="page-content">
+    <div className="page-heading"><div><div className="eyebrow">P3 · TASKS AND CANDIDATES</div><h1>Tasks.</h1><p>Inspect Job status, saved candidates, source references and business activity.</p></div><div className="model-stamp"><span className="stamp-label">ACTIVE JOB</span><strong>{job ? `#${job.jobId}` : 'None'}</strong><small>{job?.status ?? 'Select a Job'}</small></div></div>
+    {props.notice && <div className={`notice ${props.notice.tone}`} role="status">{props.notice.message}</div>}
+    <section className="panel model-list-panel"><div className="panel-head"><div><span className="section-index">JOBS</span><h2>Task history</h2></div></div>
+      {jobs.length === 0 ? <div className="empty-route"><strong>No Tasks yet</strong><span>Choose a formal document in Workspace and click Start Task.</span></div> :
+        <div className="model-list">{jobs.map((item) => <button key={item.jobId} className={`route-row ${item.jobId === workspace?.jobId ? 'selected' : ''}`} onClick={() => props.onOpenJob(item.jobId)}>
+          <span className="route-icon">☷</span><span className="route-name"><strong>Job #{item.jobId} · {item.status}</strong><small>Document #{item.documentRef.id} · {item.goal}</small><small>Candidate pointer · {item.currentCandidateId ? `#${item.currentCandidateId}` : 'none'}</small></span><span className="credential-pill">OPEN</span>
+        </button>)}</div>}
+    </section>
+    {job && <>
+      <section className="panel config-panel"><div className="panel-head"><div><span className="section-index">SAVED CANDIDATES</span><h2>Job #{job.jobId}</h2></div><span className="revision-tag">{candidates.length} shown</span></div>
+        {candidates.length === 0 ? <p className="config-note">No candidate has been saved. Confirm this Workspace, then Send a Run in “Prepare and save candidate” mode.</p> :
+          <div className="model-list">{candidates.map((item) => <div className="route-row" key={item.candidateId}>
+            <span className="route-icon">{item.status === 'accepted' ? '✓' : '▧'}</span><span className="route-name"><strong>Candidate #{item.candidateId} · {item.status}</strong><small>Sequence {item.sequence} · Run #{item.runId} · {item.issueCount} issues · {item.createdAt}</small></span>
+            <button className="text-button" onClick={() => props.onOpenCandidate(job.jobId, item.candidateId)}>View</button>
+            {item.status === 'generated' && item.candidateId !== job.currentCandidateId && <button className="secondary-button" onClick={() => props.onSelectCandidate(job.jobId, item.candidateId)}>Select</button>}
+          </div>)}</div>}
+      </section>
+      {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><div><span className="section-index">CANDIDATE DETAILS</span><h2>Candidate #{candidateDetail.candidate.candidateId}</h2></div><span className="revision-tag">Run #{candidateDetail.candidate.runId}</span></div>
+        <div className="profile-fields">{Object.entries(candidateDetail.candidate.fields).map(([name, field]) => <div key={name}><strong>{name}</strong><div>{field.raw ?? '—'} {field.normalized && field.normalized !== field.raw ? `→ ${field.normalized}` : ''} · {field.state}</div></div>)}</div>
+        <h3>Issues</h3>{candidateDetail.candidate.issues.length === 0 ? <p>No validation issues.</p> : <ul>{candidateDetail.candidate.issues.map((issue, index) => <li key={`${issue.code}:${index}`}>{issue.severity} · {issue.message} ({issue.fieldPaths.join(', ') || 'document'})</li>)}</ul>}
+        <h3>Sources</h3>{candidateDetail.candidate.sources.length === 0 ? <p>No explicit source links were saved.</p> : <ul>{candidateDetail.candidate.sources.map((source, index) => <li key={`${source.artifactId}:${source.page}:${source.blockId}:${index}`}>Document #{source.documentId} · artifact #{source.artifactId} · page {source.page} · {source.blockId ?? 'page'}{source.quote ? ` · “${source.quote}”` : ''}</li>)}</ul>}
+        {candidateDetail.candidate.lines.map((line, index) => <details key={index}><summary>Line {index + 1} · {line.description.raw ?? 'description missing'}</summary><pre>{stringify(line)}</pre></details>)}
+      </section>}
+      <section className="panel profile-panel"><div className="panel-head"><div><span className="section-index">BUSINESS ACTIVITY</span><h2>Job #{job.jobId} events</h2></div></div>
+        {activity.length === 0 ? <p>No business events are recorded yet.</p> : <ol>{activity.map((event) => <li key={event.id}><strong>{event.type}</strong> · {event.result} · {event.safeSummary} · {event.occurredAt}{event.errorCode ? ` · ${event.errorCode}` : ''}</li>)}</ol>}
+      </section>
+    </>}
+    <section className="panel profile-panel"><div className="panel-head"><div><span className="section-index">RUN CONFIRMATION</span><h2>Workspace must be reviewed after a change</h2></div><span className={`credential-pill ${confirmed ? 'ready' : ''}`}>{confirmed ? 'CONFIRMED' : 'REVIEW REQUIRED'}</span></div><p className="config-note">{workspace?.documentRef ? `Document #${workspace.documentRef.id}` : 'No document'} · {workspace?.jobId ? `Job #${workspace.jobId}` : 'no Job'} · Session {workspace?.sessionId ? `#${workspace.sessionId}` : 'unbound'} · revision ${workspace?.revision ?? '—'}</p><div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace?.sessionId} onClick={props.onConfirm}>Confirm Workspace</button></div></section>
+    <footer className="page-footer"><span>CANDIDATES ARE GENERATED, NOT ACCEPTED</span><span>ACTIVITY IS A BUSINESS RECORD</span></footer>
+  </section>;
 }
 
 function modelFieldsEqual(left: ModelProfile, right: ModelProfile): boolean {
@@ -870,10 +1264,12 @@ function AgentChatPanel({
             setRenaming(true);
             event.currentTarget.closest('details')?.removeAttribute('open');
           }} disabled={sessionMutating || selectedSession.status === 'archived'}>Rename</button>
-          <button type="button" className="danger-action" disabled={sessionMutating} onClick={() => {
+          <button type="button" className="danger-action" disabled={sessionMutating || selectedSession.hasBusinessHistory}
+            aria-describedby={selectedSession.hasBusinessHistory ? `session-delete-reason-${selectedSession.sessionId}` : undefined} onClick={() => {
             const title = selectedSession.title;
             if (window.confirm(`Permanently delete only this Session (“${title}”), including its conversations and Agent Runs? Other Sessions and Provider test Runs will be kept. This cannot be undone.`)) void onDeleteSession(selectedSession.sessionId);
           }}>Delete Session</button>
+          {selectedSession.hasBusinessHistory && <span id={`session-delete-reason-${selectedSession.sessionId}`} role="note">This Session contains invoice history and cannot be deleted.</span>}
         </div>
       </details>}
       {hasMoreSessions && <button type="button" className="chat-more" onClick={onLoadMoreSessions}>More</button>}

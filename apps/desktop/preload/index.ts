@@ -18,6 +18,22 @@ const bridge: DesktopBridge = {
   cancelRun: (runId) => ipcRenderer.invoke('flowmate:cancel-run', runId),
   queryRuntimeState: () => ipcRenderer.invoke('flowmate:query-runtime-state'),
   queryRun: (runId: number) => ipcRenderer.invoke('flowmate:query-run', runId),
+  readWorkspace: () => ipcRenderer.invoke('flowmate:read-workspace'),
+  updateWorkspace: (input) => ipcRenderer.invoke('flowmate:update-workspace', input),
+  startTask: (input) => ipcRenderer.invoke('flowmate:start-task', input),
+  queryTaskOperation: (sequence) => ipcRenderer.invoke('flowmate:query-task-operation', sequence),
+  selectCandidate: (input) => ipcRenderer.invoke('flowmate:select-candidate', input),
+  listDocuments: (request = {}) => ipcRenderer.invoke('flowmate:list-documents', request),
+  queryDocument: (documentId) => ipcRenderer.invoke('flowmate:query-document', documentId),
+  listJobs: (request = {}) => ipcRenderer.invoke('flowmate:list-jobs', request),
+  queryJob: (jobId) => ipcRenderer.invoke('flowmate:query-job', jobId),
+  listJobCandidates: (request) => ipcRenderer.invoke('flowmate:list-job-candidates', request),
+  queryJobCandidate: (request) => ipcRenderer.invoke('flowmate:query-job-candidate', request),
+  listActivity: (request) => ipcRenderer.invoke('flowmate:list-activity', request),
+  chooseAndImportInvoice: () => ipcRenderer.invoke('flowmate:choose-and-import-invoice'),
+  readDocumentPage: (input) => ipcRenderer.invoke('flowmate:read-document-page', input),
+  readDocumentOriginal: (documentId, page) => ipcRenderer.invoke('flowmate:read-document-original', documentId, page),
+  revokeDocumentUse: (documentId) => ipcRenderer.invoke('flowmate:revoke-document-use', documentId),
   subscribe(listener: (event: DesktopEvent) => void) {
     const handler = (_event: Electron.IpcRendererEvent, value: DesktopEvent) => listener(value);
     ipcRenderer.on('flowmate:event', handler);

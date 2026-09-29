@@ -45,6 +45,8 @@ export type DesktopAgentRunRequest = {
   sessionId: import('./runtime.ts').DbId;
   text: string;
   modelId: string;
+  workspace: import('./workspace.ts').WorkspaceExpectation;
+  goalMode: import('./workspace.ts').GoalMode;
   timeoutMs?: number;
 };
 
@@ -64,5 +66,21 @@ export type DesktopBridge = {
   cancelRun(runId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: import('./runtime.ts').DbId }>>;
   queryRuntimeState(): Promise<import('./runtime.ts').Result<import('./runtime.ts').RuntimeState>>;
   queryRun(runId: number): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunSnapshot>>;
+  readWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
+  updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
+  startTask(input: import('./workspace.ts').StartTaskRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').TaskOperation>>;
+  queryTaskOperation(clientSequence: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').TaskOperation | null>>;
+  selectCandidate(input: import('./workspace.ts').SelectCandidateRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').CandidateSelection>>;
+  listDocuments(request?: import('./workspace.ts').PageRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./workspace.ts').DocumentSnapshot>>>;
+  queryDocument(documentId: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').DocumentSnapshot>>;
+  listJobs(request?: import('./workspace.ts').JobPageRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./workspace.ts').JobSnapshot>>>;
+  queryJob(jobId: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').JobSnapshot>>;
+  listJobCandidates(request: import('./workspace.ts').CandidateJobPageRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').CandidateJobPage>>;
+  queryJobCandidate(request: { jobId: number; candidateId: number }): Promise<import('./runtime.ts').Result<import('./workspace.ts').CandidateJobDetail>>;
+  listActivity(request: import('./activity.ts').ActivityPageRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./activity.ts').BusinessEventSnapshot>>>;
+  chooseAndImportInvoice(): Promise<import('./runtime.ts').Result<import('./workspace.ts').DocumentSnapshot | null>>;
+  readDocumentPage(input: import('./invoice.ts').InvoiceToolInput<'read_invoice_document'>): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceToolOutput<'read_invoice_document'>>>;
+  readDocumentOriginal(documentId: number, page: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').DocumentOriginalImage>>;
+  revokeDocumentUse(documentId: number): Promise<import('./runtime.ts').Result<{ affectedSessionIds: number[]; stopRequested: boolean }>>;
   subscribe(listener: (event: DesktopEvent) => void): () => void;
 };

@@ -15,6 +15,7 @@ import {
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
+  AgentToolBinding,
   AgentExecutionInput,
   AgentNativeOutcome,
   AgentPort,
@@ -28,11 +29,18 @@ import type {
   PreparedAgent,
   Result,
   SafeConfigSnapshot,
+  P3AgentConfigFacts,
+  SdkUsageValues,
+  TokenColumns,
+  ToolDefinition,
+  UsageRecordV1,
+  UsageRecordV2,
 } from '@flowmate/contracts';
 import type { ProviderConfig } from '@flowmate/contracts';
-import { INVOICE_CHAT_SYSTEM_PROMPT } from '@flowmate/contracts';
+import { INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
 import { normalizeUsage, modelRuntimeSnapshot, prepareModelRuntime, safeUrl } from './model-runtime.ts';
 import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
+import { toPiTool } from './tools.ts';
 
 const maxContextBytes = 512 * 1024;
 const maxOutputBytes = 256 * 1024;
@@ -44,6 +52,11 @@ type AgentStreamArguments = Parameters<AgentStream>;
 type StreamModel = AgentStreamArguments[0];
 type StreamContext = AgentStreamArguments[1];
 type StreamOptions = AgentStreamArguments[2];
+type PiAgentEventListener = Parameters<AgentSession['agent']['subscribe']>[0];
+type PiAgentEvent = Parameters<PiAgentEventListener>[0];
+type PiAgentEventSignal = Parameters<PiAgentEventListener>[1];
+type ModelCallUsage = { callSequence: number; usage: UsageRecordV1; tokens: TokenColumns; complete: boolean };
+type ToolRequestState = { name: string; raw: unknown; invoked: boolean; terminal: boolean; messageObserved: boolean; messageObservedAt: string | null; requestObservedAtSequence: number | null };
 
 type ActiveExecution = {
   runId: number;
@@ -51,6 +64,14 @@ type ActiveExecution = {
   nativeSessionId: string;
   signal: AbortSignal;
   observe: (event: NativeObservation) => void;
+  p3: boolean;
+  goalMode: 'answer' | 'save-candidate';
+  toolBinding?: AgentToolBinding;
+  toolRequests: Map<string, ToolRequestState>;
+  modelCallUsages: ModelCallUsage[];
+  attemptsAtCallStart: number;
+  totalOutputBytes: number;
+  finalAssistantMessage?: AssistantMessage;
   callSequence: number;
   turnOrdinal: number;
   attempts: number;
@@ -75,6 +96,7 @@ type SessionRecord = {
   model?: NonNullable<ReturnType<ModelRuntime['getModel']>>;
   config?: ProviderConfig;
   snapshot?: SafeConfigSnapshot;
+  policy?: 'p2' | 'p3';
   preparing: boolean;
   running: boolean;
   unusable: boolean;
@@ -167,6 +189,71 @@ function textFrom(message: AssistantMessage): string {
     .map((part) => part.text).join('');
 }
 
+function sumKnown(values: Array<number | null | undefined>): number | null {
+  if (values.length === 0 || values.some((value) => value === null || value === undefined || !Number.isFinite(value))) return null;
+  return values.reduce<number>((total, value) => total + Number(value), 0);
+}
+
+function sumDecimalStrings(values: Array<string | null>): string | null {
+  if (!values.length || values.some((value) => value === null)) return null;
+  let scale = 0;
+  const parts = values.map((value) => {
+    const match = /^(-?)(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i.exec(value!);
+    if (!match) return null;
+    const fraction = match[3] ?? '';
+    const exponent = Number(match[4] ?? 0);
+    if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 100) return null;
+    const decimalPlaces = fraction.length - exponent;
+    const coefficient = BigInt(`${match[1]}${match[2]}${fraction}`);
+    const adjusted = decimalPlaces < 0 ? coefficient * 10n ** BigInt(-decimalPlaces) : coefficient;
+    scale = Math.max(scale, Math.max(0, decimalPlaces));
+    return { adjusted, decimalPlaces: Math.max(0, decimalPlaces) };
+  });
+  if (parts.some((part) => part === null)) return null;
+  let total = parts.reduce((sum, part) => sum + part!.adjusted * 10n ** BigInt(scale - part!.decimalPlaces), 0n);
+  if (total === 0n) return '0';
+  const negative = total < 0n;
+  if (negative) total = -total;
+  let digits = total.toString().padStart(scale + 1, '0');
+  if (scale) digits = `${digits.slice(0, -scale)}.${digits.slice(-scale)}`.replace(/0+$/, '').replace(/\.$/, '');
+  return `${negative ? '-' : ''}${digits}`;
+}
+
+function aggregateUsage(calls: ModelCallUsage[], attempts: number, complete: boolean, updatedAt: string): { usage: UsageRecordV2; tokens: TokenColumns } {
+  const sdkFields: Array<keyof SdkUsageValues> = ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens',
+    'costInput', 'costOutput', 'costCacheRead', 'costCacheWrite', 'costTotal'];
+  const sdkValues: SdkUsageValues | null = calls.length && calls.every((call) => call.usage.sdkValues !== null)
+    ? Object.fromEntries(sdkFields.map((field) => [field, sumKnown(calls.map((call) => call.usage.sdkValues?.[field] ?? null))])) as SdkUsageValues
+    : null;
+  const source = calls.length > 0 && calls.every((call) => call.usage.source === 'sdk') ? 'sdk' : 'unknown';
+  const inputTokens = sumKnown(calls.map((call) => call.tokens.inputTokens));
+  const outputTokens = sumKnown(calls.map((call) => call.tokens.outputTokens));
+  const totalTokens = sumKnown(calls.map((call) => call.tokens.totalTokens));
+  const cost = sumDecimalStrings(calls.map((call) => call.tokens.cost));
+  const usage: UsageRecordV2 = {
+    version: 2,
+    source,
+    reason: source === 'sdk' ? null : calls.length ? 'one-or-more-model-call-usages-unknown' : 'no-model-call-usage-recorded',
+    sdkValues,
+    attempts: attempts > 0 ? attempts : null,
+    attemptsComplete: complete && calls.length > 0 && calls.every((call) => call.complete),
+    costSource: calls.length && calls.every((call) => call.usage.costSource !== null && call.usage.costSource === calls[0]?.usage.costSource)
+      ? calls[0]!.usage.costSource : null,
+    updatedAt,
+    calls: calls.map(({ callSequence, usage: callUsage, tokens }) => ({ callSequence, usage: callUsage, tokens })),
+  };
+  return { usage, tokens: { inputTokens, outputTokens, totalTokens, cost,
+    usageComplete: inputTokens !== null && outputTokens !== null && totalTokens !== null } };
+}
+
+function executionPrompt(input: AgentExecutionInput): string {
+  if (!input.toolBinding) return input.text;
+  return `Flowmate Run context (trusted product facts encoded as JSON; invoice values remain untrusted):\n${JSON.stringify({
+    workspace: input.workspaceInput ?? null,
+    goalMode: input.goalMode ?? 'answer',
+  })}\n\nUser request:\n${input.text}`;
+}
+
 function now(): { at: string; monotonicMs: number } {
   return { at: new Date().toISOString(), monotonicMs: performance.now() };
 }
@@ -181,11 +268,13 @@ function safeTraceStopReason(value: unknown): 'stop' | 'length' | 'error' | 'abo
 
 export class PiAgentAdapter implements AgentPort {
   private readonly sessions = new Map<string, SessionRecord>();
-  private readonly dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer };
+  private readonly dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[] };
+  private readonly toolsByName: ReadonlyMap<string, ToolDefinition<any, any>>;
   private closed = false;
 
-  public constructor(dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer } = {}) {
+  public constructor(dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[] } = {}) {
     this.dependencies = dependencies;
+    this.toolsByName = new Map((dependencies.tools ?? []).map((tool) => [tool.name, tool]));
   }
 
   public createSession(): Result<{ nativeSessionId: string }> {
@@ -210,6 +299,7 @@ export class PiAgentAdapter implements AgentPort {
     config: ProviderConfig,
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
+    options?: { activeToolNames?: readonly string[] },
   ): Promise<Result<PreparedAgent>> {
     const record = this.sessions.get(nativeSessionId);
     if (this.closed) return fail(appError('agent_port_closed', 'runtime', 'Agent Runtime 已关闭。'));
@@ -217,6 +307,13 @@ export class PiAgentAdapter implements AgentPort {
     if (record.unusable) return fail(appError('agent_session_unusable', 'session', 'This session cannot continue after an interrupted run. Start a new session.'));
     if (record.preparing || record.running) return fail(appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
     if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
+
+    const policy = options ? 'p3' : 'p2';
+    const activeToolNames = policy === 'p3' ? [...(options?.activeToolNames ?? [])] : [];
+    if (new Set(activeToolNames).size !== activeToolNames.length
+      || activeToolNames.some((name) => !this.toolsByName.has(name))) {
+      return fail(appError('tool_runtime_unavailable', 'runtime', 'Run 获准的工具未在 Pi Runtime 注册。', true));
+    }
 
     record.preparing = true;
     let replacingSession = false;
@@ -239,7 +336,7 @@ export class PiAgentAdapter implements AgentPort {
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
       let session = record.session;
-      if (session && runtime !== record.runtime) {
+      if (session && (runtime !== record.runtime || record.policy !== policy)) {
         session.dispose();
         record.session = undefined;
         session = undefined;
@@ -255,15 +352,20 @@ export class PiAgentAdapter implements AgentPort {
           model,
           sessionManager: record.manager,
           settingsManager: inMemorySettings(),
-          resourceLoader: emptyResourceLoader(INVOICE_CHAT_SYSTEM_PROMPT),
-          noTools: 'all',
-          tools: [],
-          customTools: [],
+          resourceLoader: emptyResourceLoader(policy === 'p3' ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT),
+          ...(policy === 'p2' ? { noTools: 'all' as const, tools: [] } : {}),
+          customTools: policy === 'p3' ? [...this.toolsByName.values()].map((definition) => toPiTool(
+            definition,
+            (toolCallId, input, toolSignal) => this.executePiTool(record, definition, toolCallId, input, toolSignal),
+          )) : [],
           thinkingLevel: 'off',
         });
         session = created.session;
+        session.agent.toolExecution = 'parallel';
+        session.setActiveToolsByName(activeToolNames);
         session.agent.streamFunction = this.wrapStream(record, session, session.agent.streamFunction);
         record.session = session;
+        record.policy = policy;
       } else if (!sameModel(record.model, model)) {
         try {
           await session.setModel(model, { persist: false });
@@ -271,26 +373,28 @@ export class PiAgentAdapter implements AgentPort {
           return fail(appError('agent_model_switch_failed', 'session', '所选模型无法在此会话中使用。'));
         }
       }
+      if (session) {
+        session.agent.toolExecution = 'parallel';
+        session.setActiveToolsByName(activeToolNames);
+      }
 
       const snapshot = modelRuntimeSnapshot(config, limits, model, authSource);
       record.runtime = runtime;
       record.model = model;
       record.config = structuredClone(config);
       record.snapshot = snapshot;
+      record.policy = policy;
       replacingSession = false;
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
-      const agent: AgentConfigFacts = {
-        policyVersion: 'p2-invoice-chat-v1',
-        nativeSessionId,
-        systemPrompt: session.systemPrompt,
-        thinkingLevel: session.thinkingLevel,
-        resourcePolicy: 'none',
-        historyPolicy: 'memory-only',
-        maxContextBytes: 524_288,
-        maxOutputBytes: 262_144,
-        maxAssistantContentBytes: 524_288,
-        maxModelCalls: 1,
-        sessionRetry: false,
+      const agent: AgentConfigFacts | P3AgentConfigFacts = policy === 'p3' ? {
+        policyVersion: 'p3-invoice-tools-v1', nativeSessionId, systemPrompt: session.systemPrompt,
+        thinkingLevel: session.thinkingLevel, resourcePolicy: 'none', historyPolicy: 'memory-only',
+        maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12,
+        maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false,
+      } : {
+        policyVersion: 'p2-invoice-chat-v1', nativeSessionId, systemPrompt: session.systemPrompt,
+        thinkingLevel: session.thinkingLevel, resourcePolicy: 'none', historyPolicy: 'memory-only',
+        maxContextBytes: 524_288, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 1, sessionRetry: false,
       };
       return ok({
         snapshot: { ...snapshot, agent },
@@ -310,20 +414,23 @@ export class PiAgentAdapter implements AgentPort {
       const active = record.active;
       if (!active) return errorStream(model, appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
       if (active.signal.aborted) return errorStream(model, appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'), 'aborted');
-      if (active.callSequence >= 1) {
+      const modelCallLimit = active.p3 ? 12 : 1;
+      if (active.callSequence >= modelCallLimit) {
         this.stop(record, active);
-        active.failure ??= appError('agent_unexpected_continuation', 'runtime', 'P2 Agent 请求次数超过限制。');
+        active.failure ??= appError(active.p3 ? 'agent_model_call_budget' : 'agent_unexpected_continuation', 'runtime',
+          active.p3 ? 'Run 已达到模型调用次数上限。' : 'P2 Agent 请求次数超过限制。');
         active.stopReason = active.failure.code;
         return errorStream(model, active.failure);
       }
 
+      const contextLimit = active.p3 ? 8_388_608 : maxContextBytes;
       let contextSize: number;
       try {
         contextSize = encoder.encode(JSON.stringify(context)).byteLength;
       } catch {
-        contextSize = maxContextBytes + 1;
+        contextSize = contextLimit + 1;
       }
-      if (contextSize > maxContextBytes) {
+      if (contextSize > contextLimit) {
         active.failure ??= appError('agent_context_limit', 'runtime', 'Agent 上下文超过本阶段限制。');
         active.stopReason = active.failure.code;
         this.stop(record, active);
@@ -331,6 +438,13 @@ export class PiAgentAdapter implements AgentPort {
       }
 
       active.callSequence += 1;
+      active.attemptsAtCallStart = active.attempts;
+      active.responseStarted = false;
+      active.complete = false;
+      if (active.p3) {
+        active.text = '';
+        active.textBytes = 0;
+      }
       this.observe(active, 'model_request', {
         callSequence: active.callSequence,
         model: model.id,
@@ -344,6 +458,193 @@ export class PiAgentAdapter implements AgentPort {
       void worker.then(() => active.streams.delete(worker), () => active.streams.delete(worker));
       return output;
     };
+  }
+
+  private failToolRun(record: SessionRecord, active: ActiveExecution, error: ReturnType<typeof appError>): void {
+    active.failure ??= error;
+    active.stopReason = active.failure.code;
+    this.stop(record, active);
+  }
+
+  private observeAgentEvent(record: SessionRecord, active: ActiveExecution, event: PiAgentEvent, eventSignal?: PiAgentEventSignal): void {
+    const binding = active.toolBinding;
+    if (!active.p3 || !binding) return;
+    const signal = eventSignal ?? active.signal;
+    const ensureRequest = (name: string, raw: unknown, nativeToolCallId: string): ToolRequestState | null => {
+      const prior = active.toolRequests.get(nativeToolCallId);
+      if (prior) return prior;
+      const observed = binding.observeRequest(name, raw, { nativeToolCallId, signal });
+      if (!observed.ok) {
+        this.failToolRun(record, active, observed.error);
+        return null;
+      }
+      const state: ToolRequestState = { name, raw, invoked: false, terminal: false,
+        messageObserved: false, messageObservedAt: null, requestObservedAtSequence: null };
+      active.toolRequests.set(nativeToolCallId, state);
+      return state;
+    };
+    const rejectUninvoked = (state: ToolRequestState, nativeToolCallId: string) => {
+      if (state.invoked || state.terminal) return;
+      const definition = this.toolsByName.get(state.name);
+      const error = !definition
+        ? appError('tool_not_found', 'tool', '此 Run 未注册请求的工具。', false, active.runId, active.sessionId, nativeToolCallId)
+        : !binding.context.scope.allowedTools.includes(state.name)
+          ? appError('tool_access_denied', 'runtime', '此 Run 未获准使用请求的工具。', false, active.runId, active.sessionId, nativeToolCallId)
+          : appError('tool_invalid_input', 'tool', '工具参数不符合输入 Schema。', false, active.runId, active.sessionId, nativeToolCallId);
+      const rejected = binding.rejectRequest(state.name, state.raw, { nativeToolCallId, signal }, error);
+      if (!rejected.ok) this.failToolRun(record, active,
+        appError('storage_write_failed', 'storage', '拒绝的 ToolCall 终态无法保存。', true, active.runId));
+      state.terminal = true;
+    };
+
+    if (event.type === 'message_end' && event.message.role === 'assistant') {
+      const calls = event.message.content.filter((part): part is Extract<typeof part, { type: 'toolCall' }> => part.type === 'toolCall');
+      for (const call of calls) ensureRequest(call.name, call.arguments, call.id);
+      if (active.callSequence > 0) {
+        const attemptCount = Math.max(0, active.attempts - active.attemptsAtCallStart);
+        const normalized = normalizeUsage(event.message, {
+          attempts: attemptCount,
+          complete: active.complete && event.message.stopReason !== 'error' && event.message.stopReason !== 'aborted',
+        }, record.config?.connection === undefined);
+        if (normalized.usage.version === 1) {
+          const prior = active.modelCallUsages.findIndex((item) => item.callSequence === active.callSequence);
+          const callUsage: ModelCallUsage = { callSequence: active.callSequence, usage: normalized.usage,
+            tokens: normalized.tokens, complete: normalized.usage.attemptsComplete };
+          if (prior < 0) active.modelCallUsages.push(callUsage);
+          else active.modelCallUsages[prior] = callUsage;
+        }
+      }
+      if (event.message.stopReason === 'stop' && calls.length === 0) active.finalAssistantMessage = event.message;
+    }
+
+    if (event.type === 'tool_execution_start') {
+      const state = ensureRequest(event.toolName, event.args, event.toolCallId);
+      if (state) state.invoked = true;
+    }
+
+    if (event.type === 'tool_execution_end') {
+      const state = active.toolRequests.get(event.toolCallId);
+      if (state) rejectUninvoked(state, event.toolCallId);
+    }
+
+    if (event.type === 'message_end' && event.message.role === 'toolResult') {
+      const state = active.toolRequests.get(event.message.toolCallId);
+      if (state && !state.messageObserved && state.requestObservedAtSequence === null) {
+        const observedAt = now().at;
+        const saved = binding.recordDelivery(event.message.toolCallId, { version: 1, state: 'message_observed',
+          messageObservedAt: observedAt, includedInCallSequence: null, requestDispatchedAt: null, error: null });
+        if (!saved.ok) this.failToolRun(record, active,
+          appError('storage_write_failed', 'storage', '工具结果观察事实无法保存。', true, active.runId));
+        else {
+          state.messageObserved = true;
+          state.messageObservedAt = observedAt;
+        }
+      }
+    }
+
+    if (event.type === 'agent_end') {
+      for (const [nativeToolCallId, state] of active.toolRequests) {
+        rejectUninvoked(state, nativeToolCallId);
+        if (state.invoked && !state.terminal) {
+          this.failToolRun(record, active, appError('tool_execution_unconfirmed', 'runtime', '工具执行尚未完成。', true, active.runId));
+        }
+      }
+    }
+  }
+
+  private async executePiTool(
+    record: SessionRecord,
+    definition: ToolDefinition<any, any>,
+    nativeToolCallId: string,
+    input: unknown,
+    toolSignal?: AbortSignal,
+  ) {
+    const active = record.active;
+    const binding = active?.toolBinding;
+    if (!active || !active.p3 || !binding) throw new Error('工具调用缺少有效 Run 绑定。');
+    const toolCall = Object.freeze({ nativeToolCallId, signal: toolSignal
+      ? AbortSignal.any([active.signal, toolSignal]) : active.signal });
+    let request = active.toolRequests.get(nativeToolCallId);
+    if (!request) {
+      const observed = binding.observeRequest(definition.name, input, toolCall);
+      if (!observed.ok) {
+        this.failToolRun(record, active, observed.error);
+        throw new Error(observed.error.message);
+      }
+      request = { name: definition.name, raw: input, invoked: false, terminal: false, messageObserved: false, messageObservedAt: null, requestObservedAtSequence: null };
+      active.toolRequests.set(nativeToolCallId, request);
+    }
+    request.invoked = true;
+    if (active.failure || toolCall.signal.aborted) {
+      const error = active.failure ?? appError('agent_cancelled', 'runtime', 'Run 已取消，工具未执行。');
+      throw new Error(error.message);
+    }
+
+    let invocation;
+    try {
+      invocation = await binding.execute(definition.name, input, toolCall);
+    } catch {
+      const error = appError('tool_execution_failed', 'tool', '工具执行失败。');
+      this.failToolRun(record, active, error);
+      request.terminal = true;
+      throw new Error(error.message);
+    }
+    const result = invocation.result;
+    request.terminal = true;
+    if (invocation.fatal) {
+      const error = result.status === 'succeeded'
+        ? appError('storage_write_failed', 'storage', '工具运行记录无法保存。', true)
+        : result.error;
+      this.failToolRun(record, active, error);
+      throw new Error(error.message);
+    }
+    if (result.status !== 'succeeded') throw new Error(result.error.message);
+
+    let content;
+    try {
+      content = binding.formatResult
+        ? await binding.formatResult(definition.name, result.data, toolCall.signal)
+        : [{ type: 'text' as const, text: JSON.stringify(result.data) }];
+    } catch {
+      const error = appError('tool_result_format_failed', 'runtime', '工具结果无法安全回送给模型。');
+      const saved = binding.recordDelivery(nativeToolCallId, { version: 1, state: 'failed', messageObservedAt: null,
+        includedInCallSequence: null, requestDispatchedAt: null, error });
+      this.failToolRun(record, active, saved.ok ? error : appError('storage_write_failed', 'storage', '工具回送事实无法保存。', true));
+      throw new Error(active.failure!.message);
+    }
+    return { content, details: result.data };
+  }
+
+  private observeOutgoingToolResults(record: SessionRecord, active: ActiveExecution, context: StreamContext): boolean {
+    const binding = active.toolBinding;
+    if (!active.p3 || !binding) return true;
+    for (const message of context.messages) {
+      if (message.role !== 'toolResult') continue;
+      const request = active.toolRequests.get(message.toolCallId);
+      if (!request || request.requestObservedAtSequence !== null) continue;
+      if (!request.messageObserved) {
+        const messageObservedAt = now().at;
+        const messageObserved = binding.recordDelivery(message.toolCallId, { version: 1, state: 'message_observed',
+          messageObservedAt, includedInCallSequence: null, requestDispatchedAt: null, error: null });
+        if (!messageObserved.ok) {
+          this.failToolRun(record, active,
+            appError('storage_write_failed', 'storage', '工具结果观察事实无法保存。', true, active.runId));
+          return false;
+        }
+        request.messageObserved = true;
+        request.messageObservedAt = messageObservedAt;
+      }
+      const dispatchedAt = now().at;
+      const observed = binding.recordDelivery(message.toolCallId, { version: 1, state: 'request_observed',
+        messageObservedAt: request.messageObservedAt, includedInCallSequence: active.callSequence, requestDispatchedAt: dispatchedAt, error: null });
+      if (!observed.ok) {
+        this.failToolRun(record, active,
+          appError('storage_write_failed', 'storage', '模型请求中的工具结果事实无法保存。', true, active.runId));
+        return false;
+      }
+      request.requestObservedAtSequence = active.callSequence;
+    }
+    return true;
   }
 
   private async forwardStream(
@@ -376,6 +677,7 @@ export class PiAgentAdapter implements AgentPort {
       ?? this.dependencies.fetch
       ?? ((request, init) => globalThis.fetch(request, init));
     const fetch: FetchLike = async (request, init) => {
+      if (!this.observeOutgoingToolResults(record, active, context)) throw new Error('tool_result_delivery_failed');
       active.attempts += 1;
       const requestUrl = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url;
       this.observe(active, 'request_dispatched', { callSequence: active.callSequence, attempt: active.attempts, url: safeUrl(requestUrl) });
@@ -423,7 +725,13 @@ export class PiAgentAdapter implements AgentPort {
       for await (const event of stream) {
         if (event.type === 'start') active.responseStarted = true;
         if (event.type === 'text_delta' && !outputEnded) {
+          const deltaBytes = encoder.encode(event.delta).byteLength;
+          if (active.p3 && active.totalOutputBytes + deltaBytes > maxOutputBytes) {
+            failStream(appError('agent_output_limit', 'runtime', 'Run 的累计 Agent 输出超过本阶段限制。'));
+            continue;
+          }
           const appended = appendUtf8(active.text, event.delta, active.textBytes);
+          if (active.p3) active.totalOutputBytes += deltaBytes;
           const length = appended.text.length - active.text.length;
           active.text = appended.text;
           active.textBytes = appended.bytes;
@@ -445,7 +753,7 @@ export class PiAgentAdapter implements AgentPort {
             failStream(appError('agent_content_limit', 'runtime', 'Agent 原生回复内容超过本阶段限制。'));
             continue;
           }
-          if (message.content.some((part) => part.type === 'toolCall')) {
+          if (!active.p3 && message.content.some((part) => part.type === 'toolCall')) {
             failStream(appError('agent_unexpected_tool_call', 'runtime', 'P2 Agent 收到未授权的工具调用。'));
             continue;
           }
@@ -460,19 +768,22 @@ export class PiAgentAdapter implements AgentPort {
         catch { active.assistantContentBytes = maxAssistantContentBytes + 1; }
         if (active.assistantContentBytes > maxAssistantContentBytes) {
           failStream(appError('agent_content_limit', 'runtime', 'Agent 原生回复内容超过本阶段限制。'));
-        } else if (finalMessage.content.some((part) => part.type === 'toolCall')) {
+        } else if (!active.p3 && finalMessage.content.some((part) => part.type === 'toolCall')) {
           failStream(appError('agent_unexpected_tool_call', 'runtime', 'P2 Agent 收到未授权的工具调用。'));
         }
         const finalText = textFrom(finalMessage);
         const finalTextBytes = encoder.encode(finalText).byteLength;
-        if (finalTextBytes > maxOutputBytes) {
+        if (finalTextBytes > maxOutputBytes || active.p3 && active.totalOutputBytes + (active.textBytes === 0 ? finalTextBytes : 0) > maxOutputBytes) {
           active.text = appendUtf8('', finalText, 0).text;
           active.textBytes = maxOutputBytes;
           failStream(appError('agent_output_limit', 'runtime', 'Agent 回复超过本阶段限制。'));
         } else if (active.textBytes === 0 && finalTextBytes > 0) {
           active.text = finalText;
           active.textBytes = finalTextBytes;
+          if (active.p3) active.totalOutputBytes += finalTextBytes;
         }
+        if (active.p3 && finalMessage.stopReason === 'stop'
+          && !finalMessage.content.some((part) => part.type === 'toolCall')) active.finalAssistantMessage = finalMessage;
       }
       active.complete = true;
       active.stopReason = finalMessage.stopReason;
@@ -586,6 +897,10 @@ export class PiAgentAdapter implements AgentPort {
 
     const active: ActiveExecution = {
       runId: input.runId, sessionId: input.sessionId, nativeSessionId, signal, observe,
+      p3: input.toolBinding !== undefined,
+      goalMode: input.goalMode ?? 'answer',
+      ...(input.toolBinding ? { toolBinding: input.toolBinding } : {}),
+      toolRequests: new Map(), modelCallUsages: [], attemptsAtCallStart: 0, totalOutputBytes: 0,
       callSequence: 0, turnOrdinal: 0, attempts: 0, responseStatus: null,
       responseStarted: false, complete: false, wireMaxTokens: null,
       text: '', textBytes: 0, assistantContentBytes: 0, failure: null,
@@ -612,11 +927,12 @@ export class PiAgentAdapter implements AgentPort {
         });
       }
     });
+    const unsubscribeAgent = session.agent.subscribe((event, eventSignal) => this.observeAgentEvent(record, active, event, eventSignal));
     const onAbort = () => this.stop(record, active);
     signal.addEventListener('abort', onAbort, { once: true });
     let promptSettled = false;
     try {
-      const prompt = session.prompt(input.text, { expandPromptTemplates: false });
+      const prompt = session.prompt(executionPrompt(input), { expandPromptTemplates: false });
       try { await prompt; } finally { promptSettled = true; }
       await Promise.all([...active.streams]);
       await active.abortPromise;
@@ -630,13 +946,18 @@ export class PiAgentAdapter implements AgentPort {
       try { unsubscribe(); } catch {
         active.failure ??= appError('agent_cleanup_failed', 'runtime', 'Agent 事件订阅清理失败。', true);
       }
+      try { unsubscribeAgent(); } catch {
+        active.failure ??= appError('agent_cleanup_failed', 'runtime', 'Agent 工具事件清理失败。', true);
+      }
     }
 
-    const finalMessage = [...session.state.messages].reverse().find((message): message is AssistantMessage => message.role === 'assistant');
+    const finalMessage = active.p3 ? active.finalAssistantMessage
+      : [...session.state.messages].reverse().find((message): message is AssistantMessage => message.role === 'assistant');
     if (finalMessage && active.textBytes === 0) {
       const bounded = appendUtf8('', textFrom(finalMessage), 0);
       active.text = bounded.text;
       active.textBytes = bounded.bytes;
+      if (active.p3) active.totalOutputBytes += bounded.bytes;
     }
     if (!active.failure && (signal.aborted || finalMessage?.stopReason === 'aborted')) {
       active.failure = appError('agent_cancelled', 'runtime', 'Agent 执行已取消。');
@@ -652,7 +973,9 @@ export class PiAgentAdapter implements AgentPort {
     if (!stopped) active.failure ??= appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true);
     if (active.promptEntered && active.failure) record.unusable = true;
     const messageForUsage = finalMessage ?? systemError(active.failure ?? appError('agent_execution_failed', 'runtime', 'Agent 执行失败。'), model);
-    const usage = normalizeUsage(messageForUsage, { attempts: active.attempts, complete: active.complete && stopped }, record.config.connection === undefined);
+    const usage = active.p3
+      ? aggregateUsage(active.modelCallUsages, active.attempts, active.complete && stopped, now().at)
+      : normalizeUsage(messageForUsage, { attempts: active.attempts, complete: active.complete && stopped }, record.config.connection === undefined);
     const end = now();
     this.observe(active, 'native_terminal', { stopReason: active.stopReason, responseId: finalMessage?.responseId ?? null, stopped });
     record.active = undefined;

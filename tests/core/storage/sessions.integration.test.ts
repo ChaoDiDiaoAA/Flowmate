@@ -8,6 +8,9 @@ import { describe, expect, it } from 'bun:test';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 import { createRunRepository } from '../../../packages/core/src/storage/repositories.ts';
 import { normalizeListSessionsRequest, normalizeSessionRunsRequest } from '../../../packages/contracts/src/schemas.ts';
+import type { InputRecordV2, UsageRecordV2 } from '../../../packages/contracts/src/runtime.ts';
+import type { P3AgentConfigFacts } from '../../../packages/contracts/src/ports.ts';
+import type { RunScope } from '../../../packages/contracts/src/tools.ts';
 import type { ProductPaths } from '../../../packages/contracts/src/runtime.ts';
 
 function makePaths(root: string): ProductPaths {
@@ -115,12 +118,52 @@ const legacyColumns = [
 ].join(',');
 
 describe('P2 Session and Agent Run storage', () => {
-  it('migrates a real new database through versions 1 and 2 before exposing repositories', () => withDatabase((paths) => {
+  it('migrates a real new database through versions 1, 2, and 3 before exposing repositories', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }]);
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    opened.data.close();
+  }));
+
+  it('reads version-2 P3 Run facts beside unchanged version-1 P2 records', () => withDatabase((paths) => {
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const { sessions, runs } = opened.data;
+    const session = sessions.create({ nativeSessionId: 'p3-native-session', title: 'P3', at: '2026-09-24T00:00:00.000Z' });
+    expect(session.ok).toBe(true);
+    if (!session.ok) return;
+
+    const p3Agent: P3AgentConfigFacts = {
+      policyVersion: 'p3-invoice-tools-v1', nativeSessionId: 'p3-native-session',
+      systemPrompt: 'P3 fixture', thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
+      maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288,
+      maxModelCalls: 12, maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false,
+    };
+    const p3Input: InputRecordV2 = {
+      version: 2, goal: 'Read invoice', text: 'Invoice INV-1', messageTimestamp: 1_800_000_000_000,
+      workspaceInput: { documentRef: null, job: null, candidate: null },
+    };
+    const p3Usage: UsageRecordV2 = {
+      ...usage, version: 2, calls: [],
+    };
+    const p3Scope: RunScope = {
+      version: 2, allowedTools: ['list_invoice_pages'], allowedDocumentIds: [1],
+      allowedArtifactIds: [2], allowedResourcePaths: [],
+    };
+    const created = runs.createAgent({
+      goal: p3Input.goal, input: p3Input, config: { ...baseConfig, agent: p3Agent }, usage: p3Usage,
+      cleanup, createdAt: '2026-09-24T00:01:00.000Z', sessionId: session.data.sessionId, scope: p3Scope,
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runs.get(created.data)).toMatchObject({
+      ok: true,
+      data: { input: { version: 2, workspaceInput: { documentRef: null } }, usage: { version: 2, calls: [] },
+        config: { agent: { policyVersion: 'p3-invoice-tools-v1', maxToolCalls: 24 } }, scope: p3Scope },
+    });
     opened.data.close();
   }));
 
@@ -299,12 +342,12 @@ describe('P2 Session and Agent Run storage', () => {
     expect(prepared).toMatchObject({ ok: true, data: { sessionId: secondSession.data.sessionId, status: 'archived' } });
     expect(sessions.get(firstSession.data.sessionId)).toMatchObject({ ok: true, data: { status: 'active' } });
     db.exec("CREATE TRIGGER block_second_session_delete BEFORE DELETE ON sessions WHEN OLD.id=(SELECT id FROM sessions WHERE title='Two') BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;");
-    expect(sessions.delete(secondSession.data.sessionId)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(sessions.delete(secondSession.data.sessionId, '2026-09-24T00:06:30.000Z')).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(sessions.get(secondSession.data.sessionId)).toMatchObject({ ok: true, data: { status: 'archived' } });
     expect(runs.get(firstRun.data)).toMatchObject({ ok: true, data: { kind: 'agent' } });
     expect(runs.get(secondRun.data)).toMatchObject({ ok: true, data: { kind: 'agent' } });
     db.exec('DROP TRIGGER block_second_session_delete;');
-    expect(sessions.delete(secondSession.data.sessionId)).toEqual({ ok: true, data: undefined });
+    expect(sessions.delete(secondSession.data.sessionId, '2026-09-24T00:07:00.000Z')).toEqual({ ok: true, data: undefined });
     expect(sessions.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: firstSession.data.sessionId, status: 'active' }] } });
     expect(runs.get(firstRun.data)).toMatchObject({ ok: true, data: { kind: 'agent', status: 'failed', sessionId: firstSession.data.sessionId } });
     expect(runs.get(secondRun.data)).toMatchObject({ ok: false, error: { code: 'run_not_found' } });

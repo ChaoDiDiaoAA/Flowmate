@@ -9,6 +9,8 @@
         "@earendil-works/pi-coding-agent": "0.85.1",
         "@flowmate/contracts": "workspace:*",
         "@flowmate/core": "workspace:*",
+        "@flowmate/data": "workspace:*",
+        "@flowmate/employee-invoice": "workspace:*",
         "@flowmate/logging": "workspace:*",
         "@flowmate/runtime-pi": "workspace:*",
         "@flowmate/shared": "workspace:*",
@@ -65,6 +67,20 @@
       "name": "@flowmate/core",
       "dependencies": {
         "@flowmate/contracts": "workspace:*",
+        "@flowmate/shared": "workspace:*",
+      },
+    },
+    "packages/data": {
+      "name": "@flowmate/data",
+      "dependencies": {
+        "@flowmate/contracts": "workspace:*",
+      },
+    },
+    "packages/employee-invoice": {
+      "name": "@flowmate/employee-invoice",
+      "dependencies": {
+        "@flowmate/contracts": "workspace:*",
+        "@flowmate/data": "workspace:*",
         "@flowmate/shared": "workspace:*",
       },
     },
@@ -256,6 +272,10 @@
     "@flowmate/contracts": ["@flowmate/contracts@workspace:packages/contracts"],
 
     "@flowmate/core": ["@flowmate/core@workspace:packages/core"],
+
+    "@flowmate/data": ["@flowmate/data@workspace:packages/data"],
+
+    "@flowmate/employee-invoice": ["@flowmate/employee-invoice@workspace:packages/employee-invoice"],
 
     "@flowmate/logging": ["@flowmate/logging@workspace:packages/logging"],
 
