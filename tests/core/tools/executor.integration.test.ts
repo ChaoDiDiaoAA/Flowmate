@@ -8,7 +8,6 @@ import { deferCleanup } from '../../support/resources.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 import { createToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
-import { ToolRegistry } from '../../../packages/core/src/tools/registry.ts';
 
 function makeRuntime(names: string[], options: { maxToolCalls?: number; maxResultBytes?: number } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-tool-executor-'));
@@ -28,9 +27,8 @@ function makeRuntime(names: string[], options: { maxToolCalls?: number; maxResul
   const definitions: ToolDefinition<any, any>[] = names.map((name) => ({ name, version: '1', description: `Fixture ${name}`,
     inputSchema: z.object({ value: z.number().int() }).strict(), outputSchema: z.object({ value: z.number().int() }).strict(),
     effect: 'READ', executionMode: 'parallel', execute: async ({ value }) => ({ value }) }));
-  const registry = new ToolRegistry(definitions);
   const recorder = createToolRecorder(opened.data.toolCalls, () => at);
-  const executor = createToolExecutor({ registry, recorder, now: () => at, ...options });
+  const executor = createToolExecutor({ definitions, recorder, now: () => at, ...options });
   const context = (nativeToolCallId: string, signal = new AbortController().signal): ToolExecutionContext => ({
     runId: 1, sessionId: session.data.sessionId, nativeToolCallId, scope, signal,
   });
@@ -38,12 +36,24 @@ function makeRuntime(names: string[], options: { maxToolCalls?: number; maxResul
 }
 
 describe('P3 Tool Executor', () => {
+  it('validates and freezes the assembled definition list', () => {
+    const store = makeRuntime(['read_fixture']);
+    const definition = store.executor.listTools()[0]!;
+    const recorder = createToolRecorder(store.toolCalls, () => store.at);
+    const assemble = (definitions: ToolDefinition<any, any>[]) => createToolExecutor({ definitions, recorder, now: () => store.at });
+    expect(() => assemble([definition, definition])).toThrow('tool_name_duplicate');
+    expect(() => assemble([{ ...definition, version: '' }])).toThrow('tool_definition_invalid');
+    expect(() => assemble([{ ...definition, execute: undefined as never }])).toThrow('tool_definition_invalid');
+    expect(Object.isFrozen(store.executor.listTools())).toBe(true);
+    expect(Object.isFrozen(definition)).toBe(true);
+  });
+
   it('validates before business execution, scopes names, records once, and returns the original result for duplicate IDs', async () => {
     let executions = 0;
     const store = makeRuntime(['read_fixture']);
     const definition = store.executor.listTools()[0]!;
-    const registry = new ToolRegistry([{ ...definition, execute: async ({ value }) => { executions += 1; return { value }; } }]);
-    const executor = createToolExecutor({ registry, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    const definitions: ToolDefinition<any, any>[] = [{ ...definition, execute: async ({ value }) => { executions += 1; return { value }; } }];
+    const executor = createToolExecutor({ definitions, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
     const input = { value: 4 };
     const first = await executor.execute('read_fixture', input, store.context('call-1'));
     const duplicate = await executor.execute('read_fixture', input, store.context('call-1'));
@@ -69,14 +79,14 @@ describe('P3 Tool Executor', () => {
     let release!: () => void;
     const barrier = new Promise<void>((resolve) => { release = resolve; });
     const definition = store.executor.listTools()[0]!;
-    const registry = new ToolRegistry([{ ...definition, execute: async ({ value }, call, context) => {
+    const definitions: ToolDefinition<any, any>[] = [{ ...definition, execute: async ({ value }, call, context) => {
       active += 1;
       maximum = Math.max(maximum, active);
       await barrier;
       active -= 1;
       return { value, callId: call.nativeToolCallId, runId: context.runId };
-    }, outputSchema: z.object({ value: z.number().int(), callId: z.string(), runId: z.number().int() }).strict() }]);
-    const executor = createToolExecutor({ registry, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at,
+    }, outputSchema: z.object({ value: z.number().int(), callId: z.string(), runId: z.number().int() }).strict() }];
+    const executor = createToolExecutor({ definitions, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at,
       maxToolCalls: 2 });
     const left = executor.execute('read_fixture', { value: 1 }, store.context('call-left'));
     const right = executor.execute('read_fixture', { value: 2 }, store.context('call-right'));
@@ -100,8 +110,8 @@ describe('P3 Tool Executor', () => {
     let release!: () => void;
     const didStart = new Promise<void>((resolve) => { started = resolve; });
     const work = new Promise<{ value: number }>((resolve) => { release = () => resolve({ value: 9 }); });
-    const registry = new ToolRegistry([{ ...base, execute: async () => { started(); return work; } }]);
-    const executor = createToolExecutor({ registry, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    const definitions: ToolDefinition<any, any>[] = [{ ...base, execute: async () => { started(); return work; } }];
+    const executor = createToolExecutor({ definitions, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
     const controller = new AbortController();
     let settled = false;
     const execution = executor.execute('read_fixture', { value: 1 }, store.context('call-cancel', controller.signal)).finally(() => { settled = true; });
@@ -119,8 +129,8 @@ describe('P3 Tool Executor', () => {
     store.db.exec(`CREATE TRIGGER fail_tool_terminal BEFORE UPDATE OF status ON tool_calls
       WHEN NEW.status='succeeded' BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;`);
     const base = store.executor.listTools()[0]!;
-    const registry = new ToolRegistry([{ ...base, execute: async ({ value }) => { executions += 1; return { value }; } }]);
-    const executor = createToolExecutor({ registry, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    const definitions: ToolDefinition<any, any>[] = [{ ...base, execute: async ({ value }) => { executions += 1; return { value }; } }];
+    const executor = createToolExecutor({ definitions, recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
     const result = await executor.execute('read_fixture', { value: 1 }, store.context('call-store-fail'));
     expect(result).toMatchObject({ fatal: true, result: { status: 'failed', error: { code: 'storage_write_failed' } } });
     expect(executions).toBe(1);

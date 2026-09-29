@@ -1,6 +1,6 @@
 # Flowmate 领域词汇
 
-当前设计以 [产品主方案](docs/spec/00_Flowmate完整方案_v1.md)、[评测主方案](docs/eval/01_Flowmate_Agent评测总方案_v1.md)和[数据制作方案](docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)为准。路线是 Agent Engineering + Invoice Product + Agent Evaluation；核心为 Agent Harness / Runtime，不以完整企业后台为目标。当前工作区已实现 P1–P3 工程能力；P3 受控工程证据已通过，真实模型行为 A20 和正式业务 Benchmark 仍待后续核验，详见 P3 实施计划。
+当前设计以 [产品主方案](docs/spec/00_Flowmate完整方案_v1.md)、[评测主方案](docs/eval/01_Flowmate_Agent评测总方案_v1.md)和[数据制作方案](docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)为准。路线是 Agent Engineering + Invoice Product + Agent Evaluation；核心为 Agent Harness / Runtime，不以完整企业后台为目标。当前工作区已实现 P3 工程能力；P3 唯一正式发票输入目录为 `data/invoices/agent-input/`，Agent 只读取既有解析，原图仅供 UI 查看。旧连接的真实模型 A20 行为证据已记录；新模型配置和正式业务 Benchmark 尚需单独核验，详见 P3 实施计划。
 
 | 词汇 | 定义与边界 |
 |---|---|

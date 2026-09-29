@@ -4,7 +4,7 @@ import type { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import { appError, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, ok } from '@flowmate/contracts';
 import type { AgentConfigFacts, AgentNativeOutcome, AgentPort, P3AgentConfigFacts, PreparedAgent, ProviderConfig, ProviderPort, SafeConfigSnapshot } from '@flowmate/contracts';
-import { createToolExecutor, createToolRecorder, JobService, makeApplication, RuntimeService, SessionService, ToolRegistry, WorkspaceService } from '@flowmate/core';
+import { createToolExecutor, createToolRecorder, JobService, makeApplication, RuntimeService, SessionService, WorkspaceService } from '@flowmate/core';
 import type { RuntimeServicePort } from '@flowmate/core';
 import { openTestDatabase } from '../../support/database.ts';
 import { mkdtempSync } from '../../support/resources.ts';
@@ -28,11 +28,11 @@ function seedDocument(db: { db: Database }) {
   db.db.query(`INSERT INTO artifacts(id,kind,relative_path,bytes,mime_type,metadata_json,created_at) VALUES
     (1,'original','artifacts/1/original.png',1,'image/png',?,'${now()}'),
     (2,'parsed','artifacts/2/parsed.json',1,'application/json',?,'${now()}')`).run(artifactMetadata, artifactMetadata);
-  const metadata = JSON.stringify({ version: 1, pageCount: 1, parserConfiguration: 'v1', warnings: [],
+  const metadata = JSON.stringify({ version: 2, pageCount: 1, warnings: [],
     allowedUsesClaim: ['synthetic test'], licenseVerification: 'not_verified', unavailableReason: null });
   db.db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
-    parser_name,parser_version,status,metadata_json,created_at,updated_at)
-    VALUES (1,'synthetic','invoice-1','v1',1,2,'fixture','1','available',?,?,?)`).run(metadata, now(), now());
+    status,metadata_json,created_at,updated_at)
+    VALUES (1,'synthetic','invoice-1','v1',1,2,'available',?,?,?)`).run(metadata, now(), now());
 }
 
 function preparedP2Agent(onPrepare: () => void, onExecute: () => void): AgentPort {
@@ -152,7 +152,7 @@ describe('P3 Workspace and Run admission', () => {
     let preparations = 0;
     let executes = 0;
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executes += 1; });
-    const tools = createToolExecutor({ registry: new ToolRegistry(), recorder: createToolRecorder(opened.data.toolCalls, now), now });
+    const tools = createToolExecutor({ definitions: [], recorder: createToolRecorder(opened.data.toolCalls, now), now });
     const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, agent, provider, tools,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const stale = { revision: current.data.revision - 1, documentRef: current.data.documentRef, jobId: current.data.jobId,
@@ -197,7 +197,7 @@ describe('P3 Workspace and Run admission', () => {
     let executionStarted!: () => void;
     const started = new Promise<void>((resolve) => { executionStarted = resolve; });
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executions += 1; executionStarted(); });
-    const toolExecutor = createToolExecutor({ registry: new ToolRegistry(),
+    const toolExecutor = createToolExecutor({ definitions: [],
       recorder: createToolRecorder(opened.data.toolCalls, now), isSessionModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId), now });
     const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, agent, provider, tools: toolExecutor,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
@@ -240,6 +240,8 @@ describe('P3 Workspace and Run admission', () => {
     expect(admission('document', 'answer').scope.allowedTools).toEqual(documentTools);
     expect(admission('job', 'answer').scope.allowedTools).toEqual(jobTools);
     expect(admission('job', 'save-candidate').scope.allowedTools).toEqual([...jobTools, 'save_invoice_candidate']);
+    expect(admission('document', 'answer').scope.allowedArtifactIds).toEqual([2]);
+    expect(admission('job', 'save-candidate').scope.allowedArtifactIds).toEqual([2]);
   });
 });
 

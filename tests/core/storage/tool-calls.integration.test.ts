@@ -31,8 +31,8 @@ function addRunningInvoiceJob(store: ReturnType<typeof makeStore>) {
     (1,'original','documents/1/original.pdf',1,'application/pdf','{}',?),
     (2,'parsed','documents/1/parsed.json',1,'application/json','{}',?)`).run(store.stamp, store.stamp);
   store.db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
-    parser_name,parser_version,status,metadata_json,created_at,updated_at) VALUES
-    (1,'fixture','doc-1','v1',1,2,'fixture','1','available','{}',?,?)`).run(store.stamp, store.stamp);
+    status,metadata_json,created_at,updated_at) VALUES
+    (1,'fixture','doc-1','v1',1,2,'available','{}',?,?)`).run(store.stamp, store.stamp);
   store.db.query(`INSERT INTO jobs(id,document_id,goal,input_json,status,created_at,updated_at) VALUES
     (4,1,'Review','{}','running',?,?)`).run(store.stamp, store.stamp);
   store.db.query(`UPDATE runs SET job_id=4,scope_json=? WHERE id=?`).run(JSON.stringify({ version: 2,
@@ -106,8 +106,8 @@ describe('ToolCall and business event storage', () => {
       (1,'original','documents/1/original.pdf',1,'application/pdf','{}',?),
       (2,'parsed','documents/1/parsed.json',1,'application/json','{}',?)`).run(store.stamp, store.stamp);
     db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
-      parser_name,parser_version,status,metadata_json,created_at,updated_at) VALUES
-      (1,'fixture','doc-1','v1',1,2,'fixture','1','available','{}',?,?)`).run(store.stamp, store.stamp);
+      status,metadata_json,created_at,updated_at) VALUES
+      (1,'fixture','doc-1','v1',1,2,'available','{}',?,?)`).run(store.stamp, store.stamp);
     db.query(`INSERT INTO jobs(id,document_id,goal,input_json,status,created_at,updated_at) VALUES
       (4,1,'Review','{}','pending',?,?)`).run(store.stamp, store.stamp);
     db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,result,safe_summary,error_code)
@@ -157,14 +157,14 @@ describe('ToolCall and business event storage', () => {
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
   });
 
-  it('proves original evidence reached a later model request before accepting its source reference', () => {
+  it('keeps historical original-evidence ToolCalls readable without making them available to new Runs', () => {
     const store = makeStore();
     store.db.query(`INSERT INTO artifacts(id,kind,relative_path,bytes,mime_type,metadata_json,created_at) VALUES
       (1,'original','documents/1/original.png',1,'image/png','{}',?),
       (2,'parsed','documents/1/parsed.json',1,'application/json','{}',?)`).run(store.stamp, store.stamp);
     store.db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
-      parser_name,parser_version,status,metadata_json,created_at,updated_at) VALUES
-      (1,'fixture','doc-1','v1',1,2,'fixture','1','available','{}',?,?)`).run(store.stamp, store.stamp);
+      status,metadata_json,created_at,updated_at) VALUES
+      (1,'fixture','doc-1','v1',1,2,'available','{}',?,?)`).run(store.stamp, store.stamp);
     const source = { documentId: 1, version: 'v1', artifactId: 1, page: 1, blockId: null, quote: null };
     const call = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId,
       nativeToolCallId: 'original-evidence-1', toolName: 'read_invoice_evidence', toolVersion: '1', effect: 'READ',
@@ -179,16 +179,12 @@ describe('ToolCall and business event storage', () => {
         data: { kind: 'original', source, mimeType: 'image/png', bytes: 1 } },
       cleanup: { version: 1, stopReason: 'tool-completed', stopped: true, errors: [] },
       endedAt: store.stamp, stoppedAt: store.stamp }).ok).toBe(true);
-    expect(store.toolCalls.wasOriginalEvidenceDelivered({ sessionId: store.sessionId, source })).toEqual({ ok: true, data: false });
     expect(store.toolCalls.recordDelivery({ toolCallId: call.data.toolCallId, delivery: { version: 1, state: 'message_observed',
       messageObservedAt: store.stamp, includedInCallSequence: 2, requestDispatchedAt: null, error: null } }).ok).toBe(true);
     expect(store.toolCalls.recordDelivery({ toolCallId: call.data.toolCallId, delivery: { version: 1, state: 'request_observed',
       messageObservedAt: store.stamp, includedInCallSequence: 2, requestDispatchedAt: store.stamp, error: null } }).ok).toBe(true);
-    expect(store.toolCalls.wasOriginalEvidenceDelivered({ sessionId: store.sessionId, source })).toEqual({ ok: true, data: true });
-    expect(store.toolCalls.wasOriginalEvidenceDelivered({ sessionId: store.sessionId,
-      source: { ...source, quote: 'INV-123' } })).toEqual({ ok: true, data: true });
-    expect(store.toolCalls.wasOriginalEvidenceDelivered({ sessionId: store.sessionId,
-      source: { ...source, version: 'v2' } })).toEqual({ ok: true, data: false });
-    expect(store.toolCalls.wasOriginalEvidenceDelivered({ sessionId: store.sessionId + 1, source })).toEqual({ ok: true, data: false });
+    expect(store.toolCalls.get({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'original-evidence-1' }))
+      .toMatchObject({ ok: true, data: { result: { status: 'succeeded', data: { kind: 'original', source } },
+        delivery: { state: 'request_observed', includedInCallSequence: 2 } } });
   });
 });

@@ -66,8 +66,78 @@ function createVersion2Database(paths: ReturnType<typeof makePaths>) {
   db.close();
 }
 
+function createVersion3InvoiceDatabase(paths: ReturnType<typeof makePaths>) {
+  createVersion2Database(paths);
+  const db = new Database(paths.databaseFile);
+  db.exec('PRAGMA foreign_keys=ON;');
+  db.exec(readFileSync(new URL('../../../packages/core/src/storage/migrations/003_invoice_tools.sql', import.meta.url), 'utf8'));
+  const stamp = '2026-09-28T00:00:00.000Z';
+  db.query(`INSERT INTO artifacts(id,kind,relative_path,bytes,mime_type,metadata_json,created_at) VALUES
+    (41,'original','artifacts/41/original.png',1,'image/png','{}',?),
+    (42,'parsed','artifacts/42/parsed.json',1,'application/json','{}',?)`).run(stamp, stamp);
+  const metadata = JSON.stringify({ version: 1, pageCount: 1, parserConfiguration: 'legacy-private-setting',
+    warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'not_verified', unavailableReason: null });
+  db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
+    parser_name,parser_version,status,metadata_json,created_at,updated_at)
+    VALUES (43,'voxel51','legacy-invoice','legacy-v1',41,42,'legacy-parser','1','available',?,?,?)`).run(metadata, stamp, stamp);
+  db.query(`INSERT INTO jobs(id,document_id,goal,input_json,status,created_at,updated_at)
+    VALUES (44,43,'Review','{}','pending',?,?)`).run(stamp, stamp);
+  db.close();
+}
+
 describe('P3 invoice storage migration', () => {
-  it('migrates schema 2 to 3 without changing existing Provider, Agent, or Session facts', () => {
+  it('removes legacy parser fields while preserving document identity and job references', () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-parser-migration-'));
+    const paths = makePaths(root);
+    createVersion3InvoiceDatabase(paths);
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    deferCleanup(() => opened.data.close());
+    const db = opened.data.db;
+    expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 },
+    ]);
+    expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
+      .not.toContain('parser_name');
+    expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
+      .not.toContain('parser_version');
+    expect(db.query('SELECT id,document_id FROM jobs WHERE id=44').get()).toEqual({ id: 44, document_id: 43 });
+    expect(opened.data.documents.get(43)).toMatchObject({ ok: true,
+      data: { documentRef: { id: 43, version: 'legacy-v1' }, pageCount: 1, displayName: 'Invoice imported Sep 28, 2026' } });
+    expect(opened.data.documents.get(43)).not.toHaveProperty('data.parser');
+    const row = db.query('SELECT metadata_json FROM documents WHERE id=43').get() as { metadata_json: string };
+    expect(JSON.parse(row.metadata_json)).toEqual({ version: 2, pageCount: 1,
+      warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'not_verified', unavailableReason: null });
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
+  it('rolls back migration 004 if a legacy document cannot be updated', () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-parser-migration-failure-'));
+    const paths = makePaths(root);
+    createVersion3InvoiceDatabase(paths);
+    const db = new Database(paths.databaseFile);
+    db.exec("CREATE TRIGGER reject_004 BEFORE UPDATE ON documents BEGIN SELECT RAISE(ABORT,'blocked'); END;");
+    expect(db.query('SELECT COUNT(*) AS count FROM documents').get()).toEqual({ count: 1 });
+    expect(() => db.exec('UPDATE documents SET metadata_json=metadata_json WHERE id=43')).toThrow();
+    db.close();
+    const attempted = openDatabase(paths);
+    if (attempted.ok) {
+      attempted.data.close();
+    }
+    expect(attempted).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+    const after = new Database(paths.databaseFile);
+    expect(after.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
+      { version: 1 }, { version: 2 }, { version: 3 },
+    ]);
+    expect((after.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
+      .toContain('parser_name');
+    expect((after.query('SELECT metadata_json FROM documents WHERE id=43').get() as { metadata_json: string }).metadata_json)
+      .toContain('legacy-private-setting');
+    expect(after.query('SELECT id,document_id FROM jobs WHERE id=44').get()).toEqual({ id: 44, document_id: 43 });
+    after.close();
+  });
+  it('migrates schema 2 through 5 without changing existing Provider, Agent, or Session facts', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-migration-'));
     const paths = makePaths(root);
     createVersion2Database(paths);
@@ -81,13 +151,15 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 },
     ]);
+    expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
+      .not.toContain('parser_name');
     expect(db.query(`SELECT ${legacyRunColumns} FROM runs ORDER BY id`).all()).toEqual(oldRows);
     expect(db.query('SELECT job_id FROM runs ORDER BY id').all()).toEqual([{ job_id: null }, { job_id: null }]);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
-      .toHaveLength(10);
+      .toHaveLength(12);
     expect(db.query('PRAGMA table_info(runs)').all()).toHaveLength(25);
     expect(db.query('SELECT metadata_json FROM sessions WHERE id=7').get()).toEqual({
       metadata_json: '{"version":1,"model_use_blocked":null}',
@@ -126,8 +198,8 @@ describe('P3 invoice storage migration', () => {
       documentId: 1, sourceKey: 'voxel51', sourceRecordId: 'fixture-1', version: 'source-v1',
       originalArtifact: { artifactId: 1, kind: 'original' as const, relativePath: 'documents/1/original.pdf', bytes: 10, mimeType: 'application/pdf', metadata, createdAt: '2026-09-28T00:00:00.000Z' },
       parsedArtifact: { artifactId: 2, kind: 'parsed' as const, relativePath: 'documents/1/parsed.json', bytes: 12, mimeType: 'application/json', metadata, createdAt: '2026-09-28T00:00:00.000Z' },
-      parserName: 'voxel51', parserVersion: '1', status: 'available' as const,
-      metadata: { version: 1 as const, pageCount: 1, parserConfiguration: '{}', warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'unverified', unavailableReason: null },
+      status: 'available' as const,
+      metadata: { version: 2 as const, pageCount: 1, warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'unverified', unavailableReason: null },
       createdAt: '2026-09-28T00:00:00.000Z', updatedAt: '2026-09-28T00:00:00.000Z',
     };
     const registered = opened.data.documents.register(input);
@@ -212,6 +284,22 @@ describe('P3 invoice storage migration', () => {
       .toMatchObject({ ok: true, data: { workspace: { revision: 5, candidateRef: { id: 300 } } } });
     expect(opened.data.db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_selected'").get())
       .toEqual({ count: 1 });
+    opened.data.db.query(`INSERT INTO runs(id,kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+      VALUES (101,'agent',?,1,'{}','created','active fixture','{}','{}','{}','{}','2026-09-28T00:01:12.000Z')`)
+      .run(selectedSession.data.sessionId);
+    expect(opened.data.jobs.hide(1, '2026-09-28T00:01:12.000Z'))
+      .toMatchObject({ ok: false, error: { code: 'run_state_invalid' } });
+    opened.data.db.query('DELETE FROM runs WHERE id=101').run();
+    expect(opened.data.jobs.hide(1, '2026-09-28T00:01:13.000Z'))
+      .toMatchObject({ ok: true, data: { jobId: 1 } });
+    expect(opened.data.jobs.list({ limit: 20 })).toMatchObject({ ok: true, data: { items: [] } });
+    expect(opened.data.jobs.get(1)).toMatchObject({ ok: true, data: { jobId: 1 } });
+    expect(opened.data.workspace.read('2026-09-28T00:01:14.000Z'))
+      .toMatchObject({ ok: true, data: { jobId: null, candidateRef: null, revision: 6 } });
+    expect(opened.data.db.query('SELECT COUNT(*) AS count FROM invoice_candidates WHERE job_id=1').get())
+      .toEqual({ count: 1 });
+    expect(opened.data.db.query('SELECT COUNT(*) AS count FROM business_events WHERE job_id=1').get())
+      .toEqual({ count: 2 });
   });
 
   it('repairs interrupted invoice work atomically and preserves business history when deleting Sessions', () => {
@@ -230,8 +318,8 @@ describe('P3 invoice storage migration', () => {
         VALUES (1,'original','documents/3/original.pdf',10,'application/pdf','{}','2026-09-28T00:00:00.000Z'),
                (2,'parsed','documents/3/parsed.json',10,'application/json','{}','2026-09-28T00:00:00.000Z');
       INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
-        parser_name,parser_version,status,metadata_json,created_at,updated_at)
-        VALUES (3,'voxel51','fixture','v1',1,2,'fixture','1','available','{}','2026-09-28T00:00:00.000Z','2026-09-28T00:00:00.000Z');
+        status,metadata_json,created_at,updated_at)
+        VALUES (3,'voxel51','fixture','v1',1,2,'available','{}','2026-09-28T00:00:00.000Z','2026-09-28T00:00:00.000Z');
       INSERT INTO jobs(id,document_id,goal,input_json,status,created_at,updated_at)
         VALUES (4,3,'review fixture','{}','running','2026-09-28T00:00:00.000Z','2026-09-28T00:00:00.000Z');
       INSERT INTO runs(id,kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,tool_call_count,created_at,started_at)

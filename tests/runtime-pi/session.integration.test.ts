@@ -4,10 +4,10 @@ import { join } from 'node:path';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it } from 'bun:test';
 import { AgentSession, ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { INVOICE_CHAT_GOAL, ok } from '@flowmate/contracts';
+import { INVOICE_CHAT_GOAL, appError, fail, ok } from '@flowmate/contracts';
 import type { AgentToolBinding, PromptTraceBuffer, ToolDefinition } from '@flowmate/contracts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
-import type { AgentExecutionInput, NativeObservation } from '../../packages/contracts/src/ports.ts';
+import type { AgentExecutionInput, AgentObservation } from '../../packages/contracts/src/ports.ts';
 import type { ProviderConfig } from '../../packages/contracts/src/runtime.ts';
 import { z } from 'zod';
 
@@ -100,11 +100,51 @@ const config: ProviderConfig = {
   revision: 1,
   modelRef: { provider: 'flowmate-agent-fixture', model: 'invoice-fixture' },
   native: { authPath: join(tmpdir(), 'flowmate-no-auth.json'), modelsPath: null },
-  connection: { baseUrl: endpoint, api: 'openai-completions' },
+  connection: { baseUrl: endpoint, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
   parameters: { maxRetries: 0, maxRetryDelayMs: 1000 },
 };
 
 describe('PiAgentAdapter', () => {
+  it('restores the native message history after a process boundary', async () => {
+    const app = await fixture();
+    const created = app.adapter.createSession();
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const nativeId = created.data.nativeSessionId;
+    let saved = app.adapter.exportSession(nativeId);
+    expect(saved.ok).toBe(true);
+    expect(app.adapter.watchSession(nativeId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
+    const first = await app.adapter.prepare(nativeId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect((await first.data.execute(input(101, 201, 'Invoice total is 1060.'), new AbortController().signal, () => undefined)).error).toBeNull();
+    expect(saved.ok && saved.data.entries.length > 1).toBe(true);
+    expect((await app.adapter.releaseSession(nativeId)).closed).toBe(true);
+    if (!saved.ok) return;
+    expect(app.adapter.restoreSession(nativeId, saved.data)).toEqual(ok(undefined));
+    expect(app.adapter.watchSession(nativeId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
+    const second = await app.adapter.prepare(nativeId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect((await second.data.execute(input(102, 201, 'What was the total?'), new AbortController().signal, () => undefined)).error).toBeNull();
+    expect(JSON.stringify(app.requests[1]?.body.messages)).toContain('Invoice total is 1060.');
+    expect(app.adapter.inspect(nativeId).availability).toBe('ready');
+  });
+  it('blocks later sends when native history cannot be saved', async () => {
+    const app = await fixture();
+    const created = app.adapter.createSession();
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const nativeId = created.data.nativeSessionId;
+    expect(app.adapter.watchSession(nativeId, () => fail(appError('storage_write_failed', 'storage', 'Fixture write failed.'))))
+      .toEqual(ok(undefined));
+    const prepared = await app.adapter.prepare(nativeId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
+    expect(prepared).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(app.adapter.inspect(nativeId).availability).toBe('unusable');
+    expect(await app.adapter.prepare(nativeId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal))
+      .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(app.requests).toHaveLength(0);
+  });
   it('executes an authorized tool in P3 and sends its result in the next model request', async () => {
     const replies = [toolCallResponse('p3-call-1', 'probe_read', { value: 7 }), response('The checked value is 7.')];
     const tool: ToolDefinition<{ value: number }, { value: number }> = {
@@ -130,6 +170,9 @@ describe('PiAgentAdapter', () => {
     const created = app.adapter.createSession();
     expect(created.ok).toBe(true);
     if (!created.ok) return;
+    let saved = app.adapter.exportSession(created.data.nativeSessionId);
+    expect(saved.ok).toBe(true);
+    expect(app.adapter.watchSession(created.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
     const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
       { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: ['probe_read'] });
     if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
@@ -144,6 +187,9 @@ describe('PiAgentAdapter', () => {
     expect(outcome.usage.version).toBe(2);
     if (outcome.usage.version === 2) expect(outcome.usage.calls.map((call) => call.callSequence)).toEqual([1, 2]);
     expect(app.requests).toHaveLength(2);
+    const systemMessage = app.requests[0]?.body.messages?.find((message) => message.role === 'system');
+    expect(String(systemMessage?.content)).toContain('validate_invoice_candidate is read-only');
+    expect(String(systemMessage?.content)).toContain('save_invoice_candidate');
     expect(app.requests[0]?.body.tools?.some((entry) => JSON.stringify(entry).includes('probe_read'))).toBe(true);
     expect(JSON.stringify(app.requests[1]?.body.messages)).toContain('probe_read');
     expect(JSON.stringify(app.requests[1]?.body.messages)).toContain('7');
@@ -153,6 +199,90 @@ describe('PiAgentAdapter', () => {
       'delivery:p3-call-1:message_observed:',
       'delivery:p3-call-1:request_observed:2',
     ]);
+    if (!saved.ok) return;
+    expect(JSON.stringify(saved.data.entries)).toContain('p3-call-1');
+    expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
+    expect(app.adapter.restoreSession(created.data.nativeSessionId, saved.data)).toEqual(ok(undefined));
+    const changed = await app.adapter.prepare(created.data.nativeSessionId,
+      { ...config, modelRef: { ...config.modelRef, model: 'different-model' } },
+      { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: ['probe_read'] });
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) return;
+    const followup = await changed.data.execute({ ...runInput, runId: 904, text: 'What value did the tool return?',
+      toolBinding: { ...binding, context: { ...binding.context, runId: 904 } } },
+    new AbortController().signal, () => undefined);
+    expect(followup.error).toBeNull();
+    expect(app.requests[2]?.body.model).toBe('different-model');
+    expect(app.requests[2]?.body.tools?.some((entry) => JSON.stringify(entry).includes('probe_read'))).toBe(true);
+    expect(JSON.stringify(app.requests[2]?.body.messages)).toContain('p3-call-1');
+    expect(JSON.stringify(app.requests[2]?.body.messages)).toContain('7');
+    expect(events).toHaveLength(4);
+  });
+
+  it('records an unexposed tool request without executing its business logic', async () => {
+    const tool: ToolDefinition<{ value: number }, { value: number }> = {
+      name: 'probe_read', version: '1', label: 'Read value', description: 'Read a controlled value.',
+      inputSchema: z.object({ value: z.number().int() }).strict(), outputSchema: z.object({ value: z.number().int() }).strict(),
+      effect: 'READ', executionMode: 'parallel', async execute(inputValue) { return inputValue; },
+    };
+    const replies = [toolCallResponse('blocked-call', 'probe_read', { value: 7 }), response('I cannot use that tool.')];
+    const app = await fixture(() => replies.shift() ?? response(), 'fixture-only-key', undefined, [tool]);
+    const created = app.adapter.createSession();
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const denied: string[] = [];
+    let executed = false;
+    const binding: AgentToolBinding = {
+      context: { runId: 905, sessionId: 19, scope: { version: 2, allowedTools: [],
+        allowedDocumentIds: [1], allowedArtifactIds: [2], allowedResourcePaths: [] } },
+      observeRequest: () => ok(undefined),
+      rejectRequest: (_name, _raw, _call, error) => { denied.push(error.code); return ok(undefined); },
+      recordDelivery: () => ok(undefined),
+      async execute() { executed = true; return { result: { status: 'succeeded', data: { value: 7 } }, fatal: false }; },
+    };
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
+      { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: [] });
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const outcome = await prepared.data.execute({ ...input(905, 19, 'Check the value.'),
+      workspaceInput: { documentRef: { id: 1, version: 'v1' }, job: null, candidate: null },
+      goalMode: 'answer', toolBinding: binding }, new AbortController().signal, () => undefined);
+    expect(app.requests[0]?.body.tools ?? []).toEqual([]);
+    expect(denied).toContain('tool_access_denied');
+    expect(executed).toBe(false);
+    expect(outcome.error).toBeNull();
+  });
+
+  it('blocks every P3 dispatch when the final native history contains an image and requires a new Session', async () => {
+    const app = await fixture();
+    const created = app.adapter.createSession();
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
+      { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: [] });
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    const runtime = app.adapter as unknown as { sessions: Map<string, { session?: AgentSession }> };
+    const native = runtime.sessions.get(created.data.nativeSessionId)?.session;
+    expect(native).toBeDefined();
+    if (!native) return;
+    native.state.messages.push({
+      role: 'toolResult', toolCallId: 'legacy-image-result', toolName: 'read_invoice_evidence',
+      content: [{ type: 'image', data: 'aW1hZ2U=', mimeType: 'image/png' }], details: { kind: 'original' },
+      isError: false, timestamp: 1,
+    } as never);
+    const binding: AgentToolBinding = {
+      context: { runId: 903, sessionId: 20, scope: { version: 2, allowedTools: [],
+        allowedDocumentIds: [1], allowedArtifactIds: [2], allowedResourcePaths: [] } },
+      observeRequest: () => ok(undefined), rejectRequest: () => ok(undefined), recordDelivery: () => ok(undefined),
+      execute: async () => ({ result: { status: 'succeeded', data: {} }, fatal: false }),
+    };
+    const outcome = await prepared.data.execute({ ...input(903, 20, 'Continue the prior task.'),
+      workspaceInput: { documentRef: { id: 1, version: 'v1' }, job: null, candidate: null },
+      goalMode: 'answer', toolBinding: binding }, new AbortController().signal, () => undefined);
+    expect(app.requests).toHaveLength(0);
+    expect(outcome.error).toMatchObject({ code: 'agent_image_history_blocked' });
+    expect(outcome.error?.message).toContain('New Session');
+    expect(app.adapter.inspect(created.data.nativeSessionId)).toEqual({ availability: 'unusable' });
   });
 
   it('creates independent native sessions without requests and preserves same-session context', async () => {
@@ -395,7 +525,7 @@ describe('PiAgentAdapter', () => {
     const prepared = await app.adapter.prepare(created.data.nativeSessionId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
-    const observations: NativeObservation[] = [];
+    const observations: AgentObservation[] = [];
     const outcome = await prepared.data.execute(input(1, 601, '不得调用工具'), new AbortController().signal, (event) => observations.push(event));
     expect(outcome.error?.code).toBe('agent_unexpected_tool_call');
     expect(outcome.stopped).toBe(true);
@@ -419,6 +549,38 @@ describe('PiAgentAdapter', () => {
     expect(outcome.error?.category).toBe('provider');
     expect(outcome.stopped).toBe(true);
     expect(app.requests).toHaveLength(1);
+  });
+
+  it('reports a rejected provider response instead of hiding it as a missing P3 final reply', async () => {
+    const app = await fixture(() => new Response(JSON.stringify({ error: { message: 'fixture failure Bearer top-secret sk-abcdefghijklmnopqrstuvwxyz0123456789' } }), {
+      status: 400, headers: { 'content-type': 'application/json' },
+    }));
+    const created = app.adapter.createSession();
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
+      { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: [] });
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const binding: AgentToolBinding = {
+      context: { runId: 702, sessionId: 702, scope: { version: 2, allowedTools: [],
+        allowedDocumentIds: [1], allowedArtifactIds: [2], allowedResourcePaths: [] } },
+      observeRequest: () => ok(undefined), rejectRequest: () => ok(undefined), recordDelivery: () => ok(undefined),
+      execute: async () => ({ result: { status: 'succeeded', data: {} }, fatal: false }),
+    };
+    const runInput: AgentExecutionInput = { ...input(702, 702, '准备发票候选'),
+      workspaceInput: { documentRef: { id: 1, version: 'v1' }, job: null, candidate: null },
+      goalMode: 'answer', toolBinding: binding };
+
+    const outcome = await prepared.data.execute(runInput, new AbortController().signal, () => undefined);
+
+    expect(app.requests).toHaveLength(1);
+    expect(outcome.error).toMatchObject({ code: 'provider_request_rejected', category: 'provider', retryable: false });
+    expect(outcome.error?.message).toContain('HTTP 400');
+    expect(outcome.error?.message).toContain('fixture failure');
+    expect(outcome.error?.message).toContain('Bearer [REDACTED]');
+    expect(outcome.error?.message).not.toContain('top-secret');
+    expect(outcome.error?.message).not.toContain('sk-abcdefghijklmnopqrstuvwxyz0123456789');
   });
 
   it('reports disposal failures and can release the idle session after cleanup recovers', async () => {

@@ -19,7 +19,7 @@ const examples: Record<(typeof INVOICE_TOOL_NAMES)[number], unknown> = {
   read_invoice_document: { documentId: 1, page: 1, afterBlockId: null, limit: 10 },
   search_invoice_document: { documentId: 1, query: 'Tax', page: null, afterBlockId: null, limit: 10 },
   list_invoice_tables: { documentId: 1, page: null, afterBlockId: null, limit: 10 },
-  read_invoice_evidence: { documentId: 1, page: 1, kind: 'original', blockId: null },
+  read_invoice_evidence: { documentId: 1, page: 1, kind: 'parsed', blockId: 'b1' },
   check_invoice_sources: { documentId: 1, sources: [{ documentId: 1, version: 'v1', artifactId: 2, page: 1, blockId: 'b1', quote: 'Invoice' }] },
   normalize_invoice_values: { items: [{ kind: 'date', raw: '01/02/2026' }] },
   calculate_invoice_amounts: { operation: 'sum', values: ['0.1', '0.2'], scale: 2 },
@@ -35,6 +35,7 @@ describe('Pi argument schema conversion', () => {
     for (const name of INVOICE_TOOL_NAMES) {
       const schema = invoiceToolSchemas[name].input;
       const parameters = toPiParameters(schema);
+      expect((parameters as { type?: unknown }).type).toBe('object');
       const piTool = { name, description: name, parameters } as Parameters<typeof validateToolArguments>[0];
       const valid = examples[name];
       expect(schema.safeParse(valid).success).toBe(true);

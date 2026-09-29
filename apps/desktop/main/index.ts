@@ -36,9 +36,15 @@ import { defaultProductSettings, validateProductSettings } from '../../../packag
 import { createCredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import type { CredentialStore, SecureStoragePort } from '../../../packages/shared/src/secure-credential-store.ts';
 import { HostClient } from './host-client.ts';
+import type { HostCredentialRequest } from '../../host/protocol.ts';
 
 const channels = {
   getState: 'flowmate:get-state',
+  listModelCatalog: 'flowmate:list-model-catalog',
+  loginModel: 'flowmate:login-model',
+  logoutModel: 'flowmate:logout-model',
+  replyModelAuth: 'flowmate:reply-model-auth',
+  cancelModelAuth: 'flowmate:cancel-model-auth',
   saveSettings: 'flowmate:save-settings',
   callProvider: 'flowmate:call-provider',
   cancelProvider: 'flowmate:cancel-provider',
@@ -62,6 +68,7 @@ const channels = {
   queryDocument: 'flowmate:query-document',
   listJobs: 'flowmate:list-jobs',
   queryJob: 'flowmate:query-job',
+  hideJob: 'flowmate:hide-job',
   listJobCandidates: 'flowmate:list-job-candidates',
   queryJobCandidate: 'flowmate:query-job-candidate',
   listActivity: 'flowmate:list-activity',
@@ -94,6 +101,7 @@ let appVersion = '0.1.0';
 const host = new HostClient();
 const subscriptions = new Map<number, () => void>();
 const credentialStores = new Map<string, CredentialStore>();
+const piCredentialPrefix = 'pi-credential-v1:';
 
 const systemSecureStorage: SecureStoragePort = {
   async isAvailable() {
@@ -149,6 +157,21 @@ async function bootstrap(): Promise<void> {
   app.setPath('userData', userDataRoot);
   await app.whenReady();
   appVersion = readProductVersion(appRoot);
+  const testInvoiceSourceRoot = !app.isPackaged && process.env.FLOWMATE_TEST_MODE === '1'
+    ? process.env.FLOWMATE_TEST_INVOICE_SOURCE_ROOT : undefined;
+  const invoiceSourceRoot = testInvoiceSourceRoot && isAbsolutePath(testInvoiceSourceRoot)
+    ? testInvoiceSourceRoot : join(appRoot, 'data', 'invoices', 'agent-input');
+  let retiredCredentialRef: string | null = null;
+  try {
+    const old = JSON.parse(readFileSync(join(userDataRoot, 'data', 'settings.json'), 'utf8')) as { version?: unknown; models?: unknown[] };
+    if (old.version === 1 && Array.isArray(old.models)) {
+      const retired = old.models.find((model) => model && typeof model === 'object'
+        && (model as Record<string, unknown>).model === 'deepseek-flash'
+        && (model as Record<string, unknown>).api === 'openai-responses') as { credentialRef?: unknown } | undefined;
+      if (typeof retired?.credentialRef === 'string' && /^[a-zA-Z0-9_-]{16,80}$/.test(retired.credentialRef))
+        retiredCredentialRef = retired.credentialRef;
+    }
+  } catch { /* No legacy settings to clean up. */ }
   host.subscribe((event) => {
     if (event.type === 'host_state' && event.state.host === 'error') {
       hostError = true;
@@ -168,7 +191,12 @@ async function bootstrap(): Promise<void> {
       if (contents && !contents.isDestroyed()) contents.send('flowmate:event', desktopEvent);
     }
   });
-  const started = await host.start(userDataRoot, appVersion, appRoot);
+  host.setCredentialHandler(handleHostCredentialRequest);
+  const started = await host.start(userDataRoot, appVersion, appRoot, invoiceSourceRoot);
+  if (started.ok && started.data.ready && retiredCredentialRef) {
+    const removed = await credentialStore(retiredCredentialRef).remove();
+    if (!removed.ok) process.stderr.write('[Flowmate] A retired encrypted credential could not be deleted.\n');
+  }
   if (!started.ok || !started.data.ready) {
     hostError = true;
     hostErrorCode = started.ok ? 'host_start_failed' : started.error.code;
@@ -254,6 +282,42 @@ function registerIpc(): void {
 
   handle(channels.getState, async () => readDesktopState());
   handle(channels.saveSettings, async (_event, settingsRaw, credentialUpdateRaw) => saveSettings(settingsRaw, credentialUpdateRaw));
+  handle(channels.listModelCatalog, async (_event, providerId, refresh) => {
+    if (providerId !== undefined && (typeof providerId !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(providerId)))
+      return fail(appError('input_invalid', 'input', 'Provider ID is invalid.'));
+    if (refresh !== undefined && typeof refresh !== 'boolean') return fail(appError('input_invalid', 'input', 'Refresh request is invalid.'));
+    return productHostRequest({ type: 'list_model_catalog', ...(providerId === undefined ? {} : { providerId }), refresh: refresh === true },
+      'Pi model catalog is unavailable.', 60_000);
+  });
+  handle(channels.loginModel, async (_event, modelId, authType, requestId) => {
+    if (typeof modelId !== 'string' || !/^[a-zA-Z0-9._-]{1,64}$/.test(modelId)
+      || (authType !== 'api_key' && authType !== 'oauth')
+      || typeof requestId !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(requestId))
+      return fail(appError('input_invalid', 'input', 'Model login request is invalid.'));
+    const result = await productHostRequest<{ configured: true }>({ type: 'login_model', modelId, authType, requestId },
+      'Model login could not complete.', 190_000);
+    if (result.ok) await broadcastState();
+    return result;
+  });
+  handle(channels.logoutModel, async (_event, modelId) => {
+    if (typeof modelId !== 'string' || !/^[a-zA-Z0-9._-]{1,64}$/.test(modelId))
+      return fail(appError('input_invalid', 'input', 'Model ID is invalid.'));
+    const result = await productHostRequest<void>({ type: 'logout_model', modelId }, 'Model logout failed.');
+    if (result.ok) await broadcastState();
+    return result;
+  });
+  handle(channels.replyModelAuth, async (_event, loginRequestId, promptId, value) => {
+    if (typeof loginRequestId !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(loginRequestId)
+      || typeof promptId !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(promptId)
+      || value !== null && (typeof value !== 'string' || value.length > 8192))
+      return fail(appError('input_invalid', 'input', 'Model login response is invalid.'));
+    return productHostRequest({ type: 'auth_reply', loginRequestId, promptId, value }, 'Model login response failed.');
+  });
+  handle(channels.cancelModelAuth, async (_event, loginRequestId) => {
+    if (typeof loginRequestId !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(loginRequestId))
+      return fail(appError('input_invalid', 'input', 'Model login request is invalid.'));
+    return productHostRequest({ type: 'cancel_login', loginRequestId }, 'Model login cancellation failed.');
+  });
   handle(channels.callProvider, async (_event, inputRaw) => callProvider(inputRaw));
   handle(channels.cancelProvider, async (_event, requestIdRaw) => cancelProvider(requestIdRaw));
   handle(channels.queryRun, async (_event, runIdRaw) => queryRun(runIdRaw));
@@ -276,6 +340,7 @@ function registerIpc(): void {
   handle(channels.queryDocument, async (_event, raw) => queryDocument(raw));
   handle(channels.listJobs, async (_event, raw) => listJobs(raw));
   handle(channels.queryJob, async (_event, raw) => queryJob(raw));
+  handle(channels.hideJob, async (_event, raw) => hideJob(raw));
   handle(channels.listJobCandidates, async (_event, raw) => listJobCandidates(raw));
   handle(channels.queryJobCandidate, async (_event, raw) => queryJobCandidate(raw));
   handle(channels.listActivity, async (_event, raw) => listActivity(raw));
@@ -376,17 +441,14 @@ async function callProvider(inputRaw: unknown): Promise<Result<{ requestId: stri
   if (!state.data.ready) return fail(appError(hostErrorCode, 'runtime', 'Bun Host 尚未就绪。', true));
   const model = state.data.settings.models.find((item) => item.id === inputRaw.modelId);
   if (!model) return fail(appError('model_not_configured', 'input', '所选模型配置不存在。'));
-  const store = credentialStore(model.credentialRef);
-  const credential = await store.read();
-  if (!credential.ok) return credential;
-  if (!credential.data) return fail(appError('model_credential_missing', 'input', '请先保存该模型的 API Key。'));
+  if (model.kind !== 'catalog' && state.data.modelCredentials[model.id] !== 'configured')
+    return fail(appError('model_credential_missing', 'input', 'Configure authentication for this model.'));
   const requestId = randomUUID();
   try {
     const value = await host.request({
       type: 'call_provider',
       requestId,
       input: inputRaw,
-      apiKey: credential.data,
     }, 15_000) as Result<{ accepted: boolean; requestId: string; runId: number }>;
     if (!value.ok) return value;
     if (!value.data.accepted || value.data.requestId !== requestId || !Number.isSafeInteger(value.data.runId)) {
@@ -461,6 +523,11 @@ async function queryJob(raw: unknown) {
   return productHostRequest({ type: 'query_job', jobId: raw }, 'Job 查询暂不可用。');
 }
 
+async function hideJob(raw: unknown) {
+  if (!validId(raw)) return fail(appError('input_invalid', 'input', 'Processing record ID is invalid.'));
+  return productHostRequest({ type: 'hide_job', jobId: raw }, 'Processing record could not be removed.');
+}
+
 async function listJobCandidates(raw: unknown) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fail(appError('input_invalid', 'input', 'Candidate 分页参数无效。'));
   const value = raw as Record<string, unknown>;
@@ -498,7 +565,9 @@ async function listActivity(raw: unknown) {
 
 async function chooseAndImportInvoice(): Promise<Result<import('@flowmate/contracts').DocumentSnapshot | null>> {
   if (!mainWindow || mainWindow.isDestroyed()) return fail(appError('desktop_not_ready', 'runtime', '材料选择窗口尚未就绪。', true));
-  const selected = await dialog.showOpenDialog(mainWindow, { title: '选择正式发票材料', properties: ['openDirectory', 'dontAddToRecent'] });
+  const selected = await dialog.showOpenDialog(mainWindow, { title: '选择正式发票材料',
+    defaultPath: join(resolveWorkspaceRoot(app.getAppPath()), 'data', 'invoices', 'agent-input'),
+    properties: ['openDirectory', 'dontAddToRecent'] });
   if (selected.canceled) return { ok: true, data: null };
   const sourceDirectory = selected.filePaths[0];
   if (!sourceDirectory) return fail(appError('input_invalid', 'input', '未选择材料目录。'));
@@ -608,19 +677,15 @@ async function startRun(raw: unknown): Promise<Result<RunAccepted & { requestId:
   if (!state.data.ready) return fail(appError(hostErrorCode, 'runtime', 'Bun Host 尚未就绪。', true));
   const profile = state.data.settings.models.find((item) => item.id === raw.modelId);
   if (!profile) return fail(appError('model_not_configured', 'input', '所选模型配置不存在。'));
-  const store = credentialStore(profile.credentialRef);
-  const credential = await store.read();
-  if (!credential.ok) return credential;
-  if (!credential.data) return fail(appError('model_credential_missing', 'input', '请先保存该模型的 API Key。'));
+  if (profile.kind !== 'catalog' && state.data.modelCredentials[profile.id] !== 'configured')
+    return fail(appError('model_credential_missing', 'input', 'Configure authentication for this model.'));
 
   const requestId = randomUUID();
-  let apiKey = credential.data;
   try {
     const value = await host.request({
       type: 'start_run',
       requestId,
       input: raw,
-      apiKey,
       expectedSettingsRevision: state.data.settings.revision,
       expectedCredentialRef: profile.credentialRef,
     }, 15_000) as Result<RunAccepted & { requestId: string }>;
@@ -631,8 +696,6 @@ async function startRun(raw: unknown): Promise<Result<RunAccepted & { requestId:
     return value;
   } catch {
     return fail(appError('operation_result_unknown', 'runtime', 'Agent Run 受理结果未知。请查询 Session Runs 与 Runtime 状态，不要重新发送。', true));
-  } finally {
-    apiKey = '';
   }
 }
 
@@ -650,13 +713,15 @@ async function queryRuntimeState(): Promise<Result<RuntimeState>> {
 function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunRequest {
   if (!value || typeof value !== 'object') return false;
   const request = value as Partial<DesktopAgentRunRequest>;
-  const workspace = WorkspaceExpectationSchema.safeParse(request.workspace);
+  const workspace = request.workspace === undefined ? null : WorkspaceExpectationSchema.safeParse(request.workspace);
   return Number.isSafeInteger(request.sessionId) && Number(request.sessionId) > 0
     && typeof request.text === 'string' && request.text.trim().length > 0
     && new TextEncoder().encode(request.text).byteLength <= 65_536
     && typeof request.modelId === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(request.modelId)
-    && workspace.success && workspace.data.sessionId === request.sessionId
+    && (workspace === null || workspace.success && workspace.data.sessionId === request.sessionId)
     && (request.goalMode === 'answer' || request.goalMode === 'save-candidate')
+    && (request.goalMode !== 'save-candidate' || workspace?.success === true
+      && workspace.data.documentRef !== null && workspace.data.jobId !== null)
     && (request.timeoutMs === undefined || Number.isInteger(request.timeoutMs) && request.timeoutMs >= 100 && request.timeoutMs <= 120_000);
 }
 
@@ -670,6 +735,33 @@ function credentialStore(reference: string): CredentialStore {
     credentialStores.set(reference, store);
   }
   return store;
+}
+
+async function handleHostCredentialRequest(request: HostCredentialRequest): Promise<{ ok: boolean; credential?: unknown }> {
+  const settings = host.state?.settings as ProductSettings | undefined;
+  if (!settings?.models.some((model) => model.credentialRef === request.credentialRef)) return { ok: false };
+  const store = credentialStore(request.credentialRef);
+  if (request.operation === 'read') {
+    const result = await store.read();
+    if (!result.ok) return { ok: false };
+    if (!result.data) return { ok: true };
+    if (!result.data.startsWith(piCredentialPrefix)) return { ok: true, credential: { type: 'api_key', key: result.data } };
+    try { return { ok: true, credential: JSON.parse(result.data.slice(piCredentialPrefix.length)) as unknown }; }
+    catch { return { ok: false }; }
+  }
+  if (request.operation === 'delete') return { ok: (await store.remove()).ok };
+  if (!validPiCredential(request.credential)) return { ok: false };
+  return { ok: (await store.write(`${piCredentialPrefix}${JSON.stringify(request.credential)}`)).ok };
+}
+
+function validPiCredential(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const credential = value as Record<string, unknown>;
+  if (credential.type === 'api_key' && credential.key !== undefined && typeof credential.key !== 'string') return false;
+  if (credential.type === 'oauth' && (typeof credential.access !== 'string' || typeof credential.refresh !== 'string'
+    || typeof credential.expires !== 'number' || !Number.isFinite(credential.expires))) return false;
+  if (credential.type !== 'api_key' && credential.type !== 'oauth') return false;
+  try { return JSON.stringify(value).length <= 65_536; } catch { return false; }
 }
 
 async function requestHost(command: Parameters<HostClient['request']>[0]): Promise<unknown> {

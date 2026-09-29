@@ -1,10 +1,11 @@
+import { resolve } from 'node:path';
 import { createFileStore, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, makeApplication,
-  RuntimeService, SessionService, ToolRegistry, openDatabase } from '@flowmate/core';
-import { createDocumentService, createEvidenceService } from '@flowmate/data';
-import { CandidateService, createInvoiceTools } from '@flowmate/employee-invoice';
+  RuntimeService, SessionService, openDatabase } from '@flowmate/core';
+import { createDocumentService } from '@flowmate/data';
+import { createInvoiceTools, projectInvoiceDocumentPage } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter } from '@flowmate/runtime-pi';
-import { acquireProductControllerLock, createLogger, resolveProductPaths, resolveWindowsUserData } from '@flowmate/shared';
+import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
 import type { Application, ProductPaths, PromptTraceBuffer, Result } from '@flowmate/contracts';
 import type { AgentPort, ProviderPort, ToolDefinition } from '@flowmate/contracts';
@@ -12,6 +13,7 @@ import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
   paths: ProductPaths;
+  invoiceSourceRoot?: string;
   provider?: ProviderPort;
   agent?: AgentPort;
   agentFactory?: (tools: readonly ToolDefinition<any, any>[]) => AgentPort;
@@ -40,13 +42,12 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   let databaseClosed = false;
   const now = () => new Date().toISOString();
   const files = createFileStore(options.paths, database.data.documents);
-  const documents = createDocumentService({ paths: options.paths, repository: database.data.documents, files, now });
-  const evidence = createEvidenceService({ documents, repository: database.data.documents, files, now,
-    originalWasDelivered: (sessionId, source) => database.data.toolCalls.wasOriginalEvidenceDelivered({ sessionId, source }) });
-  const candidates = new CandidateService({ repository: database.data.candidates, documents, evidence, now });
-  const definitions = createInvoiceTools({ documents, evidence, candidates });
-  const registry = new ToolRegistry(definitions);
-  const toolExecutor = createToolExecutor({ registry, recorder: createToolRecorder(database.data.toolCalls, now),
+  const documents = createDocumentService({ paths: options.paths,
+    allowedSourceRoot: options.invoiceSourceRoot ?? resolve(process.cwd(), 'data', 'invoices', 'agent-input'),
+    repository: database.data.documents, files, now });
+  const definitions = createInvoiceTools({ documents, documentRepository: database.data.documents,
+    candidates: database.data.candidates, now });
+  const toolExecutor = createToolExecutor({ definitions, recorder: createToolRecorder(database.data.toolCalls, now),
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
     monotonicNow: () => performance.now() });
   const provider = options.provider ?? new PiProviderAdapter();
@@ -61,18 +62,6 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     now,
     monotonicNow: () => performance.now(),
     tools: toolExecutor,
-    formatToolResult: async (name, data, context, signal) => {
-      if (name === 'read_invoice_evidence' && typeof data === 'object' && data !== null
-        && 'kind' in data && data.kind === 'original' && 'source' in data) {
-        const delivered = evidence.readForDelivery(data.source as import('@flowmate/contracts').SourceRef, context, signal);
-        if (!delivered.ok) throw delivered.error;
-        return [
-          { type: 'text' as const, text: JSON.stringify(data) },
-          { type: 'image' as const, data: Buffer.from(delivered.data.bytes).toString('base64'), mimeType: delivered.data.mimeType },
-        ];
-      }
-      return [{ type: 'text' as const, text: JSON.stringify(data) }];
-    },
   });
   const sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now);
   const workspaceService = createWorkspaceService(database.data.workspace, now);
@@ -98,19 +87,14 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     candidates: database.data.candidates,
     events: database.data.businessEvents,
     importInvoiceMaterial: (sourceDirectory) => documents.importVoxel51({ sourceDirectory }),
-    readDocumentPage: (input) => documents.readPageForWorkspace(input),
+    readDocumentPage: (input) => {
+      const loaded = documents.readParsedForWorkspace(input.documentId);
+      return loaded.ok ? projectInvoiceDocumentPage(input, loaded.data) : loaded;
+    },
     readDocumentOriginal: (documentId, page) => {
       const image = documents.readOriginalForWorkspace(documentId, page);
       return image.ok ? ok({ documentRef: image.data.documentRef, mimeType: image.data.mimeType,
         base64: Buffer.from(image.data.bytes).toString('base64') }) : image;
     },
   }));
-}
-
-export async function createDefaultApplication(): Promise<Result<Application>> {
-  const userData = resolveWindowsUserData(process.env);
-  if (!userData.ok) return userData;
-  const paths = resolveProductPaths(userData.data);
-  if (!paths.ok) return paths;
-  return createApplication({ paths: paths.data });
 }

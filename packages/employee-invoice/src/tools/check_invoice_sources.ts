@@ -1,0 +1,49 @@
+import { invoiceToolSchemas } from '@flowmate/contracts';
+import type { DocumentRepository, DocumentService, StoredParsedDocument } from '@flowmate/data';
+import type { DocumentSnapshot, InvoiceToolInput, InvoiceToolOutput, ProductToolContext, Result, SourceRef, ToolDefinition } from '@flowmate/contracts';
+import { appError, fail, ok } from '@flowmate/contracts';
+import { unwrap } from './definition.ts';
+
+function denied(context: ProductToolContext) {
+  return fail(appError('tool_access_denied', 'runtime', 'This run cannot access the document.', false, context.runId, context.sessionId));
+}
+
+function checkSource(source: SourceRef, document: DocumentSnapshot, parsed: StoredParsedDocument):
+  { status: 'valid' | 'invalid'; code: 'parsed_quote_matched' | 'reference_mismatch' | 'block_not_found' | 'quote_mismatch' } {
+  if (source.documentId !== document.documentRef.id || source.version !== document.documentRef.version
+    || source.artifactId !== document.parsedArtifactId) return { status: 'invalid', code: 'reference_mismatch' };
+  const page = parsed.pages.find((item) => item.page === source.page);
+  const block = page?.blocks.find((item) => item.id === source.blockId);
+  if (!block) return { status: 'invalid', code: 'block_not_found' };
+  if (!source.quote || !block.text.includes(source.quote)) return { status: 'invalid', code: 'quote_mismatch' };
+  return { status: 'valid', code: 'parsed_quote_matched' };
+}
+
+export function checkInvoiceSourcesResult(input: InvoiceToolInput<'check_invoice_sources'>, context: ProductToolContext,
+  documents: DocumentService, repository: DocumentRepository): Result<InvoiceToolOutput<'check_invoice_sources'>> {
+  if (!context.scope.allowedDocumentIds.includes(input.documentId)) return denied(context);
+  const base = repository.get(input.documentId);
+  if (!base.ok) return base.error.code === 'document_not_found' ? denied(context) : base;
+  if (base.data.status !== 'available') return fail(appError('input_unavailable', 'input', 'The document is currently unavailable.', true, context.runId, context.sessionId));
+  if (!context.scope.allowedArtifactIds.includes(base.data.parsedArtifactId)) return denied(context);
+  if (input.sources.some((source) => source.documentId !== input.documentId
+    || !context.scope.allowedDocumentIds.includes(source.documentId)
+    || source.artifactId !== base.data.parsedArtifactId
+    || !context.scope.allowedArtifactIds.includes(source.artifactId))) return denied(context);
+  const loaded = documents.readParsedForRun(input.documentId, context);
+  if (!loaded.ok) return loaded;
+  return ok({ documentRef: base.data.documentRef,
+    results: input.sources.map((source, index) => ({ index, ...checkSource(source, base.data, loaded.data.parsed) })) });
+}
+
+export const checkInvoiceSources = (documents: DocumentService, repository: DocumentRepository) => ({
+  name: 'check_invoice_sources',
+  version: '1',
+  label: 'Check sources',
+  description: 'Verify candidate sources against the authorized document version, page, block, and quoted text.',
+  inputSchema: invoiceToolSchemas.check_invoice_sources.input,
+  outputSchema: invoiceToolSchemas.check_invoice_sources.output,
+  effect: 'READ',
+  executionMode: 'parallel',
+  execute: async (input, _call, context) => unwrap(checkInvoiceSourcesResult(input, context, documents, repository)),
+} satisfies ToolDefinition<InvoiceToolInput<'check_invoice_sources'>, InvoiceToolOutput<'check_invoice_sources'>>);

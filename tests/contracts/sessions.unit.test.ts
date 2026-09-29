@@ -56,6 +56,12 @@ describe('session and Agent contracts', () => {
       expect(result.data.sessionId).toBe(4);
       expect('goal' in result.data).toBe(false);
     }
+    expect(normalizeAgentRunRequest({ sessionId: 4, text: 'Hello', config, goalMode: 'answer' })).toMatchObject({ ok: true });
+    expect(normalizeAgentRunRequest({ sessionId: 4, text: 'Create a result', config, goalMode: 'save-candidate' }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(normalizeAgentRunRequest({ sessionId: 4, text: 'Create a result', config, goalMode: 'save-candidate',
+      workspace: { revision: 1, documentRef: { id: 2, version: 'v1' }, jobId: null, candidateRef: null, sessionId: 4 } }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
     expect(normalizeAgentRunRequest({ sessionId: 0, text: 'Invoice', config })).toMatchObject({ ok: false });
     expect(normalizeAgentRunRequest({ sessionId: Number.MAX_SAFE_INTEGER + 1, text: 'Invoice', config })).toMatchObject({ ok: false });
     expect(normalizeAgentRunRequest({ sessionId: 4, text: ' \n\t ', config })).toMatchObject({ ok: false });

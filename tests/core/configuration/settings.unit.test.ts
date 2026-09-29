@@ -9,9 +9,14 @@ const model = {
   id: 'model-main',
   credentialRef: 'credential-ref-0001',
   name: 'Primary model',
+  kind: 'custom' as const,
+  providerId: null,
   baseUrl: 'https://llm.example/v1',
   model: 'example-chat',
   api: 'openai-responses' as const,
+  contextWindow: 64_000,
+  maxTokens: 16_000,
+  reasoning: false,
 };
 
 describe('desktop settings', () => {
@@ -46,13 +51,14 @@ describe('desktop settings', () => {
     if (!corrupt.ok) expect(corrupt.error.code).toBe('config_settings_invalid');
   });
 
-  it('drops the retired output-token setting from existing saved profiles on read and next save', async () => {
+  it('does not reuse a retired output-token setting from a legacy profile', async () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
     const file = join(root, 'settings.json');
     const legacy = {
-      ...defaultProductSettings('2026-09-23T00:00:00.000Z'),
+      ...defaultProductSettings('2026-09-23T00:00:00.000Z'), version: 1,
       revision: 3,
-      models: [{ ...model, maxTokens: 2048 }],
+      models: [{ id: model.id, credentialRef: model.credentialRef, name: model.name,
+        baseUrl: model.baseUrl, model: model.model, api: model.api, maxTokens: 2048 }],
       defaultModelId: model.id,
     };
     await writeFile(file, JSON.stringify(legacy), 'utf8');
@@ -60,12 +66,26 @@ describe('desktop settings', () => {
     const loaded = await readProductSettings(file);
     expect(loaded.ok).toBe(true);
     if (!loaded.ok) return;
-    expect(loaded.data.models[0]).not.toHaveProperty('maxTokens');
+    expect(loaded.data.models[0]).toHaveProperty('maxTokens', null);
+    expect(loaded.data.models[0]).toHaveProperty('kind', 'legacy');
 
     const saved = await saveProductSettings(file, loaded.data);
     expect(saved.ok).toBe(true);
     const persisted = JSON.parse(await readFile(file, 'utf8')) as { models: Record<string, unknown>[] };
-    expect(persisted.models[0]).not.toHaveProperty('maxTokens');
+    expect(persisted.models[0]).toHaveProperty('maxTokens', null);
+  });
+
+  it('removes only the retired DeepSeek Responses profile while preserving other legacy routes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
+    const file = join(root, 'settings.json');
+    await writeFile(file, JSON.stringify({ ...defaultProductSettings(), version: 1,
+      models: [{ id: 'old-deepseek', credentialRef: 'old-deepseek-credential', name: 'Old',
+        baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash', api: 'openai-responses' },
+      { id: 'other', credentialRef: 'other-credential-ref', name: 'Other', baseUrl: 'https://other.example/v1',
+        model: 'other-model', api: 'openai-completions' }], defaultModelId: 'old-deepseek' }), 'utf8');
+    const loaded = await readProductSettings(file);
+    expect(loaded).toMatchObject({ ok: true, data: { version: 2, defaultModelId: null,
+      models: [{ id: 'other', kind: 'legacy' }] } });
   });
 
   it('rejects credentials embedded in a model profile', async () => {

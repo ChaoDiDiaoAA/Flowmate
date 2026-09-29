@@ -1,8 +1,14 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelProfile, ProductSettings, PromptTraceResult, RunSnapshot, SessionCursor, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
+import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelAuthNotice, ModelAuthPrompt, ModelCatalogProvider, ModelProfile, ProductSettings, RunSnapshot, SessionCursor, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'tasks' | 'model' | 'profile';
+type Page = 'workspace' | 'tasks' | 'chats' | 'models' | 'connections' | 'settings';
+const pageLabels: Record<Page, string> = {
+  workspace: 'Invoices', tasks: 'Processing History', chats: 'Chats',
+  models: 'Models', connections: 'Connections', settings: 'Settings',
+};
 type Notice = { tone: 'good' | 'bad' | 'info'; message: string } | null;
+type AuthFlow = { requestId: string; notice: ModelAuthNotice | null;
+  prompt: { id: string; value: string; definition: ModelAuthPrompt } | null };
 type ProfileDraft = { displayName: string; theme: 'system' | 'light' | 'dark' };
 type ChatTurn = {
   id: string;
@@ -12,41 +18,54 @@ type ChatTurn = {
   response: string | null;
   error: string | null;
   status: 'sending' | 'completed' | 'failed' | 'cancelled';
+  progress?: string | null;
 };
 
 function newId(): string { return crypto.randomUUID().replaceAll('-', ''); }
+function chatTitle(title: string): string { return title === 'New Session' ? 'New chat' : title; }
 
 function blankModel(): ModelProfile {
-  return { id: newId(), credentialRef: newId(), name: 'Primary model', baseUrl: '', model: '', api: 'openai-responses' };
+  return { id: newId(), credentialRef: newId(), name: 'Primary model', kind: 'catalog', providerId: null,
+    baseUrl: '', model: '', api: '', contextWindow: null, maxTokens: null, reasoning: false };
 }
 
 function errorMessage(value: unknown): string {
   if (value && typeof value === 'object' && 'error' in value) {
-    const error = (value as { error?: { message?: unknown; code?: unknown } }).error;
-    if (error && typeof error.message === 'string') return error.message;
-    if (error && typeof error.code === 'string') return error.code;
+    const error = (value as { error?: { message?: unknown; code?: unknown; category?: unknown } }).error;
+    if (error?.code === 'agent_goal_not_met') return 'No result was saved. Ask the assistant to generate and save a result.';
+    if (error?.code === 'session_scope_revoked') return 'Model access to this invoice was revoked. Start a new chat.';
+    if (error?.code === 'state_conflict') return 'The invoice context changed. Review it and send again.';
+    if (error && typeof error.message === 'string' && !/[\u3400-\u9fff]/u.test(error.message)) return error.message;
+    if (error?.category === 'provider') return 'The model request failed. Check the connection and model settings.';
+    if (error?.category === 'storage') return 'Your changes could not be saved. Please try again.';
+    if (error?.category === 'input') return 'The request is invalid. Check the selected invoice and message.';
+    if (error?.category === 'session') return 'This chat cannot continue. Start a new chat.';
   }
   return 'The operation could not be completed.';
 }
-
-function stringify(value: unknown): string { return JSON.stringify(value, null, 2); }
 
 export function App() {
   const [page, setPage] = useState<Page>('workspace');
   const [state, setState] = useState<DesktopState | null>(null);
   const [draft, setDraft] = useState<ModelProfile>(blankModel);
+  const [catalog, setCatalog] = useState<readonly ModelCatalogProvider[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [providerSearch, setProviderSearch] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
+  const [authFlow, setAuthFlow] = useState<AuthFlow | null>(null);
   const [profileDraft, setProfileDraft] = useState<ProfileDraft>({ displayName: 'Local user', theme: 'system' });
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [goal, setGoal] = useState('Answer the user clearly and directly.');
-  const [text, setText] = useState('');
+  const [text, setText] = useState('Reply with OK.');
   const [chatInput, setChatInput] = useState('');
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [sessions, setSessions] = useState<SessionSnapshot[]>([]);
+  const [sidebarRenameId, setSidebarRenameId] = useState<number | null>(null);
+  const [sidebarRenameTitle, setSidebarRenameTitle] = useState('');
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null);
-  const [confirmedWorkspaceRevision, setConfirmedWorkspaceRevision] = useState<number | null>(null);
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]);
   const [jobs, setJobs] = useState<JobSnapshot[]>([]);
   const [candidateSummaries, setCandidateSummaries] = useState<CandidateSummary[]>([]);
@@ -54,7 +73,7 @@ export function App() {
   const [activity, setActivity] = useState<BusinessEventSnapshot[]>([]);
   const [parsedPage, setParsedPage] = useState<InvoiceToolOutput<'read_invoice_document'> | null>(null);
   const [originalImage, setOriginalImage] = useState<DocumentOriginalImage | null>(null);
-  const [taskGoal, setTaskGoal] = useState('Prepare an invoice candidate from this document.');
+  const [taskGoal, setTaskGoal] = useState('');
   const [goalMode, setGoalMode] = useState<'answer' | 'save-candidate'>('answer');
   const [activeAgentRunId, setActiveAgentRunId] = useState<number | null>(null);
   const [activeAgentSessionId, setActiveAgentSessionId] = useState<number | null>(null);
@@ -64,19 +83,29 @@ export function App() {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionMutating, setSessionMutating] = useState(false);
   const [revokingAccess, setRevokingAccess] = useState(false);
-  const [chatCollapsed, setChatCollapsed] = useState(false);
+  const [chatCollapsed, setChatCollapsed] = useState(() => window.innerWidth < 1080);
+  const [navOpen, setNavOpen] = useState(false);
   const [run, setRun] = useState<RunSnapshot | null>(null);
-  const [promptTrace, setPromptTrace] = useState<PromptTraceResult | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
+  useEffect(() => {
+    let active = true;
+    void window.flowmate.listModelCatalog().then((result) => {
+      if (active && result.ok) setCatalog(result.data);
+    });
+    return () => { active = false; };
+  }, []);
   const latestFinished = useRef<Extract<DesktopEvent, { type: 'provider_finished' }> | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
   const activeChatTurnId = useRef<string | null>(null);
   const activeChatSessionId = useRef<number | null>(null);
+  const chatDrafts = useRef(new Map<string, string>());
+  const chatInputRef = useRef('');
+  const eventSequences = useRef(new Map<number, number>());
   const activeAgentRunIdRef = useRef<number | null>(null);
   const agentStopRequested = useRef(false);
   const selectedSessionIdRef = useRef<number | null>(null);
@@ -86,9 +115,36 @@ export function App() {
   const allowInitialSessionSelection = useRef(true);
   const focusComposerWhenReady = useRef(false);
   const chatComposerRef = useRef<HTMLTextAreaElement | null>(null);
+  const navToggleRef = useRef<HTMLButtonElement | null>(null);
   const latestAgentFinished = useRef(new Map<number, Extract<AgentRunEvent, { type: 'run_finished' }>>());
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
+  const assistantWasToggled = useRef(false);
   const revisionLoaded = useRef<number | null>(null);
+  const authDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    if (authFlow && !authDialogRef.current?.open) authDialogRef.current?.showModal();
+  }, [authFlow]);
+
+  function draftKey(sessionId: number | null): string { return sessionId === null ? 'new' : String(sessionId); }
+
+  function updateChatInput(value: string) {
+    chatInputRef.current = value;
+    chatDrafts.current.set(draftKey(selectedSessionIdRef.current), value);
+    setChatInput(value);
+  }
+
+  function navigate(next: Page) {
+    setPage(next);
+    setNavOpen(false);
+    if (next === 'tasks' && workspace?.jobId) void loadTaskDetails(workspace.jobId);
+  }
+
+  function openChat(sessionId: number) {
+    selectSession(sessionId, true);
+    setNavOpen(false);
+    if (window.innerWidth < 1080) setChatCollapsed(false);
+  }
 
   async function loadSessionList(append = false) {
     const before = append ? sessionCursorRef.current : null;
@@ -97,7 +153,8 @@ export function App() {
     sessionCursorRef.current = result.data.next;
     setSessionCursor(result.data.next);
     setSessions((current) => append ? [...current, ...result.data.items] : result.data.items);
-    if (allowInitialSessionSelection.current && selectedSessionIdRef.current === null && result.data.items[0]) {
+    if (allowInitialSessionSelection.current && selectedSessionIdRef.current === null
+      && !chatDrafts.current.get('new') && result.data.items[0]) {
       selectSession(result.data.items[0].sessionId);
     }
   }
@@ -110,7 +167,6 @@ export function App() {
     }
     workspaceRef.current = snapshot;
     setWorkspace(snapshot);
-    if (previous?.revision !== snapshot.revision || previous?.sessionId !== snapshot.sessionId) setConfirmedWorkspaceRevision(null);
   }
 
   async function loadWorkspace() {
@@ -162,7 +218,7 @@ export function App() {
     const result = await window.flowmate.chooseAndImportInvoice();
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     if (!result.data) return;
-    setNotice({ tone: 'good', message: `Imported document #${result.data.documentRef.id}. Choose it as the Workspace source.` });
+    setNotice({ tone: 'good', message: 'Invoice imported and ready to review.' });
     await loadProductLists();
     await selectWorkspaceDocument(result.data.documentRef.id);
   }
@@ -179,21 +235,32 @@ export function App() {
   }
 
   async function startTask() {
-    const current = workspaceRef.current;
-    if (!current?.documentRef || !current.sessionId || !taskGoal.trim()) return;
+    let current = workspaceRef.current;
+    if (!current?.documentRef) return;
+    if (!current.sessionId) {
+      const created = await createNewSession();
+      if (!created) return;
+      current = workspaceRef.current;
+    }
+    if (!current?.documentRef || !current.sessionId) return;
     const result = await window.flowmate.startTask({
       clientSequence: current.nextTaskSequence,
       expectedRevision: current.revision,
       documentRef: current.documentRef,
-      goal: taskGoal.trim(),
+      goal: `Prepare an invoice candidate from this document.${taskGoal.trim() ? ` Additional requirements: ${taskGoal.trim()}` : ''}`,
     });
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    if (!result.ok) {
+      if (result.error.code === 'state_conflict') await loadWorkspace();
+      setNotice({ tone: 'bad', message: errorMessage(result) });
+      return;
+    }
     acceptWorkspace(result.data.workspace);
     setGoalMode('save-candidate');
-    setNotice({ tone: 'good', message: `Task #${result.data.job.jobId} started. Confirm this Workspace before sending a Run.` });
+    updateChatInput('Generate and save a result for this invoice using its parsed data and source references. Keep missing or ambiguous details explicit.');
+    setChatCollapsed(false);
+    setNotice({ tone: 'good', message: 'Ready to process. Review the request in Assistant, then press Send.' });
     await loadProductLists();
     await loadTaskDetails(result.data.job.jobId);
-    setPage('tasks');
   }
 
   async function loadTaskDetails(jobId: number) {
@@ -224,7 +291,7 @@ export function App() {
     });
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     acceptWorkspace(result.data.workspace);
-    setNotice({ tone: 'good', message: `Candidate #${candidateId} is now the selected Workspace candidate.` });
+    setNotice({ tone: 'good', message: 'Selected result updated.' });
     await loadProductLists();
     await loadTaskDetails(jobId);
   }
@@ -233,8 +300,20 @@ export function App() {
     const snapshot = await changeWorkspace({ kind: 'job', jobId });
     if (!snapshot) return;
     setCandidateDetail(null);
-    setGoalMode('save-candidate');
     await loadTaskDetails(jobId);
+  }
+
+  async function hideProcessing(jobId: number) {
+    if (!window.confirm('Remove this item from Recent processing? Saved results and activity will remain available.')) return;
+    const result = await window.flowmate.hideJob(jobId);
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    if (workspaceRef.current?.jobId === jobId) {
+      setCandidateSummaries([]);
+      setCandidateDetail(null);
+      setActivity([]);
+    }
+    await loadProductOverview();
+    setNotice({ tone: 'good', message: 'Processing record removed from Recent processing.' });
   }
 
   async function loadSession(sessionId: number) {
@@ -252,9 +331,12 @@ export function App() {
   }
 
   function selectSession(sessionId: number, focusComposer = false) {
-    focusComposerWhenReady.current = focusComposer && modelReady && !busy;
+    chatDrafts.current.set(draftKey(selectedSessionIdRef.current), chatInputRef.current);
+    focusComposerWhenReady.current = focusComposer;
     selectedSessionIdRef.current = sessionId;
     setSelectedSessionId(sessionId);
+    chatInputRef.current = chatDrafts.current.get(draftKey(sessionId)) ?? '';
+    setChatInput(chatInputRef.current);
     setSelectedSession(null);
     setRunCursor(null);
     setChatTurns([]);
@@ -263,17 +345,22 @@ export function App() {
     void loadSession(sessionId);
   }
 
-  async function createNewSession() {
-    if (!state?.ready || sessionLoading || sessionMutating) return;
-    setChatInput('');
-    focusComposerWhenReady.current = modelReady && !busy;
+  async function createNewSession(preserveDraft = false): Promise<SessionSnapshot | null> {
+    if (!state?.ready || sessionLoading || sessionMutating) return null;
+    const priorDraft = chatInputRef.current;
+    chatDrafts.current.set(draftKey(selectedSessionIdRef.current), priorDraft);
+    allowInitialSessionSelection.current = false;
+    if (!preserveDraft) { chatInputRef.current = ''; setChatInput(''); }
+    focusComposerWhenReady.current = true;
     setSessionLoading(true);
     chatComposerRef.current?.focus();
     const created = await window.flowmate.createSession();
     setSessionLoading(false);
-    if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return; }
+    if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return null; }
     const session = created.data;
-    focusComposerWhenReady.current = modelReady && !busy;
+    chatInputRef.current = preserveDraft ? priorDraft : '';
+    chatDrafts.current.set(draftKey(session.sessionId), chatInputRef.current);
+    setChatInput(chatInputRef.current);
     selectedSessionIdRef.current = session.sessionId;
     setSelectedSessionId(session.sessionId);
     setSelectedSession(session);
@@ -283,6 +370,7 @@ export function App() {
     setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
     if (workspaceRef.current?.sessionId !== session.sessionId) await changeWorkspace({ kind: 'session', sessionId: session.sessionId });
     void loadSessionList();
+    return session;
   }
 
   async function renameSession(sessionId: number, title: string): Promise<boolean> {
@@ -294,7 +382,7 @@ export function App() {
     if (selectedSessionIdRef.current === sessionId) setSelectedSession(result.data);
     setSessions((current) => current.map((item) => item.sessionId === result.data.sessionId ? result.data : item)
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.sessionId - left.sessionId));
-    setNotice({ tone: 'good', message: 'Session renamed.' });
+    setNotice({ tone: 'good', message: 'Chat renamed.' });
     return true;
   }
 
@@ -329,14 +417,9 @@ export function App() {
     selectedSessionIdRef.current = next?.sessionId ?? null;
     setSelectedSessionId(next?.sessionId ?? null);
     setSelectedSession(null);
-    setChatInput('');
+    updateChatInput(chatDrafts.current.get(draftKey(next?.sessionId ?? null)) ?? '');
     setChatTurns([]);
     setRunCursor(null);
-    if (run?.kind === 'agent' && run.sessionId === sessionId) {
-      setRun(null);
-      setRunId(null);
-      setPromptTrace(null);
-    }
     if (activeAgentSessionId === sessionId) {
       setBusy(false);
       setCancelPending(false);
@@ -347,7 +430,7 @@ export function App() {
       activeChatSessionId.current = null;
       setActiveRunModel(null);
     }
-    setNotice({ tone: 'good', message: 'Session and its conversations deleted.' });
+    setNotice({ tone: 'good', message: 'Chat deleted.' });
     if (workspaceRef.current?.sessionId === sessionId) {
       await changeWorkspace({ kind: 'session', sessionId: next?.sessionId ?? null });
     }
@@ -383,7 +466,23 @@ export function App() {
         setState(event.state);
         return;
       }
+      if (event.type === 'model_auth_notice') {
+        setAuthFlow((current) => current?.requestId === event.requestId ? { ...current, notice: event.notice } : current);
+        return;
+      }
+      if (event.type === 'model_auth_prompt') {
+        setAuthFlow((current) => current?.requestId === event.requestId
+          ? { ...current, prompt: { id: event.promptId, value: '', definition: event.prompt } } : current);
+        return;
+      }
+      if ('runId' in event && 'sequence' in event) {
+        if (event.sequence <= (eventSequences.current.get(event.runId) ?? 0)) return;
+        if (latestAgentFinished.current.has(event.runId) && event.type !== 'run_finished') return;
+        eventSequences.current.set(event.runId, event.sequence);
+      }
       if (event.type === 'run_progress') {
+        if (activeChatSessionId.current !== null && event.sessionId !== activeChatSessionId.current) return;
+        if (activeAgentRunIdRef.current !== null && event.runId !== activeAgentRunIdRef.current) return;
         activeAgentRunIdRef.current = event.runId;
         activeChatSessionId.current = event.sessionId;
         setActiveAgentRunId(event.runId);
@@ -400,6 +499,17 @@ export function App() {
         }
         return;
       }
+      if (event.type === 'text_delta' || event.type === 'tool_progress') {
+        if (event.runId !== activeAgentRunIdRef.current || event.sessionId !== activeChatSessionId.current
+          || event.sessionId !== selectedSessionIdRef.current) return;
+        const turnId = activeChatTurnId.current;
+        if (!turnId) return;
+        setChatTurns((turns) => turns.map((turn) => turn.id !== turnId || turn.status !== 'sending' ? turn
+          : event.type === 'text_delta'
+            ? { ...turn, response: `${turn.response ?? ''}${event.text}` }
+            : { ...turn, progress: event.phase === 'running' ? event.label : null }));
+        return;
+      }
       if (event.type === 'run_finished') {
         latestAgentFinished.current.set(event.runId, event);
         if (selectedSessionIdRef.current === event.sessionId) {
@@ -409,7 +519,8 @@ export function App() {
           void loadSession(event.sessionId);
         }
         void loadSessionList();
-        void loadRun(event.runId);
+        void loadProductLists();
+        if (workspaceRef.current?.jobId) void loadTaskDetails(workspaceRef.current.jobId);
         if (activeAgentRunIdRef.current === event.runId) {
           activeAgentRunIdRef.current = null;
           activeChatSessionId.current = null;
@@ -460,6 +571,19 @@ export function App() {
   }, [chatTurns]);
 
   useEffect(() => {
+    const narrow = window.matchMedia('(max-width: 1079px)');
+    const followWidth = () => setChatCollapsed(narrow.matches);
+    narrow.addEventListener('change', followWidth);
+    return () => narrow.removeEventListener('change', followWidth);
+  }, []);
+
+  useEffect(() => {
+    if (!assistantWasToggled.current) return;
+    if (chatCollapsed) document.querySelector<HTMLButtonElement>('.chat-expand')?.focus();
+    else chatComposerRef.current?.focus();
+  }, [chatCollapsed]);
+
+  useEffect(() => {
     if (!state) return;
     const revision = state.settings.revision;
     if (revisionLoaded.current === revision) return;
@@ -480,43 +604,26 @@ export function App() {
   const persistedModel = state?.settings.models.find((item) => item.id === selectedModelId) ?? null;
   const credentialStatus = selectedModelId ? (state?.modelCredentials[selectedModelId] ?? 'missing') : 'missing';
   const isDraftSaved = persistedModel !== null && modelFieldsEqual(draft, persistedModel);
-  const modelReady = Boolean(state?.ready && persistedModel && isDraftSaved && credentialStatus === 'configured');
-  const canTest = Boolean(state?.ready && persistedModel && isDraftSaved && credentialStatus === 'configured' && !busy && !saving);
-  const inputSessionAvailable = selectedSessionId === null
-    ? sessionLoading
-    : selectedSession === null || selectedSession.availability === 'ready';
-  const inputEnabled = Boolean(modelReady && !saving && !busy && !sessionMutating && inputSessionAvailable);
-  const workspaceReady = Boolean(workspace && workspace.sessionId === selectedSessionId
-    && confirmedWorkspaceRevision === workspace.revision
-    && (goalMode !== 'save-candidate' || (workspace.documentRef && workspace.jobId)));
-  const canChat = Boolean(inputEnabled && !sessionLoading && selectedSession?.availability === 'ready'
-    && !selectedSession.modelUseBlocked && workspaceReady);
+  const modelReady = Boolean(state?.ready && persistedModel && isDraftSaved && persistedModel.kind !== 'legacy'
+    && (persistedModel.kind === 'catalog' || credentialStatus === 'configured'));
+  const canTest = Boolean(modelReady && !busy && !saving);
+  const inputEnabled = true;
+  const selectedForSend = selectedSession ?? sessions.find((item) => item.sessionId === selectedSessionId) ?? null;
+  const canChat = Boolean(modelReady && !busy && !sessionLoading && !sessionMutating
+    && (selectedSessionId === null || selectedForSend?.availability === 'ready' && !selectedForSend.modelUseBlocked
+      && selectedForSend.historyState === 'recoverable')
+    && (goalMode !== 'save-candidate' || (workspace?.documentRef && workspace.jobId)));
   useLayoutEffect(() => {
     if (!focusComposerWhenReady.current || !inputEnabled) return;
     focusComposerWhenReady.current = false;
     chatComposerRef.current?.focus();
   }, [inputEnabled, selectedSessionId, sessionLoading]);
   const savedModels = state?.settings.models ?? [];
-  const modelLabel = useMemo(() => draft.model.trim() || 'No model selected', [draft.model]);
-
-  async function confirmWorkspace() {
-    const latest = await window.flowmate.readWorkspace();
-    if (!latest.ok) { setNotice({ tone: 'bad', message: errorMessage(latest) }); return; }
-    if (latest.data.revision !== workspaceRef.current?.revision || latest.data.sessionId !== selectedSessionId) {
-      acceptWorkspace(latest.data);
-      setNotice({ tone: 'info', message: 'Workspace changed. Review the current source and confirm it again.' });
-      return;
-    }
-    setConfirmedWorkspaceRevision(latest.data.revision);
-    workspaceRef.current = latest.data;
-    setWorkspace(latest.data);
-    setNotice({ tone: 'good', message: `Workspace revision ${latest.data.revision} confirmed for Session #${latest.data.sessionId}.` });
-  }
 
   async function revokeModelAccess() {
     const documentId = workspaceRef.current?.documentRef?.id;
     if (!documentId || revokingAccess) return;
-    if (!window.confirm('Revoke this material for every Session that previously had access? Active Runs will be stopped. Those Sessions will no longer be able to send model requests; local records remain, and copies already sent to a remote model cannot be recalled.')) return;
+    if (!window.confirm('Revoke model access to this invoice? Any active response will stop. Chats that used this invoice can no longer send messages, while local records remain. Information already sent to a remote model cannot be recalled.')) return;
     setRevokingAccess(true);
     const result = await window.flowmate.revokeDocumentUse(documentId);
     setRevokingAccess(false);
@@ -528,8 +635,8 @@ export function App() {
     }
     setNotice({ tone: result.data.stopRequested ? 'info' : 'good',
       message: result.data.affectedSessionIds.length === 0
-        ? 'No previous Session was authorized for this material.'
-        : `Model access was revoked for ${result.data.affectedSessionIds.length} Session(s).${result.data.stopRequested ? ' The active Run is stopping.' : ''}` });
+        ? 'No previous chat used this invoice.'
+        : `Model access was revoked for ${result.data.affectedSessionIds.length} ${result.data.affectedSessionIds.length === 1 ? 'chat' : 'chats'}.${result.data.stopRequested ? ' The active response is stopping.' : ''}` });
   }
 
   function selectModel(id: string) {
@@ -539,6 +646,50 @@ export function App() {
     setDraft(item);
     setApiKey('');
     setNotice(null);
+  }
+
+  async function refreshCatalog() {
+    if (!draft.providerId) return;
+    setCatalogLoading(true);
+    const result = await window.flowmate.listModelCatalog(draft.providerId, true);
+    setCatalogLoading(false);
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    setCatalog((current) => current.map((provider) => result.data.find((item) => item.id === provider.id) ?? provider));
+  }
+
+  async function loginModel(authType: 'api_key' | 'oauth') {
+    if (!persistedModel || persistedModel.kind !== 'catalog' || !isDraftSaved || authFlow) return;
+    const requestId = crypto.randomUUID();
+    setAuthFlow({ requestId, notice: { type: 'progress', message: 'Waiting for Pi provider authentication…' }, prompt: null });
+    const result = await window.flowmate.loginModel(persistedModel.id, authType, requestId);
+    setAuthFlow(null);
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    const refreshed = await window.flowmate.getState();
+    if (refreshed.ok) setState(refreshed.data);
+    setNotice({ tone: 'good', message: 'Pi provider authentication is ready.' });
+  }
+
+  async function logoutModel() {
+    if (!persistedModel || persistedModel.kind !== 'catalog' || authFlow) return;
+    const result = await window.flowmate.logoutModel(persistedModel.id);
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    const refreshed = await window.flowmate.getState();
+    if (refreshed.ok) setState(refreshed.data);
+    setNotice({ tone: 'good', message: 'Provider credentials removed.' });
+  }
+
+  async function answerAuthPrompt() {
+    if (!authFlow?.prompt) return;
+    const { id, value } = authFlow.prompt;
+    const result = await window.flowmate.replyModelAuth(authFlow.requestId, id, value);
+    if (result.ok) setAuthFlow((current) => current?.requestId === authFlow.requestId ? { ...current, prompt: null } : current);
+    else setNotice({ tone: 'bad', message: errorMessage(result) });
+  }
+
+  function cancelAuth() {
+    if (!authFlow) return;
+    void window.flowmate.cancelModelAuth(authFlow.requestId);
+    setAuthFlow(null);
   }
 
   function updateDraft<K extends keyof ModelProfile>(key: K, value: ModelProfile[K]) {
@@ -606,24 +757,21 @@ export function App() {
     await loadRun(accepted.data.runId);
   }
 
-  async function sendChatMessage() {
-    const prompt = chatInput.trim();
-    const sessionId = selectedSessionId;
+  async function sendChatMessage(override?: { sessionId: number; prompt: string }) {
+    const prompt = override?.prompt ?? chatInputRef.current.trim();
     const model = persistedModel;
-    if (!canChat || !selectedModelId || !model || sessionId === null || !prompt) return;
-    const current = workspaceRef.current;
-    if (!current || current.sessionId !== sessionId || confirmedWorkspaceRevision !== current.revision) {
-      setConfirmedWorkspaceRevision(null);
-      setNotice({ tone: 'info', message: 'Review and confirm the current Workspace before starting a Run.' });
-      return;
+    if ((!canChat && !override) || !modelReady || busy || !selectedModelId || !model || !prompt) return;
+    setBusy(true);
+    setNotice({ tone: 'info', message: 'Preparing your request…' });
+    let sessionId = override?.sessionId ?? selectedSessionIdRef.current;
+    if (sessionId === null) {
+      const created = await createNewSession(true);
+      if (!created) { setBusy(false); return; }
+      sessionId = created.sessionId;
     }
-    const freshWorkspace = await window.flowmate.readWorkspace();
-    if (!freshWorkspace.ok) { setNotice({ tone: 'bad', message: errorMessage(freshWorkspace) }); return; }
-    if (freshWorkspace.data.revision !== current.revision || freshWorkspace.data.sessionId !== sessionId) {
-      acceptWorkspace(freshWorkspace.data);
-      setNotice({ tone: 'info', message: 'Workspace changed before Send. Review and confirm it again.' });
-      return;
-    }
+    let current = workspaceRef.current ?? await loadWorkspace();
+    if (current?.documentRef && current.sessionId !== sessionId) current = await changeWorkspace({ kind: 'session', sessionId });
+    if (workspaceRef.current?.documentRef && !current) { setBusy(false); return; }
     const turnId = newId();
     const newTurn: ChatTurn = { id: turnId, sessionId, runId: null, prompt, response: null, error: null, status: 'sending' };
     activeChatTurnId.current = turnId;
@@ -631,7 +779,8 @@ export function App() {
     activeAgentRunIdRef.current = null;
     agentStopRequested.current = false;
     setActiveRunModel({ id: model.id, name: model.name, model: model.model });
-    setChatInput('');
+    chatDrafts.current.set(draftKey(sessionId), '');
+    if (selectedSessionIdRef.current === sessionId) updateChatInput('');
     setChatTurns((turns) => [...turns, newTurn]);
     setBusy(true);
     setCancelPending(false);
@@ -640,19 +789,25 @@ export function App() {
       sessionId,
       text: prompt,
       modelId: model.id,
-      workspace: {
+      ...(current?.documentRef ? { workspace: {
         revision: current.revision,
         documentRef: current.documentRef,
         jobId: current.jobId,
         candidateRef: current.candidateRef,
         sessionId,
-      },
+      } } : {}),
       goalMode,
+      ...(goalMode === 'save-candidate' ? { timeoutMs: 120_000 } : {}),
     });
     if (!accepted.ok) {
-      setChatTurns((turns) => turns.map((turn) => turn.id === turnId
-        ? { ...turn, status: 'failed', error: errorMessage(accepted) }
-        : turn));
+      setChatTurns((turns) => turns.filter((turn) => turn.id !== turnId));
+      const restoredDraft = chatDrafts.current.get(draftKey(sessionId));
+      const nextDraft = restoredDraft ? `${prompt}\n\n${restoredDraft}` : prompt;
+      chatDrafts.current.set(draftKey(sessionId), nextDraft);
+      if (selectedSessionIdRef.current === sessionId) updateChatInput(nextDraft);
+      if (accepted.error.code === 'state_conflict') await loadWorkspace();
+      setNotice({ tone: 'bad', message: accepted.error.code === 'state_conflict'
+        ? 'Invoice context changed. Review it and press Send again; your message is preserved.' : errorMessage(accepted) });
       if (activeAgentRunIdRef.current === null) {
         setBusy(false);
         activeChatTurnId.current = null;
@@ -662,6 +817,7 @@ export function App() {
       }
       return;
     }
+    if (goalMode === 'save-candidate') setGoalMode('answer');
     const finished = latestAgentFinished.current.get(accepted.data.runId);
     if (!finished) {
       activeAgentRunIdRef.current = accepted.data.runId;
@@ -690,7 +846,14 @@ export function App() {
       activeChatTurnId.current = null;
       applyAgentFinish(finished, turnId);
     }
-    await loadRun(accepted.data.runId);
+  }
+
+  async function newChatAndSend() {
+    const prompt = chatInputRef.current.trim();
+    if (!prompt) return;
+    const created = await createNewSession(true);
+    if (!created) return;
+    await sendChatMessage({ sessionId: created.sessionId, prompt });
   }
 
   function applyAgentFinish(event: Extract<AgentRunEvent, { type: 'run_finished' }>, turnId: string) {
@@ -706,7 +869,8 @@ export function App() {
         ...turn,
         runId: event.runId,
         response: outcome.text || null,
-        error: outcome.error?.message ?? null,
+        progress: null,
+        error: outcome.error ? errorMessage({ error: outcome.error }) : null,
         status: outcome.status === 'completed' ? 'completed' : outcome.status === 'cancelled' ? 'cancelled' : 'failed',
       }
       : turn));
@@ -718,7 +882,7 @@ export function App() {
     setCancelPending(true);
     if (runId === null) {
       agentStopRequested.current = true;
-      setNotice({ tone: 'info', message: 'Stop requested. Waiting for the Agent Run to be accepted.' });
+      setNotice({ tone: 'info', message: 'Stop requested. Waiting for the request to start.' });
       return;
     }
     await requestAgentCancellation(runId);
@@ -734,7 +898,7 @@ export function App() {
     }
     setNotice({ tone: 'info', message: result.data.accepted
       ? 'Stop was accepted. Waiting for the Agent to confirm it stopped.'
-      : 'The Run is no longer active. Its saved state remains the source of truth.' });
+      : 'The response has already ended. Its saved result is shown in the chat.' });
   }
 
   async function cancelRequest() {
@@ -747,15 +911,13 @@ export function App() {
     }
     setNotice({ tone: 'info', message: result.data.accepted
       ? 'Cancellation was accepted. Waiting for the Provider to confirm it stopped.'
-      : 'No active request was found. The saved Run remains the source of truth.' });
+      : 'No active request was found. The saved result remains available.' });
   }
 
   async function loadRun(id: number) {
-    const [result, trace] = await Promise.all([window.flowmate.queryRun(id), window.flowmate.queryPromptTrace(id)]);
+    const result = await window.flowmate.queryRun(id);
     if (result.ok) setRun(result.data);
     else setNotice({ tone: 'bad', message: errorMessage(result) });
-    if (trace.ok) setPromptTrace(trace.data);
-    else setPromptTrace({ availability: 'source-unavailable', calls: [], droppedCalls: null });
   }
 
   async function removeModel() {
@@ -773,36 +935,80 @@ export function App() {
     setNotice({ tone: 'good', message: 'Model profile removed.' });
   }
 
-  const activeDisplayName = state?.settings.profile.displayName || 'Local user';
-
   return (
-    <div className={`desktop-shell theme-${profileDraft.theme} ${chatCollapsed ? 'chat-is-collapsed' : ''}`}>
-      <aside className="rail" data-testid="workspace-sidebar">
-        <div className="brand-lockup"><span className="brand-mark">F</span><span>flowmate</span></div>
-        <div className="rail-caption">LOCAL WORKSPACE</div>
+    <div className={`desktop-shell theme-${profileDraft.theme} ${chatCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''}`}>
+      {navOpen && <button className="nav-scrim" aria-label="Close navigation" onClick={() => { setNavOpen(false); navToggleRef.current?.focus(); }} />}
+      <aside className={`rail ${navOpen ? 'expanded' : ''}`} data-testid="workspace-sidebar"
+        onKeyDown={(event) => { if (event.key === 'Escape' && navOpen) { setNavOpen(false); navToggleRef.current?.focus(); } }}>
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden="true">F</span>
+          <span className="brand-wordmark"><strong>Flowmate</strong><small>INVOICE DESK</small></span>
+          <button ref={navToggleRef} type="button" className="rail-toggle" aria-label={navOpen ? 'Close navigation' : 'Open navigation'}
+            aria-expanded={navOpen} onClick={() => setNavOpen((open) => !open)}>{navOpen ? '×' : '☰'}</button>
+        </div>
+        <button className="sidebar-new-chat" type="button" aria-label="New chat" title="New chat" disabled={!state?.ready || sessionLoading || sessionMutating}
+          onClick={() => { setNavOpen(false); if (window.innerWidth < 1080) setChatCollapsed(false); void createNewSession(); }}>
+          <span aria-hidden="true">＋</span><span>New chat</span>
+        </button>
         <nav aria-label="Workspace navigation">
-          <button className={`nav-item ${page === 'workspace' ? 'active' : ''}`} aria-current={page === 'workspace' ? 'page' : undefined} onClick={() => setPage('workspace')}>
-            <span className="nav-glyph">▧</span><span>Workspace</span>
-          </button>
-          <button className={`nav-item ${page === 'tasks' ? 'active' : ''}`} aria-current={page === 'tasks' ? 'page' : undefined} onClick={() => { setPage('tasks'); if (workspace?.jobId) void loadTaskDetails(workspace.jobId); }}>
-            <span className="nav-glyph">☷</span><span>Tasks</span>
-          </button>
-          <button className={`nav-item ${page === 'model' ? 'active' : ''}`} aria-current={page === 'model' ? 'page' : undefined} onClick={() => setPage('model')}>
-            <span className="nav-glyph">◈</span><span>Model</span>
-          </button>
-          <button className={`nav-item ${page === 'profile' ? 'active' : ''}`} aria-current={page === 'profile' ? 'page' : undefined} onClick={() => setPage('profile')}>
-            <span className="nav-glyph">◎</span><span>Profile</span>
-          </button>
+          <span className="rail-caption">WORK</span>
+          {([
+            ['workspace', 'Invoices', '▧'],
+            ['tasks', 'Processing History', '☷'],
+            ['chats', 'Chats', '◌'],
+          ] as const).map(([target, label, glyph]) => <button key={target} type="button"
+            className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
+            aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
+            <span className="nav-glyph" aria-hidden="true">{glyph}</span><span>{label}</span>
+          </button>)}
+          <span className="rail-caption setup-caption">SETUP</span>
+          {([
+            ['models', 'Models', '◇'],
+            ['connections', 'Connections', '◉'],
+          ] as const).map(([target, label, glyph]) => <button key={target} type="button"
+            className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
+            aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
+            <span className="nav-glyph" aria-hidden="true">{glyph}</span><span>{label}</span>
+          </button>)}
         </nav>
+        <section className="sidebar-recents" aria-label="Recent chats">
+          <div className="sidebar-section-head"><span>RECENT CHATS</span><button type="button" onClick={() => navigate('chats')}>View all</button></div>
+          {sessions.slice(0, 5).map((session) => <div key={session.sessionId} className="sidebar-chat-row">{sidebarRenameId === session.sessionId
+            ? <form className="sidebar-chat-edit" onSubmit={async (event) => {
+              event.preventDefault();
+              if (await renameSession(session.sessionId, sidebarRenameTitle.trim())) setSidebarRenameId(null);
+            }}><input autoFocus aria-label="Chat title" value={sidebarRenameTitle} maxLength={120}
+              onChange={(event) => setSidebarRenameTitle(event.target.value)} />
+              <button type="submit" disabled={sessionMutating || !sidebarRenameTitle.trim()}>Save</button>
+              <button type="button" onClick={() => setSidebarRenameId(null)}>Cancel</button>
+            </form>
+            : <><button type="button" data-session-id={session.sessionId}
+            className={`sidebar-chat ${session.sessionId === selectedSessionId ? 'selected' : ''}`}
+            aria-label={`Open chat ${chatTitle(session.title)}`}
+            aria-current={session.sessionId === selectedSessionId ? 'true' : undefined}
+            onClick={() => openChat(session.sessionId)}>
+            <span className="sidebar-chat-mark" aria-hidden="true">◌</span>
+            <span className="sidebar-chat-title">{chatTitle(session.title)}</span>
+          </button><button className="sidebar-chat-rename" type="button" aria-label={`Rename chat ${chatTitle(session.title)}`}
+            disabled={sessionMutating || session.status === 'archived'} onClick={() => {
+              setSidebarRenameId(session.sessionId);
+              setSidebarRenameTitle(chatTitle(session.title));
+            }}>Rename</button></>}</div>)}
+          {sessions.length === 0 && <p className="sidebar-empty">Your conversations will appear here.</p>}
+        </section>
         <div className="rail-bottom">
-          <span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />
-          <div><strong>{state?.ready ? 'Host ready' : 'Host unavailable'}</strong><small>{state?.ready ? 'Local runtime connected' : 'Check the terminal output'}</small></div>
+          <button className={`nav-item ${page === 'settings' ? 'active' : ''}`} type="button" aria-label="Settings" title="Settings"
+            aria-current={page === 'settings' ? 'page' : undefined} onClick={() => navigate('settings')}>
+            <span className="nav-glyph" aria-hidden="true">⚙</span><span>Settings</span>
+          </button>
+          <div className="sidebar-status"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />
+            <span>{state?.ready ? 'Ready' : 'Unavailable'}</span></div>
         </div>
       </aside>
 
       <main className="workspace" data-testid="main-content">
         <header className="topline">
-          <div><span className="crumb">{activeDisplayName}</span><span className="slash">/</span><span>{{ workspace: 'Workspace', tasks: 'Tasks', model: 'Model', profile: 'Profile' }[page]}</span></div>
+          <div><span className="crumb">{pageLabels[page]}</span></div>
           <div className="top-state"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />{state?.ready ? 'LOCAL' : 'OFFLINE'}</div>
         </header>
 
@@ -810,10 +1016,8 @@ export function App() {
           <WorkspacePage
             workspace={workspace}
             documents={documents}
-            jobs={jobs}
-            selectedSessionId={selectedSessionId}
-            confirmed={confirmedWorkspaceRevision === workspace?.revision}
-            goalMode={goalMode}
+            candidates={candidateSummaries}
+            candidateDetail={candidateDetail}
             taskGoal={taskGoal}
             parsedPage={parsedPage}
             originalImage={originalImage}
@@ -821,8 +1025,7 @@ export function App() {
             onImport={() => void importInvoice()}
             onSelectDocument={(id) => void selectWorkspaceDocument(id)}
             onStartTask={() => void startTask()}
-            onConfirm={() => void confirmWorkspace()}
-            onGoalModeChange={setGoalMode}
+            onOpenCandidate={(jobId, candidateId) => void openCandidate(jobId, candidateId)}
             onTaskGoalChange={setTaskGoal}
             onChangeView={(view) => void changeWorkspace({ kind: 'view', view })}
             onRefresh={() => void loadProductOverview()}
@@ -832,115 +1035,142 @@ export function App() {
         ) : page === 'tasks' ? (
           <TasksPage
             workspace={workspace}
+            documents={documents}
             jobs={jobs}
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
             activity={activity}
-            confirmed={confirmedWorkspaceRevision === workspace?.revision}
             notice={notice}
             onOpenJob={(jobId) => void openJob(jobId)}
+            onHideJob={(jobId) => void hideProcessing(jobId)}
             onOpenCandidate={(jobId, candidateId) => void openCandidate(jobId, candidateId)}
             onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)}
-            onConfirm={() => void confirmWorkspace()}
           />
-        ) : page === 'model' ? (
+        ) : page === 'chats' ? (
+          <ChatsPage sessions={sessions} selectedSessionId={selectedSessionId} hasMore={sessionCursor !== null}
+            mutating={sessionMutating} notice={notice} onSelect={openChat}
+            onRename={renameSession} onDelete={deleteSession} onLoadMore={() => void loadMoreSessions()} />
+        ) : (
           <section className="page-content">
             <div className="page-heading">
-              <div><div className="eyebrow">PROVIDER WORKBENCH</div><h1>Connect a model.</h1><p>Set the route once, then send an explicit diagnostic request through Flowmate’s Provider runtime.</p></div>
-              <div className="model-stamp"><span className="stamp-label">CURRENT MODEL</span><strong>{modelLabel}</strong><small>{draft.api}</small></div>
+              <div><h1>{pageLabels[page]}</h1><p>{page === 'models'
+                ? 'Choose and configure the models available to Assistant.'
+                : page === 'connections' ? 'Check whether your saved model can respond.'
+                  : 'Make Flowmate comfortable to use on this device.'}</p></div>
             </div>
 
             {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
             {!state?.ready && <div className="notice bad" role="alert">The application Host is not ready. No model request can be sent until its data store opens successfully.</div>}
 
-            <div className="model-layout">
+            {page === 'models' && <div className="model-layout">
               <section className="panel model-list-panel">
                 <div className="panel-head"><div><span className="section-index">MODEL ROUTES</span><h2>Your models</h2></div><button className="quiet-button" onClick={() => { const fresh = blankModel(); setDraft(fresh); setSelectedModelId(fresh.id); setApiKey(''); setNotice(null); }}>＋ Add</button></div>
                 <div className="model-list">
-                  {savedModels.length === 0 && <div className="empty-route"><div className="empty-symbol">＋</div><strong>No model routes yet</strong><span>Add a Base URL, model ID, API type and API Key to begin.</span></div>}
-                  {savedModels.map((model) => <button key={model.id} className={`route-row ${selectedModelId === model.id ? 'selected' : ''}`} onClick={() => selectModel(model.id)}>
-                    <span className="route-icon">{model.api === 'anthropic-messages' ? 'A' : model.api === 'google-generative-ai' ? 'G' : 'P'}</span>
+                  {savedModels.length === 0 && <div className="empty-route"><div className="empty-symbol">＋</div><strong>No models yet</strong><span>Choose a Pi provider and model to begin.</span></div>}
+                  {savedModels.map((model) => <button key={model.id} title={model.name} className={`route-row ${selectedModelId === model.id ? 'selected' : ''}`} onClick={() => selectModel(model.id)}>
+                    <span className="route-icon">{(model.providerId ?? model.api).slice(0, 1).toUpperCase() || 'P'}</span>
                     <span className="route-name"><strong>{model.name}</strong><small>{model.model}</small></span>
-                    <span className={`credential-pill ${state?.modelCredentials[model.id] === 'configured' ? 'ready' : ''}`}>{state?.modelCredentials[model.id] === 'configured' ? 'KEY SET' : state?.modelCredentials[model.id] === 'unavailable' ? 'LOCKED' : 'NO KEY'}</span>
+                    <span className={`credential-pill ${state?.modelCredentials[model.id] === 'configured' ? 'ready' : ''}`}>{model.kind === 'legacy' ? 'RECONFIGURE' : state?.modelCredentials[model.id] === 'configured' ? 'AUTH SET' : state?.modelCredentials[model.id] === 'unavailable' ? 'LOCKED' : 'CHECK AUTH'}</span>
                   </button>)}
                 </div>
-                <div className="list-foot"><span>{savedModels.length} saved route{savedModels.length === 1 ? '' : 's'}</span><span>PI RUNTIME · 0.85.1</span></div>
+                <div className="list-foot"><span>{savedModels.length} saved model{savedModels.length === 1 ? '' : 's'}</span></div>
               </section>
 
               <section className="panel config-panel">
-                <div className="panel-head"><div><span className="section-index">MODEL CONFIGURATION</span><h2>Connection details</h2></div><span className="revision-tag">REV {state?.settings.revision ?? '—'}</span></div>
+                <div className="panel-head"><h2>Model details</h2></div>
                 <div className="form-grid">
+                  <div className="field full"><span>Connection type</span><div className="config-actions">
+                    <button type="button" className="secondary-button" onClick={() => setDraft((current) => ({ ...current, kind: 'catalog', providerId: null, baseUrl: '', api: '', model: '', contextWindow: null, maxTokens: null }))}>Pi provider</button>
+                    <button type="button" className="secondary-button" onClick={() => setDraft((current) => ({ ...current, kind: 'custom', providerId: null, baseUrl: '', api: '', model: '', contextWindow: null, maxTokens: null }))}>Custom model</button>
+                  </div></div>
                   <label className="field full"><span>Display name</span><input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} placeholder="Primary model" maxLength={128} /></label>
-                  <label className="field full"><span>Base URL <i>API root</i></span><input value={draft.baseUrl} onChange={(event) => updateDraft('baseUrl', event.target.value)} placeholder="https://api.example.com/v1" autoCapitalize="off" spellCheck={false} /></label>
-                  <label className="field full"><span>Model ID</span><input value={draft.model} onChange={(event) => updateDraft('model', event.target.value)} placeholder="model-name" autoCapitalize="off" spellCheck={false} /></label>
-                  <label className="field"><span>API protocol</span><select value={draft.api} onChange={(event) => updateDraft('api', event.target.value as ModelProfile['api'])}>
-                    <option value="openai-completions">OpenAI Chat Completions</option><option value="openai-responses">OpenAI Responses</option><option value="anthropic-messages">Anthropic Messages</option><option value="google-generative-ai">Google Generative AI</option>
-                  </select></label>
-                  <label className="field full"><span>API Key <i>{credentialStatus === 'configured' ? 'saved in system secure storage' : 'write only'}</i></span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={credentialStatus === 'configured' ? 'Leave blank to keep the saved key' : 'Enter API Key'} autoComplete="new-password" /></label>
+                  {draft.kind === 'legacy' && <p className="config-note">This older route needs to be chosen again from Pi or configured as a custom model.</p>}
+                  {draft.kind === 'catalog' && <>
+                    <label className="field full"><span>Find provider</span><input value={providerSearch}
+                      onChange={(event) => setProviderSearch(event.target.value)} placeholder="Search Pi providers" /></label>
+                    <label className="field full"><span>Pi provider</span><select value={draft.providerId ?? ''} onChange={(event) => setDraft((current) => ({ ...current, providerId: event.target.value || null, model: '' }))}>
+                      <option value="">Choose a provider</option>{catalog.filter((provider) => provider.id === draft.providerId
+                        || `${provider.id} ${provider.name}`.toLowerCase().includes(providerSearch.toLowerCase())).map((provider) =>
+                        <option key={provider.id} value={provider.id}>{provider.name}</option>)}
+                    </select></label>
+                    <label className="field full"><span>Find model</span><input value={modelSearch}
+                      onChange={(event) => setModelSearch(event.target.value)} placeholder="Search provider models" /></label>
+                    <label className="field full"><span>Model</span><select value={draft.model} onChange={(event) => updateDraft('model', event.target.value)}>
+                      <option value="">Choose a model</option>{catalog.find((provider) => provider.id === draft.providerId)?.models
+                        .filter((model) => model.id === draft.model || `${model.id} ${model.name}`.toLowerCase().includes(modelSearch.toLowerCase())).map((model) =>
+                        <option key={model.id} value={model.id}>{model.name} · {model.maxTokens.toLocaleString()} output tokens</option>)}
+                    </select></label>
+                    <button type="button" className="quiet-button" disabled={!draft.providerId || catalogLoading} onClick={() => void refreshCatalog()}>{catalogLoading ? 'Refreshing…' : 'Refresh provider models'}</button>
+                    <p className="config-note">Model limits come from the installed Pi catalog. Available authentication: {catalog.find((provider) => provider.id === draft.providerId)?.authMethods.join(', ') || 'choose a provider'}.</p>
+                  </>}
+                  {draft.kind === 'custom' && <>
+                    <label className="field full"><span>Base URL</span><input value={draft.baseUrl} onChange={(event) => updateDraft('baseUrl', event.target.value)} placeholder="https://api.example.com/v1" autoCapitalize="off" spellCheck={false} /></label>
+                    <label className="field full"><span>Model ID</span><input value={draft.model} onChange={(event) => updateDraft('model', event.target.value)} placeholder="model-name" autoCapitalize="off" spellCheck={false} /></label>
+                    <label className="field"><span>Pi API type</span><input value={draft.api} onChange={(event) => updateDraft('api', event.target.value)} placeholder="openai-completions" autoCapitalize="off" spellCheck={false} /></label>
+                    <label className="field"><span>Context window</span><input type="number" min="1" value={draft.contextWindow ?? ''} onChange={(event) => updateDraft('contextWindow', event.target.value ? Number(event.target.value) : null)} /></label>
+                    <label className="field"><span>Maximum output tokens</span><input type="number" min="1" value={draft.maxTokens ?? ''} onChange={(event) => updateDraft('maxTokens', event.target.value ? Number(event.target.value) : null)} /></label>
+                    <label className="field"><span>Reasoning</span><input type="checkbox" checked={draft.reasoning} onChange={(event) => updateDraft('reasoning', event.target.checked)} /></label>
+                  </>}
+                  {draft.kind === 'custom' && <label className="field full"><span>API Key <i>{credentialStatus === 'configured' ? 'saved in system secure storage' : 'write only'}</i></span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={credentialStatus === 'configured' ? 'Leave blank to keep the saved key' : 'Enter API Key'} autoComplete="new-password" /></label>}
                 </div>
                 <div className="config-actions">
                   {persistedModel && <button className="text-button danger-text" onClick={() => void removeModel()}>Remove model</button>}
                   <div className="action-spacer" />
-                  <button className="secondary-button" onClick={() => void saveConfiguration()} disabled={saving || !state?.ready}>{saving ? 'Saving…' : 'Save changes'}</button>
-                  <button className="primary-button" onClick={() => void testConnection()} disabled={!canTest}>Test connection <span aria-hidden="true">↗</span></button>
+                  <button className="secondary-button" onClick={() => void saveConfiguration()} disabled={saving || !state?.ready || draft.kind === 'legacy'}>{saving ? 'Saving…' : 'Save changes'}</button>
+                  {persistedModel?.kind === 'catalog' && isDraftSaved && catalog.find((provider) => provider.id === persistedModel.providerId)?.authMethods.includes('api_key')
+                    && <button className="secondary-button" onClick={() => void loginModel('api_key')} disabled={Boolean(authFlow)}>Set up API key</button>}
+                  {persistedModel?.kind === 'catalog' && isDraftSaved && catalog.find((provider) => provider.id === persistedModel.providerId)?.authMethods.includes('oauth')
+                    && <button className="secondary-button" onClick={() => void loginModel('oauth')} disabled={Boolean(authFlow)}>Sign in with provider</button>}
+                  {persistedModel?.kind === 'catalog' && credentialStatus === 'configured'
+                    && <button className="text-button danger-text" onClick={() => void logoutModel()} disabled={Boolean(authFlow)}>Sign out</button>}
+                  <button className="secondary-button" onClick={() => navigate('connections')} disabled={!persistedModel}>Check connection</button>
                 </div>
-                <div className="config-note"><span className="note-mark">i</span><span>Only <b>Test connection</b> sends a real request. Saving this form, opening the app and refreshing it never call the model.</span></div>
+                <div className="config-note"><span className="note-mark">i</span><span>Saving a model does not contact it. Use Connections to send a short test.</span></div>
               </section>
-            </div>
+            </div>}
 
-            <section className="diagnostic-panel">
-              <div className="diagnostic-top">
-                <div><span className="section-index">LIVE DIAGNOSTIC</span><h2>Send a test request</h2><p>One request, one persisted Provider Run. Conversation history and Agent tools are not included.</p></div>
-                <div className={`request-state ${busy ? 'running' : run ? (run.status === 'completed' ? 'completed' : 'failed') : ''}`}><span className="state-light" />{busy ? 'REQUEST IN PROGRESS' : run ? run.status.toUpperCase() : 'READY WHEN CONFIGURED'}</div>
+            {page === 'connections' && <section className="panel connection-check"><div className="panel-head"><h2>Connection check</h2></div>
+              <div className="connection-body">
+                <label className="field"><span>Model to check</span><select aria-label="Connection model" value={persistedModel?.id ?? ''}
+                  onChange={(event) => { selectModel(event.target.value); setRun(null); }}>
+                  <option value="" disabled>Select a saved model</option>
+                  {savedModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+                </select></label>
+                <p role="status">{busy ? 'Checking your model connection…' : run
+                  ? run.status === 'completed' ? 'Connection succeeded. Your model is ready.' : 'Connection failed. Check the model address and key.'
+                  : persistedModel ? 'Send a short test to check this model.' : 'Add a model before checking its connection.'}</p>
+                {!isDraftSaved && persistedModel && <p>Save model changes before checking the connection.</p>}
+                {busy ? <button className="secondary-button" onClick={() => void cancelRequest()} disabled={cancelPending}>Stop check</button>
+                  : <button className="primary-button" onClick={() => void testConnection()} disabled={!canTest}>Test connection</button>}
               </div>
-              <div className="diagnostic-form">
-                <label className="field"><span>Instruction</span><textarea value={goal} onChange={(event) => setGoal(event.target.value)} rows={2} maxLength={4096} /></label>
-                <label className="field"><span>Message</span><textarea value={text} onChange={(event) => setText(event.target.value)} rows={3} placeholder="Type a short message for the selected model…" /></label>
-                <div className="send-row"><span>Target · <b>{draft.model || 'No model selected'}</b> <i>{draft.api}</i></span><div>{busy && <button className="secondary-button cancel-button" onClick={() => void cancelRequest()} disabled={cancelPending}>{cancelPending ? 'Waiting for stop…' : 'Cancel request'}</button>}<button className="primary-button send-button" onClick={() => void testConnection()} disabled={!canTest}>{busy ? 'Sending…' : 'Send request'} <span aria-hidden="true">→</span></button></div></div>
-              </div>
-            </section>
-
-            {(run || runId !== null) && <RunDetails run={run} runId={runId} trace={promptTrace} onRefresh={() => runId && void loadRun(runId)} />}
-            <footer className="page-footer"><span>FLOWMATE · LOCAL PROVIDER RUNTIME</span><span>API KEYS STAY ON THIS DEVICE</span></footer>
-          </section>
-        ) : (
-          <section className="page-content profile-content">
-            <div className="page-heading"><div><div className="eyebrow">LOCAL IDENTITY</div><h1>Your profile.</h1><p>Device-local display preferences and runtime location. No account or cloud sync is configured.</p></div><div className="profile-orbit">{(profileDraft.displayName.trim()[0] || 'F').toUpperCase()}</div></div>
-            {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
-            <section className="panel profile-panel"><div className="panel-head"><div><span className="section-index">PREFERENCES</span><h2>Local profile</h2></div></div>
-              <div className="profile-fields"><label className="field"><span>Display name</span><input value={profileDraft.displayName} onChange={(event) => setProfileDraft((old) => ({ ...old, displayName: event.target.value }))} maxLength={80} /></label><label className="field"><span>Appearance</span><select value={profileDraft.theme} onChange={(event) => setProfileDraft((old) => ({ ...old, theme: event.target.value as typeof old.theme }))}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div>
-              <div className="config-actions"><span className="action-spacer" /><button className="primary-button" onClick={() => void saveProfile()} disabled={saving || !state?.ready}>{saving ? 'Saving…' : 'Save profile'}</button></div>
-            </section>
-            <section className="system-facts"><div><span>APPLICATION</span><strong>Flowmate {state?.appVersion ?? '—'}</strong></div><div><span>APPLICATION HOST</span><strong>{state?.host ?? 'starting'}</strong></div><div><span>DATA DIRECTORY</span><code>{state?.userDataPath ?? 'Loading…'}</code></div><div><span>DATABASE</span><code>{state?.userDataPath ? `${state.userDataPath}\\data\\app.sqlite` : 'Loading…'}</code></div></section>
-            <footer className="page-footer"><span>PROFILE SETTINGS ARE STORED IN settings.json</span><span>SECRETS USE OS SECURE STORAGE</span></footer>
+            </section>}
+            {page === 'settings' && <section className="panel profile-panel settings-appearance"><div className="panel-head"><h2>Appearance</h2></div>
+              <div className="profile-fields"><label className="field"><span>Display name</span><input value={profileDraft.displayName} onChange={(event) => setProfileDraft((old) => ({ ...old, displayName: event.target.value }))} maxLength={80} /></label><label className="field"><span>Theme</span><select value={profileDraft.theme} onChange={(event) => setProfileDraft((old) => ({ ...old, theme: event.target.value as typeof old.theme }))}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div>
+              <div className="config-actions"><span className="action-spacer" /><button className="secondary-button" onClick={() => void saveProfile()} disabled={saving || !state?.ready}>Save appearance</button></div>
+            </section>}
+            {page === 'settings' && <details className="panel diagnostics-panel"><summary>Diagnostics</summary>
+              <div><p>Application: {state?.ready ? 'Ready' : 'Unavailable'}</p>
+                <p>Selected model: {persistedModel ? credentialStatus === 'configured' ? 'Ready to connect' : 'Credential needs attention' : 'No model selected'}</p></div>
+            </details>}
           </section>
         )}
       </main>
       <AgentChatPanel
         collapsed={chatCollapsed}
-        onToggle={() => setChatCollapsed((collapsed) => !collapsed)}
-        sessions={sessions}
+        onToggle={() => { assistantWasToggled.current = true; setChatCollapsed((collapsed) => !collapsed); }}
         selectedSessionId={selectedSessionId}
         selectedSession={selectedSession}
-        sessionLoading={sessionLoading}
-        hasMoreSessions={sessionCursor !== null}
         hasOlderRuns={runCursor !== null}
-        onSelectSession={(id) => selectSession(id, true)}
-        onNewSession={() => void createNewSession()}
-        onRenameSession={renameSession}
-        onDeleteSession={deleteSession}
-        sessionMutating={sessionMutating}
-        onLoadMoreSessions={() => void loadMoreSessions()}
+        onNewChatAndSend={() => void newChatAndSend()}
         onLoadOlderRuns={() => void loadOlderRuns()}
         turns={chatTurns}
         transcriptRef={chatTranscriptRef}
         input={chatInput}
         composerRef={chatComposerRef}
-        onInputChange={setChatInput}
+        onInputChange={updateChatInput}
         onSend={() => void sendChatMessage()}
-        onCancel={() => void (activeAgentRunIdRef.current === null ? cancelRequest() : cancelAgentRun())}
+        onCancel={() => void cancelAgentRun()}
         enabled={canChat}
-        inputEnabled={inputEnabled}
         busy={busy}
         cancelPending={cancelPending}
         activeAgentRunId={activeAgentRunId}
@@ -949,30 +1179,101 @@ export function App() {
         selectedModelId={selectedModelId}
         modelName={persistedModel?.name ?? null}
         modelId={persistedModel?.model ?? null}
-        sessionHint={!selectedSession ? selectedSessionId !== null ? 'Loading this Session. You can write while it loads; Send will be available when ready.' : 'Create a Session to begin. Creating one does not call the model.'
-          : selectedSession.availability === 'history-unavailable' ? "This session's conversation history is unavailable after restart. Create a new session to continue."
-            : selectedSession.modelUseBlocked ? 'Model access was revoked for this Session. Create a new Session to continue.'
-            : selectedSession.availability === 'archived' ? 'This Session is pending deletion. Retry Delete to finish removing it.'
-            : selectedSession.availability === 'unusable' ? 'This Agent Session cannot continue safely. Create a new Session.'
-              : selectedSession.availability === 'busy' ? 'A Run is active for this Session.'
-                : !modelReady ? 'Save a model route and API Key to start a chat.'
-                  : !workspace ? 'Loading the Workspace.'
-                    : workspace.sessionId !== selectedSessionId ? 'Binding this Session to the Workspace.'
-                      : confirmedWorkspaceRevision !== workspace.revision ? 'Review the Workspace source and confirm it before Send.'
-                        : goalMode === 'save-candidate' && (!workspace.documentRef || !workspace.jobId) ? 'Select a document and start a Task to save a candidate.' : ''}
-        onOpenRun={(id) => { setPage('model'); void loadRun(id); }}
+        contextName={documents.find((item) => item.documentRef.id === workspace?.documentRef?.id)?.displayName ?? null}
+        goalMode={goalMode}
+        canGenerate={Boolean(workspace?.documentRef && workspace.jobId)}
+        onGoalModeChange={setGoalMode}
+        sessionHint={!selectedSession ? selectedSessionId !== null ? 'Loading this chat. You can write while it loads.' : 'Write a message to start a new chat.'
+          : selectedSession.historyState === 'legacy-read-only' ? 'This older conversation is read only. Start a new chat to continue.'
+            : selectedSession.historyState === 'invalid' ? 'Saved conversation history is invalid. Start a new chat.'
+            : selectedSession.modelUseBlocked ? 'Model access was revoked for this chat. Start a new chat to continue.'
+            : selectedSession.availability === 'archived' ? 'This chat is pending deletion. Retry Delete to finish removing it.'
+            : selectedSession.availability === 'unusable' ? 'This chat cannot continue safely. Start a new chat.'
+              : selectedSession.availability === 'busy' ? 'This chat is responding.'
+                : !modelReady ? 'Save a Pi model and set up its authentication to start a chat.'
+                  : goalMode === 'save-candidate' && (!workspace?.documentRef || !workspace.jobId) ? 'Process an invoice first to generate a result.' : ''}
       />
+      {authFlow && <dialog ref={authDialogRef} className="model-auth-dialog" onCancel={(event) => { event.preventDefault(); cancelAuth(); }} aria-label="Model authentication">
+        <h2>Connect Pi provider</h2>
+        {authFlow.notice?.type === 'auth_url' && <p>{authFlow.notice.instructions ?? 'Open this link to sign in.'}<br /><a href={authFlow.notice.url} target="_blank" rel="noreferrer">Open sign-in page</a></p>}
+        {authFlow.notice?.type === 'device_code' && <p>Enter code <strong>{authFlow.notice.userCode}</strong> at <a href={authFlow.notice.verificationUri} target="_blank" rel="noreferrer">the provider sign-in page</a>.</p>}
+        {(authFlow.notice?.type === 'progress' || authFlow.notice?.type === 'info') && <p>{authFlow.notice.message}</p>}
+        {authFlow.prompt && <form onSubmit={(event) => { event.preventDefault(); void answerAuthPrompt(); }}>
+          <label className="field"><span>{authFlow.prompt.definition.message}</span>
+            {authFlow.prompt.definition.type === 'select' ? <select value={authFlow.prompt.value}
+              onChange={(event) => setAuthFlow((current) => current?.prompt ? { ...current, prompt: { ...current.prompt, value: event.target.value } } : current)}>
+              <option value="">Choose an option</option>{authFlow.prompt.definition.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+            </select> : <input type={authFlow.prompt.definition.type === 'secret' ? 'password' : 'text'}
+              placeholder={authFlow.prompt.definition.placeholder} value={authFlow.prompt.value}
+              onChange={(event) => setAuthFlow((current) => current?.prompt ? { ...current, prompt: { ...current.prompt, value: event.target.value } } : current)} />}
+          </label><button type="submit" className="primary-button" disabled={!authFlow.prompt.value}>Continue</button>
+        </form>}
+        <button type="button" className="secondary-button" onClick={cancelAuth}>Cancel</button>
+      </dialog>}
     </div>
   );
+}
+
+function ChatsPage({ sessions, selectedSessionId, hasMore, mutating, notice, onSelect, onRename, onDelete, onLoadMore }: {
+  sessions: readonly SessionSnapshot[];
+  selectedSessionId: number | null;
+  hasMore: boolean;
+  mutating: boolean;
+  notice: Notice;
+  onSelect(sessionId: number): void;
+  onRename(sessionId: number, title: string): Promise<boolean>;
+  onDelete(sessionId: number): Promise<void>;
+  onLoadMore(): void;
+}) {
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameTitle, setRenameTitle] = useState('');
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+  useLayoutEffect(() => {
+    if (renamingId !== null) { renameInputRef.current?.focus(); renameInputRef.current?.select(); }
+  }, [renamingId]);
+  return <section className="page-content chats-page">
+    <div className="page-heading"><div><h1>Chats</h1><p>Pick a conversation to continue in Assistant.</p></div></div>
+    {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
+    <section className="panel chat-directory">
+      <div className="panel-head"><h2>Conversations</h2><span>{sessions.length} loaded</span></div>
+      {sessions.length === 0 && <div className="empty-route"><strong>No chats yet</strong><span>Use New chat in the sidebar to start one.</span></div>}
+      {sessions.map((session) => <div className={`chat-directory-row ${session.sessionId === selectedSessionId ? 'selected' : ''}`}
+        data-session-id={session.sessionId} key={session.sessionId}>
+        <button className="chat-directory-open" type="button" onClick={() => onSelect(session.sessionId)}
+          aria-current={session.sessionId === selectedSessionId ? 'true' : undefined}>
+          <strong>{chatTitle(session.title)}</strong>
+          <small>{session.historyState === 'legacy-read-only' ? 'Read only' : session.historyState === 'invalid' ? 'History unavailable'
+            : session.modelUseBlocked ? 'Access revoked' : session.availability === 'busy' ? 'Responding' : 'Ready'}
+            {' · '}{new Date(session.updatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</small>
+        </button>
+        {renamingId === session.sessionId ? <form className="chat-directory-rename" onSubmit={async (event) => {
+          event.preventDefault();
+          if (await onRename(session.sessionId, renameTitle)) setRenamingId(null);
+        }}>
+          <input ref={renameInputRef} aria-label="Chat title" value={renameTitle} maxLength={120}
+            onChange={(event) => setRenameTitle(event.target.value)} />
+          <button type="submit" disabled={mutating}>Save</button>
+          <button type="button" onClick={() => setRenamingId(null)}>Cancel</button>
+        </form> : <div className="chat-directory-actions">
+          <button type="button" onClick={() => { setRenamingId(session.sessionId); setRenameTitle(session.title); }}
+            disabled={mutating || session.status === 'archived'}>Rename</button>
+          <button type="button" disabled={mutating || session.hasBusinessHistory}
+            title={session.hasBusinessHistory ? 'This chat has invoice history and cannot be deleted.' : undefined}
+            onClick={() => {
+              if (window.confirm(`Permanently delete this chat (“${chatTitle(session.title)}”) and its messages? Other chats and connection tests will be kept. This cannot be undone.`)) void onDelete(session.sessionId);
+            }}>Delete</button>
+        </div>}
+      </div>)}
+      {hasMore && <button type="button" className="chat-directory-more" onClick={onLoadMore}>Load more chats</button>}
+    </section>
+  </section>;
 }
 
 function WorkspacePage(props: {
   workspace: WorkspaceSnapshot | null;
   documents: readonly DocumentSnapshot[];
-  jobs: readonly JobSnapshot[];
-  selectedSessionId: number | null;
-  confirmed: boolean;
-  goalMode: 'answer' | 'save-candidate';
+  candidates: readonly CandidateSummary[];
+  candidateDetail: CandidateJobDetail | null;
   taskGoal: string;
   parsedPage: InvoiceToolOutput<'read_invoice_document'> | null;
   originalImage: DocumentOriginalImage | null;
@@ -980,124 +1281,125 @@ function WorkspacePage(props: {
   onImport(): void;
   onSelectDocument(id: number | null): void;
   onStartTask(): void;
-  onConfirm(): void;
-  onGoalModeChange(value: 'answer' | 'save-candidate'): void;
+  onOpenCandidate(jobId: number, candidateId: number): void;
   onTaskGoalChange(value: string): void;
   onChangeView(value: 'original' | 'parsed' | 'candidate'): void;
   onRefresh(): void;
   onRevokeModelAccess(): void;
   revokingAccess: boolean;
 }) {
-  const { workspace, documents, jobs, selectedSessionId, confirmed, goalMode, taskGoal, parsedPage, originalImage, notice, revokingAccess } = props;
+  const { workspace, documents, candidates, candidateDetail, taskGoal, parsedPage, originalImage, notice, revokingAccess } = props;
   const selectedDocument = documents.find((item) => item.documentRef.id === workspace?.documentRef?.id) ?? null;
-  return <section className="page-content">
+  return <section className="page-content invoice-page">
     <div className="page-heading">
-      <div><div className="eyebrow">P3 · FORMAL INPUT</div><h1>Workspace.</h1><p>Choose existing invoice material, review its parsed evidence, then explicitly start a Task.</p></div>
-      <div className="model-stamp"><span className="stamp-label">WORKSPACE REVISION</span><strong>{workspace?.revision ?? '—'}</strong><small>{workspace?.sessionId ? `Session #${workspace.sessionId}` : 'No Session bound'}</small></div>
+      <div><h1>Invoices</h1><p>Review the original, parsed details and saved results in one place.</p></div>
+      <div className="invoice-heading-actions"><select className="context-select" aria-label="Choose invoice" value={workspace?.documentRef?.id ?? ''} onChange={(event) => props.onSelectDocument(Number(event.target.value))}><option value="" disabled>Choose invoice</option>{documents.map((item) => <option key={item.documentRef.id} value={item.documentRef.id}>{item.displayName}</option>)}</select><button className="secondary-button" onClick={props.onImport}>＋ Import invoice</button></div>
     </div>
     {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
-    <section className="panel model-list-panel">
-      <div className="panel-head"><div><span className="section-index">FORMAL DOCUMENTS</span><h2>Invoice materials</h2></div>
-        <div className="button-row"><button className="secondary-button" onClick={props.onRefresh}>Refresh</button><button className="primary-button" onClick={props.onImport}>＋ Choose and import</button></div>
-      </div>
-      {documents.length === 0 ? <div className="empty-route"><strong>No imported documents</strong><span>Import a directory that contains the existing original and parser output.</span></div> :
+    <section className="invoice-context">
+      <div className="invoice-context-head"><strong>All invoices</strong><button className="text-button" onClick={props.onRefresh} aria-label="Refresh invoices" title="Refresh invoices">↻</button></div>
+      {documents.length === 0 ? <div className="empty-route"><strong>No invoices yet</strong><span>Import an invoice to begin.</span></div> :
         <div className="model-list">{documents.map((document) => <button key={`${document.documentRef.id}:${document.documentRef.version}`} className={`route-row ${workspace?.documentRef?.id === document.documentRef.id ? 'selected' : ''}`} onClick={() => props.onSelectDocument(document.documentRef.id)}>
-          <span className="route-icon">▧</span><span className="route-name"><strong>Document #{document.documentRef.id}</strong><small>{document.pageCount} pages · {document.parser.name} {document.parser.version}</small></span>
-          <span className={`credential-pill ${document.status === 'available' ? 'ready' : ''}`}>{document.status.toUpperCase()}</span>
+          <span className="route-icon">▧</span><span className="route-name"><strong>{document.displayName}</strong><small>{document.pageCount} {document.pageCount === 1 ? 'page' : 'pages'} · {new Date(document.createdAt).toLocaleDateString()}</small></span>
         </button>)}</div>}
-      {workspace?.documentRef && <div className="config-note"><span className="note-mark">i</span><span>Selected source · Document #{workspace.documentRef.id} · revision {workspace.documentRef.version}{selectedDocument?.unavailableReason ? ` · ${selectedDocument.unavailableReason}` : ''}</span></div>}
-      {workspace?.documentRef && <div className="config-actions"><span className="action-spacer" /><button className="danger-action" disabled={revokingAccess} onClick={props.onRevokeModelAccess}>{revokingAccess ? 'Revoking…' : 'Revoke model access'}</button></div>}
     </section>
 
-    {workspace?.documentRef && <section className="panel config-panel">
-      <div className="panel-head"><div><span className="section-index">SOURCE REVIEW</span><h2>Original and parsed evidence</h2></div><span className="revision-tag">PAGE 1</span></div>
-      <div className="button-row">
+    {workspace?.documentRef && <section className="panel config-panel invoice-sheet">
+      <div className="panel-head"><div><h2>{selectedDocument?.displayName ?? 'Invoice'}</h2><p className="invoice-subtitle">{selectedDocument?.pageCount ?? 1} {selectedDocument?.pageCount === 1 ? 'page' : 'pages'} · Imported {selectedDocument ? new Date(selectedDocument.createdAt).toLocaleDateString() : 'recently'}</p></div>
+        <details className="invoice-access"><summary>Material access</summary><button className="danger-action" disabled={revokingAccess} onClick={props.onRevokeModelAccess}>{revokingAccess ? 'Revoking…' : 'Revoke model access'}</button></details>
+      </div>
+      <div className="button-row invoice-tabs" role="tablist" aria-label="Invoice view">
         <button className={workspace.activeView === 'original' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('original')}>Original</button>
         <button className={workspace.activeView === 'parsed' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('parsed')}>Parsed</button>
-        <button className={workspace.activeView === 'candidate' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('candidate')}>Candidate</button>
+        <button className={workspace.activeView === 'candidate' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('candidate')}>Results</button>
       </div>
       {workspace.activeView === 'original' && (originalImage
         ? <figure><img style={{ maxWidth: '100%', maxHeight: '60vh', objectFit: 'contain' }} src={`data:${originalImage.mimeType};base64,${originalImage.base64}`} alt={`Original invoice document page 1`} /><figcaption>Original page shown for user review.</figcaption></figure>
         : <p className="config-note">Original page is unavailable. The selected document may be missing its source asset.</p>)}
       {workspace.activeView === 'parsed' && (parsedPage
-        ? <div className="model-list">{parsedPage.blocks.map((block) => <article className="route-row" key={block.id}>
+        ? <div className="model-list parsed-list">{parsedPage.blocks.map((block) => <article className="route-row" key={block.id}>
           <span className="route-icon">{block.kind === 'table' ? '▤' : block.kind === 'image' ? '▧' : '¶'}</span>
-          <span className="route-name"><strong>{block.id} · {block.kind}</strong><small>{block.text || '(no extracted text)'}</small><small>Page {block.source.page} · artifact #{block.source.artifactId}{block.source.quote ? ` · ${block.source.quote}` : ''}</small></span>
+          <span className="route-name"><strong>{block.kind === 'table' ? 'Table' : block.kind === 'image' ? 'Image note' : 'Text'} · Page {block.source.page}</strong><small>{block.text || '(no extracted text)'}</small></span>
         </article>)}</div>
         : <p className="config-note">Parsed page could not be loaded.</p>)}
-      {workspace.activeView === 'candidate' && <p className="config-note">Candidate details and source links are available in Tasks after a Run saves a candidate.</p>}
+      {workspace.activeView === 'candidate' && <div className="invoice-results">{candidates.length === 0
+        ? <div className="empty-route"><strong>No results yet</strong><span>Choose Process this invoice, then send the request in Assistant.</span></div>
+        : <div className="model-list">{candidates.map((item) => <button className="route-row" key={item.candidateId} onClick={() => workspace.jobId && props.onOpenCandidate(workspace.jobId, item.candidateId)}><span className="route-icon">✓</span><span className="route-name"><strong>Result {item.sequence}</strong><small>{item.issueCount ? `${item.issueCount} issues to review` : 'No issues found'} · {new Date(item.createdAt).toLocaleDateString()}</small></span></button>)}</div>}
+        {candidateDetail && <CandidateDetails detail={candidateDetail} />}</div>}
     </section>}
 
-    <section className="panel profile-panel">
-      <div className="panel-head"><div><span className="section-index">START TASK</span><h2>Freeze this source for a Job</h2></div><span className="revision-tag">NEXT #{workspace?.nextTaskSequence ?? '—'}</span></div>
-      <label className="field full"><span>Task goal</span><textarea value={taskGoal} onChange={(event) => props.onTaskGoalChange(event.target.value)} maxLength={4096} rows={3} placeholder="What should the Agent prepare from this invoice?" /></label>
-      <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace?.documentRef || !selectedSessionId || !taskGoal.trim()} onClick={props.onStartTask}>Start Task</button></div>
-      <p className="config-note">Starting a Task creates the Job from the selected document. Choose or create a Session in Agent Chat first.</p>
+    <section className="panel invoice-process">
+      <div className="panel-head"><div><h2>Process this invoice</h2><p className="invoice-subtitle">Prepare a result from the parsed content. The model starts only when you press Send.</p></div></div>
+      <details><summary>Additional requirements</summary><label className="field full"><span>What else should the assistant consider?</span><textarea value={taskGoal} onChange={(event) => props.onTaskGoalChange(event.target.value)} maxLength={3500} rows={3} placeholder="Optional instructions for this invoice" /></label></details>
+      <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace?.documentRef} onClick={props.onStartTask}>Process this invoice</button></div>
     </section>
-
-    <section className="panel profile-panel">
-      <div className="panel-head"><div><span className="section-index">RUN GATE</span><h2>Confirm current Workspace</h2></div><span className={`credential-pill ${confirmed ? 'ready' : ''}`}>{confirmed ? 'CONFIRMED' : 'REVIEW REQUIRED'}</span></div>
-      <label className="field"><span>Run goal mode</span><select value={goalMode} onChange={(event) => props.onGoalModeChange(event.target.value as 'answer' | 'save-candidate')}>
-        <option value="answer">Answer only</option><option value="save-candidate" disabled={!workspace?.jobId || !workspace?.documentRef}>Prepare and save candidate</option>
-      </select></label>
-      <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace || !selectedSessionId || workspace.sessionId !== selectedSessionId} onClick={props.onConfirm}>{confirmed ? 'Reconfirm Workspace' : 'Confirm Workspace'}</button></div>
-      <p className="config-note">Changing Session, document, Job, view or selected candidate changes the revision and requires confirmation again. Send stays disabled until the current revision and Session match.</p>
-    </section>
-    <footer className="page-footer"><span>MODEL RUNS START ONLY FROM EXPLICIT SEND</span><span>FORMAL INPUT · NO BENCHMARK GOLD</span></footer>
+    <footer className="page-footer"><span>The original is for your review. Assistant uses registered parsed content and source references.</span></footer>
   </section>;
 }
 
 function TasksPage(props: {
   workspace: WorkspaceSnapshot | null;
+  documents: readonly DocumentSnapshot[];
   jobs: readonly JobSnapshot[];
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
   activity: readonly BusinessEventSnapshot[];
-  confirmed: boolean;
   notice: Notice;
   onOpenJob(jobId: number): void;
+  onHideJob(jobId: number): void;
   onOpenCandidate(jobId: number, candidateId: number): void;
   onSelectCandidate(jobId: number, candidateId: number): void;
-  onConfirm(): void;
 }) {
-  const { workspace, jobs, candidates, candidateDetail, activity, confirmed } = props;
+  const { workspace, jobs, candidates, candidateDetail, activity } = props;
   const job = jobs.find((item) => item.jobId === workspace?.jobId) ?? null;
+  const documentName = (documentId: number) => props.documents.find((item) => item.documentRef.id === documentId)?.displayName ?? 'Invoice';
   return <section className="page-content">
-    <div className="page-heading"><div><div className="eyebrow">P3 · TASKS AND CANDIDATES</div><h1>Tasks.</h1><p>Inspect Job status, saved candidates, source references and business activity.</p></div><div className="model-stamp"><span className="stamp-label">ACTIVE JOB</span><strong>{job ? `#${job.jobId}` : 'None'}</strong><small>{job?.status ?? 'Select a Job'}</small></div></div>
+    <div className="page-heading"><div><h1>Processing History</h1><p>Review prepared results, their sources, issues and past actions.</p></div></div>
     {props.notice && <div className={`notice ${props.notice.tone}`} role="status">{props.notice.message}</div>}
-    <section className="panel model-list-panel"><div className="panel-head"><div><span className="section-index">JOBS</span><h2>Task history</h2></div></div>
-      {jobs.length === 0 ? <div className="empty-route"><strong>No Tasks yet</strong><span>Choose a formal document in Workspace and click Start Task.</span></div> :
-        <div className="model-list">{jobs.map((item) => <button key={item.jobId} className={`route-row ${item.jobId === workspace?.jobId ? 'selected' : ''}`} onClick={() => props.onOpenJob(item.jobId)}>
-          <span className="route-icon">☷</span><span className="route-name"><strong>Job #{item.jobId} · {item.status}</strong><small>Document #{item.documentRef.id} · {item.goal}</small><small>Candidate pointer · {item.currentCandidateId ? `#${item.currentCandidateId}` : 'none'}</small></span><span className="credential-pill">OPEN</span>
-        </button>)}</div>}
+    <section className="panel model-list-panel"><div className="panel-head"><div><h2>Recent processing</h2></div></div>
+      {jobs.length === 0 ? <div className="empty-route"><strong>No processing yet</strong><span>Choose an invoice and select Process this invoice.</span></div> :
+        <div className="model-list">{jobs.map((item) => <div key={item.jobId} className={`route-row ${item.jobId === workspace?.jobId ? 'selected' : ''}`}>
+          <span className="route-icon">☷</span><button className="route-name processing-open" type="button" onClick={() => props.onOpenJob(item.jobId)}><strong>{documentName(item.documentRef.id)}</strong><small>{item.goal}</small></button><span className="credential-pill">{item.status}</span>
+          <button className="text-button danger-text" type="button" onClick={() => props.onHideJob(item.jobId)}>Delete</button>
+        </div>)}</div>}
     </section>
     {job && <>
-      <section className="panel config-panel"><div className="panel-head"><div><span className="section-index">SAVED CANDIDATES</span><h2>Job #{job.jobId}</h2></div><span className="revision-tag">{candidates.length} shown</span></div>
-        {candidates.length === 0 ? <p className="config-note">No candidate has been saved. Confirm this Workspace, then Send a Run in “Prepare and save candidate” mode.</p> :
+      <section className="panel config-panel"><div className="panel-head"><div><h2>Results for {documentName(job.documentRef.id)}</h2></div><span className="revision-tag">{candidates.length} saved</span></div>
+        {candidates.length === 0 ? <p className="config-note">No result has been saved. The assistant can prepare one when you send a processing request.</p> :
           <div className="model-list">{candidates.map((item) => <div className="route-row" key={item.candidateId}>
-            <span className="route-icon">{item.status === 'accepted' ? '✓' : '▧'}</span><span className="route-name"><strong>Candidate #{item.candidateId} · {item.status}</strong><small>Sequence {item.sequence} · Run #{item.runId} · {item.issueCount} issues · {item.createdAt}</small></span>
+            <span className="route-icon">{item.status === 'accepted' ? '✓' : '▧'}</span><span className="route-name"><strong>Result {item.sequence} · {item.status}</strong><small>{item.issueCount} issues · {new Date(item.createdAt).toLocaleString()}</small></span>
             <button className="text-button" onClick={() => props.onOpenCandidate(job.jobId, item.candidateId)}>View</button>
             {item.status === 'generated' && item.candidateId !== job.currentCandidateId && <button className="secondary-button" onClick={() => props.onSelectCandidate(job.jobId, item.candidateId)}>Select</button>}
           </div>)}</div>}
       </section>
-      {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><div><span className="section-index">CANDIDATE DETAILS</span><h2>Candidate #{candidateDetail.candidate.candidateId}</h2></div><span className="revision-tag">Run #{candidateDetail.candidate.runId}</span></div>
-        <div className="profile-fields">{Object.entries(candidateDetail.candidate.fields).map(([name, field]) => <div key={name}><strong>{name}</strong><div>{field.raw ?? '—'} {field.normalized && field.normalized !== field.raw ? `→ ${field.normalized}` : ''} · {field.state}</div></div>)}</div>
-        <h3>Issues</h3>{candidateDetail.candidate.issues.length === 0 ? <p>No validation issues.</p> : <ul>{candidateDetail.candidate.issues.map((issue, index) => <li key={`${issue.code}:${index}`}>{issue.severity} · {issue.message} ({issue.fieldPaths.join(', ') || 'document'})</li>)}</ul>}
-        <h3>Sources</h3>{candidateDetail.candidate.sources.length === 0 ? <p>No explicit source links were saved.</p> : <ul>{candidateDetail.candidate.sources.map((source, index) => <li key={`${source.artifactId}:${source.page}:${source.blockId}:${index}`}>Document #{source.documentId} · artifact #{source.artifactId} · page {source.page} · {source.blockId ?? 'page'}{source.quote ? ` · “${source.quote}”` : ''}</li>)}</ul>}
-        {candidateDetail.candidate.lines.map((line, index) => <details key={index}><summary>Line {index + 1} · {line.description.raw ?? 'description missing'}</summary><pre>{stringify(line)}</pre></details>)}
-      </section>}
-      <section className="panel profile-panel"><div className="panel-head"><div><span className="section-index">BUSINESS ACTIVITY</span><h2>Job #{job.jobId} events</h2></div></div>
-        {activity.length === 0 ? <p>No business events are recorded yet.</p> : <ol>{activity.map((event) => <li key={event.id}><strong>{event.type}</strong> · {event.result} · {event.safeSummary} · {event.occurredAt}{event.errorCode ? ` · ${event.errorCode}` : ''}</li>)}</ol>}
+      {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><h2>Result details</h2></div><CandidateDetails detail={candidateDetail} /></section>}
+      <section className="panel profile-panel"><div className="panel-head"><h2>Activity</h2></div>
+        {activity.length === 0 ? <p className="config-note">No actions recorded yet.</p> : <ol>{activity.map((event) => <li key={event.id}><strong>{activityLabel(event.type)}</strong> · {event.result} · {event.safeSummary} · {new Date(event.occurredAt).toLocaleString()}</li>)}</ol>}
       </section>
     </>}
-    <section className="panel profile-panel"><div className="panel-head"><div><span className="section-index">RUN CONFIRMATION</span><h2>Workspace must be reviewed after a change</h2></div><span className={`credential-pill ${confirmed ? 'ready' : ''}`}>{confirmed ? 'CONFIRMED' : 'REVIEW REQUIRED'}</span></div><p className="config-note">{workspace?.documentRef ? `Document #${workspace.documentRef.id}` : 'No document'} · {workspace?.jobId ? `Job #${workspace.jobId}` : 'no Job'} · Session {workspace?.sessionId ? `#${workspace.sessionId}` : 'unbound'} · revision ${workspace?.revision ?? '—'}</p><div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace?.sessionId} onClick={props.onConfirm}>Confirm Workspace</button></div></section>
-    <footer className="page-footer"><span>CANDIDATES ARE GENERATED, NOT ACCEPTED</span><span>ACTIVITY IS A BUSINESS RECORD</span></footer>
   </section>;
+}
+
+function activityLabel(type: BusinessEventSnapshot['type']): string {
+  return ({ document_imported: 'Invoice imported', task_started: 'Processing started',
+    candidate_generated: 'Result prepared', candidate_selected: 'Result selected' })[type];
+}
+
+function CandidateDetails({ detail }: { detail: CandidateJobDetail }) {
+  const candidate = detail.candidate;
+  return <div className="candidate-details">
+    <div className="profile-fields">{Object.entries(candidate.fields).map(([name, field]) => <div key={name}><strong>{name.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase())}</strong><p>{field.normalized ?? field.raw ?? '—'}</p><small>{field.state.replaceAll('_', ' ')}</small></div>)}</div>
+    {candidate.lines.length > 0 && <><h3>Line items</h3><ul>{candidate.lines.map((line, index) => <li key={index}>{line.description.raw ?? 'Unnamed item'} · {line.quantity.normalized ?? line.quantity.raw ?? '—'} × {line.unitPrice.normalized ?? line.unitPrice.raw ?? '—'} = {line.totalAmount.normalized ?? line.totalAmount.raw ?? '—'}</li>)}</ul></>}
+    <h3>Issues</h3>{candidate.issues.length ? <ul>{candidate.issues.map((issue, index) => <li key={index}>{issue.severity} · {issue.message}</li>)}</ul> : <p className="config-note">No validation issues.</p>}
+    <h3>Sources</h3>{candidate.sources.length ? <ul>{candidate.sources.map((source, index) => <li key={index}>Page {source.page}{source.quote ? ` · “${source.quote}”` : ''}</li>)}</ul> : <p className="config-note">No source links were saved.</p>}
+  </div>;
 }
 
 function modelFieldsEqual(left: ModelProfile, right: ModelProfile): boolean {
   return left.id === right.id && left.name === right.name && left.baseUrl === right.baseUrl && left.model === right.model
-    && left.api === right.api && left.credentialRef === right.credentialRef;
+    && left.api === right.api && left.credentialRef === right.credentialRef && left.kind === right.kind
+    && left.providerId === right.providerId && left.contextWindow === right.contextWindow
+    && left.maxTokens === right.maxTokens && left.reasoning === right.reasoning;
 }
 
 function turnFromRun(run: AgentRunSnapshot): ChatTurn {
@@ -1109,64 +1411,19 @@ function turnFromRun(run: AgentRunSnapshot): ChatTurn {
     runId: run.runId,
     prompt: typeof input.text === 'string' ? input.text : 'Input unavailable.',
     response: typeof output?.text === 'string' && output.text ? output.text : null,
-    error: run.error?.message ?? null,
+    error: run.error ? errorMessage({ error: run.error }) : null,
     status: run.status === 'completed' ? 'completed' : run.status === 'cancelled' ? 'cancelled'
       : run.status === 'failed' ? 'failed' : 'sending',
   };
 }
 
-function RunDetails({ run, runId, trace, onRefresh }: { run: RunSnapshot | null; runId: number | null; trace: PromptTraceResult | null; onRefresh(): void }) {
-  if (!run) return <section className="run-panel loading-run"><span className="loader-ring" /><span>Loading the persisted Run…</span><button className="text-button" onClick={onRefresh}>Refresh</button></section>;
-  const input = run.input as { goal?: string; text?: string };
-  const output = run.output as { text?: string; partial?: boolean; responseModel?: string | null; stopReason?: string } | null;
-  const config = run.config as { requestedModel?: { provider?: string; model?: string }; resolvedModel?: { provider?: string; model?: string } | null; api?: string | null; endpoint?: string | null };
-  const usage = run.usage as { source?: string; reason?: string | null; sdkValues?: { input?: number | null; output?: number | null; totalTokens?: number | null; costTotal?: number | null } | null; attempts?: number | null };
-  const cleanup = run.cleanup as { stopped?: boolean; stopReason?: string | null; errors?: unknown[] };
-  return <section className="run-panel">
-    <div className="run-heading"><div><span className="section-index">PERSISTED {run.kind === 'agent' ? 'AGENT' : 'PROVIDER'} RUN</span><h2>Run {runId ?? run.runId} <span className={`run-status ${run.status}`}>{run.status}</span></h2></div><button className="quiet-button" onClick={onRefresh}>↻ Refresh facts</button></div>
-    <div className="run-grid">
-      <article className="fact-card"><span className="fact-label">MODEL ROUTE</span><strong>{config.resolvedModel?.model ?? config.requestedModel?.model ?? 'Unknown'}</strong><small>{config.api ?? 'API unknown'} · {config.endpoint ?? 'endpoint unavailable'}</small></article>
-      <article className="fact-card"><span className="fact-label">USAGE</span><strong>{usage.source === 'sdk' ? `${usage.sdkValues?.totalTokens ?? 'Unknown'} tokens` : 'Unknown'}</strong><small>{usage.reason ?? `Attempts: ${usage.attempts ?? 'unknown'}`}</small></article>
-      <article className="fact-card"><span className="fact-label">STOP & CLEANUP</span><strong>{cleanup.stopped === true ? 'Stopped' : cleanup.stopped === false ? 'Not confirmed' : 'Unknown'}</strong><small>{cleanup.stopReason ?? 'No stop request'}</small></article>
-    </div>
-    <div className="evidence-columns">
-      <article className="evidence-block"><span className="fact-label">INPUT SENT</span><div className="input-copy"><b>Instruction</b><p>{input.goal ?? 'Not recorded'}</p><b>Message</b><p>{input.text ?? 'Not recorded'}</p></div></article>
-      <article className="evidence-block response-block"><span className="fact-label">ACTUAL RESPONSE {output?.partial ? '· PARTIAL' : ''}</span><pre className="response-copy">{output?.text || 'No response text was persisted.'}</pre></article>
-    </div>
-    {(run.error || (cleanup.errors?.length ?? 0) > 0) && <div className="error-facts"><span className="fact-label">FAILURE / CLEANUP FACTS</span><pre>{stringify({ error: run.error, cleanup })}</pre></div>}
-    <section className="prompt-trace-panel" aria-label="Temporary Prompt Trace">
-      <div className="trace-heading"><div><span className="section-index">TEMPORARY PROMPT TRACE</span><p>One logical model call; this in-memory summary is cleared when the Host exits.</p></div><strong>{trace?.availability ?? 'loading'}</strong></div>
-      {!trace && <p className="trace-empty">Loading trace availability…</p>}
-      {trace && trace.availability !== 'available' && <p className="trace-empty">{trace.availability === 'not-started' ? 'No model call started for this Run.'
-        : trace.availability === 'evicted' ? 'This call summary was evicted from the bounded buffer.'
-          : trace.availability === 'process-exited' ? 'The Host process that owned this in-memory trace has exited.'
-            : trace.availability === 'not-collected' ? 'Prompt Trace was not collected for this Run type.'
-              : 'The trace source is unavailable. Saved Run facts remain available.'}</p>}
-      {trace?.calls.map((call) => <div className="trace-call" key={`${call.runId}-${call.callSequence}`}>
-        <div className="trace-call-heading"><span>CALL {call.callSequence} · {call.state}</span><span>{call.droppedEntries} entries dropped</span></div>
-        <ol>{call.entries.map((entry, index) => <li key={`${entry.at}-${index}`}><time>{new Date(entry.at).toLocaleTimeString()}</time><code>{entry.event}</code><span>{entry.summary}{entry.truncated ? ' · truncated' : ''}</span></li>)}</ol>
-      </div>)}
-      {trace?.availability === 'available' && <small className="trace-retention">{trace.droppedCalls ?? 0} ended call summaries evicted from this Host process.</small>}
-    </section>
-    <details className="raw-run"><summary>Full persisted Run record</summary><pre>{stringify(run)}</pre></details>
-  </section>;
-}
-
 function AgentChatPanel({
   collapsed,
   onToggle,
-  sessions,
   selectedSessionId,
   selectedSession,
-  sessionLoading,
-  hasMoreSessions,
   hasOlderRuns,
-  onSelectSession,
-  onNewSession,
-  onRenameSession,
-  onDeleteSession,
-  sessionMutating,
-  onLoadMoreSessions,
+  onNewChatAndSend,
   onLoadOlderRuns,
   turns,
   transcriptRef,
@@ -1176,7 +1433,6 @@ function AgentChatPanel({
   onSend,
   onCancel,
   enabled,
-  inputEnabled,
   busy,
   cancelPending,
   activeAgentRunId,
@@ -1185,23 +1441,18 @@ function AgentChatPanel({
   selectedModelId,
   modelName,
   modelId,
+  contextName,
+  goalMode,
+  canGenerate,
+  onGoalModeChange,
   sessionHint,
-  onOpenRun,
 }: {
   collapsed: boolean;
   onToggle(): void;
-  sessions: readonly SessionSnapshot[];
   selectedSessionId: number | null;
   selectedSession: SessionSnapshot | null;
-  sessionLoading: boolean;
-  hasMoreSessions: boolean;
   hasOlderRuns: boolean;
-  onSelectSession(sessionId: number): void;
-  onNewSession(): void;
-  onRenameSession(sessionId: number, title: string): Promise<boolean>;
-  onDeleteSession(sessionId: number): Promise<void>;
-  sessionMutating: boolean;
-  onLoadMoreSessions(): void;
+  onNewChatAndSend(): void;
   onLoadOlderRuns(): void;
   turns: readonly ChatTurn[];
   transcriptRef: RefObject<HTMLDivElement | null>;
@@ -1211,7 +1462,6 @@ function AgentChatPanel({
   onSend(): void;
   onCancel(): void;
   enabled: boolean;
-  inputEnabled: boolean;
   busy: boolean;
   cancelPending: boolean;
   activeAgentRunId: number | null;
@@ -1220,99 +1470,55 @@ function AgentChatPanel({
   selectedModelId: string | null;
   modelName: string | null;
   modelId: string | null;
+  contextName: string | null;
+  goalMode: 'answer' | 'save-candidate';
+  canGenerate: boolean;
+  onGoalModeChange(value: 'answer' | 'save-candidate'): void;
   sessionHint: string;
-  onOpenRun(runId: number): void;
 }) {
-  const [renaming, setRenaming] = useState(false);
-  const [renameTitle, setRenameTitle] = useState('');
-  const [editingSessionId, setEditingSessionId] = useState<number | null>(null);
-  const renameInputRef = useRef<HTMLInputElement | null>(null);
-  useEffect(() => {
-    setRenaming(false);
-    setEditingSessionId(null);
-    setRenameTitle(selectedSession?.title ?? '');
-  }, [selectedSessionId]);
-  useLayoutEffect(() => {
-    if (!renaming || !renameInputRef.current) return;
-    renameInputRef.current.focus();
-    renameInputRef.current.select();
-  }, [renaming, selectedSessionId]);
   if (collapsed) {
     return <aside className="agent-chat-panel collapsed" data-testid="agent-chat-panel">
-      <button className="chat-expand" type="button" onClick={onToggle} aria-label="Expand Agent Chat" aria-expanded={false} title="Expand Agent Chat"><span aria-hidden="true">‹</span><b>CHAT</b></button>
+      <button className="chat-expand" type="button" onClick={onToggle} aria-label="Open Assistant" aria-expanded={false} title="Open Assistant"><span aria-hidden="true">‹</span><b>Assistant</b></button>
     </aside>;
   }
-  return <aside className="agent-chat-panel" data-testid="agent-chat-panel" aria-label="Agent Chat">
+  return <aside className="agent-chat-panel" data-testid="agent-chat-panel" aria-label="Assistant" onKeyDown={(event) => { if (event.key === 'Escape' && window.innerWidth < 1080) onToggle(); }}>
     <header className="chat-panel-head">
-      <div><span className="section-index">PI NATIVE AGENT</span><h2>Agent Chat</h2></div>
-      <button className="chat-new-session" type="button" onClick={onNewSession} disabled={sessionLoading || sessionMutating}>{sessionLoading ? 'Creating…' : sessionMutating ? 'Working…' : '＋ New'}</button>
-      <button className="chat-collapse" type="button" onClick={onToggle} aria-label="Collapse Agent Chat" aria-expanded={true} title="Collapse Agent Chat">›</button>
+      <div><h2>Assistant</h2><span className="chat-current-title">{selectedSession ? chatTitle(selectedSession.title) : 'New conversation'}</span></div>
+      <button className="chat-collapse" type="button" onClick={onToggle} aria-label="Close Assistant" aria-expanded={true} title="Close Assistant">›</button>
     </header>
-    <div className="chat-model-row"><span className={`status-dot ${enabled ? 'is-ready' : 'is-error'}`} /><div><strong>{modelName ?? 'No model configured'}</strong><small>{modelId ?? 'Open Model to add a route'}</small></div></div>
-    <div className="chat-session-select">
-      <label htmlFor="agent-session-select">SESSION</label>
-      <select id="agent-session-select" aria-label="Session" value={selectedSessionId ?? ''} disabled={sessionMutating} onChange={(event) => { const id = Number(event.target.value); if (Number.isSafeInteger(id) && id > 0) onSelectSession(id); }}>
-        <option value="">Select a Session</option>
-        {sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.title} · #{session.sessionId}</option>)}
-      </select>
-      {selectedSession && <details className="chat-session-actions">
-        <summary aria-label="Session actions" title="Session actions">•••</summary>
-        <div className="chat-session-action-menu">
-          <button type="button" onClick={(event) => {
-            setRenameTitle(selectedSession.title);
-            setEditingSessionId(selectedSession.sessionId);
-            setRenaming(true);
-            event.currentTarget.closest('details')?.removeAttribute('open');
-          }} disabled={sessionMutating || selectedSession.status === 'archived'}>Rename</button>
-          <button type="button" className="danger-action" disabled={sessionMutating || selectedSession.hasBusinessHistory}
-            aria-describedby={selectedSession.hasBusinessHistory ? `session-delete-reason-${selectedSession.sessionId}` : undefined} onClick={() => {
-            const title = selectedSession.title;
-            if (window.confirm(`Permanently delete only this Session (“${title}”), including its conversations and Agent Runs? Other Sessions and Provider test Runs will be kept. This cannot be undone.`)) void onDeleteSession(selectedSession.sessionId);
-          }}>Delete Session</button>
-          {selectedSession.hasBusinessHistory && <span id={`session-delete-reason-${selectedSession.sessionId}`} role="note">This Session contains invoice history and cannot be deleted.</span>}
-        </div>
-      </details>}
-      {hasMoreSessions && <button type="button" className="chat-more" onClick={onLoadMoreSessions}>More</button>}
-    </div>
-    {renaming && selectedSession && <form className="chat-session-rename" onSubmit={async (event) => {
-      event.preventDefault();
-      if (editingSessionId !== null && await onRenameSession(editingSessionId, renameTitle)) setRenaming(false);
-    }}>
-      <label className="sr-only" htmlFor="agent-session-title">Session title</label>
-      <input ref={renameInputRef} id="agent-session-title" aria-label="Session title" value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} autoFocus />
-      <button type="submit" disabled={sessionMutating}>Save</button>
-      <button type="button" onClick={() => setRenaming(false)} disabled={sessionMutating}>Cancel</button>
-    </form>}
+    <div className="chat-model-row"><span className={`status-dot ${modelName ? 'is-ready' : 'is-error'}`} /><div><strong>{modelName ?? 'Set up a model in Settings'}</strong></div></div>
     {selectedSession && <div className="chat-session-state"><span className={`status-dot ${selectedSession.availability === 'ready' ? 'is-ready' : selectedSession.availability === 'busy' ? 'is-warning' : 'is-error'}`} />
-      <span>{selectedSession.availability === 'ready' ? 'Ready for another Run' : selectedSession.availability === 'busy' ? 'Run in progress' : selectedSession.availability === 'history-unavailable' ? 'History unavailable after restart' : selectedSession.availability === 'unusable' ? 'Session cannot continue' : selectedSession.availability}</span>
+      <span>{selectedSession.historyState === 'legacy-read-only' ? 'Read only · older conversation' : selectedSession.historyState === 'invalid' ? 'History cannot be restored' : selectedSession.availability === 'ready' ? 'Ready' : selectedSession.availability === 'busy' ? 'Responding' : selectedSession.availability === 'unusable' ? 'Cannot continue' : 'Unavailable'}</span>
     </div>}
     {activeAgentRunId !== null && activeAgentSessionId !== null && activeAgentSessionId !== selectedSessionId
-      && <div className="chat-active-run">Run {activeAgentRunId} continues in Session #{activeAgentSessionId}. Stop remains bound to that Run.</div>}
-    {busy && activeRunModel && <div className="chat-run-model">RUNNING WITH · {activeRunModel.name} · {activeRunModel.model}{selectedModelId !== activeRunModel.id && <span>The selected model will be used for the next Run.</span>}</div>}
-    <div className="chat-boundary">Each Send starts a new Run in this native Session. P2 keeps Agent history in memory for this process; saved Session history cannot be restored after restart.</div>
+      && <div className="chat-active-run">Another conversation is responding. You can draft a message here.</div>}
+    {busy && activeRunModel && <div className="chat-run-model">Responding with {activeRunModel.name}{selectedModelId !== activeRunModel.id && <span>Your new model choice will apply next time.</span>}</div>}
     <div className="chat-transcript" ref={transcriptRef} role="log" aria-live="polite" aria-relevant="additions text">
-      {hasOlderRuns && <button type="button" className="chat-more-runs" onClick={onLoadOlderRuns}>Load older Runs</button>}
-      {turns.length === 0 && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>{selectedSession ? 'Continue this Session.' : 'Create a Session.'}</strong><p>{selectedSession ? 'Send a message to start a new Agent Run.' : 'New Session creates an identity only; it does not call the model.'}</p></div>}
+      {hasOlderRuns && <button type="button" className="chat-more-runs" onClick={onLoadOlderRuns}>Earlier messages</button>}
+      {turns.length === 0 && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>How can I help?</strong><p>Ask about this invoice, or start a general conversation.</p></div>}
       {turns.map((turn) => <article className="chat-turn" data-testid="chat-turn" key={turn.id}>
         <div className="chat-user-message"><span className="chat-speaker">YOU</span><p>{turn.prompt}</p></div>
         <div className={`chat-assistant-message ${turn.status}`}>
-          <span className="chat-speaker">FLOWMATE · {turn.status === 'sending' ? 'RUNNING' : turn.status.toUpperCase()}</span>
-          {turn.status === 'sending' ? <div className="chat-pending"><span className="loader-ring" />Waiting for the Agent Run to finish…</div>
-            : turn.response ? <p>{turn.response}</p> : <p>{turn.status === 'cancelled' ? 'Request cancelled.' : 'No response text was returned.'}</p>}
+          <span className="chat-speaker">ASSISTANT</span>
+          {turn.response && <p>{turn.response}</p>}
+          {turn.status === 'sending' && <div className="chat-pending"><span className="loader-ring" />{turn.progress ?? 'Responding…'}</div>}
+          {turn.status !== 'sending' && !turn.response && <p>{turn.status === 'cancelled' ? 'Request cancelled.' : 'No response was returned.'}</p>}
           {turn.error && <p className="chat-error">{turn.error}</p>}
-          {turn.runId !== null && <button type="button" className="chat-run-link" onClick={() => onOpenRun(turn.runId!)}>OPEN RUN · {turn.runId}</button>}
         </div>
       </article>)}
     </div>
     <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend(); }}>
+      <div className="chat-context">{contextName ? `Working with ${contextName}` : 'General conversation'}</div>
       {sessionHint && <p className="chat-config-hint">{sessionHint}</p>}
+      {(selectedSession?.historyState === 'legacy-read-only' || selectedSession?.historyState === 'invalid') && input.trim() && <button className="secondary-button" type="button" onClick={onNewChatAndSend}>New chat and send</button>}
+      {canGenerate && <button className={`generate-toggle ${goalMode === 'save-candidate' ? 'selected' : ''}`} type="button" aria-pressed={goalMode === 'save-candidate'} onClick={() => onGoalModeChange(goalMode === 'save-candidate' ? 'answer' : 'save-candidate')}>Generate result {goalMode === 'save-candidate' ? 'for next message' : ''}</button>}
       <label className="sr-only" htmlFor="agent-chat-input">Message to model</label>
       <textarea ref={composerRef} id="agent-chat-input" aria-label="Message to model" value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => {
         if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSend(); }
-      }} placeholder="Write a message…" rows={3} disabled={!inputEnabled || busy} />
+      }} placeholder="Write a message…" rows={3} />
       <div className="chat-composer-foot"><span>Enter to send · Shift+Enter for a new line</span>
         {busy ? <button className="secondary-button cancel-button" type="button" onClick={onCancel} disabled={cancelPending}>{cancelPending ? 'Stopping…' : 'Stop'}</button>
-          : <button className="primary-button" type="submit" disabled={!enabled || !input.trim()}>Send to model <span aria-hidden="true">↗</span></button>}
+          : <button className="primary-button" type="submit" disabled={!enabled || !input.trim()}>Send <span aria-hidden="true">↗</span></button>}
       </div>
     </form>
   </aside>;

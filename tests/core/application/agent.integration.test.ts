@@ -104,6 +104,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
   const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, agent, provider,
     log: { write: () => undefined, close: async () => undefined }, now: () => '2026-09-24T00:00:00.000Z', monotonicNow: () => performance.now() });
   const sessionRepository: SessionRepository = options.failSessionInsert ? {
+    ...opened.data.sessions,
     create: () => ({ ok: false, error: appError('storage_write_failed', 'storage', 'fixture session insert failure', true) }),
     get: (sessionId) => opened.data.sessions.get(sessionId),
     list: (request) => opened.data.sessions.list(request),

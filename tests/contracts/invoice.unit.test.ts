@@ -102,7 +102,22 @@ describe('P3 invoice tool contracts', () => {
     expect(invoiceToolSchemas.check_invoice_sources.input.safeParse({
       documentId: 1, sources: [{ ...source, quote: '' }],
     }).success).toBe(false);
+    expect(invoiceToolSchemas.read_invoice_evidence.input.safeParse({
+      documentId: 1, page: 1, kind: 'original', blockId: null,
+    }).success).toBe(false);
+    expect(invoiceToolSchemas.read_invoice_evidence.input.safeParse({
+      documentId: 1, page: 1, kind: 'parsed', blockId: null,
+    }).success).toBe(false);
+    expect(invoiceToolSchemas.read_invoice_evidence.output.safeParse({
+      kind: 'original', source: { ...source, artifactId: 1, blockId: null, quote: null },
+      mimeType: 'image/png', bytes: 12,
+    }).success).toBe(false);
     expect(CandidateDraftSchema.safeParse(candidate).success).toBe(true);
+    expect(CandidateDraftSchema.safeParse({
+      ...candidate,
+      fields: { ...candidate.fields, invoiceNumber: { ...field, raw: 'INV-OLD', normalized: 'INV-OLD', state: 'present',
+        sources: [{ documentId: 1, version: 'fixture-v1', artifactId: 1, page: 1, blockId: null, quote: null }] } },
+    }).success).toBe(true);
     expect(CandidateDraftSchema.safeParse({ ...candidate, status: 'accepted' }).success).toBe(false);
     expect(CandidateDraftSchema.safeParse({
       ...candidate,

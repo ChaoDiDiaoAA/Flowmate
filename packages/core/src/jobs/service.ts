@@ -6,6 +6,11 @@ import type { JobRepository } from '../storage/repositories.ts';
 export class JobService {
   public constructor(private readonly repository: JobRepository, private readonly now: () => string) {}
 
+  public hide(jobId: number) {
+    if (!Number.isSafeInteger(jobId) || jobId < 1) return fail(appError('input_invalid', 'input', 'Processing record ID is invalid.'));
+    return this.repository.hide(jobId, this.now());
+  }
+
   public create(raw: StartTaskRequest): Result<TaskOperation> {
     const parsed = StartTaskRequestSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'Start Task 参数无效。'));

@@ -91,7 +91,6 @@ export type AgentPortAvailability = 'ready' | 'busy' | 'unusable' | 'missing';
 
 export type AgentNativeOutcome = NativeOutcome & { agent: AgentFacts };
 
-export type AgentToolContent = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: 'image/jpeg' | 'image/png' };
 export type AgentToolInvocation = { result: ToolResult<unknown>; fatal: boolean };
 export type AgentToolBinding = {
   context: ProductToolContext;
@@ -99,7 +98,6 @@ export type AgentToolBinding = {
   rejectRequest(name: string, raw: unknown, call: ToolCallContext, error: AppError): Result<void>;
   recordDelivery(nativeToolCallId: string, delivery: ToolCallDelivery): Result<void>;
   execute(name: string, input: unknown, call: ToolCallContext): Promise<AgentToolInvocation>;
-  formatResult?(name: string, data: unknown, signal: AbortSignal): Promise<AgentToolContent[]>;
 };
 
 export type AgentExecutionInput = NativeInput & {
@@ -134,6 +132,8 @@ export type NativeObservation = {
     textBytes?: number;
   }>;
 };
+
+export type AgentObservation = NativeObservation | { type: 'display_text_delta'; text: string; at: string; monotonicMs: number };
 
 export type NativeOutcome = {
   wireMaxTokens?: number | null;
@@ -172,12 +172,15 @@ export interface PreparedAgent {
   execute(
     input: AgentExecutionInput,
     signal: AbortSignal,
-    observe: (event: NativeObservation) => void,
+    observe: (event: AgentObservation) => void,
   ): Promise<AgentNativeOutcome>;
 }
 
 export interface AgentPort {
   createSession(): Result<{ nativeSessionId: string }>;
+  exportSession?(nativeSessionId: string): Result<import('./runtime.ts').NativeSessionHistory>;
+  restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory): Result<void>;
+  watchSession?(nativeSessionId: string, save: (history: import('./runtime.ts').NativeSessionHistory) => Result<void>): Result<void>;
   inspect(nativeSessionId: string): {
     availability: AgentPortAvailability;
   };

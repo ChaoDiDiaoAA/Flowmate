@@ -8,6 +8,5 @@ export * from './runtime/service.ts';
 export * from './sessions/service.ts';
 export * from './workspace/service.ts';
 export * from './jobs/service.ts';
-export * from './tools/registry.ts';
 export * from './tools/recorder.ts';
 export * from './tools/executor.ts';

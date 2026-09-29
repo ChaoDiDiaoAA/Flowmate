@@ -8,11 +8,7 @@ export type ModelRef = {
   model: string;
 };
 
-export type ProviderApi =
-  | 'openai-completions'
-  | 'openai-responses'
-  | 'anthropic-messages'
-  | 'google-generative-ai';
+export type ProviderApi = string;
 
 export type ProductPaths = {
   root: string;
@@ -66,6 +62,7 @@ export type ProviderConfig = {
   name: string;
   revision: number;
   modelRef: ModelRef;
+  credentialRef?: string;
   native: {
     authPath: string;
     modelsPath: string | null;
@@ -73,6 +70,9 @@ export type ProviderConfig = {
   connection?: {
     baseUrl: string;
     api: ProviderApi;
+    contextWindow?: number;
+    maxTokens?: number;
+    reasoning?: boolean;
   };
   parameters: {
     maxRetries: number;
@@ -245,6 +245,15 @@ export type ChatScope = {
 
 export type SessionAvailability = 'ready' | 'busy' | 'unusable' | 'history-unavailable' | 'archived';
 export type SessionStatus = 'active' | 'archived';
+export type SessionHistoryState = 'recoverable' | 'legacy-read-only' | 'invalid';
+
+export type NativeSessionHistory = {
+  storageVersion: 1;
+  header: { type: 'session'; id: string; timestamp: string; cwd: string; version?: number; parentSession?: string };
+  entries: readonly { type: string; id: string; parentId: string | null; timestamp: string; [key: string]: unknown }[];
+  leafId: string | null;
+  unusable: boolean;
+};
 
 export type SessionSnapshot = {
   sessionId: DbId;
@@ -254,6 +263,7 @@ export type SessionSnapshot = {
   createdAt: string;
   updatedAt: string;
   availability: SessionAvailability;
+  historyState: SessionHistoryState;
   activeRunId: DbId | null;
   modelUseBlocked: boolean;
   hasBusinessHistory: boolean;
@@ -300,6 +310,8 @@ export type AgentRunEvent = {
   at: string;
 } & (
   | { type: 'run_progress'; phase: 'created' | 'running' | 'stopping'; reason?: string }
+  | { type: 'text_delta'; text: string }
+  | { type: 'tool_progress'; toolName: string; label: string; phase: 'running' | 'succeeded' | 'failed' | 'cancelled' }
   | { type: 'run_finished'; result: Result<AgentOutcome> }
 );
 
@@ -374,6 +386,7 @@ export interface Application {
   queryDocument(documentId: DbId): Promise<Result<import('./workspace.ts').DocumentSnapshot>>;
   listJobs(request?: import('./workspace.ts').JobPageRequest): Promise<Result<import('./workspace.ts').Page<import('./workspace.ts').JobSnapshot>>>;
   queryJob(jobId: DbId): Promise<Result<import('./workspace.ts').JobSnapshot>>;
+  hideJob(jobId: DbId): Promise<Result<import('./workspace.ts').JobSnapshot>>;
   listJobCandidates(request: import('./workspace.ts').CandidateJobPageRequest): Promise<Result<import('./workspace.ts').CandidateJobPage>>;
   queryJobCandidate(request: { jobId: DbId; candidateId: DbId }): Promise<Result<import('./workspace.ts').CandidateJobDetail>>;
   listActivity(request: import('./activity.ts').ActivityPageRequest): Promise<Result<import('./workspace.ts').Page<import('./activity.ts').BusinessEventSnapshot>>>;

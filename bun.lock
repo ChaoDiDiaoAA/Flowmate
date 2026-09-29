@@ -52,14 +52,6 @@
         "@types/node": "24.10.1",
       },
     },
-    "apps/cli": {
-      "name": "@flowmate/cli",
-      "dependencies": {
-        "@flowmate/contracts": "workspace:*",
-        "@flowmate/core": "workspace:*",
-        "@flowmate/shared": "workspace:*",
-      },
-    },
     "packages/contracts": {
       "name": "@flowmate/contracts",
     },
@@ -266,8 +258,6 @@
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.25.12", "", { "os": "win32", "cpu": "x64" }, "sha512-alJC0uCZpTFrSL0CCDjcgleBXPnCrEAhTBILpeAp7M/OFgoqtAetfBzX0xM00MUsVVPpVjlPuMbREqnZCXaTnA=="],
 
     "@flowmate/agent-eval": ["@flowmate/agent-eval@workspace:agent-eval"],
-
-    "@flowmate/cli": ["@flowmate/cli@workspace:apps/cli"],
 
     "@flowmate/contracts": ["@flowmate/contracts@workspace:packages/contracts"],
 

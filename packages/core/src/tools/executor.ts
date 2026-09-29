@@ -1,6 +1,5 @@
-import { AppErrorSchema, ToolExecutionContextSchema, appError, fail, ok } from '@flowmate/contracts';
+import { AppErrorSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, appError, fail, ok } from '@flowmate/contracts';
 import type { AppError, DbId, Result, ToolCallDelivery, ToolDefinition, ToolExecutionContext, ToolResult, ToolCallSnapshot } from '@flowmate/contracts';
-import { ToolRegistry } from './registry.ts';
 import { createToolRecorder } from './recorder.ts';
 type Recorder = ReturnType<typeof createToolRecorder>;
 export type ToolExecution = { call: ToolCallSnapshot; result: ToolResult<unknown>; fatal: boolean };
@@ -18,7 +17,7 @@ function safeError(value: unknown): AppError {
 }
 
 export function createToolExecutor(input: {
-  registry: ToolRegistry;
+  definitions: readonly ToolDefinition<any, any>[];
   recorder: Recorder;
   isSessionModelUseBlocked?: (sessionId: DbId) => Result<boolean>;
   now: () => string;
@@ -27,6 +26,23 @@ export function createToolExecutor(input: {
   maxResultBytes?: number;
   monotonicNow?: () => number;
 }) {
+  const definitions = Object.freeze([...input.definitions]);
+  const byName = new Map<string, ToolDefinition<any, any>>();
+  for (const definition of definitions) {
+    if (!definition || typeof definition.name !== 'string' || !/^[a-z][a-z0-9_]{0,127}$/.test(definition.name)
+      || typeof definition.version !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(definition.version)
+      || typeof definition.description !== 'string' || !definition.description.trim() || definition.description.length > 4096
+      || !ToolEffectSchema.safeParse(definition.effect).success
+      || !ToolExecutionModeSchema.safeParse(definition.executionMode).success
+      || !definition.inputSchema || typeof definition.inputSchema.safeParse !== 'function'
+      || !definition.outputSchema || typeof definition.outputSchema.safeParse !== 'function'
+      || typeof definition.execute !== 'function'
+      || (definition.label !== undefined && (typeof definition.label !== 'string' || !definition.label.trim() || definition.label.length > 128))) {
+      throw new Error('tool_definition_invalid');
+    }
+    if (byName.has(definition.name)) throw new Error('tool_name_duplicate');
+    byName.set(definition.name, Object.freeze(definition));
+  }
   const budgets = new Map<DbId, RunBudget>();
   const active = new Map<string, Promise<ToolExecution>>();
   const maxCalls = input.maxToolCalls ?? 24;
@@ -58,7 +74,7 @@ export function createToolExecutor(input: {
         bound.runId, bound.sessionId, bound.nativeToolCallId));
     }
     const requested = input.recorder.request({ context: bound, call: { nativeToolCallId: bound.nativeToolCallId, signal: bound.signal },
-      name, definition: input.registry.get(name), raw });
+      name, definition: byName.get(name), raw });
     if (!requested.ok) { budget.fatal = true; return requested; }
     if (!prior.ok) budget.ids.add(bound.nativeToolCallId);
     return requested;
@@ -91,7 +107,7 @@ export function createToolExecutor(input: {
       return { call: unavailableCall(context, name), result: { status: 'failed', error: failure }, fatal: true };
     }
     const bound = Object.freeze({ ...contextCheck.data, scope: context.scope });
-    const definition = input.registry.get(name);
+    const definition = byName.get(name);
     const identity = `${bound.runId}:${bound.nativeToolCallId}`;
     const budget = budgets.get(bound.runId) ?? { ids: new Set<string>(), resultsBytes: 0, closed: false, fatal: false };
     budgets.set(bound.runId, budget);
@@ -221,7 +237,7 @@ export function createToolExecutor(input: {
         && call.result.status === 'succeeded' && call.delivery.state === 'request_observed' ? [call.result.committedCandidateId] : []))];
       return ok({ candidateIds, deliveredCandidateIds });
     },
-    listTools: () => input.registry.list(),
+    listTools: () => definitions,
   };
 }
 

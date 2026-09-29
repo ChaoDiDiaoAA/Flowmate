@@ -4,7 +4,26 @@ import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp } from '../support/resources.ts';
-import { HostClient } from '../../apps/desktop/main/host-client.ts';
+import { HostClient, safeChildEnvironment } from '../../apps/desktop/main/host-client.ts';
+
+it('passes Pi provider ambient auth to Host without Judge or platform credentials', () => {
+  const previous = { deepseek: process.env.DEEPSEEK_API_KEY, judge: process.env.FLOWMATE_JUDGE_API_KEY,
+    langfuse: process.env.LANGFUSE_SECRET_KEY };
+  try {
+    process.env.DEEPSEEK_API_KEY = 'ambient-fixture';
+    process.env.FLOWMATE_JUDGE_API_KEY = 'judge-fixture';
+    process.env.LANGFUSE_SECRET_KEY = 'platform-fixture';
+    const env = safeChildEnvironment();
+    expect(env.DEEPSEEK_API_KEY).toBe('ambient-fixture');
+    expect(env.FLOWMATE_JUDGE_API_KEY).toBeUndefined();
+    expect(env.LANGFUSE_SECRET_KEY).toBeUndefined();
+  } finally {
+    for (const [name, value] of Object.entries({ DEEPSEEK_API_KEY: previous.deepseek,
+      FLOWMATE_JUDGE_API_KEY: previous.judge, LANGFUSE_SECRET_KEY: previous.langfuse })) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+});
 
 it('turns a Host stdin EPIPE into rejected pending requests instead of an uncaught main-process error', async () => {
   const repoRoot = resolve(import.meta.dir, '../..');
@@ -31,6 +50,42 @@ it('turns a Host stdin EPIPE into rejected pending requests instead of an uncaug
   }
 });
 
+it('uses Pi native API-key login and returns the credential to the protected Main store', async () => {
+  const repoRoot = resolve(import.meta.dir, '../..');
+  const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-pi-login-'));
+  const client = new HostClient();
+  let stored: unknown;
+  client.setCredentialHandler(async (request) => {
+    if (request.operation === 'read') return { ok: true, ...(stored === undefined ? {} : { credential: stored }) };
+    if (request.operation === 'write') { stored = request.credential; return { ok: true }; }
+    stored = undefined;
+    return { ok: true };
+  });
+  const unsubscribe = client.subscribe((event) => {
+    if (event.type === 'model_auth_prompt') void client.request({ type: 'auth_reply',
+      loginRequestId: event.requestId, promptId: event.promptId, value: 'synthetic-pi-key' });
+  });
+  try {
+    const started = await client.start(userDataRoot, '0.1.0', repoRoot);
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const settings = { version: 2 as const, revision: 0, profile: { displayName: 'Login test', theme: 'system' as const },
+      models: [{ id: 'pi-deepseek', credentialRef: 'login_credential_reference_1', name: 'DeepSeek',
+        kind: 'catalog' as const, providerId: 'deepseek', baseUrl: '', model: 'deepseek-v4-flash',
+        api: '', contextWindow: null, maxTokens: null, reasoning: false }],
+      defaultModelId: 'pi-deepseek', updatedAt: '2026-09-29T00:00:00.000Z' };
+    expect(await client.request({ type: 'save_settings', settings })).toMatchObject({ ok: true });
+    expect(await client.request({ type: 'login_model', requestId: 'pi-login-1', modelId: 'pi-deepseek', authType: 'api_key' }, 30_000))
+      .toMatchObject({ ok: true, data: { configured: true } });
+    expect(stored).toEqual({ type: 'api_key', key: 'synthetic-pi-key' });
+    expect(await client.request({ type: 'logout_model', modelId: 'pi-deepseek' })).toMatchObject({ ok: true });
+    expect(stored).toBeUndefined();
+  } finally {
+    unsubscribe();
+    await client.close();
+  }
+});
+
 it('wires the real Host Agent path, rejects stale model state after credential lookup and continues native history per Session', async () => {
   const repoRoot = resolve(import.meta.dir, '../..');
   const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-agent-'));
@@ -51,6 +106,13 @@ it('wires the real Host Agent path, rejects stale model state after credential l
   });
   const client = new HostClient();
   const finished: Array<{ runId: number; result: unknown }> = [];
+  const credentialRequests: string[] = [];
+  client.setCredentialHandler(async (request) => {
+    credentialRequests.push(request.operation);
+    return request.operation === 'read'
+      ? { ok: true, credential: { type: 'api_key', key: 'synthetic-host-agent-key' } }
+      : { ok: false };
+  });
   client.subscribe((event) => {
     if (event.type === 'agent_run_event' && event.value.type === 'run_finished') {
       finished.push({ runId: event.value.runId, result: event.value.result });
@@ -61,9 +123,11 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     expect(started.ok).toBe(true);
     if (!started.ok) return;
 
-    const profile = { id: 'fixture-model', credentialRef: 'credential_reference_1234', name: 'Fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'host-agent-fixture', api: 'openai-completions' as const };
+    const profile = { id: 'fixture-model', credentialRef: 'credential_reference_1234', name: 'Fixture', kind: 'custom' as const,
+      providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'host-agent-fixture', api: 'openai-completions',
+      contextWindow: 64_000, maxTokens: 16_384, reasoning: false };
     const initialSettings = {
-      version: 1 as const,
+      version: 2 as const,
       revision: 0,
       profile: { displayName: 'Host Agent Test', theme: 'system' as const },
       models: [profile],
@@ -103,7 +167,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const stale = await client.request({
       type: 'start_run', requestId: 'stale-agent-run',
       input: { sessionId: created.data.sessionId, text: 'stale config must not dispatch', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: saved.data?.revision ?? 1, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: saved.data?.revision ?? 1, expectedCredentialRef: 'credential_reference_1234',
     }) as { ok: boolean; error?: { code: string } };
     expect(stale).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(requestBodies).toHaveLength(0);
@@ -111,7 +175,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const firstPending = client.request({
       type: 'start_run', requestId: 'first-agent-run',
       input: { sessionId: created.data.sessionId, text: '發票摘要：號碼 INV-2048，價稅合計 1060 元，日期缺失。', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
     }, 30_000) as Promise<{ ok: boolean; data?: { runId: number; sessionId: number } }>;
     const first = await firstPending;
     expect(first).toMatchObject({ ok: true, data: { runId: 1, sessionId: created.data.sessionId } });
@@ -119,7 +183,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const duplicateStart = await client.request({
       type: 'start_run', requestId: 'first-agent-run',
       input: { sessionId: created.data.sessionId, text: 'must not replay a completed Run', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
     }) as { ok: boolean; error?: { code: string } };
     expect(duplicateStart).toMatchObject({ ok: false, error: { code: 'request_duplicate' } });
     expect(requestBodies).toHaveLength(1);
@@ -127,7 +191,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const second = await client.request({
       type: 'start_run', requestId: 'follow-up-agent-run',
       input: { sessionId: created.data.sessionId, text: '剛才那張發票的價稅合計是多少？', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      apiKey: 'synthetic-host-agent-key', expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
     }) as { ok: boolean; data?: { runId: number; sessionId: number } };
     expect(second).toMatchObject({ ok: true, data: { runId: 2, sessionId: created.data.sessionId } });
     await waitFor(() => finished.some((event) => event.runId === 2));
@@ -137,6 +201,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     expect(finished[1].result).toMatchObject({ ok: true, data: { status: 'completed', text: replies[1] } });
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies.every(({ authorization }) => authorization === 'Bearer synthetic-host-agent-key')).toBe(true);
+    expect(credentialRequests).toContain('read');
     expect(requestBodies.map(({ body }) => (body.tools ?? []).map((tool) =>
       (tool as { function?: { name?: string } }).function?.name).sort())).toEqual([
       ['calculate_invoice_amounts', 'normalize_invoice_values'],

@@ -4,18 +4,16 @@ import type { ParsedBlock, Result } from '@flowmate/contracts';
 export const VOXEL51_SOURCE_KEY = 'voxel51-hq-invoice-ocr';
 
 export type ParsedVoxel51Document = {
-  formatVersion: 1;
-  parser: { name: string; version: string; configuration: string };
+  formatVersion: 2;
   pages: Array<{ page: number; blocks: ParsedBlock[] }>;
   completeness: { status: 'complete'; checks: string[]; warnings: string[] };
 };
 
 export type Voxel51Sample = {
   sourceKey: typeof VOXEL51_SOURCE_KEY;
+  sampleId: string;
   sourceRecordId: string;
   datasetRevision: string;
-  parserKey: string;
-  version: string;
   originalFileName: 'original.jpg' | 'original.png';
   allowedUsesClaim: string[];
   licenseVerification: string;
@@ -45,6 +43,13 @@ function pageText(value: unknown): string | null {
   return page.text;
 }
 
+function annotationText(value: unknown, label: 'Caption' | 'Footnote'): string | null {
+  if (value === undefined) return '';
+  const texts = typeof value === 'string' ? [value] : Array.isArray(value) ? value : null;
+  if (!texts || !texts.every((item) => typeof item === 'string')) return null;
+  return texts.map((text) => text ? `${label}: ${text}` : '').filter(Boolean).join('\n\n');
+}
+
 function blockText(block: Record<string, unknown>): { kind: ParsedBlock['kind']; text: string } | null {
   const type = block.type;
   if (type === 'text' || type === 'header' || type === 'footer' || type === 'page_footnote' || type === 'page_number') {
@@ -52,17 +57,19 @@ function blockText(block: Record<string, unknown>): { kind: ParsedBlock['kind'];
   }
   if (type === 'table') {
     if (typeof block.table_body !== 'string') return null;
-    const caption = typeof block.table_caption === 'string' ? block.table_caption : '';
-    const footnote = typeof block.table_footnote === 'string' ? block.table_footnote : '';
-    return { kind: 'table', text: [caption ? `Caption: ${caption}` : '', block.table_body, footnote ? `Footnote: ${footnote}` : '']
+    const caption = annotationText(block.table_caption, 'Caption');
+    const footnote = annotationText(block.table_footnote, 'Footnote');
+    if (caption === null || footnote === null) return null;
+    return { kind: 'table', text: [caption, block.table_body, footnote]
       .filter(Boolean).join('\n\n') };
   }
   if (type === 'image') {
-    const caption = typeof block.image_caption === 'string' ? block.image_caption
-      : typeof block.caption === 'string' ? block.caption : '';
-    const footnote = typeof block.image_footnote === 'string' ? block.image_footnote
-      : typeof block.footnote === 'string' ? block.footnote : '';
-    return { kind: 'image', text: [caption ? `Caption: ${caption}` : '', footnote ? `Footnote: ${footnote}` : '']
+    const captionValue = block.image_caption === undefined ? block.caption : block.image_caption;
+    const footnoteValue = block.image_footnote === undefined ? block.footnote : block.image_footnote;
+    const caption = annotationText(captionValue, 'Caption');
+    const footnote = annotationText(footnoteValue, 'Footnote');
+    if (caption === null || footnote === null) return null;
+    return { kind: 'image', text: [caption, footnote]
       .filter(Boolean).join('\n\n') };
   }
   return null;
@@ -72,16 +79,16 @@ export function parseVoxel51Sample(input: Voxel51SampleInput): Result<Voxel51Sam
   const metadata = record(input.metadata);
   const content = input.content;
   const sourceRecordId = metadata?.sourceRecordId;
+  const sampleId = metadata?.sampleId;
   const datasetRevision = metadata?.datasetRevision;
-  const parserKey = metadata?.parserKey;
   const allowedUsesClaim = stringList(metadata?.allowedUsesClaim, 32);
   const licenseVerification = metadata?.licenseVerification;
   const files = metadata?.files;
-  const rawPageText = pageText(input.pages);
-  const sourceVersion = typeof datasetRevision === 'string' && typeof parserKey === 'string' ? `${datasetRevision}:${parserKey}` : '';
-  const invalid = !metadata || typeof sourceRecordId !== 'string' || sourceRecordId.length < 1 || sourceRecordId.length > 512
+  const pageDirectory = Array.isArray(input.pages) && input.pages.length === 1 ? input.pages[0] : null;
+  const rawPageText = pageText(pageDirectory);
+  const invalid = !metadata || typeof sampleId !== 'string' || !/^\d{6}$/.test(sampleId)
+    || typeof sourceRecordId !== 'string' || sourceRecordId.length < 1 || sourceRecordId.length > 512
     || typeof datasetRevision !== 'string' || datasetRevision.length < 1 || datasetRevision.length > 256
-    || typeof parserKey !== 'string' || parserKey.length < 1 || parserKey.length > 256 || sourceVersion.length > 512
     || !allowedUsesClaim || typeof licenseVerification !== 'string' || licenseVerification.length > 1024
     || !Array.isArray(files) || files.length < 3 || files.length > 64
     || typeof metadata.qualityStatus !== 'string' || /partial|blocked|incomplete|failed/i.test(metadata.qualityStatus)
@@ -89,7 +96,7 @@ export function parseVoxel51Sample(input: Voxel51SampleInput): Result<Voxel51Sam
     || !Array.isArray(content) || content.length < 1 || content.length > 2_000 || rawPageText === null;
   if (invalid) return fail(appError('source_invalid', 'input', '来源材料结构不完整或不受支持。'));
 
-  const page = record(input.pages)!;
+  const page = record(pageDirectory)!;
   if (Number(page.blockCount) !== content.length) return fail(appError('source_invalid', 'input', '来源页目录与解析块数量不一致。'));
   const blocks: ParsedBlock[] = [];
   for (const [sourceIndex, raw] of content.entries()) {
@@ -117,16 +124,14 @@ export function parseVoxel51Sample(input: Voxel51SampleInput): Result<Voxel51Sam
   }
   return ok({
     sourceKey: VOXEL51_SOURCE_KEY,
+    sampleId: sampleId as string,
     sourceRecordId: sourceRecordId as string,
     datasetRevision: datasetRevision as string,
-    parserKey: parserKey as string,
-    version: sourceVersion,
     originalFileName: input.originalFileName as Voxel51Sample['originalFileName'],
     allowedUsesClaim,
     licenseVerification,
     parsed: {
-      formatVersion: 1,
-      parser: { name: 'voxel51', version: parserKey as string, configuration: parserKey as string },
+      formatVersion: 2,
       pages: [{ page: 1, blocks }],
       completeness: { status: 'complete', checks: ['page-sequence', 'block-count', 'supported-blocks'], warnings: [] },
     },

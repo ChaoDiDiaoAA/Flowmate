@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AgentRunEvent, DesktopState } from '@flowmate/contracts';
+import type { AgentRunEvent, DesktopState, ModelAuthNotice, ModelAuthPrompt } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
 const modelId = z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/);
@@ -19,6 +19,16 @@ const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optiona
 
 const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('get_state') }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('credential_response'),
+    value: z.object({ ok: z.boolean(), credential: z.unknown().optional() }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_model_catalog'),
+    providerId: z.string().min(1).max(128).optional(), refresh: z.boolean() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('login_model'), modelId,
+    authType: z.enum(['api_key', 'oauth']) }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('logout_model'), modelId }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('auth_reply'), loginRequestId: requestId,
+    promptId: requestId, value: z.string().max(8192).nullable() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('cancel_login'), loginRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('save_settings'), settings: z.unknown() }).strict(),
   z.object({
     version: z.literal(1), requestId, type: z.literal('call_provider'),
@@ -26,7 +36,6 @@ const hostCommandSchema = z.discriminatedUnion('type', [
       goal: z.string().min(1).max(4096), text: z.string().max(65_536), modelId,
       timeoutMs: z.number().int().min(100).max(120_000).optional(),
     }).strict(),
-    apiKey: z.string().min(1).max(4096),
   }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_provider'), targetRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_run'), runId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict(),
@@ -45,6 +54,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('query_document'), documentId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_jobs'), input: pageInput.extend({ documentId: dbId.optional() }) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_job'), jobId: dbId }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('hide_job'), jobId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_job_candidates'), input: z.object({
     jobId: dbId, beforeSequence: dbId.nullable().optional(), limit: pageLimit.optional(),
   }).strict() }).strict(),
@@ -83,11 +93,10 @@ const hostCommandSchema = z.discriminatedUnion('type', [
       workspace: z.object({
         revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), documentRef: documentRef.nullable(), jobId: dbId.nullable(),
         candidateRef: z.object({ id: dbId, sequence: dbId }).strict().nullable(), sessionId: dbId,
-      }).strict(),
+      }).strict().optional(),
       goalMode: z.enum(['answer', 'save-candidate']),
       timeoutMs: z.number().int().min(100).max(120_000).optional(),
     }).strict(),
-    apiKey: z.string().min(1).max(4096),
     expectedSettingsRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     expectedCredentialRef: credentialRef,
   }).strict(),
@@ -105,6 +114,8 @@ export type HostReady = {
 };
 
 export type HostResponse = { version: 1; type: 'response'; requestId: string; value: unknown };
+export type HostCredentialRequest = { version: 1; type: 'credential_request'; requestId: string;
+  credentialRef: string; operation: 'read' | 'write' | 'delete'; credential?: unknown };
 
 export type HostEvent = {
   version: 1;
@@ -113,10 +124,12 @@ export type HostEvent = {
     | { type: 'provider_observation'; requestId: string; runId: number; sequence: number; observation: string; at: string; data: Readonly<Record<string, unknown>> }
     | { type: 'provider_finished'; requestId: string; runId: number; result: unknown }
     | { type: 'host_state'; state: Partial<Omit<DesktopState, 'modelCredentials'>> & Pick<DesktopState, 'version' | 'ready' | 'host' | 'appVersion' | 'userDataPath'> }
+    | { type: 'model_auth_notice'; requestId: string; notice: ModelAuthNotice }
+    | { type: 'model_auth_prompt'; requestId: string; promptId: string; prompt: ModelAuthPrompt }
     | { type: 'agent_run_event'; requestId: string; value: AgentRunEvent };
 };
 
-export type HostOutput = HostReady | HostResponse | HostEvent;
+export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest;
 
 export function parseHostCommand(value: unknown): HostCommand | null {
   const parsed = hostCommandSchema.safeParse(value);

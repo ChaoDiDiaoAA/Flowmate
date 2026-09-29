@@ -9,12 +9,15 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
+  type SessionEntry,
+  type SessionHeader,
   type AgentSession,
   type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
+  AgentObservation,
   AgentToolBinding,
   AgentExecutionInput,
   AgentNativeOutcome,
@@ -22,6 +25,7 @@ import type {
   AgentPortAvailability,
   CloseReport,
   NativeObservation,
+  NativeSessionHistory,
   PromptTraceBuffer,
   PromptTraceEntry,
   PromptTraceEvent,
@@ -63,7 +67,7 @@ type ActiveExecution = {
   sessionId: number;
   nativeSessionId: string;
   signal: AbortSignal;
-  observe: (event: NativeObservation) => void;
+  observe: (event: AgentObservation) => void;
   p3: boolean;
   goalMode: 'answer' | 'save-candidate';
   toolBinding?: AgentToolBinding;
@@ -100,6 +104,8 @@ type SessionRecord = {
   preparing: boolean;
   running: boolean;
   unusable: boolean;
+  historyWriter?: (history: NativeSessionHistory) => Result<void>;
+  historyFailure?: ReturnType<typeof appError>;
   active?: ActiveExecution;
 };
 
@@ -138,6 +144,7 @@ function canReuseRuntime(previous: ProviderConfig | undefined, next: ProviderCon
   return Boolean(previous)
     && previous!.native.authPath === next.native.authPath
     && previous!.native.modelsPath === next.native.modelsPath
+    && previous!.credentialRef === next.credentialRef
     && Boolean(previous!.connection) === Boolean(next.connection);
 }
 
@@ -254,6 +261,11 @@ function executionPrompt(input: AgentExecutionInput): string {
   })}\n\nUser request:\n${input.text}`;
 }
 
+function hasImageContent(messages: StreamContext['messages']): boolean {
+  return messages.some((message) => Array.isArray(message.content)
+    && message.content.some((part) => typeof part === 'object' && part !== null && 'type' in part && part.type === 'image'));
+}
+
 function now(): { at: string; monotonicMs: number } {
   return { at: new Date().toISOString(), monotonicMs: performance.now() };
 }
@@ -286,6 +298,64 @@ export class PiAgentAdapter implements AgentPort {
     return ok({ nativeSessionId });
   }
 
+  public exportSession(nativeSessionId: string): Result<NativeSessionHistory> {
+    const record = this.sessions.get(nativeSessionId);
+    const header = record?.manager.getHeader();
+    if (!record || !header || header.id !== nativeSessionId) {
+      return fail(appError('session_history_invalid', 'session', 'Native conversation identity is unavailable.'));
+    }
+    return ok({ storageVersion: 1, header: structuredClone(header),
+      entries: structuredClone(record.manager.getEntries()) as unknown as NativeSessionHistory['entries'],
+      leafId: record.manager.getLeafId(), unusable: record.unusable });
+  }
+
+  public restoreSession(nativeSessionId: string, history: NativeSessionHistory): Result<void> {
+    if (this.closed || this.sessions.has(nativeSessionId)) return fail(appError('session_history_invalid', 'session', 'Conversation cannot be restored in this state.'));
+    const cwd = this.dependencies.cwd ?? process.cwd();
+    const ids = new Set<string>();
+    if (history.storageVersion !== 1 || history.header.type !== 'session' || history.header.version !== 3
+      || history.header.id !== nativeSessionId || history.header.cwd !== cwd || history.unusable
+      || history.entries.some((entry) => {
+        const invalid = !entry || typeof entry.id !== 'string' || ids.has(entry.id)
+          || entry.parentId !== null && !ids.has(entry.parentId)
+          || !['message', 'thinking_level_change', 'model_change', 'compaction', 'branch_summary', 'custom', 'custom_message', 'label', 'session_info'].includes(entry.type)
+          || JSON.stringify(entry).includes('"type":"image"');
+        ids.add(entry.id);
+        return invalid;
+      }) || history.leafId !== null && !ids.has(history.leafId)) {
+      return fail(appError('session_history_invalid', 'session', 'Saved conversation history is incompatible. Start a new chat.'));
+    }
+    try {
+      const manager = SessionManager.inMemory(cwd, undefined,
+        [history.header as SessionHeader, ...history.entries as unknown as SessionEntry[]]);
+      if (history.leafId === null) manager.resetLeaf();
+      else if (manager.getLeafId() !== history.leafId) manager.branch(history.leafId);
+      if (manager.getSessionId() !== nativeSessionId || manager.getEntries().length !== history.entries.length) throw new Error('native_history_mismatch');
+      manager.buildSessionContext();
+      this.sessions.set(nativeSessionId, { manager, preparing: false, running: false, unusable: false });
+      return ok(undefined);
+    } catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history could not be restored.')); }
+  }
+
+  public watchSession(nativeSessionId: string, save: (history: NativeSessionHistory) => Result<void>): Result<void> {
+    const record = this.sessions.get(nativeSessionId);
+    if (!record || record.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
+    record.historyWriter = save;
+    const manager = record.manager;
+    const original = manager._persist.bind(manager);
+    manager._persist = (entry) => {
+      original(entry);
+      const snapshot = this.exportSession(nativeSessionId);
+      const saved = snapshot.ok ? save(snapshot.data) : snapshot;
+      if (!saved.ok) {
+        record.historyFailure = appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true);
+        record.unusable = true;
+        throw new Error('native_history_write_failed');
+      }
+    };
+    return ok(undefined);
+  }
+
   public inspect(nativeSessionId: string) {
     const record = this.sessions.get(nativeSessionId);
     const availability: AgentPortAvailability = !record ? 'missing'
@@ -304,7 +374,7 @@ export class PiAgentAdapter implements AgentPort {
     const record = this.sessions.get(nativeSessionId);
     if (this.closed) return fail(appError('agent_port_closed', 'runtime', 'Agent Runtime 已关闭。'));
     if (!record) return fail(appError('agent_session_missing', 'session', 'Agent Session 不存在。'));
-    if (record.unusable) return fail(appError('agent_session_unusable', 'session', 'This session cannot continue after an interrupted run. Start a new session.'));
+    if (record.unusable) return fail(record.historyFailure ?? appError('agent_session_unusable', 'session', 'This session cannot continue after an interrupted run. Start a new session.'));
     if (record.preparing || record.running) return fail(appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
     if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
@@ -403,7 +473,7 @@ export class PiAgentAdapter implements AgentPort {
     } catch {
       // createAgentSession can append native model metadata before it throws; do not reuse an uncertain manager.
       if ((replacingSession || sessionCreationStarted) && !record.session) record.unusable = true;
-      return fail(appError('agent_session_init_failed', 'session', 'Agent Session 初始化失败。', true));
+      return fail(record.historyFailure ?? appError('agent_session_init_failed', 'session', 'Agent Session 初始化失败。', true));
     } finally {
       record.preparing = false;
     }
@@ -414,6 +484,14 @@ export class PiAgentAdapter implements AgentPort {
       const active = record.active;
       if (!active) return errorStream(model, appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
       if (active.signal.aborted) return errorStream(model, appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'), 'aborted');
+      if (active.p3 && hasImageContent(context.messages)) {
+        const error = appError('agent_image_history_blocked', 'session', '当前 Session 历史包含图像内容，未向模型发送。请通过 New Session 新建会话后继续。',
+          false, active.runId, active.sessionId);
+        active.failure ??= error;
+        active.stopReason = error.code;
+        this.stop(record, active);
+        return errorStream(model, error);
+      }
       const modelCallLimit = active.p3 ? 12 : 1;
       if (active.callSequence >= modelCallLimit) {
         this.stop(record, active);
@@ -518,8 +596,7 @@ export class PiAgentAdapter implements AgentPort {
     }
 
     if (event.type === 'tool_execution_start') {
-      const state = ensureRequest(event.toolName, event.args, event.toolCallId);
-      if (state) state.invoked = true;
+      ensureRequest(event.toolName, event.args, event.toolCallId);
     }
 
     if (event.type === 'tool_execution_end') {
@@ -600,19 +677,7 @@ export class PiAgentAdapter implements AgentPort {
     }
     if (result.status !== 'succeeded') throw new Error(result.error.message);
 
-    let content;
-    try {
-      content = binding.formatResult
-        ? await binding.formatResult(definition.name, result.data, toolCall.signal)
-        : [{ type: 'text' as const, text: JSON.stringify(result.data) }];
-    } catch {
-      const error = appError('tool_result_format_failed', 'runtime', '工具结果无法安全回送给模型。');
-      const saved = binding.recordDelivery(nativeToolCallId, { version: 1, state: 'failed', messageObservedAt: null,
-        includedInCallSequence: null, requestDispatchedAt: null, error });
-      this.failToolRun(record, active, saved.ok ? error : appError('storage_write_failed', 'storage', '工具回送事实无法保存。', true));
-      throw new Error(active.failure!.message);
-    }
-    return { content, details: result.data };
+    return { content: [{ type: 'text' as const, text: JSON.stringify(result.data) }], details: result.data };
   }
 
   private observeOutgoingToolResults(record: SessionRecord, active: ActiveExecution, context: StreamContext): boolean {
@@ -730,12 +795,18 @@ export class PiAgentAdapter implements AgentPort {
             failStream(appError('agent_output_limit', 'runtime', 'Run 的累计 Agent 输出超过本阶段限制。'));
             continue;
           }
+          const previousText = active.text;
           const appended = appendUtf8(active.text, event.delta, active.textBytes);
           if (active.p3) active.totalOutputBytes += deltaBytes;
           const length = appended.text.length - active.text.length;
           active.text = appended.text;
           active.textBytes = appended.bytes;
           this.observe(active, 'text_delta', { length, textBytes: active.textBytes });
+          const displayText = appended.text.slice(previousText.length);
+          if (displayText) {
+            try { active.observe({ type: 'display_text_delta', text: displayText, ...now() }); }
+            catch { /* display observers cannot interrupt the native run */ }
+          }
           if (appended.exceeded) {
             failStream(appError('agent_output_limit', 'runtime', 'Agent 回复超过本阶段限制。'));
             continue;
@@ -758,7 +829,13 @@ export class PiAgentAdapter implements AgentPort {
             continue;
           }
         }
-        if (event.type === 'error') finalMessage = event.error;
+        if (event.type === 'error') {
+          finalMessage = event.error;
+          active.failure ??= event.error.stopReason === 'length'
+            ? appError('agent_incomplete_response', 'runtime', 'Agent 回复因输出限制提前结束。')
+            : this.providerError(active, event.error);
+          active.stopReason = active.failure.code;
+        }
         if (event.type === 'done') finalMessage = event.message;
         if (!outputEnded) output.push(event);
       }
@@ -872,6 +949,15 @@ export class PiAgentAdapter implements AgentPort {
     if (active.signal.aborted) return appError('agent_cancelled', 'runtime', 'Agent 执行已取消。');
     if (active.responseStatus === 401 || active.responseStatus === 403) return appError('provider_auth_failed', 'provider', 'Provider 认证失败。');
     if (active.responseStatus === 429) return appError('provider_rate_limited', 'provider', 'Provider 请求受到限流。', true);
+    if (active.responseStatus !== null && active.responseStatus >= 400 && active.responseStatus < 500) {
+      const raw = error instanceof Error ? error.message
+        : typeof error === 'object' && error !== null && 'errorMessage' in error && typeof error.errorMessage === 'string'
+          ? error.errorMessage : '';
+      const detail = raw.replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
+        .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]').trim().slice(0, 300);
+      return appError('provider_request_rejected', 'provider',
+        `Provider 拒绝了 Agent 请求（HTTP ${active.responseStatus}）${detail ? `：${detail}` : '。'}`);
+    }
     if (!active.responseStarted) return appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true);
     if (error instanceof Error && error.name === 'AbortError') return appError('agent_cancelled', 'runtime', 'Agent 执行已取消。');
     return appError('provider_stream_interrupted', 'provider', 'Provider 响应流中断。', true);
@@ -882,7 +968,7 @@ export class PiAgentAdapter implements AgentPort {
     nativeSessionId: string,
     input: AgentExecutionInput,
     signal: AbortSignal,
-    observe: (event: NativeObservation) => void,
+    observe: (event: AgentObservation) => void,
   ): Promise<AgentNativeOutcome> {
     const session = record.session;
     const model = record.model;
@@ -968,10 +1054,20 @@ export class PiAgentAdapter implements AgentPort {
       else if (finalMessage.stopReason !== 'stop' || !active.text) active.failure = appError('agent_goal_not_met', 'runtime', 'Agent 未返回可用的发票摘要回答。');
     }
     if (!active.failure && !finalMessage) active.failure = appError('agent_goal_not_met', 'runtime', 'Agent 未返回最终回复。');
+    if (record.historyFailure) active.failure = record.historyFailure;
 
     const stopped = promptSettled && session.isIdle && active.streams.size === 0;
     if (!stopped) active.failure ??= appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true);
     if (active.promptEntered && active.failure) record.unusable = true;
+    if (record.historyWriter) {
+      const snapshot = this.exportSession(nativeSessionId);
+      const saved = snapshot.ok ? record.historyWriter(snapshot.data) : snapshot;
+      if (!saved.ok) {
+        record.unusable = true;
+        record.historyFailure = appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true);
+        active.failure = record.historyFailure;
+      }
+    }
     const messageForUsage = finalMessage ?? systemError(active.failure ?? appError('agent_execution_failed', 'runtime', 'Agent 执行失败。'), model);
     const usage = active.p3
       ? aggregateUsage(active.modelCallUsages, active.attempts, active.complete && stopped, now().at)

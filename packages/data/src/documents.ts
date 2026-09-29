@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   appError,
   fail,
@@ -6,23 +7,18 @@ import {
 } from '@flowmate/contracts';
 import type {
   DocumentSnapshot,
-  InvoiceToolInput,
-  InvoiceToolOutput,
   ProductPaths,
   ProductToolContext,
   Result,
   RunScope,
-  SourceRef,
 } from '@flowmate/contracts';
 import { parseVoxel51Sample } from './parsed-document.ts';
 import { isSupportedOriginal, readVoxel51Files } from './source/voxel51.ts';
 
-const MAX_RESULT_BYTES = 128 * 1024;
 const MAX_WORKSPACE_ORIGINAL_BYTES = 10 * 1024 * 1024;
 
 export type StoredParsedDocument = {
-  formatVersion: 1;
-  parser: { name: string; version: string; configuration: string };
+  formatVersion: 2;
   pages: Array<{ page: number; blocks: Array<ReturnType<typeof ParsedBlockSchema.parse>> }>;
   completeness: { status: 'complete'; checks: string[]; warnings: string[] };
 };
@@ -46,9 +42,9 @@ type PublishArtifactInput = {
 type PublishedArtifactPair = { documentId: number; original: PublishedArtifact; parsed: PublishedArtifact };
 type NewDocumentRegistration = {
   documentId: number; sourceKey: string; sourceRecordId: string; version: string;
-  originalArtifact: PublishedArtifact; parsedArtifact: PublishedArtifact; parserName: string; parserVersion: string;
+  originalArtifact: PublishedArtifact; parsedArtifact: PublishedArtifact;
   status: 'available' | 'unavailable';
-  metadata: { version: 1; pageCount: number; parserConfiguration: string; warnings: string[];
+  metadata: { version: 2; sampleId?: string; pageCount: number; warnings: string[];
     allowedUsesClaim: string[]; licenseVerification: string; unavailableReason: string | null };
   createdAt: string; updatedAt: string;
 };
@@ -74,13 +70,12 @@ function parseJson(bytes: Uint8Array): unknown {
 function decodeParsed(value: unknown): StoredParsedDocument {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_parsed_document');
   const parsed = value as Record<string, unknown>;
-  if (parsed.formatVersion !== 1 || !parsed.parser || typeof parsed.parser !== 'object' || Array.isArray(parsed.parser)
+  if ((parsed.formatVersion !== 1 && parsed.formatVersion !== 2)
+    || (parsed.formatVersion === 2 && 'parser' in parsed)
     || !Array.isArray(parsed.pages) || parsed.pages.length < 1 || parsed.pages.length > 20
     || !parsed.completeness || typeof parsed.completeness !== 'object' || Array.isArray(parsed.completeness)) throw new Error('invalid_parsed_document');
-  const parser = parsed.parser as Record<string, unknown>;
   const completeness = parsed.completeness as Record<string, unknown>;
-  if (typeof parser.name !== 'string' || typeof parser.version !== 'string' || typeof parser.configuration !== 'string'
-    || completeness.status !== 'complete' || !Array.isArray(completeness.checks) || !completeness.checks.every((item) => typeof item === 'string')
+  if (completeness.status !== 'complete' || !Array.isArray(completeness.checks) || !completeness.checks.every((item) => typeof item === 'string')
     || !Array.isArray(completeness.warnings) || !completeness.warnings.every((item) => typeof item === 'string')) throw new Error('invalid_parsed_document');
   const pages = parsed.pages.map((value) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_parsed_page');
@@ -89,8 +84,19 @@ function decodeParsed(value: unknown): StoredParsedDocument {
       || page.blocks.length > 2_000) throw new Error('invalid_parsed_page');
     return { page: Number(page.page), blocks: page.blocks.map((block) => ParsedBlockSchema.parse(block)) };
   });
-  return { formatVersion: 1, parser: parser as StoredParsedDocument['parser'], pages,
+  return { formatVersion: 2, pages,
     completeness: completeness as StoredParsedDocument['completeness'] };
+}
+
+function documentVersion(datasetRevision: string, files: readonly Uint8Array[]): string {
+  const digest = createHash('sha256');
+  for (const bytes of files) {
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64BE(BigInt(bytes.byteLength));
+    digest.update(length);
+    digest.update(bytes);
+  }
+  return `${datasetRevision}:parsed-v3:${digest.digest('hex')}`;
 }
 
 function scopeAllows(scope: RunScope, document: DocumentSnapshot): boolean {
@@ -98,13 +104,9 @@ function scopeAllows(scope: RunScope, document: DocumentSnapshot): boolean {
     && scope.allowedArtifactIds.includes(document.parsedArtifactId);
 }
 
-function sourceFor(document: DocumentSnapshot, page: number, blockId: string | null, quote: string | null): SourceRef {
-  return { documentId: document.documentRef.id, version: document.documentRef.version,
-    artifactId: document.parsedArtifactId, page, blockId, quote: quote ? quote.slice(0, 1024) : null };
-}
-
 export type DocumentServiceOptions = {
   paths: ProductPaths;
+  allowedSourceRoot: string;
   repository: DocumentRepository;
   files: FileStore;
   now: () => string;
@@ -126,20 +128,22 @@ export class DocumentService {
 
   private async importVoxel51Locked(input: { sourceDirectory: string }, signal?: AbortSignal): Promise<Result<DocumentSnapshot>> {
     if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
-    const source = readVoxel51Files(input.sourceDirectory, this.options.paths.root, signal);
+    const source = readVoxel51Files(input.sourceDirectory, this.options.paths.root, signal, this.options.allowedSourceRoot);
     if (!source.ok) return source;
-    const { originalFileName, originalMimeType, originalBytes, contentBytes, pagesBytes } = source.data;
+    const { originalFileName, originalMimeType, originalBytes, contentBytes, pagesBytes, metadataBytes } = source.data;
     const parsed = parseVoxel51Sample(source.data);
     if (!parsed.ok) return parsed;
+    const version = documentVersion(parsed.data.datasetRevision, [originalBytes, contentBytes, pagesBytes, metadataBytes]);
+    if (version.length > 512) return fail(appError('source_invalid', 'input', '来源版本超过支持范围。'));
     const existing = this.options.repository.findBySource({ sourceKey: parsed.data.sourceKey,
-      sourceRecordId: parsed.data.sourceRecordId, version: parsed.data.version });
+      sourceRecordId: parsed.data.sourceRecordId, version });
     if (!existing.ok) return existing;
     const sourceRecord = {
-      version: 1,
+      version: 2,
       sourceKey: parsed.data.sourceKey,
+      sampleId: parsed.data.sampleId,
       sourceRecordId: parsed.data.sourceRecordId,
       datasetRevision: parsed.data.datasetRevision,
-      parserKey: parsed.data.parserKey,
       allowedUsesClaim: parsed.data.allowedUsesClaim,
       licenseVerification: parsed.data.licenseVerification,
       original: { fileName: originalFileName, bytes: originalBytes.byteLength },
@@ -156,7 +160,7 @@ export class DocumentService {
     if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
     const now = this.options.now();
     const publish: PublishArtifactInput = {
-      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, sourceVersion: parsed.data.version, at: now,
+      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, sourceVersion: version, at: now,
       original: { kind: 'original', primaryName: originalFileName,
         files: [{ name: originalFileName, bytes: originalBytes, mimeType: originalMimeType }] },
       parsed: { kind: 'parsed', primaryName: 'parsed.json', files: [
@@ -171,12 +175,10 @@ export class DocumentService {
     if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消；已发布文件保留为待核对孤儿。'));
     const result = this.options.repository.register({
       documentId: published.data.documentId,
-      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, version: parsed.data.version,
+      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, version,
       originalArtifact: published.data.original, parsedArtifact: published.data.parsed,
-      parserName: parsed.data.parsed.parser.name, parserVersion: parsed.data.parsed.parser.version,
       status: 'available', metadata: {
-        version: 1, pageCount: parsed.data.parsed.pages.length,
-        parserConfiguration: parsed.data.parsed.parser.configuration,
+        version: 2, sampleId: parsed.data.sampleId, pageCount: parsed.data.parsed.pages.length,
         warnings: parsed.data.parsed.completeness.warnings,
         allowedUsesClaim: parsed.data.allowedUsesClaim,
         licenseVerification: parsed.data.licenseVerification,
@@ -185,30 +187,6 @@ export class DocumentService {
       createdAt: now, updatedAt: now,
     });
     return result;
-  }
-
-  public listPages(input: InvoiceToolInput<'list_invoice_pages'>, context: ProductToolContext): Result<InvoiceToolOutput<'list_invoice_pages'>> {
-    const loaded = this.loadParsed(input.documentId, context);
-    if (!loaded.ok) return loaded;
-    const pages = loaded.data.parsed.pages.map((page) => ({
-      page: page.page,
-      blockCount: page.blocks.length,
-      tableCount: page.blocks.filter((block) => block.kind === 'table').length,
-    }));
-    return ok({ documentRef: loaded.data.document.documentRef, parsedArtifactId: loaded.data.document.parsedArtifactId,
-      pageCount: pages.length, pages }) as Result<InvoiceToolOutput<'list_invoice_pages'>>;
-  }
-
-  public readPage(input: InvoiceToolInput<'read_invoice_document'>, context: ProductToolContext): Result<InvoiceToolOutput<'read_invoice_document'>> {
-    const loaded = this.loadParsed(input.documentId, context);
-    if (!loaded.ok) return loaded;
-    return this.readPageFromParsed(input, loaded.data);
-  }
-
-  public readPageForWorkspace(input: InvoiceToolInput<'read_invoice_document'>): Result<InvoiceToolOutput<'read_invoice_document'>> {
-    const loaded = this.readParsedForWorkspace(input.documentId);
-    if (!loaded.ok) return loaded;
-    return this.readPageFromParsed(input, loaded.data);
   }
 
   public readOriginalForWorkspace(documentId: number, page: number): Result<{ documentRef: DocumentSnapshot['documentRef']; mimeType: 'image/jpeg' | 'image/png'; bytes: Uint8Array }> {
@@ -230,95 +208,6 @@ export class DocumentService {
     return ok({ documentRef: document.data.documentRef, mimeType, bytes: bytes.data });
   }
 
-  private readPageFromParsed(input: InvoiceToolInput<'read_invoice_document'>,
-    loadedValue: { document: DocumentSnapshot; parsed: StoredParsedDocument }): Result<InvoiceToolOutput<'read_invoice_document'>> {
-    const loaded = { ok: true as const, data: loadedValue };
-    const page = loaded.data.parsed.pages.find((candidate) => candidate.page === input.page);
-    if (!page) return fail(appError('tool_invalid_input', 'input', '指定页码不存在。'));
-    let start = 0;
-    if (input.afterBlockId !== null) {
-      const cursor = page.blocks.findIndex((block) => block.id === input.afterBlockId);
-      if (cursor < 0) return fail(appError('tool_invalid_input', 'input', '分页游标不属于指定页。'));
-      start = cursor + 1;
-    }
-    const available = page.blocks.slice(start);
-    const selected: Array<ReturnType<typeof ParsedBlockSchema.parse> & { source: SourceRef }> = [];
-    const maxItems = Math.min(input.limit, 50);
-    let completePage = false;
-    for (const block of available.slice(0, maxItems)) {
-      const candidate = { ...block, source: sourceFor(loaded.data.document, page.page, block.id, block.text) };
-      const attempt = [...selected, candidate];
-      const response = {
-        documentRef: loaded.data.document.documentRef, parsedArtifactId: loaded.data.document.parsedArtifactId,
-        page: page.page, pageCount: loaded.data.parsed.pages.length, blocks: attempt,
-        nextAfterBlockId: null, completePage: false,
-      };
-      if (Buffer.byteLength(JSON.stringify(response), 'utf8') > MAX_RESULT_BYTES) {
-        if (selected.length === 0) return fail(appError('tool_result_too_large', 'runtime', '完整解析块超过结果大小限制。'));
-        break;
-      }
-      selected.push(candidate);
-    }
-    completePage = start + selected.length >= page.blocks.length;
-    const response = {
-      documentRef: loaded.data.document.documentRef, parsedArtifactId: loaded.data.document.parsedArtifactId,
-      page: page.page, pageCount: loaded.data.parsed.pages.length, blocks: selected,
-      nextAfterBlockId: completePage ? null : selected.at(-1)?.id ?? input.afterBlockId,
-      completePage,
-    };
-    return ok(response) as Result<InvoiceToolOutput<'read_invoice_document'>>;
-  }
-
-  public search(input: InvoiceToolInput<'search_invoice_document'>, context: ProductToolContext): Result<InvoiceToolOutput<'search_invoice_document'>> {
-    if (!input.query.trim()) return fail(appError('tool_invalid_input', 'input', '搜索内容不能为空。'));
-    const loaded = this.loadParsed(input.documentId, context);
-    if (!loaded.ok) return loaded;
-    if (input.page !== null && !loaded.data.parsed.pages.some((page) => page.page === input.page)) {
-      return fail(appError('tool_invalid_input', 'input', '指定页码不存在。'));
-    }
-    const flattened = loaded.data.parsed.pages.flatMap((page) => page.blocks.map((block) => ({ page: page.page, block })))
-      .filter((item) => input.page === null || item.page === input.page);
-    const cursorIndex = input.afterBlockId === null ? -1 : flattened.findIndex((item) => item.block.id === input.afterBlockId);
-    if (input.afterBlockId !== null && cursorIndex < 0) return fail(appError('tool_invalid_input', 'input', '分页游标无效。'));
-    const remaining = flattened.slice(cursorIndex + 1);
-    const matches = remaining.flatMap(({ page, block }) => {
-      const index = block.text.indexOf(input.query);
-      if (index < 0) return [];
-      const excerpt = block.text.slice(index, index + 512);
-      return [{ page, blockId: block.id, kind: block.kind, excerpt, source: sourceFor(loaded.data.document, page, block.id, excerpt) }];
-    });
-    const items = matches.slice(0, input.limit);
-    const response = { documentRef: loaded.data.document.documentRef, parsedArtifactId: loaded.data.document.parsedArtifactId,
-      query: input.query, matches: items, nextAfterBlockId: matches.length > items.length ? items.at(-1)?.blockId ?? null : null,
-      complete: matches.length <= items.length };
-    if (Buffer.byteLength(JSON.stringify(response), 'utf8') > MAX_RESULT_BYTES) return fail(appError('tool_result_too_large', 'runtime', '搜索结果超过大小限制。'));
-    return ok(response) as Result<InvoiceToolOutput<'search_invoice_document'>>;
-  }
-
-  public listTables(input: InvoiceToolInput<'list_invoice_tables'>, context: ProductToolContext): Result<InvoiceToolOutput<'list_invoice_tables'>> {
-    const loaded = this.loadParsed(input.documentId, context);
-    if (!loaded.ok) return loaded;
-    if (input.page !== null && !loaded.data.parsed.pages.some((page) => page.page === input.page)) {
-      return fail(appError('tool_invalid_input', 'input', '指定页码不存在。'));
-    }
-    const blocks = loaded.data.parsed.pages.filter((page) => input.page === null || page.page === input.page)
-      .flatMap((page) => page.blocks.map((block) => ({ page: page.page, block })));
-    const cursorIndex = input.afterBlockId === null ? -1 : blocks.findIndex(({ block }) => block.id === input.afterBlockId);
-    if (input.afterBlockId !== null && cursorIndex < 0) {
-      return fail(appError('tool_invalid_input', 'input', '分页游标无效。'));
-    }
-    const tables = blocks.slice(cursorIndex + 1).filter(({ block }) => block.kind === 'table');
-    const items = tables.slice(0, input.limit).map(({ page, block }) => ({
-      page, blockId: block.id, sourceType: block.sourceType, textLength: block.text.length,
-      preview: block.text.slice(0, 256), source: sourceFor(loaded.data.document, page, block.id, block.text),
-    }));
-    const response = { documentRef: loaded.data.document.documentRef, parsedArtifactId: loaded.data.document.parsedArtifactId,
-      tables: items, nextAfterBlockId: tables.length > items.length ? items.at(-1)?.blockId ?? null : null,
-      complete: tables.length <= items.length };
-    if (Buffer.byteLength(JSON.stringify(response), 'utf8') > MAX_RESULT_BYTES) return fail(appError('tool_result_too_large', 'runtime', '表格目录超过大小限制。'));
-    return ok(response) as Result<InvoiceToolOutput<'list_invoice_tables'>>;
-  }
-
   public restoreDocument(documentId: number): Result<DocumentSnapshot> {
     const document = this.options.repository.get(documentId);
     if (!document.ok) return document;
@@ -335,8 +224,7 @@ export class DocumentService {
     if (!parsedBytes.ok) return this.unavailableDocument(documentId, 'parsed_artifact_missing_or_corrupt');
     try {
       const decoded = decodeParsed(parseJson(parsedBytes.data));
-      if (decoded.parser.name !== document.data.parser.name || decoded.parser.version !== document.data.parser.version
-        || decoded.parser.configuration !== document.data.parser.configuration || decoded.pages.length !== document.data.pageCount) {
+      if (decoded.pages.length !== document.data.pageCount) {
         return this.unavailableDocument(documentId, 'parsed_document_mismatch');
       }
       for (const file of parsed.data.metadata.files) {
@@ -385,10 +273,6 @@ export class DocumentService {
       ? this.unavailableDocument(documentId, 'parsed_artifact_missing_or_corrupt') : bytes;
     try { return ok({ document: document.data, parsed: decodeParsed(parseJson(bytes.data)) }); }
     catch { return this.unavailableDocument(documentId, 'parsed_document_invalid'); }
-  }
-
-  private loadParsed(documentId: number, context: ProductToolContext): Result<{ document: DocumentSnapshot; parsed: StoredParsedDocument }> {
-    return this.readParsedForRun(documentId, context);
   }
 
   private unavailableDocument(documentId: number, reason: string, context?: ProductToolContext): Result<never> {

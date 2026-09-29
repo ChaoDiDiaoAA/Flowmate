@@ -2,30 +2,30 @@
 
 ## 项目与当前阶段
 
-基于 Pi SDK 的本地发票 Agent。当前工作区已交付 P1 Provider 与 P2 Agent Session，并实现 P3 的受控材料导入、Workspace、Start Task、13 个工具、候选与来源/Activity 查看。P3 工程验收见 [P3 实施计划](docs/plans/P3_实施计划_v1.md)；代码仍在当前工作区，未提交。真实模型行为核验 A20 尚未运行，统一业务 Benchmark 仍未制作。Langfuse 是评测结果的可选展示平台。
+基于 Pi SDK 的本地发票 Agent。当前工作区已实现 P3 的受控解析材料导入、英文发票工作台、Assistant 对话及重启续聊、13 个按可信现场暴露的工具、候选与来源记录。原票仅供工作台人工查看，Agent 使用已登记的解析文本和表格。旧连接的真实模型 A20 结果保留在 [P3 实施计划](docs/plans/P3_实施计划_v1.md)；新配置需要单独验证。统一业务 Benchmark 仍待制作。
 
 ## 安装与配置
 
 ```powershell
 bun install --frozen-lockfile
-if (!(Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-[.env.example](.env.example)：`.env` 中的 `FLOWMATE_LLM_*` 用于 CLI；桌面端在 Model 页面配置连接与 API Key，密钥由系统安全存储保护。独立 Judge 和 Langfuse 只在后续评测流程中使用。工程测试使用受控本地端点，不调用付费模型或平台。
+模型只在桌面 **Models** 页面配置。选择 Pi 内置供应商和模型后，按该供应商支持的方式设置 API Key、登录，或使用 Pi 的环境认证；明确选择 **Custom model** 才填写 Base URL、Pi API 类型和模型能力。凭据保存在系统加密存储中。评测用的 Judge、Langfuse 可单独配置 [.env.example](.env.example)。
 
 ## 启动与使用
 
 在仓库根目录执行：
 
 ```powershell
-bun run dev                       # 启动三栏桌面应用
-bun run cli -- provider chat      # 命令行交互聊天
+bun run dev                       # 启动桌面应用
 bun --no-env-file run test        # 工程验证，不运行 Agent 评测
 ```
 
-桌面启动、打开页面和保存配置不会自动调用模型。只有用户点击 **Test Connection**、聊天 **Send to model** 或在 CLI 输入并发送问题时，才会发起 Provider 请求，可能产生费用。桌面聊天的 Send 创建一个 Session Agent Run；同一进程中 Pi 使用该 Session 的内存历史，重启后历史不能恢复。Provider Connection 检查仍单独保存为 Provider Run。桌面正式数据位于 `%APPDATA%\Flowmate`；工程测试使用隔离临时目录。
+桌面启动、打开页面和保存配置不会自动请求模型。用户点击 **Test connection** 或 Assistant 的 **Send** 才会请求模型，可能产生费用。新会话的 Pi 原生历史保存到 SQLite，可在重启后续聊；升级前没有原生历史的旧会话只读。桌面正式数据位于 `%APPDATA%\Flowmate`，工程测试使用隔离临时目录。
 
-第一次使用桌面端：打开 **Model** 配置 Base URL、Model ID、API protocol 和 API Key。随后在 **Workspace** 选择正式已有解析的材料并导入，检查原票与解析，点 **Start Task** 建立任务；回到聊天现场确认材料、任务和目标，再显式点 **Send to model**。Agent 可按获准范围读取解析、回看证据并生成本地候选。到 **Tasks** 查看候选、来源和 Activity；需要时由用户显式选择当前候选。P3 不运行 OCR/Parser，不提供候选接受或导出；撤回某材料的模型使用权限会禁用已经使用该材料的 Session，需新建 Session 才能继续。只有点击 Send 才会发起 Provider 请求，可能产生费用。桌面正式数据位于 `%APPDATA%\Flowmate`；工程测试使用隔离临时目录。
+正式发票导入来源为仓库 `data/invoices/agent-input/`。在 **Invoices** 导入并查看 **Original / Parsed / Results**，点击 **Process this invoice** 建立待发送任务，再到右侧 **Assistant** 点击 **Send**。Agent 只读取已登记的解析数据和来源，不发送原票图像，也不运行解析器。**Processing History** 展示候选、来源、问题和操作历史；其 **Delete** 仅从近期列表隐藏处理记录，保留候选与审计。**Chats** 和左侧最近会话均可重命名。撤回材料使用权限后，受影响的会话不能继续请求模型。
+
+候选结果存放在 `%APPDATA%\Flowmate\data\app.sqlite` 的 `invoice_candidates` 表中，字段、明细、问题及来源引用随候选保存；`tool_calls` 和 `business_events` 保留调用与操作记录。生成候选不等于用户接受，接受状态需另行选择。
 
 ## 文档导航
 

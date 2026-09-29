@@ -116,5 +116,10 @@ function convert(schema: z.ZodTypeAny, path = 'root'): TSchema {
 
 /** Convert only the Zod subset used by P3 tool inputs. Unknown nodes fail closed. */
 export function toPiParameters(schema: z.ZodTypeAny): TSchema {
-  return convert(schema);
+  const parameters = convert(schema);
+  const def = nodeDefinition(schema);
+  if (def.typeName !== 'ZodUnion') return parameters;
+  if (!def.options?.every((option) => nodeDefinition(option).typeName === 'ZodObject')) return unsupported();
+  // Object unions need an explicit root type for Responses APIs; anyOf still enforces each branch.
+  return { ...parameters, type: 'object' } as TSchema;
 }

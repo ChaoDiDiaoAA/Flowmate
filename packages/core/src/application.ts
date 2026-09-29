@@ -165,6 +165,8 @@ export function makeApplication(
     queryJob: async (jobId) => Number.isSafeInteger(jobId) && jobId > 0
       ? products?.jobs.get(jobId) ?? fail(appError('job_service_unavailable', 'storage', 'Job 查询尚未组装。', true))
       : fail(appError('input_invalid', 'input', 'Job ID 无效。')),
+    hideJob: async (jobId) => jobs?.hide(jobId)
+      ?? fail(appError('job_service_unavailable', 'storage', 'Processing service is unavailable.', true)),
     listJobCandidates: async (raw) => {
       if (!raw || typeof raw !== 'object' || !Number.isSafeInteger(raw.jobId) || raw.jobId < 1
         || raw.beforeSequence !== undefined && raw.beforeSequence !== null && (!Number.isSafeInteger(raw.beforeSequence) || raw.beforeSequence < 1)

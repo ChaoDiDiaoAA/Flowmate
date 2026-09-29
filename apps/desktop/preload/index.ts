@@ -3,6 +3,11 @@ import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest 
 
 const bridge: DesktopBridge = {
   getState: () => ipcRenderer.invoke('flowmate:get-state'),
+  listModelCatalog: (providerId, refresh = false) => ipcRenderer.invoke('flowmate:list-model-catalog', providerId, refresh),
+  loginModel: (modelId, authType, requestId) => ipcRenderer.invoke('flowmate:login-model', modelId, authType, requestId),
+  logoutModel: (modelId) => ipcRenderer.invoke('flowmate:logout-model', modelId),
+  replyModelAuth: (requestId, promptId, value) => ipcRenderer.invoke('flowmate:reply-model-auth', requestId, promptId, value),
+  cancelModelAuth: (requestId) => ipcRenderer.invoke('flowmate:cancel-model-auth', requestId),
   saveSettings: (settings: ProductSettings, credentialUpdate?: { modelId: string; apiKey: string }) =>
     ipcRenderer.invoke('flowmate:save-settings', settings, credentialUpdate),
   callProvider: (input: ProviderTestRequest) => ipcRenderer.invoke('flowmate:call-provider', input),
@@ -27,6 +32,7 @@ const bridge: DesktopBridge = {
   queryDocument: (documentId) => ipcRenderer.invoke('flowmate:query-document', documentId),
   listJobs: (request = {}) => ipcRenderer.invoke('flowmate:list-jobs', request),
   queryJob: (jobId) => ipcRenderer.invoke('flowmate:query-job', jobId),
+  hideJob: (jobId) => ipcRenderer.invoke('flowmate:hide-job', jobId),
   listJobCandidates: (request) => ipcRenderer.invoke('flowmate:list-job-candidates', request),
   queryJobCandidate: (request) => ipcRenderer.invoke('flowmate:query-job-candidate', request),
   listActivity: (request) => ipcRenderer.invoke('flowmate:list-activity', request),

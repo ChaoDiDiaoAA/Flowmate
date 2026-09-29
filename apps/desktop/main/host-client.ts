@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { Result } from '@flowmate/contracts';
-import type { HostCommand, HostEvent, HostOutput } from '../../host/protocol.ts';
+import type { HostCommand, HostCredentialRequest, HostEvent, HostOutput } from '../../host/protocol.ts';
 
 type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
 type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
@@ -21,19 +22,26 @@ export class HostClient {
   private processExited = false;
   private exited = Promise.resolve<number | null>(null);
   private resolveExit: ((code: number | null) => void) | null = null;
+  private credentialHandler: ((request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>) | null = null;
 
   public get state(): HostState | null { return this.currentState; }
+
+  public setCredentialHandler(handler: (request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>): void {
+    this.credentialHandler = handler;
+  }
 
   public subscribe(listener: (event: HostEvent['event']) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
-  public async start(userDataRoot: string, appVersion: string, cwd: string): Promise<Result<HostState>> {
+  public async start(userDataRoot: string, appVersion: string, cwd: string,
+    invoiceSourceRoot = join(cwd, 'data', 'invoices', 'agent-input')): Promise<Result<HostState>> {
     const executable = process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun';
     const env = safeChildEnvironment();
     env.FLOWMATE_DESKTOP_VERSION = appVersion;
-    const child = spawn(executable, ['--no-env-file', 'apps/host/main.ts', '--user-data-root', userDataRoot], {
+    const child = spawn(executable, ['--no-env-file', 'apps/host/main.ts', '--user-data-root', userDataRoot,
+      '--invoice-source-root', invoiceSourceRoot], {
       cwd,
       env,
       windowsHide: true,
@@ -134,6 +142,14 @@ export class HostClient {
       }
       if (output.version !== 1 || typeof output.type !== 'string') return;
       if (output.type === 'ready') { onReady(output); return; }
+      if (output.type === 'credential_request') {
+        void Promise.resolve().then(() => this.credentialHandler?.(output) ?? { ok: false })
+          .catch(() => ({ ok: false })).then((value) => {
+            if (child.stdin.writable) child.stdin.write(`${JSON.stringify({ version: 1, type: 'credential_response',
+              requestId: output.requestId, value })}\n`);
+          });
+        return;
+      }
       if (output.type === 'response') {
         const pending = this.pending.get(output.requestId);
         if (!pending) return;
@@ -166,9 +182,14 @@ export class HostClient {
   }
 }
 
-function safeChildEnvironment(): NodeJS.ProcessEnv {
+export function safeChildEnvironment(): NodeJS.ProcessEnv {
   const allowed = ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'BUN_INSTALL'];
   const env: NodeJS.ProcessEnv = {};
   for (const name of allowed) if (process.env[name]) env[name] = process.env[name];
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value && !/^(FLOWMATE_|LANGFUSE_|CODEX_)/.test(name)
+      && (/_(?:API_KEY|AUTH_TOKEN|OAUTH_TOKEN|TOKEN|ACCESS_KEY_ID|SECRET_ACCESS_KEY|PROFILE|REGION|CREDENTIALS|CREDENTIALS_FILE|PROJECT|LOCATION)$/.test(name)
+        || name.startsWith('AWS_'))) env[name] = value;
+  }
   return env;
 }

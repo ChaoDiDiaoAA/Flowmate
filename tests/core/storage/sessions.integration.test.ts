@@ -118,12 +118,57 @@ const legacyColumns = [
 ].join(',');
 
 describe('P2 Session and Agent Run storage', () => {
-  it('migrates a real new database through versions 1, 2, and 3 before exposing repositories', () => withDatabase((paths) => {
+  it('migrates a real new database through version 6 before exposing repositories', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    opened.data.close();
+  }));
+
+  it('keeps ordered native history and leaf across restart, and marks corrupt history invalid', () => withDatabase((paths) => {
+    const first = openDatabase(paths);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const header = { type: 'session' as const, version: 3, id: 'native-history-one',
+      timestamp: '2026-09-24T00:00:00.000Z', cwd: paths.runtimeDir };
+    const created = first.data.sessions.create({ nativeSessionId: header.id, title: 'History', at: header.timestamp,
+      nativeHistory: { storageVersion: 1, header, entries: [], leafId: null, unusable: false } });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const sessionId = created.data.sessionId;
+    const entry = { type: 'message', id: 'first', parentId: null, timestamp: header.timestamp,
+      message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } };
+    expect(first.data.sessions.saveHistory(sessionId, { storageVersion: 1, header, entries: [entry], leafId: entry.id, unusable: false }).ok).toBe(true);
+    first.data.close();
+    const second = openDatabase(paths);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.data.sessions.loadHistory(sessionId)).toMatchObject({ ok: true, data: { leafId: 'first', entries: [entry] } });
+    expect(second.data.sessions.get(sessionId)).toMatchObject({ ok: true, data: { historyState: 'recoverable' } });
+    second.data.db.query('UPDATE session_native_entries SET entry_json=? WHERE session_id=? AND sequence=0')
+      .run(JSON.stringify({ ...entry, parentId: 'missing' }), sessionId);
+    expect(second.data.sessions.get(sessionId)).toMatchObject({ ok: true, data: { historyState: 'invalid' } });
+    expect(second.data.sessions.loadHistory(sessionId)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    second.data.close();
+  }));
+
+  it('deletes a permitted session and its native history in one transaction', () => withDatabase((paths) => {
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const at = '2026-09-24T00:00:00.000Z';
+    const header = { type: 'session' as const, version: 3, id: 'native-delete-one', timestamp: at, cwd: paths.runtimeDir };
+    const created = opened.data.sessions.create({ nativeSessionId: header.id, title: 'Delete', at,
+      nativeHistory: { storageVersion: 1, header, entries: [], leafId: null, unusable: false } });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const id = created.data.sessionId;
+    expect(opened.data.sessions.prepareDelete(id, at).ok).toBe(true);
+    expect(opened.data.sessions.delete(id, at)).toEqual({ ok: true, data: undefined });
+    expect(opened.data.db.query('SELECT * FROM session_native_history WHERE session_id=?').get(id)).toBeNull();
+    expect(opened.data.sessions.get(id)).toMatchObject({ ok: false, error: { code: 'session_not_found' } });
     opened.data.close();
   }));
 

@@ -75,12 +75,13 @@ export const CandidateDraftSchema = z.object({
   notes: z.array(z.string().max(1024)).max(20),
 }).strict();
 export type CandidateDraft = z.infer<typeof CandidateDraftSchema>;
+const maxCandidateFieldPaths = 10 + 8 * 200;
 
 export const CheckResultSchema = z.object({
   rule: z.string().min(1).max(128),
   version: z.literal('1'),
   status: z.enum(['passed', 'failed', 'not_evaluable', 'not_applicable']),
-  fieldPaths: z.array(z.string().max(256)).max(32),
+  fieldPaths: z.array(z.string().max(256)).max(maxCandidateFieldPaths),
   actual: z.string().max(1024).nullable(),
   expected: z.string().max(1024).nullable(),
   difference: z.string().max(1024).nullable(),
@@ -93,7 +94,7 @@ export const InvoiceIssueSchema = z.object({
   code: z.string().min(1).max(128),
   severity: z.enum(['warning', 'error']),
   origin: z.enum(['rule', 'model']),
-  fieldPaths: z.array(z.string().max(256)).max(32),
+  fieldPaths: z.array(z.string().max(256)).max(maxCandidateFieldPaths),
   message: z.string().min(1).max(1024),
   rule: z.string().max(128).nullable(),
 }).strict();
@@ -166,26 +167,19 @@ const tableIndexSchema = z.object({
   complete: z.boolean(),
 }).strict();
 
-const evidenceResultSchema = z.union([
-  z.object({
-    kind: z.literal('parsed'), source: SourceRefSchema,
-    text: z.string().max(65_536), sourceType: z.string().min(1).max(128),
-  }).strict(),
-  z.object({
-    kind: z.literal('original'), source: SourceRefSchema,
-    mimeType: z.enum(['image/jpeg', 'image/png']),
-    bytes: z.number().int().positive().max(2 * 1024 * 1024),
-  }).strict(),
-]);
+const evidenceResultSchema = z.object({
+  kind: z.literal('parsed'), source: SourceRefSchema,
+  text: z.string().max(65_536), sourceType: z.string().min(1).max(128),
+}).strict();
 
 const sourceChecksSchema = z.object({
   documentRef: DocumentRefSchema,
   results: z.array(z.object({
     index: z.number().int().min(0).max(49),
-    status: z.enum(['valid', 'invalid', 'unverified']),
+    status: z.enum(['valid', 'invalid']),
     code: z.enum([
       'parsed_quote_matched', 'reference_mismatch', 'block_not_found',
-      'quote_mismatch', 'original_not_delivered', 'visual_truth_unverified',
+      'quote_mismatch',
     ]),
   }).strict()).min(1).max(50),
 }).strict();
@@ -221,7 +215,7 @@ const candidateValidationSchema = z.object({
   saveable: z.boolean(),
   violations: z.array(z.object({
     code: z.string().min(1).max(128),
-    fieldPaths: z.array(z.string().max(256)).max(32),
+    fieldPaths: z.array(z.string().max(256)).max(maxCandidateFieldPaths),
   }).strict()).max(1_000),
   checks: z.array(CheckResultSchema).max(1_000),
   issues: z.array(InvoiceIssueSchema).max(1_000),
@@ -308,7 +302,7 @@ export const invoiceToolSchemas = {
   read_invoice_evidence: {
     input: z.object({
       documentId: idSchema, page: pageSchema,
-      kind: z.enum(['parsed', 'original']), blockId: blockIdSchema.nullable(),
+      kind: z.literal('parsed'), blockId: blockIdSchema,
     }).strict(),
     output: evidenceResultSchema,
   },

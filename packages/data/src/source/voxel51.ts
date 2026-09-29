@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync, readdirSync } from 'node:fs';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { Result } from '@flowmate/contracts';
@@ -13,6 +13,7 @@ export type Voxel51Files = {
   originalBytes: Uint8Array;
   contentBytes: Uint8Array;
   pagesBytes: Uint8Array;
+  metadataBytes: Uint8Array;
   metadata: unknown;
   content: unknown;
   pages: unknown;
@@ -21,6 +22,12 @@ export type Voxel51Files = {
 function within(root: string, target: string): boolean {
   const rel = relative(resolve(root), resolve(target));
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function samePath(left: string, right: string): boolean {
+  const a = resolve(left);
+  const b = resolve(right);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
 function readBoundedFile(root: string, name: string, limit: number): Result<Uint8Array> {
@@ -60,20 +67,30 @@ function readBoundedFile(root: string, name: string, limit: number): Result<Uint
   }
 }
 
-function fileListingMatches(metadata: unknown, expected: Array<{ name: string; bytes: number }>): boolean {
+function fileListingMatches(metadata: unknown, expected: Array<{ name: string; bytes: number }>, strict = false): boolean {
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
   const files = (metadata as Record<string, unknown>).files;
-  if (!Array.isArray(files)) return false;
+  if (!Array.isArray(files) || strict && files.length !== expected.length) return false;
   const listed = new Map<string, number>();
   for (const item of files) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
     const record = item as Record<string, unknown>;
-    if (typeof record.path !== 'string' || !Number.isSafeInteger(record.bytes) || Number(record.bytes) <= 0) return false;
-    const name = basename(record.path);
+    if (typeof record.path !== 'string' || !Number.isSafeInteger(record.bytes) || Number(record.bytes) <= 0
+      || strict && Object.keys(record).sort().join(',') !== 'bytes,path') return false;
+    const name = strict ? record.path : basename(record.path);
     if (listed.has(name)) return false;
     listed.set(name, Number(record.bytes));
   }
   return expected.every(({ name, bytes }) => listed.get(name) === bytes);
+}
+
+function formalMetadataMatches(metadata: unknown, sampleId: string): boolean {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  const record = metadata as Record<string, unknown>;
+  const expectedKeys = ['allowedUsesClaim', 'datasetId', 'datasetRevision', 'files', 'licenseVerification',
+    'qualityStatus', 'sampleId', 'schemaVersion', 'sourceRecordId'].sort();
+  return Object.keys(record).sort().join(',') === expectedKeys.join(',') && record.schemaVersion === 1
+    && record.sampleId === sampleId && typeof record.datasetId === 'string' && record.datasetId.length > 0;
 }
 
 function imageDimensions(bytes: Uint8Array, extension: '.jpg' | '.png'): { width: number; height: number } | null {
@@ -117,9 +134,11 @@ export function isSupportedOriginal(bytes: Uint8Array, fileName: string): boolea
     && imageDimensions(bytes, fileName.endsWith('.jpg') ? '.jpg' : '.png') !== null;
 }
 
-export function readVoxel51Files(sourceDirectory: string, productRoot: string, signal?: AbortSignal): Result<Voxel51Files> {
+export function readVoxel51Files(sourceDirectory: string, productRoot: string, signal?: AbortSignal,
+  allowedSourceRoot?: string): Result<Voxel51Files> {
   if (signal?.aborted) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
   let directory: string;
+  let canonicalAllowedRoot: string | undefined;
   try {
     if (!sourceDirectory || typeof sourceDirectory !== 'string') throw new Error('invalid_source_directory');
     const supplied = resolve(sourceDirectory);
@@ -130,10 +149,36 @@ export function readVoxel51Files(sourceDirectory: string, productRoot: string, s
   } catch {
     return fail(appError('source_invalid', 'input', '来源目录无效或位于产品受管目录内。'));
   }
+  if (allowedSourceRoot !== undefined) {
+    try {
+      const suppliedRoot = resolve(allowedSourceRoot);
+      const rootInfo = lstatSync(suppliedRoot);
+      if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('invalid_invoice_source_root');
+      canonicalAllowedRoot = realpathSync(suppliedRoot);
+      if (!samePath(suppliedRoot, canonicalAllowedRoot)) throw new Error('invoice_source_root_linked');
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+        return fail(appError('input_unavailable', 'input', '正式发票材料目录当前不可用。', true));
+      }
+      return fail(appError('source_invalid', 'input', '正式发票材料目录无效。'));
+    }
+    if (!samePath(resolve(sourceDirectory), directory) || !within(canonicalAllowedRoot, directory)
+      || !samePath(dirname(directory), canonicalAllowedRoot) || !/^\d{6}$/.test(basename(directory))) {
+      return fail(appError('source_invalid', 'input', '只能导入正式目录中的直接样本子目录。'));
+    }
+  }
   const jpg = existsOriginal(directory, 'original.jpg');
   const png = existsOriginal(directory, 'original.png');
   if (jpg === png) return fail(appError('source_invalid', 'input', '来源必须恰有一个 original.jpg 或 original.png。'));
   const originalFileName = jpg ? 'original.jpg' : 'original.png';
+  if (canonicalAllowedRoot !== undefined) {
+    const expectedNames = [originalFileName, 'content.json', 'pages.json', 'metadata.json'].sort();
+    const entries = readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name, 'en'));
+    if (entries.length !== expectedNames.length || entries.some((entry, index) => entry.name !== expectedNames[index]
+      || !entry.isFile() || entry.isSymbolicLink())) {
+      return fail(appError('source_invalid', 'input', '正式样本目录必须只包含白名单中的四个普通文件。'));
+    }
+  }
   const originalBytes = readBoundedFile(directory, originalFileName, MAX_ORIGINAL_BYTES);
   if (!originalBytes.ok) return originalBytes;
   if (!isSupportedOriginal(originalBytes.data, originalFileName)) return fail(appError('source_invalid', 'input', '原图格式或尺寸无效。'));
@@ -157,13 +202,17 @@ export function readVoxel51Files(sourceDirectory: string, productRoot: string, s
   } catch {
     return fail(appError('source_invalid', 'input', '来源 JSON 格式无效。'));
   }
+  if (canonicalAllowedRoot !== undefined && !formalMetadataMatches(metadata, basename(directory))) {
+    return fail(appError('source_invalid', 'input', '正式样本元数据不符合精简白名单。'));
+  }
   if (!fileListingMatches(metadata, [
     { name: originalFileName, bytes: originalBytes.data.byteLength },
     { name: 'content.json', bytes: contentBytes.data.byteLength },
     { name: 'pages.json', bytes: pagesBytes.data.byteLength },
-  ])) return fail(appError('source_invalid', 'input', '来源文件清单与实际文件不一致。'));
+  ], canonicalAllowedRoot !== undefined)) return fail(appError('source_invalid', 'input', '来源文件清单与实际文件不一致。'));
   return ok({ originalFileName, originalMimeType: jpg ? 'image/jpeg' : 'image/png',
-    originalBytes: originalBytes.data, contentBytes: contentBytes.data, pagesBytes: pagesBytes.data, metadata, content, pages });
+    originalBytes: originalBytes.data, contentBytes: contentBytes.data, pagesBytes: pagesBytes.data,
+    metadataBytes: metadataBytes.data, metadata, content, pages });
 }
 
 function existsOriginal(directory: string, name: string): boolean {

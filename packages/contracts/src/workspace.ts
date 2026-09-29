@@ -99,11 +99,11 @@ export type JobStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'faile
 
 export type DocumentSnapshot = {
   documentRef: DocumentRef;
+  displayName: string;
   status: 'available' | 'unavailable';
   pageCount: number;
   originalArtifactId: DbId;
   parsedArtifactId: DbId;
-  parser: { name: string; version: string; configuration: string };
   warnings: string[];
   unavailableReason: string | null;
   createdAt: string;

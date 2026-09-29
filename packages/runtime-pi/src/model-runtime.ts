@@ -15,6 +15,7 @@ export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promis
 
 export type PiProviderDependencies = {
   credentials?: CredentialStore;
+  credentialsFor?: (config: ProviderConfig) => CredentialStore | undefined;
   fetch?: FetchLike;
   witness?: (value: Readonly<Record<string, unknown>>) => void;
   runtimeApiKey?: string;
@@ -94,8 +95,6 @@ export function normalizeUsage(
 
 const codingAgentVersion = '0.85.1';
 const aiVersion = '0.85.1';
-// Pi requires a positive model maxTokens value for custom registrations.
-const piCustomModelMaxTokens = 8192;
 
 export function safeUrl(value: string): string | null {
   try {
@@ -116,8 +115,7 @@ function classifyAuthError(error: unknown): boolean {
 
 function runtimeApiKey(config: ProviderConfig, dependencies: PiProviderDependencies): string | undefined {
   return dependencies.runtimeApiKeyFor?.(config)
-    ?? dependencies.runtimeApiKey
-    ?? (config.modelRef.provider === 'flowmate-env' ? process.env.FLOWMATE_LLM_API_KEY : undefined);
+    ?? dependencies.runtimeApiKey;
 }
 
 export async function refreshModelRuntimeAuth(
@@ -152,7 +150,7 @@ export async function prepareModelRuntime(
   let runtime: ModelRuntime;
   try {
     runtime = existingRuntime ?? await ModelRuntime.create({
-      credentials: dependencies.credentials,
+      credentials: dependencies.credentialsFor?.(config) ?? dependencies.credentials,
       authPath: config.native.authPath,
       modelsPath: config.native.modelsPath,
       modelsStore: new InMemoryModelsStore(),
@@ -174,6 +172,12 @@ export async function prepareModelRuntime(
     : runtime.getModel(config.modelRef.provider, config.modelRef.model);
   const modelMaxTokens = catalogModel && Number.isSafeInteger(catalogModel.maxTokens) && catalogModel.maxTokens > 0
     ? catalogModel.maxTokens : null;
+  if (config.connection && (!Number.isSafeInteger(config.connection.maxTokens ?? modelMaxTokens)
+    || (config.connection.maxTokens ?? modelMaxTokens ?? 0) <= 0
+    || !Number.isSafeInteger(config.connection.contextWindow ?? catalogModel?.contextWindow)
+    || (config.connection.contextWindow ?? catalogModel?.contextWindow ?? 0) <= 0)) {
+    return fail(appError('provider_model_limits_missing', 'input', 'The custom model needs its actual context and output limits.'));
+  }
   try {
     if (config.connection) {
       runtime.registerProvider(config.modelRef.provider, {
@@ -183,9 +187,9 @@ export async function prepareModelRuntime(
           id: config.modelRef.model,
           name: config.modelRef.model,
           input: ['text'],
-          reasoning: catalogModel?.reasoning ?? false,
-          contextWindow: catalogModel?.contextWindow ?? 0,
-          maxTokens: modelMaxTokens ?? piCustomModelMaxTokens,
+          reasoning: config.connection.reasoning ?? catalogModel?.reasoning ?? false,
+          contextWindow: config.connection.contextWindow ?? catalogModel!.contextWindow,
+          maxTokens: config.connection.maxTokens ?? modelMaxTokens!,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         }],
       });

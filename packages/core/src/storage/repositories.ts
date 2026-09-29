@@ -16,6 +16,8 @@ import type {
   NormalizedListSessionsRequest,
   NormalizedSessionRunsRequest,
   SessionStatus,
+  SessionHistoryState,
+  NativeSessionHistory,
   SafeConfigSnapshot,
   SdkUsageValues,
   TokenColumns,
@@ -28,7 +30,6 @@ import type {
   CandidateSummary,
   CandidateReceipt,
   CandidateDraft,
-  SourceRef,
   CheckResult,
   InvoiceIssue,
   InvoiceToolOutput,
@@ -100,9 +101,11 @@ export type SessionRow = {
   updatedAt: string;
   modelUseBlocked: boolean;
   hasBusinessHistory: boolean;
+  historyState: SessionHistoryState;
+  nativeUnusable: boolean;
 };
 
-export type NewSession = { nativeSessionId: string; title: string; at: string; expectedRevision?: number };
+export type NewSession = { nativeSessionId: string; title: string; at: string; expectedRevision?: number; nativeHistory?: NativeSessionHistory };
 
 export type AgentOutputRecord = OutputRecord & { agent: AgentFacts };
 
@@ -130,13 +133,11 @@ export type NewDocumentRegistration = {
   version: string;
   originalArtifact: Omit<StoredArtifact, 'kind'> & { kind: 'original'; createdAt: string };
   parsedArtifact: Omit<StoredArtifact, 'kind'> & { kind: 'parsed'; createdAt: string };
-  parserName: string;
-  parserVersion: string;
   status: 'available' | 'unavailable';
   metadata: {
-    version: 1;
+    version: 2;
+    sampleId?: string;
     pageCount: number;
-    parserConfiguration: string;
     warnings: string[];
     allowedUsesClaim: string[];
     licenseVerification: string;
@@ -176,6 +177,7 @@ export type StartTaskRecord = {
 export interface JobRepository {
   get(jobId: DbId): Result<JobSnapshot>;
   list(input: NormalizedPageRequest & { documentId?: DbId }): Result<Page<JobSnapshot>>;
+  hide(jobId: DbId, at: string): Result<JobSnapshot>;
   create(input: StartTaskRecord): Result<TaskOperation>;
   queryOperation(clientSequence: DbId, at: string): Result<TaskOperation | null>;
 }
@@ -202,7 +204,6 @@ export interface ToolCallRepository {
   finish(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string; stoppedAt: string | null }): Result<ToolCallSnapshot>;
   reject(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string }): Result<ToolCallSnapshot>;
   recordDelivery(input: { toolCallId: DbId; delivery: ToolCallDelivery }): Result<ToolCallSnapshot>;
-  wasOriginalEvidenceDelivered(input: { sessionId: DbId; source: SourceRef }): Result<boolean>;
 }
 
 export type ActivityFilter = { documentId: DbId } | { jobId: DbId };
@@ -220,6 +221,8 @@ export interface SessionRepository {
   revokeDocumentUse(input: { documentId: DbId; at: string }): Result<{ affectedSessionIds: DbId[] }>;
   prepareDelete(sessionId: DbId, at: string): Result<SessionRow>;
   delete(sessionId: DbId, at: string): Result<void>;
+  loadHistory(sessionId: DbId): Result<NativeSessionHistory | null>;
+  saveHistory(sessionId: DbId, history: NativeSessionHistory): Result<void>;
 }
 
 export type TerminalWrite = {
@@ -449,6 +452,8 @@ function sessionRow(value: unknown, hasHistory = false): SessionRow {
     updatedAt: row.updated_at,
     modelUseBlocked: blocked !== null,
     hasBusinessHistory: hasHistory,
+    historyState: 'legacy-read-only',
+    nativeUnusable: false,
   };
 }
 
@@ -498,28 +503,34 @@ function artifactMetadata(value: unknown): ArtifactMetadata {
 function documentSnapshot(value: unknown): DocumentSnapshot {
   const row = value as {
     id: number; version: string; status: string; original_artifact_id: number; parsed_artifact_id: number;
-    parser_name: string; parser_version: string; metadata_json: string; created_at: string; updated_at: string;
+    metadata_json: string; created_at: string; updated_at: string;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id <= 0 || typeof row.version !== 'string'
     || !['available', 'unavailable'].includes(row.status) || !Number.isSafeInteger(row.original_artifact_id)
-    || !Number.isSafeInteger(row.parsed_artifact_id) || typeof row.parser_name !== 'string'
-    || typeof row.parser_version !== 'string' || typeof row.created_at !== 'string' || typeof row.updated_at !== 'string') {
+    || !Number.isSafeInteger(row.parsed_artifact_id)
+    || typeof row.created_at !== 'string' || typeof row.updated_at !== 'string') {
     throw new Error('invalid_document_row');
   }
-  const metadata = exactRecord(readJson(row.metadata_json, 'document_metadata'), 'document_metadata', [
-    'version', 'pageCount', 'parserConfiguration', 'warnings', 'allowedUsesClaim', 'licenseVerification', 'unavailableReason',
+  const rawMetadata = readJson(row.metadata_json, 'document_metadata');
+  const hasSampleId = Object.prototype.hasOwnProperty.call(rawMetadata, 'sampleId');
+  const metadata = exactRecord(rawMetadata, 'document_metadata', [
+    'version', 'pageCount', 'warnings', 'allowedUsesClaim', 'licenseVerification', 'unavailableReason',
+    ...(hasSampleId ? ['sampleId'] : []),
   ]);
-  if (metadata.version !== 1 || !Number.isSafeInteger(metadata.pageCount) || Number(metadata.pageCount) < 1
-    || Number(metadata.pageCount) > 20 || typeof metadata.parserConfiguration !== 'string'
+  if (metadata.version !== 2 || !Number.isSafeInteger(metadata.pageCount) || Number(metadata.pageCount) < 1
+    || Number(metadata.pageCount) > 20
     || !Array.isArray(metadata.warnings) || !metadata.warnings.every((item) => typeof item === 'string')
     || !Array.isArray(metadata.allowedUsesClaim) || !metadata.allowedUsesClaim.every((item) => typeof item === 'string')
     || typeof metadata.licenseVerification !== 'string'
-    || (metadata.unavailableReason !== null && typeof metadata.unavailableReason !== 'string')) throw new Error('invalid_document_metadata');
+    || (metadata.unavailableReason !== null && typeof metadata.unavailableReason !== 'string')
+    || (hasSampleId && (typeof metadata.sampleId !== 'string' || !/^\d{6}$/.test(metadata.sampleId)))) throw new Error('invalid_document_metadata');
   DocumentRefSchema.parse({ id: row.id, version: row.version });
   return {
     documentRef: { id: row.id, version: row.version }, status: row.status as DocumentSnapshot['status'],
+    displayName: hasSampleId ? `Invoice ${metadata.sampleId}` : `Invoice imported ${new Intl.DateTimeFormat('en-US', {
+      month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
+    }).format(new Date(row.created_at))}`,
     pageCount: Number(metadata.pageCount), originalArtifactId: row.original_artifact_id, parsedArtifactId: row.parsed_artifact_id,
-    parser: { name: row.parser_name, version: row.parser_version, configuration: metadata.parserConfiguration },
     warnings: metadata.warnings as string[], unavailableReason: metadata.unavailableReason as string | null,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
@@ -741,11 +752,11 @@ export function createDocumentRepository(db: Database): DocumentRepository {
           || original.metadata.sourceVersion !== input.version || parsed.metadata.sourceVersion !== input.version
           || input.status !== 'available' && input.status !== 'unavailable') throw new Error('invalid_document_registration');
         const metadata = exactRecord(input.metadata, 'document_metadata', [
-          'version', 'pageCount', 'parserConfiguration', 'warnings', 'allowedUsesClaim', 'licenseVerification', 'unavailableReason',
+          'version', 'pageCount', 'warnings', 'allowedUsesClaim', 'licenseVerification', 'unavailableReason',
+          ...(Object.prototype.hasOwnProperty.call(input.metadata, 'sampleId') ? ['sampleId'] : []),
         ]);
         const validatedSnapshot = documentSnapshot({ id: input.documentId, version: input.version, status: input.status,
           original_artifact_id: original.artifactId, parsed_artifact_id: parsed.artifactId,
-          parser_name: input.parserName, parser_version: input.parserVersion,
           metadata_json: asJson(metadata), created_at: input.createdAt, updated_at: input.updatedAt });
         const insertArtifact = db.query(`INSERT INTO artifacts(id,kind,relative_path,bytes,mime_type,metadata_json,created_at)
           VALUES (?,?,?,?,?,?,?)`);
@@ -754,9 +765,9 @@ export function createDocumentRepository(db: Database): DocumentRepository {
         insertArtifact.run(parsed.artifactId, parsed.kind, parsed.relativePath, parsed.bytes, parsed.mimeType,
           asJson(parsed.metadata), input.parsedArtifact.createdAt);
         db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
-          parser_name,parser_version,status,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+          status,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
           .run(input.documentId, input.sourceKey, input.sourceRecordId, input.version, original.artifactId, parsed.artifactId,
-            input.parserName, input.parserVersion, input.status, asJson(metadata), input.createdAt, input.updatedAt);
+            input.status, asJson(metadata), input.createdAt, input.updatedAt);
         db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,artifact_id,result,safe_summary)
           VALUES ('document_imported',?,'system',?,?,?,'succeeded','Document imported')`)
           .run(input.createdAt, `document:${input.documentId}`, input.documentId, original.artifactId);
@@ -1024,7 +1035,7 @@ export function createJobRepository(db: Database): JobRepository {
           || input.documentId !== undefined && (!Number.isSafeInteger(input.documentId) || input.documentId < 1)) {
           return fail(appError('input_invalid', 'input', 'Job 分页参数无效。'));
         }
-        const clauses = [input.documentId === undefined ? '' : 'document_id=?', input.beforeId === undefined ? '' : 'id<?'].filter(Boolean);
+        const clauses = ['hidden_at IS NULL', input.documentId === undefined ? '' : 'document_id=?', input.beforeId === undefined ? '' : 'id<?'].filter(Boolean);
         const values = [input.documentId, input.beforeId].filter((value): value is number => value !== undefined);
         const query = `SELECT id FROM jobs${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''} ORDER BY id DESC LIMIT ?`;
         const rows = db.query(query).all(...values, input.limit + 1) as Array<{ id: number }>;
@@ -1039,6 +1050,23 @@ export function createJobRepository(db: Database): JobRepository {
       } catch {
         return fail(appError('storage_corrupt', 'storage', 'Job 列表无法读取。'));
       }
+    },
+
+    hide(jobId, at) {
+      const hidden = transaction(db, () => {
+        const row = db.query('SELECT hidden_at FROM jobs WHERE id=?').get(jobId) as { hidden_at: string | null } | null;
+        if (!row) return fail(appError('job_not_found', 'input', 'Processing record not found.'));
+        const job = readJob(db, jobId);
+        if (!job) throw new Error('hidden_job_invalid');
+        if (row.hidden_at !== null) return ok(job);
+        const active = db.query("SELECT 1 FROM runs WHERE job_id=? AND status IN ('created','running') LIMIT 1").get(jobId);
+        if (active) return fail(appError('run_state_invalid', 'runtime', 'Wait for the active response before deleting this processing record.'));
+        db.query('UPDATE jobs SET hidden_at=? WHERE id=?').run(at, jobId);
+        db.query("UPDATE workspace SET active_job_id=NULL,selection_json=NULL,active_view='original',revision=revision+1,updated_at=? WHERE id=1 AND active_job_id=?")
+          .run(at, jobId);
+        return ok(job);
+      });
+      return hidden.ok ? hidden.data : hidden;
     },
 
     queryOperation(clientSequence, at) {
@@ -1257,25 +1285,6 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
       } catch { return fail(databaseError('ToolCall 回送事实保存失败。')); }
     },
 
-    wasOriginalEvidenceDelivered(input) {
-      try {
-        const rows = db.query(`SELECT result_json,delivery_json FROM tool_calls
-          WHERE session_id=? AND tool_name='read_invoice_evidence' AND status='succeeded' ORDER BY id DESC`)
-          .all(input.sessionId) as Array<{ result_json: string | null; delivery_json: string }>;
-        for (const row of rows) {
-          if (row.result_json === null || readDelivery(readJson(row.delivery_json, 'tool_delivery'))?.state !== 'request_observed') continue;
-          const result = object(readJson(row.result_json, 'tool_result'), 'tool_result');
-          if (result.version !== 1 || result.status !== 'succeeded' || !result.data) continue;
-          const data = object(result.data, 'tool_evidence_result');
-          if (data.kind !== 'original') continue;
-          const source = SourceRefSchema.safeParse(data.source);
-          if (source.success && source.data.documentId === input.source.documentId
-            && source.data.version === input.source.version && source.data.artifactId === input.source.artifactId
-            && source.data.page === input.source.page && source.data.blockId === input.source.blockId) return ok(true);
-        }
-        return ok(false);
-      } catch { return fail(appError('storage_corrupt', 'storage', '证据回送记录无法核验。')); }
-    },
   };
 }
 
@@ -1608,7 +1617,69 @@ function hasBusinessHistory(db: Database, sessionId: DbId): boolean {
 
 function readSessionRow(db: Database, value: unknown): SessionRow {
   const row = sessionRow(value);
-  return { ...row, hasBusinessHistory: hasBusinessHistory(db, row.sessionId) };
+  let historyState: SessionHistoryState = 'legacy-read-only';
+  let nativeUnusable = false;
+  try {
+    const history = readNativeHistory(db, row.sessionId);
+    if (history) { historyState = 'recoverable'; nativeUnusable = history.unusable; }
+  } catch { historyState = 'invalid'; }
+  return { ...row, hasBusinessHistory: hasBusinessHistory(db, row.sessionId), historyState, nativeUnusable };
+}
+
+function readNativeHistory(db: Database, sessionId: DbId): NativeSessionHistory | null {
+  const row = db.query('SELECT storage_version,header_json,leaf_id,entry_count,unusable FROM session_native_history WHERE session_id=?')
+    .get(sessionId) as { storage_version: number; header_json: string; leaf_id: string | null; entry_count: number; unusable: number } | null;
+  if (!row) return null;
+  const header = JSON.parse(row.header_json) as NativeSessionHistory['header'];
+  const stored = db.query('SELECT sequence,entry_id,entry_json FROM session_native_entries WHERE session_id=? ORDER BY sequence')
+    .all(sessionId) as Array<{ sequence: number; entry_id: string; entry_json: string }>;
+  if (row.storage_version !== 1 || row.unusable !== 0 && row.unusable !== 1 || !Number.isSafeInteger(row.entry_count)
+    || stored.length !== row.entry_count || header?.type !== 'session' || header.id !== (db.query('SELECT native_session_id FROM sessions WHERE id=?').get(sessionId) as { native_session_id: string } | null)?.native_session_id
+    || header.version !== 3 || typeof header.timestamp !== 'string' || typeof header.cwd !== 'string') throw new Error('invalid_native_header');
+  const ids = new Set<string>();
+  const entries = stored.map((item, index) => {
+    const entry = JSON.parse(item.entry_json) as NativeSessionHistory['entries'][number];
+    if (item.sequence !== index || !entry || typeof entry !== 'object' || entry.id !== item.entry_id
+      || typeof entry.id !== 'string' || ids.has(entry.id) || typeof entry.type !== 'string'
+      || typeof entry.timestamp !== 'string' || entry.parentId !== null && !ids.has(entry.parentId)
+      || JSON.stringify(entry).includes('"type":"image"')) throw new Error('invalid_native_entry');
+    ids.add(entry.id);
+    return entry;
+  });
+  if (row.leaf_id !== null && !ids.has(row.leaf_id) || row.leaf_id === null && entries.length > 0) throw new Error('invalid_native_leaf');
+  return { storageVersion: 1, header, entries, leafId: row.leaf_id, unusable: row.unusable === 1 };
+}
+
+function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessionHistory): void {
+  const session = db.query('SELECT native_session_id FROM sessions WHERE id=?').get(sessionId) as { native_session_id: string } | null;
+  if (!session || history.storageVersion !== 1 || history.header.type !== 'session'
+    || history.header.version !== 3 || history.header.id !== session.native_session_id
+    || history.leafId !== null && !history.entries.some((entry) => entry.id === history.leafId)) throw new Error('invalid_native_history');
+  const previous = db.query('SELECT header_json,entry_count,unusable FROM session_native_history WHERE session_id=?')
+    .get(sessionId) as { header_json: string; entry_count: number; unusable: number } | null;
+  const headerJson = JSON.stringify(history.header);
+  if (!previous) {
+    db.query('INSERT INTO session_native_history(session_id,storage_version,header_json,leaf_id,entry_count,unusable) VALUES (?,1,?,?,0,?)')
+      .run(sessionId, headerJson, null, history.unusable ? 1 : 0);
+  } else if (previous.header_json !== headerJson || previous.entry_count > history.entries.length) {
+    throw new Error('native_history_rewrite');
+  }
+  const existing = db.query('SELECT sequence,entry_json FROM session_native_entries WHERE session_id=? ORDER BY sequence')
+    .all(sessionId) as Array<{ sequence: number; entry_json: string }>;
+  if (existing.length !== (previous?.entry_count ?? 0)
+    || existing.some((row, index) => row.sequence !== index || row.entry_json !== JSON.stringify(history.entries[index]))) {
+    throw new Error('native_history_diverged');
+  }
+  for (let index = existing.length; index < history.entries.length; index += 1) {
+    const entry = history.entries[index]!;
+    if (!entry.id || typeof entry.id !== 'string' || typeof entry.timestamp !== 'string'
+      || typeof entry.type !== 'string' || entry.parentId !== null && !history.entries.slice(0, index).some((parent) => parent.id === entry.parentId)
+      || JSON.stringify(entry).includes('"type":"image"')) throw new Error('invalid_native_entry');
+    db.query('INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json) VALUES (?,?,?,?)')
+      .run(sessionId, index, entry.id, JSON.stringify(entry));
+  }
+  db.query('UPDATE session_native_history SET leaf_id=?,entry_count=?,unusable=? WHERE session_id=?')
+    .run(history.leafId, history.entries.length, previous?.unusable || history.unusable ? 1 : 0, sessionId);
 }
 
 function hasTable(db: Database, table: string): boolean {
@@ -1627,6 +1698,7 @@ export function createSessionRepository(db: Database): SessionRepository {
           .run(input.nativeSessionId, input.title, input.at, input.at);
         const id = Number(result.lastInsertRowid);
         if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_session_id');
+        if (input.nativeHistory) writeNativeHistory(db, id, input.nativeHistory);
         if (input.expectedRevision !== undefined) {
           const changed = db.query(`UPDATE workspace SET active_session_id=?,revision=revision+1,updated_at=?
             WHERE id=1 AND revision=?`).run(id, input.at, input.expectedRevision).changes;
@@ -1648,6 +1720,16 @@ export function createSessionRepository(db: Database): SessionRepository {
       } catch {
         return fail(appError('storage_corrupt', 'storage', 'Session 事实无法读取。'));
       }
+    },
+
+    loadHistory(sessionId) {
+      try { return ok(readNativeHistory(db, sessionId)); }
+      catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
+    },
+
+    saveHistory(sessionId, history) {
+      const saved = transaction(db, () => writeNativeHistory(db, sessionId, history));
+      return saved.ok ? ok(undefined) : fail(appError('storage_write_failed', 'storage', 'Conversation history could not be saved.', true));
     },
 
     list(request) {
@@ -1757,7 +1839,8 @@ export function createSessionRepository(db: Database): SessionRepository {
         db.query('UPDATE workspace SET active_session_id=NULL,revision=revision+1,updated_at=? WHERE id=1 AND active_session_id=?')
           .run(at, sessionId);
         db.query("DELETE FROM runs WHERE kind='agent' AND session_id=?").run(sessionId);
-        if (db.query('DELETE FROM sessions WHERE id=?').run(sessionId).changes !== 1) {
+        // Bun counts rows removed by the native-history cascades too.
+        if (db.query('DELETE FROM sessions WHERE id=?').run(sessionId).changes < 1) {
           return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         }
         return ok(undefined);
@@ -1879,7 +1962,7 @@ export function createRunRepository(db: Database): RunRepository {
             : input.goalMode === 'save-candidate' ? [...INVOICE_TOOL_NAMES] : INVOICE_TOOL_NAMES.slice(0, 12);
         const scope = RunScopeSchema.parse({ version: 2, allowedTools,
           allowedDocumentIds: document ? [document.id] : [],
-          allowedArtifactIds: document ? [document.original_artifact_id, document.parsed_artifact_id] : [],
+          allowedArtifactIds: document ? [document.parsed_artifact_id] : [],
           allowedResourcePaths: [],
         });
         const inputRecord = { version: 2, goal: input.goal, text: input.text, messageTimestamp: input.messageTimestamp, workspaceInput };

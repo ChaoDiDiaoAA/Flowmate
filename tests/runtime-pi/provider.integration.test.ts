@@ -1,6 +1,7 @@
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { describe, expect, it, mock } from 'bun:test';
 import { PiProviderAdapter, type FetchLike } from '../../packages/runtime-pi/src/provider.ts';
+import { prepareModelRuntime } from '../../packages/runtime-pi/src/model-runtime.ts';
 import type { ProviderConfig } from '../../packages/contracts/src/runtime.ts';
 import type { NativeObservation } from '../../packages/contracts/src/ports.ts';
 
@@ -16,6 +17,19 @@ const config: ProviderConfig = {
 const input = { goal: '返回一句话', text: '合成文本', messageTimestamp: 1789948800000 };
 
 describe('PiProviderAdapter', () => {
+  it('requires a real output limit for an unknown custom model', async () => {
+    const profile: ProviderConfig = { ...config,
+      modelRef: { provider: 'flowmate-profile-test', model: 'deepseek-flash' },
+      connection: { baseUrl: 'http://127.0.0.1:9999', api: 'openai-responses' } };
+    const prepared = await prepareModelRuntime(profile, { timeoutMs: 10_000, stopGraceMs: 5_000 },
+      new AbortController().signal, { runtimeApiKey: 'SYNTHETIC_ONLY' });
+    expect(prepared.ok).toBe(false);
+    if (!prepared.ok) expect(prepared.error.code).toBe('provider_model_limits_missing');
+    const configured = await prepareModelRuntime({ ...profile, connection: { ...profile.connection!, contextWindow: 64_000, maxTokens: 16_384 } },
+      { timeoutMs: 10_000, stopGraceMs: 5_000 }, new AbortController().signal, { runtimeApiKey: 'SYNTHETIC_ONLY' });
+    expect(configured.ok).toBe(true);
+    if (configured.ok) expect(configured.data.model.maxTokens).toBe(16_384);
+  });
   it('resolves Pi model metadata offline without adding a Flowmate output-token setting', async () => {
     const adapter = new PiProviderAdapter({ credentials: new InMemoryCredentialStore(), runtimeApiKey: 'SYNTHETIC_ONLY', fetch: mock<FetchLike>() });
     const prepared = await adapter.prepare(config, { timeoutMs: 10000, stopGraceMs: 5000 }, new AbortController().signal);
@@ -32,7 +46,7 @@ describe('PiProviderAdapter', () => {
       { status: 200, headers: { 'content-type': 'text/event-stream' } }));
     const adapter = new PiProviderAdapter({ runtimeApiKey: 'SYNTHETIC_ONLY', fetch });
     const requested: ProviderConfig = { ...config, modelRef: { provider: 'flowmate-env', model: 'synthetic-model' },
-      connection: { baseUrl: 'https://not-contacted.invalid/v1', api: 'openai-responses' } };
+      connection: { baseUrl: 'https://not-contacted.invalid/v1', api: 'openai-responses', contextWindow: 64_000, maxTokens: 16_384 } };
     const prepared = await adapter.prepare(requested, { timeoutMs: 10_000, stopGraceMs: 5000 }, new AbortController().signal);
     expect(prepared.ok).toBe(true);
     if (!prepared.ok) return;
@@ -70,9 +84,9 @@ describe('PiProviderAdapter', () => {
     expect(native.ok).toBe(true);
     if (!native.ok) return;
     const baseUrl = native.data.snapshot.endpoint!;
-    for (const [url, api] of [[baseUrl, 'openai-completions'], ['https://gateway.invalid/v1', 'openai-completions'], [baseUrl, 'openai-responses']] as const) {
+    for (const [url, api] of [[baseUrl, native.data.snapshot.api!], ['https://gateway.invalid/v1', 'openai-completions'], [baseUrl, 'openai-responses']] as const) {
       const prepared = await adapter.prepare({ ...config, modelRef: { provider: 'flowmate-env', model: config.modelRef.model }, connection: { baseUrl: url, api }, parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } }, { timeoutMs: 10000, stopGraceMs: 5000 }, new AbortController().signal);
-      expect(prepared.ok).toBe(true);
+      expect(prepared.ok).toBe(url === baseUrl && api === native.data.snapshot.api);
       if (prepared.ok) {
         expect(prepared.data.snapshot.endpoint).toBe(url);
         expect(prepared.data.snapshot.parameters).not.toHaveProperty('maxTokens');
@@ -113,7 +127,7 @@ describe('PiProviderAdapter', () => {
     const envConfig: ProviderConfig = {
       ...config,
       modelRef: { provider: 'flowmate-env', model: 'invoice-model' },
-      connection: { baseUrl: 'https://llm.example.com/v1', api: 'openai-completions' },
+      connection: { baseUrl: 'https://llm.example.com/v1', api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 1000 },
     };
     const fetch = mock<FetchLike>(async () => new Response([
@@ -131,7 +145,7 @@ describe('PiProviderAdapter', () => {
     expect(prepared.data.snapshot.parameters).not.toHaveProperty('maxTokens');
     const outcome = await prepared.data.execute(input, new AbortController().signal, () => undefined);
     const [requestInput, requestInit] = fetch.mock.calls[0] ?? [];
-    expect(outcome.wireMaxTokens).toBe(8192);
+    expect(outcome.wireMaxTokens).toBe(16_384);
     const request = requestInput === undefined ? null : new Request(requestInput, requestInit);
     expect(outcome.text).toContain('已提取');
     expect(prepared.data.snapshot.endpoint).toBe('https://llm.example.com/v1');
@@ -141,7 +155,7 @@ describe('PiProviderAdapter', () => {
       expect(request.headers.get('authorization')).toBe('Bearer ENV_TEST_KEY');
       const payload = await request.json();
       expect(payload.model).toBe('invoice-model');
-      expect(payload.max_tokens ?? payload.max_completion_tokens).toBe(8192);
+      expect(payload.max_tokens ?? payload.max_completion_tokens).toBe(16_384);
     }
   });
 

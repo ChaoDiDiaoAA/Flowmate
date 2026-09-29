@@ -17,7 +17,6 @@
     "test:integration": "bun --no-env-file run scripts/test.ts integration",
     "test:e2e": "bun --no-env-file run scripts/test.ts e2e",
     "test": "bun --no-env-file run scripts/test.ts all",
-    "cli": "bun run apps/cli/main.ts",
     "eval": "node --import tsx agent-eval/src/cli.ts",
     "eval:smoke": "node --import tsx agent-eval/src/cli.ts run --dataset flowmate-agent-v1 --selection smoke --judge off",
     "eval:full": "node --import tsx agent-eval/src/cli.ts run --dataset flowmate-agent-v1 --selection full --judge required"

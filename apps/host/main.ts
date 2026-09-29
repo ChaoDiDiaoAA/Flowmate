@@ -1,11 +1,13 @@
-import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
+import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
 import { appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok } from '@flowmate/contracts';
 import type { Application, DesktopState, ProductSettings } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings } from '@flowmate/core';
 import { createPromptTraceBuffer } from '@flowmate/logging';
-import { PiAgentAdapter, PiProviderAdapter } from '@flowmate/runtime-pi';
+import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
 import { parseHostCommand } from './protocol.ts';
@@ -25,15 +27,22 @@ function startupRoot(): string | null {
   return value && isAbsolute(value) ? value : null;
 }
 
+function startupInvoiceSourceRoot(): string | null {
+  const index = process.argv.indexOf('--invoice-source-root');
+  const value = index >= 0 ? process.argv[index + 1] : undefined;
+  return value && isAbsolute(value) ? value : null;
+}
+
 const root = startupRoot();
+const invoiceSourceRoot = startupInvoiceSourceRoot() ?? join(process.cwd(), 'data', 'invoices', 'agent-input');
 if (!root) {
   send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: '' } as Omit<DesktopState, 'modelCredentials'> });
   process.exitCode = 2;
 } else {
-  await runHost(root);
+  await runHost(root, invoiceSourceRoot);
 }
 
-async function runHost(userDataRoot: string): Promise<void> {
+async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise<void> {
   const pathsResult = resolveProductPaths(userDataRoot);
   if (!pathsResult.ok) {
     send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: userDataRoot } as Omit<DesktopState, 'modelCredentials'> });
@@ -43,12 +52,6 @@ async function runHost(userDataRoot: string): Promise<void> {
   const paths = pathsResult.data;
   const settingsFile = join(paths.root, 'data', 'settings.json');
   const authFile = join(paths.runtimeDir, 'pi-desktop', 'auth.json');
-  await mkdir(dirname(authFile), { recursive: true });
-  try { await readFile(authFile, 'utf8'); }
-  catch {
-    const handle = await open(authFile, 'wx', 0o600).catch(() => null);
-    if (handle) { await handle.writeFile('{}\n', 'utf8'); await handle.close(); }
-  }
 
   let settings = await readProductSettings(settingsFile);
   if (!settings.ok) {
@@ -56,19 +59,69 @@ async function runHost(userDataRoot: string): Promise<void> {
     process.exitCode = 2;
     return;
   }
+  try {
+    const raw = JSON.parse(await readFile(settingsFile, 'utf8')) as { version?: unknown };
+    if (raw.version === 1) settings = await saveProductSettings(settingsFile, settings.data);
+  } catch { /* A missing settings file already has safe defaults. */ }
+  if (!settings.ok) {
+    send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> });
+    process.exitCode = 2;
+    return;
+  }
   let currentSettings: ProductSettings = settings.data ?? defaultProductSettings();
-  const activeKeys = new Map<string, string>();
-  const agentKeyByRun = new Map<number, string>();
   const active = new Map<string, { controller: AbortController; runId: number | null }>();
   const recentlySeen = new Set<string>();
   const seenOrder: string[] = [];
   let application: Application;
-  const runtimeApiKeyFor = (config: { modelRef: { provider: string } }) => activeKeys.get(config.modelRef.provider);
+  const pendingCredentials = new Map<string, (value: { ok: boolean; credential?: unknown }) => void>();
+  const credentialWrites = new Map<string, Promise<unknown>>();
+  const credentialRequest = (ref: string, operation: 'read' | 'write' | 'delete', credential?: Credential): Promise<Credential | undefined> => {
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => { pendingCredentials.delete(requestId); reject(new Error('credential_timeout')); }, 10_000);
+      pendingCredentials.set(requestId, (value) => {
+        clearTimeout(timeout);
+        if (!value.ok) reject(new Error('credential_unavailable'));
+        else resolve(value.credential as Credential | undefined);
+      });
+      send({ version: 1, type: 'credential_request', requestId, credentialRef: ref, operation,
+        ...(credential === undefined ? {} : { credential }) });
+    });
+  };
+  const credentialsFor = (config: { credentialRef?: string; modelRef: { provider: string } }): CredentialStore | undefined => {
+    const ref = config.credentialRef;
+    if (!ref) return undefined;
+    const providerId = config.modelRef.provider;
+    const read = () => credentialRequest(ref, 'read');
+    const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
+      const previous = credentialWrites.get(ref) ?? Promise.resolve();
+      const current = previous.catch(() => undefined).then(operation);
+      credentialWrites.set(ref, current.catch(() => undefined));
+      return current;
+    };
+    return {
+      read: async (id) => id === providerId ? read() : undefined,
+      list: async () => { const credential = await read(); return credential ? [{ providerId, type: credential.type }] : []; },
+      modify: (id, fn) => {
+        if (id !== providerId) return Promise.reject(new Error('credential_provider_mismatch'));
+        return serialize(async () => {
+          const current = await read();
+          const next = await fn(current);
+          if (next !== undefined) await credentialRequest(ref, 'write', next);
+          return next ?? current;
+        });
+      },
+      delete: (id) => id === providerId
+        ? serialize(async () => { await credentialRequest(ref, 'delete'); })
+        : Promise.reject(new Error('credential_provider_mismatch')),
+    };
+  };
   const promptTrace = createPromptTraceBuffer();
   const created = await createApplication({
     paths,
-    provider: new PiProviderAdapter({ runtimeApiKeyFor }),
-    agentFactory: (tools) => new PiAgentAdapter({ runtimeApiKeyFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace, tools }),
+    invoiceSourceRoot,
+    provider: new PiProviderAdapter({ credentialsFor }),
+    agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace, tools }),
     promptTrace,
   });
   if (!created.ok) {
@@ -77,6 +130,9 @@ async function runHost(userDataRoot: string): Promise<void> {
     return;
   }
   application = created.data;
+  const catalog = await createPiModelCatalog();
+  const logins = new Map<string, AbortController>();
+  const authPrompts = new Map<string, { requestId: string; resolve(value: string): void; reject(error: Error): void }>();
 
   const state = (): Omit<DesktopState, 'modelCredentials'> => ({
     version: 1,
@@ -97,8 +153,109 @@ async function runHost(userDataRoot: string): Promise<void> {
   };
 
   const dispatch = async (command: HostCommand): Promise<void> => {
+    if (command.type === 'credential_response') {
+      pendingCredentials.get(command.requestId)?.(command.value);
+      pendingCredentials.delete(command.requestId);
+      return;
+    }
     if (command.type === 'get_state') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: ok(state()) });
+      return;
+    }
+    if (command.type === 'list_model_catalog') {
+      try { send({ version: 1, type: 'response', requestId: command.requestId,
+        value: ok(await catalog.list(command.providerId, command.refresh)) }); }
+      catch { send({ version: 1, type: 'response', requestId: command.requestId,
+        value: fail(appError('provider_catalog_unavailable', 'provider', 'Pi model catalog is unavailable.', true)) }); }
+      return;
+    }
+    if (command.type === 'auth_reply') {
+      const prompt = authPrompts.get(command.promptId);
+      if (!prompt || prompt.requestId !== command.loginRequestId) {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('auth_prompt_missing', 'input', 'The login prompt is no longer active.')) });
+        return;
+      }
+      authPrompts.delete(command.promptId);
+      if (command.value === null) prompt.reject(new Error('auth_cancelled'));
+      else prompt.resolve(command.value);
+      send({ version: 1, type: 'response', requestId: command.requestId, value: ok(undefined) });
+      return;
+    }
+    if (command.type === 'cancel_login') {
+      logins.get(command.loginRequestId)?.abort();
+      send({ version: 1, type: 'response', requestId: command.requestId, value: ok(undefined) });
+      return;
+    }
+    if (command.type === 'login_model') {
+      if (logins.size > 0 || !claimRequestId(command.requestId)) {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('auth_login_busy', 'input', 'Another model login is already active.')) });
+        return;
+      }
+      const profile = currentSettings.models.find((model) => model.id === command.modelId);
+      if (!profile || profile.kind !== 'catalog' || !profile.providerId) {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('model_not_configured', 'input', 'Choose and save a Pi provider model first.')) });
+        return;
+      }
+      const credentials = credentialsFor({ credentialRef: profile.credentialRef, modelRef: { provider: profile.providerId } })!;
+      const controller = new AbortController();
+      logins.set(command.requestId, controller);
+      const timer = setTimeout(() => controller.abort(), 180_000);
+      try {
+        await loginPiProvider(profile.providerId, command.authType, credentials, {
+          signal: controller.signal,
+          notify: (notice) => send({ version: 1, type: 'event', event: {
+            type: 'model_auth_notice', requestId: command.requestId, notice,
+          } }),
+          prompt: (prompt) => {
+            const promptId = randomUUID();
+            return new Promise<string>((resolve, reject) => {
+              const abort = () => { authPrompts.delete(promptId); reject(new Error('auth_cancelled')); };
+              if (controller.signal.aborted || prompt.signal?.aborted) { abort(); return; }
+              authPrompts.set(promptId, { requestId: command.requestId, resolve, reject });
+              controller.signal.addEventListener('abort', abort, { once: true });
+              prompt.signal?.addEventListener('abort', abort, { once: true });
+              const { signal: _signal, ...visiblePrompt } = prompt;
+              send({ version: 1, type: 'event', event: {
+                type: 'model_auth_prompt', requestId: command.requestId, promptId, prompt: visiblePrompt,
+              } });
+            });
+          },
+        });
+        send({ version: 1, type: 'response', requestId: command.requestId, value: ok({ configured: true }) });
+      } catch {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError(controller.signal.aborted ? 'auth_cancelled' : 'auth_login_failed', 'provider',
+            controller.signal.aborted ? 'Model login was cancelled or timed out.' : 'Pi provider login failed.', true)) });
+      } finally {
+        clearTimeout(timer);
+        logins.delete(command.requestId);
+        for (const [id, prompt] of authPrompts) if (prompt.requestId === command.requestId) authPrompts.delete(id);
+      }
+      return;
+    }
+    if (command.type === 'logout_model') {
+      if (logins.size > 0) {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('auth_login_busy', 'input', 'Finish the active model login first.')) });
+        return;
+      }
+      const profile = currentSettings.models.find((model) => model.id === command.modelId);
+      if (!profile || profile.kind !== 'catalog' || !profile.providerId) {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('model_not_configured', 'input', 'The Pi provider model is unavailable.')) });
+        return;
+      }
+      try {
+        await logoutPiProvider(profile.providerId, credentialsFor({ credentialRef: profile.credentialRef,
+          modelRef: { provider: profile.providerId } })!);
+        send({ version: 1, type: 'response', requestId: command.requestId, value: ok(undefined) });
+      } catch {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('auth_logout_failed', 'provider', 'Pi provider logout failed.', true)) });
+      }
       return;
     }
     if (command.type === 'save_settings') {
@@ -154,6 +311,10 @@ async function runHost(userDataRoot: string): Promise<void> {
     }
     if (command.type === 'query_job') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryJob(command.jobId) });
+      return;
+    }
+    if (command.type === 'hide_job') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.hideJob(command.jobId) });
       return;
     }
     if (command.type === 'list_job_candidates') {
@@ -265,14 +426,21 @@ async function runHost(userDataRoot: string): Promise<void> {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('model_not_configured', 'input', '所选模型配置不存在。')) });
         return;
       }
-      const providerId = `flowmate-profile-${profile.id}`;
+      if (profile.kind === 'legacy') {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('model_reconfiguration_required', 'input', 'Choose this model again from the Pi catalog or configure it as custom.')) });
+        return;
+      }
+      const providerId = profile.kind === 'catalog' ? profile.providerId! : `flowmate-profile-${profile.id}`;
       const config = {
         version: 1 as const,
         name: `desktop-${profile.name}`,
         revision: Math.max(1, currentSettings.revision),
         modelRef: { provider: providerId, model: profile.model },
+        credentialRef: profile.credentialRef,
         native: { authPath: authFile, modelsPath: null },
-        connection: { baseUrl: profile.baseUrl, api: profile.api },
+        ...(profile.kind === 'custom' ? { connection: { baseUrl: profile.baseUrl, api: profile.api,
+          contextWindow: profile.contextWindow!, maxTokens: profile.maxTokens!, reasoning: profile.reasoning } } : {}),
         parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
       };
       const normalized = normalizeAgentRunRequest({
@@ -287,25 +455,16 @@ async function runHost(userDataRoot: string): Promise<void> {
         send({ version: 1, type: 'response', requestId: command.requestId, value: normalized });
         return;
       }
-      activeKeys.set(providerId, command.apiKey);
       let accepted;
       try {
         accepted = await application.startRun(normalized.data, { onEvent(event) {
-          if (event.type === 'run_progress' && event.phase === 'created') agentKeyByRun.set(event.runId, providerId);
-          if (event.type === 'run_finished') {
-            const key = agentKeyByRun.get(event.runId);
-            if (key) activeKeys.delete(key);
-            agentKeyByRun.delete(event.runId);
-          }
           send({ version: 1, type: 'event', event: { type: 'agent_run_event', requestId: command.requestId, value: event } });
         } });
       } catch {
-        if (![...agentKeyByRun.values()].includes(providerId)) activeKeys.delete(providerId);
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('host_command_failed', 'runtime', 'Agent Run 未能提交。', true)) });
         return;
       }
       if (!accepted.ok) {
-        if (![...agentKeyByRun.values()].includes(providerId)) activeKeys.delete(providerId);
         send({ version: 1, type: 'response', requestId: command.requestId, value: accepted });
         return;
       }
@@ -322,14 +481,21 @@ async function runHost(userDataRoot: string): Promise<void> {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('model_not_configured', 'input', '所选模型配置不存在。')) });
         return;
       }
-      const providerId = `flowmate-profile-${profile.id}`;
+      if (profile.kind === 'legacy') {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('model_reconfiguration_required', 'input', 'Choose this model again from the Pi catalog or configure it as custom.')) });
+        return;
+      }
+      const providerId = profile.kind === 'catalog' ? profile.providerId! : `flowmate-profile-${profile.id}`;
       const config = {
         version: 1 as const,
         name: `desktop-${profile.name}`,
         revision: Math.max(1, currentSettings.revision),
         modelRef: { provider: providerId, model: profile.model },
+        credentialRef: profile.credentialRef,
         native: { authPath: authFile, modelsPath: null },
-        connection: { baseUrl: profile.baseUrl, api: profile.api },
+        ...(profile.kind === 'custom' ? { connection: { baseUrl: profile.baseUrl, api: profile.api,
+          contextWindow: profile.contextWindow!, maxTokens: profile.maxTokens!, reasoning: profile.reasoning } } : {}),
         parameters: {
           maxRetries: 0,
           maxRetryDelayMs: 2000,
@@ -348,7 +514,6 @@ async function runHost(userDataRoot: string): Promise<void> {
       const controller = new AbortController();
       const current = { controller, runId: null as number | null };
       active.set(command.requestId, current);
-      activeKeys.set(providerId, command.apiKey);
       let accepted = false;
       const result = await application.callProvider(normalized.data, {
         signal: controller.signal,
@@ -365,7 +530,6 @@ async function runHost(userDataRoot: string): Promise<void> {
         },
       });
       active.delete(command.requestId);
-      activeKeys.delete(providerId);
       if (accepted && current.runId !== null) {
         send({ version: 1, type: 'event', event: { type: 'provider_finished', requestId: command.requestId, runId: current.runId, result } });
       } else if (!accepted) {

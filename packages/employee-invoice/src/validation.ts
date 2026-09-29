@@ -3,50 +3,15 @@ import type {
   CheckResult,
   InvoiceField,
   InvoiceIssue,
-  InvoiceToolInput,
   InvoiceToolOutput,
 } from '@flowmate/contracts';
 import { absoluteDecimalAtMost, addDecimal, multiplyDecimal, parseDecimal, roundDecimal, subtractDecimal, taxAmount, toDecimalString } from '@flowmate/shared';
 
-const currencyScales: Readonly<Record<string, number>> = { CNY: 2, USD: 2, EUR: 2, GBP: 2, JPY: 0, KWD: 3, BHD: 3 };
+export const currencyScales: Readonly<Record<string, number>> = { CNY: 2, USD: 2, EUR: 2, GBP: 2, JPY: 0, KWD: 3, BHD: 3 };
 const requiredHeader: ReadonlyArray<keyof CandidateDraft['fields']> = [
   'invoiceNumber', 'issueDate', 'sellerName', 'buyerName', 'currency', 'totalAmount',
 ];
 const amountFields = new Set(['netAmount', 'taxAmount', 'totalAmount', 'quantity', 'unitPrice', 'taxRate']);
-
-export function normalizeInvoiceValues(input: InvoiceToolInput<'normalize_invoice_values'>): InvoiceToolOutput<'normalize_invoice_values'> {
-  return { items: input.items.map(({ kind, raw }, index) => {
-    const text = raw.trim();
-    if (kind === 'decimal') {
-      const value = parseDecimal(text);
-      return value
-        ? { index, kind, raw, status: 'normalized' as const, value: toDecimalString(value), alternatives: [], reason: null }
-        : { index, kind, raw, status: 'unsupported' as const, value: null, alternatives: [], reason: 'unsupported_decimal' };
-    }
-    if (kind === 'currency') {
-      const code = /^[A-Za-z]{3}$/.test(text) ? text.toUpperCase() : '';
-      return code && currencyScales[code] !== undefined
-        ? { index, kind, raw, status: 'normalized' as const, value: code, alternatives: [], reason: null }
-        : { index, kind, raw, status: 'unsupported' as const, value: null, alternatives: [], reason: 'unsupported_currency' };
-    }
-    const parsedDate = parseDate(text);
-    if (parsedDate.kind === 'valid') {
-      return { index, kind, raw, status: 'normalized' as const, value: parsedDate.value, alternatives: [], reason: null };
-    }
-    if (parsedDate.kind === 'ambiguous') {
-      return { index, kind, raw, status: 'ambiguous' as const, value: null, alternatives: parsedDate.values, reason: 'ambiguous_date_order' };
-    }
-    return { index, kind, raw, status: 'unsupported' as const, value: null, alternatives: [], reason: 'unsupported_date' };
-  }) };
-}
-
-export function calculateInvoiceAmounts(input: InvoiceToolInput<'calculate_invoice_amounts'>): InvoiceToolOutput<'calculate_invoice_amounts'> {
-  const exact = input.operation === 'sum' ? addDecimal(input.values)
-    : input.operation === 'product' ? multiplyDecimal(input.quantity, input.unitPrice)
-      : taxAmount(input.netAmount, input.taxRate);
-  return { operation: input.operation, exact, rounded: input.scale === null ? null : roundDecimal(exact, input.scale),
-    scale: input.scale, rounding: input.scale === null ? null : 'half_away_from_zero' };
-}
 
 export function evaluateCandidate(candidate: CandidateDraft,
   sourceResults: readonly InvoiceToolOutput<'check_invoice_sources'>['results'][number][]): {
@@ -61,7 +26,6 @@ export function evaluateCandidate(candidate: CandidateDraft,
   const sources = fields.flatMap(({ value }) => value.sources);
   const badSourcePaths: string[] = [];
   let validSourceCount = 0;
-  let unverifiedSourceCount = 0;
   let sourceCursor = 0;
 
   for (const field of fields) {
@@ -109,19 +73,13 @@ export function evaluateCandidate(candidate: CandidateDraft,
         badSourcePaths.push(path);
       } else if (result.status === 'valid') {
         validSourceCount += 1;
-      } else if (result.status === 'invalid') {
-        badSourcePaths.push(path);
-      } else {
-        unverifiedSourceCount += 1;
-        addIssue(issues, 'image_quote_unverified', 'warning', [path], 'The original-image quote was delivered but its visual meaning is not verified.', 'source-reference');
-      }
+      } else badSourcePaths.push(path);
     }
   }
 
   if (badSourcePaths.length > 0) addViolation(violations, 'source_invalid', badSourcePaths);
-  const allSourcesAccounted = sourceResults.length === sources.length && validSourceCount + unverifiedSourceCount === sources.length;
-  checks.push(check('source-reference', sources.length === 0 ? 'not_applicable' : !allSourcesAccounted || badSourcePaths.length > 0 ? 'failed'
-    : unverifiedSourceCount > 0 ? 'not_evaluable' : 'passed',
+  const allSourcesAccounted = sourceResults.length === sources.length && validSourceCount === sources.length;
+  checks.push(check('source-reference', sources.length === 0 ? 'not_applicable' : !allSourcesAccounted || badSourcePaths.length > 0 ? 'failed' : 'passed',
   unique(sources.length === 0 ? fields.filter(({ value }) => value.state === 'present').map(({ path }) => path) : badSourcePaths),
   null, null, null, null, sources.length === 0 ? 'present_source_missing' : null));
 
@@ -248,7 +206,7 @@ function interpretRawDecimal(value: string): { kind: 'value'; value: string } | 
   return null;
 }
 
-function parseDate(value: string): { kind: 'valid'; value: string } | { kind: 'ambiguous'; values: string[] } | { kind: 'invalid' } {
+export function parseDate(value: string): { kind: 'valid'; value: string } | { kind: 'ambiguous'; values: string[] } | { kind: 'invalid' } {
   const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
   if (iso && validDate(Number(iso[1]), Number(iso[2]), Number(iso[3]))) return { kind: 'valid', value };
   const chinese = /^(\d{4})年(\d{1,2})月(\d{1,2})日$/.exec(value);

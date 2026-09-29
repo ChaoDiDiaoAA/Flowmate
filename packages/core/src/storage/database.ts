@@ -35,15 +35,21 @@ export type DbHandle = {
   close: () => void;
 };
 
-function migrationSql(version: 1 | 2 | 3): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql'][version - 1];
+function migrationSql(version: 1 | 2 | 3 | 4 | 5 | 6): string {
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
 
-function runMigration(db: Database, version: 1 | 2 | 3): void {
+function runMigration(db: Database, version: 1 | 2 | 3 | 4 | 5 | 6): void {
   try {
-    db.exec(migrationSql(version));
+    if (version === 4) {
+      for (const statement of migrationSql(version).split(';').map((sql) => sql.trim()).filter(Boolean)) {
+        db.exec(statement);
+      }
+      if (db.query('PRAGMA foreign_key_check').all().length) throw new Error('migration_foreign_key_violation');
+      db.exec('COMMIT');
+    } else db.exec(migrationSql(version));
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* preserve migration error; caller closes the database */ }
     throw error;
@@ -56,10 +62,10 @@ function migrateToLatest(db: Database): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 3) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 6) {
     throw new Error('unsupported_schema_version');
   }
-  for (let version = versions.length + 1; version <= 3; version += 1) runMigration(db, version as 2 | 3);
+  for (let version = versions.length + 1; version <= 6; version += 1) runMigration(db, version as 2 | 3 | 4 | 5 | 6);
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {
