@@ -93,7 +93,7 @@ export async function runDev(root = process.cwd()): Promise<void> {
       const env: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RENDERER_URL: rendererUrl, FLOWMATE_DEV_PARENT: '1' };
       delete env.NODE_OPTIONS;
       delete env.ELECTRON_RUN_AS_NODE;
-      const child = spawn(executable, args, { cwd: root, windowsHide: true, detached: process.platform === 'win32',
+      const child = spawn(executable, args, { cwd: root, detached: process.platform === 'win32',
         stdio: ['inherit', 'inherit', 'inherit', 'ipc'], serialization: 'json',
         env });
       desktop = child;

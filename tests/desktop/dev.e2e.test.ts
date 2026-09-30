@@ -18,7 +18,7 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
   symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'), 'junction');
   const mainFile = join(root, 'apps/desktop/main/index.ts');
   const preloadFile = join(root, 'apps/desktop/preload/index.ts');
-  const mainSource = readFileSync(mainFile, 'utf8');
+  const mainSource = `${readFileSync(mainFile, 'utf8')}\napp.on('browser-window-created', (_event, window) => {\n  window.once('ready-to-show', () => setTimeout(() => console.log('[Flowmate test window] ' + JSON.stringify({ visible: window.isVisible() })), 100));\n});\n`;
   const preloadSource = readFileSync(preloadFile, 'utf8');
   writeFileSync(mainFile, `${mainSource}\nconst = ;\n`);
   writeFileSync(preloadFile, `${preloadSource}\nconst = ;\n`);
@@ -96,6 +96,8 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
     writeFileSync(preloadFile, preloadSource);
     await waitFor(() => readyPids().length === 1);
     let page = await connect();
+    await waitFor(() => output.includes('[Flowmate test window]'));
+    expect(output).toContain('[Flowmate test window] {"visible":true}');
     expect(requests).toBe(0);
     expect(await page.evaluate(async (port) => {
       const state = await window.flowmate.getState();
