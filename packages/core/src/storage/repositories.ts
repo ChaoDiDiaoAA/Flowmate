@@ -156,6 +156,8 @@ export interface DocumentRepository {
   getArtifact(artifactId: DbId): Result<StoredArtifact>;
   register(input: NewDocumentRegistration): Result<DocumentSnapshot>;
   setAvailability(input: { documentId: DbId; status: 'available' | 'unavailable'; reason: string | null; at: string }): Result<DocumentSnapshot>;
+  hide(documentId: DbId, at: string): Result<{ documentId: DbId; affectedChatCount: number }>;
+  unhide(documentId: DbId, at: string): Result<DocumentSnapshot>;
 }
 
 export type WorkspaceUpdate = { expectedRevision: number; change: WorkspaceChange; at: string };
@@ -220,7 +222,7 @@ export interface SessionRepository {
   isModelUseBlocked(sessionId: DbId): Result<boolean>;
   revokeDocumentUse(input: { documentId: DbId; at: string }): Result<{ affectedSessionIds: DbId[] }>;
   prepareDelete(sessionId: DbId, at: string): Result<SessionRow>;
-  delete(sessionId: DbId, at: string): Result<void>;
+  delete(sessionId: DbId, at: string): Result<'hidden' | 'permanent'>;
   loadHistory(sessionId: DbId): Result<NativeSessionHistory | null>;
   saveHistory(sessionId: DbId, history: NativeSessionHistory): Result<void>;
 }
@@ -470,6 +472,34 @@ function parseSessionModelUse(value: string): { documentIds: number[]; at: strin
   return { documentIds: blocked.documentIds as number[], at: blocked.at, reason: blocked.reason };
 }
 
+type DocumentRunAssociation = { session_id: number; scope_json: string | null; config_json: string; job_document_id: number | null };
+
+function runUsesDocument(row: DocumentRunAssociation, documentId: DbId): boolean {
+  let scope: unknown = null;
+  try { scope = row.scope_json === null ? null : JSON.parse(row.scope_json); } catch { /* Invalid P3 scope must be treated conservatively. */ }
+  const parsed = RunScopeSchema.safeParse(scope);
+  return parsed.success && parsed.data.allowedDocumentIds.includes(documentId)
+    || row.job_document_id === documentId || !parsed.success && configPolicy(row.config_json) !== 'p2';
+}
+
+function blockSessionsUsingDocument(db: Database, documentId: DbId, at: string): DbId[] {
+  const rows = db.query(`SELECT run.session_id,run.scope_json,run.config_json,job.document_id AS job_document_id
+    FROM runs run LEFT JOIN jobs job ON job.id=run.job_id WHERE run.kind='agent' AND run.session_id IS NOT NULL`).all() as DocumentRunAssociation[];
+  const affected = [...new Set(rows.filter((row) => runUsesDocument(row, documentId)).map((row) => row.session_id))]
+    .sort((left, right) => left - right);
+  for (const sessionId of affected) {
+    const row = db.query('SELECT metadata_json FROM sessions WHERE id=?').get(sessionId) as { metadata_json: string } | null;
+    if (!row) throw new Error('revocation_session_missing');
+    const current = parseSessionModelUse(row.metadata_json);
+    const documentIds = [...new Set([...(current?.documentIds ?? []), documentId])].sort((left, right) => left - right);
+    const metadata = JSON.stringify({ version: 1, model_use_blocked: { documentIds, at, reason: 'document_use_revoked' } });
+    if (db.query('UPDATE sessions SET metadata_json=?,updated_at=? WHERE id=?').run(metadata, at, sessionId).changes !== 1) {
+      throw new Error('revocation_session_update_failed');
+    }
+  }
+  return affected;
+}
+
 function configPolicy(value: string | null): 'p2' | 'p3' | null {
   if (value === null) return null;
   try {
@@ -503,7 +533,7 @@ function artifactMetadata(value: unknown): ArtifactMetadata {
 function documentSnapshot(value: unknown): DocumentSnapshot {
   const row = value as {
     id: number; version: string; status: string; original_artifact_id: number; parsed_artifact_id: number;
-    metadata_json: string; created_at: string; updated_at: string;
+    metadata_json: string; created_at: string; updated_at: string; hidden_at?: string | null;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id <= 0 || typeof row.version !== 'string'
     || !['available', 'unavailable'].includes(row.status) || !Number.isSafeInteger(row.original_artifact_id)
@@ -526,7 +556,7 @@ function documentSnapshot(value: unknown): DocumentSnapshot {
     || (hasSampleId && (typeof metadata.sampleId !== 'string' || !/^\d{6}$/.test(metadata.sampleId)))) throw new Error('invalid_document_metadata');
   DocumentRefSchema.parse({ id: row.id, version: row.version });
   return {
-    documentRef: { id: row.id, version: row.version }, status: row.status as DocumentSnapshot['status'],
+    documentRef: { id: row.id, version: row.version }, status: row.status as DocumentSnapshot['status'], isHidden: row.hidden_at != null,
     displayName: hasSampleId ? `Invoice ${metadata.sampleId}` : `Invoice imported ${new Intl.DateTimeFormat('en-US', {
       month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
     }).format(new Date(row.created_at))}`,
@@ -717,8 +747,8 @@ export function createDocumentRepository(db: Database): DocumentRepository {
           return fail(appError('input_invalid', 'input', 'Document 分页参数无效。'));
         }
         const rows = input.beforeId === undefined
-          ? db.query('SELECT * FROM documents ORDER BY id DESC LIMIT ?').all(input.limit + 1)
-          : db.query('SELECT * FROM documents WHERE id<? ORDER BY id DESC LIMIT ?').all(input.beforeId, input.limit + 1);
+          ? db.query('SELECT * FROM documents WHERE hidden_at IS NULL ORDER BY id DESC LIMIT ?').all(input.limit + 1)
+          : db.query('SELECT * FROM documents WHERE hidden_at IS NULL AND id<? ORDER BY id DESC LIMIT ?').all(input.beforeId, input.limit + 1);
         const items = (rows as unknown[]).map(documentSnapshot);
         const hasMore = items.length > input.limit;
         const page = hasMore ? items.slice(0, input.limit) : items;
@@ -792,6 +822,36 @@ export function createDocumentRepository(db: Database): DocumentRepository {
         return ok(documentSnapshot(db.query('SELECT * FROM documents WHERE id=?').get(input.documentId)));
       });
       return updated.ok ? updated.data : updated;
+    },
+
+    hide(documentId, at) {
+      const hidden = transaction(db, () => {
+        const row = db.query('SELECT hidden_at FROM documents WHERE id=?').get(documentId) as { hidden_at: string | null } | null;
+        if (!row) return fail(appError('document_not_found', 'input', 'Invoice not found.'));
+        if (row.hidden_at !== null) return ok({ documentId, affectedChatCount: 0 });
+        const active = db.query(`SELECT run.session_id,run.scope_json,run.config_json,job.document_id AS job_document_id
+          FROM runs run LEFT JOIN jobs job ON job.id=run.job_id
+          WHERE run.kind='agent' AND run.status IN ('created','running')`).all() as DocumentRunAssociation[];
+        if (active.some((run) => runUsesDocument(run, documentId))) {
+          return fail(appError('document_busy', 'runtime', 'Wait for the active response or stop it before removing this invoice.', true));
+        }
+        const affectedSessionIds = blockSessionsUsingDocument(db, documentId, at);
+        db.query('UPDATE documents SET hidden_at=?,updated_at=? WHERE id=?').run(at, at, documentId);
+        db.query(`UPDATE workspace SET active_document_id=NULL,active_job_id=NULL,active_view='original',
+          selection_json=NULL,revision=revision+1,updated_at=? WHERE id=1 AND active_document_id=?`).run(at, documentId);
+        return ok({ documentId, affectedChatCount: affectedSessionIds.length });
+      });
+      return hidden.ok ? hidden.data : hidden;
+    },
+
+    unhide(documentId, at) {
+      const restored = transaction(db, () => {
+        const row = db.query('SELECT hidden_at FROM documents WHERE id=?').get(documentId) as { hidden_at: string | null } | null;
+        if (!row) return fail(appError('document_not_found', 'input', 'Invoice not found.'));
+        if (row.hidden_at !== null) db.query('UPDATE documents SET hidden_at=NULL,updated_at=? WHERE id=?').run(at, documentId);
+        return ok(documentSnapshot(db.query('SELECT * FROM documents WHERE id=?').get(documentId)));
+      });
+      return restored.ok ? restored.data : restored;
     },
   };
 }
@@ -901,8 +961,8 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
         let activeView = row.active_view as WorkspaceSnapshot['activeView'];
         const change = input.change;
         if (change.kind === 'document') {
-          if (change.documentId !== null && !db.query('SELECT id FROM documents WHERE id=?').get(change.documentId)) {
-            return fail(appError('document_not_found', 'input', 'Document 不存在。'));
+          if (change.documentId !== null && !db.query('SELECT id FROM documents WHERE id=? AND hidden_at IS NULL').get(change.documentId)) {
+            return fail(appError('document_not_found', 'input', 'Invoice is no longer in the workspace.'));
           }
           if (documentId !== change.documentId) {
             documentId = change.documentId;
@@ -912,6 +972,9 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
         } else if (change.kind === 'job') {
           const job = readJob(db, change.jobId);
           if (!job) return fail(appError('job_not_found', 'input', 'Job 不存在。'));
+          if (!db.query('SELECT id FROM documents WHERE id=? AND hidden_at IS NULL').get(job.documentRef.id)) {
+            return fail(appError('input_unavailable', 'input', 'This invoice is available only in Processing History.'));
+          }
           if (jobId !== change.jobId || documentId !== job.documentRef.id) {
             jobId = change.jobId;
             documentId = job.documentRef.id;
@@ -956,6 +1019,9 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
           document_id: number; current_candidate_id: number | null; status: string;
         } | null;
         if (!job) return fail(appError('job_not_found', 'input', 'Job 不存在。'));
+        if (!db.query('SELECT id FROM documents WHERE id=? AND hidden_at IS NULL').get(job.document_id)) {
+          return fail(appError('input_unavailable', 'input', 'This invoice is available only for review.'));
+        }
         if (job.current_candidate_id !== input.expectedCandidateId) {
           return fail(appError('state_conflict', 'input', 'Job 当前候选已变化，请重新读取。', true));
         }
@@ -1107,9 +1173,9 @@ export function createJobRepository(db: Database): JobRepository {
         if (workspace.revision !== input.expectedRevision || workspace.active_document_id !== input.documentRef.id) {
           return fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true));
         }
-        const document = db.query('SELECT version,status FROM documents WHERE id=?').get(input.documentRef.id) as { version: string; status: string } | null;
+        const document = db.query('SELECT version,status,hidden_at FROM documents WHERE id=?').get(input.documentRef.id) as { version: string; status: string; hidden_at: string | null } | null;
         if (!document || document.version !== input.documentRef.version) return fail(appError('document_not_found', 'input', 'Document 版本不存在。'));
-        if (document.status !== 'available') return fail(appError('input_unavailable', 'input', 'Document 当前不可读取。', true));
+        if (document.status !== 'available' || document.hidden_at !== null) return fail(appError('input_unavailable', 'input', 'Invoice is no longer available for processing.', true));
         const inputJson = { version: 1, clientSequence: input.clientSequence, expectedRevision: input.expectedRevision,
           documentRef: input.documentRef, goal: input.goal };
         const inserted = db.query(`INSERT INTO jobs(document_id,goal,input_json,status,created_at,updated_at)
@@ -1736,10 +1802,10 @@ export function createSessionRepository(db: Database): SessionRepository {
       try {
         const rows = request.before
           ? db.query(`SELECT * FROM sessions
-              WHERE updated_at < ? OR (updated_at = ? AND id < ?)
+              WHERE hidden_at IS NULL AND (updated_at < ? OR (updated_at = ? AND id < ?))
               ORDER BY updated_at DESC,id DESC LIMIT ?`)
             .all(request.before.updatedAt, request.before.updatedAt, request.before.sessionId, request.limit + 1)
-          : db.query('SELECT * FROM sessions ORDER BY updated_at DESC,id DESC LIMIT ?').all(request.limit + 1);
+          : db.query('SELECT * FROM sessions WHERE hidden_at IS NULL ORDER BY updated_at DESC,id DESC LIMIT ?').all(request.limit + 1);
         const mapped = (rows as unknown[]).map((row) => readSessionRow(db, row));
         const hasMore = mapped.length > request.limit;
         const items = hasMore ? mapped.slice(0, request.limit) : mapped;
@@ -1777,32 +1843,7 @@ export function createSessionRepository(db: Database): SessionRepository {
         if (!db.query('SELECT id FROM documents WHERE id=?').get(input.documentId)) {
           return { ok: false as const, error: appError('document_not_found', 'input', '正式材料不存在。') };
         }
-        const rows = db.query(`SELECT run.session_id,run.scope_json,run.config_json,job.document_id AS job_document_id
-          FROM runs run LEFT JOIN jobs job ON job.id=run.job_id WHERE run.kind='agent' AND run.session_id IS NOT NULL`).all() as Array<{
-            session_id: number; scope_json: string | null; config_json: string; job_document_id: number | null;
-          }>;
-        const affected = new Set<DbId>();
-        for (const row of rows) {
-          let scope: unknown = null;
-          try { scope = row.scope_json === null ? null : JSON.parse(row.scope_json); } catch { /* unreadable P3 scope is conservative below */ }
-          const parsed = RunScopeSchema.safeParse(scope);
-          const policy = configPolicy(row.config_json);
-          if (parsed.success && parsed.data.allowedDocumentIds.includes(input.documentId)
-            || row.job_document_id === input.documentId
-            || !parsed.success && policy !== 'p2') affected.add(row.session_id);
-        }
-        const affectedSessionIds = [...affected].sort((left, right) => left - right);
-        for (const sessionId of affectedSessionIds) {
-          const row = db.query('SELECT metadata_json FROM sessions WHERE id=?').get(sessionId) as { metadata_json: string } | null;
-          if (!row) throw new Error('revocation_session_missing');
-          const current = parseSessionModelUse(row.metadata_json);
-          const documentIds = [...new Set([...(current?.documentIds ?? []), input.documentId])].sort((left, right) => left - right);
-          const metadata = JSON.stringify({ version: 1, model_use_blocked: { documentIds, at: input.at, reason: 'document_use_revoked' } });
-          if (db.query('UPDATE sessions SET metadata_json=?,updated_at=? WHERE id=?').run(metadata, input.at, sessionId).changes !== 1) {
-            throw new Error('revocation_session_update_failed');
-          }
-        }
-        return { ok: true as const, data: { affectedSessionIds } };
+        return { ok: true as const, data: { affectedSessionIds: blockSessionsUsingDocument(db, input.documentId, input.at) } };
       });
       return revoked.ok ? revoked.data : revoked;
     },
@@ -1814,9 +1855,6 @@ export function createSessionRepository(db: Database): SessionRepository {
         if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
           return fail(appError('session_busy', 'session', 'An Agent Run is active in this Session. Wait for it to finish before deleting this Session.', true));
         }
-        if (hasBusinessHistory(db, sessionId)) {
-          return fail(appError('session_has_business_history', 'session', 'This Session contains invoice history and cannot be deleted.'));
-        }
         db.query("UPDATE sessions SET status='archived',updated_at=? WHERE id=? AND status!='archived'").run(at, sessionId);
         return ok(readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(sessionId)));
       });
@@ -1825,7 +1863,7 @@ export function createSessionRepository(db: Database): SessionRepository {
 
     delete(sessionId, at) {
       const deleted = transaction(db, () => {
-        const row = db.query('SELECT status FROM sessions WHERE id=?').get(sessionId) as { status: string } | null;
+        const row = db.query('SELECT status,hidden_at FROM sessions WHERE id=?').get(sessionId) as { status: string; hidden_at: string | null } | null;
         if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (row.status !== 'archived') {
           return fail(appError('session_delete_not_prepared', 'session', 'Session deletion has not been prepared.'));
@@ -1833,17 +1871,19 @@ export function createSessionRepository(db: Database): SessionRepository {
         if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
           return fail(appError('session_busy', 'session', 'An Agent Run is active in this Session. Wait for it to finish before deleting this Session.', true));
         }
-        if (hasBusinessHistory(db, sessionId)) {
-          return fail(appError('session_has_business_history', 'session', 'This Session contains invoice history and cannot be deleted.'));
-        }
+        if (row.hidden_at !== null) return ok('hidden' as const);
         db.query('UPDATE workspace SET active_session_id=NULL,revision=revision+1,updated_at=? WHERE id=1 AND active_session_id=?')
           .run(at, sessionId);
+        if (hasBusinessHistory(db, sessionId)) {
+          db.query('UPDATE sessions SET hidden_at=?,updated_at=? WHERE id=?').run(at, at, sessionId);
+          return ok('hidden' as const);
+        }
         db.query("DELETE FROM runs WHERE kind='agent' AND session_id=?").run(sessionId);
         // Bun counts rows removed by the native-history cascades too.
         if (db.query('DELETE FROM sessions WHERE id=?').run(sessionId).changes < 1) {
           return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         }
-        return ok(undefined);
+        return ok('permanent' as const);
       });
       return deleted.ok ? deleted.data : deleted;
     },
@@ -1913,15 +1953,15 @@ export function createRunRepository(db: Database): RunRepository {
         }
         if (input.expected.sessionId !== input.sessionId) return fail(appError('state_conflict', 'input', '当前 Session 与请求不一致。', true));
 
-        let document: { id: number; version: string; status: string; original_artifact_id: number; parsed_artifact_id: number } | null = null;
+        let document: { id: number; version: string; status: string; hidden_at: string | null; original_artifact_id: number; parsed_artifact_id: number } | null = null;
         if (input.expected.documentRef !== null) {
-          type DocumentRow = { id: number; version: string; status: string; original_artifact_id: number; parsed_artifact_id: number };
-          document = db.query('SELECT id,version,status,original_artifact_id,parsed_artifact_id FROM documents WHERE id=?')
+          type DocumentRow = { id: number; version: string; status: string; hidden_at: string | null; original_artifact_id: number; parsed_artifact_id: number };
+          document = db.query('SELECT id,version,status,hidden_at,original_artifact_id,parsed_artifact_id FROM documents WHERE id=?')
             .get(input.expected.documentRef.id) as DocumentRow | null;
           if (!document || document.version !== input.expected.documentRef.version) {
             return fail(appError('document_not_found', 'input', 'Document 版本不存在。'));
           }
-          if (document.status !== 'available') return fail(appError('input_unavailable', 'input', 'Document 当前不可读取。', true));
+          if (document.status !== 'available' || document.hidden_at !== null) return fail(appError('input_unavailable', 'input', 'Invoice is no longer available for processing.', true));
         }
         const job = input.expected.jobId === null ? null : readJob(db, input.expected.jobId);
         if ((input.expected.jobId !== null && !job) || (job && (!document || job.documentRef.id !== document.id

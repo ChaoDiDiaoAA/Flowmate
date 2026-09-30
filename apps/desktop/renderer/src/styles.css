@@ -179,12 +179,14 @@ h1 { margin-bottom: 0; color: var(--foreground); font-family: var(--font-display
 .field > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .field i { color: var(--foreground-subtle); font-size: 10px; font-style: normal; font-weight: 400; }
 .field input, .field select, .field textarea { width: 100%; min-height: 36px; padding: 7px 10px; border: 1px solid var(--input); border-radius: 5px; color: var(--foreground); background: var(--surface); font-size: 12px; font-weight: 400; }
+.model-limit { display: flex; align-items: center; min-height: 40px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 5px; color: var(--foreground); background: var(--surface-muted); font-size: 15px; font-weight: 600; }
 .field input::placeholder, .field textarea::placeholder { color: var(--foreground-subtle); opacity: .72; }
 .field input[spellcheck=false], .system-facts code { font-family: var(--font-numeric-stack); font-size: 11px; }
 .field textarea { min-height: 76px; resize: vertical; line-height: 1.5; }
 .config-actions { display: flex; align-items: center; gap: 8px; padding: 0 16px 12px; }
 .action-spacer { flex: 1; }
 .config-note { display: flex; align-items: flex-start; gap: 8px; margin: 0 16px 14px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 5px; color: var(--foreground-muted); background: var(--surface-muted); font-size: 11px; line-height: 1.45; }
+.config-note.catalog-error { grid-column: 1 / -1; margin: 0; }
 .note-mark { display: grid; width: 15px; height: 15px; flex: 0 0 15px; place-items: center; border: 1px solid var(--border-strong); border-radius: 50%; color: var(--accent); font-size: 10px; }
 .config-note b { color: var(--foreground); font-weight: 650; }
 
@@ -472,6 +474,8 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 .invoice-context .route-icon { width: 28px; height: 28px; flex-basis: 28px; font-size: 13px; }
 .invoice-context .route-name strong { font-size: 14px; }
 .invoice-context .route-name small { font-size: 13px; }
+.invoice-row-delete { min-height: 40px; flex: 0 0 auto; padding: 0 2px; font-size: 12px; }
+.invoice-heading-delete { display: none; }
 .invoice-sheet, .invoice-process { grid-column: 2; }
 .invoice-page > .panel + .panel { margin-top: 0; }
 .invoice-heading-actions { display: flex; gap: 8px; align-items: center; }
@@ -498,10 +502,12 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 .candidate-details .profile-fields > div { padding: 12px; border: 1px solid var(--border); border-radius: 6px; }
 .candidate-details .profile-fields p { margin: 5px 0; }
 .candidate-details .profile-fields small { color: var(--foreground-muted); font-size: 13px; }
-.connection-check, .settings-appearance { margin-top: 16px; }
-.connection-check { padding-bottom: 18px; }
-.connection-check p { margin: 14px 20px; }
-.connection-check button { margin-left: 20px; }
+.settings-appearance { margin-top: 16px; }
+.model-subsection { display: grid; gap: 10px; padding: 18px 20px; border-top: 1px solid var(--border); }
+.model-subsection h3 { margin: 0; font-size: 16px; font-weight: 650; }
+.model-subsection p { margin: 0; color: var(--foreground-muted); overflow-wrap: anywhere; }
+.model-subsection-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.model-check { background: var(--surface-muted); border-radius: 0 0 8px 8px; }
 .agent-chat-panel { background: var(--surface); }
 .chat-panel-head { min-height: 64px; padding: 10px 16px; }
 .chat-new-session, .chat-collapse, .chat-expand, .chat-session-select select, .chat-session-actions summary { min-height: 40px; font-size: 14px; }
@@ -535,28 +541,18 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 .chat-directory-actions button:hover, .chat-directory-rename button:hover, .chat-directory-more:hover { background: var(--surface-muted); }
 .chat-directory-rename input { min-width: 120px; max-width: 240px; height: 40px; padding: 0 9px; border: 1px solid var(--input); border-radius: 6px; color: var(--foreground); background: var(--surface); font-size: 14px; }
 .chat-directory-more { margin: 14px 18px; }
-.connection-check { max-width: 660px; margin-top: 0; }
-.connection-body { display: grid; gap: 14px; padding: 0 20px 20px; }
-.connection-body .field { max-width: 440px; }
-.connection-body p { margin: 0; }
-.connection-body button { justify-self: start; margin-left: 0; }
 .diagnostics-panel { max-width: 660px; margin-top: 16px; }
 .diagnostics-panel summary { min-height: 48px; padding: 14px 20px; cursor: pointer; font-size: 15px; font-weight: 650; }
 .diagnostics-panel > div { padding: 0 20px 16px; }
 .diagnostics-panel p { margin: 8px 0; color: var(--foreground-muted); font-size: 14px; }
 .generate-toggle { align-self: flex-start; min-height: 40px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--foreground-muted); background: var(--surface); font-size: 13px; }
 .generate-toggle.selected { border-color: var(--primary); color: var(--primary); background: color-mix(in srgb, var(--primary) 10%, var(--surface)); }
-.model-auth-dialog { width: min(440px, calc(100vw - 32px)); padding: 24px; border: 1px solid var(--border); border-radius: 12px; color: var(--foreground); background: var(--surface); box-shadow: 0 20px 60px rgb(0 0 0 / 25%); }
-.model-auth-dialog::backdrop { background: rgb(8 20 14 / 45%); }
-.model-auth-dialog h2 { margin: 0 0 16px; font-size: 20px; }
-.model-auth-dialog p { font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
-.model-auth-dialog form { display: grid; gap: 12px; margin: 16px 0; }
-.model-auth-dialog .secondary-button { margin-top: 12px; }
 @media (max-width: 1359px) {
   .invoice-page { grid-template-columns: minmax(0, 1fr); }
   .invoice-context { display: none; }
   .invoice-sheet, .invoice-process { grid-column: 1; }
   .context-select { display: block; }
+  .invoice-heading-delete { display: inline-flex; }
 }
 @media (max-width: 1199px) {
   .desktop-shell, .desktop-shell.chat-is-collapsed { grid-template-columns: 64px minmax(0, 1fr) 380px; }
@@ -585,6 +581,7 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 }
 @media (max-width: 1079px) {
   .desktop-shell, .desktop-shell.chat-is-collapsed { grid-template-columns: 64px minmax(0, 1fr); }
+  .page-content { padding-right: 82px; }
   .agent-chat-panel { position: fixed; z-index: 20; inset: 0 0 0 auto; width: min(380px, calc(100vw - 64px)); box-shadow: -18px 0 48px rgb(0 0 0 / 20%); }
   .agent-chat-panel.collapsed { position: fixed; inset: auto 18px 18px auto; width: 52px; height: 52px; border: 0; border-radius: 50%; box-shadow: 0 8px 28px rgb(0 0 0 / 18%); }
   .agent-chat-panel.collapsed .chat-expand { width: 52px; height: 52px; border-radius: 50%; background: var(--primary); color: var(--primary-foreground); }

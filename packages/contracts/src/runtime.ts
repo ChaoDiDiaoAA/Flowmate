@@ -269,6 +269,8 @@ export type SessionSnapshot = {
   hasBusinessHistory: boolean;
 };
 
+export type DeleteSessionResult = { deletedSessionId: DbId; disposition: 'hidden' | 'permanent' };
+
 export type CreateSessionRequest = { title?: string; expectedRevision?: number };
 export type RenameSessionRequest = { sessionId: DbId; title: string };
 
@@ -371,7 +373,7 @@ export interface Application {
   queryRun(runId: DbId): Promise<Result<RunSnapshot>>;
   createSession(request?: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
   renameSession(request: RenameSessionRequest): Promise<Result<SessionSnapshot>>;
-  deleteSession(sessionId: DbId): Promise<Result<{ deletedSessionId: DbId }>>;
+  deleteSession(sessionId: DbId): Promise<Result<DeleteSessionResult>>;
   listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
   querySession(sessionId: DbId): Promise<Result<SessionSnapshot>>;
   listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>>;
@@ -384,6 +386,7 @@ export interface Application {
   selectCandidate(input: import('./workspace.ts').SelectCandidateRequest): Promise<Result<import('./workspace.ts').CandidateSelection>>;
   listDocuments(request?: import('./workspace.ts').PageRequest): Promise<Result<import('./workspace.ts').Page<import('./workspace.ts').DocumentSnapshot>>>;
   queryDocument(documentId: DbId): Promise<Result<import('./workspace.ts').DocumentSnapshot>>;
+  hideDocument(documentId: DbId): Promise<Result<{ documentId: DbId; affectedChatCount: number }>>;
   listJobs(request?: import('./workspace.ts').JobPageRequest): Promise<Result<import('./workspace.ts').Page<import('./workspace.ts').JobSnapshot>>>;
   queryJob(jobId: DbId): Promise<Result<import('./workspace.ts').JobSnapshot>>;
   hideJob(jobId: DbId): Promise<Result<import('./workspace.ts').JobSnapshot>>;

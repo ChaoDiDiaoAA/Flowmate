@@ -86,6 +86,56 @@ it('uses Pi native API-key login and returns the credential to the protected Mai
   }
 });
 
+it('rejects Pi requests without a local API key even when environment or OAuth credentials exist', async () => {
+  const repoRoot = resolve(import.meta.dir, '../..');
+  const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-local-key-'));
+  const client = new HostClient();
+  let stored: { type: string; key?: string; access?: string; refresh?: string; expires?: number } | undefined;
+  client.setCredentialHandler(async (request) => request.operation === 'read'
+    ? { ok: true, ...(stored ? { credential: stored } : {}) } : { ok: false });
+  const previousKey = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = 'synthetic-ambient-key';
+  try {
+    const started = await client.start(userDataRoot, '0.1.0', repoRoot);
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const profile = { id: 'pi-deepseek', credentialRef: 'local_key_credential_ref_1234', name: 'DeepSeek',
+      kind: 'catalog' as const, providerId: 'deepseek', baseUrl: '', model: 'deepseek-v4-flash',
+      api: '', contextWindow: null, maxTokens: null, reasoning: false };
+    const settings = { version: 2 as const, revision: 0,
+      profile: { displayName: 'Local key test', theme: 'system' as const }, models: [profile],
+      defaultModelId: profile.id, updatedAt: '2026-09-30T00:00:00.000Z' };
+    const saved = await client.request({ type: 'save_settings', settings }) as { ok: boolean; data?: { revision: number } };
+    expect(saved).toMatchObject({ ok: true, data: { revision: 1 } });
+    const created = await client.request({ type: 'create_session', requestId: 'local-key-session', input: {} }) as {
+      ok: boolean; data?: { sessionId: number } };
+    expect(created.ok).toBe(true);
+    if (!created.data) return;
+    const call = () => client.request({ type: 'call_provider', requestId: crypto.randomUUID(),
+      input: { goal: 'Check', text: 'OK', modelId: profile.id } });
+    const run = () => client.request({ type: 'start_run', requestId: crypto.randomUUID(),
+      input: { sessionId: created.data!.sessionId, text: 'Check', modelId: profile.id, goalMode: 'answer' },
+      expectedSettingsRevision: 1, expectedCredentialRef: profile.credentialRef });
+    expect(await call()).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
+    expect(await run()).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
+    stored = { type: 'oauth', access: 'old-access', refresh: 'old-refresh', expires: Date.now() + 60_000 };
+    expect(await call()).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
+    expect(await run()).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
+    stored = { type: 'api_key', key: 'synthetic-local-key' };
+    const unsupported = await client.request({ type: 'save_settings', settings: {
+      ...settings, revision: 1, models: [{ ...profile, providerId: 'openai-codex' }],
+    } });
+    expect(unsupported).toMatchObject({ ok: true });
+    expect(await call()).toMatchObject({ ok: false, error: { code: 'model_api_key_unsupported' } });
+    expect(await client.request({ type: 'list_session_runs', input: { sessionId: created.data.sessionId, limit: 10 } }))
+      .toMatchObject({ ok: true, data: { items: [] } });
+  } finally {
+    if (previousKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = previousKey;
+    await client.close();
+  }
+});
+
 it('wires the real Host Agent path, rejects stale model state after credential lookup and continues native history per Session', async () => {
   const repoRoot = resolve(import.meta.dir, '../..');
   const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-agent-'));
@@ -236,7 +286,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     expect(other.ok).toBe(true);
     if (!other.data) return;
     const deleted = await client.request({ type: 'delete_session', requestId: 'delete-other-session', sessionId: other.data.sessionId });
-    expect(deleted).toEqual({ ok: true, data: { deletedSessionId: other.data.sessionId } });
+    expect(deleted).toEqual({ ok: true, data: { deletedSessionId: other.data.sessionId, disposition: 'permanent' } });
     expect(await client.request({ type: 'query_session', sessionId: created.data.sessionId })).toMatchObject({ ok: true, data: { sessionId: created.data.sessionId } });
     expect(await client.request({ type: 'query_session', sessionId: other.data.sessionId })).toMatchObject({ ok: false, error: { code: 'session_not_found' } });
     expect(await client.request({ type: 'query_run', runId: 1 })).toMatchObject({ ok: true, data: { kind: 'agent', sessionId: created.data.sessionId } });

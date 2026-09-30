@@ -96,7 +96,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -137,7 +137,29 @@ describe('P3 invoice storage migration', () => {
     expect(after.query('SELECT id,document_id FROM jobs WHERE id=44').get()).toEqual({ id: 44, document_id: 43 });
     after.close();
   });
-  it('migrates schema 2 through 5 without changing existing Provider, Agent, or Session facts', () => {
+
+  it('rolls back migration 007 when its visibility index cannot be created', () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-visibility-migration-failure-'));
+    const paths = makePaths(root);
+    createVersion3InvoiceDatabase(paths);
+    const db = new Database(paths.databaseFile);
+    for (const version of ['004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql']) {
+      db.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${version}`, import.meta.url), 'utf8'));
+    }
+    db.exec('CREATE INDEX sessions_visible_recent ON sessions(id);');
+    db.close();
+    expect(openDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+    const after = new Database(paths.databaseFile);
+    expect(after.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 },
+    ]);
+    expect((after.query('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map((row) => row.name)).not.toContain('hidden_at');
+    expect((after.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name)).not.toContain('hidden_at');
+    expect(after.query('SELECT id FROM documents WHERE id=43').get()).toEqual({ id: 43 });
+    expect(after.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    after.close();
+  });
+  it('migrates schema 2 through 8 without changing existing Provider, Agent, or Session facts', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-migration-'));
     const paths = makePaths(root);
     createVersion2Database(paths);
@@ -151,7 +173,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -289,6 +311,8 @@ describe('P3 invoice storage migration', () => {
       .run(selectedSession.data.sessionId);
     expect(opened.data.jobs.hide(1, '2026-09-28T00:01:12.000Z'))
       .toMatchObject({ ok: false, error: { code: 'run_state_invalid' } });
+    expect(opened.data.documents.hide(1, '2026-09-28T00:01:12.000Z'))
+      .toMatchObject({ ok: false, error: { code: 'document_busy' } });
     opened.data.db.query('DELETE FROM runs WHERE id=101').run();
     expect(opened.data.jobs.hide(1, '2026-09-28T00:01:13.000Z'))
       .toMatchObject({ ok: true, data: { jobId: 1 } });
@@ -300,6 +324,34 @@ describe('P3 invoice storage migration', () => {
       .toEqual({ count: 1 });
     expect(opened.data.db.query('SELECT COUNT(*) AS count FROM business_events WHERE job_id=1').get())
       .toEqual({ count: 2 });
+    opened.data.db.exec("CREATE TRIGGER fail_document_hide BEFORE UPDATE OF hidden_at ON documents BEGIN SELECT RAISE(ABORT,'fixture failure'); END;");
+    expect(opened.data.documents.hide(1, '2026-09-28T00:01:15.000Z'))
+      .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(opened.data.sessions.get(selectedSession.data.sessionId)).toMatchObject({ ok: true, data: { modelUseBlocked: false } });
+    expect(opened.data.workspace.read('2026-09-28T00:01:15.000Z'))
+      .toMatchObject({ ok: true, data: { documentRef: { id: 1 }, revision: 6 } });
+    opened.data.db.exec('DROP TRIGGER fail_document_hide;');
+    expect(opened.data.documents.hide(1, '2026-09-28T00:01:16.000Z'))
+      .toEqual({ ok: true, data: { documentId: 1, affectedChatCount: 1 } });
+    expect(opened.data.documents.hide(1, '2026-09-28T00:01:17.000Z'))
+      .toEqual({ ok: true, data: { documentId: 1, affectedChatCount: 0 } });
+    expect(opened.data.documents.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [] } });
+    expect(opened.data.documents.get(1)).toMatchObject({ ok: true, data: { isHidden: true } });
+    expect(opened.data.sessions.get(selectedSession.data.sessionId)).toMatchObject({ ok: true, data: { modelUseBlocked: true } });
+    expect(opened.data.workspace.read('2026-09-28T00:01:18.000Z'))
+      .toMatchObject({ ok: true, data: { documentRef: null, jobId: null, revision: 7 } });
+    expect(opened.data.workspace.update({ expectedRevision: 7, at: '2026-09-28T00:01:18.000Z',
+      change: { kind: 'document', documentId: 1 } })).toMatchObject({ ok: false, error: { code: 'document_not_found' } });
+    expect(opened.data.jobs.create({ clientSequence: 2, expectedRevision: 7, documentRef: { id: 1, version: 'source-v1' },
+      goal: 'Try again', at: '2026-09-28T00:01:19.000Z' })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(opened.data.jobs.get(1)).toMatchObject({ ok: true, data: { jobId: 1 } });
+    expect(opened.data.db.query('SELECT COUNT(*) AS count FROM invoice_candidates WHERE job_id=1').get())
+      .toEqual({ count: 1 });
+    expect(opened.data.documents.unhide(1, '2026-09-28T00:01:20.000Z'))
+      .toMatchObject({ ok: true, data: { isHidden: false } });
+    expect(opened.data.documents.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ documentRef: { id: 1 } }] } });
+    expect(opened.data.sessions.get(selectedSession.data.sessionId)).toMatchObject({ ok: true, data: { modelUseBlocked: true } });
+    expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 
   it('repairs interrupted invoice work atomically and preserves business history when deleting Sessions', () => {
@@ -370,9 +422,17 @@ describe('P3 invoice storage migration', () => {
     expect(db.query('SELECT status,status_reason FROM jobs WHERE id=4').get()).toMatchObject({ status: 'failed' });
     expect(db.query('SELECT id FROM invoice_candidates WHERE id=70').get()).toEqual({ id: 70 });
     expect(db.query('SELECT id FROM business_events WHERE candidate_id=70').get()).toMatchObject({ id: expect.any(Number) });
-    expect(recovered.data.sessions.prepareDelete(7, '2026-09-28T00:01:00.000Z'))
-      .toMatchObject({ ok: false, error: { code: 'session_has_business_history' } });
-    expect(recovered.data.sessions.get(7)).toMatchObject({ ok: true, data: { status: 'active' } });
+    const nativeHistory = { storageVersion: 1 as const,
+      header: { type: 'session' as const, version: 3, id: 'native-session-7', timestamp: '2026-09-28T00:00:00.000Z', cwd: paths.runtimeDir },
+      entries: [], leafId: null, unusable: false };
+    expect(recovered.data.sessions.saveHistory(7, nativeHistory)).toEqual({ ok: true, data: undefined });
+    expect(recovered.data.sessions.prepareDelete(7, '2026-09-28T00:01:00.000Z').ok).toBe(true);
+    expect(recovered.data.sessions.delete(7, '2026-09-28T00:01:00.000Z')).toEqual({ ok: true, data: 'hidden' });
+    expect(recovered.data.sessions.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: 8 }] } });
+    expect(recovered.data.sessions.get(7)).toMatchObject({ ok: true, data: { status: 'archived', hasBusinessHistory: true } });
+    expect(recovered.data.sessions.loadHistory(7)).toEqual({ ok: true, data: nativeHistory });
+    expect(db.query('SELECT session_id,job_id FROM runs WHERE id=50').get()).toEqual({ session_id: 7, job_id: 4 });
+    expect(db.query('SELECT id FROM invoice_candidates WHERE id=70').get()).toEqual({ id: 70 });
 
     const emptySession = recovered.data.sessions.create({ nativeSessionId: 'native-empty', title: 'Empty', at: '2026-09-28T00:02:00.000Z' });
     expect(emptySession.ok).toBe(true);
@@ -380,7 +440,7 @@ describe('P3 invoice storage migration', () => {
     db.query(`INSERT INTO workspace(id,active_session_id,created_at,updated_at,revision)
       VALUES (1,?,'2026-09-28T00:02:00.000Z','2026-09-28T00:02:00.000Z',4)`).run(emptySession.data.sessionId);
     expect(recovered.data.sessions.prepareDelete(emptySession.data.sessionId, '2026-09-28T00:03:00.000Z').ok).toBe(true);
-    expect(recovered.data.sessions.delete(emptySession.data.sessionId, '2026-09-28T00:04:00.000Z')).toEqual({ ok: true, data: undefined });
+    expect(recovered.data.sessions.delete(emptySession.data.sessionId, '2026-09-28T00:04:00.000Z')).toEqual({ ok: true, data: 'permanent' });
     expect(db.query('SELECT active_session_id,revision FROM workspace WHERE id=1').get()).toEqual({ active_session_id: null, revision: 5 });
     const terminalBefore = db.query('SELECT status,ended_at,result_json,stopped_at FROM tool_calls WHERE id=60').get();
     closeRecovered();
@@ -395,6 +455,8 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(closeSecondOpen);
     if (secondOpen.ok) {
       expect(secondOpen.data.db.query('SELECT status,ended_at,result_json,stopped_at FROM tool_calls WHERE id=60').get()).toEqual(terminalBefore);
+      expect(secondOpen.data.sessions.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: 8 }] } });
+      expect(secondOpen.data.sessions.loadHistory(7)).toEqual({ ok: true, data: nativeHistory });
     }
     closeSecondOpen();
 

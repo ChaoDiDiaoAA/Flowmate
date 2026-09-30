@@ -100,6 +100,7 @@ export type JobStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'faile
 export type DocumentSnapshot = {
   documentRef: DocumentRef;
   displayName: string;
+  isHidden: boolean;
   status: 'available' | 'unavailable';
   pageCount: number;
   originalArtifactId: DbId;

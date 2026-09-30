@@ -61,28 +61,31 @@ async function captureDesktopViews(page: Page) {
   if (!root) return;
   mkdirSync(root, { recursive: true });
   const nav = page.getByRole('navigation', { name: 'Workspace navigation' });
-  expect(await page.locator('.rail .nav-item').count()).toBe(6);
-  for (const name of ['Invoices', 'Processing History', 'Chats', 'Models', 'Connections', 'Settings']) {
+  expect(await page.locator('.rail .nav-item').count()).toBe(5);
+  for (const name of ['Invoices', 'Processing History', 'Chats', 'Models', 'Settings']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(1);
   }
-  for (const name of ['Activity', 'Workspace', 'Approved Results', 'Prompts', 'Skills', 'Extensions', 'Evaluation']) {
+  for (const name of ['Connections', 'Activity', 'Workspace', 'Approved Results', 'Prompts', 'Skills', 'Extensions', 'Evaluation']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(0);
   }
   for (const theme of ['light', 'dark'] as const) {
     await page.locator('.rail').getByRole('button', { name: 'Settings' }).click();
     await page.getByLabel('Theme').selectOption(theme);
     await page.setViewportSize({ width: 1440, height: 900 });
-    for (const [label, slug] of [['Models', 'models'], ['Connections', 'connections'], ['Chats', 'chats'], ['Settings', 'settings']] as const) {
+    for (const [label, slug] of [['Chats', 'chats'], ['Settings', 'settings']] as const) {
       await page.locator('.rail').getByRole('button', { name: label, exact: true }).click();
       await page.getByRole('heading', { name: label, exact: true }).waitFor({ state: 'visible' });
       await page.screenshot({ path: join(root, `1440x900-${theme}-${slug}.png`), fullPage: false });
     }
-    await nav.getByRole('button', { name: 'Invoices' }).click();
-    await page.getByRole('button', { name: 'Results', exact: true }).click();
     for (const [width, height] of [[1440, 900], [1280, 800], [980, 720]] as const) {
       await page.setViewportSize({ width, height });
-      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await nav.getByRole('button', { name: 'Models' }).click();
+      await page.getByRole('heading', { name: 'Models', exact: true }).waitFor({ state: 'visible' });
       const name = `${width}x${height}-${theme}`;
+      await page.screenshot({ path: join(root, `${name}-models.png`), fullPage: false });
+      await nav.getByRole('button', { name: 'Invoices' }).click();
+      await page.getByRole('button', { name: 'Results', exact: true }).click();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
       await page.screenshot({ path: join(root, `${name}.png`), fullPage: false });
       if (width === 980) {
         await page.getByRole('button', { name: 'Open Assistant' }).click();
@@ -92,6 +95,7 @@ async function captureDesktopViews(page: Page) {
         expect(await page.getByRole('button', { name: 'Open Assistant' }).evaluate((element) => document.activeElement === element)).toBe(true);
         await page.getByRole('button', { name: 'Open navigation' }).click();
         expect(await nav.getByRole('button', { name: 'Processing History' }).isVisible()).toBe(true);
+        expect(await nav.getByRole('button', { name: 'Models' }).isVisible()).toBe(true);
         await page.screenshot({ path: join(root, `${name}-navigation.png`), fullPage: false });
         await page.keyboard.press('Escape');
         expect(await page.getByRole('button', { name: 'Open navigation' }).evaluate((element) => document.activeElement === element)).toBe(true);
@@ -101,16 +105,48 @@ async function captureDesktopViews(page: Page) {
   await page.setViewportSize({ width: 1440, height: 900 });
 }
 
+async function capturePiModelViews(page: Page) {
+  const root = process.env.FLOWMATE_SCREENSHOT_ROOT;
+  if (!root) return;
+  mkdirSync(root, { recursive: true });
+  const nav = page.getByRole('navigation', { name: 'Workspace navigation' });
+  for (const theme of ['light', 'dark'] as const) {
+    await page.locator('.rail').getByRole('button', { name: 'Settings' }).click();
+    await page.getByLabel('Theme').selectOption(theme);
+    await nav.getByRole('button', { name: 'Models' }).click();
+    for (const [width, height] of [[1440, 900], [1280, 800], [980, 720]] as const) {
+      await page.setViewportSize({ width, height });
+      const name = `${width}x${height}-${theme}-pi-model`;
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await page.screenshot({ path: join(root, `${name}.png`), fullPage: false });
+      await page.getByRole('heading', { name: 'Connection check' }).scrollIntoViewIfNeeded();
+      await page.screenshot({ path: join(root, `${name}-auth.png`), fullPage: false });
+      await page.locator('.workspace').evaluate((element) => { element.scrollTop = 0; });
+    }
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.locator('.rail').getByRole('button', { name: 'Settings' }).click();
+  await page.getByLabel('Theme').selectOption('system');
+  await nav.getByRole('button', { name: 'Models' }).click();
+}
+
 it('desktop sends directly, keeps drafts editable and restores native history after restart', async () => {
   if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E requires Windows');
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-chat-e2e-'));
   const requestBodies: unknown[] = [];
   let releaseLiveText: (() => void) | null = null;
+  let holdNextConnection = false;
+  let connectionStarted: (() => void) | null = null;
   const server = Bun.serve({
     hostname: '127.0.0.1', port: 0,
     async fetch(request) {
       const body = await request.json();
       requestBodies.push(body);
+      if (holdNextConnection) {
+        holdNextConnection = false;
+        connectionStarted?.();
+        return new Promise<Response>(() => {});
+      }
       if (JSON.stringify(body).includes('B_HOLD')) return new Promise<Response>(() => {});
       if (JSON.stringify(body).includes('LIVE_TEXT')) {
         const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
@@ -136,6 +172,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
   }
   env.FLOWMATE_TEST_MODE = '1';
   env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  env.DEEPSEEK_API_KEY = 'synthetic-ambient-key';
   const launch = () => electron.launch({ executablePath: electronPath,
     args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
   let electronApp: Awaited<ReturnType<typeof electron.launch>> | null = null;
@@ -146,10 +183,75 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     const composer = page.getByRole('textbox', { name: 'Message to model' });
     expect(await composer.isDisabled()).toBe(false);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
+    const piKey = page.locator('.config-panel input[type="password"]');
+    await piKey.fill('synthetic-before-provider');
     await page.getByLabel('Pi provider').selectOption('deepseek');
+    expect(await piKey.inputValue()).toBe('synthetic-before-provider');
     const catalogModel = page.locator('.config-panel .form-grid select').nth(1);
     await catalogModel.selectOption('deepseek-v4-flash');
-    expect(await catalogModel.locator('option:checked').textContent()).toContain('output tokens');
+    await piKey.fill('');
+    expect(await catalogModel.locator('option:checked').textContent()).toBe('DeepSeek V4 Flash');
+    expect(await page.locator('.model-limit').allTextContents()).toEqual(['1,000,000 tokens', '384,000 tokens']);
+    expect(await page.getByText('Context window', { exact: true }).count()).toBe(1);
+    expect(await page.getByText('Maximum output', { exact: true }).count()).toBe(1);
+    await page.getByRole('button', { name: 'Refresh models' }).click();
+    expect(await catalogModel.inputValue()).toBe('deepseek-v4-flash');
+    expect(await page.getByLabel('Find provider').count()).toBe(0);
+    expect(await page.getByLabel('Find model').count()).toBe(0);
+    expect(await page.getByLabel('Service URL').count()).toBe(0);
+    await page.getByRole('heading', { name: 'Authentication' }).waitFor({ state: 'visible' });
+    expect(await piKey.isEnabled()).toBe(true);
+    expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    await page.getByText(/Configuration saved/).waitFor({ state: 'visible', timeout: 10_000 });
+    await page.getByText('API key required before testing or sending.').waitFor({ state: 'visible' });
+    expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
+    const missingKey = await page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      if (!state.ok || !state.data.settings.defaultModelId) throw new Error('model_missing');
+      return window.flowmate.callProvider({ goal: 'Check', text: 'OK', modelId: state.data.settings.defaultModelId });
+    });
+    expect(missingKey).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
+    const missingChatKey = await page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      if (!state.ok || !state.data.settings.defaultModelId) throw new Error('model_missing');
+      return window.flowmate.startRun({ sessionId: 1, text: 'Check', modelId: state.data.settings.defaultModelId, goalMode: 'answer' });
+    });
+    expect(missingChatKey).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
+    expect(requestBodies).toHaveLength(0);
+    await piKey.fill('synthetic-pi-key');
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    await page.getByText('API key saved in system secure storage.').waitFor({ state: 'visible' });
+    expect(await piKey.inputValue()).toBe('');
+    expect(await page.getByRole('button', { name: 'Remove API key' }).isEnabled()).toBe(true);
+    expect(requestBodies).toHaveLength(0);
+    await capturePiModelViews(page);
+    const oauthProvider = page.getByLabel('Pi provider').locator('option[value="openai-codex"]');
+    expect(await oauthProvider.evaluate((option) => (option as HTMLOptionElement).disabled)).toBe(true);
+    expect(await oauthProvider.textContent()).toContain('API key unavailable');
+    expect(requestBodies).toHaveLength(0);
+    await piKey.fill('synthetic-pi-key-replaced');
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    await page.getByText('API key saved in system secure storage.').waitFor({ state: 'visible' });
+    expect(JSON.stringify(await page.evaluate(() => window.flowmate.getState()))).not.toContain('synthetic-pi-key-replaced');
+    for (const path of [join(userData, 'data', 'settings.json'), join(userData, 'data', 'app.sqlite'),
+      join(userData, 'data', 'app.sqlite-wal'), join(userData, 'logs', 'flowmate.log')]) {
+      if (existsSync(path)) expect(readFileSync(path).includes('synthetic-pi-key-replaced')).toBe(false);
+    }
+    await page.getByLabel('Pi provider').selectOption('openai');
+    expect(await piKey.getAttribute('placeholder')).toBe('Enter API Key');
+    expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
+    await page.getByLabel('Pi provider').selectOption('deepseek');
+    await catalogModel.selectOption('deepseek-v4-flash');
+    expect(await piKey.getAttribute('placeholder')).toBe('Leave blank to keep the saved key');
+    await page.getByRole('button', { name: 'Remove API key' }).click();
+    await page.getByText('API key removed. Add a key before testing or sending.').waitFor({ state: 'visible' });
+    expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
+    expect((await page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      if (!state.ok || !state.data.settings.defaultModelId) throw new Error('model_missing');
+      return window.flowmate.callProvider({ goal: 'Check', text: 'OK', modelId: state.data.settings.defaultModelId });
+    }))).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
     await page.getByRole('button', { name: 'Custom model' }).click();
     await page.getByLabel('Display name').first().fill('Controlled model');
     await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
@@ -159,6 +261,15 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByLabel('Maximum output tokens').fill('16384');
     await page.getByLabel(/API Key/).fill('synthetic-desktop-key');
     expect(await composer.isDisabled()).toBe(false);
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    await page.getByText(/Configuration saved/).waitFor({ state: 'visible', timeout: 10_000 });
+    expect(requestBodies).toHaveLength(0);
+    await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/other`);
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    await page.getByText('write only', { exact: true }).waitFor({ state: 'visible' });
+    expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
+    await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
+    await page.getByLabel(/API Key/).fill('synthetic-desktop-key');
     await page.getByRole('button', { name: 'Save changes' }).click();
     await page.getByText(/Configuration saved/).waitFor({ state: 'visible', timeout: 10_000 });
     expect(requestBodies).toHaveLength(0);
@@ -269,12 +380,93 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByRole('button', { name: 'New chat and send' }).click();
     await page.locator('[data-testid="chat-turn"]').filter({ hasText: 'Continue the older chat.' })
       .waitFor({ state: 'visible', timeout: 20_000 });
-    expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).not.toBe(legacyId);
+    const currentSessionId = Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'));
+    expect(currentSessionId).not.toBe(legacyId);
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats' }).click();
+    const olderRow = page.locator(`.chat-directory-row[data-session-id="${legacyId}"]`);
+    const cancelDelete = page.waitForEvent('dialog').then(async (dialog) => {
+      expect(dialog.message()).toContain('Permanently delete this chat');
+      await dialog.dismiss();
+    });
+    await olderRow.getByRole('button', { name: 'Delete' }).click();
+    await cancelDelete;
+    expect(await olderRow.count()).toBe(1);
+    const confirmDelete = page.waitForEvent('dialog').then((dialog) => dialog.accept());
+    await olderRow.getByRole('button', { name: 'Delete' }).click();
+    await confirmDelete;
+    await olderRow.waitFor({ state: 'detached', timeout: 10_000 });
+    expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(currentSessionId);
+    await page.getByText('Chat deleted.', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
+    const beforeCheck = requestBodies.length;
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
+    expect(requestBodies).toHaveLength(beforeCheck);
+    await page.getByRole('button', { name: 'Test connection' }).click();
+    await page.getByText('Connection succeeded. Your model is ready.').waitFor({ state: 'visible', timeout: 20_000 });
+    expect(requestBodies).toHaveLength(beforeCheck + 1);
+    const started = new Promise<void>((resolve) => { connectionStarted = resolve; });
+    holdNextConnection = true;
+    await page.getByRole('button', { name: 'Test connection' }).click();
+    await Promise.race([started, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Connection test did not start')), 10_000))]);
+    await page.getByRole('button', { name: 'Stop check' }).click();
+    await page.getByText('Connection check stopped.').waitFor({ state: 'visible', timeout: 20_000 });
+    expect(requestBodies).toHaveLength(beforeCheck + 2);
   } finally {
     if (electronApp) await electronApp.close().catch(() => undefined);
     server.stop(true);
   }
 }, 120_000);
+
+it('keeps an ambient-only Pi provider visible but unavailable without API-key support', async () => {
+  if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E requires Windows');
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-ambient-e2e-'));
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP',
+    'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'BUN_INSTALL']) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  env.FLOWMATE_TEST_MODE = '1';
+  env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  const app = await electron.launch({ executablePath: electronPath,
+    args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+  try {
+    const page = await app.firstWindow();
+    await page.waitForFunction(async () => {
+      const state = await window.flowmate.getState();
+      return state.ok && state.data.ready;
+    }, null, { timeout: 20_000 });
+    await app.evaluate(({ ipcMain }) => {
+      ipcMain.removeHandler('flowmate:list-model-catalog');
+      ipcMain.handle('flowmate:list-model-catalog', async () => ({ ok: false, error: {
+        code: 'provider_catalog_unavailable', category: 'provider', message: 'Pi model catalog is unavailable.', retryable: true,
+      } }));
+    });
+    await page.reload();
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
+    expect(await page.getByRole('alert').filter({ hasText: 'Pi model catalog is unavailable.' }).isVisible()).toBe(true);
+    expect(await page.getByRole('button', { name: 'Reload providers' }).isEnabled()).toBe(true);
+    await app.evaluate(({ ipcMain }) => {
+      ipcMain.removeHandler('flowmate:list-model-catalog');
+      ipcMain.handle('flowmate:list-model-catalog', async () => ({ ok: true, data: [{
+        id: 'deepseek', name: 'DeepSeek', authMethods: ['ambient'], models: [{
+          id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', api: 'openai-completions',
+          endpoint: null, contextWindow: 128000, maxTokens: 32768, reasoning: false,
+        }],
+      }] }));
+    });
+    await page.getByRole('button', { name: 'Reload providers' }).click();
+    const desktopState = await page.evaluate(() => window.flowmate.getState());
+    expect(desktopState.ok ? { ready: desktopState.data.ready, host: desktopState.data.host }
+      : { error: desktopState.error.code }).toEqual({ ready: true, host: 'ready' });
+    const provider = page.getByLabel('Pi provider').locator('option[value="deepseek"]');
+    await page.waitForFunction(() => document.querySelector<HTMLOptionElement>('.config-panel option[value="deepseek"]')?.disabled === true);
+    expect(await provider.evaluate((option) => (option as HTMLOptionElement).disabled)).toBe(true);
+    expect(await provider.textContent()).toContain('API key unavailable');
+    expect(await page.getByLabel('Service URL').count()).toBe(0);
+    expect(await page.locator('.config-panel input[type="password"]').count()).toBe(1);
+    expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
+  } finally { await app.close(); }
+}, 60_000);
 it('desktop completes import, Start Task, Run, candidate source and Activity without leaving the local fixture', async () => {
   if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E currently requires the Windows developer host');
   if (!existsSync(electronPath)) throw new Error('Electron runtime binary is not installed; run the Electron install script');
@@ -455,9 +647,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     await page.getByText('Result prepared', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
     await captureDesktopViews(page);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats' }).click();
-    expect(await page.locator('.chat-directory-row.selected').getByRole('button', { name: 'Delete' }).isDisabled()).toBe(true);
-    expect(await page.locator('.chat-directory-row.selected').getByRole('button', { name: 'Delete' }).getAttribute('title'))
-      .toBe('This chat has invoice history and cannot be deleted.');
+    expect(await page.locator('.chat-directory-row.selected').getByRole('button', { name: 'Delete' }).isEnabled()).toBe(true);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Invoices' }).click();
     await page.getByRole('button', { name: 'Generate result', exact: true }).click();
     expect(await page.getByRole('button', { name: 'Generate result for next message' }).getAttribute('aria-pressed')).toBe('true');
@@ -479,11 +669,54 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     await confirmRevocation;
     await page.getByText(/Model access was revoked for 1 chat/).waitFor({ state: 'visible', timeout: 10_000 });
     expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Invoices' }).click();
+    await page.setViewportSize({ width: 980, height: 720 });
+    const invoiceRow = page.locator('.invoice-context .route-row').filter({ hasText: 'Invoice 000001' });
+    const invoiceDelete = page.locator('.invoice-heading-delete');
+    await invoiceDelete.focus();
+    expect(await invoiceDelete.evaluate((element) => document.activeElement === element)).toBe(true);
+    const cancelInvoiceDelete = page.waitForEvent('dialog').then(async (dialog) => {
+      expect(dialog.message()).toContain('Processing history and saved results will remain');
+      await dialog.dismiss();
+    });
+    await page.keyboard.press('Enter');
+    await cancelInvoiceDelete;
+    expect(await invoiceRow.count()).toBe(1);
+    const confirmInvoiceDelete = page.waitForEvent('dialog').then((dialog) => dialog.accept());
+    await invoiceDelete.focus();
+    await page.keyboard.press('Enter');
+    await confirmInvoiceDelete;
+    await page.getByText(/Invoice removed from All invoices/).waitFor({ state: 'visible', timeout: 10_000 });
+    expect(await invoiceRow.count()).toBe(0);
+    expect(await page.getByRole('option', { name: 'Invoice 000001' }).count()).toBe(0);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Processing History' }).click();
+    await page.getByRole('button', { name: 'Invoice 000001' }).click();
+    await page.getByText('Read only', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
+    await page.getByText('Result 1 · generated').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.getByRole('button', { name: 'View', exact: true }).click();
+    await page.getByText(/Page 1 · “INV-P3-1”/).waitFor({ state: 'visible', timeout: 10_000 });
     const hidePrompt = page.waitForEvent('dialog').then((dialog) => dialog.accept());
     await page.getByRole('button', { name: 'Delete', exact: true }).click();
     await hidePrompt;
     await page.getByText('No processing yet').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats' }).click();
+    const selectedChat = page.locator('.chat-directory-row.selected');
+    const selectedChatId = Number(await selectedChat.getAttribute('data-session-id'));
+    const cancelChatDelete = page.waitForEvent('dialog').then(async (dialog) => {
+      expect(dialog.message()).toContain('invoice history and saved results will remain');
+      await dialog.dismiss();
+    });
+    await selectedChat.getByRole('button', { name: 'Delete' }).click();
+    await cancelChatDelete;
+    expect(await selectedChat.count()).toBe(1);
+    const confirmChatDelete = page.waitForEvent('dialog').then((dialog) => dialog.accept());
+    const chatDelete = selectedChat.getByRole('button', { name: 'Delete' });
+    await chatDelete.focus();
+    expect(await chatDelete.evaluate((element) => document.activeElement === element)).toBe(true);
+    await page.keyboard.press('Enter');
+    await confirmChatDelete;
+    await page.locator(`.chat-directory-row[data-session-id="${selectedChatId}"]`).waitFor({ state: 'detached', timeout: 10_000 });
+    expect(await page.locator('.chats-page .notice').textContent()).toContain('Chat removed from Conversations');
 
     await electronApp.close();
     electronApp = null;
@@ -492,6 +725,8 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
       const job = database.query('SELECT id,current_candidate_id FROM jobs').get() as { id: number; current_candidate_id: number | null };
       expect(job).toEqual({ id: 1, current_candidate_id: null });
       expect(database.query('SELECT hidden_at IS NOT NULL AS hidden FROM jobs WHERE id=1').get()).toEqual({ hidden: 1 });
+      expect(database.query('SELECT hidden_at IS NOT NULL AS hidden FROM documents WHERE id=1').get()).toEqual({ hidden: 1 });
+      expect(database.query('SELECT hidden_at IS NOT NULL AS hidden FROM sessions WHERE id=?').get(selectedChatId)).toEqual({ hidden: 1 });
       expect(database.query('SELECT id,job_id,run_id,status FROM invoice_candidates').get())
         .toMatchObject({ id: 1, job_id: 1, run_id: expect.any(Number), status: 'generated' });
       expect(database.query('SELECT kind,status,job_id,tool_call_count FROM runs WHERE job_id=1 ORDER BY id ASC LIMIT 1').get())

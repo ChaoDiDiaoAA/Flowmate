@@ -3,8 +3,10 @@ export type ProductApi = string;
 export type ModelCatalogProvider = {
   id: string;
   name: string;
+  /** Interactive options; an api_key provider may also resolve ambient credentials through Pi. */
   authMethods: readonly ('api_key' | 'oauth' | 'ambient')[];
-  models: readonly { id: string; name: string; api: string; contextWindow: number; maxTokens: number; reasoning: boolean }[];
+  models: readonly { id: string; name: string; api: string; endpoint: string | null;
+    contextWindow: number; maxTokens: number; reasoning: boolean }[];
 };
 
 export type ModelAuthPrompt =
@@ -86,7 +88,7 @@ export type DesktopBridge = {
   cancelProvider(requestId: string): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: number | null }>>;
   createSession(request?: import('./runtime.ts').CreateSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
   renameSession(request: import('./runtime.ts').RenameSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
-  deleteSession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<{ deletedSessionId: import('./runtime.ts').DbId }>>;
+  deleteSession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<import('./runtime.ts').DeleteSessionResult>>;
   listSessions(request?: import('./runtime.ts').ListSessionsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionPage>>;
   querySession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
   listSessionRuns(request: import('./runtime.ts').SessionRunsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionRunsPage>>;
@@ -102,6 +104,7 @@ export type DesktopBridge = {
   selectCandidate(input: import('./workspace.ts').SelectCandidateRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').CandidateSelection>>;
   listDocuments(request?: import('./workspace.ts').PageRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./workspace.ts').DocumentSnapshot>>>;
   queryDocument(documentId: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').DocumentSnapshot>>;
+  hideDocument(documentId: number): Promise<import('./runtime.ts').Result<{ documentId: number; affectedChatCount: number }>>;
   listJobs(request?: import('./workspace.ts').JobPageRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./workspace.ts').JobSnapshot>>>;
   queryJob(jobId: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').JobSnapshot>>;
   hideJob(jobId: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').JobSnapshot>>;

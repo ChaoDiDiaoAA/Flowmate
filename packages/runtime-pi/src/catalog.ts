@@ -2,6 +2,7 @@ import { InMemoryModelsStore } from '@earendil-works/pi-ai';
 import type { AuthInteraction, AuthType, CredentialStore } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { ModelCatalogProvider } from '@flowmate/contracts';
+import { safeUrl } from './model-runtime.ts';
 
 export async function createPiModelCatalog() {
   const runtime = await ModelRuntime.create({ modelsPath: null, modelsStore: new InMemoryModelsStore(),
@@ -15,6 +16,7 @@ export async function createPiModelCatalog() {
         authMethods: [provider.auth.apiKey?.login ? 'api_key' : provider.auth.apiKey ? 'ambient' : null,
           provider.auth.oauth ? 'oauth' : null].filter((method): method is 'api_key' | 'oauth' | 'ambient' => method !== null),
         models: runtime.getModels(provider.id).map((model) => ({ id: model.id, name: model.name, api: model.api,
+          endpoint: safeUrl(model.baseUrl),
           contextWindow: model.contextWindow, maxTokens: model.maxTokens, reasoning: model.reasoning })),
       }));
     },

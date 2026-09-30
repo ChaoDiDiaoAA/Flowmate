@@ -58,6 +58,7 @@ type ProductApplicationOptions = {
   candidates: CandidateRepository;
   events: BusinessEventRepository;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
+  hideDocument?: (documentId: DbId) => Result<{ documentId: DbId; affectedChatCount: number }>;
   readDocumentPage: (input: import('@flowmate/contracts').InvoiceToolInput<'read_invoice_document'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'read_invoice_document'>>;
   readDocumentOriginal: (documentId: DbId, page: number) => Result<import('@flowmate/contracts').DocumentOriginalImage>;
 };
@@ -95,7 +96,7 @@ export function makeApplication(
       const normalized = normalizeSessionId(raw);
       if (!normalized.ok) return normalized;
       const deleted = await (sessions?.deleteSession(normalized.data) ?? Promise.resolve(fail(sessionServiceUnavailable())));
-      if (deleted.ok) {
+      if (deleted.ok && deleted.data.disposition === 'permanent') {
         try { promptTrace?.clearSession(deleted.data.deletedSessionId); } catch { /* deletion is already committed */ }
       }
       return deleted;
@@ -152,6 +153,10 @@ export function makeApplication(
     queryDocument: async (documentId) => Number.isSafeInteger(documentId) && documentId > 0
       ? products?.documents.get(documentId) ?? fail(appError('document_service_unavailable', 'storage', 'Document 查询尚未组装。', true))
       : fail(appError('input_invalid', 'input', 'Document ID 无效。')),
+    hideDocument: async (documentId) => Number.isSafeInteger(documentId) && documentId > 0
+      ? products?.hideDocument?.(documentId)
+        ?? fail(appError('document_service_unavailable', 'storage', 'Invoice removal is unavailable.', true))
+      : fail(appError('input_invalid', 'input', 'Invoice reference is invalid.')),
     listJobs: async (raw = {}) => {
       const page = normalizePageRequest(raw, ['documentId']);
       if (!page.ok) return page;

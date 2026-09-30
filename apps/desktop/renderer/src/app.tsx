@@ -1,14 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelAuthNotice, ModelAuthPrompt, ModelCatalogProvider, ModelProfile, ProductSettings, RunSnapshot, SessionCursor, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
+import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, ProductSettings, RunSnapshot, SessionCursor, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'tasks' | 'chats' | 'models' | 'connections' | 'settings';
+type Page = 'workspace' | 'tasks' | 'chats' | 'models' | 'settings';
 const pageLabels: Record<Page, string> = {
   workspace: 'Invoices', tasks: 'Processing History', chats: 'Chats',
-  models: 'Models', connections: 'Connections', settings: 'Settings',
+  models: 'Models', settings: 'Settings',
 };
 type Notice = { tone: 'good' | 'bad' | 'info'; message: string } | null;
-type AuthFlow = { requestId: string; notice: ModelAuthNotice | null;
-  prompt: { id: string; value: string; definition: ModelAuthPrompt } | null };
 type ProfileDraft = { displayName: string; theme: 'system' | 'light' | 'dark' };
 type ChatTurn = {
   id: string;
@@ -49,15 +47,11 @@ export function App() {
   const [state, setState] = useState<DesktopState | null>(null);
   const [draft, setDraft] = useState<ModelProfile>(blankModel);
   const [catalog, setCatalog] = useState<readonly ModelCatalogProvider[]>([]);
-  const [catalogLoading, setCatalogLoading] = useState(false);
-  const [providerSearch, setProviderSearch] = useState('');
-  const [modelSearch, setModelSearch] = useState('');
-  const [authFlow, setAuthFlow] = useState<AuthFlow | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [profileDraft, setProfileDraft] = useState<ProfileDraft>({ displayName: 'Local user', theme: 'system' });
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState('');
-  const [goal, setGoal] = useState('Answer the user clearly and directly.');
-  const [text, setText] = useState('Reply with OK.');
   const [chatInput, setChatInput] = useState('');
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [sessions, setSessions] = useState<SessionSnapshot[]>([]);
@@ -67,7 +61,10 @@ export function App() {
   const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null);
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]);
+  const [historicalDocuments, setHistoricalDocuments] = useState<Record<number, DocumentSnapshot>>({});
   const [jobs, setJobs] = useState<JobSnapshot[]>([]);
+  const [historyJobId, setHistoryJobId] = useState<number | null>(null);
+  const [hidingDocumentId, setHidingDocumentId] = useState<number | null>(null);
   const [candidateSummaries, setCandidateSummaries] = useState<CandidateSummary[]>([]);
   const [candidateDetail, setCandidateDetail] = useState<CandidateJobDetail | null>(null);
   const [activity, setActivity] = useState<BusinessEventSnapshot[]>([]);
@@ -95,7 +92,15 @@ export function App() {
   useEffect(() => {
     let active = true;
     void window.flowmate.listModelCatalog().then((result) => {
-      if (active && result.ok) setCatalog(result.data);
+      if (!active) return;
+      if (result.ok) {
+        setCatalog(result.data);
+        setCatalogError(result.data.length ? null : 'No Pi providers are available. Reload providers to try again.');
+      } else setCatalogError(errorMessage(result));
+    }).catch(() => {
+      if (active) setCatalogError('Could not load Pi providers. Reload providers to try again.');
+    }).finally(() => {
+      if (active) setCatalogLoading(false);
     });
     return () => { active = false; };
   }, []);
@@ -120,11 +125,6 @@ export function App() {
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
   const assistantWasToggled = useRef(false);
   const revisionLoaded = useRef<number | null>(null);
-  const authDialogRef = useRef<HTMLDialogElement | null>(null);
-
-  useEffect(() => {
-    if (authFlow && !authDialogRef.current?.open) authDialogRef.current?.showModal();
-  }, [authFlow]);
 
   function draftKey(sessionId: number | null): string { return sessionId === null ? 'new' : String(sessionId); }
 
@@ -137,7 +137,8 @@ export function App() {
   function navigate(next: Page) {
     setPage(next);
     setNavOpen(false);
-    if (next === 'tasks' && workspace?.jobId) void loadTaskDetails(workspace.jobId);
+    const selectedJobId = historyJobId ?? workspace?.jobId;
+    if (next === 'tasks' && selectedJobId) void loadTaskDetails(selectedJobId);
   }
 
   function openChat(sessionId: number) {
@@ -185,6 +186,14 @@ export function App() {
     else setNotice({ tone: 'bad', message: errorMessage(documentsResult) });
     if (jobsResult.ok) setJobs(jobsResult.data.items);
     else setNotice({ tone: 'bad', message: errorMessage(jobsResult) });
+    if (jobsResult.ok) {
+      const visibleIds = new Set(documentsResult.ok ? documentsResult.data.items.map((item) => item.documentRef.id) : []);
+      const missingIds = [...new Set(jobsResult.data.items.map((item) => item.documentRef.id))]
+        .filter((id) => !visibleIds.has(id));
+      const fetched = await Promise.all(missingIds.map((id) => window.flowmate.queryDocument(id)));
+      setHistoricalDocuments((current) => ({ ...current, ...Object.fromEntries(fetched.filter((item) => item.ok)
+        .map((item) => [item.data.documentRef.id, item.data])) }));
+    }
   }
 
   async function changeWorkspace(change: WorkspaceChange) {
@@ -225,7 +234,9 @@ export function App() {
 
   async function selectWorkspaceDocument(documentId: number | null) {
     const snapshot = await changeWorkspace({ kind: 'document', documentId });
-    if (!snapshot || documentId === null) return;
+    if (!snapshot) return;
+    setHistoryJobId(null);
+    if (documentId === null) return;
     let doc = documents.find((item) => item.documentRef.id === documentId);
     if (!doc) {
       const queried = await window.flowmate.queryDocument(documentId);
@@ -255,6 +266,7 @@ export function App() {
       return;
     }
     acceptWorkspace(result.data.workspace);
+    setHistoryJobId(result.data.job.jobId);
     setGoalMode('save-candidate');
     updateChatInput('Generate and save a result for this invoice using its parsed data and source references. Keep missing or ambiguous details explicit.');
     setChatCollapsed(false);
@@ -297,8 +309,16 @@ export function App() {
   }
 
   async function openJob(jobId: number) {
-    const snapshot = await changeWorkspace({ kind: 'job', jobId });
-    if (!snapshot) return;
+    const job = jobs.find((item) => item.jobId === jobId);
+    if (!job) return;
+    const document = await window.flowmate.queryDocument(job.documentRef.id);
+    if (!document.ok) { setNotice({ tone: 'bad', message: errorMessage(document) }); return; }
+    setHistoricalDocuments((current) => ({ ...current, [document.data.documentRef.id]: document.data }));
+    if (!document.data.isHidden) {
+      const snapshot = await changeWorkspace({ kind: 'job', jobId });
+      if (!snapshot) return;
+    }
+    setHistoryJobId(jobId);
     setCandidateDetail(null);
     await loadTaskDetails(jobId);
   }
@@ -307,13 +327,39 @@ export function App() {
     if (!window.confirm('Remove this item from Recent processing? Saved results and activity will remain available.')) return;
     const result = await window.flowmate.hideJob(jobId);
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-    if (workspaceRef.current?.jobId === jobId) {
+    if (workspaceRef.current?.jobId === jobId || historyJobId === jobId) {
+      setHistoryJobId(null);
       setCandidateSummaries([]);
       setCandidateDetail(null);
       setActivity([]);
     }
     await loadProductOverview();
     setNotice({ tone: 'good', message: 'Processing record removed from Recent processing.' });
+  }
+
+  async function hideInvoice(documentId: number) {
+    if (hidingDocumentId !== null) return;
+    const document = documents.find((item) => item.documentRef.id === documentId);
+    if (!document || !window.confirm(`Remove “${document.displayName}” from All invoices? Processing history and saved results will remain. Related chats will become read only. Reimport this invoice to show it again.`)) return;
+    setHidingDocumentId(documentId);
+    const result = await window.flowmate.hideDocument(documentId);
+    setHidingDocumentId(null);
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    if (workspaceRef.current?.documentRef?.id === documentId) {
+      setParsedPage(null);
+      setOriginalImage(null);
+      setCandidateSummaries([]);
+      setCandidateDetail(null);
+      setGoalMode('answer');
+    }
+    await Promise.all([loadProductOverview(), loadSessionList()]);
+    if (selectedSessionIdRef.current !== null) {
+      const current = await window.flowmate.querySession(selectedSessionIdRef.current);
+      if (current.ok) setSelectedSession(current.data);
+    }
+    const updated = await window.flowmate.queryDocument(documentId);
+    if (updated.ok) setHistoricalDocuments((current) => ({ ...current, [documentId]: updated.data }));
+    setNotice({ tone: 'good', message: `Invoice removed from All invoices. ${result.data.affectedChatCount} related ${result.data.affectedChatCount === 1 ? 'chat cannot' : 'chats cannot'} use it for new messages.` });
   }
 
   async function loadSession(sessionId: number) {
@@ -388,6 +434,7 @@ export function App() {
 
   async function deleteSession(sessionId: number): Promise<void> {
     if (sessionMutating) return;
+    const wasSelected = selectedSessionIdRef.current === sessionId;
     setSessionMutating(true);
     const result = await window.flowmate.deleteSession(sessionId);
     if (!result.ok) {
@@ -408,18 +455,22 @@ export function App() {
 
     const refreshed = await window.flowmate.listSessions({ limit: 100 });
     const remaining = refreshed.ok ? refreshed.data.items : sessions.filter((item) => item.sessionId !== sessionId);
-    const next = remaining.find((item) => item.status === 'active') ?? null;
     setSessions(remaining);
     const nextCursor = refreshed.ok ? refreshed.data.next : null;
     setSessionCursor(nextCursor);
     sessionCursorRef.current = nextCursor;
-    allowInitialSessionSelection.current = false;
-    selectedSessionIdRef.current = next?.sessionId ?? null;
-    setSelectedSessionId(next?.sessionId ?? null);
-    setSelectedSession(null);
-    updateChatInput(chatDrafts.current.get(draftKey(next?.sessionId ?? null)) ?? '');
-    setChatTurns([]);
-    setRunCursor(null);
+    chatDrafts.current.delete(draftKey(sessionId));
+    const next = wasSelected ? remaining.find((item) => item.status === 'active') ?? null : null;
+    if (wasSelected) {
+      sessionLoadSequence.current += 1;
+      allowInitialSessionSelection.current = false;
+      selectedSessionIdRef.current = next?.sessionId ?? null;
+      setSelectedSessionId(next?.sessionId ?? null);
+      setSelectedSession(null);
+      updateChatInput(chatDrafts.current.get(draftKey(next?.sessionId ?? null)) ?? '');
+      setChatTurns([]);
+      setRunCursor(null);
+    }
     if (activeAgentSessionId === sessionId) {
       setBusy(false);
       setCancelPending(false);
@@ -430,11 +481,15 @@ export function App() {
       activeChatSessionId.current = null;
       setActiveRunModel(null);
     }
-    setNotice({ tone: 'good', message: 'Chat deleted.' });
     if (workspaceRef.current?.sessionId === sessionId) {
-      await changeWorkspace({ kind: 'session', sessionId: next?.sessionId ?? null });
+      const refreshedWorkspace = await loadWorkspace();
+      if (refreshedWorkspace && next && refreshedWorkspace.sessionId !== next.sessionId) {
+        await changeWorkspace({ kind: 'session', sessionId: next.sessionId });
+      }
     }
-    if (next) void loadSession(next.sessionId);
+    setNotice({ tone: 'good', message: result.data.disposition === 'hidden'
+      ? 'Chat removed from Conversations. Invoice history and saved results remain available.' : 'Chat deleted.' });
+    if (wasSelected && next) void loadSession(next.sessionId);
     setSessionMutating(false);
   }
 
@@ -466,15 +521,7 @@ export function App() {
         setState(event.state);
         return;
       }
-      if (event.type === 'model_auth_notice') {
-        setAuthFlow((current) => current?.requestId === event.requestId ? { ...current, notice: event.notice } : current);
-        return;
-      }
-      if (event.type === 'model_auth_prompt') {
-        setAuthFlow((current) => current?.requestId === event.requestId
-          ? { ...current, prompt: { id: event.promptId, value: '', definition: event.prompt } } : current);
-        return;
-      }
+      if (event.type === 'model_auth_notice' || event.type === 'model_auth_prompt') return;
       if ('runId' in event && 'sequence' in event) {
         if (event.sequence <= (eventSequences.current.get(event.runId) ?? 0)) return;
         if (latestAgentFinished.current.has(event.runId) && event.type !== 'run_finished') return;
@@ -604,8 +651,14 @@ export function App() {
   const persistedModel = state?.settings.models.find((item) => item.id === selectedModelId) ?? null;
   const credentialStatus = selectedModelId ? (state?.modelCredentials[selectedModelId] ?? 'missing') : 'missing';
   const isDraftSaved = persistedModel !== null && modelFieldsEqual(draft, persistedModel);
+  const selectedCatalogProvider = catalog.find((provider) => provider.id === draft.providerId);
+  const selectedCatalogModel = selectedCatalogProvider?.models.find((model) => model.id === draft.model);
+  const keyReusable = credentialStatus === 'configured' && persistedModel?.kind === draft.kind
+    && (draft.kind === 'catalog' ? persistedModel.providerId === draft.providerId
+      : draft.kind === 'custom' ? persistedModel.baseUrl === draft.baseUrl && persistedModel.api === draft.api : false);
   const modelReady = Boolean(state?.ready && persistedModel && isDraftSaved && persistedModel.kind !== 'legacy'
-    && (persistedModel.kind === 'catalog' || credentialStatus === 'configured'));
+    && credentialStatus === 'configured'
+    && (persistedModel.kind !== 'catalog' || selectedCatalogProvider?.authMethods.includes('api_key')));
   const canTest = Boolean(modelReady && !busy && !saving);
   const inputEnabled = true;
   const selectedForSend = selectedSession ?? sessions.find((item) => item.sessionId === selectedSessionId) ?? null;
@@ -645,51 +698,34 @@ export function App() {
     setSelectedModelId(id);
     setDraft(item);
     setApiKey('');
+    setRun(null);
     setNotice(null);
   }
 
   async function refreshCatalog() {
-    if (!draft.providerId) return;
     setCatalogLoading(true);
-    const result = await window.flowmate.listModelCatalog(draft.providerId, true);
-    setCatalogLoading(false);
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-    setCatalog((current) => current.map((provider) => result.data.find((item) => item.id === provider.id) ?? provider));
-  }
-
-  async function loginModel(authType: 'api_key' | 'oauth') {
-    if (!persistedModel || persistedModel.kind !== 'catalog' || !isDraftSaved || authFlow) return;
-    const requestId = crypto.randomUUID();
-    setAuthFlow({ requestId, notice: { type: 'progress', message: 'Waiting for Pi provider authentication…' }, prompt: null });
-    const result = await window.flowmate.loginModel(persistedModel.id, authType, requestId);
-    setAuthFlow(null);
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-    const refreshed = await window.flowmate.getState();
-    if (refreshed.ok) setState(refreshed.data);
-    setNotice({ tone: 'good', message: 'Pi provider authentication is ready.' });
+    try {
+      const result = await window.flowmate.listModelCatalog(draft.providerId ?? undefined, Boolean(draft.providerId));
+      if (!result.ok) { setCatalogError(errorMessage(result)); return; }
+      setCatalogError(result.data.length ? null : 'No Pi providers are available. Reload providers to try again.');
+      setCatalog((current) => draft.providerId
+        ? current.map((provider) => result.data.find((item) => item.id === provider.id) ?? provider)
+        : result.data);
+    } catch {
+      setCatalogError('Could not load Pi providers. Reload providers to try again.');
+    } finally {
+      setCatalogLoading(false);
+    }
   }
 
   async function logoutModel() {
-    if (!persistedModel || persistedModel.kind !== 'catalog' || authFlow) return;
+    if (!persistedModel || persistedModel.kind !== 'catalog' || !isDraftSaved) return;
     const result = await window.flowmate.logoutModel(persistedModel.id);
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    setApiKey('');
     const refreshed = await window.flowmate.getState();
     if (refreshed.ok) setState(refreshed.data);
-    setNotice({ tone: 'good', message: 'Provider credentials removed.' });
-  }
-
-  async function answerAuthPrompt() {
-    if (!authFlow?.prompt) return;
-    const { id, value } = authFlow.prompt;
-    const result = await window.flowmate.replyModelAuth(authFlow.requestId, id, value);
-    if (result.ok) setAuthFlow((current) => current?.requestId === authFlow.requestId ? { ...current, prompt: null } : current);
-    else setNotice({ tone: 'bad', message: errorMessage(result) });
-  }
-
-  function cancelAuth() {
-    if (!authFlow) return;
-    void window.flowmate.cancelModelAuth(authFlow.requestId);
-    setAuthFlow(null);
+    setNotice({ tone: 'good', message: 'API key removed. Add a key before testing or sending.' });
   }
 
   function updateDraft<K extends keyof ModelProfile>(key: K, value: ModelProfile[K]) {
@@ -738,7 +774,7 @@ export function App() {
     setRun(null);
     setRunId(null);
     setNotice({ tone: 'info', message: 'Sending a real Provider request. The request may incur usage charges.' });
-    const accepted = await window.flowmate.callProvider({ goal, text, modelId: selectedModelId });
+    const accepted = await window.flowmate.callProvider({ goal: 'Verify this model connection.', text: 'Reply with OK.', modelId: selectedModelId });
     if (!accepted.ok) {
       setBusy(false);
       setNotice({ tone: 'bad', message: errorMessage(accepted) });
@@ -964,7 +1000,6 @@ export function App() {
           <span className="rail-caption setup-caption">SETUP</span>
           {([
             ['models', 'Models', '◇'],
-            ['connections', 'Connections', '◉'],
           ] as const).map(([target, label, glyph]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
             aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
@@ -1024,6 +1059,8 @@ export function App() {
             notice={notice}
             onImport={() => void importInvoice()}
             onSelectDocument={(id) => void selectWorkspaceDocument(id)}
+            onHideDocument={(id) => void hideInvoice(id)}
+            hidingDocumentId={hidingDocumentId}
             onStartTask={() => void startTask()}
             onOpenCandidate={(jobId, candidateId) => void openCandidate(jobId, candidateId)}
             onTaskGoalChange={setTaskGoal}
@@ -1036,7 +1073,9 @@ export function App() {
           <TasksPage
             workspace={workspace}
             documents={documents}
+            historicalDocuments={historicalDocuments}
             jobs={jobs}
+            selectedJobId={historyJobId ?? workspace?.jobId ?? null}
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
             activity={activity}
@@ -1055,8 +1094,7 @@ export function App() {
             <div className="page-heading">
               <div><h1>{pageLabels[page]}</h1><p>{page === 'models'
                 ? 'Choose and configure the models available to Assistant.'
-                : page === 'connections' ? 'Check whether your saved model can respond.'
-                  : 'Make Flowmate comfortable to use on this device.'}</p></div>
+                : 'Make Flowmate comfortable to use on this device.'}</p></div>
             </div>
 
             {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
@@ -1064,44 +1102,47 @@ export function App() {
 
             {page === 'models' && <div className="model-layout">
               <section className="panel model-list-panel">
-                <div className="panel-head"><div><span className="section-index">MODEL ROUTES</span><h2>Your models</h2></div><button className="quiet-button" onClick={() => { const fresh = blankModel(); setDraft(fresh); setSelectedModelId(fresh.id); setApiKey(''); setNotice(null); }}>＋ Add</button></div>
+                <div className="panel-head"><div><span className="section-index">MODEL ROUTES</span><h2>Your models</h2></div><button className="quiet-button" onClick={() => { const fresh = blankModel(); setDraft(fresh); setSelectedModelId(fresh.id); setApiKey(''); setRun(null); setNotice(null); }}>＋ Add</button></div>
                 <div className="model-list">
                   {savedModels.length === 0 && <div className="empty-route"><div className="empty-symbol">＋</div><strong>No models yet</strong><span>Choose a Pi provider and model to begin.</span></div>}
                   {savedModels.map((model) => <button key={model.id} title={model.name} className={`route-row ${selectedModelId === model.id ? 'selected' : ''}`} onClick={() => selectModel(model.id)}>
                     <span className="route-icon">{(model.providerId ?? model.api).slice(0, 1).toUpperCase() || 'P'}</span>
                     <span className="route-name"><strong>{model.name}</strong><small>{model.model}</small></span>
-                    <span className={`credential-pill ${state?.modelCredentials[model.id] === 'configured' ? 'ready' : ''}`}>{model.kind === 'legacy' ? 'RECONFIGURE' : state?.modelCredentials[model.id] === 'configured' ? 'AUTH SET' : state?.modelCredentials[model.id] === 'unavailable' ? 'LOCKED' : 'CHECK AUTH'}</span>
+                    <span className={`credential-pill ${state?.modelCredentials[model.id] === 'configured' ? 'ready' : ''}`}>{model.kind === 'legacy' ? 'RECONFIGURE' : state?.modelCredentials[model.id] === 'configured' ? 'KEY SAVED' : state?.modelCredentials[model.id] === 'unavailable' ? 'LOCKED' : 'KEY NEEDED'}</span>
                   </button>)}
                 </div>
                 <div className="list-foot"><span>{savedModels.length} saved model{savedModels.length === 1 ? '' : 's'}</span></div>
               </section>
 
               <section className="panel config-panel">
-                <div className="panel-head"><h2>Model details</h2></div>
+                <div className="panel-head"><h2>Model details</h2>{draft.kind === 'catalog' && <button type="button" className="quiet-button"
+                  disabled={catalogLoading} onClick={() => void refreshCatalog()}>{catalogLoading ? 'Loading…' : draft.providerId ? 'Refresh models' : 'Reload providers'}</button>}</div>
                 <div className="form-grid">
                   <div className="field full"><span>Connection type</span><div className="config-actions">
-                    <button type="button" className="secondary-button" onClick={() => setDraft((current) => ({ ...current, kind: 'catalog', providerId: null, baseUrl: '', api: '', model: '', contextWindow: null, maxTokens: null }))}>Pi provider</button>
-                    <button type="button" className="secondary-button" onClick={() => setDraft((current) => ({ ...current, kind: 'custom', providerId: null, baseUrl: '', api: '', model: '', contextWindow: null, maxTokens: null }))}>Custom model</button>
+                    <button type="button" className="secondary-button" onClick={() => { setApiKey(''); setDraft((current) => ({ ...current, kind: 'catalog', providerId: null, baseUrl: '', api: '', model: '', contextWindow: null, maxTokens: null })); }}>Pi provider</button>
+                    <button type="button" className="secondary-button" onClick={() => { setApiKey(''); setDraft((current) => ({ ...current, kind: 'custom', providerId: null, baseUrl: '', api: '', model: '', contextWindow: null, maxTokens: null })); }}>Custom model</button>
                   </div></div>
                   <label className="field full"><span>Display name</span><input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} placeholder="Primary model" maxLength={128} /></label>
                   {draft.kind === 'legacy' && <p className="config-note">This older route needs to be chosen again from Pi or configured as a custom model.</p>}
                   {draft.kind === 'catalog' && <>
-                    <label className="field full"><span>Find provider</span><input value={providerSearch}
-                      onChange={(event) => setProviderSearch(event.target.value)} placeholder="Search Pi providers" /></label>
-                    <label className="field full"><span>Pi provider</span><select value={draft.providerId ?? ''} onChange={(event) => setDraft((current) => ({ ...current, providerId: event.target.value || null, model: '' }))}>
-                      <option value="">Choose a provider</option>{catalog.filter((provider) => provider.id === draft.providerId
-                        || `${provider.id} ${provider.name}`.toLowerCase().includes(providerSearch.toLowerCase())).map((provider) =>
-                        <option key={provider.id} value={provider.id}>{provider.name}</option>)}
+                    <label className="field full"><span>Pi provider</span><select value={draft.providerId ?? ''} onChange={(event) => {
+                      const providerId = event.target.value || null;
+                      if (draft.providerId && draft.providerId !== providerId) setApiKey('');
+                      setDraft((current) => ({ ...current, providerId, model: '' }));
+                    }}>
+                      <option value="">Choose a provider</option>{catalog.map((provider) =>
+                        <option key={provider.id} value={provider.id} disabled={!provider.authMethods.includes('api_key')}>{provider.name}{provider.authMethods.includes('api_key') ? '' : ' · API key unavailable'}</option>)}
                     </select></label>
-                    <label className="field full"><span>Find model</span><input value={modelSearch}
-                      onChange={(event) => setModelSearch(event.target.value)} placeholder="Search provider models" /></label>
-                    <label className="field full"><span>Model</span><select value={draft.model} onChange={(event) => updateDraft('model', event.target.value)}>
-                      <option value="">Choose a model</option>{catalog.find((provider) => provider.id === draft.providerId)?.models
-                        .filter((model) => model.id === draft.model || `${model.id} ${model.name}`.toLowerCase().includes(modelSearch.toLowerCase())).map((model) =>
-                        <option key={model.id} value={model.id}>{model.name} · {model.maxTokens.toLocaleString()} output tokens</option>)}
+                    {catalogError && <p className="config-note catalog-error" role="alert">{catalogError}</p>}
+                    <label className="field full"><span>Model</span><select value={draft.model} disabled={!selectedCatalogProvider?.authMethods.includes('api_key')} onChange={(event) => updateDraft('model', event.target.value)}>
+                      <option value="">Choose a model</option>{selectedCatalogProvider?.models.map((model) =>
+                        <option key={model.id} value={model.id}>{model.name}</option>)}
                     </select></label>
-                    <button type="button" className="quiet-button" disabled={!draft.providerId || catalogLoading} onClick={() => void refreshCatalog()}>{catalogLoading ? 'Refreshing…' : 'Refresh provider models'}</button>
-                    <p className="config-note">Model limits come from the installed Pi catalog. Available authentication: {catalog.find((provider) => provider.id === draft.providerId)?.authMethods.join(', ') || 'choose a provider'}.</p>
+                    {selectedCatalogModel && <>
+                      <div className="field"><span>Context window</span><output className="model-limit">{selectedCatalogModel.contextWindow.toLocaleString()} tokens</output></div>
+                      <div className="field"><span>Maximum output</span><output className="model-limit">{selectedCatalogModel.maxTokens.toLocaleString()} tokens</output></div>
+                    </>}
+                    <label className="field full"><span>API Key <i>{keyReusable ? 'saved in system secure storage' : 'write only'}</i></span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={keyReusable ? 'Leave blank to keep the saved key' : 'Enter API Key'} autoComplete="new-password" /></label>
                   </>}
                   {draft.kind === 'custom' && <>
                     <label className="field full"><span>Base URL</span><input value={draft.baseUrl} onChange={(event) => updateDraft('baseUrl', event.target.value)} placeholder="https://api.example.com/v1" autoCapitalize="off" spellCheck={false} /></label>
@@ -1111,39 +1152,42 @@ export function App() {
                     <label className="field"><span>Maximum output tokens</span><input type="number" min="1" value={draft.maxTokens ?? ''} onChange={(event) => updateDraft('maxTokens', event.target.value ? Number(event.target.value) : null)} /></label>
                     <label className="field"><span>Reasoning</span><input type="checkbox" checked={draft.reasoning} onChange={(event) => updateDraft('reasoning', event.target.checked)} /></label>
                   </>}
-                  {draft.kind === 'custom' && <label className="field full"><span>API Key <i>{credentialStatus === 'configured' ? 'saved in system secure storage' : 'write only'}</i></span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={credentialStatus === 'configured' ? 'Leave blank to keep the saved key' : 'Enter API Key'} autoComplete="new-password" /></label>}
+                  {draft.kind === 'custom' && <label className="field full"><span>API Key <i>{keyReusable ? 'saved in system secure storage' : 'write only'}</i></span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={keyReusable ? 'Leave blank to keep the saved key' : 'Enter API Key'} autoComplete="new-password" /></label>}
                 </div>
+                {draft.kind === 'catalog' && <section className="model-subsection" aria-labelledby="model-auth-heading">
+                  <h3 id="model-auth-heading">Authentication</h3>
+                  <p role="status">{!draft.providerId ? 'Choose a Pi provider and model.'
+                    : selectedCatalogProvider && !selectedCatalogProvider.authMethods.includes('api_key') ? 'This Pi provider cannot use an API key in Flowmate. Choose another provider.'
+                      : credentialStatus === 'unavailable' && isDraftSaved ? 'Secure credential storage is unavailable. Save an API key when storage is ready.'
+                        : apiKey.trim() ? 'API key ready to save. Saving will not contact the model.'
+                          : keyReusable ? 'API key saved in system secure storage.'
+                            : 'API key required before testing or sending.'}</p>
+                  <div className="model-subsection-actions">
+                    {isDraftSaved && credentialStatus === 'configured' && <button className="text-button danger-text"
+                      onClick={() => void logoutModel()}>Remove API key</button>}
+                  </div>
+                </section>}
                 <div className="config-actions">
                   {persistedModel && <button className="text-button danger-text" onClick={() => void removeModel()}>Remove model</button>}
                   <div className="action-spacer" />
-                  <button className="secondary-button" onClick={() => void saveConfiguration()} disabled={saving || !state?.ready || draft.kind === 'legacy'}>{saving ? 'Saving…' : 'Save changes'}</button>
-                  {persistedModel?.kind === 'catalog' && isDraftSaved && catalog.find((provider) => provider.id === persistedModel.providerId)?.authMethods.includes('api_key')
-                    && <button className="secondary-button" onClick={() => void loginModel('api_key')} disabled={Boolean(authFlow)}>Set up API key</button>}
-                  {persistedModel?.kind === 'catalog' && isDraftSaved && catalog.find((provider) => provider.id === persistedModel.providerId)?.authMethods.includes('oauth')
-                    && <button className="secondary-button" onClick={() => void loginModel('oauth')} disabled={Boolean(authFlow)}>Sign in with provider</button>}
-                  {persistedModel?.kind === 'catalog' && credentialStatus === 'configured'
-                    && <button className="text-button danger-text" onClick={() => void logoutModel()} disabled={Boolean(authFlow)}>Sign out</button>}
-                  <button className="secondary-button" onClick={() => navigate('connections')} disabled={!persistedModel}>Check connection</button>
+                  <button className="secondary-button" onClick={() => void saveConfiguration()} disabled={saving || !state?.ready || draft.kind === 'legacy' || draft.kind === 'catalog' && Boolean(selectedCatalogProvider && !selectedCatalogProvider.authMethods.includes('api_key'))}>{saving ? 'Saving…' : 'Save changes'}</button>
                 </div>
-                <div className="config-note"><span className="note-mark">i</span><span>Saving a model does not contact it. Use Connections to send a short test.</span></div>
+                <section className="model-subsection model-check" aria-labelledby="model-check-heading">
+                  <h3 id="model-check-heading">Connection check</h3>
+                  <p>Testing sends a real model request and may incur usage charges. Saving or opening this page does not send a request.</p>
+                  <p role="status">{busy ? 'Checking your model connection…' : isDraftSaved && run
+                    ? run.status === 'completed' ? 'Connection succeeded. Your model is ready.'
+                      : run.status === 'cancelled' ? 'Connection check stopped.' : 'Connection failed. Check the model and API key.'
+                    : !isDraftSaved && persistedModel ? 'Save model changes before checking the connection.'
+                      : persistedModel && credentialStatus !== 'configured' ? 'Save an API key before checking this connection.'
+                        : persistedModel ? 'Send a short test to check this model.' : 'Add a model before checking its connection.'}</p>
+                  <div className="model-subsection-actions">
+                    {busy ? <button className="secondary-button" onClick={() => void cancelRequest()} disabled={cancelPending}>Stop check</button>
+                      : <button className="primary-button" onClick={() => void testConnection()} disabled={!canTest}>Test connection</button>}
+                  </div>
+                </section>
               </section>
             </div>}
-
-            {page === 'connections' && <section className="panel connection-check"><div className="panel-head"><h2>Connection check</h2></div>
-              <div className="connection-body">
-                <label className="field"><span>Model to check</span><select aria-label="Connection model" value={persistedModel?.id ?? ''}
-                  onChange={(event) => { selectModel(event.target.value); setRun(null); }}>
-                  <option value="" disabled>Select a saved model</option>
-                  {savedModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
-                </select></label>
-                <p role="status">{busy ? 'Checking your model connection…' : run
-                  ? run.status === 'completed' ? 'Connection succeeded. Your model is ready.' : 'Connection failed. Check the model address and key.'
-                  : persistedModel ? 'Send a short test to check this model.' : 'Add a model before checking its connection.'}</p>
-                {!isDraftSaved && persistedModel && <p>Save model changes before checking the connection.</p>}
-                {busy ? <button className="secondary-button" onClick={() => void cancelRequest()} disabled={cancelPending}>Stop check</button>
-                  : <button className="primary-button" onClick={() => void testConnection()} disabled={!canTest}>Test connection</button>}
-              </div>
-            </section>}
             {page === 'settings' && <section className="panel profile-panel settings-appearance"><div className="panel-head"><h2>Appearance</h2></div>
               <div className="profile-fields"><label className="field"><span>Display name</span><input value={profileDraft.displayName} onChange={(event) => setProfileDraft((old) => ({ ...old, displayName: event.target.value }))} maxLength={80} /></label><label className="field"><span>Theme</span><select value={profileDraft.theme} onChange={(event) => setProfileDraft((old) => ({ ...old, theme: event.target.value as typeof old.theme }))}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div>
               <div className="config-actions"><span className="action-spacer" /><button className="secondary-button" onClick={() => void saveProfile()} disabled={saving || !state?.ready}>Save appearance</button></div>
@@ -1190,26 +1234,9 @@ export function App() {
             : selectedSession.availability === 'archived' ? 'This chat is pending deletion. Retry Delete to finish removing it.'
             : selectedSession.availability === 'unusable' ? 'This chat cannot continue safely. Start a new chat.'
               : selectedSession.availability === 'busy' ? 'This chat is responding.'
-                : !modelReady ? 'Save a Pi model and set up its authentication to start a chat.'
+                : !modelReady ? 'Save a model and its API key to start a chat.'
                   : goalMode === 'save-candidate' && (!workspace?.documentRef || !workspace.jobId) ? 'Process an invoice first to generate a result.' : ''}
       />
-      {authFlow && <dialog ref={authDialogRef} className="model-auth-dialog" onCancel={(event) => { event.preventDefault(); cancelAuth(); }} aria-label="Model authentication">
-        <h2>Connect Pi provider</h2>
-        {authFlow.notice?.type === 'auth_url' && <p>{authFlow.notice.instructions ?? 'Open this link to sign in.'}<br /><a href={authFlow.notice.url} target="_blank" rel="noreferrer">Open sign-in page</a></p>}
-        {authFlow.notice?.type === 'device_code' && <p>Enter code <strong>{authFlow.notice.userCode}</strong> at <a href={authFlow.notice.verificationUri} target="_blank" rel="noreferrer">the provider sign-in page</a>.</p>}
-        {(authFlow.notice?.type === 'progress' || authFlow.notice?.type === 'info') && <p>{authFlow.notice.message}</p>}
-        {authFlow.prompt && <form onSubmit={(event) => { event.preventDefault(); void answerAuthPrompt(); }}>
-          <label className="field"><span>{authFlow.prompt.definition.message}</span>
-            {authFlow.prompt.definition.type === 'select' ? <select value={authFlow.prompt.value}
-              onChange={(event) => setAuthFlow((current) => current?.prompt ? { ...current, prompt: { ...current.prompt, value: event.target.value } } : current)}>
-              <option value="">Choose an option</option>{authFlow.prompt.definition.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
-            </select> : <input type={authFlow.prompt.definition.type === 'secret' ? 'password' : 'text'}
-              placeholder={authFlow.prompt.definition.placeholder} value={authFlow.prompt.value}
-              onChange={(event) => setAuthFlow((current) => current?.prompt ? { ...current, prompt: { ...current.prompt, value: event.target.value } } : current)} />}
-          </label><button type="submit" className="primary-button" disabled={!authFlow.prompt.value}>Continue</button>
-        </form>}
-        <button type="button" className="secondary-button" onClick={cancelAuth}>Cancel</button>
-      </dialog>}
     </div>
   );
 }
@@ -1257,10 +1284,13 @@ function ChatsPage({ sessions, selectedSessionId, hasMore, mutating, notice, onS
         </form> : <div className="chat-directory-actions">
           <button type="button" onClick={() => { setRenamingId(session.sessionId); setRenameTitle(session.title); }}
             disabled={mutating || session.status === 'archived'}>Rename</button>
-          <button type="button" disabled={mutating || session.hasBusinessHistory}
-            title={session.hasBusinessHistory ? 'This chat has invoice history and cannot be deleted.' : undefined}
+          <button type="button" disabled={mutating || session.availability === 'busy'}
+            title={session.availability === 'busy' ? 'Wait for the current response or stop it before removing this chat.' : undefined}
             onClick={() => {
-              if (window.confirm(`Permanently delete this chat (“${chatTitle(session.title)}”) and its messages? Other chats and connection tests will be kept. This cannot be undone.`)) void onDelete(session.sessionId);
+              const confirmation = session.hasBusinessHistory
+                ? `Remove “${chatTitle(session.title)}” from Conversations? Its invoice history and saved results will remain available. This chat cannot continue.`
+                : `Permanently delete this chat (“${chatTitle(session.title)}”) and its messages? Other chats and connection tests will be kept. This cannot be undone.`;
+              if (window.confirm(confirmation)) void onDelete(session.sessionId);
             }}>Delete</button>
         </div>}
       </div>)}
@@ -1280,6 +1310,8 @@ function WorkspacePage(props: {
   notice: Notice;
   onImport(): void;
   onSelectDocument(id: number | null): void;
+  onHideDocument(id: number): void;
+  hidingDocumentId: number | null;
   onStartTask(): void;
   onOpenCandidate(jobId: number, candidateId: number): void;
   onTaskGoalChange(value: string): void;
@@ -1293,15 +1325,17 @@ function WorkspacePage(props: {
   return <section className="page-content invoice-page">
     <div className="page-heading">
       <div><h1>Invoices</h1><p>Review the original, parsed details and saved results in one place.</p></div>
-      <div className="invoice-heading-actions"><select className="context-select" aria-label="Choose invoice" value={workspace?.documentRef?.id ?? ''} onChange={(event) => props.onSelectDocument(Number(event.target.value))}><option value="" disabled>Choose invoice</option>{documents.map((item) => <option key={item.documentRef.id} value={item.documentRef.id}>{item.displayName}</option>)}</select><button className="secondary-button" onClick={props.onImport}>＋ Import invoice</button></div>
+      <div className="invoice-heading-actions"><select className="context-select" aria-label="Choose invoice" value={selectedDocument?.documentRef.id ?? ''} onChange={(event) => props.onSelectDocument(Number(event.target.value))}><option value="" disabled>Choose invoice</option>{documents.map((item) => <option key={item.documentRef.id} value={item.documentRef.id}>{item.displayName}</option>)}</select>{selectedDocument && <button className="text-button danger-text invoice-heading-delete" disabled={props.hidingDocumentId !== null} onClick={() => props.onHideDocument(selectedDocument.documentRef.id)}>Delete</button>}<button className="secondary-button" onClick={props.onImport}>＋ Import invoice</button></div>
     </div>
     {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
     <section className="invoice-context">
       <div className="invoice-context-head"><strong>All invoices</strong><button className="text-button" onClick={props.onRefresh} aria-label="Refresh invoices" title="Refresh invoices">↻</button></div>
       {documents.length === 0 ? <div className="empty-route"><strong>No invoices yet</strong><span>Import an invoice to begin.</span></div> :
-        <div className="model-list">{documents.map((document) => <button key={`${document.documentRef.id}:${document.documentRef.version}`} className={`route-row ${workspace?.documentRef?.id === document.documentRef.id ? 'selected' : ''}`} onClick={() => props.onSelectDocument(document.documentRef.id)}>
-          <span className="route-icon">▧</span><span className="route-name"><strong>{document.displayName}</strong><small>{document.pageCount} {document.pageCount === 1 ? 'page' : 'pages'} · {new Date(document.createdAt).toLocaleDateString()}</small></span>
-        </button>)}</div>}
+        <div className="model-list">{documents.map((document) => <div key={`${document.documentRef.id}:${document.documentRef.version}`} className={`route-row ${workspace?.documentRef?.id === document.documentRef.id ? 'selected' : ''}`}>
+          <span className="route-icon" aria-hidden="true">▧</span>
+          <button className="route-name processing-open" type="button" onClick={() => props.onSelectDocument(document.documentRef.id)}><strong>{document.displayName}</strong><small>{document.pageCount} {document.pageCount === 1 ? 'page' : 'pages'} · {new Date(document.createdAt).toLocaleDateString()}</small></button>
+          <button className="text-button danger-text invoice-row-delete" type="button" aria-label={`Delete ${document.displayName}`} disabled={props.hidingDocumentId !== null} onClick={() => props.onHideDocument(document.documentRef.id)}>Delete</button>
+        </div>)}</div>}
     </section>
 
     {workspace?.documentRef && <section className="panel config-panel invoice-sheet">
@@ -1340,7 +1374,9 @@ function WorkspacePage(props: {
 function TasksPage(props: {
   workspace: WorkspaceSnapshot | null;
   documents: readonly DocumentSnapshot[];
+  historicalDocuments: Readonly<Record<number, DocumentSnapshot>>;
   jobs: readonly JobSnapshot[];
+  selectedJobId: number | null;
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
   activity: readonly BusinessEventSnapshot[];
@@ -1351,25 +1387,26 @@ function TasksPage(props: {
   onSelectCandidate(jobId: number, candidateId: number): void;
 }) {
   const { workspace, jobs, candidates, candidateDetail, activity } = props;
-  const job = jobs.find((item) => item.jobId === workspace?.jobId) ?? null;
-  const documentName = (documentId: number) => props.documents.find((item) => item.documentRef.id === documentId)?.displayName ?? 'Invoice';
+  const job = jobs.find((item) => item.jobId === props.selectedJobId) ?? null;
+  const documentInfo = (documentId: number) => props.documents.find((item) => item.documentRef.id === documentId) ?? props.historicalDocuments[documentId];
+  const documentName = (documentId: number) => documentInfo(documentId)?.displayName ?? 'Invoice';
   return <section className="page-content">
     <div className="page-heading"><div><h1>Processing History</h1><p>Review prepared results, their sources, issues and past actions.</p></div></div>
     {props.notice && <div className={`notice ${props.notice.tone}`} role="status">{props.notice.message}</div>}
     <section className="panel model-list-panel"><div className="panel-head"><div><h2>Recent processing</h2></div></div>
       {jobs.length === 0 ? <div className="empty-route"><strong>No processing yet</strong><span>Choose an invoice and select Process this invoice.</span></div> :
-        <div className="model-list">{jobs.map((item) => <div key={item.jobId} className={`route-row ${item.jobId === workspace?.jobId ? 'selected' : ''}`}>
+        <div className="model-list">{jobs.map((item) => <div key={item.jobId} className={`route-row ${item.jobId === props.selectedJobId ? 'selected' : ''}`}>
           <span className="route-icon">☷</span><button className="route-name processing-open" type="button" onClick={() => props.onOpenJob(item.jobId)}><strong>{documentName(item.documentRef.id)}</strong><small>{item.goal}</small></button><span className="credential-pill">{item.status}</span>
           <button className="text-button danger-text" type="button" onClick={() => props.onHideJob(item.jobId)}>Delete</button>
         </div>)}</div>}
     </section>
     {job && <>
-      <section className="panel config-panel"><div className="panel-head"><div><h2>Results for {documentName(job.documentRef.id)}</h2></div><span className="revision-tag">{candidates.length} saved</span></div>
+      <section className="panel config-panel"><div className="panel-head"><div><h2>Results for {documentName(job.documentRef.id)}</h2></div><span className="revision-tag">{documentInfo(job.documentRef.id)?.isHidden ? 'Read only' : `${candidates.length} saved`}</span></div>
         {candidates.length === 0 ? <p className="config-note">No result has been saved. The assistant can prepare one when you send a processing request.</p> :
           <div className="model-list">{candidates.map((item) => <div className="route-row" key={item.candidateId}>
             <span className="route-icon">{item.status === 'accepted' ? '✓' : '▧'}</span><span className="route-name"><strong>Result {item.sequence} · {item.status}</strong><small>{item.issueCount} issues · {new Date(item.createdAt).toLocaleString()}</small></span>
             <button className="text-button" onClick={() => props.onOpenCandidate(job.jobId, item.candidateId)}>View</button>
-            {item.status === 'generated' && item.candidateId !== job.currentCandidateId && <button className="secondary-button" onClick={() => props.onSelectCandidate(job.jobId, item.candidateId)}>Select</button>}
+            {!documentInfo(job.documentRef.id)?.isHidden && item.status === 'generated' && item.candidateId !== job.currentCandidateId && <button className="secondary-button" onClick={() => props.onSelectCandidate(job.jobId, item.candidateId)}>Select</button>}
           </div>)}</div>}
       </section>
       {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><h2>Result details</h2></div><CandidateDetails detail={candidateDetail} /></section>}

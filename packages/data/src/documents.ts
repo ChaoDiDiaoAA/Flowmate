@@ -55,6 +55,7 @@ export interface DocumentRepository {
   getArtifact(artifactId: number): Result<StoredArtifact>;
   register(input: NewDocumentRegistration): Result<DocumentSnapshot>;
   setAvailability(input: { documentId: number; status: 'available' | 'unavailable'; reason: string | null; at: string }): Result<DocumentSnapshot>;
+  unhide(documentId: number, at: string): Result<DocumentSnapshot>;
 }
 export interface FileStore {
   publish(input: PublishArtifactInput): Promise<Result<PublishedArtifactPair>>;
@@ -247,7 +248,7 @@ export class DocumentService {
       ? fail(appError('tool_access_denied', 'runtime', '当前 Run 无权读取该材料。', false, context.runId, context.sessionId))
       : document;
     if (!scopeAllows(context.scope, document.data)) return fail(appError('tool_access_denied', 'runtime', '当前 Run 无权读取该材料。', false, context.runId, context.sessionId));
-    if (document.data.status !== 'available') return fail(appError('input_unavailable', 'input', '材料当前不可读取。', true, context.runId, context.sessionId));
+    if (document.data.status !== 'available' || document.data.isHidden) return fail(appError('input_unavailable', 'input', '材料当前不可读取。', true, context.runId, context.sessionId));
     const artifact = this.options.repository.getArtifact(document.data.parsedArtifactId);
     if (!artifact.ok) return artifact;
     const bytes = this.options.files.read(artifact.data, 'parsed.json');
@@ -303,7 +304,7 @@ export class DocumentService {
       && Buffer.compare(Buffer.from(savedContent.data), Buffer.from(content)) === 0
       && Buffer.compare(Buffer.from(savedPages.data), Buffer.from(pages)) === 0
       && Buffer.compare(Buffer.from(savedSource.data), Buffer.from(source)) === 0
-      ? ok(document)
+      ? document.isHidden ? this.options.repository.unhide(document.documentRef.id, this.options.now()) : ok(document)
       : fail(appError('document_version_conflict', 'input', '同一来源版本对应了不同材料内容。'));
   }
 }

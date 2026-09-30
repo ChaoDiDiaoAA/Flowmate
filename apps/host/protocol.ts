@@ -52,6 +52,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   }).strict() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_documents'), input: pageInput }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_document'), documentId: dbId }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('hide_document'), documentId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_jobs'), input: pageInput.extend({ documentId: dbId.optional() }) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_job'), jobId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('hide_job'), jobId: dbId }).strict(),

@@ -118,13 +118,42 @@ const legacyColumns = [
 ].join(',');
 
 describe('P2 Session and Agent Run storage', () => {
-  it('migrates a real new database through version 6 before exposing repositories', () => withDatabase((paths) => {
+  it('migrates a real new database through version 8 before exposing repositories', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     opened.data.close();
+  }));
+
+  it('migrates version 7 without guessing old entry ownership and preserves native JSON', () => withDatabase((paths) => {
+    const legacy = createLegacyV1(paths);
+    for (const file of ['002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql',
+      '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql']) {
+      if (file === '004_parsed_documents.sql') {
+        for (const sql of readFileSync(new URL(`../../../packages/core/src/storage/migrations/${file}`, import.meta.url), 'utf8')
+          .split(';').map((sql) => sql.trim()).filter(Boolean)) legacy.exec(sql);
+        legacy.exec('COMMIT');
+      } else legacy.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${file}`, import.meta.url), 'utf8'));
+    }
+    const header = '{"type":"session","version":3,"id":"native-v7","timestamp":"2026-09-30T00:00:00.000Z","cwd":"fixture"}';
+    const entry = '{"type":"message","id":"old-e1","parentId":null,"timestamp":"2026-09-30T00:00:00.000Z","message":{"role":"user","content":"old input","timestamp":1}}';
+    legacy.query("INSERT INTO sessions(id,native_session_id,title,created_at,updated_at) VALUES (1,'native-v7','Old chat',?,?)")
+      .run('2026-09-30T00:00:00.000Z', '2026-09-30T00:00:00.000Z');
+    legacy.query("INSERT INTO session_native_history(session_id,storage_version,header_json,leaf_id,entry_count,unusable) VALUES (1,1,?,'old-e1',1,0)").run(header);
+    legacy.query("INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json) VALUES (1,0,'old-e1',?)").run(entry);
+    legacy.close();
+    const migrated = openDatabase(paths);
+    expect(migrated.ok).toBe(true);
+    if (!migrated.ok) return;
+    try {
+      expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 8 });
+      expect(migrated.data.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: entry, run_id: null });
+      expect(migrated.data.db.query('SELECT header_json,storage_version,leaf_id,entry_count FROM session_native_history').get())
+        .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });
+      expect(migrated.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    } finally { migrated.data.close(); }
   }));
 
   it('keeps ordered native history and leaf across restart, and marks corrupt history invalid', () => withDatabase((paths) => {
@@ -166,7 +195,7 @@ describe('P2 Session and Agent Run storage', () => {
     if (!created.ok) return;
     const id = created.data.sessionId;
     expect(opened.data.sessions.prepareDelete(id, at).ok).toBe(true);
-    expect(opened.data.sessions.delete(id, at)).toEqual({ ok: true, data: undefined });
+    expect(opened.data.sessions.delete(id, at)).toEqual({ ok: true, data: 'permanent' });
     expect(opened.data.db.query('SELECT * FROM session_native_history WHERE session_id=?').get(id)).toBeNull();
     expect(opened.data.sessions.get(id)).toMatchObject({ ok: false, error: { code: 'session_not_found' } });
     opened.data.close();
@@ -392,7 +421,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(runs.get(firstRun.data)).toMatchObject({ ok: true, data: { kind: 'agent' } });
     expect(runs.get(secondRun.data)).toMatchObject({ ok: true, data: { kind: 'agent' } });
     db.exec('DROP TRIGGER block_second_session_delete;');
-    expect(sessions.delete(secondSession.data.sessionId, '2026-09-24T00:07:00.000Z')).toEqual({ ok: true, data: undefined });
+    expect(sessions.delete(secondSession.data.sessionId, '2026-09-24T00:07:00.000Z')).toEqual({ ok: true, data: 'permanent' });
     expect(sessions.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: firstSession.data.sessionId, status: 'active' }] } });
     expect(runs.get(firstRun.data)).toMatchObject({ ok: true, data: { kind: 'agent', status: 'failed', sessionId: firstSession.data.sessionId } });
     expect(runs.get(secondRun.data)).toMatchObject({ ok: false, error: { code: 'run_not_found' } });

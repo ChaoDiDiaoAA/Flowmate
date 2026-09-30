@@ -113,7 +113,42 @@ describe('P3 controlled document input', () => {
     writeFileSync(metadataPath, JSON.stringify(metadata));
     const changed = await service.importVoxel51({ sourceDirectory });
     expect(changed.ok).toBe(true);
-    if (changed.ok) expect(changed.data.documentRef.version).not.toBe(imported.data.documentRef.version);
+    if (changed.ok) {
+      expect(changed.data.documentRef.version).not.toBe(imported.data.documentRef.version);
+      expect(opened.documents.list({ limit: 1 })).toMatchObject({ ok: true,
+        data: { items: [{ documentRef: { id: changed.data.documentRef.id } }], nextBeforeId: changed.data.documentRef.id } });
+      expect(opened.documents.hide(changed.data.documentRef.id, '2026-09-28T00:01:00.000Z').ok).toBe(true);
+      expect(opened.documents.list({ limit: 1 })).toMatchObject({ ok: true,
+        data: { items: [{ documentRef: { id: imported.data.documentRef.id } }], nextBeforeId: null } });
+    }
+  });
+
+  it('restores a hidden invoice only after its managed files match the formal input', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-reimport-hidden-'));
+    const sourceDirectory = join(root, 'source', '000001');
+    writeSample(sourceDirectory);
+    const { opened, service, productPaths } = serviceFor(root);
+    const imported = await service.importVoxel51({ sourceDirectory });
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const documentId = imported.data.documentRef.id;
+    expect(opened.documents.hide(documentId, '2026-09-28T00:01:00.000Z'))
+      .toEqual({ ok: true, data: { documentId, affectedChatCount: 0 } });
+    expect(opened.documents.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [] } });
+    const context = { runId: 1, sessionId: 1, scope: { version: 2 as const, allowedTools: ['read_invoice_document'],
+      allowedDocumentIds: [documentId], allowedArtifactIds: [imported.data.parsedArtifactId], allowedResourcePaths: [] } };
+    expect(service.readParsedForRun(documentId, context)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+    const managedPath = join(productPaths.artifactsDir, String(imported.data.parsedArtifactId), 'parsed.json');
+    const saved = readFileSync(managedPath);
+    const tampered = Buffer.from(saved);
+    tampered[0] = tampered[0] === 123 ? 91 : 123;
+    writeFileSync(managedPath, tampered);
+    expect(await service.importVoxel51({ sourceDirectory })).toMatchObject({ ok: false, error: { code: 'document_version_conflict' } });
+    expect(opened.documents.get(documentId)).toMatchObject({ ok: true, data: { isHidden: true } });
+    writeFileSync(managedPath, saved);
+    expect(await service.importVoxel51({ sourceDirectory })).toMatchObject({ ok: true,
+      data: { documentRef: { id: documentId }, isHidden: false } });
+    expect(opened.documents.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ documentRef: { id: documentId } }] } });
   });
   it('maps existing parsed content to stable one-based pages and source-index block IDs', () => {
     const result = parseVoxel51Sample(sample());

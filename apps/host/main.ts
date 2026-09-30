@@ -4,7 +4,7 @@ import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
 import { appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok } from '@flowmate/contracts';
-import type { Application, DesktopState, ProductSettings } from '@flowmate/contracts';
+import type { Application, DesktopState, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings } from '@flowmate/core';
 import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
@@ -131,6 +131,19 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
   }
   application = created.data;
   const catalog = await createPiModelCatalog();
+  const requireDesktopPiKey = async (profile: ModelProfile): Promise<Result<void>> => {
+    if (profile.kind !== 'catalog') return ok(undefined);
+    let provider;
+    try { provider = (await catalog.list(profile.providerId ?? undefined)).find((item) => item.id === profile.providerId); }
+    catch { return fail(appError('provider_catalog_unavailable', 'provider', 'Pi model catalog is unavailable.', true)); }
+    if (!provider?.authMethods.includes('api_key'))
+      return fail(appError('model_api_key_unsupported', 'input', 'This Pi provider does not support API key access.'));
+    try {
+      const credential = await credentialRequest(profile.credentialRef, 'read');
+      if (credential?.type === 'api_key' && typeof credential.key === 'string' && credential.key.trim()) return ok(undefined);
+    } catch { return fail(appError('model_credential_unavailable', 'storage', 'The saved API key could not be read.')); }
+    return fail(appError('model_credential_missing', 'input', 'Save an API key for this model in Models.'));
+  };
   const logins = new Map<string, AbortController>();
   const authPrompts = new Map<string, { requestId: string; resolve(value: string): void; reject(error: Error): void }>();
 
@@ -305,6 +318,10 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryDocument(command.documentId) });
       return;
     }
+    if (command.type === 'hide_document') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.hideDocument(command.documentId) });
+      return;
+    }
     if (command.type === 'list_jobs') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listJobs(command.input) });
       return;
@@ -431,6 +448,8 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
           value: fail(appError('model_reconfiguration_required', 'input', 'Choose this model again from the Pi catalog or configure it as custom.')) });
         return;
       }
+      const key = await requireDesktopPiKey(profile);
+      if (!key.ok) { send({ version: 1, type: 'response', requestId: command.requestId, value: key }); return; }
       const providerId = profile.kind === 'catalog' ? profile.providerId! : `flowmate-profile-${profile.id}`;
       const config = {
         version: 1 as const,
@@ -486,6 +505,8 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
           value: fail(appError('model_reconfiguration_required', 'input', 'Choose this model again from the Pi catalog or configure it as custom.')) });
         return;
       }
+      const key = await requireDesktopPiKey(profile);
+      if (!key.ok) { send({ version: 1, type: 'response', requestId: command.requestId, value: key }); return; }
       const providerId = profile.kind === 'catalog' ? profile.providerId! : `flowmate-profile-${profile.id}`;
       const config = {
         version: 1 as const,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import * as messages from '../../packages/contracts/src/runtime.ts';
 import {
   normalizeAgentRunRequest,
   normalizeCreateSessionRequest,
@@ -102,5 +103,68 @@ describe('session and Agent contracts', () => {
     expect(normalizeSessionRunsRequest({ sessionId: 3, beforeRunId: 0 })).toMatchObject({ ok: false });
     expect(normalizeSessionRunsRequest({ sessionId: 3, limit: 0 })).toMatchObject({ ok: false });
     expect(normalizeSessionRunsRequest({ sessionId: 3, runId: 7 })).toMatchObject({ ok: false });
+  });
+});
+
+describe('P4 message wire contracts', () => {
+  const base = { entryId: 'e1', runId: 7, liveOrdinal: 1, timestamp: 1,
+    persistence: 'saved', truncated: false, phase: 'ended', stopReason: null,
+    toolCallId: null, toolName: null, isError: null };
+  const user = { ...base, role: 'user', blocks: [{ type: 'text', text: 'Tax?' }], textOrigin: 'product-input' };
+  const assistant = { ...base, role: 'assistant', blocks: [{ type: 'toolCall', id: 'c1', name: 'read_invoice_document' }],
+    stopReason: 'toolUse', textOrigin: null };
+  const result = { ...base, role: 'toolResult', blocks: [], toolCallId: 'c1', toolName: 'read_invoice_document',
+    isError: false, textOrigin: null };
+  const session = { sessionId: 2, nativeSessionId: 'native-2', title: 'Invoice', status: 'active',
+    createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:00.000Z',
+    availability: 'ready', historyState: 'recoverable', activeRunId: null, modelUseBlocked: false,
+    hasBusinessHistory: false };
+
+  it('rejects role-mixed fields and unknown properties while retaining all three legal variants', () => {
+    expect(messages.SessionMessageViewSchema).toBeDefined();
+    for (const value of [user, assistant, result]) expect(messages.SessionMessageViewSchema.safeParse(value).success).toBe(true);
+    for (const value of [
+      { ...user, toolCallId: 'forged' }, { ...user, blocks: assistant.blocks }, { ...user, secret: 'private' },
+      { ...assistant, stopReason: null }, { ...assistant, textOrigin: 'product-input' },
+      { ...assistant, blocks: [{ type: 'text', text: 'Done' }], textOrigin: null },
+      { ...result, isError: undefined }, { ...result, toolCallId: '' }, { ...result, blocks: assistant.blocks },
+      { ...user, timestamp: Infinity }, { ...user, persistence: 'saved', entryId: null },
+      { ...user, liveOrdinal: 0 }, { ...user, blocks: Array.from({ length: 257 }, () => ({ type: 'text', text: '' })) },
+      { ...user, blocks: [{ type: 'text', text: '票'.repeat(22_000) }] },
+    ]) expect(messages.SessionMessageViewSchema.safeParse(value).success).toBe(false);
+  });
+
+  it('normalizes only legal message cursors and bounds without accepting privileged fields', () => {
+    expect(messages.normalizeSessionMessagesRequest).toBeDefined();
+    expect(messages.normalizeSessionMessagesRequest({ sessionId: 2 })).toEqual({ ok: true, data: { sessionId: 2, limit: 50 } });
+    expect(messages.normalizeSessionMessagesRequest({ sessionId: 2, beforeEntryId: 'e1', limit: 100 }))
+      .toEqual({ ok: true, data: { sessionId: 2, beforeEntryId: 'e1', limit: 100 } });
+    for (const value of [{ sessionId: 0 }, { sessionId: 2, limit: null }, { sessionId: 2, limit: 101 },
+      { sessionId: 2, beforeEntryId: null }, { sessionId: 2, beforeEntryId: '' },
+      { sessionId: 2, beforeEntryId: 'x'.repeat(129) }, { sessionId: 2, nativeSessionId: 'forged' }]) {
+      expect(messages.normalizeSessionMessagesRequest(value)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    }
+  });
+
+  it('accepts saved query items but rejects temporary states and non-white-listed session fields', () => {
+    expect(messages.SessionMessagesPageSchema).toBeDefined();
+    const page = { session, leafId: 'e1', entryCount: 1, items: [user], nextBeforeEntryId: null };
+    expect(messages.SessionMessagesPageSchema.safeParse(page).success).toBe(true);
+    for (const value of [{ ...page, items: [{ ...user, persistence: 'pending' }] },
+      { ...page, items: [{ ...assistant, phase: 'streaming' }] }, { ...page, nativeHistory: {} },
+      { ...page, session: { ...session, credentials: 'private' } }]) {
+      expect(messages.SessionMessagesPageSchema.safeParse(value).success).toBe(false);
+    }
+  });
+
+  it('checks the complete upsert envelope and requires the message to belong to that real Run', () => {
+    expect(messages.MessageUpsertEventSchema).toBeDefined();
+    const event = { type: 'message_upsert', runId: 7, sessionId: 2, nativeSessionId: 'native-2',
+      sequence: 1, at: '2026-09-30T00:00:00.000Z', message: user };
+    expect(messages.MessageUpsertEventSchema.safeParse(event).success).toBe(true);
+    for (const value of [{ ...event, runId: 8 }, { ...event, sequence: 0 }, { ...event, at: 'invalid' },
+      { ...event, nativeSessionId: '' }, { ...event, extra: true }, { ...event, message: { ...user, liveOrdinal: null } }]) {
+      expect(messages.MessageUpsertEventSchema.safeParse(value).success).toBe(false);
+    }
   });
 });

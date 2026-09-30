@@ -10,11 +10,19 @@
 | Run | 一次实际执行，created/running/completed/failed/cancelled；重试或恢复创建新 Run |
 | Session | 多轮与原生历史归属，active/archived；完整历史可保存恢复，不等于一次 Run |
 | Session Input | 用户提交及投递/消费/处理关联；受理不代表模型已经消费 |
+| Messages 四层 | 完整 SessionEntry/header/parent/leaf、当前 AgentMessage[]、实际模型兼容 Message[] 与产品 UI 投影分别承担历史、工作记忆、请求和展示职责 |
+| SDK Message | Pi 0.85.1 pi-ai 的 user/assistant/toolResult 三角色联合类型；systemPrompt、tools 和模型参数独立装配，没有 SystemMessage 角色 |
+| SDK CustomMessage / 摘要 | pi-coding-agent 提供的消息扩展；容器、摘要或角色类型存在不表示产品入口已启用，custom.display 不等于上下文排除或资料授权 |
+| Flowmate 自定义原生消息 | 当前代码没有产品专属原生角色/业务 customType/载荷；P4 取舍后不新增，沿标准 user 与真实 toolResult 路径；未来确有独立业务语义时随所属阶段评估 |
+| UI Message Projection | P4 待实施的 MessageDisplayBlock、SessionMessageView、SessionMessagesPage；白名单查询/IPC 投影，不进入模型；生成 phase 与保存 persistence 分开 |
+| Live Message Identity | P4 的 Run 内 liveOrdinal 与真实 entryId 归并；Host 已加载 native Session 在成功保存后保留 entry→Run/ordinal，Run 终态不清、release/重启清；查询仍核验 SQLite 正文/关联，不按内容或时间猜身份 |
+| Temporary Sequence / Durable Cursor | P4 事件 sequence 仅当前进程临时顺序，按每消息比较；P6 持久事件 sequence/cursor 才用于补读。liveOrdinal/临时序号不作恢复来源或平台稳定 ID |
 | ContextSnapshot | 某次请求使用的任务事实与来源快照；后续新快照不能改写历史依据 |
 | Memory | 原生 header/entries/parent/leaf 的持久化与使用；不增加跨任务知识库 |
 | Compaction | Pi 原生历史压缩；真实触发、保存和后续事实使用分别验证 |
 | Tool Call | requested/running/succeeded/failed/cancelled；拒绝以 failed 加原因表达 |
-| Tool / AgentTool / ToolDefinition | 基础描述契约、Pi 执行契约、注入可信产品上下文的业务定义；唯一 Executor 管准入和调用事实 |
+| Tool Delivery | not_attempted/message_observed/request_observed/failed/unknown 与 ToolCall 执行终态分别确认；回送失败/未知不撤销已提交候选或改写执行成功 |
+| Tool / AgentTool / ToolDefinition | 按主方案三层契约接合 SDK 描述/执行与产品展示及可信 ProductToolContext；ToolExecutor 是唯一业务执行入口，登记准入和调用事实 |
 | ToolExecutionMode | 工具声明的 parallel/sequential 调度属性；Pi 调度，P3 为 12 个并行读取/纯计算工具和 1 个串行候选保存工具 |
 | RunScope | 工具及资料允许范围，来自可信产品控制；子范围不得大于父范围 |
 | Model access revocation | 对已使用指定材料的 Session 持久禁用后续模型调用；本地历史仍可查看，显式新 Session 才能用当前授权继续 |
@@ -23,6 +31,7 @@
 | Artifact | 受控文件产物，以整数 ID 和实际内容/路径关联，不使用自定义摘要身份 |
 | Prompt / Skill | 作者行为指导及原生发现/读取资源；选用、读取、遵循分别核验 |
 | Extension | Pi 原生可执行扩展/Hook，是受信代码，不是操作系统沙箱 |
+| State Transition | 按具体对象定义当前状态、真实触发、前置条件、负责人、动作、新状态和保存边界；Run/ToolCall/Delivery、P4 生成/保存、P5 投递/处理、P10 压缩、P12 实例、P13 子执行各自冻结必要合法/拒绝边，不合成统一消息状态机 |
 | Subagent | 主 LLM 通过插件工具发起的只读子任务；独立原生 Session，绑定父子产品身份，范围收窄 |
 | userData | 操作系统/Electron 标准应用数据根；正式 DB 只有 data/app.sqlite |
 | Case / expected | 质量场景及预期约束，采用 input + expected；expected 不发送模型 |

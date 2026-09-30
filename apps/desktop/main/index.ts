@@ -66,6 +66,7 @@ const channels = {
   selectCandidate: 'flowmate:select-candidate',
   listDocuments: 'flowmate:list-documents',
   queryDocument: 'flowmate:query-document',
+  hideDocument: 'flowmate:hide-document',
   listJobs: 'flowmate:list-jobs',
   queryJob: 'flowmate:query-job',
   hideJob: 'flowmate:hide-job',
@@ -338,6 +339,7 @@ function registerIpc(): void {
   handle(channels.selectCandidate, async (_event, raw) => selectCandidate(raw));
   handle(channels.listDocuments, async (_event, raw) => listDocuments(raw));
   handle(channels.queryDocument, async (_event, raw) => queryDocument(raw));
+  handle(channels.hideDocument, async (_event, raw) => hideDocument(raw));
   handle(channels.listJobs, async (_event, raw) => listJobs(raw));
   handle(channels.queryJob, async (_event, raw) => queryJob(raw));
   handle(channels.hideJob, async (_event, raw) => hideJob(raw));
@@ -368,7 +370,7 @@ async function readDesktopState(): Promise<Result<DesktopState>> {
   if (base.data.settings) {
     const settings = base.data.settings as ProductSettings;
     await Promise.all(settings.models.map(async (model) => {
-      modelCredentials[model.id] = await credentialStore(model.credentialRef).status();
+      modelCredentials[model.id] = await modelCredentialStatus(model);
     }));
   }
   return { ok: true, data: {
@@ -376,6 +378,21 @@ async function readDesktopState(): Promise<Result<DesktopState>> {
     ...(hostError ? { ready: false, host: 'error' as const } : {}),
     modelCredentials,
   } };
+}
+
+async function modelCredentialStatus(model: ProductSettings['models'][number]): Promise<'missing' | 'configured' | 'unavailable'> {
+  const store = credentialStore(model.credentialRef);
+  const status = await store.status();
+  if (status !== 'configured' || model.kind !== 'catalog') return status;
+  const saved = await store.read();
+  if (!saved.ok) return 'unavailable';
+  if (!saved.data) return 'missing';
+  if (!saved.data.startsWith(piCredentialPrefix)) return saved.data.trim() ? 'configured' : 'missing';
+  try {
+    const credential = JSON.parse(saved.data.slice(piCredentialPrefix.length)) as { type?: unknown; key?: unknown };
+    return credential.type === 'api_key' && typeof credential.key === 'string' && credential.key.trim()
+      ? 'configured' : 'missing';
+  } catch { return 'unavailable'; }
 }
 
 async function saveSettings(settingsRaw: unknown, credentialUpdateRaw: unknown): Promise<Result<ProductSettings>> {
@@ -386,8 +403,15 @@ async function saveSettings(settingsRaw: unknown, credentialUpdateRaw: unknown):
   const previous = previousResult.data.settings as ProductSettings;
   let next = parsed.data;
   let newCredentialRef: string | null = null;
-  let oldCredentialRef: string | null = null;
   let update: { modelId: string; apiKey: string } | null = null;
+  const previousModels = new Map(previous.models.map((model) => [model.id, model]));
+  next = { ...next, models: next.models.map((model) => {
+    const prior = previousModels.get(model.id);
+    const sameCredentialTarget = prior?.kind === model.kind && (model.kind === 'catalog'
+      ? prior.providerId === model.providerId
+      : model.kind === 'custom' ? prior.baseUrl === model.baseUrl && prior.api === model.api : true);
+    return { ...model, credentialRef: sameCredentialTarget ? prior!.credentialRef : randomUUID().replaceAll('-', '') };
+  }) };
   if (credentialUpdateRaw !== undefined && credentialUpdateRaw !== null) {
     if (typeof credentialUpdateRaw !== 'object') return fail(appError('credential_invalid', 'input', '模型凭据输入无效。'));
     const candidate = credentialUpdateRaw as { modelId?: unknown; apiKey?: unknown };
@@ -397,8 +421,6 @@ async function saveSettings(settingsRaw: unknown, credentialUpdateRaw: unknown):
     }
     const nextModel = next.models.find((model) => model.id === candidate.modelId);
     if (!nextModel) return fail(appError('credential_model_missing', 'input', '凭据对应的模型配置不存在。'));
-    const priorModel = previous.models.find((model) => model.id === candidate.modelId);
-    oldCredentialRef = priorModel?.credentialRef ?? null;
     newCredentialRef = randomUUID().replaceAll('-', '');
     next = {
       ...next,
@@ -419,15 +441,11 @@ async function saveSettings(settingsRaw: unknown, credentialUpdateRaw: unknown):
     if (newCredentialRef) await credentialStore(newCredentialRef).remove();
     return saved;
   }
-  if (newCredentialRef && oldCredentialRef && oldCredentialRef !== newCredentialRef) {
-    const removed = await credentialStore(oldCredentialRef).remove();
-    if (!removed.ok) process.stderr.write('[Flowmate] An old encrypted credential could not be removed.\n');
-  }
-  const nextIds = new Set(saved.data.models.map((model) => model.id));
+  const nextRefs = new Set(saved.data.models.map((model) => model.credentialRef));
   for (const priorModel of previous.models) {
-    if (!nextIds.has(priorModel.id) && !saved.data.models.some((model) => model.credentialRef === priorModel.credentialRef)) {
+    if (!nextRefs.has(priorModel.credentialRef)) {
       const removed = await credentialStore(priorModel.credentialRef).remove();
-      if (!removed.ok) process.stderr.write('[Flowmate] A removed model credential could not be deleted.\n');
+      if (!removed.ok) process.stderr.write('[Flowmate] An obsolete encrypted credential could not be removed.\n');
     }
   }
   await broadcastState();
@@ -441,8 +459,8 @@ async function callProvider(inputRaw: unknown): Promise<Result<{ requestId: stri
   if (!state.data.ready) return fail(appError(hostErrorCode, 'runtime', 'Bun Host 尚未就绪。', true));
   const model = state.data.settings.models.find((item) => item.id === inputRaw.modelId);
   if (!model) return fail(appError('model_not_configured', 'input', '所选模型配置不存在。'));
-  if (model.kind !== 'catalog' && state.data.modelCredentials[model.id] !== 'configured')
-    return fail(appError('model_credential_missing', 'input', 'Configure authentication for this model.'));
+  if (state.data.modelCredentials[model.id] !== 'configured')
+    return fail(appError('model_credential_missing', 'input', 'Save an API key for this model in Models.'));
   const requestId = randomUUID();
   try {
     const value = await host.request({
@@ -510,6 +528,11 @@ async function listDocuments(raw: unknown) {
 async function queryDocument(raw: unknown) {
   if (!validId(raw)) return fail(appError('input_invalid', 'input', 'Document ID 无效。'));
   return productHostRequest({ type: 'query_document', documentId: raw }, 'Document 查询暂不可用。');
+}
+
+async function hideDocument(raw: unknown) {
+  if (!validId(raw)) return fail(appError('input_invalid', 'input', 'Invoice reference is invalid.'));
+  return productHostRequest({ type: 'hide_document', documentId: raw }, 'Invoice could not be removed.');
 }
 
 async function listJobs(raw: unknown) {
@@ -631,10 +654,10 @@ async function renameSession(raw: unknown): Promise<Result<SessionSnapshot>> {
   catch { return fail(appError('host_request_failed', 'runtime', 'Session 重命名未能提交给 Bun Host。', true)); }
 }
 
-async function deleteSession(raw: unknown): Promise<Result<{ deletedSessionId: number }>> {
+async function deleteSession(raw: unknown): Promise<Result<import('@flowmate/contracts').DeleteSessionResult>> {
   const sessionId = normalizeSessionId(raw);
   if (!sessionId.ok) return sessionId;
-  try { return await host.request({ type: 'delete_session', sessionId: sessionId.data }) as Result<{ deletedSessionId: number }>; }
+  try { return await host.request({ type: 'delete_session', sessionId: sessionId.data }) as Result<import('@flowmate/contracts').DeleteSessionResult>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Session could not be submitted for deletion to Bun Host.', true)); }
 }
 
@@ -677,8 +700,8 @@ async function startRun(raw: unknown): Promise<Result<RunAccepted & { requestId:
   if (!state.data.ready) return fail(appError(hostErrorCode, 'runtime', 'Bun Host 尚未就绪。', true));
   const profile = state.data.settings.models.find((item) => item.id === raw.modelId);
   if (!profile) return fail(appError('model_not_configured', 'input', '所选模型配置不存在。'));
-  if (profile.kind !== 'catalog' && state.data.modelCredentials[profile.id] !== 'configured')
-    return fail(appError('model_credential_missing', 'input', 'Configure authentication for this model.'));
+  if (state.data.modelCredentials[profile.id] !== 'configured')
+    return fail(appError('model_credential_missing', 'input', 'Save an API key for this model in Models.'));
 
   const requestId = randomUUID();
   try {

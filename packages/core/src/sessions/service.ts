@@ -3,6 +3,7 @@ import type {
   AgentPort,
   CreateSessionRequest,
   DbId,
+  DeleteSessionResult,
   NormalizedListSessionsRequest,
   Result,
   RenameSessionRequest,
@@ -62,7 +63,7 @@ export class SessionService {
     return row.ok ? ok(this.project(row.data)) : row;
   }
 
-  public async deleteSession(sessionId: DbId): Promise<Result<{ deletedSessionId: DbId }>> {
+  public async deleteSession(sessionId: DbId): Promise<Result<DeleteSessionResult>> {
     if (this.deleting) return deleteInProgress();
     this.deleting = true;
     try {
@@ -73,7 +74,7 @@ export class SessionService {
       catch { return failDeleteSession(); }
       if (!released.stopped || !released.closed) return failDeleteSession();
       const deleted = this.repository.delete(sessionId, this.now());
-      return deleted.ok ? ok({ deletedSessionId: sessionId }) : failDeleteSession();
+      return deleted.ok ? ok({ deletedSessionId: sessionId, disposition: deleted.data }) : failDeleteSession();
     } finally {
       this.deleting = false;
     }
@@ -142,6 +143,6 @@ function deleteInProgress<T>(): Result<T> {
   return fail(appError('session_delete_in_progress', 'session', 'A Session deletion is already in progress.', true));
 }
 
-function failDeleteSession(): Result<{ deletedSessionId: DbId }> {
+function failDeleteSession(): Result<DeleteSessionResult> {
   return { ok: false, error: { code: 'session_delete_incomplete', category: 'session', message: 'Session deletion is incomplete. Retry Delete Session to finish removing it.', retryable: true } };
 }

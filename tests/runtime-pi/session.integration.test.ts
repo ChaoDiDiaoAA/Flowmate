@@ -105,6 +105,57 @@ const config: ProviderConfig = {
 };
 
 describe('PiAgentAdapter', () => {
+  it('publishes saved message snapshots with real entries and keeps their bridge after the Run', async () => {
+    const app = await fixture();
+    const created = app.adapter.createSession();
+    if (!created.ok) throw new Error('fixture session');
+    const bindings: Array<{ entryId: string; runId: number }> = [];
+    let saved = app.adapter.exportSession(created.data.nativeSessionId);
+    expect(app.adapter.watchSession(created.data.nativeSessionId, (history, context) => {
+      saved = ok(history);
+      if (context) bindings.push(context);
+      return ok(undefined);
+    }).ok).toBe(true);
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
+      { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const observations: AgentObservation[] = [];
+    const runInput = input(104, 204, 'What is the fixture total?');
+    const result = await prepared.data.execute(runInput, new AbortController().signal, (event) => observations.push(event));
+    expect(result.error).toBeNull();
+    const messages = observations.filter((event) => event.type === 'display_message');
+    expect(messages.some((event) => event.message.role === 'user' && event.message.persistence === 'saved')).toBe(true);
+    expect(messages.some((event) => event.message.role === 'assistant' && event.message.persistence === 'saved')).toBe(true);
+    expect(bindings.length).toBe(2);
+    if (!saved.ok) throw new Error(saved.error.code);
+    const projected = app.adapter.projectSessionMessages({ history: saved.data, bindings,
+      runInputs: [{ runId: 104, input: { version: 1, goal: runInput.goal, text: runInput.text,
+        messageTimestamp: runInput.messageTimestamp }, goalMode: null }], limit: 50 });
+    expect(projected.ok).toBe(true);
+    if (!projected.ok) throw new Error(projected.error.code);
+    expect(projected.data.items.map((item) => item.liveOrdinal)).toEqual([1, 2]);
+    expect(projected.data.items.every((item) => item.entryId !== null && item.runId === 104)).toBe(true);
+    expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
+    const noBridge = app.adapter.projectSessionMessages({ history: saved.data, bindings,
+      runInputs: [{ runId: 104, input: { version: 1, goal: runInput.goal, text: runInput.text,
+        messageTimestamp: runInput.messageTimestamp }, goalMode: null }], limit: 50 });
+    expect(noBridge.ok && noBridge.data.items.every((item) => item.liveOrdinal === null)).toBe(true);
+  });
+
+  it('checks current model permission before conversion and sends no request after revocation', async () => {
+    const app = await fixture();
+    const created = app.adapter.createSession();
+    if (!created.ok) throw new Error('fixture session');
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
+      { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const result = await prepared.data.execute({ ...input(105, 205, 'Forbidden after revocation'),
+      verifyModelUse: () => fail(appError('session_scope_revoked', 'session', 'Revoked fixture')) },
+    new AbortController().signal, () => undefined);
+    expect(app.requests).toHaveLength(0);
+    expect(result.error?.code).toBe('session_scope_revoked');
+  });
+
   it('restores the native message history after a process boundary', async () => {
     const app = await fixture();
     const created = app.adapter.createSession();

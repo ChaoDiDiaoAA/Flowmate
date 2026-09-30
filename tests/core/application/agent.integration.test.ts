@@ -198,7 +198,7 @@ describe('P2 Application Agent entry', () => {
     expect(clearedTraceSessions).toEqual([]);
 
     setReleaseFailure(false);
-    expect(await app.deleteSession(second.data.sessionId)).toEqual({ ok: true, data: { deletedSessionId: second.data.sessionId } });
+    expect(await app.deleteSession(second.data.sessionId)).toEqual({ ok: true, data: { deletedSessionId: second.data.sessionId, disposition: 'permanent' } });
     expect(await app.listSessions({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: first.data.sessionId, status: 'active' }] } });
     expect(clearedTraceSessions).toEqual([second.data.sessionId]);
     expect(released).toEqual(['native-2']);

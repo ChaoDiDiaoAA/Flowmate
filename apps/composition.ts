@@ -87,6 +87,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     candidates: database.data.candidates,
     events: database.data.businessEvents,
     importInvoiceMaterial: (sourceDirectory) => documents.importVoxel51({ sourceDirectory }),
+    hideDocument: (documentId) => database.data.documents.hide(documentId, now()),
     readDocumentPage: (input) => {
       const loaded = documents.readParsedForWorkspace(input.documentId);
       return loaded.ok ? projectInvoiceDocumentPage(input, loaded.data) : loaded;

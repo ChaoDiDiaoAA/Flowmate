@@ -30,6 +30,7 @@ const bridge: DesktopBridge = {
   selectCandidate: (input) => ipcRenderer.invoke('flowmate:select-candidate', input),
   listDocuments: (request = {}) => ipcRenderer.invoke('flowmate:list-documents', request),
   queryDocument: (documentId) => ipcRenderer.invoke('flowmate:query-document', documentId),
+  hideDocument: (documentId) => ipcRenderer.invoke('flowmate:hide-document', documentId),
   listJobs: (request = {}) => ipcRenderer.invoke('flowmate:list-jobs', request),
   queryJob: (jobId) => ipcRenderer.invoke('flowmate:query-job', jobId),
   hideJob: (jobId) => ipcRenderer.invoke('flowmate:hide-job', jobId),
