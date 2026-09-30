@@ -18,6 +18,8 @@ import type {
   SessionStatus,
   SessionHistoryState,
   NativeSessionHistory,
+  NativeHistoryAppendContext,
+  NativeHistoryDisplayRecord,
   SafeConfigSnapshot,
   SdkUsageValues,
   TokenColumns,
@@ -224,7 +226,8 @@ export interface SessionRepository {
   prepareDelete(sessionId: DbId, at: string): Result<SessionRow>;
   delete(sessionId: DbId, at: string): Result<'hidden' | 'permanent'>;
   loadHistory(sessionId: DbId): Result<NativeSessionHistory | null>;
-  saveHistory(sessionId: DbId, history: NativeSessionHistory): Result<void>;
+  readHistoryForDisplay(sessionId: DbId): Result<NativeHistoryDisplayRecord>;
+  saveHistory(sessionId: DbId, history: NativeSessionHistory, context?: NativeHistoryAppendContext): Result<void>;
 }
 
 export type TerminalWrite = {
@@ -238,6 +241,7 @@ export type TerminalWrite = {
   stoppedAt: string | null;
   durationMs: number | null;
   cancelRequestedAt?: string;
+  nativeHistoryUnusable?: boolean;
 };
 
 export interface RunRepository {
@@ -1344,6 +1348,10 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
         if (!parsed) return fail(appError('input_invalid', 'storage', 'ToolCall 回送事实无效。'));
         const current = byId(input.toolCallId);
         if (!current.ok) return current;
+        if (current.data.delivery.state === parsed.state) {
+          return stableJson(current.data.delivery) === stableJson(parsed) ? current
+            : fail(appError('state_conflict', 'runtime', 'ToolCall 同状态回送事实已固定。'));
+        }
         if (!deliveryTransition(current.data.delivery.state, parsed.state)) return fail(appError('state_conflict', 'runtime', 'ToolCall 回送事实不能回退。'));
         const changed = db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?')
           .run(JSON.stringify(parsed), input.toolCallId).changes;
@@ -1697,8 +1705,11 @@ function readNativeHistory(db: Database, sessionId: DbId): NativeSessionHistory 
     .get(sessionId) as { storage_version: number; header_json: string; leaf_id: string | null; entry_count: number; unusable: number } | null;
   if (!row) return null;
   const header = JSON.parse(row.header_json) as NativeSessionHistory['header'];
-  const stored = db.query('SELECT sequence,entry_id,entry_json FROM session_native_entries WHERE session_id=? ORDER BY sequence')
-    .all(sessionId) as Array<{ sequence: number; entry_id: string; entry_json: string }>;
+  const stored = db.query(`SELECT entry.sequence,entry.entry_id,entry.entry_json,entry.run_id,
+      run.kind AS run_kind,run.session_id AS run_session_id
+    FROM session_native_entries entry LEFT JOIN runs run ON run.id=entry.run_id
+    WHERE entry.session_id=? ORDER BY entry.sequence`)
+    .all(sessionId) as Array<{ sequence: number; entry_id: string; entry_json: string; run_id: number | null; run_kind: string | null; run_session_id: number | null }>;
   if (row.storage_version !== 1 || row.unusable !== 0 && row.unusable !== 1 || !Number.isSafeInteger(row.entry_count)
     || stored.length !== row.entry_count || header?.type !== 'session' || header.id !== (db.query('SELECT native_session_id FROM sessions WHERE id=?').get(sessionId) as { native_session_id: string } | null)?.native_session_id
     || header.version !== 3 || typeof header.timestamp !== 'string' || typeof header.cwd !== 'string') throw new Error('invalid_native_header');
@@ -1708,7 +1719,8 @@ function readNativeHistory(db: Database, sessionId: DbId): NativeSessionHistory 
     if (item.sequence !== index || !entry || typeof entry !== 'object' || entry.id !== item.entry_id
       || typeof entry.id !== 'string' || ids.has(entry.id) || typeof entry.type !== 'string'
       || typeof entry.timestamp !== 'string' || entry.parentId !== null && !ids.has(entry.parentId)
-      || JSON.stringify(entry).includes('"type":"image"')) throw new Error('invalid_native_entry');
+      || item.run_id !== null && (!Number.isSafeInteger(item.run_id) || item.run_id <= 0 || item.run_kind !== 'agent'
+        || item.run_session_id !== sessionId || entry.type !== 'message')) throw new Error('invalid_native_entry');
     ids.add(entry.id);
     return entry;
   });
@@ -1716,10 +1728,12 @@ function readNativeHistory(db: Database, sessionId: DbId): NativeSessionHistory 
   return { storageVersion: 1, header, entries, leafId: row.leaf_id, unusable: row.unusable === 1 };
 }
 
-function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessionHistory): void {
+function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessionHistory, context?: NativeHistoryAppendContext): void {
   const session = db.query('SELECT native_session_id FROM sessions WHERE id=?').get(sessionId) as { native_session_id: string } | null;
   if (!session || history.storageVersion !== 1 || history.header.type !== 'session'
     || history.header.version !== 3 || history.header.id !== session.native_session_id
+    || typeof history.header.timestamp !== 'string' || typeof history.header.cwd !== 'string' || typeof history.unusable !== 'boolean'
+    || history.leafId === null && history.entries.length > 0
     || history.leafId !== null && !history.entries.some((entry) => entry.id === history.leafId)) throw new Error('invalid_native_history');
   const previous = db.query('SELECT header_json,entry_count,unusable FROM session_native_history WHERE session_id=?')
     .get(sessionId) as { header_json: string; entry_count: number; unusable: number } | null;
@@ -1730,19 +1744,26 @@ function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessio
   } else if (previous.header_json !== headerJson || previous.entry_count > history.entries.length) {
     throw new Error('native_history_rewrite');
   }
-  const existing = db.query('SELECT sequence,entry_json FROM session_native_entries WHERE session_id=? ORDER BY sequence')
-    .all(sessionId) as Array<{ sequence: number; entry_json: string }>;
+  const existing = db.query('SELECT sequence,entry_id,entry_json,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence')
+    .all(sessionId) as Array<{ sequence: number; entry_id: string; entry_json: string; run_id: number | null }>;
   if (existing.length !== (previous?.entry_count ?? 0)
     || existing.some((row, index) => row.sequence !== index || row.entry_json !== JSON.stringify(history.entries[index]))) {
     throw new Error('native_history_diverged');
   }
+  if (context !== undefined) {
+    const binding = exactRecord(context, 'native_entry_run_binding', ['entryId', 'runId']);
+    const index = history.entries.findIndex((entry) => entry.id === binding.entryId);
+    const run = db.query('SELECT kind,session_id FROM runs WHERE id=?').get(context.runId) as { kind: string; session_id: number | null } | null;
+    if (typeof binding.entryId !== 'string' || !Number.isSafeInteger(binding.runId) || Number(binding.runId) <= 0
+      || index < 0 || history.entries[index]?.type !== 'message' || run?.kind !== 'agent' || run.session_id !== sessionId
+      || index < existing.length && existing[index]?.run_id !== binding.runId) throw new Error('invalid_native_entry_run_binding');
+  }
   for (let index = existing.length; index < history.entries.length; index += 1) {
     const entry = history.entries[index]!;
     if (!entry.id || typeof entry.id !== 'string' || typeof entry.timestamp !== 'string'
-      || typeof entry.type !== 'string' || entry.parentId !== null && !history.entries.slice(0, index).some((parent) => parent.id === entry.parentId)
-      || JSON.stringify(entry).includes('"type":"image"')) throw new Error('invalid_native_entry');
-    db.query('INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json) VALUES (?,?,?,?)')
-      .run(sessionId, index, entry.id, JSON.stringify(entry));
+      || typeof entry.type !== 'string' || entry.parentId !== null && !history.entries.slice(0, index).some((parent) => parent.id === entry.parentId)) throw new Error('invalid_native_entry');
+    db.query('INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json,run_id) VALUES (?,?,?,?,?)')
+      .run(sessionId, index, entry.id, JSON.stringify(entry), context?.entryId === entry.id ? context.runId : null);
   }
   db.query('UPDATE session_native_history SET leaf_id=?,entry_count=?,unusable=? WHERE session_id=?')
     .run(history.leafId, history.entries.length, previous?.unusable || history.unusable ? 1 : 0, sessionId);
@@ -1793,8 +1814,19 @@ export function createSessionRepository(db: Database): SessionRepository {
       catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
     },
 
-    saveHistory(sessionId, history) {
-      const saved = transaction(db, () => writeNativeHistory(db, sessionId, history));
+    readHistoryForDisplay(sessionId) {
+      try {
+        return ok(db.transaction((): NativeHistoryDisplayRecord => {
+          const history = readNativeHistory(db, sessionId);
+          const bindings = db.query('SELECT entry_id,run_id FROM session_native_entries WHERE session_id=? AND run_id IS NOT NULL ORDER BY sequence')
+            .all(sessionId) as Array<{ entry_id: string; run_id: number }>;
+          return { history, bindings: bindings.map((entry) => ({ entryId: entry.entry_id, runId: entry.run_id })) };
+        }).deferred());
+      } catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
+    },
+
+    saveHistory(sessionId, history, context) {
+      const saved = transaction(db, () => writeNativeHistory(db, sessionId, history, context));
       return saved.ok ? ok(undefined) : fail(appError('storage_write_failed', 'storage', 'Conversation history could not be saved.', true));
     },
 
@@ -2049,6 +2081,8 @@ export function createRunRepository(db: Database): RunRepository {
       const result = transaction(db, () => {
         const active = db.query("SELECT kind,session_id,job_id,config_json FROM runs WHERE id=? AND status IN ('created','running')")
           .get(runId) as { kind: 'provider' | 'agent'; session_id: number | null; job_id: number | null; config_json: string } | null;
+        if (terminal.nativeHistoryUnusable !== undefined && typeof terminal.nativeHistoryUnusable !== 'boolean'
+          || terminal.nativeHistoryUnusable === true && active?.kind === 'provider') throw new Error('invalid_native_history_terminal');
         const changed = db
           .query(
             `UPDATE runs SET
@@ -2075,6 +2109,7 @@ export function createRunRepository(db: Database): RunRepository {
             runId,
           ).changes;
         if (changed === 1 && active?.kind === 'agent' && active.session_id !== null) {
+          if (terminal.nativeHistoryUnusable === true) db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(active.session_id);
           db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(terminal.endedAt, active.session_id);
         }
         if (changed === 1 && active?.kind === 'agent' && active.job_id !== null) {
@@ -2165,6 +2200,8 @@ export function createRunRepository(db: Database): RunRepository {
         const recovered = transaction(db, () => {
           const activeRuns = db.query("SELECT id FROM runs WHERE status IN ('created','running')").all() as Array<{ id: number }>;
           if (activeRuns.length === 0) return 0;
+          if (hasTable(db, 'session_native_history')) db.query(`UPDATE session_native_history SET unusable=1
+            WHERE session_id IN (SELECT session_id FROM runs WHERE kind='agent' AND status IN ('created','running'))`).run();
           if (hasTable(db, 'tool_calls')) db.query(`UPDATE tool_calls SET status='failed',
               result_json=json_object('version',1,'status','failed',
                 'error',json_object('code','runtime_interrupted','category','runtime','message','The process exited during this tool call.','retryable',true),

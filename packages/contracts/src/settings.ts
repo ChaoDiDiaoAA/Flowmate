@@ -92,6 +92,7 @@ export type DesktopBridge = {
   listSessions(request?: import('./runtime.ts').ListSessionsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionPage>>;
   querySession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
   listSessionRuns(request: import('./runtime.ts').SessionRunsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionRunsPage>>;
+  listSessionMessages(request: import('./runtime.ts').SessionMessagesRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionMessagesPage>>;
   queryPromptTrace(runId: import('./runtime.ts').DbId, callSequence?: number): Promise<import('./runtime.ts').Result<import('./diagnostics.ts').PromptTraceResult>>;
   startRun(input: DesktopAgentRunRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunAccepted & { requestId: string }>>;
   cancelRun(runId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: import('./runtime.ts').DbId }>>;

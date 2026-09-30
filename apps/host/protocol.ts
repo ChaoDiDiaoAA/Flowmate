@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { AgentRunEvent, DesktopState, ModelAuthNotice, ModelAuthPrompt } from '@flowmate/contracts';
+import { SessionMessagesRequestSchema } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
 const modelId = z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/);
@@ -80,6 +81,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     }).strict(),
   }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session'), sessionId: dbId }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_session_messages'), input: SessionMessagesRequestSchema }).strict(),
   z.object({
     version: z.literal(1), requestId, type: z.literal('list_session_runs'),
     input: z.object({ sessionId: dbId, beforeRunId: dbId.optional(), limit: pageLimit.optional() }).strict(),

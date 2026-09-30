@@ -2,6 +2,14 @@ import { describe, expect, it } from 'bun:test';
 import { parseHostCommand } from '../../apps/host/protocol.ts';
 
 describe('versioned desktop Host protocol', () => {
+  it('accepts only bounded native message queries', () => {
+    const request = { version: 1, requestId: 'messages-1', type: 'list_session_messages', input: { sessionId: 4 } };
+    expect(parseHostCommand(request)).toMatchObject({ ...request, input: { sessionId: 4, limit: 50 } });
+    for (const input of [{ sessionId: 0 }, { sessionId: 4, limit: 101 }, { sessionId: 4, limit: null },
+      { sessionId: 4, beforeEntryId: 'x'.repeat(129) }, { sessionId: 4, beforeEntryId: null }, { sessionId: 4, role: 'assistant' }]) {
+      expect(parseHostCommand({ ...request, input })).toBeNull();
+    }
+  });
   it('accepts only typed commands and bounded identifiers', () => {
     expect(parseHostCommand({ version: 1, requestId: 'rpc-1', type: 'query_run', runId: 2 })).toEqual({
       version: 1, requestId: 'rpc-1', type: 'query_run', runId: 2,

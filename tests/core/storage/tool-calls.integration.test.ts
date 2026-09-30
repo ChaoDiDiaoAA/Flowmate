@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
 import { appError } from '@flowmate/contracts';
+import type { ToolCallDelivery } from '@flowmate/contracts';
 import { deferCleanup } from '../../support/resources.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 
@@ -44,6 +45,58 @@ function missingField() {
 }
 
 describe('ToolCall and business event storage', () => {
+  it.each(['message_observed', 'request_observed', 'failed', 'unknown'] as const)('does not write an equivalent repeated %s delivery observation', (state) => {
+    const store = makeStore();
+    const requested = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'delivery-idempotent',
+      toolName: 'list_invoice_pages', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp });
+    expect(requested.ok).toBe(true);
+    if (!requested.ok) return;
+    const toolCallId = requested.data.toolCallId;
+    expect(store.toolCalls.fixArguments({ toolCallId, finalArguments: {} }).ok).toBe(true);
+    expect(store.toolCalls.start({ toolCallId, startedAt: store.stamp }).ok).toBe(true);
+    expect(store.toolCalls.finish({ toolCallId, result: { version: 1, committedCandidateId: null, status: 'succeeded', data: { pages: [] } },
+      cleanup: { version: 1, stopReason: 'tool-completed', stopped: true, errors: [] }, endedAt: store.stamp, stoppedAt: store.stamp }).ok).toBe(true);
+    const message: ToolCallDelivery = { version: 1, state: 'message_observed', messageObservedAt: store.stamp,
+      includedInCallSequence: 2, requestDispatchedAt: null, error: null };
+    expect(store.toolCalls.recordDelivery({ toolCallId, delivery: message }).ok).toBe(true);
+    const delivery: ToolCallDelivery = { ...message, state, requestDispatchedAt: state === 'request_observed' ? store.stamp : null,
+      error: state === 'failed' || state === 'unknown' ? appError('tool_result_delivery_failed', 'runtime', 'Fixture delivery failed.', true) : null };
+    const observed = store.toolCalls.recordDelivery({ toolCallId, delivery });
+    expect(observed.ok).toBe(true);
+    const before = store.db.query('SELECT delivery_json,status,result_json FROM tool_calls WHERE id=?').get(toolCallId);
+    store.db.exec("CREATE TRIGGER reject_delivery_rewrite BEFORE UPDATE OF delivery_json ON tool_calls BEGIN SELECT RAISE(ABORT,'duplicate delivery write'); END;");
+    const equivalent = { error: delivery.error === null ? null : { retryable: delivery.error.retryable, message: delivery.error.message,
+      category: delivery.error.category, code: delivery.error.code }, requestDispatchedAt: delivery.requestDispatchedAt,
+      includedInCallSequence: delivery.includedInCallSequence, messageObservedAt: delivery.messageObservedAt, state, version: 1 as const };
+    expect(store.toolCalls.recordDelivery({ toolCallId, delivery: equivalent })).toEqual(observed);
+    expect(store.db.query('SELECT delivery_json,status,result_json FROM tool_calls WHERE id=?').get(toolCallId)).toEqual(before);
+  });
+
+  it.each(['messageObservedAt', 'includedInCallSequence', 'requestDispatchedAt', 'error'] as const)('rejects same-state delivery with conflicting %s and preserves its first fact', (field) => {
+    const store = makeStore();
+    const requested = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'delivery-conflict',
+      toolName: 'list_invoice_pages', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp });
+    expect(requested.ok).toBe(true);
+    if (!requested.ok) return;
+    const toolCallId = requested.data.toolCallId;
+    const message: ToolCallDelivery = { version: 1, state: 'message_observed', messageObservedAt: store.stamp,
+      includedInCallSequence: 2, requestDispatchedAt: null, error: null };
+    expect(store.toolCalls.recordDelivery({ toolCallId, delivery: message }).ok).toBe(true);
+    const observed: ToolCallDelivery = { ...message, state: 'failed', error: appError('tool_result_delivery_failed', 'runtime', 'First failure.', true) };
+    expect(store.toolCalls.recordDelivery({ toolCallId, delivery: observed }).ok).toBe(true);
+    const before = store.db.query('SELECT delivery_json FROM tool_calls WHERE id=?').get(toolCallId);
+    const values = { messageObservedAt: '2026-09-28T00:00:01.000Z', includedInCallSequence: 3,
+      requestDispatchedAt: '2026-09-28T00:00:01.000Z', error: { ...observed.error!, message: 'Different failure.' } };
+    expect(store.toolCalls.recordDelivery({ toolCallId, delivery: { ...observed, [field]: values[field] } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(store.db.query('SELECT delivery_json FROM tool_calls WHERE id=?').get(toolCallId)).toEqual(before);
+    for (const state of ['request_observed', 'unknown'] as const) expect(store.toolCalls.recordDelivery({ toolCallId, delivery: { ...observed, state } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(store.toolCalls.recordDelivery({ toolCallId, delivery: { ...observed, version: 2 as unknown as 1 } }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(store.db.query('SELECT delivery_json FROM tool_calls WHERE id=?').get(toolCallId)).toEqual(before);
+  });
+
   it('deduplicates only the same native request and preserves fixed arguments and terminal facts', () => {
     const store = makeStore();
     const request = { runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'native-call-1',

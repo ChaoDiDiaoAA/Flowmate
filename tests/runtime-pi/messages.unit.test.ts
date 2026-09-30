@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'bun:test';
-import { SessionManager } from '@earendil-works/pi-coding-agent';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import { SessionManager, type AgentSession } from '@earendil-works/pi-coding-agent';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { NativeSessionHistory } from '@flowmate/contracts';
+
+type AgentMessage = AgentSession['messages'][number];
 
 const module = await import('../../packages/runtime-pi/src/messages.ts').catch(() => null);
 function api() { expect(module).not.toBeNull(); return module!; }
@@ -20,13 +21,52 @@ const result = { role: 'toolResult' as const, toolCallId: 'c1', toolName: 'norma
 function history(messages: readonly AgentMessage[]): NativeSessionHistory {
   const manager = SessionManager.inMemory('D:/fixture');
   for (const message of messages) manager.appendMessage(message as Parameters<typeof manager.appendMessage>[0]);
-  return { storageVersion: 1, header: manager.getHeader()!, entries: manager.getEntries(), leafId: manager.getLeafId(), unusable: false };
+  return { storageVersion: 1, header: manager.getHeader()!, entries: manager.getEntries().map(entry => ({ ...entry })), leafId: manager.getLeafId(), unusable: false };
 }
 function project(value: NativeSessionHistory, options: Record<string, unknown> = {}) {
   return api().projectSessionMessages({ history: value, bindings: [], runInputs: [], limit: 50, ...options });
 }
 
 describe('P4 native messages and projection', () => {
+  it('projects SDK streaming partial calls only once their real identity is formed', () => {
+    const partial = assistant([{ type: 'toolCall', id: '', name: '', arguments: {} }], 'pending');
+    const context = { entryId: null, runId: 7, liveOrdinal: 1, persistence: 'pending' as const, phase: 'streaming' as const };
+    expect(api().projectMessageView(partial, context)).toMatchObject({ ok: true, data: { role: 'assistant', blocks: [], textOrigin: null } });
+    expect(api().projectMessageView(call, context)).toMatchObject({ ok: true, data: {
+      blocks: [{ type: 'toolCall', id: 'c1', name: 'normalize_invoice_values' }] } });
+    expect(api().projectMessageView(partial, { ...context, phase: 'ended' })).toMatchObject({ ok: false });
+  });
+
+  it('creates a schema-checked saved read summary rather than exposing its raw output', () => {
+    const data = { documentRef: { id: 2, version: 'v1' }, parsedArtifactId: 1, page: 1, pageCount: 1,
+      blocks: [], nextAfterBlockId: null, completePage: true };
+    const readCall = assistant([{ type: 'toolCall', id: 'read1', name: 'read_invoice_document', arguments: { documentId: 2 } }], 'toolUse');
+    const readResult = { ...result, toolCallId: 'read1', toolName: 'read_invoice_document', content: [{ type: 'text' as const, text: JSON.stringify(data) }] };
+    expect(project(history([user, readCall, readResult]))).toMatchObject({ ok: true, data: { items: [
+      { role: 'user' }, { role: 'assistant' }, { role: 'toolResult', blocks: [{ type: 'text', text: '读取第 1 页，返回 0 个材料块' }] },
+    ] } });
+    expect(project(history([user, readCall, { ...readResult, content: [{ type: 'text' as const, text: '{"page":"forged"}' }] }])))
+      .toMatchObject({ ok: true, data: { items: [{ role: 'user' }, { role: 'assistant' }, {
+        role: 'toolResult', toolCallId: 'read1', blocks: [{ type: 'text', text: '结果摘要不可用，请查询工具事实' }],
+      }] } });
+    expect(project(history([user, readCall, { ...readResult, isError: true }]))).toMatchObject({ ok: true, data: { items: [
+      { role: 'user' }, { role: 'assistant' }, { blocks: [{ type: 'text', text: '工具返回错误，请查看本 Run 的受控错误反馈' }] },
+    ] } });
+  });
+
+  it('retains a legal SDK tool result with fixed text without opening a product tool or exposing output', () => {
+    const context = { entryId: null, runId: 7, liveOrdinal: 3, persistence: 'pending' as const, phase: 'ended' as const };
+    expect(api().projectMessageView({ ...result, toolName: 'probe_read' }, context)).toMatchObject({ ok: true, data: {
+      toolName: 'probe_read', toolCallId: 'c1', blocks: [{ type: 'text', text: '工具已返回结果，请查询工具事实' }],
+    } });
+    expect(api().projectMessageView({ ...result, toolName: 'save_invoice_candidate' }, context)).toMatchObject({ ok: true, data: {
+      blocks: [{ type: 'text', text: '结果摘要不可用，请查询工具事实' }],
+    } });
+    const output = { items: [{ index: 0, kind: 'decimal', raw: 'private value', status: 'normalized', value: '10', alternatives: [], reason: null }] };
+    expect(api().projectMessageView({ ...result, content: [{ type: 'text', text: JSON.stringify(output) }] }, context))
+      .toMatchObject({ ok: true, data: { blocks: [{ type: 'text', text: 'normalize_invoice_values：已返回结果' }] } });
+  });
+
   it('formats the existing business prefix exactly and leaves chat text untouched', () => {
     expect(api().formatExecutionPrompt({ text: '  Tax?  ', business: false })).toBe('  Tax?  ');
     expect(api().formatExecutionPrompt({ text: 'Tax?', business: true })).toBe(
@@ -76,11 +116,18 @@ describe('P4 native messages and projection', () => {
     }
   });
 
+  it('allows omitted SDK object fields but rejects array holes, undefined array elements and accessor data', () => {
+    expect(api().validateModelMessages([user, call, { ...result, details: { optional: undefined } }]).ok).toBe(true);
+    for (const details of [[undefined], new Array(1), { get secret() { return 'hidden'; } }, { [Symbol('secret')]: 'hidden' }]) {
+      expect(api().validateModelMessages([user, call, { ...result, details }]).ok).toBe(false);
+    }
+  });
+
   it('keeps SDK metadata distinct from closed custom, bash and summary context messages', () => {
     const metadata = history([user]);
     const manager = SessionManager.inMemory(metadata.header.cwd, undefined, [metadata.header, ...metadata.entries] as Parameters<typeof SessionManager.inMemory>[2]);
     manager.appendCustomEntry('fixture.metadata', { visible: false });
-    const withMetadata = { ...metadata, entries: manager.getEntries(), leafId: manager.getLeafId() };
+    const withMetadata = { ...metadata, entries: manager.getEntries().map(entry => ({ ...entry })), leafId: manager.getLeafId() };
     expect(api().validateNativeHistory(withMetadata).ok).toBe(true);
     expect(project(withMetadata)).toMatchObject({ ok: true, data: { items: [{ role: 'user' }] } });
     const closed = [
@@ -105,7 +152,7 @@ describe('P4 native messages and projection', () => {
       expect(page.data.items[1]!.blocks).toEqual([{ type: 'text', text: 'Reading' },
         { type: 'toolCall', id: 'c1', name: 'normalize_invoice_values' }]);
       expect(page.data.items[2]).toMatchObject({ toolCallId: 'c1', toolName: 'normalize_invoice_values', isError: false,
-        textOrigin: null, blocks: [{ type: 'text', text: 'normalize_invoice_values：已返回结果' }] });
+        textOrigin: null, blocks: [{ type: 'text', text: '结果摘要不可用，请查询工具事实' }] });
       expect(JSON.stringify(page.data)).not.toMatch(/signature|not-ui|response-secret|hidden/);
       expect(page.data.items.every(item => item.persistence === 'saved' && item.phase === 'ended')).toBe(true);
     }
@@ -126,6 +173,9 @@ describe('P4 native messages and projection', () => {
     }
     const duplicate = history([user, { ...user, timestamp: 2 }]);
     expect(project(duplicate, { ...options, bindings: duplicate.entries.map(entry => ({ entryId: entry.id, runId: 7 })), liveBindings: [] }).ok).toBe(false);
+    const after = history([user, assistant([{ type: 'text', text: 'Later' }])]);
+    expect(project(after, { limit: 1, bindings: [{ entryId: after.entries[0]!.id, runId: 7 }],
+      runInputs: [{ runId: 7, input: { ...input, text: 'forged' }, goalMode: null }] }).ok).toBe(false);
   });
 
   it('verifies the business prompt wrapper before showing the original user text', () => {
@@ -144,7 +194,7 @@ describe('P4 native messages and projection', () => {
     manager.branch(first);
     const leaf = manager.appendMessage(assistant([{ type: 'text', text: 'Current branch' }]));
     const meta = manager.appendModelChange('fixture', 'model');
-    const value = { storageVersion: 1 as const, header: manager.getHeader()!, entries: manager.getEntries(), leafId: meta, unusable: false };
+    const value = { storageVersion: 1 as const, header: manager.getHeader()!, entries: manager.getEntries().map(entry => ({ ...entry })), leafId: meta, unusable: false };
     const latest = project(value, { limit: 1 });
     expect(latest).toMatchObject({ ok: true, data: { items: [{ entryId: leaf }], nextBeforeEntryId: leaf } });
     expect(project(value, { beforeEntryId: leaf, limit: 1 })).toMatchObject({ ok: true, data: { items: [{ entryId: first }], nextBeforeEntryId: null } });

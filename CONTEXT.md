@@ -2,6 +2,8 @@
 
 当前设计以 [产品主方案](docs/spec/00_Flowmate完整方案_v1.md)、[评测主方案](docs/eval/01_Flowmate_Agent评测总方案_v1.md)和[数据制作方案](docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)为准。路线是 Agent Engineering + Invoice Product + Agent Evaluation；核心为 Agent Harness / Runtime，不以完整企业后台为目标。当前工作区已实现 P3 工程能力；P3 唯一正式发票输入目录为 `data/invoices/agent-input/`，Agent 只读取既有解析，原图仅供 UI 查看。旧连接的真实模型 A20 行为证据已记录；新模型配置和正式业务 Benchmark 尚需单独核验，详见 P3 实施计划。
 
+2026-09-30 P4 实施状态：当前工作区已接入三具名消息视图及严格 schema、原生历史公共查询、008 原生条目 run_id 归属、逐消息完整快照归并与成功保存身份桥；`runtime-pi/messages.ts` 统一原生校验、prompt 格式化和 `projectMessageView` 白名单投影。必要历史失败保留最后已提交前缀并阻断续用。本次 Unit、Integration、标准 Electron E2E、typecheck 及桌面构建工程门禁通过，命令、数量与限制见 [P4 实施计划 §4.3](docs/plans/P4_实施计划_v1.md)；P3 历史数字、真实模型证据和 Benchmark readiness 不由此更新。
+
 | 词汇 | 定义与边界 |
 |---|---|
 | Application Core | 薄产品入口与协调，连接 Runtime、Session、存储与发票服务；不重写 Pi Loop |
@@ -14,7 +16,7 @@
 | SDK Message | Pi 0.85.1 pi-ai 的 user/assistant/toolResult 三角色联合类型；systemPrompt、tools 和模型参数独立装配，没有 SystemMessage 角色 |
 | SDK CustomMessage / 摘要 | pi-coding-agent 提供的消息扩展；容器、摘要或角色类型存在不表示产品入口已启用，custom.display 不等于上下文排除或资料授权 |
 | Flowmate 自定义原生消息 | 当前代码没有产品专属原生角色/业务 customType/载荷；P4 取舍后不新增，沿标准 user 与真实 toolResult 路径；未来确有独立业务语义时随所属阶段评估 |
-| UI Message Projection | P4 待实施的 MessageDisplayBlock、SessionMessageView、SessionMessagesPage；白名单查询/IPC 投影，不进入模型；生成 phase 与保存 persistence 分开 |
+| UI Message Projection | P4 已接入 MessageDisplayBlock、三具名 SessionMessageView 分支和 SessionMessagesPage；共享 projectMessageView 生成白名单查询/IPC 投影，不进入模型；生成 phase 与保存 persistence 分开 |
 | Live Message Identity | P4 的 Run 内 liveOrdinal 与真实 entryId 归并；Host 已加载 native Session 在成功保存后保留 entry→Run/ordinal，Run 终态不清、release/重启清；查询仍核验 SQLite 正文/关联，不按内容或时间猜身份 |
 | Temporary Sequence / Durable Cursor | P4 事件 sequence 仅当前进程临时顺序，按每消息比较；P6 持久事件 sequence/cursor 才用于补读。liveOrdinal/临时序号不作恢复来源或平台稳定 ID |
 | ContextSnapshot | 某次请求使用的任务事实与来源快照；后续新快照不能改写历史依据 |

@@ -7,6 +7,7 @@ import {
   normalizeSessionId,
   normalizeListSessionsRequest,
   normalizeSessionRunsRequest,
+  normalizeSessionMessagesRequest,
   invoiceToolSchemas,
   ok,
 } from '@flowmate/contracts';
@@ -114,6 +115,10 @@ export function makeApplication(
       if (!normalized.ok) return normalized;
       if (!runs.listBySession) return fail(appError('session_runs_unavailable', 'storage', 'Session Run 仓储尚未组装。'));
       return runs.listBySession(normalized.data);
+    },
+    listSessionMessages: async (raw) => {
+      const normalized = normalizeSessionMessagesRequest(raw);
+      return normalized.ok ? sessions?.listMessages(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
     },
     queryPromptTrace: async (runId, callSequence) => {
       if (!isDbId(runId) || (callSequence !== undefined && !isDbId(callSequence))) {

@@ -3,6 +3,9 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { Database } from 'bun:sqlite';
+import { SessionMessageViewSchema } from '@flowmate/contracts';
+import type { SessionMessagesPage, SessionMessageView, Result } from '@flowmate/contracts';
 import { mkdtemp } from '../support/resources.ts';
 import { HostClient, safeChildEnvironment } from '../../apps/desktop/main/host-client.ts';
 
@@ -299,6 +302,203 @@ it('wires the real Host Agent path, rejects stale model state after credential l
       child.kill();
       await Promise.race([once(child, 'exit'), new Promise((resolveExit) => setTimeout(resolveExit, 1_000))]);
     }
+    server.stop(true);
+  }
+}, 30_000);
+
+it('queries real Pi messages through Host across tool delivery, model changes, Session isolation and restart', async () => {
+  const repoRoot = resolve(import.meta.dir, '../..');
+  const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-p4-messages-'));
+  type WireMessage = { role: string; content?: unknown; tool_call_id?: string };
+  const requests: Array<{ model: string; messages: WireMessage[] }> = [];
+  const callId = 'call-p4-host-1';
+  const args = { operation: 'tax', netAmount: '100', taxRate: '13', scale: 2 };
+  const reply = '精确税额是 13.00 元。';
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    const body = await request.json() as typeof requests[number];
+    requests.push(body);
+    const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
+      `data: ${JSON.stringify({ id: `p4-host-${requests.length}`, object: 'chat.completion.chunk', created: 1,
+        model: body.model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+    const stream = requests.length === 1
+      ? `${chunk({ role: 'assistant', tool_calls: [{ index: 0, id: callId, type: 'function',
+        function: { name: 'calculate_invoice_amounts', arguments: JSON.stringify(args) } }] })}${chunk({}, 'tool_calls')}`
+      : `${chunk({ role: 'assistant', content: reply })}${chunk({}, 'stop')}`;
+    return new Response(`${stream}data: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const clients: HostClient[] = [];
+  const finished: Array<{ runId: number; result: unknown }> = [];
+  const upserts: Array<{ runId: number; sessionId: number; message: SessionMessageView }> = [];
+  const credentials: string[] = [];
+  const newClient = () => {
+    const client = new HostClient();
+    clients.push(client);
+    client.setCredentialHandler(async (request) => {
+      credentials.push(request.operation);
+      return request.operation === 'read' ? { ok: true, credential: { type: 'api_key', key: 'synthetic-p4-host-key' } } : { ok: false };
+    });
+    client.subscribe((event) => {
+      if (event.type !== 'agent_run_event') return;
+      if (event.value.type === 'run_finished') finished.push({ runId: event.value.runId, result: event.value.result });
+      if (event.value.type === 'message_upsert') upserts.push({ runId: event.value.runId, sessionId: event.value.sessionId, message: event.value.message });
+    });
+    return client;
+  };
+  const client = newClient();
+  try {
+    expect((await client.start(userDataRoot, '0.1.0', repoRoot)).ok).toBe(true);
+    const created = await client.request({ type: 'create_session', requestId: 'p4-primary', input: { title: 'Tax discussion' } }) as Result<{ sessionId: number }>;
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const sessionId = created.data.sessionId;
+    expect(await client.request({ type: 'list_session_messages', input: { sessionId, limit: 20 } }))
+      .toMatchObject({ ok: true, data: { items: [], leafId: null, entryCount: 0 } });
+    const profile = { id: 'p4-model-a', credentialRef: 'p4_host_credential_ref_a', name: 'P4 A', kind: 'custom' as const,
+      providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'host-p4-model-a', api: 'openai-completions',
+      contextWindow: 64_000, maxTokens: 16_384, reasoning: false };
+    const alternate = { ...profile, id: 'p4-model-b', credentialRef: 'p4_host_credential_ref_b', name: 'P4 B', model: 'host-p4-model-b' };
+    expect(await client.request({ type: 'save_settings', settings: { version: 2, revision: 0,
+      profile: { displayName: 'P4 messages', theme: 'system' }, models: [profile, alternate], defaultModelId: profile.id,
+      updatedAt: '2026-09-30T00:00:00.000Z' } })).toMatchObject({ ok: true, data: { revision: 1 } });
+    expect(await client.request({ type: 'update_workspace', requestId: 'p4-bind-primary',
+      input: { expectedRevision: 0, change: { kind: 'session', sessionId } } })).toMatchObject({ ok: true, data: { revision: 1 } });
+    const workspace = { revision: 1, documentRef: null, jobId: null, candidateRef: null, sessionId };
+    const firstText = '请计算 100 元按 13% 税率的税额，记住这是 P4_PRIMARY_ONLY。';
+    const first = await client.request({ type: 'start_run', requestId: 'p4-run-first',
+      input: { sessionId, text: firstText, modelId: profile.id, workspace, goalMode: 'answer' },
+      expectedSettingsRevision: 1, expectedCredentialRef: profile.credentialRef }) as Result<{ runId: number }>;
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    await waitFor(() => finished.some((event) => event.runId === first.data.runId));
+    expect(finished.find((event) => event.runId === first.data.runId)?.result).toMatchObject({ ok: true, data: { status: 'completed', text: reply } });
+    expect(requests).toHaveLength(2);
+    const toolWire = requests[1]!.messages.find((message) => message.role === 'tool');
+    expect(toolWire?.tool_call_id).toBe(callId);
+    expect(JSON.parse(String(toolWire?.content))).toMatchObject({ operation: 'tax', exact: '13', rounded: '13.00', scale: 2 });
+    const firstPage = await client.request({ type: 'list_session_messages', input: { sessionId, limit: 100 } }) as Result<SessionMessagesPage>;
+    expect(firstPage.ok).toBe(true);
+    if (!firstPage.ok) return;
+    expect(firstPage.data.items.map((message) => message.role)).toEqual(['user', 'assistant', 'toolResult', 'assistant']);
+    expect(firstPage.data.items.every((message) => message.runId === first.data.runId && message.entryId !== null && message.liveOrdinal !== null
+      && message.phase === 'ended' && message.persistence === 'saved' && SessionMessageViewSchema.safeParse(message).success)).toBe(true);
+    expect(firstPage.data.items[0]).toMatchObject({ textOrigin: 'product-input', blocks: [{ type: 'text', text: firstText }] });
+    expect(firstPage.data.items[1]).toMatchObject({ blocks: [{ type: 'toolCall', id: callId, name: 'calculate_invoice_amounts' }] });
+    expect(firstPage.data.items[2]).toMatchObject({ toolCallId: callId, toolName: 'calculate_invoice_amounts', isError: false });
+    const firstSaved = upserts.filter((event) => event.runId === first.data.runId && event.message.persistence === 'saved');
+    expect(new Set(firstSaved.map((event) => event.message.entryId)).size).toBe(4);
+    for (const message of firstPage.data.items) expect(firstSaved).toContainEqual({ runId: first.data.runId, sessionId, message });
+    const noQueryRequests = requests.length;
+    const noQueryCredentials = credentials.length;
+    expect(await client.request({ type: 'list_session_messages', input: { sessionId, limit: 100 } })).toEqual(firstPage);
+    expect(requests).toHaveLength(noQueryRequests);
+    expect(credentials).toHaveLength(noQueryCredentials);
+
+    const secondText = '为什么这个税额是 13 元？沿用上一轮记忆回答。';
+    const second = await client.request({ type: 'start_run', requestId: 'p4-run-switch-model',
+      input: { sessionId, text: secondText, modelId: alternate.id, workspace, goalMode: 'answer' },
+      expectedSettingsRevision: 1, expectedCredentialRef: alternate.credentialRef }) as Result<{ runId: number }>;
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    await waitFor(() => finished.some((event) => event.runId === second.data.runId));
+    expect(requests).toHaveLength(3);
+    expect(requests[2]!.model).toBe(alternate.model);
+    expect(JSON.stringify(requests[2]!.messages)).toContain('P4_PRIMARY_ONLY');
+    expect(JSON.stringify(requests[2]!.messages)).toContain(reply);
+    expect(requests[2]!.messages.filter((message) => message.role === 'user')).toHaveLength(2);
+    expect(requests[2]!.messages.filter((message) => message.role === 'tool')).toHaveLength(1);
+    expect(await client.request({ type: 'query_run', runId: second.data.runId })).toMatchObject({ ok: true,
+      data: { config: { requestedModel: { model: alternate.model }, resolvedModel: { model: alternate.model } } } });
+    const all = await client.request({ type: 'list_session_messages', input: { sessionId, limit: 100 } }) as Result<SessionMessagesPage>;
+    expect(all.ok).toBe(true);
+    if (!all.ok) return;
+    expect(all.data.items).toHaveLength(6);
+    expect(all.data.items.slice(0, 4)).toEqual(firstPage.data.items);
+    expect(all.data.items.slice(4).map((message) => message.runId)).toEqual([second.data.runId, second.data.runId]);
+    const recent = await client.request({ type: 'list_session_messages', input: { sessionId, limit: 2 } }) as Result<SessionMessagesPage>;
+    expect(recent.ok).toBe(true);
+    if (!recent.ok) return;
+    expect(recent.data.items).toEqual(all.data.items.slice(4));
+    expect(recent.data.nextBeforeEntryId).toBe(recent.data.items[0]!.entryId);
+    const older = await client.request({ type: 'list_session_messages', input: { sessionId,
+      beforeEntryId: recent.data.nextBeforeEntryId!, limit: 100 } }) as Result<SessionMessagesPage>;
+    expect(older).toMatchObject({ ok: true, data: { items: firstPage.data.items, nextBeforeEntryId: null } });
+
+    const other = await client.request({ type: 'create_session', requestId: 'p4-other', input: { title: 'Other tax discussion' } }) as Result<{ sessionId: number }>;
+    expect(other.ok).toBe(true);
+    if (!other.ok) return;
+    expect(await client.request({ type: 'update_workspace', requestId: 'p4-bind-other',
+      input: { expectedRevision: 1, change: { kind: 'session', sessionId: other.data.sessionId } } })).toMatchObject({ ok: true, data: { revision: 2 } });
+    const isolated = await client.request({ type: 'start_run', requestId: 'p4-run-other', input: { sessionId: other.data.sessionId,
+      text: 'P4_OTHER_ONLY 独立对话', modelId: alternate.id, workspace: { ...workspace, revision: 2, sessionId: other.data.sessionId }, goalMode: 'answer' },
+      expectedSettingsRevision: 1, expectedCredentialRef: alternate.credentialRef }) as Result<{ runId: number }>;
+    expect(isolated.ok).toBe(true);
+    if (!isolated.ok) return;
+    await waitFor(() => finished.some((event) => event.runId === isolated.data.runId));
+    expect(requests).toHaveLength(4);
+    expect(JSON.stringify(requests[3]!.messages)).not.toContain('P4_PRIMARY_ONLY');
+    expect(requests[3]!.messages.filter((message) => message.role === 'user')).toHaveLength(1);
+    const otherPage = await client.request({ type: 'list_session_messages', input: { sessionId: other.data.sessionId, limit: 100 } }) as Result<SessionMessagesPage>;
+    expect(otherPage).toMatchObject({ ok: true, data: { items: [{ role: 'user', runId: isolated.data.runId }, { role: 'assistant', runId: isolated.data.runId }] } });
+    expect(await client.request({ type: 'list_session_messages', input: { sessionId, limit: 100 } })).toEqual(all);
+
+    expect(await client.close()).toMatchObject({ ok: true, data: { closed: true } });
+    const databaseFile = join(userDataRoot, 'data', 'app.sqlite');
+    const savedDb = new Database(databaseFile, { readonly: true });
+    const savedRows = savedDb.query('SELECT session_id,sequence,entry_id,entry_json,run_id FROM session_native_entries ORDER BY session_id,sequence').all();
+    const savedHeads = savedDb.query('SELECT * FROM session_native_history ORDER BY session_id').all();
+    expect(savedDb.query('SELECT native_tool_call_id,status,delivery_json FROM tool_calls').all()).toEqual([{ native_tool_call_id: callId, status: 'succeeded',
+      delivery_json: expect.stringContaining('"state":"request_observed"') }]);
+    expect(savedDb.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
+    expect(savedDb.query('SELECT entry_id FROM session_native_entries WHERE run_id=? AND json_extract(entry_json,\'$.type\')=\'message\' ORDER BY sequence')
+      .all(first.data.runId)).toEqual(firstPage.data.items.map((message) => ({ entry_id: message.entryId })));
+    expect(savedDb.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    savedDb.close();
+    const restarted = newClient();
+    expect((await restarted.start(userDataRoot, '0.1.0', repoRoot)).ok).toBe(true);
+    const beforeRead = { requests: requests.length, credentials: credentials.length, events: upserts.length };
+    const recovered = await restarted.request({ type: 'list_session_messages', input: { sessionId, limit: 100 } }) as Result<SessionMessagesPage>;
+    expect(recovered.ok).toBe(true);
+    if (!recovered.ok) return;
+    expect(recovered.data.items).toEqual(all.data.items.map((message) => ({ ...message, liveOrdinal: null })));
+    expect(recovered.data.leafId).toBe(all.data.leafId);
+    expect(recovered.data.session).toMatchObject({ availability: 'ready', historyState: 'recoverable' });
+    expect(await restarted.request({ type: 'list_session_messages', input: { sessionId: other.data.sessionId, limit: 100 } }))
+      .toMatchObject({ ok: true, data: { items: [{ runId: isolated.data.runId, liveOrdinal: null }, { runId: isolated.data.runId, liveOrdinal: null }] } });
+    expect({ requests: requests.length, credentials: credentials.length, events: upserts.length }).toEqual(beforeRead);
+    expect(await restarted.close()).toMatchObject({ ok: true, data: { closed: true } });
+    const unchanged = new Database(databaseFile, { readonly: true });
+    try {
+      expect(unchanged.query('SELECT session_id,sequence,entry_id,entry_json,run_id FROM session_native_entries ORDER BY session_id,sequence').all()).toEqual(savedRows);
+      expect(unchanged.query('SELECT * FROM session_native_history ORDER BY session_id').all()).toEqual(savedHeads);
+      expect(unchanged.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
+    } finally { unchanged.close(); }
+    const resumed = newClient();
+    expect((await resumed.start(userDataRoot, '0.1.0', repoRoot)).ok).toBe(true);
+    expect(await resumed.request({ type: 'update_workspace', requestId: 'p4-restore-workspace',
+      input: { expectedRevision: 2, change: { kind: 'session', sessionId } } })).toMatchObject({ ok: true, data: { revision: 3 } });
+    const resumedRun = await resumed.request({ type: 'start_run', requestId: 'p4-resumed-run', input: { sessionId,
+      text: '恢复后再解释 P4_RESUME_ONLY。', modelId: alternate.id, workspace: { ...workspace, revision: 3 }, goalMode: 'answer' },
+      expectedSettingsRevision: 1, expectedCredentialRef: alternate.credentialRef }) as Result<{ runId: number }>;
+    expect(resumedRun.ok).toBe(true);
+    if (!resumedRun.ok) return;
+    await waitFor(() => finished.some((event) => event.runId === resumedRun.data.runId));
+    expect(finished.find((event) => event.runId === resumedRun.data.runId)?.result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(requests).toHaveLength(5);
+    expect(JSON.stringify(requests[4]!.messages)).toContain('P4_PRIMARY_ONLY');
+    expect(JSON.stringify(requests[4]!.messages)).not.toContain('P4_OTHER_ONLY');
+    expect(JSON.stringify(requests[4]!.messages)).toContain('P4_RESUME_ONLY');
+    expect(requests[4]!.messages.filter((message) => message.role === 'tool')).toHaveLength(1);
+    expect(requests[4]!.messages.filter((message) => message.role === 'user')).toHaveLength(3);
+    const resumedPage = await resumed.request({ type: 'list_session_messages', input: { sessionId, limit: 100 } }) as Result<SessionMessagesPage>;
+    expect(resumedPage.ok).toBe(true);
+    if (!resumedPage.ok) return;
+    expect(resumedPage.data.items.slice(0, 6)).toEqual(all.data.items.map((message) => ({ ...message, liveOrdinal: null })));
+    expect(resumedPage.data.items.slice(6).map((message) => [message.runId, message.liveOrdinal])).toEqual([
+      [resumedRun.data.runId, 1], [resumedRun.data.runId, 2],
+    ]);
+    expect(await resumed.close()).toMatchObject({ ok: true, data: { closed: true } });
+  } finally {
+    for (const active of clients) await active.close();
     server.stop(true);
   }
 }, 30_000);

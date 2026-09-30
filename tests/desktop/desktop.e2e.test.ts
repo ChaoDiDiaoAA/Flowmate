@@ -278,6 +278,11 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await page.locator('[data-testid="chat-turn"]').filter({ hasText: 'Desktop connection verified.' })
       .waitFor({ state: 'visible', timeout: 20_000 });
+    await page.locator('[data-message-role="assistant"][data-persistence="saved"]')
+      .waitFor({ state: 'visible', timeout: 10_000 });
+    expect(await page.locator('[data-message-role="user"]').count()).toBe(1);
+    expect(await page.locator('[data-message-role="assistant"]').count()).toBe(1);
+    expect(await page.locator('[data-message-role="assistant"]').getByText('Saved', { exact: true }).count()).toBe(1);
     expect(requestBodies).toHaveLength(1);
     expect((requestBodies[0] as { tools?: unknown[] }).tools ?? []).toHaveLength(0);
     const firstSessionId = Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'));
@@ -441,6 +446,8 @@ it('keeps an ambient-only Pi provider visible but unavailable without API-key su
         code: 'provider_catalog_unavailable', category: 'provider', message: 'Pi model catalog is unavailable.', retryable: true,
       } }));
     });
+
+
     await page.reload();
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
     expect(await page.getByRole('alert').filter({ hasText: 'Pi model catalog is unavailable.' }).isVisible()).toBe(true);
@@ -467,6 +474,179 @@ it('keeps an ambient-only Pi provider visible but unavailable without API-key su
     expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
   } finally { await app.close(); }
 }, 60_000);
+it('reconciles Renderer messages from the public history IPC without replaying an input', async () => {
+  if (process.platform !== 'win32') throw new Error('desktop E2E requires Windows');
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-message-receipt-e2e-'));
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP',
+    'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'BUN_INSTALL']) {
+    if (process.env[name]) env[name] = process.env[name]!;
+  }
+  env.FLOWMATE_TEST_MODE = '1';
+  env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  const app = await electron.launch({ executablePath: electronPath,
+    args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+  try {
+    const page = await app.firstWindow();
+    const desktop = await page.evaluate(() => window.flowmate.getState());
+    if (!desktop.ok) throw new Error('desktop_state_missing');
+    await app.evaluate(({ ipcMain }, data) => {
+      const replace = (channel: string, value: unknown) => {
+        ipcMain.removeHandler(channel);
+        ipcMain.handle(channel, async () => ({ ok: true, data: value }));
+      };
+      const session = { sessionId: 12, nativeSessionId: 'renderer-native-s', title: 'Controlled receipt', status: 'active',
+        createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:00.000Z', availability: 'ready',
+        historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: false };
+      const otherSession = { ...session, sessionId: 13, nativeSessionId: 'renderer-native-t', title: 'Other receipt' };
+      const user = { entryId: 'renderer-e1', runId: 101, liveOrdinal: 1, timestamp: 1790726400000,
+        persistence: 'saved', truncated: false, role: 'user', blocks: [{ type: 'text', text: 'Controlled question' }],
+        phase: 'ended', stopReason: null, toolCallId: null, toolName: null, isError: null, textOrigin: 'product-input' };
+      replace('flowmate:get-state', { ...data, ready: true, host: 'ready' });
+      replace('flowmate:list-model-catalog', []);
+      replace('flowmate:read-workspace', { revision: 0, documentRef: null, jobId: null, candidateRef: null,
+        sessionId: 12, activeView: 'original' });
+      replace('flowmate:list-sessions', { items: [session, otherSession], next: null });
+      ipcMain.removeHandler('flowmate:query-session');
+      ipcMain.handle('flowmate:query-session', async (_event, id) => ({ ok: true, data: id === 13 ? otherSession : session }));
+      const runPage = { items: [{ kind: 'agent', runId: 101, sessionId: 12, jobId: null,
+        status: 'completed', input: { version: 1, goal: 'Chat', text: 'Controlled question', messageTimestamp: 1790726400000 },
+        config: {}, output: { text: 'Run summary is separate' }, usage: { version: 1, source: 'unknown', reason: null,
+          sdkValues: null, attempts: null, attemptsComplete: false, costSource: null, updatedAt: '2026-09-30T00:00:00.000Z' },
+        tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+        durationMs: 1, toolCallCount: 0, error: null, cleanup: {}, createdAt: '2026-09-30T00:00:00.000Z',
+        startedAt: '2026-09-30T00:00:00.000Z', endedAt: '2026-09-30T00:00:00.000Z', cancelRequestedAt: null, stoppedAt: null,
+        scope: { version: 1, mode: 'chat-text', toolNames: [], resourcePaths: [] } }], nextBeforeRunId: null };
+      ipcMain.removeHandler('flowmate:list-session-runs');
+      ipcMain.handle('flowmate:list-session-runs', async (_event, input) => ({ ok: true,
+        data: input.sessionId === 13 ? { items: [], nextBeforeRunId: null } : runPage }));
+      const receipt = { session, items: [user] as unknown[], historyCalls: 0, activeQueries: 0, maxQueries: 0,
+        startCalls: 0, hold: false, failNext: false, release: null as (() => void) | null };
+      (globalThis as unknown as { rendererReceipt: typeof receipt }).rendererReceipt = receipt;
+      ipcMain.removeHandler('flowmate:list-session-messages');
+      ipcMain.handle('flowmate:list-session-messages', async (_event, input) => {
+        if (input.sessionId === 13) return { ok: true, data: { session: otherSession, leafId: 'renderer-t1', entryCount: 1,
+          items: [{ ...user, entryId: 'renderer-t1', runId: null, liveOrdinal: null, textOrigin: 'native-content',
+            blocks: [{ type: 'text', text: 'Other Session question' }] }], nextBeforeEntryId: null } };
+        receipt.historyCalls += 1;
+        receipt.activeQueries += 1;
+        receipt.maxQueries = Math.max(receipt.maxQueries, receipt.activeQueries);
+        const snapshot = structuredClone(receipt.items);
+        try {
+          if (receipt.hold) await new Promise<void>((resolve) => { receipt.release = resolve; });
+          if (receipt.failNext) {
+            receipt.failNext = false;
+            return { ok: false, error: { code: 'storage_read_failed', category: 'storage', message: 'Controlled history unavailable.', retryable: true } };
+          }
+          return { ok: true, data: { session, leafId: 'renderer-e1', entryCount: snapshot.length,
+            items: snapshot, nextBeforeEntryId: null } };
+        } finally { receipt.activeQueries -= 1; }
+      });
+      ipcMain.removeHandler('flowmate:start-run');
+      ipcMain.handle('flowmate:start-run', async () => { receipt.startCalls += 1; return { ok: false }; });
+    }, desktop.data);
+    await page.reload();
+    await page.locator('[data-message-entry="renderer-e1"]').waitFor({ state: 'visible', timeout: 10_000 });
+    expect(await page.locator('[data-message-role="user"]').textContent()).toContain('Controlled question');
+    expect(await page.locator('[data-message-role="user"]').getByText('Saved', { exact: true }).count()).toBe(1);
+    expect(await page.locator('.chat-user-message').count()).toBe(1);
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', {
+      type: 'run_progress', runId: 101, sessionId: 12, nativeSessionId: 'renderer-native-s', sequence: 99,
+      at: '2026-09-30T00:00:00.000Z', phase: 'running',
+    }));
+    await page.waitForTimeout(50);
+    expect(await page.getByRole('button', { name: 'Stop', exact: true }).count()).toBe(0);
+    await page.getByRole('textbox', { name: 'Message to model' }).fill('Draft stays editable');
+    await app.evaluate(({ BrowserWindow }) => {
+      type Receipt = { hold: boolean };
+      (globalThis as unknown as { rendererReceipt: Receipt }).rendererReceipt.hold = true;
+      const send = (value: unknown) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', value);
+      const envelope = { runId: 102, sessionId: 12, nativeSessionId: 'renderer-native-s', at: '2026-09-30T00:00:00.000Z' };
+      const view = { entryId: null, runId: 102, liveOrdinal: 1, timestamp: 1790726400001, persistence: 'pending',
+        truncated: false, role: 'assistant', blocks: [{ type: 'text', text: 'AB' }], phase: 'streaming', stopReason: 'pending',
+        toolCallId: null, toolName: null, isError: null, textOrigin: 'native-content' };
+      send({ ...envelope, type: 'run_progress', sequence: 1, phase: 'running' });
+      send({ ...envelope, type: 'message_upsert', sequence: 3, message: view });
+      send({ ...envelope, type: 'message_upsert', sequence: 2, message: { ...view, liveOrdinal: 2,
+        timestamp: 1790726400002, blocks: [{ type: 'text', text: 'Another message' }] } });
+      send({ ...envelope, type: 'message_upsert', sequence: 2, message: { ...view, blocks: [{ type: 'text', text: 'A' }] } });
+      send({ ...envelope, type: 'message_upsert', sequence: 3, message: view });
+      send({ ...envelope, type: 'message_upsert', sequence: 3, message: { ...view, blocks: [{ type: 'text', text: 'CONFLICT' }] } });
+    });
+    await page.locator('[data-message-role="assistant"]').filter({ hasText: 'AB' }).waitFor({ state: 'visible' });
+    expect(await page.locator('[data-message-role="assistant"]').count()).toBe(2);
+    expect(await page.locator('.chat-transcript').textContent()).not.toContain('CONFLICT');
+    await app.evaluate(({ BrowserWindow }) => {
+      const send = (value: unknown) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', value);
+      const envelope = { runId: 102, sessionId: 12, nativeSessionId: 'renderer-native-s', at: '2026-09-30T00:00:00.000Z' };
+      send({ ...envelope, type: 'run_finished', sequence: 1, result: { ok: true, data: { runId: 102, sessionId: 12,
+        nativeSessionId: 'renderer-native-s', status: 'completed', text: 'RUN TEXT IS NOT A MESSAGE', error: null,
+        stopped: false, cleanupErrors: [] } } });
+      send({ ...envelope, type: 'message_upsert', sequence: 4, message: { entryId: null, runId: 102, liveOrdinal: 1,
+        timestamp: 1790726400001, persistence: 'pending', truncated: false, role: 'assistant',
+        blocks: [{ type: 'text', text: 'LATE' }], phase: 'streaming', stopReason: 'pending', toolCallId: null,
+        toolName: null, isError: null, textOrigin: 'native-content' } });
+    });
+    await page.getByText('2 messages have not been confirmed as saved.', { exact: false }).waitFor({ state: 'visible' });
+    expect(await page.getByRole('button', { name: 'Stop', exact: true }).count()).toBe(0);
+    expect(await page.locator('.chat-transcript').textContent()).not.toContain('LATE');
+    expect(await page.locator('.chat-transcript').textContent()).not.toContain('RUN TEXT IS NOT A MESSAGE');
+    await app.evaluate(() => {
+      type Receipt = { hold: boolean; items: unknown[]; release: (() => void) | null };
+      const receipt = (globalThis as unknown as { rendererReceipt: Receipt }).rendererReceipt;
+      const base = { runId: 102, persistence: 'saved', truncated: false, role: 'assistant', phase: 'ended', stopReason: 'stop',
+        toolCallId: null, toolName: null, isError: null, textOrigin: 'native-content' };
+      receipt.items.push({ ...base, entryId: 'renderer-e2', liveOrdinal: 1, timestamp: 1790726400001, blocks: [{ type: 'text', text: 'AB' }] },
+        { ...base, entryId: 'renderer-e3', liveOrdinal: 2, timestamp: 1790726400002, blocks: [{ type: 'text', text: 'Another message' }] });
+      receipt.hold = false;
+      receipt.release?.();
+    });
+    await page.locator('[data-message-entry="renderer-e3"]').waitFor({ state: 'visible' });
+    expect(await page.locator('[data-message-role="assistant"][data-persistence="saved"]').count()).toBe(2);
+    expect(await page.getByRole('textbox', { name: 'Message to model' }).inputValue()).toBe('Draft stays editable');
+    const counts = await app.evaluate(() => {
+      const receipt = (globalThis as unknown as { rendererReceipt: { historyCalls: number; maxQueries: number; startCalls: number } }).rendererReceipt;
+      return { historyCalls: receipt.historyCalls, maxQueries: receipt.maxQueries, startCalls: receipt.startCalls };
+    });
+    expect(counts).toEqual({ historyCalls: 3, maxQueries: 1, startCalls: 0 });
+    await app.evaluate(() => { (globalThis as unknown as { rendererReceipt: { failNext: boolean } }).rendererReceipt.failNext = true; });
+    await page.getByRole('button', { name: 'Refresh history', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'Controlled history unavailable.' }).waitFor({ state: 'visible' });
+    expect(await page.locator('[data-message-entry="renderer-e3"]').count()).toBe(1);
+    await page.waitForTimeout(100);
+    expect(await app.evaluate(() => (globalThis as unknown as { rendererReceipt: { historyCalls: number } }).rendererReceipt.historyCalls)).toBe(4);
+    await app.evaluate(({ BrowserWindow }) => {
+      const send = (value: unknown) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', value);
+      const envelope = { sessionId: 12, nativeSessionId: 'renderer-native-s', at: '2026-09-30T00:00:00.000Z' };
+      send({ ...envelope, type: 'run_progress', runId: 103, sequence: 1, phase: 'running' });
+      send({ ...envelope, type: 'run_finished', runId: 102, sequence: 1, result: { ok: true, data: { runId: 102,
+        sessionId: 12, nativeSessionId: 'renderer-native-s', status: 'completed', text: 'OLD RUN TEXT',
+        error: null, stopped: false, cleanupErrors: [] } } });
+    });
+    await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'visible' });
+    expect(await page.getByRole('textbox', { name: 'Message to model' }).inputValue()).toBe('Draft stays editable');
+    expect(await page.locator('.chat-transcript').textContent()).not.toContain('OLD RUN TEXT');
+    await app.evaluate(() => { (globalThis as unknown as { rendererReceipt: { hold: boolean } }).rendererReceipt.hold = true; });
+    await page.getByRole('button', { name: 'Refresh history', exact: true }).click();
+    await page.locator('.sidebar-chat[data-session-id="13"]').click();
+    await page.locator('[data-message-entry="renderer-t1"]').waitFor({ state: 'visible' });
+    await app.evaluate(({ BrowserWindow }) => {
+      const receipt = (globalThis as unknown as { rendererReceipt: { hold: boolean; release: (() => void) | null } }).rendererReceipt;
+      receipt.hold = false;
+      receipt.release?.();
+      BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', { type: 'message_upsert', runId: 103,
+        sessionId: 12, nativeSessionId: 'renderer-native-s', sequence: 2, at: '2026-09-30T00:00:00.000Z',
+        message: { entryId: null, runId: 103, liveOrdinal: 1, timestamp: 1790726400003, persistence: 'pending',
+          truncated: false, role: 'assistant', blocks: [{ type: 'text', text: 'WRONG SESSION' }], phase: 'streaming',
+          stopReason: 'pending', toolCallId: null, toolName: null, isError: null, textOrigin: 'native-content' } });
+    });
+    await page.waitForTimeout(100);
+    expect(await page.locator('[data-message-entry="renderer-t1"]').count()).toBe(1);
+    expect(await page.locator('[data-message-entry="renderer-e1"]').count()).toBe(0);
+    expect(await page.locator('.chat-transcript').textContent()).not.toContain('WRONG SESSION');
+  } finally { await app.close(); }
+}, 60_000);
+
 it('desktop completes import, Start Task, Run, candidate source and Activity without leaving the local fixture', async () => {
   if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E currently requires the Windows developer host');
   if (!existsSync(electronPath)) throw new Error('Electron runtime binary is not installed; run the Electron install script');
@@ -599,6 +779,13 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await page.locator('[data-testid="chat-turn"]').filter({ hasText: 'all twelve read tools returned results' })
       .waitFor({ state: 'visible', timeout: 20_000 });
+    await page.waitForFunction(() => document.querySelectorAll('[data-message-role="toolResult"][data-persistence="saved"]').length === 13,
+      null, { timeout: 10_000 });
+    expect(await page.locator('[data-message-role="assistant"]').count()).toBe(3);
+    expect(await page.locator('.chat-tool-call').count()).toBe(13);
+    const messageEntryIds = await page.locator('[data-message-entry]').evaluateAll((items) =>
+      items.map((item) => item.getAttribute('data-message-entry')));
+    expect(new Set(messageEntryIds).size).toBe(messageEntryIds.length);
     expect(requests).toHaveLength(3);
     expect(requests.every(({ authorization }) => authorization === 'Bearer synthetic-desktop-p3-key')).toBe(true);
     const toolNames = (requests[0]?.body.tools ?? []).map((tool) => (tool as { function?: { name?: string } }).function?.name ?? '').sort();

@@ -16,6 +16,7 @@ const fixtureRoots = new Set<string>();
 const fixtureAdapters = new Set<PiAgentAdapter>();
 const input = (runId: number, sessionId: number, text: string): AgentExecutionInput => ({
   runId, sessionId, goal: INVOICE_CHAT_GOAL, text, messageTimestamp: 1_790_000_000_000,
+  verifyModelUse: () => ok(undefined),
 });
 
 function sse(delta: Record<string, unknown>, finishReason: string | null = null): string {
@@ -154,6 +155,159 @@ describe('PiAgentAdapter', () => {
     new AbortController().signal, () => undefined);
     expect(app.requests).toHaveLength(0);
     expect(result.error?.code).toBe('session_scope_revoked');
+  });
+
+  it('stops immediately on user persistence failure and retains only the committed prefix', async () => {
+    const app = await fixture();
+    const native = app.adapter.createSession();
+    if (!native.ok) throw new Error(native.error.message);
+    let saved = app.adapter.exportSession(native.data.nativeSessionId);
+    const attempted: import('@flowmate/contracts').NativeSessionHistory[] = [];
+    let failed = false;
+    app.adapter.watchSession(native.data.nativeSessionId, (history) => {
+      attempted.push(structuredClone(history));
+      if (!failed && history.entries.some((entry) => entry.type === 'message' && (entry.message as { role?: string }).role === 'user')) {
+        failed = true;
+        return fail(appError('storage_write_failed', 'storage', 'Controlled user save failure.'));
+      }
+      saved = ok(structuredClone(history));
+      return ok(undefined);
+    });
+    const prepared = await app.adapter.prepare(native.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.message);
+    const events: AgentObservation[] = [];
+    const outcome = await prepared.data.execute(input(106, 206, 'Fail this user save.'), new AbortController().signal, (event) => events.push(event));
+    expect(outcome.error?.code).toBe('storage_write_failed');
+    expect(outcome.stopped).toBe(true);
+    expect(app.requests).toHaveLength(0);
+    if (!saved.ok) throw new Error(saved.error.message);
+    expect(saved.data.unusable).toBe(true);
+    expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(0);
+    const firstFailure = attempted.findIndex((history) => history.entries.some((entry) => entry.type === 'message'));
+    expect(attempted.slice(firstFailure + 1).every((history) => !history.entries.some((entry) => entry.type === 'message'))).toBe(true);
+    expect(events.filter((event) => event.type === 'display_message').map((event) => event.message.persistence)).toContain('failed');
+    expect(events.some((event) => event.type === 'display_message' && event.message.persistence === 'saved')).toBe(false);
+  });
+
+  it('rechecks permission at fetch after the SDK has converted model messages', async () => {
+    const app = await fixture();
+    const native = app.adapter.createSession();
+    if (!native.ok) throw new Error(native.error.message);
+    const prepared = await app.adapter.prepare(native.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.message);
+    let revoked = false;
+    const outcome = await prepared.data.execute({ ...input(107, 207, 'Revoke before dispatch.'),
+      verifyModelUse: () => revoked ? fail(appError('session_scope_revoked', 'session', 'Revoked before fetch.')) : ok(undefined) },
+    new AbortController().signal, (event) => { if (event.type === 'request_budget') revoked = true; });
+    expect(app.requests).toHaveLength(0);
+    expect(outcome.error?.code).toBe('session_scope_revoked');
+    expect(outcome.stopped).toBe(true);
+  });
+
+  it.each(['return', 'throw'] as const)('retains the saved prefix and settles an actual stop when final save fails by %s', async (mode) => {
+    const app = await fixture();
+    const native = app.adapter.createSession();
+    if (!native.ok) throw new Error(native.error.message);
+    let saved = app.adapter.exportSession(native.data.nativeSessionId);
+    let finalFailed = false;
+    app.adapter.watchSession(native.data.nativeSessionId, (history, context) => {
+      if (!finalFailed && context === undefined && history.entries.filter((entry) => entry.type === 'message').length === 2) {
+        finalFailed = true;
+        if (mode === 'throw') throw new Error('Controlled final save exception.');
+        return fail(appError('storage_write_failed', 'storage', 'Controlled final save failure.'));
+      }
+      saved = ok(structuredClone(history));
+      return ok(undefined);
+    });
+    const prepared = await app.adapter.prepare(native.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.message);
+    const outcome = await prepared.data.execute(input(108, 208, 'Save before finishing.'), new AbortController().signal, () => undefined);
+    expect(finalFailed).toBe(true);
+    expect(outcome.error?.code).toBe('storage_write_failed');
+    expect(outcome.stopped).toBe(true);
+    expect(app.requests).toHaveLength(1);
+    if (!saved.ok) throw new Error(saved.error.message);
+    expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(2);
+    expect(saved.data.unusable).toBe(true);
+    expect(app.adapter.inspect(native.data.nativeSessionId).availability).toBe('unusable');
+    expect((await app.adapter.releaseSession(native.data.nativeSessionId)).closed).toBe(true);
+    expect(app.adapter.restoreSession(native.data.nativeSessionId, saved.data)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+  });
+
+  it('rejects uncloneable native data without leaving a stopped Session busy or saving its tail', async () => {
+    const app = await fixture();
+    const nativeId = app.adapter.createSession();
+    if (!nativeId.ok) throw new Error(nativeId.error.message);
+    let saved = app.adapter.exportSession(nativeId.data.nativeSessionId);
+    app.adapter.watchSession(nativeId.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); });
+    const prepared = await app.adapter.prepare(nativeId.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.message);
+    const records = (app.adapter as unknown as { sessions: Map<string, { session: AgentSession }> }).sessions;
+    const native = records.get(nativeId.data.nativeSessionId)!.session;
+    const unsubscribe = native.subscribe((event) => {
+      if (event.type === 'message_end' && event.message.role === 'user') Reflect.set(event.message, 'illegalService', () => undefined);
+    });
+    try {
+      const outcome = await prepared.data.execute(input(109, 209, 'Reject native service fields.'), new AbortController().signal, () => undefined);
+      expect(outcome.error?.code).toBe('session_history_invalid');
+      expect(outcome.stopped).toBe(true);
+      expect(app.requests).toHaveLength(0);
+      if (!saved.ok) throw new Error(saved.error.message);
+      expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(0);
+      expect(saved.data.unusable).toBe(true);
+      expect((await app.adapter.releaseSession(nativeId.data.nativeSessionId)).closed).toBe(true);
+    } finally { unsubscribe(); }
+  });
+
+  it.each(['content', 'usage'] as const)('settles malformed native assistant %s without reading the rejected object again', async (field) => {
+    const app = await fixture(() => response(field === 'content' ? '' : 'fixture answer'));
+    const created = app.adapter.createSession();
+    if (!created.ok) throw new Error(created.error.message);
+    let saved = app.adapter.exportSession(created.data.nativeSessionId);
+    app.adapter.watchSession(created.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); });
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.message);
+    const records = (app.adapter as unknown as { sessions: Map<string, { session: AgentSession }> }).sessions;
+    const native = records.get(created.data.nativeSessionId)!.session;
+    const unsubscribe = native.subscribe((event) => {
+      if (event.type === 'message_end' && event.message.role === 'assistant') Reflect.set(event.message, field, null);
+    });
+    try {
+      const outcome = await prepared.data.execute(input(110, 210, 'Reject malformed assistant.'), new AbortController().signal, () => undefined);
+      expect(outcome.error?.code).toBe('session_history_invalid');
+      expect(outcome.stopped).toBe(true);
+      expect(app.requests).toHaveLength(1);
+      if (!saved.ok) throw new Error(saved.error.message);
+      expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(1);
+      expect(saved.data.unusable).toBe(true);
+      expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
+    } finally { unsubscribe(); }
+  });
+
+  it.each(['orphan', 'duplicate', 'wrong-name', 'unknown-role', 'unknown-block'] as const)
+    ('rejects injected %s working memory before any Provider request', async (kind) => {
+    const app = await fixture();
+    const created = app.adapter.createSession();
+    if (!created.ok) throw new Error(created.error.message);
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
+    if (!prepared.ok) throw new Error(prepared.error.message);
+    const records = (app.adapter as unknown as { sessions: Map<string, { session: AgentSession }> }).sessions;
+    const native = records.get(created.data.nativeSessionId)!.session;
+    const assistant = { role: 'assistant', content: [{ type: 'toolCall', id: 'bad-call', name: 'probe', arguments: {} }],
+      api: 'openai-completions', provider: 'fixture', model: 'invoice-fixture', timestamp: 1, stopReason: 'toolUse',
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const result = { role: 'toolResult', toolCallId: 'bad-call', toolName: kind === 'wrong-name' ? 'wrong' : 'probe',
+      content: [{ type: 'text', text: '{}' }], isError: false, timestamp: 2 };
+    const messages = kind === 'orphan' ? [result] : kind === 'duplicate' ? [assistant, result, result]
+      : kind === 'wrong-name' ? [assistant, result] : kind === 'unknown-role' ? [{ role: 'invented', content: '', timestamp: 1 }]
+        : [{ role: 'user', content: [{ type: 'invented', text: '' }], timestamp: 1 }];
+    native.state.messages.push(...messages as unknown as typeof native.state.messages);
+    const outcome = await prepared.data.execute(input(111, 211, 'Do not dispatch invalid history.'), new AbortController().signal, () => undefined);
+    expect(outcome.error?.code).toBe('session_history_invalid');
+    expect(outcome.stopped).toBe(true);
+    expect(app.requests).toHaveLength(0);
+    expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
   });
 
   it('restores the native message history after a process boundary', async () => {
@@ -374,7 +528,7 @@ describe('PiAgentAdapter', () => {
     expect(app.requests.every((request) => (request.body.tools ?? []).length === 0)).toBe(true);
     expect(app.requests.every((request) => request.authorization === 'Bearer fixture-only-key')).toBe(true);
     expect(observations.some((value) => (value as { type?: string }).type === 'agent_event')).toBe(true);
-    expect(JSON.stringify(observations)).not.toContain('INVOICE_A');
+    expect(JSON.stringify(observations.filter((value) => !['display_message', 'display_text_delta'].includes((value as { type: string }).type)))).not.toContain('INVOICE_A');
     expect(app.adapter.inspect(a.data.nativeSessionId).availability).toBe('ready');
     expect((await filesUnder(app.root))).toEqual(directories);
     expect(await app.adapter.releaseSession(a.data.nativeSessionId)).toMatchObject({ stopped: true, closed: true });

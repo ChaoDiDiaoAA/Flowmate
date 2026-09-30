@@ -245,6 +245,41 @@ async function createTempWorkspace() {
 }
 
 describe('Pi 0.85.1 AgentSession contract', () => {
+  it('binds ordinary Loop message_end by object before persist and idle custom after persist', async () => {
+    const originalFetch = globalThis.fetch;
+    const harness = makeFetchHarness();
+    Reflect.set(globalThis, 'fetch', harness.fetch);
+    const workspace = await createTempWorkspace();
+    let session: Awaited<ReturnType<typeof createFixtureSession>>['session'] | undefined;
+    try {
+      const fixture = await createFixtureRuntime();
+      const created = await createFixtureSession(workspace.cwd, workspace.agentDir, fixture.runtime, fixture.model);
+      session = created.session;
+      const ended = new Set<object>();
+      const observations: Array<{ role: string; endedBeforePersist: boolean }> = [];
+      const persist = created.manager._persist.bind(created.manager);
+      created.manager._persist = (entry) => {
+        if (entry.type === 'message') observations.push({ role: entry.message.role, endedBeforePersist: ended.has(entry.message) });
+        if (entry.type === 'custom_message') observations.push({ role: 'custom', endedBeforePersist: false });
+        persist(entry);
+      };
+      session.subscribe((event) => {
+        if (event.type === 'message_end') {
+          if (event.message.role === 'custom') expect(observations.at(-1)).toEqual({ role: 'custom', endedBeforePersist: false });
+          ended.add(event.message);
+        }
+      });
+      await session.prompt('Native reference probe.', { expandPromptTemplates: false });
+      expect(observations).toEqual([{ role: 'user', endedBeforePersist: true }, { role: 'assistant', endedBeforePersist: true }]);
+      await session.sendCustomMessage({ customType: 'sdk-order-probe', content: 'SDK fixture only.', display: false, details: {} });
+      expect(observations.at(-1)).toEqual({ role: 'custom', endedBeforePersist: false });
+      expect(harness.requests).toHaveLength(1);
+    } finally {
+      session?.dispose();
+      Reflect.set(globalThis, 'fetch', originalFetch);
+      await rm(workspace.root, { recursive: true, force: true });
+    }
+  });
   it('uses the pinned SDK and the installed transitive agent-core version', () => {
     const rootPackage = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
       dependencies: Record<string, string>;

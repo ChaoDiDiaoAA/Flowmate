@@ -72,6 +72,7 @@ type ActiveCall = {
 type AgentEventPayload =
   | { type: 'run_progress'; phase: 'created' | 'running' | 'stopping'; reason?: string }
   | { type: 'text_delta'; text: string }
+  | { type: 'message_upsert'; message: import('@flowmate/contracts').SessionMessageView }
   | { type: 'tool_progress'; toolName: string; label: string; phase: 'running' | 'succeeded' | 'failed' | 'cancelled' }
   | { type: 'run_finished'; result: Result<AgentOutcome> };
 
@@ -581,6 +582,16 @@ export class RuntimeService {
       ...input,
       runId: active.runId,
       sessionId: request.sessionId,
+      verifyModelUse: () => {
+        const row = this.dependencies.sessions?.get(request.sessionId);
+        if (!row || !row.ok) return fail(appError('storage_read_failed', 'storage', 'Session 使用资格无法确认。', true, active.runId, request.sessionId));
+        if (row.data.nativeSessionId !== session.nativeSessionId || row.data.status !== 'active') {
+          return fail(appError('session_history_invalid', 'session', 'Run 与 Session 身份不一致。', false, active.runId, request.sessionId));
+        }
+        if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
+        if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', '会话历史不可继续使用。', false, active.runId, request.sessionId));
+        return ok(undefined);
+      },
       ...(context.admission ? { workspaceInput: context.admission.workspaceInput, goalMode: request.goalMode ?? 'answer' as const } : {}),
       ...(productContext && this.dependencies.tools ? { toolBinding: {
         context: productContext,
@@ -610,6 +621,9 @@ export class RuntimeService {
     let nativeWork: Promise<AgentNativeOutcome>;
     try {
       nativeWork = Promise.resolve(prepared.execute(agentInput, active.controller.signal, (event) => {
+        if (event.type === 'display_message' && !active.terminalCommitted) {
+          context.emit({ type: 'message_upsert', message: event.message });
+        }
         if (event.type === 'display_text_delta' && !active.terminalCommitted && !active.controller.signal.aborted) {
           context.emit({ type: 'text_delta', text: event.text });
         }
@@ -708,6 +722,7 @@ export class RuntimeService {
     const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
     const terminal: TerminalWrite = {
       status,
+      nativeHistoryUnusable: unconfirmed || !stopped || this.dependencies.agent?.inspect(session.nativeSessionId).availability === 'unusable',
       output,
       error: finalError,
       usage,

@@ -12,6 +12,8 @@ import type { InputRecordV2, UsageRecordV2 } from '../../../packages/contracts/s
 import type { P3AgentConfigFacts } from '../../../packages/contracts/src/ports.ts';
 import type { RunScope } from '../../../packages/contracts/src/tools.ts';
 import type { ProductPaths } from '../../../packages/contracts/src/runtime.ts';
+import type { NativeSessionHistory } from '@flowmate/contracts';
+import { deferCleanup } from '../../support/resources.ts';
 
 function makePaths(root: string): ProductPaths {
   return {
@@ -83,6 +85,32 @@ const agentConfig = {
 };
 const scope = { version: 1 as const, mode: 'chat-text' as const, toolNames: [] as [], resourcePaths: [] as [] };
 
+function nativeFixture(paths: ProductPaths) {
+  const opened = openDatabase(paths);
+  expect(opened.ok).toBe(true);
+  if (!opened.ok) throw new Error(opened.error.code);
+  let closed = false;
+  const close = () => { if (!closed) { closed = true; opened.data.close(); } };
+  deferCleanup(close);
+  const history: NativeSessionHistory = { storageVersion: 1,
+    header: { type: 'session', version: 3, id: 'native-p4-storage', timestamp: '2026-09-30T00:00:00.000Z', cwd: paths.runtimeDir },
+    entries: [], leafId: null, unusable: false };
+  const session = opened.data.sessions.create({ nativeSessionId: history.header.id, title: 'P4 storage', at: history.header.timestamp, nativeHistory: history });
+  expect(session.ok).toBe(true);
+  if (!session.ok) throw new Error(session.error.code);
+  const run = opened.data.runs.createAgent({ goal: runInput.goal, input: runInput,
+    config: { ...agentConfig, agent: { ...agentConfig.agent, nativeSessionId: history.header.id } }, usage, cleanup,
+    createdAt: history.header.timestamp, sessionId: session.data.sessionId, scope });
+  expect(run.ok).toBe(true);
+  if (!run.ok) throw new Error(run.error.code);
+  const entry = { type: 'message', id: 'p4-e1', parentId: null, timestamp: history.header.timestamp,
+    message: { role: 'user', content: 'hello', timestamp: 1 } };
+  const terminal = { status: 'failed' as const, output: null, error: { code: 'agent_failed', category: 'runtime' as const, message: 'fixture', retryable: false },
+    usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+    cleanup, endedAt: '2026-09-30T00:01:00.000Z', stoppedAt: null, durationMs: 1000 };
+  return { ...opened.data, close, sessionId: session.data.sessionId, runId: run.data, history, entry, terminal };
+}
+
 function createLegacyV1(paths: ProductPaths, includeActive = false) {
   mkdirSync(join(paths.root, 'data'), { recursive: true });
   const db = new Database(paths.databaseFile, { create: true });
@@ -111,6 +139,19 @@ function createLegacyV1(paths: ProductPaths, includeActive = false) {
   return db;
 }
 
+function createLegacyV7(paths: ProductPaths) {
+  const db = createLegacyV1(paths);
+  for (const file of ['002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql',
+    '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql']) {
+    if (file === '004_parsed_documents.sql') {
+      for (const sql of readFileSync(new URL(`../../../packages/core/src/storage/migrations/${file}`, import.meta.url), 'utf8')
+        .split(';').map((sql) => sql.trim()).filter(Boolean)) db.exec(sql);
+      db.exec('COMMIT');
+    } else db.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${file}`, import.meta.url), 'utf8'));
+  }
+  return db;
+}
+
 const legacyColumns = [
   'id', 'kind', 'status', 'goal', 'input_json', 'config_json', 'output_json', 'error_json', 'cleanup_json', 'usage_json',
   'input_tokens', 'output_tokens', 'total_tokens', 'cost', 'duration_ms', 'tool_call_count', 'usage_complete', 'created_at',
@@ -118,6 +159,110 @@ const legacyColumns = [
 ].join(',');
 
 describe('P2 Session and Agent Run storage', () => {
+  it('binds only the true appended message to its Run and reads display facts without changing the SDK snapshot', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
+    expect(typeof store.sessions.readHistoryForDisplay).toBe('function');
+    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history: store.history, bindings: [] } });
+    expect(store.sessions.readHistoryForDisplay(999_999)).toEqual({ ok: true, data: { history: null, bindings: [] } });
+    const context = { entryId: store.entry.id, runId: store.runId };
+    expect(store.sessions.saveHistory(store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
+    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history,
+      bindings: [{ entryId: 'p4-e1', runId: store.runId }] } });
+    expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: history });
+    store.db.exec("CREATE TRIGGER reject_duplicate_append BEFORE INSERT ON session_native_entries BEGIN SELECT RAISE(ABORT,'duplicate append'); END;");
+    expect(store.sessions.saveHistory(store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
+    expect(store.db.query('SELECT COUNT(*) AS count FROM session_native_entries').get()).toEqual({ count: 1 });
+    expect(() => store.db.query('UPDATE session_native_entries SET run_id=999999').run()).toThrow();
+    store.db.exec('DROP TRIGGER reject_duplicate_append;');
+    expect(store.runs.finish(store.runId, store.terminal).ok).toBe(true);
+    store.db.query('DELETE FROM runs WHERE id=?').run(store.runId);
+    expect(store.db.query('SELECT entry_json,run_id FROM session_native_entries').get())
+      .toEqual({ entry_json: JSON.stringify(store.entry), run_id: null });
+    expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(store.sessions.prepareDelete(store.sessionId, store.terminal.endedAt).ok).toBe(true);
+    expect(store.sessions.delete(store.sessionId, store.terminal.endedAt)).toEqual({ ok: true, data: 'permanent' });
+  }));
+
+  it('rejects foreign, Provider, nonmessage and missing entry bindings without a partial append or old null backfill', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    const other = store.sessions.create({ nativeSessionId: 'native-p4-other', title: 'Other', at: store.history.header.timestamp });
+    expect(other.ok).toBe(true);
+    if (!other.ok) return;
+    store.db.query(`INSERT INTO runs(id,kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,error_json,created_at,ended_at)
+      VALUES (100,'agent',?,'{}','failed','fixture','{}','{}','{}','{}','{}',?,?)`).run(other.data.sessionId, store.history.header.timestamp, store.history.header.timestamp);
+    store.db.query(`INSERT INTO runs(id,kind,status,goal,input_json,config_json,cleanup_json,usage_json,error_json,created_at,ended_at)
+      VALUES (101,'provider','failed','fixture','{}','{}','{}','{}','{}',?,?)`).run(store.history.header.timestamp, store.history.header.timestamp);
+    const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
+    for (const context of [{ entryId: store.entry.id, runId: 100 }, { entryId: store.entry.id, runId: 101 },
+      { entryId: 'missing', runId: store.runId }, { entryId: store.entry.id, runId: 999_999 }]) {
+      expect(store.sessions.saveHistory(store.sessionId, history, context)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: store.history });
+    }
+    const setting = { ...store.entry, type: 'model_change', provider: 'fixture', modelId: 'fixture' };
+    expect(store.sessions.saveHistory(store.sessionId, { ...history, entries: [setting] }, { entryId: setting.id, runId: store.runId }).ok).toBe(false);
+    expect(store.sessions.saveHistory(store.sessionId, history)).toEqual({ ok: true, data: undefined });
+    expect(store.sessions.saveHistory(store.sessionId, history, { entryId: store.entry.id, runId: store.runId }).ok).toBe(false);
+    expect(store.db.query('SELECT run_id FROM session_native_entries').get()).toEqual({ run_id: null });
+  }));
+
+  it('rolls back failed message binding with the header count leaf and committed JSON prefix unchanged', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    const prefix = { ...store.history, entries: [store.entry], leafId: store.entry.id };
+    expect(store.sessions.saveHistory(store.sessionId, prefix).ok).toBe(true);
+    const before = store.db.query('SELECT * FROM session_native_history').get();
+    const second = { ...store.entry, id: 'p4-e2', parentId: store.entry.id };
+    store.db.exec("CREATE TRIGGER reject_run_binding BEFORE INSERT ON session_native_entries WHEN NEW.run_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'binding failed'); END;");
+    expect(store.sessions.saveHistory(store.sessionId, { ...prefix, entries: [store.entry, second], leafId: second.id },
+      { entryId: second.id, runId: store.runId })).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(store.db.query('SELECT * FROM session_native_history').get()).toEqual(before);
+    expect(store.db.query('SELECT entry_id,entry_json,run_id FROM session_native_entries ORDER BY sequence').all())
+      .toEqual([{ entry_id: 'p4-e1', entry_json: JSON.stringify(store.entry), run_id: null }]);
+  }));
+
+  it('preserves opaque native metadata instead of guessing image content from serialized strings', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    const entry = { type: 'custom', id: 'sdk-metadata', parentId: null, timestamp: store.history.header.timestamp,
+      customType: 'sdk-fixture-metadata', data: { type: 'image', note: 'metadata only' } };
+    const history = { ...store.history, entries: [entry], leafId: entry.id };
+    expect(store.sessions.saveHistory(store.sessionId, history)).toEqual({ ok: true, data: undefined });
+    expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: history });
+  }));
+
+  it('commits sticky unusable with the Agent terminal or rolls back both facts, and never accepts it for a Provider Run', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    store.db.exec("CREATE TRIGGER reject_history_block BEFORE UPDATE OF unusable ON session_native_history WHEN NEW.unusable=1 BEGIN SELECT RAISE(ABORT,'history block failed'); END;");
+    expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true }).ok).toBe(false);
+    expect(store.db.query('SELECT status FROM runs WHERE id=?').get(store.runId)).toEqual({ status: 'created' });
+    expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: false } });
+    store.db.exec('DROP TRIGGER reject_history_block;');
+    expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true })).toEqual({ ok: true, data: true });
+    expect(store.sessions.saveHistory(store.sessionId, store.history).ok).toBe(true);
+    expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: true } });
+    const provider = store.runs.create({ goal: runInput.goal, input: runInput, config: baseConfig, usage, cleanup, createdAt: store.terminal.endedAt });
+    expect(provider.ok).toBe(true);
+    if (!provider.ok) return;
+    expect(store.runs.finish(provider.data, { ...store.terminal, nativeHistoryUnusable: true }).ok).toBe(false);
+    expect(store.db.query('SELECT status FROM runs WHERE id=?').get(provider.data)).toEqual({ status: 'created' });
+  }));
+
+  it.each(['created', 'running'] as const)('blocks an interrupted %s Agent history on startup without blocking a completed Session', (status) => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    const completed = store.sessions.create({ nativeSessionId: 'native-completed', title: 'Complete', at: store.history.header.timestamp,
+      nativeHistory: { ...store.history, header: { ...store.history.header, id: 'native-completed' } } });
+    expect(completed.ok).toBe(true);
+    if (!completed.ok) return;
+    store.db.query('UPDATE runs SET status=? WHERE id=?').run(status, store.runId);
+    store.close();
+    const reopened = openDatabase(paths);
+    expect(reopened.ok).toBe(true);
+    if (!reopened.ok) return;
+    deferCleanup(() => reopened.data.close());
+    expect(reopened.data.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: true } });
+    expect(reopened.data.sessions.loadHistory(completed.data.sessionId)).toMatchObject({ ok: true, data: { unusable: false } });
+    expect(reopened.data.db.query("SELECT COUNT(*) AS count FROM runs WHERE status IN ('created','running')").get()).toEqual({ count: 0 });
+  }));
+
   it('migrates a real new database through version 8 before exposing repositories', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
@@ -128,15 +273,7 @@ describe('P2 Session and Agent Run storage', () => {
   }));
 
   it('migrates version 7 without guessing old entry ownership and preserves native JSON', () => withDatabase((paths) => {
-    const legacy = createLegacyV1(paths);
-    for (const file of ['002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql',
-      '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql']) {
-      if (file === '004_parsed_documents.sql') {
-        for (const sql of readFileSync(new URL(`../../../packages/core/src/storage/migrations/${file}`, import.meta.url), 'utf8')
-          .split(';').map((sql) => sql.trim()).filter(Boolean)) legacy.exec(sql);
-        legacy.exec('COMMIT');
-      } else legacy.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${file}`, import.meta.url), 'utf8'));
-    }
+    const legacy = createLegacyV7(paths);
     const header = '{"type":"session","version":3,"id":"native-v7","timestamp":"2026-09-30T00:00:00.000Z","cwd":"fixture"}';
     const entry = '{"type":"message","id":"old-e1","parentId":null,"timestamp":"2026-09-30T00:00:00.000Z","message":{"role":"user","content":"old input","timestamp":1}}';
     legacy.query("INSERT INTO sessions(id,native_session_id,title,created_at,updated_at) VALUES (1,'native-v7','Old chat',?,?)")
@@ -154,6 +291,57 @@ describe('P2 Session and Agent Run storage', () => {
         .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });
       expect(migrated.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { migrated.data.close(); }
+  }));
+
+  it('rolls back the new column when migration 008 cannot commit its version marker', () => withDatabase((paths) => {
+    const legacy = createLegacyV7(paths);
+    const before = legacy.query(`SELECT ${legacyColumns} FROM runs ORDER BY id`).all();
+    legacy.exec("CREATE TRIGGER reject_schema_8 BEFORE INSERT ON schema_migrations WHEN NEW.version=8 BEGIN SELECT RAISE(ABORT,'version marker failed'); END;");
+    legacy.close();
+    expect(openDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+    const after = new Database(paths.databaseFile);
+    try {
+      expect(after.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 7 });
+      expect((after.query('PRAGMA table_info(session_native_entries)').all() as Array<{ name: string }>).map((column) => column.name)).not.toContain('run_id');
+      expect(after.query(`SELECT ${legacyColumns} FROM runs ORDER BY id`).all()).toEqual(before);
+      expect(after.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    } finally { after.close(); }
+  }));
+
+  it('rejects inconsistent persisted Run ownership rather than displaying or restoring guessed facts', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
+    expect(store.sessions.saveHistory(store.sessionId, history, { entryId: store.entry.id, runId: store.runId }).ok).toBe(true);
+    const other = store.sessions.create({ nativeSessionId: 'native-corrupt-other', title: 'Other', at: store.history.header.timestamp });
+    expect(other.ok).toBe(true);
+    if (!other.ok) return;
+    store.db.query('UPDATE runs SET session_id=? WHERE id=?').run(other.data.sessionId, store.runId);
+    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    expect(store.sessions.get(store.sessionId)).toMatchObject({ ok: true, data: { historyState: 'invalid' } });
+    expect(store.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: JSON.stringify(store.entry), run_id: store.runId });
+  }));
+
+  it('rolls back startup history blocking when interrupted Run repair fails, then blocks on the next successful startup', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true }).ok).toBe(true);
+    store.db.query('UPDATE session_native_history SET unusable=0').run();
+    store.db.query("UPDATE runs SET status='running',ended_at=NULL,error_json=NULL WHERE id=?").run(store.runId);
+    store.db.exec("CREATE TRIGGER reject_interruption BEFORE UPDATE ON runs WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'interrupted repair failed'); END;");
+    store.close();
+    expect(openDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+    const unrecovered = new Database(paths.databaseFile);
+    expect(unrecovered.query('SELECT status FROM runs WHERE id=?').get(store.runId)).toEqual({ status: 'running' });
+    expect(unrecovered.query('SELECT unusable FROM session_native_history').get()).toEqual({ unusable: 0 });
+    unrecovered.exec('DROP TRIGGER reject_interruption;');
+    unrecovered.close();
+    const recovered = openDatabase(paths);
+    expect(recovered.ok).toBe(true);
+    if (!recovered.ok) return;
+    deferCleanup(() => recovered.data.close());
+    expect(recovered.data.db.query('SELECT status FROM runs WHERE id=?').get(store.runId)).toEqual({ status: 'failed' });
+    expect(recovered.data.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: true } });
+    expect(recovered.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   }));
 
   it('keeps ordered native history and leaf across restart, and marks corrupt history invalid', () => withDatabase((paths) => {

@@ -63,7 +63,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     monotonicNow: () => performance.now(),
     tools: toolExecutor,
   });
-  const sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now);
+  const sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs);
   const workspaceService = createWorkspaceService(database.data.workspace, now);
   const jobService = createJobService(database.data.jobs, now);
   return ok(makeApplication(runtime, database.data.runs, async () => {

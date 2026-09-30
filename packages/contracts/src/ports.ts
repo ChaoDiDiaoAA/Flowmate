@@ -8,6 +8,10 @@ import type {
   SessionSnapshot,
   UsageRecord,
   TokenColumns,
+  SessionMessageView,
+  SessionMessagesPage,
+  NativeHistoryAppendContext,
+  NativeMessageProjectionInput,
 } from './runtime.ts';
 import type { ProductToolContext, ToolCallContext, ToolResult } from './tools.ts';
 import type { CandidateJobDetail, CandidateJobPage, GoalMode, WorkspaceInput } from './workspace.ts';
@@ -106,6 +110,7 @@ export type AgentExecutionInput = NativeInput & {
   workspaceInput?: WorkspaceInput;
   goalMode?: GoalMode;
   toolBinding?: AgentToolBinding;
+  verifyModelUse: () => Result<void>;
 };
 
 export type AgentNativeEventName =
@@ -133,7 +138,9 @@ export type NativeObservation = {
   }>;
 };
 
-export type AgentObservation = NativeObservation | { type: 'display_text_delta'; text: string; at: string; monotonicMs: number };
+export type AgentObservation = NativeObservation
+  | { type: 'display_text_delta'; text: string; at: string; monotonicMs: number }
+  | { type: 'display_message'; message: SessionMessageView; at: string; monotonicMs: number };
 
 export type NativeOutcome = {
   wireMaxTokens?: number | null;
@@ -180,7 +187,8 @@ export interface AgentPort {
   createSession(): Result<{ nativeSessionId: string }>;
   exportSession?(nativeSessionId: string): Result<import('./runtime.ts').NativeSessionHistory>;
   restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory): Result<void>;
-  watchSession?(nativeSessionId: string, save: (history: import('./runtime.ts').NativeSessionHistory) => Result<void>): Result<void>;
+  watchSession?(nativeSessionId: string, save: (history: import('./runtime.ts').NativeSessionHistory, context?: NativeHistoryAppendContext) => Result<void>): Result<void>;
+  projectSessionMessages?(input: NativeMessageProjectionInput): Result<Pick<SessionMessagesPage, 'items' | 'nextBeforeEntryId'>>;
   inspect(nativeSessionId: string): {
     availability: AgentPortAvailability;
   };

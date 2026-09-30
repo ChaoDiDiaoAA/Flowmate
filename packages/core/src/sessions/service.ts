@@ -1,4 +1,4 @@
-import { appError, fail, ok } from '@flowmate/contracts';
+import { appError, fail, ok, SessionMessagesPageSchema } from '@flowmate/contracts';
 import type {
   AgentPort,
   CreateSessionRequest,
@@ -11,8 +11,11 @@ import type {
   SessionAvailability,
   SessionPage,
   SessionSnapshot,
+  NormalizedSessionMessagesRequest,
+  SessionMessagesPage,
+  MessageRunInput,
 } from '@flowmate/contracts';
-import type { SessionRepository, SessionRow } from '../storage/repositories.ts';
+import type { SessionRepository, SessionRow, RunRepository } from '../storage/repositories.ts';
 
 export class SessionService {
   private deleting = false;
@@ -22,6 +25,7 @@ export class SessionService {
     private readonly agent: AgentPort,
     private readonly runtimeState: () => RuntimeState,
     private readonly now: () => string,
+    private readonly runs: RunRepository,
   ) {}
 
   public async create(request: CreateSessionRequest): Promise<Result<SessionSnapshot>> {
@@ -41,7 +45,7 @@ export class SessionService {
       return row;
     }
     const watched = this.agent.watchSession?.(native.data.nativeSessionId,
-      (snapshot) => this.repository.saveHistory(row.data.sessionId, snapshot));
+      (snapshot, context) => this.repository.saveHistory(row.data.sessionId, snapshot, context));
     if (watched && !watched.ok) {
       await this.agent.releaseSession(native.data.nativeSessionId);
       return watched;
@@ -87,6 +91,40 @@ export class SessionService {
       items: page.data.items.map((row) => this.project(row)),
       next: page.data.next,
     });
+  }
+
+  public listMessages(request: NormalizedSessionMessagesRequest): Result<SessionMessagesPage> {
+    const row = this.repository.get(request.sessionId);
+    if (!row.ok) return row;
+    const stored = this.repository.readHistoryForDisplay(request.sessionId);
+    if (!stored.ok) return stored;
+    if (!stored.data.history && row.data.historyState === 'legacy-read-only') {
+      return ok({ session: this.project(row.data), leafId: null, entryCount: 0, items: [], nextBeforeEntryId: null });
+    }
+    if (!stored.data.history || !this.agent.projectSessionMessages) {
+      return fail(appError('session_history_unavailable', 'session', 'Saved native messages are unavailable.'));
+    }
+    const runInputs: MessageRunInput[] = [];
+    for (const runId of new Set(stored.data.bindings.map((binding) => binding.runId))) {
+      const run = this.runs.get(runId);
+      if (!run.ok || run.data.kind !== 'agent' || run.data.sessionId !== request.sessionId) {
+        return fail(appError('session_history_invalid', 'session', 'Saved message Run identity is inconsistent.'));
+      }
+      const config = run.data.config as Record<string, unknown>;
+      const mode = config.goalMode;
+      const goalMode = mode === 'answer' || mode === 'save-candidate' ? mode : null;
+      if (run.data.input.version === 2 && goalMode === null) {
+        return fail(appError('session_history_invalid', 'session', 'Saved message Run context is incomplete.'));
+      }
+      runInputs.push({ runId, input: run.data.input, goalMode });
+    }
+    const projected = this.agent.projectSessionMessages({ history: stored.data.history, bindings: stored.data.bindings,
+      runInputs, limit: request.limit, ...(request.beforeEntryId === undefined ? {} : { beforeEntryId: request.beforeEntryId }) });
+    if (!projected.ok) return projected;
+    const page = { session: this.project(row.data), leafId: stored.data.history.leafId,
+      entryCount: stored.data.history.entries.length, ...projected.data };
+    const parsed = SessionMessagesPageSchema.safeParse(page);
+    return parsed.success ? ok(parsed.data) : fail(appError('session_history_invalid', 'session', 'Saved message projection is invalid.'));
   }
 
   private project(row: SessionRow): SessionSnapshot {
@@ -136,7 +174,7 @@ export function ensureNativeSession(repository: SessionRepository, agent: AgentP
   if (!history.data) return fail(appError('session_history_unavailable', 'session', 'This conversation has no saved native history.'));
   const restored = agent.restoreSession(row.nativeSessionId, history.data);
   if (!restored.ok) return restored;
-  return agent.watchSession(row.nativeSessionId, (snapshot) => repository.saveHistory(row.sessionId, snapshot));
+  return agent.watchSession(row.nativeSessionId, (snapshot, context) => repository.saveHistory(row.sessionId, snapshot, context));
 }
 
 function deleteInProgress<T>(): Result<T> {

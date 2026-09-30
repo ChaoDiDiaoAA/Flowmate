@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, ProductSettings, RunSnapshot, SessionCursor, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
+import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, ProductSettings, RunSnapshot, SessionCursor, SessionMessageView, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
+import { applyMessageUpsert, mergeSavedHistory, type MessageViewState } from './message-state.ts';
 
 type Page = 'workspace' | 'tasks' | 'chats' | 'models' | 'settings';
 const pageLabels: Record<Page, string> = {
@@ -18,6 +19,12 @@ type ChatTurn = {
   status: 'sending' | 'completed' | 'failed' | 'cancelled';
   progress?: string | null;
 };
+type RunFeedback = { runId: number; status: 'completed' | 'failed' | 'cancelled'; error: string | null };
+
+function emptyMessageState(sessionId: number): MessageViewState {
+  return { sessionId, byEntryId: new Map(), liveByRun: new Map(), lastSequenceByMessage: new Map(),
+    aliases: new Map(), highestSeenSequenceByRun: new Map(), closedRuns: new Set() };
+}
 
 function newId(): string { return crypto.randomUUID().replaceAll('-', ''); }
 function chatTitle(title: string): string { return title === 'New Session' ? 'New chat' : title; }
@@ -54,6 +61,11 @@ export function App() {
   const [apiKey, setApiKey] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
+  const [messageState, setMessageState] = useState<MessageViewState | null>(null);
+  const [messageCursor, setMessageCursor] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [runFeedbacks, setRunFeedbacks] = useState<RunFeedback[]>([]);
   const [sessions, setSessions] = useState<SessionSnapshot[]>([]);
   const [sidebarRenameId, setSidebarRenameId] = useState<number | null>(null);
   const [sidebarRenameTitle, setSidebarRenameTitle] = useState('');
@@ -111,6 +123,11 @@ export function App() {
   const chatDrafts = useRef(new Map<string, string>());
   const chatInputRef = useRef('');
   const eventSequences = useRef(new Map<number, number>());
+  const messageStates = useRef(new Map<number, MessageViewState>());
+  const messageCursors = useRef(new Map<number, string | null>());
+  const nativeSessionIds = useRef(new Map<number, string>());
+  const knownRunSessions = useRef(new Map<number, number>());
+  const historyQueries = useRef(new Map<number, { inFlight: boolean; refreshPending: boolean; beforeEntryId?: string }>());
   const activeAgentRunIdRef = useRef<number | null>(null);
   const agentStopRequested = useRef(false);
   const selectedSessionIdRef = useRef<number | null>(null);
@@ -152,6 +169,7 @@ export function App() {
     const result = await window.flowmate.listSessions({ limit: 100, ...(before ? { before } : {}) });
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     sessionCursorRef.current = result.data.next;
+    for (const session of result.data.items) nativeSessionIds.current.set(session.sessionId, session.nativeSessionId);
     setSessionCursor(result.data.next);
     setSessions((current) => append ? [...current, ...result.data.items] : result.data.items);
     if (allowInitialSessionSelection.current && selectedSessionIdRef.current === null
@@ -354,8 +372,9 @@ export function App() {
     }
     await Promise.all([loadProductOverview(), loadSessionList()]);
     if (selectedSessionIdRef.current !== null) {
-      const current = await window.flowmate.querySession(selectedSessionIdRef.current);
-      if (current.ok) setSelectedSession(current.data);
+      const queriedSessionId = selectedSessionIdRef.current;
+      const current = await window.flowmate.querySession(queriedSessionId);
+      if (current.ok && selectedSessionIdRef.current === queriedSessionId) setSelectedSession(current.data);
     }
     const updated = await window.flowmate.queryDocument(documentId);
     if (updated.ok) setHistoricalDocuments((current) => ({ ...current, [documentId]: updated.data }));
@@ -363,29 +382,106 @@ export function App() {
   }
 
   async function loadSession(sessionId: number) {
-    const sequence = ++sessionLoadSequence.current;
-    const [sessionResult, runsResult] = await Promise.all([
-      window.flowmate.querySession(sessionId),
-      window.flowmate.listSessionRuns({ sessionId, limit: 100 }),
-    ]);
-    if (sequence !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
-    if (!sessionResult.ok) { setNotice({ tone: 'bad', message: errorMessage(sessionResult) }); return; }
-    if (!runsResult.ok) { setNotice({ tone: 'bad', message: errorMessage(runsResult) }); return; }
-    setSelectedSession(sessionResult.data);
-    setRunCursor(runsResult.data.nextBeforeRunId);
-    setChatTurns(runsResult.data.items.slice().reverse().map(turnFromRun));
+    await querySessionHistory(sessionId);
+  }
+
+  function publishMessages(next: MessageViewState) {
+    messageStates.current.set(next.sessionId, next);
+    if (selectedSessionIdRef.current !== next.sessionId) return;
+    setMessageState(next);
+    const userRuns = new Set([...next.byEntryId.values(), ...[...next.liveByRun.values()].flatMap((items) => [...items.values()])]
+      .filter((item) => item.role === 'user').map((item) => item.runId));
+    setChatTurns((turns) => turns.filter((turn) => turn.runId === null || !userRuns.has(turn.runId)));
+  }
+
+  async function querySessionHistory(sessionId: number, beforeEntryId?: string) {
+    if (selectedSessionIdRef.current !== sessionId) return;
+    const coordinator = historyQueries.current.get(sessionId) ?? { inFlight: false, refreshPending: false };
+    historyQueries.current.set(sessionId, coordinator);
+    if (coordinator.inFlight) {
+      coordinator.refreshPending = true;
+      coordinator.beforeEntryId = beforeEntryId;
+      return;
+    }
+    coordinator.inFlight = true;
+    const selection = sessionLoadSequence.current;
+    setHistoryLoading(true);
+    let failed = false;
+    try {
+      const [sessionResult, runsResult, messagesResult] = await Promise.all([
+        window.flowmate.querySession(sessionId),
+        window.flowmate.listSessionRuns({ sessionId, limit: 100 }),
+        window.flowmate.listSessionMessages({ sessionId, limit: 50, ...(beforeEntryId ? { beforeEntryId } : {}) }),
+      ]);
+      if (selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
+      if (!sessionResult.ok || !runsResult.ok || !messagesResult.ok) {
+        failed = true;
+        const rejection = !sessionResult.ok ? sessionResult : !runsResult.ok ? runsResult : messagesResult;
+        if (sessionResult.ok) setSelectedSession(sessionResult.data);
+        setHistoryError(errorMessage(rejection));
+        return;
+      }
+      if (sessionResult.data.sessionId !== sessionId || messagesResult.data.session.sessionId !== sessionId
+        || runsResult.data.items.some((item) => item.sessionId !== sessionId)
+        || messagesResult.data.session.nativeSessionId !== sessionResult.data.nativeSessionId) {
+        failed = true;
+        setHistoryError('The history response does not match this chat. Refresh history to verify it.');
+        return;
+      }
+      nativeSessionIds.current.set(sessionId, sessionResult.data.nativeSessionId);
+      const base = messageStates.current.get(sessionId) ?? emptyMessageState(sessionId);
+      const closedRuns = new Set(base.closedRuns);
+      for (const item of runsResult.data.items) {
+        knownRunSessions.current.set(item.runId, sessionId);
+        if (item.status === 'completed' || item.status === 'failed' || item.status === 'cancelled') closedRuns.add(item.runId);
+      }
+      const merged = mergeSavedHistory({ ...base, closedRuns }, messagesResult.data);
+      publishMessages(merged.state);
+      setSelectedSession(sessionResult.data);
+      setHistoryError(merged.queryRequired ? 'Saved message facts conflict with the displayed history. Refresh history to verify it.' : null);
+      failed = merged.queryRequired;
+      if (beforeEntryId !== undefined || !messageCursors.current.has(sessionId)) {
+        messageCursors.current.set(sessionId, messagesResult.data.nextBeforeEntryId);
+      }
+      setMessageCursor(messageCursors.current.get(sessionId) ?? null);
+      setRunCursor(runsResult.data.nextBeforeRunId);
+      if (sessionResult.data.historyState === 'legacy-read-only') {
+        setChatTurns(runsResult.data.items.slice().reverse().map(turnFromRun));
+      }
+      setRunFeedbacks(runsResult.data.items.filter((item) => item.status === 'cancelled' || item.status === 'failed')
+        .map((item) => ({ runId: item.runId, status: item.status as 'failed' | 'cancelled',
+          error: item.error ? errorMessage({ error: item.error }) : null })));
+    } catch {
+      failed = true;
+      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId) {
+        setHistoryError('History could not be loaded. Refresh history to try again.');
+      }
+    } finally {
+      coordinator.inFlight = false;
+      const followUp = coordinator.refreshPending && !failed && selectedSessionIdRef.current === sessionId;
+      const pendingBefore = coordinator.beforeEntryId;
+      coordinator.refreshPending = false;
+      delete coordinator.beforeEntryId;
+      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId) setHistoryLoading(false);
+      if (followUp) void querySessionHistory(sessionId, pendingBefore);
+    }
   }
 
   function selectSession(sessionId: number, focusComposer = false) {
     chatDrafts.current.set(draftKey(selectedSessionIdRef.current), chatInputRef.current);
     focusComposerWhenReady.current = focusComposer;
     selectedSessionIdRef.current = sessionId;
+    sessionLoadSequence.current += 1;
     setSelectedSessionId(sessionId);
     chatInputRef.current = chatDrafts.current.get(draftKey(sessionId)) ?? '';
     setChatInput(chatInputRef.current);
     setSelectedSession(null);
     setRunCursor(null);
     setChatTurns([]);
+    setMessageState(messageStates.current.get(sessionId) ?? null);
+    setMessageCursor(messageCursors.current.get(sessionId) ?? null);
+    setHistoryError(null);
+    setRunFeedbacks([]);
     setNotice(null);
     if (workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
     void loadSession(sessionId);
@@ -404,6 +500,8 @@ export function App() {
     setSessionLoading(false);
     if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return null; }
     const session = created.data;
+    nativeSessionIds.current.set(session.sessionId, session.nativeSessionId);
+    sessionLoadSequence.current += 1;
     chatInputRef.current = preserveDraft ? priorDraft : '';
     chatDrafts.current.set(draftKey(session.sessionId), chatInputRef.current);
     setChatInput(chatInputRef.current);
@@ -411,6 +509,12 @@ export function App() {
     setSelectedSessionId(session.sessionId);
     setSelectedSession(session);
     setChatTurns([]);
+    const newMessages = emptyMessageState(session.sessionId);
+    messageStates.current.set(session.sessionId, newMessages);
+    setMessageState(newMessages);
+    setMessageCursor(null);
+    setHistoryError(null);
+    setRunFeedbacks([]);
     setRunCursor(null);
     setNotice(null);
     setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
@@ -445,8 +549,9 @@ export function App() {
         sessionCursorRef.current = refreshed.data.next;
       }
       if (selectedSessionIdRef.current !== null) {
-        const current = await window.flowmate.querySession(selectedSessionIdRef.current);
-        if (current.ok) setSelectedSession(current.data);
+        const queriedSessionId = selectedSessionIdRef.current;
+        const current = await window.flowmate.querySession(queriedSessionId);
+        if (current.ok && selectedSessionIdRef.current === queriedSessionId) setSelectedSession(current.data);
       }
       setNotice({ tone: 'bad', message: errorMessage(result) });
       setSessionMutating(false);
@@ -469,6 +574,10 @@ export function App() {
       setSelectedSession(null);
       updateChatInput(chatDrafts.current.get(draftKey(next?.sessionId ?? null)) ?? '');
       setChatTurns([]);
+      setMessageState(next ? messageStates.current.get(next.sessionId) ?? null : null);
+      setMessageCursor(next ? messageCursors.current.get(next.sessionId) ?? null : null);
+      setHistoryError(null);
+      setRunFeedbacks([]);
       setRunCursor(null);
     }
     if (activeAgentSessionId === sessionId) {
@@ -499,9 +608,16 @@ export function App() {
 
   async function loadOlderRuns() {
     const sessionId = selectedSessionIdRef.current;
+    if (sessionId !== null && selectedSession?.historyState !== 'legacy-read-only') {
+      const cursor = messageCursors.current.get(sessionId);
+      if (cursor) await querySessionHistory(sessionId, cursor);
+      return;
+    }
     const beforeRunId = runCursor;
     if (sessionId === null || beforeRunId === null) return;
+    const selection = sessionLoadSequence.current;
     const result = await window.flowmate.listSessionRuns({ sessionId, beforeRunId, limit: 100 });
+    if (selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     setRunCursor(result.data.nextBeforeRunId);
     setChatTurns((current) => [...result.data.items.slice().reverse().map(turnFromRun), ...current]);
@@ -522,14 +638,27 @@ export function App() {
         return;
       }
       if (event.type === 'model_auth_notice' || event.type === 'model_auth_prompt') return;
-      if ('runId' in event && 'sequence' in event) {
-        if (event.sequence <= (eventSequences.current.get(event.runId) ?? 0)) return;
-        if (latestAgentFinished.current.has(event.runId) && event.type !== 'run_finished') return;
-        eventSequences.current.set(event.runId, event.sequence);
+      if (event.type === 'message_upsert') {
+        if (event.sessionId !== selectedSessionIdRef.current
+          || nativeSessionIds.current.get(event.sessionId) !== event.nativeSessionId
+          || knownRunSessions.current.get(event.runId) !== event.sessionId) return;
+        const merged = applyMessageUpsert(messageStates.current.get(event.sessionId) ?? emptyMessageState(event.sessionId), event);
+        publishMessages(merged.state);
+        if (event.message.persistence === 'failed') {
+          setSelectedSession((current) => current?.sessionId === event.sessionId ? { ...current, availability: 'unusable' } : current);
+        }
+        if (merged.queryRequired) void loadSession(event.sessionId);
+        return;
       }
       if (event.type === 'run_progress') {
+        if (latestAgentFinished.current.has(event.runId)
+          || messageStates.current.get(event.sessionId)?.closedRuns.has(event.runId)
+          || nativeSessionIds.current.get(event.sessionId) !== event.nativeSessionId
+          || event.sequence <= (eventSequences.current.get(event.runId) ?? 0)) return;
         if (activeChatSessionId.current !== null && event.sessionId !== activeChatSessionId.current) return;
         if (activeAgentRunIdRef.current !== null && event.runId !== activeAgentRunIdRef.current) return;
+        eventSequences.current.set(event.runId, event.sequence);
+        knownRunSessions.current.set(event.runId, event.sessionId);
         activeAgentRunIdRef.current = event.runId;
         activeChatSessionId.current = event.sessionId;
         setActiveAgentRunId(event.runId);
@@ -546,23 +675,31 @@ export function App() {
         }
         return;
       }
-      if (event.type === 'text_delta' || event.type === 'tool_progress') {
+      if (event.type === 'text_delta') return;
+      if (event.type === 'tool_progress') {
+        if (latestAgentFinished.current.has(event.runId)
+          || messageStates.current.get(event.sessionId)?.closedRuns.has(event.runId)
+          || event.sequence <= (eventSequences.current.get(event.runId) ?? 0)) return;
+        eventSequences.current.set(event.runId, event.sequence);
         if (event.runId !== activeAgentRunIdRef.current || event.sessionId !== activeChatSessionId.current
           || event.sessionId !== selectedSessionIdRef.current) return;
         const turnId = activeChatTurnId.current;
         if (!turnId) return;
         setChatTurns((turns) => turns.map((turn) => turn.id !== turnId || turn.status !== 'sending' ? turn
-          : event.type === 'text_delta'
-            ? { ...turn, response: `${turn.response ?? ''}${event.text}` }
-            : { ...turn, progress: event.phase === 'running' ? event.label : null }));
+          : { ...turn, progress: event.phase === 'running' ? event.label : null }));
         return;
       }
       if (event.type === 'run_finished') {
+        if (latestAgentFinished.current.has(event.runId)
+          || nativeSessionIds.current.get(event.sessionId) !== event.nativeSessionId
+          || knownRunSessions.current.get(event.runId) !== event.sessionId) return;
         latestAgentFinished.current.set(event.runId, event);
+        const prior = messageStates.current.get(event.sessionId) ?? emptyMessageState(event.sessionId);
+        publishMessages({ ...prior, closedRuns: new Set([...prior.closedRuns, event.runId]) });
         if (selectedSessionIdRef.current === event.sessionId) {
           setRunId(event.runId);
           const turnId = activeChatTurnId.current;
-          if (turnId) applyAgentFinish(event, turnId);
+          if (turnId && activeAgentRunIdRef.current === event.runId) applyAgentFinish(event, turnId);
           void loadSession(event.sessionId);
         }
         void loadSessionList();
@@ -590,9 +727,9 @@ export function App() {
       if (event.type === 'provider_finished') {
         latestFinished.current = event;
         setRunId(event.runId);
-        setBusy(false);
-        setCancelPending(false);
         if (activeRequestIdRef.current === event.requestId) {
+          setBusy(false);
+          setCancelPending(false);
           activeRequestIdRef.current = null;
           setActiveRequestId(null);
         }
@@ -615,7 +752,7 @@ export function App() {
   useEffect(() => {
     const transcript = chatTranscriptRef.current;
     if (transcript) transcript.scrollTop = transcript.scrollHeight;
-  }, [chatTurns]);
+  }, [chatTurns, messageState]);
 
   useEffect(() => {
     const narrow = window.matchMedia('(max-width: 1079px)');
@@ -662,7 +799,7 @@ export function App() {
   const canTest = Boolean(modelReady && !busy && !saving);
   const inputEnabled = true;
   const selectedForSend = selectedSession ?? sessions.find((item) => item.sessionId === selectedSessionId) ?? null;
-  const canChat = Boolean(modelReady && !busy && !sessionLoading && !sessionMutating
+  const canChat = Boolean(modelReady && !busy && !sessionLoading && !sessionMutating && !historyLoading && !historyError
     && (selectedSessionId === null || selectedForSend?.availability === 'ready' && !selectedForSend.modelUseBlocked
       && selectedForSend.historyState === 'recoverable')
     && (goalMode !== 'save-candidate' || (workspace?.documentRef && workspace.jobId)));
@@ -683,8 +820,9 @@ export function App() {
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     await loadSessionList();
     if (selectedSessionIdRef.current !== null) {
-      const selected = await window.flowmate.querySession(selectedSessionIdRef.current);
-      if (selected.ok) setSelectedSession(selected.data);
+      const queriedSessionId = selectedSessionIdRef.current;
+      const selected = await window.flowmate.querySession(queriedSessionId);
+      if (selected.ok && selectedSessionIdRef.current === queriedSessionId) setSelectedSession(selected.data);
     }
     setNotice({ tone: result.data.stopRequested ? 'info' : 'good',
       message: result.data.affectedSessionIds.length === 0
@@ -854,6 +992,7 @@ export function App() {
       return;
     }
     if (goalMode === 'save-candidate') setGoalMode('answer');
+    knownRunSessions.current.set(accepted.data.runId, sessionId);
     const finished = latestAgentFinished.current.get(accepted.data.runId);
     if (!finished) {
       activeAgentRunIdRef.current = accepted.data.runId;
@@ -871,16 +1010,18 @@ export function App() {
       ? { ...turn, runId: accepted.data.runId }
       : turn));
     if (finished) {
-      setBusy(false);
-      setCancelPending(false);
-      activeAgentRunIdRef.current = null;
-      activeChatSessionId.current = null;
-      setActiveAgentRunId(null);
-      setActiveAgentSessionId(null);
-      setActiveRunModel(null);
-      agentStopRequested.current = false;
-      activeChatTurnId.current = null;
-      applyAgentFinish(finished, turnId);
+      if (activeChatTurnId.current === turnId || activeAgentRunIdRef.current === accepted.data.runId) {
+        setBusy(false);
+        setCancelPending(false);
+        activeAgentRunIdRef.current = null;
+        activeChatSessionId.current = null;
+        setActiveAgentRunId(null);
+        setActiveAgentSessionId(null);
+        setActiveRunModel(null);
+        agentStopRequested.current = false;
+        activeChatTurnId.current = null;
+        applyAgentFinish(finished, turnId);
+      }
     }
   }
 
@@ -893,23 +1034,17 @@ export function App() {
   }
 
   function applyAgentFinish(event: Extract<AgentRunEvent, { type: 'run_finished' }>, turnId: string) {
+    setChatTurns((turns) => turns.filter((turn) => turn.id !== turnId));
     if (!event.result.ok) {
-      setChatTurns((turns) => turns.map((turn) => turn.id === turnId
-        ? { ...turn, runId: event.runId, status: 'failed', error: errorMessage(event.result) }
-        : turn));
+      setRunFeedbacks((items) => [...items.filter((item) => item.runId !== event.runId),
+        { runId: event.runId, status: 'failed', error: errorMessage(event.result) }]);
       return;
     }
     const outcome = event.result.data;
-    setChatTurns((turns) => turns.map((turn) => turn.id === turnId
-      ? {
-        ...turn,
-        runId: event.runId,
-        response: outcome.text || null,
-        progress: null,
-        error: outcome.error ? errorMessage({ error: outcome.error }) : null,
-        status: outcome.status === 'completed' ? 'completed' : outcome.status === 'cancelled' ? 'cancelled' : 'failed',
-      }
-      : turn));
+    if (outcome.status !== 'completed') {
+      setRunFeedbacks((items) => [...items.filter((item) => item.runId !== event.runId),
+        { runId: event.runId, status: outcome.status, error: outcome.error ? errorMessage({ error: outcome.error }) : null }]);
+    }
   }
 
   async function cancelAgentRun() {
@@ -1204,10 +1339,20 @@ export function App() {
         onToggle={() => { assistantWasToggled.current = true; setChatCollapsed((collapsed) => !collapsed); }}
         selectedSessionId={selectedSessionId}
         selectedSession={selectedSession}
-        hasOlderRuns={runCursor !== null}
+        hasOlderRuns={selectedSession?.historyState === 'legacy-read-only' ? runCursor !== null : messageCursor !== null}
         onNewChatAndSend={() => void newChatAndSend()}
         onLoadOlderRuns={() => void loadOlderRuns()}
         turns={chatTurns}
+        messages={messageState ? [...messageState.byEntryId.values(), ...[...messageState.liveByRun]
+          .filter(([runId]) => !messageState.closedRuns.has(runId)).flatMap(([, items]) => [...items.values()])]
+          .sort((left, right) => left.timestamp - right.timestamp
+            || (left.runId === right.runId ? (left.liveOrdinal ?? 0) - (right.liveOrdinal ?? 0) : 0)) : []}
+        unconfirmedCount={messageState ? [...messageState.liveByRun]
+          .filter(([runId]) => messageState.closedRuns.has(runId)).reduce((total, [, items]) => total + items.size, 0) : 0}
+        historyLoading={historyLoading}
+        historyError={historyError}
+        runFeedbacks={runFeedbacks}
+        onRefreshHistory={() => { if (selectedSessionIdRef.current !== null) void loadSession(selectedSessionIdRef.current); }}
         transcriptRef={chatTranscriptRef}
         input={chatInput}
         composerRef={chatComposerRef}
@@ -1463,6 +1608,12 @@ function AgentChatPanel({
   onNewChatAndSend,
   onLoadOlderRuns,
   turns,
+  messages,
+  unconfirmedCount,
+  historyLoading,
+  historyError,
+  runFeedbacks,
+  onRefreshHistory,
   transcriptRef,
   input,
   composerRef,
@@ -1492,6 +1643,12 @@ function AgentChatPanel({
   onNewChatAndSend(): void;
   onLoadOlderRuns(): void;
   turns: readonly ChatTurn[];
+  messages: readonly SessionMessageView[];
+  unconfirmedCount: number;
+  historyLoading: boolean;
+  historyError: string | null;
+  runFeedbacks: readonly RunFeedback[];
+  onRefreshHistory(): void;
   transcriptRef: RefObject<HTMLDivElement | null>;
   input: string;
   composerRef: RefObject<HTMLTextAreaElement | null>;
@@ -1531,9 +1688,35 @@ function AgentChatPanel({
       && <div className="chat-active-run">Another conversation is responding. You can draft a message here.</div>}
     {busy && activeRunModel && <div className="chat-run-model">Responding with {activeRunModel.name}{selectedModelId !== activeRunModel.id && <span>Your new model choice will apply next time.</span>}</div>}
     <div className="chat-transcript" ref={transcriptRef} role="log" aria-live="polite" aria-relevant="additions text">
-      {hasOlderRuns && <button type="button" className="chat-more-runs" onClick={onLoadOlderRuns}>Earlier messages</button>}
-      {turns.length === 0 && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>How can I help?</strong><p>Ask about this invoice, or start a general conversation.</p></div>}
-      {turns.map((turn) => <article className="chat-turn" data-testid="chat-turn" key={turn.id}>
+      <div className="chat-history-actions">
+        {hasOlderRuns && <button type="button" className="chat-more-runs" onClick={onLoadOlderRuns} disabled={historyLoading}>Earlier messages</button>}
+        {selectedSessionId !== null && <button type="button" className="chat-more-runs" onClick={onRefreshHistory} disabled={historyLoading}>
+          {historyLoading ? 'Loading history…' : 'Refresh history'}</button>}
+      </div>
+      {historyError && <p className="chat-error" role="alert">{historyError}</p>}
+      {unconfirmedCount > 0 && <p className="chat-save-feedback" role="status">{unconfirmedCount} {unconfirmedCount === 1 ? 'message has' : 'messages have'} not been confirmed as saved. Refresh history to check.</p>}
+      {messages.length === 0 && turns.length === 0 && !historyLoading && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>How can I help?</strong><p>Ask about this invoice, or start a general conversation.</p></div>}
+      {messages.map((message) => <article className="chat-turn native-message" data-testid="chat-turn"
+        data-message-role={message.role} data-message-entry={message.entryId ?? undefined}
+        data-message-run={message.runId ?? undefined} data-message-ordinal={message.liveOrdinal ?? undefined}
+        data-persistence={message.persistence} key={message.entryId ? `entry:${message.entryId}` : `live:${message.runId}:${message.liveOrdinal}`}>
+        <div className={message.role === 'user' ? 'chat-user-message' : message.role === 'toolResult' ? 'chat-tool-result'
+          : `chat-assistant-message ${message.phase === 'streaming' ? 'sending' : message.stopReason === 'aborted' ? 'cancelled' : message.stopReason === 'error' ? 'failed' : 'completed'}`}>
+          <span className="chat-speaker">{message.role === 'user' ? 'YOU' : message.role === 'toolResult' ? 'TOOL RESULT' : 'ASSISTANT'}</span>
+          {message.role === 'toolResult' && <div className="chat-tool-identity"><strong>{message.toolName}</strong><small>{message.toolCallId}</small></div>}
+          {message.blocks.map((block, index) => block.type === 'text' ? <p key={index}>{block.text}</p>
+            : <div className="chat-tool-call" key={`${block.id}:${index}`}><strong>{block.name}</strong><small>{block.id}</small></div>)}
+          {message.phase === 'streaming' && <div className="chat-pending"><span className="loader-ring" />Responding…</div>}
+          {message.truncated && <p className="chat-save-feedback">This message is shortened for display. Its full saved content is preserved.</p>}
+          <span className={`chat-message-save ${message.persistence}`}>
+            {message.persistence === 'saved' ? 'Saved' : message.persistence === 'failed' ? 'Save failed' : 'Waiting to save'}
+          </span>
+        </div>
+      </article>)}
+      {selectedSession?.historyState !== 'legacy-read-only' && turns.filter((turn) => turn.status === 'sending').map((turn) =>
+        <div className="chat-input-intent" key={turn.id}><span>Submitting your message…</span><p>{turn.prompt}</p></div>)}
+      {selectedSession?.historyState === 'legacy-read-only' && turns.length > 0 && <p className="chat-save-feedback">Earlier conversation summaries · full message history is unavailable</p>}
+      {selectedSession?.historyState === 'legacy-read-only' && turns.map((turn) => <article className="chat-turn" data-testid="legacy-run-summary" key={turn.id}>
         <div className="chat-user-message"><span className="chat-speaker">YOU</span><p>{turn.prompt}</p></div>
         <div className={`chat-assistant-message ${turn.status}`}>
           <span className="chat-speaker">ASSISTANT</span>
@@ -1543,6 +1726,10 @@ function AgentChatPanel({
           {turn.error && <p className="chat-error">{turn.error}</p>}
         </div>
       </article>)}
+      {busy && activeAgentSessionId === selectedSessionId && !messages.some((message) => message.phase === 'streaming')
+        && <div className="chat-pending"><span className="loader-ring" />Responding…</div>}
+      {runFeedbacks.map((item) => <p className={item.status === 'failed' ? 'chat-error' : 'chat-save-feedback'} key={item.runId}>
+        {item.status === 'cancelled' ? 'Request cancelled.' : item.error ?? 'The request failed.'}</p>)}
     </div>
     <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend(); }}>
       <div className="chat-context">{contextName ? `Working with ${contextName}` : 'General conversation'}</div>

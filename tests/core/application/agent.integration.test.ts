@@ -114,7 +114,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     prepareDelete: (sessionId, at) => opened.data.sessions.prepareDelete(sessionId, at),
     delete: (sessionId, at) => opened.data.sessions.delete(sessionId, at),
   } : opened.data.sessions;
-  const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z');
+  const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z', opened.data.runs);
   const promptTrace: PromptTraceBuffer = {
     begin() {}, append() {}, end() {}, clearSession(sessionId) { clearedTraceSessions.push(sessionId); },
     query() { if (options.failTraceQuery) throw new Error('diagnostic source failed'); return { availability: 'not-started', calls: [], droppedCalls: 0 }; },
@@ -125,6 +125,15 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
 }
 
 describe('P2 Application Agent entry', () => {
+  it('rejects invalid message queries and reports legacy native history without preparing a model', async () => {
+    const { app, counts } = harness();
+    const created = await app.createSession({});
+    if (!created.ok) throw new Error(created.error.message);
+    expect(typeof app.listSessionMessages).toBe('function');
+    expect(await app.listSessionMessages({ sessionId: 0 })).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(await app.listSessionMessages({ sessionId: created.data.sessionId })).toMatchObject({ ok: true, data: { items: [], entryCount: 0, leafId: null, session: { historyState: 'legacy-read-only' } } });
+    expect(counts()).toEqual({ created: 1, preparations: 0 });
+  });
   it('creates persistent Session identity without preparing a model and runs same-Session follow-up as a new Run', async () => {
     const { app, db, counts } = harness();
     const created = await app.createSession({});

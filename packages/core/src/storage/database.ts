@@ -49,6 +49,10 @@ function runMigration(db: Database, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8): voi
       }
       if (db.query('PRAGMA foreign_key_check').all().length) throw new Error('migration_foreign_key_violation');
       db.exec('COMMIT');
+    } else if (version === 8) {
+      // Bun/SQLite can suppress a statement error in an ALTER + multi-statement exec.
+      // Execute this small migration statement by statement so the outer catch rolls back.
+      for (const statement of migrationSql(version).split(';').map((sql) => sql.trim()).filter(Boolean)) db.exec(statement);
     } else db.exec(migrationSql(version));
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* preserve migration error; caller closes the database */ }

@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'bun:test';
 import { validateToolArguments } from '@earendil-works/pi-ai';
+import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { AgentSession } from '@earendil-works/pi-coding-agent';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { Database } from 'bun:sqlite';
+import { appError, fail } from '@flowmate/contracts';
+import type { AgentNativeOutcome, AgentRunEvent, Application, NativeSessionHistory, ProviderConfig, Result } from '@flowmate/contracts';
+import { createApplication } from '../../apps/composition.ts';
+import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
+import { openDatabase } from '../../packages/core/src/storage/database.ts';
+import { deferCleanup, mkdtempSync } from '../support/resources.ts';
 import { CandidateDraftSchema, INVOICE_TOOL_NAMES, invoiceToolSchemas } from '../../packages/contracts/src/invoice.ts';
 import { toPiParameters } from '../../packages/runtime-pi/src/schema.ts';
 import { z } from 'zod';
@@ -29,6 +41,341 @@ const examples: Record<(typeof INVOICE_TOOL_NAMES)[number], unknown> = {
   compare_invoice_candidates: { leftCandidateId: 2, rightCandidateId: 3, afterPath: null, limit: 20 },
   save_invoice_candidate: { documentId: 1, candidate },
 };
+
+function writeFaultInvoice(directory: string) {
+  mkdirSync(directory, { recursive: true });
+  const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64');
+  const content = JSON.stringify([{ type: 'text', text: 'Synthetic invoice total 100.00', bbox: [0, 0, 1, 1], page_idx: 0 }]);
+  const pages = JSON.stringify([{ pageNumber: 1, text: 'Synthetic invoice total 100.00', blockCount: 1 }]);
+  writeFileSync(join(directory, 'original.png'), original);
+  writeFileSync(join(directory, 'content.json'), content);
+  writeFileSync(join(directory, 'pages.json'), pages);
+  writeFileSync(join(directory, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId: '000001',
+    datasetId: 'voxel51-hq-invoice-ocr', sourceRecordId: 'synthetic-p4-fault', datasetRevision: 'p4-fixture', qualityStatus: 'complete',
+    allowedUsesClaim: ['local test'], licenseVerification: 'not_verified', files: [{ path: 'original.png', bytes: original.length },
+      { path: 'content.json', bytes: Buffer.byteLength(content) }, { path: 'pages.json', bytes: Buffer.byteLength(pages) }] }));
+}
+
+describe('P4 real candidate commit and message persistence failures', () => {
+  it.each(['toolResult-save', 'assistant-save', 'delivery-conflict', 'blocking-write-failure'] as const)
+    ('preserves the committed candidate and actual tool facts after %s, then blocks continuation across restart', async (fault) => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-p4-tool-fault-'));
+    const product = join(root, 'product');
+    const paths = { root: product, databaseFile: join(product, 'data', 'app.sqlite'), logsDir: join(product, 'logs'),
+      artifactsDir: join(product, 'artifacts'), outputsDir: join(product, 'outputs'), runtimeDir: join(product, 'runtime') };
+    const sourceRoot = join(root, 'source');
+    const source = join(sourceRoot, '000001');
+    writeFaultInvoice(source);
+    if (fault === 'blocking-write-failure') {
+      const seeded = openDatabase(paths);
+      if (!seeded.ok) throw new Error(seeded.error.code);
+      seeded.data.db.exec("CREATE TRIGGER reject_unsafe_marker BEFORE UPDATE OF unusable ON session_native_history WHEN NEW.unusable=1 BEGIN SELECT RAISE(ABORT,'unsafe marker failed'); END;");
+      seeded.data.db.exec("CREATE TRIGGER reject_failed_terminal BEFORE UPDATE ON runs WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'terminal failed'); END;");
+      seeded.data.close();
+    }
+    const callId = `p4-save-${fault}`;
+    let documentId = 0;
+    const requests: Array<{ messages: Array<{ role: string; content?: unknown; tool_call_id?: string }> }> = [];
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      requests.push(await request.json());
+      const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
+        `data: ${JSON.stringify({ id: `candidate-fault-${requests.length}`, model: 'p4-fault-model',
+          choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+      const response = requests.length === 1
+        ? `${chunk({ role: 'assistant', tool_calls: [{ index: 0, id: callId, type: 'function',
+          function: { name: 'save_invoice_candidate', arguments: JSON.stringify({ documentId, candidate }) } }] })}${chunk({}, 'tool_calls')}`
+        : `${chunk({ role: 'assistant', content: 'The candidate was saved for review.' })}${chunk({}, 'stop')}`;
+      return new Response(`${response}data: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    deferCleanup(() => server.stop(true));
+    let adapter!: PiAgentAdapter;
+    let outcome: AgentNativeOutcome | undefined;
+    let executions = 0;
+    let prepareCount = 0;
+    let injected = false;
+    let priorPrefix: NativeSessionHistory | undefined;
+    let prefixAtFailure: NativeSessionHistory | undefined;
+    let failedEntryId: string | undefined;
+    const deliveries: Array<{ state: string; result: Result<void> }> = [];
+    let repeatedDeliveries = 0;
+    let aborts = 0;
+    const originalAbort = AgentSession.prototype.abort;
+    AgentSession.prototype.abort = function(...args) { aborts += 1; return originalAbort.apply(this, args); };
+    deferCleanup(() => { AgentSession.prototype.abort = originalAbort; });
+    const opened = await createApplication({ paths, invoiceSourceRoot: sourceRoot,
+      logger: { write: () => undefined, close: async () => undefined }, agentFactory: (tools) => {
+        adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+          credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p4-fault-key' });
+        const watch = adapter.watchSession.bind(adapter);
+        adapter.watchSession = (nativeId, save) => watch(nativeId, (history, context) => {
+          const entry = history.entries.at(-1);
+          const message = entry?.type === 'message' ? entry.message as Record<string, unknown> : null;
+          const target = fault === 'assistant-save' ? message?.role === 'assistant' && message.stopReason === 'stop'
+            : message?.role === 'toolResult';
+          if (fault !== 'delivery-conflict' && context && target && !injected) {
+            injected = true;
+            prefixAtFailure = priorPrefix && structuredClone(priorPrefix);
+            failedEntryId = context.entryId;
+            return fail(appError('storage_write_failed', 'storage', 'Controlled native message save failure.', true));
+          }
+          const result = save(history, context);
+          if (result.ok) priorPrefix = structuredClone(history);
+          return result;
+        });
+        const prepare = adapter.prepare.bind(adapter);
+        adapter.prepare = async (...args) => {
+          prepareCount += 1;
+          const result = await prepare(...args);
+          if (!result.ok) return result;
+          const nativeExecute = result.data.execute.bind(result.data);
+          return { ...result, data: { ...result.data, execute: async (input, signal, observe) => {
+            const binding = input.toolBinding!;
+            outcome = await nativeExecute({ ...input, toolBinding: { ...binding,
+              execute: async (...call) => { executions += 1; return binding.execute(...call); },
+              recordDelivery: (id, delivery) => {
+                const actual = binding.recordDelivery(id, delivery);
+                deliveries.push({ state: delivery.state, result: actual });
+                if (delivery.state === 'message_observed' && actual.ok) {
+                  const repeated = binding.recordDelivery(id, structuredClone(delivery));
+                  expect(repeated).toEqual(actual);
+                  repeatedDeliveries += 1;
+                  deliveries.push({ state: 'repeated', result: repeated });
+                }
+                if (fault === 'delivery-conflict' && delivery.state === 'message_observed' && actual.ok && !injected) {
+                  injected = true;
+                  const conflict = binding.recordDelivery(id, { ...delivery, messageObservedAt: '2000-01-01T00:00:00.000Z' });
+                  deliveries.push({ state: 'conflict', result: conflict });
+                  return conflict;
+                }
+                return actual;
+              },
+            } }, signal, observe);
+            return outcome;
+          } } };
+        };
+        return adapter;
+      } });
+    if (!opened.ok) throw new Error(opened.error.code);
+    const app = opened.data;
+    deferCleanup(() => app.close());
+    const imported = await app.importInvoiceMaterial(source);
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    documentId = imported.data.documentRef.id;
+    const session = await app.createSession({ title: 'Candidate failure' });
+    expect(session.ok).toBe(true);
+    if (!session.ok) return;
+    const sessionId = session.data.sessionId;
+    expect(await app.updateWorkspace({ expectedRevision: 0, change: { kind: 'session', sessionId } })).toMatchObject({ ok: true, data: { revision: 1 } });
+    const selected = await app.updateWorkspace({ expectedRevision: 1, change: { kind: 'document', documentId } });
+    expect(selected.ok).toBe(true);
+    if (!selected.ok) return;
+    const task = await app.startTask({ clientSequence: 1, expectedRevision: selected.data.revision,
+      documentRef: imported.data.documentRef, goal: 'Save a synthetic candidate' });
+    expect(task.ok).toBe(true);
+    if (!task.ok) return;
+    const jobId = task.data.job.jobId;
+    const current = task.data.workspace;
+    const workspace = { revision: current.revision, sessionId, documentRef: current.documentRef,
+      jobId: current.jobId, candidateRef: current.candidateRef };
+    const config: ProviderConfig = { version: 1, name: 'P4 fault model', revision: 1,
+      modelRef: { provider: 'p4-fault-fixture', model: 'p4-fault-model' },
+      native: { authPath: join(root, 'unused-auth.json'), modelsPath: null },
+      connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
+      parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
+    const events: AgentRunEvent[] = [];
+    let finish!: (event: Extract<AgentRunEvent, { type: 'run_finished' }>) => void;
+    const completion = new Promise<Extract<AgentRunEvent, { type: 'run_finished' }>>((resolve) => { finish = resolve; });
+    const request = { sessionId, text: 'Save the supplied candidate for review.', config, workspace, goalMode: 'save-candidate' as const };
+    const accepted = await app.startRun(request, { onEvent: (event) => { events.push(event); if (event.type === 'run_finished') finish(event); } });
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    const terminal = await completion;
+    expect(terminal.result).toMatchObject(fault === 'blocking-write-failure'
+      ? { ok: false, error: { code: 'storage_write_failed' } }
+      : { ok: true, data: { status: 'failed', stopped: true, error: { code: 'storage_write_failed' } } });
+    expect(injected).toBe(true);
+    expect(executions).toBe(1);
+    expect(repeatedDeliveries).toBe(fault === 'assistant-save' || fault === 'delivery-conflict' ? 1 : 0);
+    expect(outcome?.stopped).toBe(true);
+    expect(aborts).toBeGreaterThan(0);
+    expect(adapter.inspect(session.data.nativeSessionId)).toEqual({ availability: 'unusable' });
+    const callsExpected = fault === 'assistant-save' ? 2 : 1;
+    expect(requests).toHaveLength(callsExpected);
+    if (fault === 'assistant-save') {
+      const toolMessage = requests[1]!.messages.find((message) => message.role === 'tool');
+      expect(toolMessage?.tool_call_id).toBe(callId);
+      expect(JSON.parse(String(toolMessage?.content))).toMatchObject({ candidateId: 1, jobId, sequence: 1 });
+    }
+    const candidates = await app.listJobCandidates({ jobId, limit: 20 });
+    expect(candidates).toMatchObject({ ok: true, data: { items: [{ candidateId: 1, jobId, sequence: 1 }] } });
+    expect(await app.queryJobCandidate({ jobId, candidateId: 1 })).toMatchObject({ ok: true });
+    const page = await app.listSessionMessages({ sessionId, limit: 100 });
+    expect(page.ok).toBe(true);
+    if (!page.ok) return;
+    expect(page.data.session.availability).toBe('unusable');
+    expect(page.data.items.map((message) => message.role)).toEqual(fault === 'toolResult-save' || fault === 'blocking-write-failure'
+      ? ['user', 'assistant'] : fault === 'delivery-conflict'
+        ? ['user', 'assistant', 'toolResult', 'assistant'] : ['user', 'assistant', 'toolResult']);
+    if (fault === 'delivery-conflict') expect(page.data.items.at(-1)).toMatchObject({ role: 'assistant', stopReason: 'aborted' });
+    if (fault !== 'delivery-conflict') {
+      expect(page.data.items.some((message) => message.entryId === failedEntryId)).toBe(false);
+      expect(events.some((event) => event.type === 'message_upsert' && event.message.persistence === 'failed')).toBe(true);
+      expect(events.some((event) => event.type === 'message_upsert' && event.message.entryId === failedEntryId && event.message.persistence === 'saved')).toBe(false);
+    } else expect(deliveries.find((delivery) => delivery.state === 'conflict')?.result).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    if (fault === 'blocking-write-failure') expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: true } });
+    else {
+      expect(await app.queryRun(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'failed', cleanup: { stopped: true }, stoppedAt: expect.any(String) } });
+      expect(await app.startRun(request)).toMatchObject({ ok: false, error: { code: 'agent_session_unusable' } });
+    }
+    expect(requests).toHaveLength(callsExpected);
+    expect(await app.close()).toMatchObject({ ok: true, data: { closed: true } });
+    const db = new Database(paths.databaseFile);
+    let dbClosed = false;
+    const closeDb = () => { if (!dbClosed) { dbClosed = true; db.close(); } };
+    deferCleanup(closeDb);
+    const committedEntries = db.query('SELECT entry_id,entry_json,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(sessionId);
+    const head = db.query('SELECT leaf_id,entry_count,unusable FROM session_native_history WHERE session_id=?').get(sessionId) as { leaf_id: string | null; entry_count: number; unusable: number };
+    expect(head.unusable).toBe(fault === 'blocking-write-failure' ? 0 : 1);
+    expect(head.entry_count).toBe(committedEntries.length);
+    expect(head.leaf_id).toBe((committedEntries.at(-1) as { entry_id: string } | undefined)?.entry_id ?? null);
+    if (fault !== 'delivery-conflict') {
+      if (!prefixAtFailure) throw new Error('Missing actual committed prefix at the save failure.');
+      expect(committedEntries.map((entry) => (entry as { entry_id: string }).entry_id)).not.toContain(failedEntryId);
+      expect(head.leaf_id).toBe(prefixAtFailure.leafId);
+      expect(committedEntries.map((entry) => (entry as { entry_json: string }).entry_json))
+        .toEqual(prefixAtFailure.entries.map((entry) => JSON.stringify(entry)));
+    }
+    expect(db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 1 });
+    expect(db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
+    expect(db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 1 });
+    const tool = db.query('SELECT status,result_json,delivery_json FROM tool_calls WHERE native_tool_call_id=?').get(callId) as { status: string; result_json: string; delivery_json: string };
+    expect(tool.status).toBe('succeeded');
+    expect(JSON.parse(tool.result_json)).toMatchObject({ status: 'succeeded', committedCandidateId: 1 });
+    expect(JSON.parse(tool.delivery_json).state).toBe(fault === 'assistant-save' ? 'request_observed'
+      : fault === 'delivery-conflict' ? 'message_observed' : 'not_attempted');
+    if (fault === 'toolResult-save' || fault === 'blocking-write-failure') expect(deliveries).toEqual([]);
+    if (fault === 'blocking-write-failure') {
+      expect(db.query('SELECT status FROM runs WHERE id=?').get(accepted.data.runId)).toEqual({ status: 'running' });
+      db.exec('DROP TRIGGER reject_unsafe_marker;');
+      db.exec('DROP TRIGGER reject_failed_terminal;');
+    }
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    closeDb();
+    let recoveredPrepareCount = 0;
+    const recovered = await createApplication({ paths, invoiceSourceRoot: sourceRoot,
+      logger: { write: () => undefined, close: async () => undefined }, agentFactory: (tools) => {
+        const restored = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+          credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p4-fault-key' });
+        const prepare = restored.prepare.bind(restored);
+        restored.prepare = async (...args) => { recoveredPrepareCount += 1; return prepare(...args); };
+        return restored;
+      } });
+    expect(recovered.ok).toBe(true);
+    if (!recovered.ok) return;
+    deferCleanup(() => recovered.data.close());
+    const recoveredPage = await recovered.data.listSessionMessages({ sessionId, limit: 100 });
+    expect(recoveredPage).toMatchObject({ ok: true, data: { session: { availability: 'unusable' },
+      items: page.data.items.map((message) => ({ ...message, liveOrdinal: null })) } });
+    expect(await recovered.data.startRun(request)).toMatchObject({ ok: false, error: { code: 'agent_session_unusable' } });
+    expect(await recovered.data.queryRun(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'failed' } });
+    expect(await recovered.data.listJobCandidates({ jobId, limit: 20 })).toEqual(candidates);
+    expect(recoveredPrepareCount).toBe(0);
+    expect(prepareCount).toBe(1);
+    expect(requests).toHaveLength(callsExpected);
+    expect(executions).toBe(1);
+    expect(priorPrefix?.entries.map((entry) => entry.id)).toEqual(committedEntries.map((entry) => (entry as { entry_id: string }).entry_id));
+  }, 30_000);
+});
+
+it('persists real material revocation between conversion and fetch while saved history remains readable', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-p4-revoke-'));
+  const product = join(root, 'product');
+  const paths = { root: product, databaseFile: join(product, 'data', 'app.sqlite'), logsDir: join(product, 'logs'),
+    artifactsDir: join(product, 'artifacts'), outputsDir: join(product, 'outputs'), runtimeDir: join(product, 'runtime') };
+  const sourceRoot = join(root, 'source');
+  const source = join(sourceRoot, '000001');
+  writeFaultInvoice(source);
+  let requestCount = 0;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    await request.json(); requestCount += 1;
+    const chunks = [{ role: 'assistant', content: 'Synthetic invoice saved conversation.' }, {}].map((delta, index) =>
+      `data: ${JSON.stringify({ id: 'revocation-fixture', model: 'p4-revoke', choices: [{ index: 0, delta, finish_reason: index ? 'stop' : null }] })}\n\n`);
+    return new Response(`${chunks.join('')}data: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  deferCleanup(() => server.stop(true));
+  let app!: Application;
+  let documentId = 0;
+  let revokeOnDispatch = false;
+  let revocation: ReturnType<typeof app.revokeDocumentUse> | undefined;
+  let prepares = 0;
+  const opened = await createApplication({ paths, invoiceSourceRoot: sourceRoot,
+    logger: { write: () => undefined, close: async () => undefined }, agentFactory: (tools) => {
+      const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-revoke-key' });
+      const prepare = adapter.prepare.bind(adapter);
+      adapter.prepare = async (...args) => {
+        prepares += 1;
+        const result = await prepare(...args);
+        if (!result.ok) return result;
+        const execute = result.data.execute.bind(result.data);
+        return { ...result, data: { ...result.data, execute: (input, signal, observe) => execute(input, signal, (event) => {
+          observe(event);
+          if (revokeOnDispatch && event.type === 'request_budget' && !revocation) revocation = app.revokeDocumentUse(documentId);
+        }) } };
+      };
+      return adapter;
+    } });
+  if (!opened.ok) throw new Error(opened.error.message);
+  app = opened.data;
+  deferCleanup(() => app.close());
+  const imported = await app.importInvoiceMaterial(source);
+  if (!imported.ok) throw new Error(imported.error.message);
+  documentId = imported.data.documentRef.id;
+  const session = await app.createSession({ title: 'Revoked native memory' });
+  if (!session.ok) throw new Error(session.error.message);
+  const sessionId = session.data.sessionId;
+  await app.updateWorkspace({ expectedRevision: 0, change: { kind: 'session', sessionId } });
+  const selected = await app.updateWorkspace({ expectedRevision: 1, change: { kind: 'document', documentId } });
+  if (!selected.ok) throw new Error(selected.error.message);
+  const workspace = { revision: selected.data.revision, sessionId, documentRef: selected.data.documentRef,
+    jobId: selected.data.jobId, candidateRef: selected.data.candidateRef };
+  const config: ProviderConfig = { version: 1, name: 'Revocation fixture', revision: 1,
+    modelRef: { provider: 'p4-revoke-fixture', model: 'p4-revoke' }, native: { authPath: join(root, 'unused-auth.json'), modelsPath: null },
+    connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
+  const request = { sessionId, text: 'Use the selected synthetic material.', config, workspace, goalMode: 'answer' as const };
+  const run = async () => {
+    let finish!: (event: Extract<AgentRunEvent, { type: 'run_finished' }>) => void;
+    const completion = new Promise<Extract<AgentRunEvent, { type: 'run_finished' }>>((resolve) => { finish = resolve; });
+    const accepted = await app.startRun(request, { onEvent: (event) => { if (event.type === 'run_finished') finish(event); } });
+    if (!accepted.ok) throw new Error(accepted.error.message);
+    return completion;
+  };
+  expect((await run()).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const first = await app.listSessionMessages({ sessionId });
+  if (!first.ok) throw new Error(first.error.message);
+  expect(first.data.items).toHaveLength(2);
+  revokeOnDispatch = true;
+  expect((await run()).result).toMatchObject({ ok: true, data: { status: 'cancelled', stopped: true } });
+  expect(await revocation).toMatchObject({ ok: true, data: { affectedSessionIds: [sessionId], stopRequested: true } });
+  expect(requestCount).toBe(1);
+  const history = await app.listSessionMessages({ sessionId });
+  expect(history.ok).toBe(true);
+  if (!history.ok) throw new Error(history.error.message);
+  expect(history.data.session.modelUseBlocked).toBe(true);
+  expect(history.data.items.slice(0, 2)).toEqual(first.data.items);
+  expect(await app.startRun(request)).toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
+  expect(prepares).toBe(2);
+  expect(requestCount).toBe(1);
+  expect(await app.close()).toMatchObject({ ok: true, data: { closed: true } });
+  const db = new Database(paths.databaseFile, { readonly: true });
+  try {
+    expect(db.query("SELECT json_extract(metadata_json,'$.model_use_blocked.reason') AS reason, json_extract(metadata_json,'$.model_use_blocked.documentIds[0]') AS documentId FROM sessions WHERE id=?")
+      .get(sessionId)).toEqual({ reason: 'document_use_revoked', documentId });
+  }
+  finally { db.close(); }
+});
 
 describe('Pi argument schema conversion', () => {
   it('preserves all supported strict Zod constraints through the installed Pi validator', async () => {

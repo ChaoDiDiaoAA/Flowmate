@@ -269,6 +269,110 @@ export type SessionSnapshot = {
   hasBusinessHistory: boolean;
 };
 
+export type MessageTextBlock = { type: 'text'; text: string };
+export type MessageToolCallBlock = { type: 'toolCall'; id: string; name: string };
+export type MessageDisplayBlock = MessageTextBlock | MessageToolCallBlock;
+export type SessionMessageViewBase = {
+  entryId: string | null; runId: DbId | null; liveOrdinal: number | null;
+  timestamp: number; persistence: 'pending' | 'saved' | 'failed'; truncated: boolean;
+};
+export type SessionUserMessageView = SessionMessageViewBase & {
+  role: 'user'; blocks: MessageTextBlock[]; phase: 'ended'; stopReason: null;
+  toolCallId: null; toolName: null; isError: null; textOrigin: 'product-input' | 'native-content';
+};
+export type SessionAssistantMessageView = SessionMessageViewBase & {
+  role: 'assistant'; blocks: MessageDisplayBlock[]; phase: 'streaming' | 'ended';
+  stopReason: 'pending' | 'stop' | 'length' | 'toolUse' | 'error' | 'aborted' | 'deferred';
+  toolCallId: null; toolName: null; isError: null; textOrigin: 'native-content' | null;
+};
+export type SessionToolResultMessageView = SessionMessageViewBase & {
+  role: 'toolResult'; blocks: MessageTextBlock[]; phase: 'ended'; stopReason: null;
+  toolCallId: string; toolName: string; isError: boolean; textOrigin: null;
+};
+export type SessionMessageView = SessionUserMessageView | SessionAssistantMessageView | SessionToolResultMessageView;
+export type SessionMessagesRequest = { sessionId: DbId; beforeEntryId?: string; limit?: number };
+export type NormalizedSessionMessagesRequest = { sessionId: DbId; beforeEntryId?: string; limit: number };
+export type SessionMessagesPage = {
+  session: SessionSnapshot; leafId: string | null; entryCount: number;
+  items: SessionMessageView[]; nextBeforeEntryId: string | null;
+};
+export type NativeEntryRunBinding = { entryId: string; runId: DbId };
+export type NativeEntryLiveBinding = NativeEntryRunBinding & { liveOrdinal: number };
+export type NativeHistoryAppendContext = NativeEntryRunBinding;
+export type NativeHistoryDisplayRecord = { history: NativeSessionHistory | null; bindings: NativeEntryRunBinding[] };
+export type MessageRunInput = {
+  runId: DbId; input: Readonly<InputRecord>; goalMode: import('./workspace.ts').GoalMode | null;
+};
+export type NativeMessageProjectionInput = {
+  history: NativeSessionHistory; bindings: NativeEntryRunBinding[]; runInputs: MessageRunInput[];
+  beforeEntryId?: string; limit: number; liveBindings?: readonly NativeEntryLiveBinding[];
+};
+
+const messageDbIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const messageIdSchema = z.string().min(1);
+const messageCursorSchema = messageIdSchema.max(128);
+const messageTextBlockSchema = z.object({ type: z.literal('text'), text: z.string() }).strict();
+const messageToolCallBlockSchema = z.object({ type: z.literal('toolCall'), id: messageIdSchema, name: messageIdSchema }).strict();
+const messageBaseShape = {
+  entryId: messageIdSchema.nullable(), runId: messageDbIdSchema.nullable(), liveOrdinal: messageDbIdSchema.nullable(),
+  timestamp: z.number().finite(), persistence: z.enum(['pending', 'saved', 'failed']), truncated: z.boolean(),
+};
+const messageNullResultShape = { toolCallId: z.null(), toolName: z.null(), isError: z.null() };
+export const SessionMessageViewSchema: z.ZodType<SessionMessageView> = z.discriminatedUnion('role', [
+  z.object({ ...messageBaseShape, ...messageNullResultShape, role: z.literal('user'),
+    blocks: z.array(messageTextBlockSchema).max(256), phase: z.literal('ended'), stopReason: z.null(),
+    textOrigin: z.enum(['product-input', 'native-content']) }).strict(),
+  z.object({ ...messageBaseShape, ...messageNullResultShape, role: z.literal('assistant'),
+    blocks: z.array(z.discriminatedUnion('type', [messageTextBlockSchema, messageToolCallBlockSchema])).max(256),
+    phase: z.enum(['streaming', 'ended']), stopReason: z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']),
+    textOrigin: z.literal('native-content').nullable() }).strict(),
+  z.object({ ...messageBaseShape, role: z.literal('toolResult'), blocks: z.array(messageTextBlockSchema).max(256),
+    phase: z.literal('ended'), stopReason: z.null(), toolCallId: messageIdSchema, toolName: messageIdSchema,
+    isError: z.boolean(), textOrigin: z.null() }).strict(),
+]).superRefine((message, context) => {
+  const textBytes = message.blocks.reduce((sum, block) => sum + (block.type === 'text' ? new TextEncoder().encode(block.text).length : 0), 0);
+  if (textBytes > 65_536) context.addIssue({ code: 'custom', message: 'Message display text exceeds its byte limit.' });
+  if (message.persistence === 'saved' && message.entryId === null) context.addIssue({ code: 'custom', message: 'Saved message needs an entry identity.' });
+  if (message.role === 'assistant' && (message.blocks.some(block => block.type === 'text') !== (message.textOrigin === 'native-content'))) {
+    context.addIssue({ code: 'custom', message: 'Assistant text origin must describe the projected blocks.' });
+  }
+});
+
+export const SessionMessagesRequestSchema = z.object({ sessionId: messageDbIdSchema,
+  beforeEntryId: messageCursorSchema.optional(), limit: z.number().int().min(1).max(100).default(50) }).strict();
+export function normalizeSessionMessagesRequest(raw: unknown): Result<NormalizedSessionMessagesRequest> {
+  const parsed = SessionMessagesRequestSchema.safeParse(raw);
+  return parsed.success ? { ok: true, data: parsed.data } : { ok: false,
+    error: { code: 'input_invalid', category: 'input', message: 'Conversation message query is invalid.', retryable: false } };
+}
+export const SessionSnapshotSchema: z.ZodType<SessionSnapshot> = z.object({
+  sessionId: messageDbIdSchema, nativeSessionId: messageIdSchema, title: z.string(),
+  status: z.enum(['active', 'archived']), createdAt: z.string().datetime({ offset: true }), updatedAt: z.string().datetime({ offset: true }),
+  availability: z.enum(['ready', 'busy', 'unusable', 'history-unavailable', 'archived']),
+  historyState: z.enum(['recoverable', 'legacy-read-only', 'invalid']), activeRunId: messageDbIdSchema.nullable(),
+  modelUseBlocked: z.boolean(), hasBusinessHistory: z.boolean(),
+}).strict();
+export const SessionMessagesPageSchema: z.ZodType<SessionMessagesPage> = z.object({
+  session: SessionSnapshotSchema, leafId: messageIdSchema.nullable(), entryCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  items: z.array(SessionMessageViewSchema).max(100), nextBeforeEntryId: messageCursorSchema.nullable(),
+}).strict().superRefine((page, context) => {
+  if (page.items.some(item => item.phase !== 'ended' || item.persistence !== 'saved' || item.entryId === null)) {
+    context.addIssue({ code: 'custom', message: 'Message queries contain saved, ended entries only.' });
+  }
+  if (new TextEncoder().encode(JSON.stringify({ items: page.items, nextBeforeEntryId: page.nextBeforeEntryId })).length > 1_048_576) {
+    context.addIssue({ code: 'custom', message: 'Message page exceeds its byte limit.' });
+  }
+});
+export const MessageUpsertEventSchema = z.object({
+  type: z.literal('message_upsert'), runId: messageDbIdSchema, sessionId: messageDbIdSchema,
+  nativeSessionId: messageIdSchema, sequence: messageDbIdSchema, at: z.string().datetime({ offset: true }),
+  message: SessionMessageViewSchema,
+}).strict().superRefine((event, context) => {
+  if (event.message.runId !== event.runId || event.message.liveOrdinal === null) {
+    context.addIssue({ code: 'custom', message: 'Live message must belong to its Run and have its real ordinal.' });
+  }
+});
+
 export type DeleteSessionResult = { deletedSessionId: DbId; disposition: 'hidden' | 'permanent' };
 
 export type CreateSessionRequest = { title?: string; expectedRevision?: number };
@@ -314,6 +418,7 @@ export type AgentRunEvent = {
   | { type: 'run_progress'; phase: 'created' | 'running' | 'stopping'; reason?: string }
   | { type: 'text_delta'; text: string }
   | { type: 'tool_progress'; toolName: string; label: string; phase: 'running' | 'succeeded' | 'failed' | 'cancelled' }
+  | { type: 'message_upsert'; message: SessionMessageView }
   | { type: 'run_finished'; result: Result<AgentOutcome> }
 );
 
@@ -377,6 +482,7 @@ export interface Application {
   listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
   querySession(sessionId: DbId): Promise<Result<SessionSnapshot>>;
   listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>>;
+  listSessionMessages(request: SessionMessagesRequest): Promise<Result<SessionMessagesPage>>;
   queryPromptTrace(runId: DbId, callSequence?: number): Promise<Result<import('./diagnostics.ts').PromptTraceResult>>;
   startRun(request: AgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
   readWorkspace(): Promise<Result<import('./workspace.ts').WorkspaceSnapshot>>;

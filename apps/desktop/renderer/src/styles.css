@@ -597,3 +597,17 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
   .chat-directory-row { flex-wrap: wrap; }
   .chat-directory-actions, .chat-directory-rename { width: 100%; padding-left: 0; }
 }
+
+.chat-history-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.chat-history-actions .chat-more-runs { width: auto; margin: 0; }
+.native-message .chat-user-message, .native-message .chat-assistant-message { margin-bottom: 0; }
+.chat-tool-result { padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
+.chat-tool-result p { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-tool-call, .chat-tool-identity { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; overflow-wrap: anywhere; }
+.chat-tool-call { padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.chat-tool-call small, .chat-tool-identity small { color: var(--foreground-muted); font-size: 11px; }
+.chat-message-save { display: block; margin-top: 8px; color: var(--foreground-muted); font-size: 11px; }
+.chat-message-save.failed { color: var(--negative); }
+.chat-save-feedback { color: var(--foreground-muted); font-size: 12px; line-height: 1.5; }
+.chat-input-intent { margin: 12px 0; padding: 10px; border: 1px dashed var(--border); border-radius: 8px; color: var(--foreground-muted); font-size: 12px; }
+.chat-input-intent p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }

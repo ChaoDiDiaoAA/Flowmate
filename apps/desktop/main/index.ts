@@ -11,6 +11,10 @@ import {
   normalizeRenameSessionRequest,
   normalizeSessionId,
   normalizeSessionRunsRequest,
+  normalizeSessionMessagesRequest,
+  SessionMessagesPageSchema,
+  MessageUpsertEventSchema,
+  AppErrorSchema,
   StartTaskRequestSchema,
   SelectCandidateRequestSchema,
   WorkspaceChangeSchema,
@@ -29,6 +33,7 @@ import type {
   RunSnapshot,
   SessionPage,
   SessionRunsPage,
+  SessionMessagesPage,
   SessionSnapshot,
   RuntimeState,
 } from '@flowmate/contracts';
@@ -55,6 +60,7 @@ const channels = {
   listSessions: 'flowmate:list-sessions',
   querySession: 'flowmate:query-session',
   listSessionRuns: 'flowmate:list-session-runs',
+  listSessionMessages: 'flowmate:list-session-messages',
   queryPromptTrace: 'flowmate:query-prompt-trace',
   startRun: 'flowmate:start-run',
   cancelRun: 'flowmate:cancel-run',
@@ -187,6 +193,7 @@ async function bootstrap(): Promise<void> {
       return;
     }
     const desktopEvent = event.type === 'agent_run_event' ? event.value : event as DesktopEvent;
+    if (desktopEvent.type === 'message_upsert' && !MessageUpsertEventSchema.safeParse(desktopEvent).success) return;
     for (const [webContentsId] of subscriptions) {
       const contents = BrowserWindow.getAllWindows().find((window) => window.webContents.id === webContentsId)?.webContents;
       if (contents && !contents.isDestroyed()) contents.send('flowmate:event', desktopEvent);
@@ -328,6 +335,7 @@ function registerIpc(): void {
   handle(channels.listSessions, async (_event, inputRaw) => listSessions(inputRaw));
   handle(channels.querySession, async (_event, sessionIdRaw) => querySession(sessionIdRaw));
   handle(channels.listSessionRuns, async (_event, inputRaw) => listSessionRuns(inputRaw));
+  handle(channels.listSessionMessages, async (_event, inputRaw) => listSessionMessages(inputRaw));
   handle(channels.queryPromptTrace, async (_event, runIdRaw, sequenceRaw) => queryPromptTrace(runIdRaw, sequenceRaw));
   handle(channels.startRun, async (_event, inputRaw) => startRun(inputRaw));
   handle(channels.cancelRun, async (_event, runIdRaw) => cancelRun(runIdRaw));
@@ -679,6 +687,25 @@ async function listSessionRuns(raw: unknown): Promise<Result<SessionRunsPage>> {
   if (!input.ok) return input;
   try { return await host.request({ type: 'list_session_runs', input: input.data }) as Result<SessionRunsPage>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Session Run 历史暂不可用。', true)); }
+}
+
+async function listSessionMessages(raw: unknown): Promise<Result<SessionMessagesPage>> {
+  const input = normalizeSessionMessagesRequest(raw);
+  if (!input.ok) return input;
+  try {
+    const result = await host.request({ type: 'list_session_messages', input: input.data }) as Result<unknown>;
+    if (!result || typeof result !== 'object' || result.ok !== true && result.ok !== false) {
+      return fail(appError('session_history_invalid', 'session', 'Message query returned an invalid result.'));
+    }
+    if (!result.ok) {
+      const error = AppErrorSchema.safeParse(result.error);
+      return error.success ? { ok: false, error: error.data }
+        : fail(appError('session_history_invalid', 'session', 'Message query returned an invalid error.'));
+    }
+    const parsed = SessionMessagesPageSchema.safeParse(result.data);
+    return parsed.success && parsed.data.session.sessionId === input.data.sessionId ? { ok: true, data: parsed.data }
+      : fail(appError('session_history_invalid', 'session', 'Message query returned an invalid projection.'));
+  } catch { return fail(appError('host_request_failed', 'runtime', 'Session 消息暂不可用。', true)); }
 }
 
 async function queryPromptTrace(runIdRaw: unknown, sequenceRaw?: unknown): Promise<Result<PromptTraceResult>> {

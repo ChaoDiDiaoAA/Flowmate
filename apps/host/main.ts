@@ -402,6 +402,10 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listSessionRuns(command.input) });
       return;
     }
+    if (command.type === 'list_session_messages') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listSessionMessages(command.input) });
+      return;
+    }
     if (command.type === 'query_prompt_trace') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryPromptTrace(command.runId, command.callSequence) });
       return;

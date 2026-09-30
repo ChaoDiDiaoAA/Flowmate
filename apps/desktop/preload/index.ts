@@ -18,6 +18,7 @@ const bridge: DesktopBridge = {
   listSessions: (request = {}) => ipcRenderer.invoke('flowmate:list-sessions', request),
   querySession: (sessionId) => ipcRenderer.invoke('flowmate:query-session', sessionId),
   listSessionRuns: (request) => ipcRenderer.invoke('flowmate:list-session-runs', request),
+  listSessionMessages: (request) => ipcRenderer.invoke('flowmate:list-session-messages', request),
   queryPromptTrace: (runId, callSequence) => ipcRenderer.invoke('flowmate:query-prompt-trace', runId, callSequence),
   startRun: (input) => ipcRenderer.invoke('flowmate:start-run', input),
   cancelRun: (runId) => ipcRenderer.invoke('flowmate:cancel-run', runId),

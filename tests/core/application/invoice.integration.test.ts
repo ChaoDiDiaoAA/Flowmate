@@ -86,7 +86,7 @@ describe('P3 Workspace and Run admission', () => {
       close: async () => ({ stopped: true, closed: true, errors: [] }),
     };
     const sessionAgent = preparedP2Agent(() => undefined, () => undefined);
-    const sessionService = new SessionService(opened.data.sessions, sessionAgent, () => stubRuntime.state(), now);
+    const sessionService = new SessionService(opened.data.sessions, sessionAgent, () => stubRuntime.state(), now, opened.data.runs);
     const productApplication = { documents: opened.data.documents, jobs: opened.data.jobs, candidates: opened.data.candidates,
       events: opened.data.businessEvents, importInvoiceMaterial: async () => opened.data.documents.get(1),
       readDocumentPage: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
@@ -157,7 +157,7 @@ describe('P3 Workspace and Run admission', () => {
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const stale = { revision: current.data.revision - 1, documentRef: current.data.documentRef, jobId: current.data.jobId,
       candidateRef: current.data.candidateRef, sessionId: native.data.sessionId };
-    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now);
+    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs);
     const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService);
     expect(await app.startRun({ sessionId: native.data.sessionId, text: 'Review invoice', config, workspace: stale }))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
@@ -201,7 +201,7 @@ describe('P3 Workspace and Run admission', () => {
       recorder: createToolRecorder(opened.data.toolCalls, now), isSessionModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId), now });
     const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, agent, provider, tools: toolExecutor,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
-    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now);
+    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs);
     const workspaceService = new WorkspaceService(opened.data.workspace, now);
     const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService,
       undefined, workspaceService);
