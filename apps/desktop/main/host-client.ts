@@ -22,6 +22,7 @@ export class HostClient {
   private processExited = false;
   private exited = Promise.resolve<number | null>(null);
   private resolveExit: ((code: number | null) => void) | null = null;
+  private closedReport: { closed: boolean; stopped: boolean; errors: readonly unknown[] } | null = null;
   private credentialHandler: ((request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>) | null = null;
 
   public get state(): HostState | null { return this.currentState; }
@@ -70,7 +71,6 @@ export class HostClient {
       this.processExited = true;
       this.resolveExit?.(code);
       this.resolveExit = null;
-      this.failAll('host_exited', 'Bun Host 已退出。');
       if (!startupSettled) settleStartup(fail(appError('host_exited', 'runtime', 'Bun Host 在就绪前退出。', true)));
       if (!this.expectedExit) this.emit({ type: 'host_state', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: userDataRoot } });
     });
@@ -117,13 +117,24 @@ export class HostClient {
   }
 
   public async close(): Promise<Result<{ closed: boolean; stopped: boolean; errors: readonly unknown[] }>> {
+    if (this.closedReport && this.processExited) return ok(this.closedReport);
     if (!this.child) return ok({ closed: true, stopped: true, errors: [] });
-    if (this.processExited || this.child.exitCode !== null) return ok({ closed: true, stopped: true, errors: [] });
+    if (this.processExited || this.child.exitCode !== null) return ok({ closed: true, stopped: false,
+      errors: [appError('host_exited', 'runtime', 'Bun Host 已退出，执行停止与清理未确认。', true)] });
     try {
-      const response = await this.request({ type: 'close' }, 15_000) as Result<{ closed: boolean; stopped: boolean; errors: readonly unknown[] }>;
+      const response = this.closedReport ? ok(this.closedReport)
+        : await this.request({ type: 'close' }, 15_000) as Result<{ closed: boolean; stopped: boolean; errors: readonly unknown[] }>;
       if (response.ok && response.data.closed) {
+        this.closedReport = response.data;
         this.expectedExit = true;
-        await Promise.race([this.exited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const exited = await Promise.race([this.exited.then(() => true), new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), 2_000);
+          })]);
+          if (!exited) return ok({ ...response.data, closed: false, errors: [...response.data.errors,
+            appError('host_exit_unconfirmed', 'runtime', 'Bun Host 已确认清理，但进程退出尚未确认。', true)] });
+        } finally { clearTimeout(timer); }
       }
       return response;
     } catch {
@@ -162,6 +173,8 @@ export class HostClient {
       }
     });
     input.on('close', () => {
+      // Exit can precede stdout draining its buffered close acknowledgement.
+      this.failAll('host_exited', 'Bun Host 输出通道已关闭。');
       if (!this.expectedExit) this.emit({ type: 'host_state', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath } });
     });
   }

@@ -83,6 +83,8 @@ export function openDatabase(paths: ProductPaths): Result<DbHandle> {
     mkdirSync(paths.artifactsDir, { recursive: true });
     mkdirSync(paths.outputsDir, { recursive: true });
     mkdirSync(paths.runtimeDir, { recursive: true });
+    const created = validateProductPaths(paths, validated.data);
+    if (!created.ok) return created;
     db = new Database(paths.databaseFile, { create: true });
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 1000; PRAGMA journal_mode = DELETE; PRAGMA locking_mode = EXCLUSIVE;');
     migrateToLatest(db);

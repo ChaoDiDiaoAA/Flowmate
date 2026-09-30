@@ -3,7 +3,7 @@ import { describe, expect, it, mock } from 'bun:test';
 import { PiProviderAdapter, type FetchLike } from '../../packages/runtime-pi/src/provider.ts';
 import { prepareModelRuntime } from '../../packages/runtime-pi/src/model-runtime.ts';
 import type { ProviderConfig } from '../../packages/contracts/src/runtime.ts';
-import type { NativeObservation } from '../../packages/contracts/src/ports.ts';
+import type { NativeObservation, NativeOutcome } from '../../packages/contracts/src/ports.ts';
 
 const config: ProviderConfig = {
   version: 1,
@@ -239,6 +239,46 @@ describe('PiProviderAdapter', () => {
     expect(outcome.partial).toBe(false);
     expect(outcome.usage.attempts).toBe(1);
     expect(outcome.usage.attemptsComplete).toBe(false);
+  });
+
+  it('[F-output-limit-clock] keeps the stop grace bounded when the wall clock moves backward', async () => {
+    const originalDateNow = Date.now;
+    let wallClockShift = 0;
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let guard: ReturnType<typeof setTimeout> | undefined;
+    let pending: Promise<NativeOutcome> | undefined;
+    const adapter = new PiProviderAdapter({ runtimeApiKey: 'SYNTHETIC_ONLY', fetch: async (_request, init) => {
+      const encoded = new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ index: 0,
+        delta: { content: 'x'.repeat(256 * 1024 + 1) }, finish_reason: null }] })}\n\n`);
+      return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        bodyController = controller;
+        controller.enqueue(encoded);
+        init?.signal?.addEventListener('abort', () => { wallClockShift = -60_000; }, { once: true });
+      } }), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    try {
+      Date.now = () => originalDateNow() + wallClockShift;
+      const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 25 }, new AbortController().signal);
+      if (!prepared.ok) throw new Error(prepared.error.code);
+      pending = prepared.data.execute(input, new AbortController().signal, () => undefined);
+      const result = await Promise.race([
+        pending.then((outcome) => ({ kind: 'outcome' as const, outcome })),
+        new Promise<{ kind: 'guard' }>((resolve) => { guard = setTimeout(() => resolve({ kind: 'guard' }), 1_000); }),
+      ]);
+      expect(wallClockShift).toBe(-60_000);
+      expect(result.kind).toBe('outcome');
+      if (result.kind === 'outcome') {
+        expect(result.outcome).toMatchObject({ stopped: false, error: { code: 'provider_output_limit' },
+          cleanupErrors: [{ code: 'stop_unconfirmed' }] });
+        expect((await adapter.close()).closed).toBe(false);
+      }
+    } finally {
+      if (guard !== undefined) clearTimeout(guard);
+      Date.now = originalDateNow;
+      bodyController?.close();
+      await pending;
+      await adapter.close();
+    }
   });
 
   it('[F-auth-source-change] does not turn credentials removed after prepare into success', async () => {

@@ -3,11 +3,129 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
+import { createServer } from 'node:http';
+import { openDatabase } from '@flowmate/core';
+import { resolveProductPaths } from '@flowmate/shared';
 import { SessionMessageViewSchema } from '@flowmate/contracts';
 import type { SessionMessagesPage, SessionMessageView, Result } from '@flowmate/contracts';
 import { mkdtemp } from '../support/resources.ts';
 import { HostClient, safeChildEnvironment } from '../../apps/desktop/main/host-client.ts';
+
+it('does not report Host closure from an acknowledgement while its process is still alive', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-host-exit-confirmation-'));
+  mkdirSync(join(root, 'apps', 'host'), { recursive: true });
+  writeFileSync(join(root, 'apps', 'host', 'main.ts'), [
+    "import { createInterface } from 'node:readline';",
+    "console.log(JSON.stringify({ version: 1, type: 'ready', state: { version: 1, ready: true, host: 'ready', userDataPath: 'synthetic' } }));",
+    'const input = createInterface({ input: process.stdin });',
+    "input.on('line', line => { const request = JSON.parse(line); console.log(JSON.stringify({ version: 1, type: 'response', requestId: request.requestId, value: { ok: true, data: { stopped: true, closed: true, errors: [] } } })); });",
+    "input.on('close', () => process.exit(0));",
+  ].join('\n'));
+  const client = new HostClient();
+  expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: true });
+  const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  try {
+    expect(await client.close()).toMatchObject({ ok: true, data: {
+      stopped: true, closed: false, errors: [{ code: 'host_exit_unconfirmed' }],
+    } });
+    expect(child.exitCode).toBeNull();
+    const exited = once(child, 'exit');
+    child.stdin.end();
+    await exited;
+    expect(await client.close()).toMatchObject({ ok: true, data: { stopped: true, closed: true, errors: [] } });
+  } finally {
+    if (child.exitCode === null) { const exited = once(child, 'exit'); child.stdin.end(); await exited; }
+  }
+}, 10_000);
+
+it('accepts a buffered Host close acknowledgement after the child exits normally', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-host-buffered-close-'));
+  mkdirSync(join(root, 'apps', 'host'), { recursive: true });
+  writeFileSync(join(root, 'apps', 'host', 'main.ts'), [
+    "import { createInterface } from 'node:readline';",
+    "console.log(JSON.stringify({ version: 1, type: 'ready', state: { version: 1, ready: true, host: 'ready', userDataPath: 'synthetic' } }));",
+    'const input = createInterface({ input: process.stdin });',
+    "input.on('line', line => { const request = JSON.parse(line); console.log(JSON.stringify({ version: 1, type: 'response', requestId: request.requestId, value: { ok: true, data: { stopped: true, closed: true, errors: [] } } })); setTimeout(() => process.exit(0), 30); });",
+    "input.on('close', () => process.exit(0));",
+  ].join('\n'));
+  const client = new HostClient();
+  expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: true });
+  const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  try {
+    child.stdout.pause();
+    const exited = once(child, 'exit');
+    const closing = client.close();
+    await exited;
+    expect(child.exitCode).toBe(0);
+    child.stdout.resume();
+    expect(await closing).toEqual({ ok: true, data: { stopped: true, closed: true, errors: [] } });
+    expect(await client.close()).toEqual({ ok: true, data: { stopped: true, closed: true, errors: [] } });
+  } finally {
+    child.stdout.resume();
+    if (child.exitCode === null) { const exited = once(child, 'exit'); child.stdin.end(); await exited; }
+  }
+}, 10_000);
+
+it('preserves unconfirmed cleanup after a Host crash and recovers its interrupted Run without replay', async () => {
+  const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-crash-'));
+  let requests = 0;
+  let markStarted!: () => void;
+  const requestStarted = new Promise<void>((resolveStarted) => { markStarted = resolveStarted; });
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      requests += 1;
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.write(`data: ${JSON.stringify({ id: 'host-crash', choices: [{ index: 0, delta: { role: 'assistant', content: 'Partial' }, finish_reason: null }] })}\n\n`);
+      markStarted();
+    });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Fixture server has no port');
+  const client = new HostClient();
+  client.setCredentialHandler(async () => ({ ok: true, credential: { type: 'api_key', key: 'synthetic-host-crash-key' } }));
+  let child: ChildProcessWithoutNullStreams | null = null;
+  try {
+    expect(await client.start(userDataRoot, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true, data: { ready: true } });
+    child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    expect(await client.request({ type: 'save_settings', settings: {
+      version: 2, revision: 0, profile: { displayName: 'Crash test', theme: 'system' },
+      models: [{ id: 'crash-model', credentialRef: 'credential_reference_crash', name: 'Crash model', kind: 'custom', providerId: null,
+        baseUrl: `http://127.0.0.1:${address.port}/v1`, model: 'crash-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'crash-model', updatedAt: '2026-09-30T00:00:00.000Z',
+    } })).toMatchObject({ ok: true });
+    const accepted = await client.request({ type: 'call_provider', input: { modelId: 'crash-model', goal: 'Test crash recovery', text: 'Hold this request.' } }) as Result<{ runId: number }>;
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    await Promise.race([requestStarted, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Provider request did not start')), 5_000))]);
+    expect(await client.request({ type: 'query_run', runId: accepted.data.runId })).toMatchObject({ ok: true, data: { status: 'running' } });
+    const exited = once(child, 'exit');
+    child.kill(); // Deliberate crash; this is not the normal shutdown/abort test.
+    await exited;
+    expect(await client.close()).toMatchObject({ ok: true, data: { closed: true, stopped: false, errors: [{ code: 'host_exited' }] } });
+    await expect(client.request({ type: 'get_state' })).rejects.toThrow('host_not_writable');
+    const paths = resolveProductPaths(userDataRoot);
+    expect(paths.ok).toBe(true);
+    if (!paths.ok) return;
+    const recovered = openDatabase(paths.data);
+    expect(recovered.ok).toBe(true);
+    if (!recovered.ok) return;
+    try {
+      expect(recovered.data.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: {
+        status: 'failed', error: { code: 'runtime_interrupted' }, cleanup: { stopped: false, lateObservationRequired: true },
+      } });
+      expect(requests).toBe(1);
+    } finally { recovered.data.close(); }
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; }
+    server.closeAllConnections();
+    server.close();
+  }
+}, 20_000);
 
 it('passes Pi provider ambient auth to Host without Judge or platform credentials', () => {
   const previous = { deepseek: process.env.DEEPSEEK_API_KEY, judge: process.env.FLOWMATE_JUDGE_API_KEY,

@@ -367,14 +367,15 @@ describe('RuntimeService Agent lifecycle', () => {
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
     await entered.promise;
-    expect(service.cancel(accepted.data.runId)).toMatchObject({ ok: true, data: { accepted: true } });
+    const cancellation = service.cancel(accepted.data.runId);
     work.resolve(nativeOutcome);
     const end = await finished.done.promise;
-    expect(end).toMatchObject({ type: 'run_finished', result: { ok: true, data: { status: 'cancelled', error: { code: 'agent_cancelled' } } } });
+    expect(cancellation).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(end).toMatchObject({ type: 'run_finished', result: { ok: false, error: { code: 'storage_write_failed' } } });
     expect(db.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: {
       status: 'cancelled', cancelRequestedAt: '2026-09-24T00:00:00.000Z', stoppedAt: '2026-09-24T00:00:00.000Z',
     } });
-    expect(service.state()).toMatchObject({ blocked: false });
+    expect(service.state()).toMatchObject({ blocked: true });
   });
 
   it('fails the Run when the native Agent returns a non-mechanical completion', async () => {

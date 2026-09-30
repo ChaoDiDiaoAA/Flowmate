@@ -10,7 +10,7 @@
     "agent-eval"
   ],
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node --import tsx scripts/dev.ts",
     "build:desktop": "electron-vite build",
     "typecheck": "tsc --noEmit",
     "test:unit": "bun --no-env-file run scripts/test.ts unit",

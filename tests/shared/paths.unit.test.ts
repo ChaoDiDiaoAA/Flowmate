@@ -53,6 +53,18 @@ describe('ProductPaths', () => {
     if (!result.ok) expect(result.error.code).toBe('path_outside_root');
   });
 
+  it.each([
+    { root: 'C:\\trial', databaseFile: 'D:\\outside\\trial.sqlite' },
+    { root: '\\\\server\\share\\trial', databaseFile: '\\\\other\\share\\trial.sqlite' },
+    { root: '\\\\server\\share\\trial', databaseFile: '\\\\server\\other\\trial.sqlite' },
+  ])('[F-path-isolation] rejects a database on another Windows volume: $databaseFile', ({ root, databaseFile }) => {
+    const paths = resolveProductPaths(root);
+    if (!paths.ok) throw new Error(paths.error.code);
+    const result = validateProductPaths({ ...paths.data, databaseFile });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('path_outside_root');
+  });
+
   it('[F-path-isolation] rejects an existing junction that resolves outside the trial root', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-path-root-'));
     const outside = mkdtempSync(join(tmpdir(), 'flowmate-path-outside-'));
@@ -73,5 +85,33 @@ describe('ProductPaths', () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe('path_outside_root');
+  });
+
+  it('[F-path-isolation] rejects an ancestor redirected after the initial validation', () => {
+    const parent = mkdtempSync(join(tmpdir(), 'flowmate-path-parent-'));
+    const outside = mkdtempSync(join(tmpdir(), 'flowmate-path-redirect-'));
+    const root = join(parent, 'not-created-yet');
+    const paths = resolveProductPaths(root);
+    if (!paths.ok) throw new Error(paths.error.code);
+    const before = validateProductPaths(paths.data);
+    if (!before.ok) throw new Error(before.error.code);
+    symlinkSync(outside, root, 'junction');
+    const after = validateProductPaths(paths.data, before.data);
+    expect(after.ok).toBe(false);
+    if (!after.ok) expect(after.error.code).toBe('path_outside_root');
+  });
+
+  it('[F-path-isolation] rejects a broken junction instead of treating it as a missing directory', () => {
+    const parent = mkdtempSync(join(tmpdir(), 'flowmate-path-broken-'));
+    const root = join(parent, 'root');
+    mkdirSync(root);
+    symlinkSync(join(parent, 'outside-missing'), join(root, 'artifacts'), 'junction');
+    const paths = resolveProductPaths(root);
+    if (!paths.ok) throw new Error(paths.error.code);
+
+    const result = validateProductPaths(paths.data);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('path_invalid');
   });
 });

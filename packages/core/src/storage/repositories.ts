@@ -24,6 +24,8 @@ import type {
   SdkUsageValues,
   TokenColumns,
   UsageRecord,
+  UsageRecordV1,
+  UsageRecordV2,
   DocumentSnapshot,
   WorkspaceSnapshot,
   WorkspaceChange,
@@ -1636,6 +1638,8 @@ const usageKeys: readonly (keyof SdkUsageValues)[] = [
   'costInput', 'costOutput', 'costCacheRead', 'costCacheWrite', 'costTotal',
 ];
 
+function mergeUsage(current: UsageRecordV1, incoming: UsageRecordV1): UsageRecordV1;
+function mergeUsage(current: UsageRecord, incoming: UsageRecord): UsageRecord;
 function mergeUsage(current: UsageRecord, incoming: UsageRecord): UsageRecord {
   const currentValues = current.sdkValues;
   const incomingValues = incoming.sdkValues;
@@ -1649,16 +1653,38 @@ function mergeUsage(current: UsageRecord, incoming: UsageRecord): UsageRecord {
     })
     : null;
   const source = current.source === 'sdk' || incoming.source === 'sdk' ? 'sdk' : current.source;
-  return {
+  const merged: UsageRecordV1 = {
     version: 1,
     source,
-    reason: source === 'sdk' ? null : incoming.reason ?? current.reason,
+    reason: current.source === 'sdk' ? current.reason
+      : incoming.source === 'sdk' ? incoming.reason : incoming.reason ?? current.reason,
     sdkValues: mergedValues,
     attempts: current.attempts ?? incoming.attempts,
     attemptsComplete: current.attemptsComplete || incoming.attemptsComplete,
     costSource: current.costSource ?? incoming.costSource,
     updatedAt: incoming.updatedAt,
   };
+  if (current.version === 1 && incoming.version === 1) return merged;
+  const calls = new Map<number, UsageRecordV2['calls'][number]>();
+  for (const record of [current, incoming]) {
+    if (record.version !== 2) continue;
+    for (const call of record.calls) {
+      const previous = calls.get(call.callSequence);
+      calls.set(call.callSequence, previous ? {
+        callSequence: call.callSequence,
+        usage: mergeUsage(previous.usage, call.usage),
+        tokens: {
+          inputTokens: previous.tokens.inputTokens ?? call.tokens.inputTokens,
+          outputTokens: previous.tokens.outputTokens ?? call.tokens.outputTokens,
+          totalTokens: previous.tokens.totalTokens ?? call.tokens.totalTokens,
+          cost: previous.tokens.cost ?? call.tokens.cost,
+          usageComplete: previous.tokens.usageComplete || call.tokens.usageComplete,
+        },
+      } : call);
+    }
+  }
+  return UsageRecordV2Schema.parse({ ...merged, version: 2,
+    calls: [...calls.values()].sort((a, b) => a.callSequence - b.callSequence) });
 }
 
 function transaction<T>(db: Database, fn: () => T): Result<T> {

@@ -21,6 +21,8 @@ export function createLogger(logsDir: string, options: { maxBytes?: number; back
   const backups = Math.max(0, options.backups ?? 2);
   const file = join(logsDir, 'flowmate.log');
   let reportedFailure = false;
+  let dropped = 0;
+  let closed = false;
 
   function rotate(requiredBytes: number): void {
     let size = 0;
@@ -46,14 +48,22 @@ export function createLogger(logsDir: string, options: { maxBytes?: number; back
 
   return {
     write(event) {
-      const line = `${JSON.stringify(event)}\n`;
+      if (closed) return;
       try {
+        const line = `${JSON.stringify(event)}\n`;
         rotate(Buffer.byteLength(line, 'utf8'));
         appendFileSync(file, line, 'utf8');
       } catch {
+        dropped += 1;
         reportFailure();
       }
     },
-    close: async () => undefined,
+    async close() {
+      if (closed) return;
+      closed = true;
+      if (dropped) {
+        try { process.stderr.write(`Flowmate logger closed: ${dropped} events dropped.\n`); } catch { /* stderr is best effort */ }
+      }
+    },
   };
 }

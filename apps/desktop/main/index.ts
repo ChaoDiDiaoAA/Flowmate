@@ -100,6 +100,9 @@ const providerTestSchema = (value: unknown): value is ProviderTestRequest => val
 let mainWindow: BrowserWindow | null = null;
 let allowWindowClose = false;
 let allowQuit = false;
+let desktopClosing = false;
+let closeInFlight: Promise<void> | null = null;
+let devShutdownRequestId: string | null = null;
 let hostError = false;
 let hostErrorCode = 'host_not_ready';
 let ipcRegistered = false;
@@ -146,12 +149,34 @@ app.on('before-quit', (event) => {
   void closeHostAndQuit();
 });
 
-void bootstrap().catch(() => {
+const startup = bootstrap().catch(async () => {
   hostError = true;
   hostErrorCode = 'desktop_start_failed';
+  await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_ready', ready: false });
+  await app.whenReady();
   registerIpc();
   createMainWindow();
 });
+
+const managedDevelopment = !app.isPackaged && process.env.FLOWMATE_DEV_PARENT === '1' && typeof process.send === 'function';
+if (managedDevelopment) {
+  process.on('message', (raw: unknown) => {
+    if (!raw || typeof raw !== 'object') return;
+    const command = raw as Record<string, unknown>;
+    if (command.version !== 1 || command.type !== 'flowmate_dev_shutdown'
+      || typeof command.requestId !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(command.requestId)) return;
+    devShutdownRequestId = command.requestId;
+    void closeHostAndQuit();
+  });
+  process.on('disconnect', () => { void closeHostAndQuit(); });
+}
+
+async function sendDevelopmentNotice(value: Record<string, unknown>): Promise<void> {
+  if (!managedDevelopment || !process.connected || !process.send) return;
+  await new Promise<void>((resolveSent) => {
+    try { process.send!(value, undefined, {}, () => resolveSent()); } catch { resolveSent(); }
+  });
+}
 
 async function bootstrap(): Promise<void> {
   const appRoot = resolveWorkspaceRoot(app.getAppPath());
@@ -211,10 +236,21 @@ async function bootstrap(): Promise<void> {
   }
   registerIpc();
   createMainWindow();
+  await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_ready', ready: !hostError });
 }
 
-async function closeHostAndQuit(): Promise<void> {
+function closeHostAndQuit(): Promise<void> {
+  if (closeInFlight) return closeInFlight;
+  closeInFlight = closeDesktop().finally(() => { closeInFlight = null; });
+  return closeInFlight;
+}
+
+async function closeDesktop(): Promise<void> {
+  desktopClosing = true;
+  await startup;
   const closed = await host.close();
+  await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_closed', requestId: devShutdownRequestId,
+    closed: closed.ok && closed.data.closed, stopped: closed.ok && closed.data.stopped });
   if (closed.ok && closed.data.closed && closed.data.stopped) {
     allowWindowClose = true;
     allowQuit = true;
@@ -283,6 +319,7 @@ function registerIpc(): void {
   const handle = (channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>) => {
     ipcMain.handle(channel, async (event, ...args) => {
       if (!isTrustedSender(event)) return fail(appError('ipc_forbidden', 'input', '请求来源不受信任。'));
+      if (desktopClosing) return fail(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
       try { return await handler(event, ...args); }
       catch { return fail(appError('desktop_operation_failed', 'runtime', '桌面操作失败。', true)); }
     });

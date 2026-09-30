@@ -64,6 +64,8 @@ type ActiveCall = {
   terminalCommitted: boolean;
   stop: (reason: StopReason) => boolean;
   stopIntent?: StopIntent;
+  storageError?: AppError;
+  providerFailureBeforeStop?: boolean;
   completion: Promise<Result<ProviderOutcome>>;
   poisoned: boolean;
   observe: (type: ProviderObservation['type'], data?: Readonly<Record<string, unknown>>) => void;
@@ -234,9 +236,25 @@ export class RuntimeService {
   }
 
   public cancel(runId: number): Result<{ runId: number; accepted: boolean }> {
-    if (this.active?.runId === runId) return ok({ runId, accepted: this.active.stop('user') });
+    if (this.active?.runId === runId) {
+      const active = this.active;
+      const accepted = active.stop('user');
+      return active.storageError ? fail(active.storageError, runId) : ok({ runId, accepted });
+    }
     const existing = this.dependencies.runs.get(runId);
     return existing.ok ? ok({ runId, accepted: false }) : existing;
+  }
+
+  private persistCancellation(active: ActiveCall, at: string): boolean {
+    try {
+      const recorded = this.dependencies.runs.recordCancel(active.runId, at);
+      if (recorded.ok) return recorded.data;
+    } catch { /* an unexpected storage exception must not prevent abort */ }
+    active.storageError = appError('storage_write_failed', 'storage', '取消意图保存失败。', true, active.runId);
+    active.poisoned = this.poisoned = true;
+    try { this.dependencies.log.write({ at, level: 'error', component: 'runtime', runId: active.runId,
+      event: 'cancel_record_failed', code: active.storageError.code }); } catch { /* diagnostics are best effort */ }
+    return false;
   }
 
   public async revokeDocumentUse(documentId: number): Promise<Result<{ affectedSessionIds: number[]; stopRequested: boolean }>> {
@@ -346,14 +364,12 @@ export class RuntimeService {
       if (stopIntent || active.poisoned || active.terminalCommitted) return false;
       stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
       active.stopIntent = stopIntent;
-      if (reason === 'user') {
-        const persisted = this.dependencies.runs.recordCancel(runId, stopIntent.at);
-        if (!persisted.ok) {
-          try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'error', component: 'runtime', runId, event: 'cancel_record_failed', code: persisted.error.code }); } catch { /* diagnostics are best effort */ }
-        }
+      try {
+        if (reason === 'user') this.persistCancellation(active, stopIntent.at);
+      } finally {
+        resolveStop?.(stopIntent);
+        controller.abort(reason);
       }
-      resolveStop?.(stopIntent);
-      controller.abort(reason);
       emit({ type: 'run_progress', phase: 'stopping', reason });
       return true;
     };
@@ -390,6 +406,7 @@ export class RuntimeService {
       return fail(appError('runtime_busy', 'runtime', '已有 Provider Run 正在执行。'));
     }
 
+    const startedAt = this.dependencies.monotonicNow();
     const createdAt = this.dependencies.now();
     const input: InputRecord = { version: 1, goal: request.goal, text: request.text, messageTimestamp: Date.now() };
     const created = this.dependencies.runs.create({
@@ -429,7 +446,7 @@ export class RuntimeService {
       sessionId: null,
       nativeSessionId: null,
       controller,
-      startedAt: this.dependencies.monotonicNow(),
+      startedAt,
       terminalCommitted: false,
       stop: () => false,
       completion: Promise.resolve(fail(appError('runtime_not_started', 'runtime', 'Run 尚未开始。', false, runId))),
@@ -444,29 +461,30 @@ export class RuntimeService {
       active.stopIntent = stopIntent;
       const elapsedMs = Math.max(0, Math.round(stopIntent.monotonicMs - active.startedAt));
       let cancelPersisted: boolean | undefined;
-      if (reason === 'user') {
-        const persisted = this.dependencies.runs.recordCancel(runId, stopIntent.at);
-        cancelPersisted = persisted.ok && persisted.data;
-        if (!persisted.ok) {
-          try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'error', component: 'runtime', runId, event: 'cancel_record_failed', code: persisted.error.code }); } catch { /* diagnostics are best effort */ }
-        }
+      try {
+        if (reason === 'user') cancelPersisted = this.persistCancellation(active, stopIntent.at);
+      } finally {
+        stopResolver?.(stopIntent);
+        controller.abort(reason);
       }
-      stopResolver?.(stopIntent);
-      controller.abort(reason);
       observe('stop_requested', { reason, elapsedMs, deadlineElapsedMs: request.timeoutMs, stopGraceMs: request.stopGraceMs });
       if (reason === 'user') observe('cancel_requested', { persisted: cancelPersisted });
       return true;
     };
     active.stop = requestStop;
     this.active = active;
+    const timer = setTimeout(() => requestStop('timeout'), Math.max(0, request.timeoutMs - (this.dependencies.monotonicNow() - startedAt)));
     observe('run_created', { status: 'created' });
     const externalAbort = () => requestStop('user');
     control.signal?.addEventListener('abort', externalAbort, { once: true });
     if (control.signal?.aborted) requestStop('user');
 
-    const completion = this.execute(active, request, input, observe, stopPromise, () => stopIntent);
+    const readStop = () => {
+      if (!stopIntent && this.dependencies.monotonicNow() - startedAt >= request.timeoutMs) requestStop('timeout');
+      return stopIntent;
+    };
+    const completion = this.execute(active, request, input, observe, stopPromise, readStop);
     active.completion = completion;
-    const timer = setTimeout(() => requestStop('timeout'), request.timeoutMs);
     const result = completion.finally(() => {
       clearTimeout(timer);
       control.signal?.removeEventListener('abort', externalAbort);
@@ -706,6 +724,7 @@ export class RuntimeService {
         : finalError ? 'failed' : 'completed';
     const cleanupErrors = new Map<string, AppError>();
     for (const cleanupError of outcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
+    if (active.storageError) cleanupErrors.set(active.storageError.code, active.storageError);
     if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true, active.runId));
     const cleanup: CleanupRecord = {
       version: 1,
@@ -750,6 +769,7 @@ export class RuntimeService {
     if (stopped && !unconfirmed) toolExecutor?.releaseRun(active.runId);
     active.poisoned ||= unconfirmed || !!cleanupFailure;
     if (unconfirmed || cleanupFailure) this.poisoned = true;
+    if (active.storageError) return fail(active.storageError, active.runId);
     return ok({
       runId: active.runId,
       sessionId: request.sessionId,
@@ -782,8 +802,9 @@ export class RuntimeService {
     stopPromise: Promise<StopIntent>,
     readStop: () => StopIntent | undefined,
   ): Promise<Result<ProviderOutcome>> {
-    if (readStop()) {
-      return this.finish(active, request, input, errorForStop(readStop()!.reason, active.runId), null, true, undefined, readStop());
+    const initialStop = readStop();
+    if (initialStop) {
+      return this.finish(active, request, input, errorForStop(initialStop.reason, active.runId), null, true, undefined, initialStop);
     }
     let prepared: Result<PreparedProvider>;
     try {
@@ -793,10 +814,8 @@ export class RuntimeService {
         stopPromise.then((intent) => ({ kind: 'stop' as const, intent })),
       ]);
       if (first.kind === 'stop') {
-        const settled = await Promise.race([
-          preparePromise.then(() => ({ kind: 'prepared' as const }), () => ({ kind: 'prepared' as const })),
-          new Promise<{ kind: 'grace' }>((resolve) => setTimeout(() => resolve({ kind: 'grace' }), request.stopGraceMs)),
-        ]);
+        const remaining = Math.max(0, request.stopGraceMs - (this.dependencies.monotonicNow() - first.intent.monotonicMs));
+        const settled = await withinGrace(preparePromise.then(() => undefined, () => undefined), remaining);
         if (settled.kind === 'grace') {
           void preparePromise.catch(() => undefined);
           return this.finish(active, request, input, errorForStop(first.intent.reason, active.runId), null, false, undefined, first.intent, true);
@@ -805,14 +824,17 @@ export class RuntimeService {
       }
       prepared = first.value;
     } catch {
-      return this.finish(active, request, input, appError('provider_runtime_init_failed', 'provider', 'Provider Runtime 初始化失败。', true, active.runId), null, true, undefined, readStop());
+      const stop = readStop();
+      return this.finish(active, request, input, stop ? errorForStop(stop.reason, active.runId)
+        : appError('provider_runtime_init_failed', 'provider', 'Provider Runtime 初始化失败。', true, active.runId), null, true, undefined, stop);
     }
     if (!prepared.ok) {
       const stop = readStop();
       return this.finish(active, request, input, stop ? errorForStop(stop.reason, active.runId) : prepared.error, null, true, undefined, stop);
     }
-    if (readStop()) {
-      return this.finish(active, request, input, errorForStop(readStop()!.reason, active.runId), null, true, undefined, readStop());
+    const preparedStop = readStop();
+    if (preparedStop) {
+      return this.finish(active, request, input, errorForStop(preparedStop.reason, active.runId), null, true, undefined, preparedStop);
     }
     const started = this.dependencies.runs.start(active.runId, prepared.data.snapshot, this.dependencies.now());
     if (!started.ok) {
@@ -820,15 +842,22 @@ export class RuntimeService {
       this.poisoned = true;
       return fail(started.error, active.runId);
     }
-
+    const startStop = readStop();
+    if (startStop) {
+      return this.finish(active, request, input, errorForStop(startStop.reason, active.runId), null, true, undefined, startStop);
+    }
     let work: Promise<NativeOutcome>;
     try {
       work = prepared.data.execute(input, active.controller.signal, (event) => {
+        if (event.type === 'native_terminal' && event.data.failed === true
+          && typeof event.data.failureMonotonicMs === 'number' && Number.isFinite(event.data.failureMonotonicMs)) {
+          // Pi observations and the Runtime clock use the same process monotonic clock.
+          active.providerFailureBeforeStop ||= !active.stopIntent || event.data.failureMonotonicMs < active.stopIntent.monotonicMs;
+        }
         if (event.type !== 'agent_event') observe(event.type, event.data);
       });
     } catch {
-      const stop = readStop();
-      return this.finish(active, request, input, stop ? errorForStop(stop.reason, active.runId) : appError('provider_runtime_error', 'provider', 'Provider 执行失败。', true, active.runId), null, false, undefined, stop);
+      work = Promise.reject();
     }
     const workResult = work.then((outcome) => {
       if (active.terminalCommitted && active.poisoned) {
@@ -838,22 +867,29 @@ export class RuntimeService {
         }
       }
       return { kind: 'work' as const, outcome };
-    });
+    }, () => ({ kind: 'error' as const }));
     const stopResult = stopPromise.then((intent) => ({ kind: 'stop' as const, intent }));
     const first = await Promise.race([workResult, stopResult]);
+    let finished: Awaited<typeof workResult>;
     if (first.kind === 'stop') {
-      const settled = await Promise.race([
-        workResult,
-        new Promise<{ kind: 'grace' }>((resolve) => setTimeout(() => resolve({ kind: 'grace' }), request.stopGraceMs)),
-      ]);
+      const remaining = Math.max(0, request.stopGraceMs - (this.dependencies.monotonicNow() - first.intent.monotonicMs));
+      const settled = await withinGrace(workResult, remaining);
       if (settled.kind === 'grace') {
         active.poisoned = true;
         void work.catch(() => undefined);
         return this.finish(active, request, input, errorForStop(first.intent.reason, active.runId), null, false, undefined, first.intent, true);
       }
-      return this.finishFromOutcome(active, request, input, settled.outcome, first.intent);
+      finished = settled.value;
+    } else {
+      finished = first;
     }
-    return this.finishFromOutcome(active, request, input, first.outcome, readStop());
+    const stop = readStop();
+    if (finished.kind === 'error') {
+      active.controller.abort('provider_runtime_error');
+      return this.finish(active, request, input, stop ? errorForStop(stop.reason, active.runId)
+        : appError('provider_runtime_error', 'provider', 'Provider 执行失败。', true, active.runId), null, false, undefined, stop, true);
+    }
+    return this.finishFromOutcome(active, request, input, finished.outcome, stop);
   }
 
   private async finishFromOutcome(
@@ -863,12 +899,12 @@ export class RuntimeService {
     outcome: NativeOutcome,
     stopIntent: StopIntent | undefined,
   ): Promise<Result<ProviderOutcome>> {
-    if (stopIntent) {
+    if (stopIntent && !(active.providerFailureBeforeStop && outcome.error)) {
       const error = errorForStop(stopIntent.reason, active.runId);
       const confirmedCancellation = stopIntent.reason === 'user' && outcome.stopped;
       return this.finish(active, request, input, error, outcome, outcome.stopped, outcome, stopIntent, !outcome.stopped && !confirmedCancellation);
     }
-    if (outcome.error) return this.finish(active, request, input, { ...outcome.error, runId: active.runId }, outcome, outcome.stopped, outcome, undefined, !outcome.stopped);
+    if (outcome.error) return this.finish(active, request, input, { ...outcome.error, runId: active.runId }, outcome, outcome.stopped, outcome, stopIntent, !outcome.stopped);
     if (!outcome.stopped) return this.finish(active, request, input, appError('provider_stop_unconfirmed', 'provider', 'Provider 停止未确认。', true, active.runId), outcome, false, outcome, undefined, true);
     return this.finish(active, request, input, null, outcome, true, outcome, undefined);
   }
@@ -884,13 +920,14 @@ export class RuntimeService {
     stopIntent: StopIntent | undefined,
     unconfirmed = false,
   ): Promise<Result<ProviderOutcome>> {
-    const status: ProviderOutcome['status'] = stopIntent
+    const status: ProviderOutcome['status'] = stopIntent && !(active.providerFailureBeforeStop && rawOutcome?.error)
       ? (stopIntent.reason === 'user' && stopped ? stopStatus(stopIntent.reason) : 'failed')
       : error ? 'failed' : 'completed';
     const finalError = error === null && status === 'completed' && rawOutcome ? null : error ?? appError('provider_incomplete_response', 'provider', 'Provider 响应不完整。', false, active.runId);
     const output = rawOutcome ? outputRecord(rawOutcome) : null;
     const cleanupErrors = new Map<string, AppError>();
     for (const cleanupError of rawOutcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
+    if (active.storageError) cleanupErrors.set(active.storageError.code, active.storageError);
     if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId));
     const cleanup: CleanupRecord = {
       version: 1,
@@ -931,6 +968,7 @@ export class RuntimeService {
     active.poisoned ||= unconfirmed;
     if (unconfirmed) this.poisoned = true;
     active.observe('stopped', { stopped, reason: cleanup.stopReason, cleanupErrors: cleanup.errors.map((entry) => entry.code) });
+    if (active.storageError) return fail(active.storageError, active.runId);
     const productOutcome: ProviderOutcome = {
       runId: active.runId,
       status,

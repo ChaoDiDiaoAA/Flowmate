@@ -2,6 +2,7 @@ import {
   appError,
   fail,
   normalizeAgentRunRequest,
+  normalizeProviderRequest,
   normalizeCreateSessionRequest,
   normalizeRenameSessionRequest,
   normalizeSessionId,
@@ -83,7 +84,10 @@ export function makeApplication(
   let finalCloseResult: Result<CloseReport> | null = null;
   const closeErrors = new Map<string, ReturnType<typeof appError>>();
   return {
-    callProvider: (request, control) => runtime.callProvider(request, control),
+    callProvider: async (raw, control) => {
+      const normalized = normalizeProviderRequest(raw);
+      return normalized.ok ? runtime.callProvider(normalized.data, control) : normalized;
+    },
     queryRun: async (runId) => isDbId(runId) ? runs.get(runId) : fail(appError('input_invalid', 'input', 'Run ID 无效。')),
     createSession: async (raw = {}) => {
       const normalized = normalizeCreateSessionRequest(raw);

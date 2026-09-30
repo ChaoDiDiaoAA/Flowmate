@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import lockfile from 'proper-lockfile';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { ProductPaths, Result } from '@flowmate/contracts';
+import { validateProductPaths } from './paths.ts';
 
 export type ProductControllerLease = { release(): Promise<Result<void>> };
 
@@ -12,14 +13,23 @@ export type ProductControllerLease = { release(): Promise<Result<void>> };
  * directory with a heartbeat and can recover a stale lock after a crash.
  */
 export async function acquireProductControllerLock(paths: ProductPaths): Promise<Result<ProductControllerLease>> {
+  const validated = validateProductPaths(paths);
+  if (!validated.ok) return validated;
   try {
     await mkdir(dirname(paths.databaseFile), { recursive: true });
+    const created = validateProductPaths(paths, validated.data);
+    if (!created.ok) return created;
     const releaseLock = await lockfile.lock(paths.databaseFile, {
       realpath: false,
       stale: 15_000,
       update: 3_000,
       retries: 0,
     });
+    const locked = validateProductPaths(paths, validated.data);
+    if (!locked.ok) {
+      await releaseLock();
+      return locked;
+    }
     let released = false;
     return ok({
       async release() {

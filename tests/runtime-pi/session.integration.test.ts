@@ -352,6 +352,11 @@ describe('PiAgentAdapter', () => {
   });
   it('executes an authorized tool in P3 and sends its result in the next model request', async () => {
     const replies = [toolCallResponse('p3-call-1', 'probe_read', { value: 7 }), response('The checked value is 7.')];
+    for (let index = 0; index < replies.length; index += 1) {
+      const body = (await replies[index]!.text()).replace('data: [DONE]',
+        'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\ndata: [DONE]');
+      replies[index] = new Response(body, { headers: replies[index]!.headers });
+    }
     const tool: ToolDefinition<{ value: number }, { value: number }> = {
       name: 'probe_read', version: '1', description: 'Read the controlled test value.', label: 'Read value',
       inputSchema: z.object({ value: z.number().int() }).strict(),
@@ -391,6 +396,7 @@ describe('PiAgentAdapter', () => {
     expect(outcome.agent.modelCallCount).toBe(2);
     expect(outcome.usage.version).toBe(2);
     if (outcome.usage.version === 2) expect(outcome.usage.calls.map((call) => call.callSequence)).toEqual([1, 2]);
+    expect(outcome.tokens).toEqual({ inputTokens: 6, outputTokens: 4, totalTokens: 10, cost: null, usageComplete: false });
     expect(app.requests).toHaveLength(2);
     const systemMessage = app.requests[0]?.body.messages?.find((message) => message.role === 'system');
     expect(String(systemMessage?.content)).toContain('validate_invoice_candidate is read-only');

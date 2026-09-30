@@ -429,14 +429,17 @@ describe('RuntimeService lifecycle', () => {
     db.data.close();
   });
 
-  it('[F-cancel-record-failure] still aborts the provider when recording cancel intent fails', async () => {
+  it.each(['returned', 'thrown'] as const)('[F-cancel-record-failure] stops and blocks after a $failure storage failure', async (failure) => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-cancel-record-failure-'));
     const db = openDatabase(paths(root));
     expect(db.ok).toBe(true);
     if (!db.ok) return;
     const runs: RunRepository = new Proxy(db.data.runs, {
       get(target, key, receiver) {
-        if (key === 'recordCancel') return (runId: number) => ({ ok: false, error: { code: 'storage_write_failed', category: 'storage', message: '模拟取消记录失败。', retryable: true, runId } });
+        if (key === 'recordCancel') return (runId: number) => {
+          if (failure === 'thrown') throw new Error('synthetic private storage exception');
+          return { ok: false, error: { code: 'storage_write_failed', category: 'storage', message: '模拟取消记录失败。', retryable: true, runId } };
+        };
         const value = Reflect.get(target, key, receiver) as unknown;
         return typeof value === 'function' ? value.bind(target) : value;
       },
@@ -448,25 +451,59 @@ describe('RuntimeService lifecycle', () => {
       now: () => '2026-09-21T00:00:00.000Z',
       monotonicNow: () => performance.now(),
     });
-    const controller = new AbortController();
-    const pending = service.callProvider(request, { signal: controller.signal });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    controller.abort();
+    let runId!: number;
+    let dispatched!: () => void;
+    const entered = new Promise<void>((resolve) => { dispatched = resolve; });
+    const pending = service.callProvider(request, { onObservation(event) {
+      if (event.type === 'run_created') runId = event.runId;
+      if (event.type === 'request_dispatched') dispatched();
+    } });
+    await entered;
+    let cancel;
+    let thrown: unknown;
+    try { cancel = service.cancel(runId); } catch (error) { thrown = error; }
     const result = await pending;
 
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.data.status).toBe('cancelled');
-      const saved = db.data.runs.get(result.data.runId);
-      expect(saved.ok).toBe(true);
-      if (saved.ok) {
-        expect(saved.data.cancelRequestedAt).not.toBeNull();
-        expect(saved.data.stoppedAt).not.toBeNull();
-      }
+    expect(thrown).toBeUndefined();
+    expect(cancel).toMatchObject({ ok: false, error: { code: 'storage_write_failed', runId } });
+    expect(result).toMatchObject({ ok: false, error: { code: 'storage_write_failed', runId } });
+    expect(JSON.stringify(result)).not.toContain('synthetic private storage exception');
+    const saved = db.data.runs.get(runId);
+    expect(saved).toMatchObject({ ok: true, data: { status: 'cancelled',
+      error: { code: 'provider_cancelled' }, cleanup: { stopped: true, errors: [{ code: 'storage_write_failed' }] } } });
+    if (saved.ok) {
+      expect(saved.data.cancelRequestedAt).not.toBeNull();
+      expect(saved.data.stoppedAt).not.toBeNull();
     }
-    expect(service.state()).toMatchObject({ blocked: false });
+    expect(service.state()).toMatchObject({ blocked: true });
+    expect(await service.callProvider(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
     expect((await service.close()).closed).toBe(true);
     db.data.close();
+  });
+
+  it.each(['run-created', 'prepare'] as const)('[F-total-deadline] refuses dispatch after time is spent in $phase', async (phase) => {
+    let elapsed = 0;
+    let executed = false;
+    const provider: ProviderPort = {
+      async prepare() {
+        if (phase === 'prepare') elapsed = 200;
+        return { ok: true, data: { snapshot, execute: async () => { executed = true; return success; } } };
+      },
+      async close() { return { stopped: true, closed: true, errors: [] }; },
+    };
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-deadline-'));
+    const opened = openDatabase(paths(root));
+    if (!opened.ok) throw new Error(opened.error.code);
+    const service = new RuntimeService({ runs: opened.data.runs, provider,
+      log: { write: () => undefined, close: async () => undefined },
+      now: () => '2026-09-21T00:00:00.000Z', monotonicNow: () => elapsed });
+    const result = await service.callProvider(request, { onObservation(event) {
+      if (phase === 'run-created' && event.type === 'run_created') elapsed = 200;
+    } });
+    expect(result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true, error: { code: 'provider_timeout' } } });
+    expect(executed).toBe(false);
+    await service.close();
+    opened.data.close();
   });
 
   it('[F-late-result] does not allow a late provider result to revive an unconfirmed stopped Run', async () => {
@@ -481,12 +518,12 @@ describe('RuntimeService lifecycle', () => {
       usage: {
         ...success.usage,
         source: 'sdk',
-        reason: null,
+        reason: 'retry-usage-incomplete',
         sdkValues: { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5, costInput: null, costOutput: null, costCacheRead: null, costCacheWrite: null, costTotal: null },
-        attempts: 1,
+        attempts: 2,
         attemptsComplete: true,
       },
-      tokens: { inputTokens: 3, outputTokens: 2, totalTokens: 5, cost: null, usageComplete: true },
+      tokens: { inputTokens: 3, outputTokens: 2, totalTokens: 5, cost: null, usageComplete: false },
     };
     const provider: ProviderPort = {
       async prepare() {
@@ -536,7 +573,8 @@ describe('RuntimeService lifecycle', () => {
         expect(queried.data.error?.code).toBe('provider_timeout');
         expect(queried.data.output).toBeNull();
         expect(queried.data.tokens).toMatchObject({ inputTokens: 3, outputTokens: 2, totalTokens: 5 });
-        expect(queried.data.usage).toMatchObject({ source: 'sdk', attempts: 1 });
+        expect(queried.data.usage).toMatchObject({ source: 'sdk', attempts: 2, reason: 'retry-usage-incomplete' });
+        expect(queried.data.tokens.usageComplete).toBe(false);
       }
     }
     const finalClose = await service.close();

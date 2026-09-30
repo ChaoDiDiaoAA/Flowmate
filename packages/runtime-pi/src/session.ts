@@ -1,7 +1,6 @@
 import {
   createAssistantMessageEventStream,
   type AssistantMessage,
-  type FetchFunction,
 } from '@earendil-works/pi-ai';
 import {
   createAgentSession,
@@ -47,7 +46,7 @@ import type {
 } from '@flowmate/contracts';
 import type { ProviderConfig } from '@flowmate/contracts';
 import { INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
-import { normalizeUsage, modelRuntimeSnapshot, prepareModelRuntime, safeUrl } from './model-runtime.ts';
+import { normalizeUsage, modelRuntimeSnapshot, observedFetch, prepareModelRuntime, safeUrl } from './model-runtime.ts';
 import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import { toPiTool } from './tools.ts';
 import { formatExecutionPrompt, validateNativeHistory, validateModelMessages, projectSessionMessages, projectMessageView } from './messages.ts';
@@ -250,10 +249,13 @@ function aggregateUsage(calls: ModelCallUsage[], attempts: number, complete: boo
   const outputTokens = sumKnown(calls.map((call) => call.tokens.outputTokens));
   const totalTokens = sumKnown(calls.map((call) => call.tokens.totalTokens));
   const cost = sumDecimalStrings(calls.map((call) => call.tokens.cost));
+  const usageComplete = calls.length > 0 && calls.every((call) => call.tokens.usageComplete)
+    && inputTokens !== null && outputTokens !== null && totalTokens !== null;
   const usage: UsageRecordV2 = {
     version: 2,
     source,
-    reason: source === 'sdk' ? null : calls.length ? 'one-or-more-model-call-usages-unknown' : 'no-model-call-usage-recorded',
+    reason: source === 'sdk' ? usageComplete ? null : 'one-or-more-model-call-usages-incomplete'
+      : calls.length ? 'one-or-more-model-call-usages-unknown' : 'no-model-call-usage-recorded',
     sdkValues,
     attempts: attempts > 0 ? attempts : null,
     attemptsComplete: complete && calls.length > 0 && calls.every((call) => call.complete),
@@ -263,7 +265,7 @@ function aggregateUsage(calls: ModelCallUsage[], attempts: number, complete: boo
     calls: calls.map(({ callSequence, usage: callUsage, tokens }) => ({ callSequence, usage: callUsage, tokens })),
   };
   return { usage, tokens: { inputTokens, outputTokens, totalTokens, cost,
-    usageComplete: inputTokens !== null && outputTokens !== null && totalTokens !== null } };
+    usageComplete } };
 }
 
 function now(): { at: string; monotonicMs: number } {
@@ -844,7 +846,7 @@ export class PiAgentAdapter implements AgentPort {
         this.observe(active, 'response_started', { callSequence: active.callSequence, attempt: active.attempts, status: response.status });
         return response;
       } catch (error) {
-        if (!active.failure) active.failure = this.providerError(active, error);
+        if (!active.failure) active.failure = this.providerError(active, error, true);
         throw error;
       }
     };
@@ -871,7 +873,7 @@ export class PiAgentAdapter implements AgentPort {
       const stream = await nativeStream(model, context, {
         ...options,
         signal,
-        fetch: fetch as FetchFunction,
+        fetch: observedFetch(model.api, fetch),
         timeoutMs: record.snapshot?.limits.timeoutMs,
         maxRetries: record.config?.parameters.maxRetries,
         maxRetryDelayMs: record.config?.parameters.maxRetryDelayMs,
@@ -1036,7 +1038,7 @@ export class PiAgentAdapter implements AgentPort {
     }
   }
 
-  private providerError(active: ActiveExecution, error: unknown): ReturnType<typeof appError> {
+  private providerError(active: ActiveExecution, error: unknown, transportFailed = false): ReturnType<typeof appError> {
     if (active.signal.aborted) return appError('agent_cancelled', 'runtime', 'Agent 执行已取消。');
     if (active.responseStatus === 401 || active.responseStatus === 403) return appError('provider_auth_failed', 'provider', 'Provider 认证失败。');
     if (active.responseStatus === 429) return appError('provider_rate_limited', 'provider', 'Provider 请求受到限流。', true);
@@ -1049,7 +1051,8 @@ export class PiAgentAdapter implements AgentPort {
       return appError('provider_request_rejected', 'provider',
         `Provider 拒绝了 Agent 请求（HTTP ${active.responseStatus}）${detail ? `：${detail}` : '。'}`);
     }
-    if (!active.responseStarted) return appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true);
+    if (!active.responseStarted) return transportFailed ? appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true)
+      : appError('provider_error', 'provider', 'Provider 请求失败。', true);
     if (error instanceof Error && error.name === 'AbortError') return appError('agent_cancelled', 'runtime', 'Agent 执行已取消。');
     return appError('provider_stream_interrupted', 'provider', 'Provider 响应流中断。', true);
   }

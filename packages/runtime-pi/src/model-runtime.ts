@@ -2,6 +2,7 @@ import {
   InMemoryModelsStore,
   type Api,
   type CredentialStore,
+  type FetchFunction,
   type Model,
   ModelsError,
 } from '@earendil-works/pi-ai';
@@ -12,6 +13,12 @@ import type { SafeConfigSnapshot, SdkUsageValues, TokenColumns, UsageRecord } fr
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 
 export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+export function observedFetch(api: Api, fetch: FetchLike): FetchFunction | undefined {
+  // Pi 0.85.1 Google rejects custom fetch; Bedrock uses its own HTTP handler.
+  return ['openai-completions', 'openai-responses', 'azure-openai-responses', 'openai-codex-responses',
+    'anthropic-messages', 'mistral-conversations', 'pi-messages'].includes(api) ? fetch as FetchFunction : undefined;
+}
 
 export type PiProviderDependencies = {
   credentials?: CredentialStore;
@@ -69,26 +76,27 @@ export function normalizeUsage(
   };
   const reported = [values.input, values.output, values.cacheRead, values.cacheWrite, values.totalTokens]
     .some((value) => value !== null && value > 0);
-  const known = reported && facts.complete;
-  const costKnown = known && canVerifyCost && values.costTotal !== null;
+  const costKnown = reported && canVerifyCost && values.costTotal !== null && values.costTotal > 0;
   const usage: UsageRecord = {
     version: 1,
-    source: known ? 'sdk' : 'unknown',
-    reason: known ? null : facts.attempts > 0 ? 'sdk-zero-or-missing-presence-proof' : 'request-not-started',
-    sdkValues: known ? values : (facts.attempts > 0 ? values : null),
+    source: reported ? 'sdk' : 'unknown',
+    reason: facts.attempts > 1 ? 'retry-usage-incomplete' : reported ? 'sdk-usage-presence-unconfirmed'
+      : facts.attempts > 0 ? 'sdk-zero-or-missing-presence-proof' : 'request-attempts-unobserved',
+    sdkValues: reported || facts.attempts > 0 ? values : null,
     attempts: facts.attempts > 0 ? facts.attempts : null,
-    attemptsComplete: facts.complete,
+    attemptsComplete: facts.complete && facts.attempts > 0,
     costSource: costKnown ? 'pi-sdk-model-catalog-estimate' : null,
     updatedAt: new Date().toISOString(),
   };
   return {
     usage,
     tokens: {
-      inputTokens: known ? values.input : null,
-      outputTokens: known ? values.output : null,
-      totalTokens: known ? values.totalTokens : null,
+      inputTokens: values.input !== null && values.input > 0 ? values.input : null,
+      outputTokens: values.output !== null && values.output > 0 ? values.output : null,
+      totalTokens: values.totalTokens !== null && values.totalTokens > 0 ? values.totalTokens : null,
       cost: costKnown ? String(values.costTotal) : null,
-      usageComplete: known,
+      // ponytail: Pi does not expose usage-presence proof; keep totals partial until a public witness exists.
+      usageComplete: false,
     },
   };
 }

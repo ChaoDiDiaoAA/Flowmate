@@ -4,7 +4,7 @@ import { stat } from 'node:fs/promises';
 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { createLogger } from '../../packages/shared/src/logging.ts';
 
 describe('safe structured logger', () => {
@@ -24,8 +24,15 @@ describe('safe structured logger', () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-logs-failure-'));
     const logger = createLogger(root);
     await rm(root, { recursive: true, force: true });
-
-    expect(() => logger.write({ at: '2026-09-21T00:00:00.000Z', level: 'error', component: 'test', event: 'disk-failure' })).not.toThrow();
-    await expect(logger.close()).resolves.toBeUndefined();
+    const diagnostic = spyOn(process.stderr, 'write').mockReturnValue(true);
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        expect(() => logger.write({ at: '2026-09-21T00:00:00.000Z', level: 'error', component: 'test', event: 'disk-failure' })).not.toThrow();
+      }
+      expect(diagnostic.mock.calls).toEqual([['Flowmate logger write failed.\n']]);
+      await expect(logger.close()).resolves.toBeUndefined();
+      await expect(logger.close()).resolves.toBeUndefined();
+      expect(diagnostic.mock.calls).toEqual([['Flowmate logger write failed.\n'], ['Flowmate logger closed: 3 events dropped.\n']]);
+    } finally { diagnostic.mockRestore(); }
   });
 });

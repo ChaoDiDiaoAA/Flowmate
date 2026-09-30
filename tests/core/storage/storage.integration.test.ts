@@ -141,30 +141,71 @@ describe('P1 SQLite storage', () => {
     opened.data.close();
   });
 
-  it('[F-crash-reopen] marks created and running rows as interrupted on a real reopen', () => {
+  it.each(['created', 'running'] as const)('[F-crash-reopen] recovers a committed %s row after a real Bun process crash without replay', async (state) => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-storage-reopen-'));
-    const first = openDatabase(makePaths(root));
-    expect(first.ok).toBe(true);
-    if (!first.ok) return;
-    const created = first.data.runs.create({ goal: input.goal, input, config, usage, cleanup, createdAt: '2026-09-21T00:00:00.000Z' });
-    expect(created.ok).toBe(true);
-    if (!created.ok) return;
-    expect(first.data.runs.start(created.data, config, '2026-09-21T00:00:00.010Z').ok).toBe(true);
-    first.data.close();
+    const moduleUrl = new URL('../../../packages/core/src/storage/database.ts', import.meta.url);
+    const script = join(root, 'crash.ts');
+    writeFileSync(script, [
+      `import { openDatabase } from ${JSON.stringify(moduleUrl.href)};`,
+      `const opened = openDatabase(${JSON.stringify(makePaths(root))});`,
+      "if (!opened.ok) throw new Error(opened.error.code);",
+      `const created = opened.data.runs.create(${JSON.stringify({ goal: input.goal, input, config, usage, cleanup, createdAt: '2026-09-21T00:00:00.000Z' })});`,
+      "if (!created.ok) throw new Error(created.error.code);",
+      ...(state === 'running' ? [
+        `const started = opened.data.runs.start(created.data, ${JSON.stringify(config)}, '2026-09-21T00:00:00.010Z');`,
+        "if (!started.ok) throw new Error(started.error.code);",
+      ] : []),
+      "console.log('ready:' + created.data);",
+      'setInterval(() => {}, 1000);',
+    ].join('\n'));
+    const child = Bun.spawn([process.execPath, '--no-env-file', script], {
+      cwd: root, stdout: 'pipe', stderr: 'pipe',
+      env: Object.fromEntries(['PATH', 'SystemRoot', 'TEMP', 'TMP'].flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : [])),
+    });
+    const watchdog = setTimeout(() => child.kill('SIGKILL'), 5_000);
+    let runId = 0;
+    try {
+      const reader = child.stdout.getReader();
+      let stdout = '';
+      while (!stdout.includes('\n')) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        stdout += new TextDecoder().decode(chunk.value);
+      }
+      expect(stdout).toMatch(/^ready:\d+/);
+      runId = Number(stdout.match(/^ready:(\d+)/)?.[1]);
+      // A deliberate crash proves interrupted recovery, never graceful stopping.
+      child.kill('SIGKILL');
+      expect(await child.exited).not.toBe(0);
+    } finally {
+      clearTimeout(watchdog);
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await child.exited;
+    }
 
     const reopened = openDatabase(makePaths(root));
     expect(reopened.ok).toBe(true);
     if (reopened.ok) {
-      const snapshot = reopened.data.runs.get(created.data);
+      const snapshot = reopened.data.runs.get(runId);
       expect(snapshot.ok).toBe(true);
       if (snapshot.ok) {
         expect(snapshot.data.status).toBe('failed');
         expect(snapshot.data.error?.code).toBe('runtime_interrupted');
         expect(snapshot.data.cleanup).toMatchObject({ stopped: false, lateObservationRequired: true });
+        expect(snapshot.data.stoppedAt).toBeNull();
+        expect(snapshot.data.output).toBeNull();
+        expect(snapshot.data.input).toEqual(input);
       }
+      expect(reopened.data.db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 1 });
       reopened.data.close();
+      const again = openDatabase(makePaths(root));
+      expect(again.ok).toBe(true);
+      if (again.ok) {
+        expect(again.data.runs.get(runId)).toEqual(snapshot);
+        again.data.close();
+      }
     }
-  });
+  }, 10_000);
 
   it('[F-schema-version] rejects an unsupported schema and a corrupt database instead of creating a replacement', () => {
     const unsupportedRoot = mkdtempSync(join(tmpdir(), 'flowmate-storage-schema-'));

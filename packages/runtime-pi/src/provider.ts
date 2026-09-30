@@ -2,7 +2,6 @@ import {
   type Api,
   type AssistantMessage,
   type AssistantMessageEvent,
-  type FetchFunction,
   type Model,
 } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
@@ -11,7 +10,7 @@ import type {
   ProviderConfig,
   Result,
 } from '@flowmate/contracts';
-import { normalizeUsage, prepareModelRuntime, safeUrl } from './model-runtime.ts';
+import { normalizeUsage, observedFetch, prepareModelRuntime, safeUrl } from './model-runtime.ts';
 import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 export type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import type {
@@ -27,6 +26,7 @@ type FetchFacts = {
   responseStatus: number | null;
   requestStarted: boolean;
   responseStarted: boolean;
+  transportFailed: boolean;
   complete: boolean;
 };
 
@@ -40,7 +40,7 @@ function normalizeText(message: AssistantMessage): string {
 }
 
 function mapPiFailure(
-  facts: { responseStatus: number | null; responseStarted: boolean; aborted: boolean; stopReason: string; text: string },
+  facts: { responseStatus: number | null; responseStarted: boolean; transportFailed: boolean; aborted: boolean; stopReason: string; text: string },
 ): ReturnType<typeof appError> {
   if (facts.aborted || facts.stopReason === 'aborted') {
     return appError('provider_cancelled', 'provider', 'Provider 请求已中止。');
@@ -55,7 +55,8 @@ function mapPiFailure(
     return appError('provider_output_limit', 'provider', 'Provider 响应超过输出限制。', false);
   }
   if (!facts.responseStarted && facts.stopReason === 'error') {
-    return appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true);
+    return facts.transportFailed ? appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true)
+      : appError('provider_error', 'provider', 'Provider 请求失败。', true);
   }
   if (facts.stopReason === 'length') {
     return appError('provider_incomplete_response', 'provider', 'Provider 因模型或服务端输出限制提前结束，未返回完整文本。');
@@ -64,9 +65,9 @@ function mapPiFailure(
     return appError('provider_incomplete_response', 'provider', 'Provider 未返回完整文本。');
   }
   return appError(
-    facts.responseStarted ? 'provider_stream_interrupted' : 'provider_network_error',
+    facts.responseStarted ? 'provider_stream_interrupted' : facts.transportFailed ? 'provider_network_error' : 'provider_error',
     'provider',
-    facts.responseStarted ? 'Provider 响应流中断。' : 'Provider 请求未建立响应。',
+    facts.responseStarted ? 'Provider 响应流中断。' : facts.transportFailed ? 'Provider 请求未建立响应。' : 'Provider 请求失败。',
     true,
   );
 }
@@ -166,7 +167,7 @@ export class PiProviderAdapter implements ProviderPort {
     stopGraceMs: number,
     deferReleaseUntil: (settled: Promise<unknown>) => void,
   ): Promise<NativeOutcome> {
-    const facts: FetchFacts = { attempts: 0, responseStatus: null, requestStarted: false, responseStarted: false, complete: false };
+    const facts: FetchFacts = { attempts: 0, responseStatus: null, requestStarted: false, responseStarted: false, transportFailed: false, complete: false };
     const baseFetch: FetchLike = this.dependencies.fetch ?? ((request, init) => globalThis.fetch(request, init));
     const fetch: FetchLike = async (request, init) => {
       facts.attempts += 1;
@@ -181,6 +182,7 @@ export class PiProviderAdapter implements ProviderPort {
         this.dependencies.witness?.({ type: 'fetch_response', attempt: facts.attempts, status: response.status });
         return response;
       } catch (error) {
+        facts.transportFailed = true;
         this.dependencies.witness?.({ type: 'fetch_error', attempt: facts.attempts, aborted: signal.aborted });
         throw error;
       }
@@ -191,6 +193,7 @@ export class PiProviderAdapter implements ProviderPort {
     let text = '';
     let textBytes = 0;
     let outputLimitExceeded = false;
+    let failureMonotonicMs: number | null = null;
     let streamFailed = false;
     let wireMaxTokens: number | null = null;
     const requestController = new AbortController();
@@ -205,7 +208,7 @@ export class PiProviderAdapter implements ProviderPort {
       observe({ type: 'model_request', at: new Date().toISOString(), monotonicMs: performance.now(), data: context });
       const stream = runtime.streamSimple(model, context, {
         signal: requestController.signal,
-        fetch: fetch as FetchFunction,
+        fetch: observedFetch(model.api, fetch),
         maxRetries: config.parameters.maxRetries,
         maxRetryDelayMs: config.parameters.maxRetryDelayMs,
         onResponse: (response) => {
@@ -222,7 +225,6 @@ export class PiProviderAdapter implements ProviderPort {
             observe({ type: 'request_budget', at: new Date().toISOString(), monotonicMs: performance.now(), data: {
               wireMaxTokens: typeof wireMaxTokens === 'number' ? wireMaxTokens : null,
             } });
-            observe({ type: 'request_dispatched', at: new Date().toISOString(), monotonicMs: performance.now(), data: { model: model.id, keys: Object.keys(record).sort() } });
           }
           return undefined;
         },
@@ -235,7 +237,7 @@ export class PiProviderAdapter implements ProviderPort {
         if (stopDeadline === null) {
           next = await pending;
         } else {
-          const remaining = Math.max(0, stopDeadline - Date.now());
+          const remaining = Math.max(0, stopDeadline - performance.now());
           let timer: ReturnType<typeof setTimeout> | undefined;
           let settled: { kind: 'event'; value: IteratorResult<AssistantMessageEvent> } | { kind: 'timeout' };
           try {
@@ -268,18 +270,26 @@ export class PiProviderAdapter implements ProviderPort {
             observe({ type: 'text_delta', at: new Date().toISOString(), monotonicMs: performance.now(), data: { length: acceptedLength } });
             if (appended.exceeded) {
               outputLimitExceeded = true;
-              stopDeadline = Date.now() + stopGraceMs;
+              failureMonotonicMs ??= performance.now();
+              stopDeadline = performance.now() + stopGraceMs;
               requestController.abort('output_limit');
             }
           }
         }
         if (event.type === 'start') facts.responseStarted = true;
-        if (event.type === 'error') streamError = event.error;
-        if (event.type === 'done') finalMessage = event.message;
+        if (event.type === 'error') {
+          streamError = event.error;
+          if (event.error.stopReason !== 'aborted') failureMonotonicMs ??= performance.now();
+        }
+        if (event.type === 'done') {
+          finalMessage = event.message;
+          if (event.message.stopReason !== 'stop') failureMonotonicMs ??= performance.now();
+        }
       }
       if (!outputLimitExceeded) finalMessage ??= await stream.result();
     } catch (error) {
       streamFailed = true;
+      if (!signal.aborted) failureMonotonicMs ??= performance.now();
       const fallback = error instanceof Error ? error.message : '';
       streamError ??= {
         role: 'assistant', content: [], api: model.api, provider: model.provider, model: model.id,
@@ -293,8 +303,8 @@ export class PiProviderAdapter implements ProviderPort {
 
     if (outputLimitExceeded) {
       this.dependencies.witness?.({ type: 'output_limit_stop', stopped: facts.complete, streamFailed, aborted: requestController.signal.aborted });
-      const error = mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, aborted: signal.aborted, stopReason: 'output_limit', text });
-      observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: 'output_limit' } });
+      const error = mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, transportFailed: facts.transportFailed, aborted: false, stopReason: 'output_limit', text });
+      observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: 'output_limit', failed: true, failureMonotonicMs } });
       return {
         wireMaxTokens,
         text,
@@ -311,14 +321,16 @@ export class PiProviderAdapter implements ProviderPort {
     }
     const message = finalMessage ?? streamError;
     if (!message) {
-      const error = mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, aborted: signal.aborted, stopReason: 'error', text });
-      observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: 'error' } });
+      const error = mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, transportFailed: facts.transportFailed, aborted: signal.aborted && failureMonotonicMs === null, stopReason: 'error', text });
+      failureMonotonicMs ??= performance.now();
+      observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: 'error', failed: true, failureMonotonicMs } });
       return { wireMaxTokens, text, partial: text.length > 0, stopReason: 'error', responseId: null, responseModel: null, error, usage: { version: 1, source: 'unknown', reason: 'no-final-message', sdkValues: null, attempts: facts.attempts || null, attemptsComplete: facts.complete, costSource: null, updatedAt: new Date().toISOString() }, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false }, stopped: facts.complete, cleanupErrors: [] };
     }
     const finalText = text || normalizeText(message);
-    const error = message.stopReason === 'stop' && finalText.length > 0 ? null : mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, aborted: signal.aborted, stopReason: message.stopReason, text: finalText });
+    const error = message.stopReason === 'stop' && finalText.length > 0 ? null : mapPiFailure({ responseStatus: facts.responseStatus, responseStarted: facts.responseStarted, transportFailed: facts.transportFailed, aborted: signal.aborted && failureMonotonicMs === null, stopReason: message.stopReason, text: finalText });
+    if (error) failureMonotonicMs ??= performance.now();
     const usage = normalizeUsage(message, facts, config.connection === undefined);
-    observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: message.stopReason, responseId: message.responseId ?? null } });
+    observe({ type: 'native_terminal', at: new Date().toISOString(), monotonicMs: performance.now(), data: { stopReason: message.stopReason, responseId: message.responseId ?? null, failed: error !== null, failureMonotonicMs } });
     return {
       wireMaxTokens,
       text: finalText,

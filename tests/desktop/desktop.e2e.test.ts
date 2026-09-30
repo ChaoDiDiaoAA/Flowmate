@@ -3,6 +3,8 @@ import { _electron as electron, type Page } from 'playwright';
 import { expect, it } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp } from '../support/resources.ts';
@@ -128,6 +130,90 @@ async function capturePiModelViews(page: Page) {
   await page.locator('.rail').getByRole('button', { name: 'Settings' }).click();
   await page.getByLabel('Theme').selectOption('system');
   await nav.getByRole('button', { name: 'Models' }).click();
+}
+
+for (const action of ['last-window', 'quit', 'main-exit'] as const) {
+  it(`desktop ${action} aborts an in-flight Provider and releases its storage`, async () => {
+    const userData = await mkdtemp(join(tmpdir(), `flowmate-desktop-${action}-`));
+    let requests = 0;
+    let markStarted!: () => void;
+    let markDisconnected!: () => void;
+    const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted; });
+    const disconnected = new Promise<void>((resolveDisconnected) => { markDisconnected = resolveDisconnected; });
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on('end', () => {
+        requests += 1;
+        response.on('close', markDisconnected);
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        response.write(`data: ${JSON.stringify({ id: 'desktop-shutdown', choices: [{ index: 0, delta: { role: 'assistant', content: 'Partial' }, finish_reason: null }] })}\n\n`);
+        markStarted();
+      });
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Fixture server has no port');
+    const env: Record<string, string> = {};
+    for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA']) {
+      if (process.env[name]) env[name] = process.env[name];
+    }
+    env.FLOWMATE_TEST_MODE = '1';
+    env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+    let electronApp: Awaited<ReturnType<typeof electron.launch>> | null = null;
+    try {
+      electronApp = await electron.launch({ executablePath: electronPath,
+        args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+      const page = await electronApp.firstWindow();
+      await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ state: 'visible', timeout: 20_000 });
+      const saved = await page.evaluate(async (port) => {
+        const state = await window.flowmate.getState();
+        if (!state.ok) return state;
+        return window.flowmate.saveSettings({ ...state.data.settings,
+          models: [{ id: 'shutdown-model', credentialRef: 'desktop_shutdown_credential', name: 'Shutdown model', kind: 'custom', providerId: null,
+            baseUrl: `http://127.0.0.1:${port}/v1`, model: 'shutdown-model', api: 'openai-completions',
+            contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'shutdown-model',
+        }, { modelId: 'shutdown-model', apiKey: 'synthetic-desktop-shutdown-key' });
+      }, address.port);
+      expect(saved.ok).toBe(true);
+      expect(requests).toBe(0);
+      const accepted = await page.evaluate(() => window.flowmate.callProvider({
+        modelId: 'shutdown-model', goal: 'Verify controlled shutdown.', text: 'Hold this response until the desktop closes.',
+      }));
+      expect(accepted.ok).toBe(true);
+      if (!accepted.ok) return;
+      await started;
+      expect(await page.evaluate((runId) => window.flowmate.queryRun(runId), accepted.data.runId))
+        .toMatchObject({ ok: true, data: { status: 'running' } });
+      const exited = once(electronApp.process(), 'exit');
+      if (action === 'last-window') await electronApp.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows()[0]!.close(); });
+      if (action === 'quit') await electronApp.evaluate(({ app }) => { app.quit(); });
+      if (action === 'main-exit') await electronApp.evaluate(() => { process.exit(0); }).catch(() => undefined);
+      await Promise.all([exited, disconnected]);
+      const databaseFile = join(userData, 'data', 'app.sqlite');
+      for (let attempt = 0; existsSync(`${databaseFile}.lock`) && attempt < 200; attempt += 1) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+      expect(existsSync(`${databaseFile}.lock`)).toBe(false);
+      const db = new Database(databaseFile, { readonly: true });
+      try {
+        const row = db.query('SELECT status,error_json,cleanup_json,stopped_at,cancel_requested_at FROM runs WHERE id=?').get(accepted.data.runId) as {
+          status: string; error_json: string; cleanup_json: string; stopped_at: string | null; cancel_requested_at: string | null;
+        };
+        expect(row.status).toBe('failed');
+        expect(JSON.parse(row.error_json)).toMatchObject({ code: 'runtime_shutdown' });
+        expect(JSON.parse(row.cleanup_json)).toMatchObject({ stopped: true, stopReason: 'shutdown', errors: [], lateObservationRequired: false });
+        expect(row.stopped_at).not.toBeNull();
+        expect(row.cancel_requested_at).toBeNull();
+        expect(db.query('SELECT count(*) AS count FROM runs').get()).toEqual({ count: 1 });
+        expect(requests).toBe(1);
+      } finally { db.close(); }
+    } finally {
+      if (electronApp) await electronApp.close().catch(() => undefined);
+      server.closeAllConnections();
+      server.close();
+    }
+  }, 40_000);
 }
 
 it('desktop sends directly, keeps drafts editable and restores native history after restart', async () => {
