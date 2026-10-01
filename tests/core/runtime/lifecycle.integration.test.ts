@@ -9,6 +9,7 @@ import type { NativeOutcome, PreparedProvider, ProviderPort, SafeConfigSnapshot 
 import type { RunRepository } from '../../../packages/core/src/storage/repositories.ts';
 import type { ProviderConfig, ProviderRequest } from '../../../packages/contracts/src/runtime.ts';
 import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
+import { makeApplication } from '../../../packages/core/src/application.ts';
 
 const config: ProviderConfig = {
   version: 1,
@@ -198,6 +199,57 @@ describe('RuntimeService lifecycle', () => {
     db.close();
   });
 
+  it('[F-cancel-prepare-settle] waits for preparation to stop within grace without executing the cancelled Run', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let enteredPrepare!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredPrepare = resolve; });
+    let internalSignal: AbortSignal | undefined;
+    let executions = 0;
+    const provider: ProviderPort = {
+      async prepare(_config, _limits, signal) {
+        internalSignal = signal;
+        enteredPrepare();
+        await gate;
+        return { ok: true, data: { snapshot, execute: async () => { executions += 1; return success; } } };
+      },
+      async close() { return { stopped: true, closed: true, errors: [] }; },
+    };
+    const { db, service } = serviceFor(provider);
+    const app = makeApplication(service, db.runs, async () => {
+      db.close();
+      return { stopped: true, closed: true, errors: [] };
+    });
+    let runId!: number;
+    const pending = app.callProvider({ ...request, timeoutMs: 2_000, stopGraceMs: 2_000 }, {
+      onObservation(event) { if (event.type === 'run_created') runId = event.runId; },
+    });
+    try {
+      await Promise.race([entered, pending.then(() => { throw new Error('Provider never prepared'); })]);
+      expect(await app.cancelRun(runId)).toEqual({ ok: true, data: { runId, accepted: true } });
+      expect(internalSignal?.aborted).toBe(true);
+      expect(await app.queryRun(runId)).toMatchObject({ ok: true, data: {
+        status: 'created', startedAt: null, endedAt: null, stoppedAt: null, cleanup: { stopped: false },
+      } });
+      release();
+      expect(await pending).toMatchObject({ ok: true, data: {
+        runId, status: 'cancelled', stopped: true, error: { code: 'provider_cancelled' },
+      } });
+      const saved = await app.queryRun(runId);
+      expect(saved).toMatchObject({ ok: true, data: { runId, status: 'cancelled', startedAt: null,
+        output: null, cleanup: { stopped: true, lateObservationRequired: false, errors: [] } } });
+      if (!saved.ok) throw new Error(saved.error.code);
+      expect(saved.data.cancelRequestedAt).not.toBeNull();
+      expect(saved.data.stoppedAt).not.toBeNull();
+      expect(executions).toBe(0);
+      expect(db.db.query('SELECT id,status,started_at FROM runs').all()).toEqual([{ id: runId, status: 'cancelled', started_at: null }]);
+    } finally {
+      release();
+      await pending;
+      await app.close();
+    }
+  }, 10_000);
+
   it('persists a completed provider outcome through the service', async () => {
     const { db, service } = serviceFor(new ControlledProvider('success'));
     const result = await service.callProvider(request);
@@ -275,6 +327,67 @@ describe('RuntimeService lifecycle', () => {
     }
     db.close();
   });
+
+  it('[V01/V02] keeps an accepted stop and read-only feedback separate from actual stopping and commit', async () => {
+    let release!: () => void;
+    let dispatched!: () => void;
+    const entered = new Promise<void>((resolve) => { dispatched = resolve; });
+    let executions = 0;
+    const provider: ProviderPort = {
+      async prepare() {
+        return { ok: true, data: { snapshot, execute: async (_input, signal, observe) => {
+          executions += 1;
+          observe({ type: 'request_dispatched', at: new Date().toISOString(), monotonicMs: performance.now(), data: {} });
+          await new Promise<void>((resolve) => { release = resolve; });
+          expect(signal.aborted).toBe(true);
+          return { ...success, text: '', partial: true, stopReason: 'aborted' };
+        } } };
+      },
+      async close() { return { stopped: true, closed: true, errors: [] }; },
+    };
+    const { db, service } = serviceFor(provider);
+    const app = makeApplication(service, db.runs, async () => {
+      db.close();
+      return { stopped: true, closed: true, errors: [] };
+    });
+    let runId!: number;
+    const pending = app.callProvider({ ...request, timeoutMs: 2_000, stopGraceMs: 2_000 }, { onObservation(event) {
+      if (event.type === 'run_created') runId = event.runId;
+      if (event.type === 'request_dispatched') dispatched();
+      // Notification delivery cannot decide the persisted product result.
+      throw new Error('synthetic observer failure');
+    } });
+    try {
+      await Promise.race([entered, pending.then(() => { throw new Error('Provider never dispatched'); })]);
+      expect(await app.cancelRun(runId)).toEqual({ ok: true, data: { runId, accepted: true } });
+      const stopping = await app.queryRun(runId);
+      expect(stopping).toMatchObject({ ok: true, data: { runId, status: 'running',
+        output: null, endedAt: null, stoppedAt: null, cleanup: { stopped: false } } });
+      if (!stopping.ok) throw new Error(stopping.error.code);
+      expect(stopping.data.cancelRequestedAt).not.toBeNull();
+      expect(await app.cancelRun(runId)).toEqual({ ok: true, data: { runId, accepted: false } });
+      expect(await app.queryRun(runId)).toEqual(stopping);
+      expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { active: { runId, kind: 'provider' } } });
+      expect(await app.callProvider(request)).toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
+    } finally { release?.(); }
+    const result = await pending;
+    expect(result).toMatchObject({ ok: true, data: { runId, status: 'cancelled', stopped: true,
+      error: { code: 'provider_cancelled' } } });
+    const saved = await app.queryRun(runId);
+    expect(saved).toMatchObject({ ok: true, data: { runId, status: 'cancelled', cleanup: { stopped: true } } });
+    if (!saved.ok) throw new Error(saved.error.code);
+    expect(saved.data.startedAt).not.toBeNull();
+    expect(saved.data.endedAt).not.toBeNull();
+    expect(saved.data.stoppedAt).not.toBeNull();
+    expect(await app.cancelRun(runId)).toEqual({ ok: true, data: { runId, accepted: false } });
+    expect(await app.queryRun(runId)).toEqual(saved);
+    expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { active: null, blocked: false } });
+    expect(db.db.query('SELECT id,status,cancel_requested_at,stopped_at FROM runs').all()).toEqual([
+      { id: runId, status: 'cancelled', cancel_requested_at: saved.data.cancelRequestedAt, stopped_at: saved.data.stoppedAt },
+    ]);
+    expect(executions).toBe(1);
+    expect((await app.close()).ok).toBe(true);
+  }, 10_000);
 
   it('[F-timeout-cancel-order] preserves the first stop intent', async () => {
     const { db, service } = serviceFor(new ControlledProvider('abort'));
@@ -512,6 +625,9 @@ describe('RuntimeService lifecycle', () => {
     expect(db.ok).toBe(true);
     if (!db.ok) return;
     let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let work: Promise<NativeOutcome> | undefined;
+    let executions = 0;
     let pendingWork = true;
     const lateOutcome: NativeOutcome = {
       ...success,
@@ -531,13 +647,10 @@ describe('RuntimeService lifecycle', () => {
           ok: true as const,
           data: {
             snapshot,
-            execute: async () => {
-              try {
-                await new Promise<void>((resolve) => { release = resolve; });
-                return lateOutcome;
-              } finally {
-                pendingWork = false;
-              }
+            execute: () => {
+              executions += 1;
+              work = gate.then(() => lateOutcome).finally(() => { pendingWork = false; });
+              return work;
             },
           },
         };
@@ -551,34 +664,43 @@ describe('RuntimeService lifecycle', () => {
       now: () => '2026-09-21T00:00:00.000Z',
       monotonicNow: () => performance.now(),
     });
-    const result = await service.callProvider({ ...request, timeoutMs: 20, stopGraceMs: 10 });
-    expect(result.ok).toBe(true);
-    let runId: number | undefined;
-    if (result.ok) {
-      runId = result.data.runId;
-      expect(result.data.status).toBe('failed');
-      expect(result.data.stopped).toBe(false);
-      expect(result.data.error?.code).toBe('provider_timeout');
+    const app = makeApplication(service, db.data.runs, async () => {
+      db.data.close();
+      return { stopped: true, closed: true, errors: [] };
+    });
+    try {
+      const result = await app.callProvider({ ...request, timeoutMs: 100, stopGraceMs: 100 });
+      expect(result).toMatchObject({ ok: true, data: { status: 'failed', stopped: false, error: { code: 'provider_timeout' } } });
+      if (!result.ok) throw new Error(result.error.code);
+      const runId = result.data.runId;
+      const before = await app.queryRun(runId);
+      expect(before).toMatchObject({ ok: true, data: { runId, kind: 'provider', status: 'failed', output: null,
+        error: { code: 'provider_timeout' }, cancelRequestedAt: null, stoppedAt: null,
+        cleanup: { stopped: false, lateObservationRequired: true, errors: [{ code: 'stop_unconfirmed' }] } } });
+      if (!before.ok) throw new Error(before.error.code);
+      const facts = db.data.db.query(`SELECT id,kind,session_id,status,output_json,error_json,cleanup_json,
+        started_at,ended_at,cancel_requested_at,stopped_at FROM runs ORDER BY id`);
+      const committedRows = facts.all();
+      expect(committedRows).toHaveLength(1);
+      expect(await app.callProvider(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
+      expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: true } });
+      expect(facts.all()).toEqual(committedRows);
+      const firstClose = await service.close();
+      expect(firstClose.closed).toBe(false);
+      release();
+      await work;
+      const queried = await app.queryRun(runId);
+      expect(queried).toEqual({ ok: true, data: { ...before.data, usage: lateOutcome.usage, tokens: lateOutcome.tokens } });
+      expect(facts.all()).toEqual(committedRows);
+      expect(await app.callProvider(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
+      expect(facts.all()).toHaveLength(1);
+      expect(executions).toBe(1);
+      const finalClose = await service.close();
+      expect(finalClose).toMatchObject({ stopped: true, closed: true, errors: [{ code: 'stop_unconfirmed' }] });
+    } finally {
+      release();
+      await work;
+      await app.close();
     }
-    const firstClose = await service.close();
-    expect(firstClose.closed).toBe(false);
-    release();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(runId).toBeDefined();
-    if (runId !== undefined) {
-      const queried = db.data.runs.get(runId);
-      expect(queried.ok).toBe(true);
-      if (queried.ok) {
-        expect(queried.data.status).toBe('failed');
-        expect(queried.data.error?.code).toBe('provider_timeout');
-        expect(queried.data.output).toBeNull();
-        expect(queried.data.tokens).toMatchObject({ inputTokens: 3, outputTokens: 2, totalTokens: 5 });
-        expect(queried.data.usage).toMatchObject({ source: 'sdk', attempts: 2, reason: 'retry-usage-incomplete' });
-        expect(queried.data.tokens.usageComplete).toBe(false);
-      }
-    }
-    const finalClose = await service.close();
-    expect(finalClose).toMatchObject({ stopped: true, closed: true, errors: [{ code: 'stop_unconfirmed' }] });
-    db.data.close();
   });
 });

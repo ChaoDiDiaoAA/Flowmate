@@ -4,7 +4,7 @@ import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
 import { appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok } from '@flowmate/contracts';
-import type { Application, DesktopState, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
+import type { AgentRunEvent, Application, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings } from '@flowmate/core';
 import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
@@ -74,6 +74,24 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
   const seenOrder: string[] = [];
   let application: Application;
   const pendingCredentials = new Map<string, (value: { ok: boolean; credential?: unknown }) => void>();
+  const pendingForms = new Map<string, { request: InvoiceFormBridgeRequest; resolve(receipt: InvoiceFormApplicationReceipt): void }>();
+  const invoiceFormBridge = (request: InvoiceFormBridgeRequest, signal: AbortSignal): Promise<InvoiceFormApplicationReceipt> => {
+    const requestId = randomUUID();
+    const unknown = (): InvoiceFormApplicationReceipt => ({ runId: request.runId, toolCallId: request.toolCallId,
+      formInstanceId: request.target.formInstanceId, candidateId: request.candidateId, candidateSequence: request.candidateSequence,
+      observedAt: new Date().toISOString(), outcome: 'unknown' });
+    if (signal.aborted) return Promise.resolve(unknown());
+    return new Promise(resolve => {
+      const finish = (receipt: InvoiceFormApplicationReceipt) => {
+        clearTimeout(timer); pendingForms.delete(requestId); resolve(receipt);
+      };
+      // Core ends its local wait on cancellation. Keep this original receiver
+      // within the existing deadline so a late receipt can supplement its call.
+      const timer = setTimeout(() => finish(unknown()), 7500);
+      pendingForms.set(requestId, { request, resolve: finish });
+      send({ version: 1, type: 'invoice_form_request', requestId, request });
+    });
+  };
   const credentialWrites = new Map<string, Promise<unknown>>();
   const credentialRequest = (ref: string, operation: 'read' | 'write' | 'delete', credential?: Credential): Promise<Credential | undefined> => {
     const requestId = randomUUID();
@@ -123,6 +141,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     provider: new PiProviderAdapter({ credentialsFor }),
     agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace, tools }),
     promptTrace,
+    invoiceFormBridge,
   });
   if (!created.ok) {
     send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> });
@@ -166,6 +185,29 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
   };
 
   const dispatch = async (command: HostCommand): Promise<void> => {
+    if (command.type === 'invoice_form_response') {
+      const pending = pendingForms.get(command.requestId);
+      if (!pending) return;
+      const original = pending.request, receipt = command.receipt;
+      if (receipt.runId === original.runId && receipt.toolCallId === original.toolCallId
+        && receipt.formInstanceId === original.target.formInstanceId && receipt.candidateId === original.candidateId
+        && receipt.candidateSequence === original.candidateSequence
+        && (receipt.outcome !== 'applied' || receipt.appliedRevision === original.target.expectedRevision + 1)) pending.resolve(receipt);
+      return;
+    }
+    if (command.type === 'save_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.saveInvoiceCandidate(command.input) }); return; }
+    if (command.type === 'accept_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.acceptInvoiceCandidate(command.input) }); return; }
+    if (command.type === 'reject_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.rejectInvoiceCandidate(command.input) }); return; }
+    if (command.type === 'export_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.exportInvoiceCandidate(command.input) }); return; }
+    if (command.type === 'query_invoice_candidate_operation') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryInvoiceCandidateOperation(command.input) }); return; }
+    if (command.type === 'query_session_input') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.querySessionInput(command.input) });
+      return;
+    }
+    if (command.type === 'query_invoice_form_application') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryInvoiceFormApplication(command.input) });
+      return;
+    }
     if (command.type === 'credential_response') {
       pendingCredentials.get(command.requestId)?.(command.value);
       pendingCredentials.delete(command.requestId);
@@ -374,6 +416,10 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.createSession(command.input) });
       return;
     }
+    if (command.type === 'query_native_tools') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryNativeTools() });
+      return;
+    }
     if (command.type === 'rename_session') {
       if (!claimRequestId(command.requestId)) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('request_duplicate', 'input', '该请求身份已使用，未重复执行。')) });
@@ -433,7 +479,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       }
       return;
     }
-    if (command.type === 'start_run') {
+    if (command.type === 'start_run' || command.type === 'submit_invoice_form_input') {
       if (!claimRequestId(command.requestId)) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('request_duplicate', 'input', '该请求身份已使用，未重复执行。')) });
         return;
@@ -466,23 +512,31 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
           contextWindow: profile.contextWindow!, maxTokens: profile.maxTokens!, reasoning: profile.reasoning } } : {}),
         parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
       };
-      const normalized = normalizeAgentRunRequest({
+      const normalized = command.type === 'start_run' ? normalizeAgentRunRequest({
         sessionId: command.input.sessionId,
         text: command.input.text,
         config,
-        workspace: command.input.workspace,
+        ...(command.input.workspace === undefined ? {} : { workspace: command.input.workspace }),
+        ...(command.input.workingDirectory === undefined ? {} : { workingDirectory: command.input.workingDirectory }),
         goalMode: command.input.goalMode,
         ...(command.input.timeoutMs === undefined ? {} : { timeoutMs: command.input.timeoutMs }),
-      });
-      if (!normalized.ok) {
+      }) : null;
+      if (normalized && !normalized.ok) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: normalized });
         return;
       }
       let accepted;
       try {
-        accepted = await application.startRun(normalized.data, { onEvent(event) {
+        const control = { onEvent(event: AgentRunEvent) {
           send({ version: 1, type: 'event', event: { type: 'agent_run_event', requestId: command.requestId, value: event } });
-        } });
+        } };
+        if (command.type === 'submit_invoice_form_input') accepted = await application.submitInput({
+          sessionId: command.input.workspace.sessionId, clientSequence: command.input.clientSequence, mode: 'prompt', goalMode: 'fill-form',
+          text: '将当前已选候选录入发票表单，保留供人工检查。', config,
+          workspace: command.input.workspace, formTarget: command.input.target,
+        }, control);
+        else if (normalized?.ok) accepted = await application.startRun(normalized.data, control);
+        else throw new Error('invalid_request');
       } catch {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('host_command_failed', 'runtime', 'Agent Run 未能提交。', true)) });
         return;

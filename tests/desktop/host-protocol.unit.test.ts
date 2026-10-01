@@ -2,6 +2,59 @@ import { describe, expect, it } from 'bun:test';
 import { parseHostCommand } from '../../apps/host/protocol.ts';
 
 describe('versioned desktop Host protocol', () => {
+  it('validates human candidate commands and original-operation lookup without model or Run fields', () => {
+    const base = { operationRef: 'human-fixture-1', jobId: 7, candidateId: 9, expectedCandidateId: 9, expectedRevision: 3 };
+    for (const command of [
+      { type: 'accept_invoice_candidate', input: { ...base, dirty: false } },
+      { type: 'reject_invoice_candidate', input: { ...base, reason: 'Reviewed and incorrect' } },
+      { type: 'export_invoice_candidate', input: { operationRef: base.operationRef, candidateId: 9, format: 'json' } },
+      { type: 'query_invoice_candidate_operation', input: { kind: 'accept', request: { ...base, dirty: false } } },
+    ]) {
+      expect(parseHostCommand({ version: 1, requestId: 'human-wire', ...command })).not.toBeNull();
+      expect(parseHostCommand({ version: 1, requestId: 'human-wire', ...command, input: { ...command.input, runId: 2 } })).toBeNull();
+    }
+    expect(parseHostCommand({ version: 1, requestId: 'human-wire', type: 'accept_invoice_candidate', input: { ...base, dirty: true } })).toBeNull();
+  });
+  it('separates trusted Fill admission from ordinary Send and validates private application replies', () => {
+    const input = { modelId: 'profile-1', clientSequence: 3, target: { formInstanceId: 'form-1', expectedRevision: 0 },
+      workspace: { revision: 2, documentRef: { id: 4, version: 'v1' }, jobId: 7, candidateRef: { id: 9, sequence: 1 }, sessionId: 12 } };
+    const command = { version: 1, requestId: 'fill-1', type: 'submit_invoice_form_input', input,
+      expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' } as const;
+    expect(parseHostCommand(command)).toEqual(command);
+    expect(parseHostCommand({ ...command, input: { ...input, goalMode: 'answer' } })).toBeNull();
+    expect(parseHostCommand({ ...command, input: { ...input, candidate: {} } })).toBeNull();
+    expect(parseHostCommand({ ...command, input: { ...input, clientSequence: 0 } })).toBeNull();
+    const receipt = { runId: 101, toolCallId: 21, formInstanceId: 'form-1', candidateId: 9, candidateSequence: 1,
+      observedAt: '2026-10-01T00:00:00.000Z', outcome: 'unknown' } as const;
+    const reply = { version: 1, requestId: 'application-1', type: 'invoice_form_response', receipt } as const;
+    expect(parseHostCommand(reply)).toEqual(reply);
+    expect(parseHostCommand({ ...reply, receipt: { ...receipt, outcome: 'applied' } })).toBeNull();
+    expect(parseHostCommand({ ...reply, execute: 'arbitrary script' })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'lookup-1', type: 'query_invoice_form_application',
+      input: { runId: 101, toolCallId: 21 } })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'lookup-2', type: 'query_session_input',
+      input: { sessionId: 12, clientSequence: 3 } })).not.toBeNull();
+  });
+  it('accepts optional working directories on ordinary Runs and rejects retired or forged permissions', () => {
+    expect(parseHostCommand({ version: 1, requestId: 'local-new', type: 'create_local_task_session', input: { title: 'Local task' } })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'native-tools', type: 'query_native_tools' })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'local-new', type: 'create_local_task_session', input: { title: 'Local task', toolProfile: 'trusted-local' } })).toBeNull();
+    const request = { version: 1, requestId: 'local-start', type: 'start_run', input: {
+      sessionId: 5, text: 'Read this directory.', modelId: 'profile-1', goalMode: 'answer',
+      workspace: { revision: 0, documentRef: null, jobId: null, candidateRef: null, sessionId: 5 },
+      workingDirectory: 'D:\\work',
+    }, expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' } as const;
+    expect(parseHostCommand(request)).toEqual(request);
+    for (const input of [
+      { ...request.input, goalMode: 'unknown' },
+      { ...request.input, goalMode: 'local-task' },
+      { ...request.input, workingDirectory: 'relative' },
+      { ...request.input, workingDirectory: ' ' },
+      { ...request.input, localTask: { workingDirectory: 'D:\\work' } },
+      { ...request.input, commandAccess: 'all' },
+      { ...request.input, workspace: undefined },
+    ]) expect(parseHostCommand({ ...request, input })).toBeNull();
+  });
   it('accepts only bounded native message queries', () => {
     const request = { version: 1, requestId: 'messages-1', type: 'list_session_messages', input: { sessionId: 4 } };
     expect(parseHostCommand(request)).toMatchObject({ ...request, input: { sessionId: 4, limit: 50 } });

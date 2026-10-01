@@ -1,5 +1,8 @@
 import type { Database } from 'bun:sqlite';
+import { join, isAbsolute } from 'node:path';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { finishSessionInputs, markInputConsumed, recoverSessionInputs } from '../sessions/input-ledger.ts';
 import { InputRecordV2Schema, UsageRecordV2Schema, appError, fail, ok } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
@@ -36,6 +39,9 @@ import type {
   CandidateDraft,
   CheckResult,
   InvoiceIssue,
+  InvoiceFormTarget,
+  InvoiceFormApplicationReceipt,
+  InvoiceFormBridgeRequest,
   InvoiceToolOutput,
   WorkspaceExpectation,
   WorkspaceContext,
@@ -56,9 +62,37 @@ import type {
   NormalizedPageRequest,
   CandidateRepository,
   SaveCandidateRecord,
+  ProductToolContext,
+  StoredCandidateDraft,
+  StoredInvoiceField,
+  SaveInvoiceCandidateRequest,
+  SaveInvoiceCandidateResponse,
+  AcceptInvoiceCandidateRequest,
+  RejectInvoiceCandidateRequest,
+  InvoiceCandidateDecisionResponse,
+  ExportInvoiceCandidateRequest,
+  InvoiceExportReference,
+  InvoiceCandidateOperationQuery,
+  InvoiceCandidateOperationResult,
 } from '@flowmate/contracts';
-import type { RunAgentConfigFacts, AgentFacts, RunScope } from '@flowmate/contracts';
-import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema } from '@flowmate/contracts';
+import type { RunAgentConfigFacts, AgentFacts, RunScope, LegacyRunScope } from '@flowmate/contracts';
+import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_REVIEW_TOOL_NAMES, NATIVE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, InvoiceFormTargetSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, FillInvoiceFormInputSchema } from '@flowmate/contracts';
+import { StoredCandidateDraftSchema, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandidateRequestSchema,
+  RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields,
+  invoiceFieldDisplayValue, isLegalInvoiceNormalizedValue } from '@flowmate/contracts';
+import { InvoiceCandidateOperationQuerySchema } from '@flowmate/contracts';
+
+export type ValidateHumanInvoice = (draft: StoredCandidateDraft, documentRef: { id: DbId; version: string }) =>
+  Result<{ checks: CheckResult[]; issues: InvoiceIssue[] }>;
+export interface InvoiceEditRepository extends CandidateRepository {
+  saveHuman(input: SaveInvoiceCandidateRequest & { at: string; validate: ValidateHumanInvoice }): Result<SaveInvoiceCandidateResponse>;
+  accept(input: AcceptInvoiceCandidateRequest & { at: string; validate: ValidateHumanInvoice }): Result<InvoiceCandidateDecisionResponse>;
+  reject(input: RejectInvoiceCandidateRequest & { at: string }): Result<InvoiceCandidateDecisionResponse>;
+  readAccepted(candidateId: DbId): Result<{ candidate: CandidateSnapshot; documentRef: { id: DbId; version: string } }>;
+  findExport(input: ExportInvoiceCandidateRequest): Result<InvoiceExportReference | null>;
+  registerExport(input: ExportInvoiceCandidateRequest & { relativePath: string; bytes: number; sha256: string; at: string }): Result<InvoiceExportReference>;
+  queryOperation(input: InvoiceCandidateOperationQuery & { at: string }): Result<InvoiceCandidateOperationResult>;
+}
 
 export type NewProviderRun = {
   goal: string;
@@ -86,6 +120,8 @@ export type NewWorkspaceAgentRun = {
   usage: UsageRecord;
   cleanup: CleanupRecord;
   createdAt: string;
+  nativeTools?: { runtimeDir: string; allowedTools: readonly string[]; workingDirectory?: string };
+  formTarget?: InvoiceFormTarget;
 };
 
 export type WorkspaceRunAdmission = {
@@ -94,6 +130,7 @@ export type WorkspaceRunAdmission = {
   scope: RunScope;
   workspaceContext: WorkspaceContext;
   workspaceInput: WorkspaceInput;
+  formTarget?: InvoiceFormTarget;
 };
 
 export type SessionRow = {
@@ -210,6 +247,9 @@ export interface ToolCallRepository {
   finish(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string; stoppedAt: string | null }): Result<ToolCallSnapshot>;
   reject(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string }): Result<ToolCallSnapshot>;
   recordDelivery(input: { toolCallId: DbId; delivery: ToolCallDelivery }): Result<ToolCallSnapshot>;
+  recordFormApplication(input: { toolCallId: DbId; receipt: InvoiceFormApplicationReceipt }): Result<ToolCallSnapshot>;
+  readFormApplicationRequest(toolCallId: DbId): Result<Extract<InvoiceFormBridgeRequest, { operation: 'apply' }>>;
+  getNativeWorkingDirectory(context: ProductToolContext): Result<string>;
 }
 
 export type ActivityFilter = { documentId: DbId } | { jobId: DbId };
@@ -374,7 +414,15 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
   if (kind === 'agent') validatedAgentConfig(record.agent);
   else if (record.agent !== undefined) throw new Error('unexpected_provider_agent_config');
   if (record.workspaceContext !== undefined) WorkspaceContextSchema.parse(record.workspaceContext);
-  if (record.goalMode !== undefined && !['answer', 'save-candidate'].includes(String(record.goalMode))) throw new Error('invalid_goal_mode');
+  if (record.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form', 'local-task'].includes(String(record.goalMode))) throw new Error('invalid_goal_mode');
+  if (record.formTarget !== undefined) {
+    InvoiceFormTargetSchema.parse(record.formTarget);
+    if (record.goalMode !== 'fill-form') throw new Error('unexpected_form_target');
+  } else if (record.goalMode === 'fill-form') throw new Error('missing_form_target');
+  if (record.workingDirectory !== undefined && (typeof record.workingDirectory !== 'string'
+    || !isAbsolute(record.workingDirectory) || /[\x00-\x1f\x7f]/.test(record.workingDirectory))) throw new Error('invalid_working_directory');
+  if (record.goalMode === 'local-task' && (typeof record.workingDirectory !== 'string'
+    || record.workspaceContext !== undefined)) throw new Error('invalid_local_task_config');
   return record;
 }
 
@@ -389,8 +437,16 @@ function validatedAgentFacts(value: unknown): Record<string, unknown> {
   return agent;
 }
 
-function validatedScope(value: unknown): ChatScope | RunScope {
+function validatedScope(value: unknown): ChatScope | RunScope | LegacyRunScope {
   const record = object(value, 'scope');
+  if (record.version === 3) {
+    const { allowedWritePaths, commandAccess, ...base } = record;
+    const scope = RunScopeSchema.parse({ ...base, version: 2 });
+    if (!Array.isArray(allowedWritePaths) || !allowedWritePaths.every((path) => typeof path === 'string'
+      && isAbsolute(path) && !/[\x00-\x1f\x7f]/.test(path)) || new Set(allowedWritePaths).size !== allowedWritePaths.length
+      || !['none', 'trusted-local'].includes(String(commandAccess))) throw new Error('invalid_legacy_agent_scope_shape');
+    return { ...scope, version: 3, allowedWritePaths, commandAccess } as LegacyRunScope;
+  }
   if (record.version === 2) {
     const parsed = RunScopeSchema.safeParse(record);
     if (!parsed.success) throw new Error('invalid_agent_scope_shape');
@@ -465,9 +521,14 @@ function sessionRow(value: unknown, hasHistory = false): SessionRow {
   };
 }
 
-function parseSessionModelUse(value: string): { documentIds: number[]; at: string; reason: 'document_use_revoked' } | null {
-  const metadata = exactRecord(readJson(value, 'session_metadata'), 'session_metadata', ['version', 'model_use_blocked']);
+function parseSessionMetadata(value: string): Record<string, unknown> {
+  const metadata = recordWithOptional(readJson(value, 'session_metadata'), 'session_metadata', ['version', 'model_use_blocked'], ['tool_profile']);
   if (metadata.version !== 1) throw new Error('invalid_session_metadata_version');
+  if (metadata.tool_profile !== undefined && !['invoice', 'trusted-local'].includes(String(metadata.tool_profile))) throw new Error('invalid_session_tool_profile');
+  return metadata;
+}
+function parseSessionModelUse(value: string): { documentIds: number[]; at: string; reason: 'document_use_revoked' } | null {
+  const metadata = parseSessionMetadata(value);
   if (metadata.model_use_blocked === null) return null;
   const blocked = exactRecord(metadata.model_use_blocked, 'session_model_use_blocked', ['documentIds', 'at', 'reason']);
   if (!Array.isArray(blocked.documentIds) || blocked.documentIds.length < 1
@@ -483,9 +544,10 @@ type DocumentRunAssociation = { session_id: number; scope_json: string | null; c
 function runUsesDocument(row: DocumentRunAssociation, documentId: DbId): boolean {
   let scope: unknown = null;
   try { scope = row.scope_json === null ? null : JSON.parse(row.scope_json); } catch { /* Invalid P3 scope must be treated conservatively. */ }
-  const parsed = RunScopeSchema.safeParse(scope);
-  return parsed.success && parsed.data.allowedDocumentIds.includes(documentId)
-    || row.job_document_id === documentId || !parsed.success && configPolicy(row.config_json) !== 'p2';
+  try {
+    const parsed = validatedScope(scope);
+    return parsed.version !== 1 && parsed.allowedDocumentIds.includes(documentId) || row.job_document_id === documentId;
+  } catch { return row.job_document_id === documentId || configPolicy(row.config_json) !== 'p2'; }
 }
 
 function blockSessionsUsingDocument(db: Database, documentId: DbId, at: string): DbId[] {
@@ -498,7 +560,7 @@ function blockSessionsUsingDocument(db: Database, documentId: DbId, at: string):
     if (!row) throw new Error('revocation_session_missing');
     const current = parseSessionModelUse(row.metadata_json);
     const documentIds = [...new Set([...(current?.documentIds ?? []), documentId])].sort((left, right) => left - right);
-    const metadata = JSON.stringify({ version: 1, model_use_blocked: { documentIds, at, reason: 'document_use_revoked' } });
+    const metadata = JSON.stringify({ ...parseSessionMetadata(row.metadata_json), model_use_blocked: { documentIds, at, reason: 'document_use_revoked' } });
     if (db.query('UPDATE sessions SET metadata_json=?,updated_at=? WHERE id=?').run(metadata, at, sessionId).changes !== 1) {
       throw new Error('revocation_session_update_failed');
     }
@@ -520,6 +582,40 @@ function exactRecord(value: unknown, label: string, keys: readonly string[]): Re
   const parsed = object(value, label);
   if (Object.keys(parsed).length !== keys.length || keys.some((key) => !(key in parsed))) throw new Error(`invalid_${label}_shape`);
   return parsed;
+}
+
+function recordWithOptional(value: unknown, label: string, required: readonly string[], optional: readonly string[]): Record<string, unknown> {
+  const parsed = object(value, label);
+  if (required.some((key) => !(key in parsed)) || Object.keys(parsed).some((key) => !required.includes(key) && !optional.includes(key))) throw new Error(`invalid_${label}_shape`);
+  return parsed;
+}
+
+const nativeIdSchema = z.string().min(1).max(256).refine((value) => !/[\x00-\x1f\x7f]/.test(value));
+const nativeProcessSchema = z.object({
+  nativeToolCallId: nativeIdSchema, pid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  identity: nativeIdSchema, executable: z.string().min(1).max(4096).refine((value) => !/[\x00-\x1f\x7f]/.test(value)),
+  startedAt: z.string().datetime(), stopped: z.boolean(), stoppedAt: z.string().datetime().optional(),
+  exitCode: z.number().int().nullable().optional(),
+}).strict().superRefine((record, context) => {
+  if (!record.stopped && (record.stoppedAt !== undefined || record.exitCode !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'An active process cannot have terminal facts.' });
+  }
+});
+const nativeOutputSchema = z.object({
+  nativeToolCallId: nativeIdSchema,
+  fileName: z.string().min(1).max(255).refine((value) => !/[\\/:\x00-\x1f\x7f]/.test(value) && value !== '.' && value !== '..'),
+  bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), truncated: z.boolean(),
+  observedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict().refine((record) => record.observedBytes >= record.bytes);
+
+function readToolCleanup(value: unknown): ToolCallCleanup {
+  const cleanup = recordWithOptional(value, 'tool_call_cleanup', ['version', 'stopReason', 'stopped', 'errors'], ['nativeProcesses', 'nativeOutputs']);
+  if (cleanup.version !== 1 || cleanup.stopReason !== null && typeof cleanup.stopReason !== 'string'
+    || typeof cleanup.stopped !== 'boolean' || !Array.isArray(cleanup.errors)) throw new Error('invalid_tool_call_cleanup');
+  return { version: 1, stopReason: cleanup.stopReason as string | null, stopped: cleanup.stopped,
+    errors: cleanup.errors.map((error) => AppErrorSchema.parse(error)),
+    ...(cleanup.nativeProcesses === undefined ? {} : { nativeProcesses: z.array(nativeProcessSchema).max(24).parse(cleanup.nativeProcesses) }),
+    ...(cleanup.nativeOutputs === undefined ? {} : { nativeOutputs: z.array(nativeOutputSchema).max(24).parse(cleanup.nativeOutputs) }) };
 }
 
 function artifactMetadata(value: unknown): ArtifactMetadata {
@@ -583,7 +679,76 @@ function storedArtifact(value: unknown): StoredArtifact {
     bytes: row.bytes, mimeType: row.mime_type, metadata: artifactMetadata(readJson(row.metadata_json, 'artifact_metadata')) };
 }
 
-function toolCallSnapshot(value: unknown): ToolCallSnapshot {
+function readToolEnvelope(value: string | null): { result: StoredToolResult | null; formApplication?: InvoiceFormApplicationReceipt } {
+  if (value === null) return { result: null };
+  const record = object(readJson(value, 'tool_call_result'), 'tool_call_result');
+  const formApplication = record.formApplication === undefined ? undefined : InvoiceFormApplicationReceiptSchema.parse(record.formApplication);
+  if (!('status' in record)) {
+    exactRecord(record, 'pending_tool_result', ['version', 'formApplication']);
+    if (record.version !== 1 || formApplication === undefined) throw new Error('invalid_pending_tool_result');
+    return { result: null, formApplication };
+  }
+  if (record.version !== 1 || !['succeeded', 'failed', 'cancelled'].includes(String(record.status))
+    || (record.committedCandidateId !== null && (!Number.isSafeInteger(record.committedCandidateId) || Number(record.committedCandidateId) < 1))) {
+    throw new Error('invalid_tool_call_result');
+  }
+  if (record.status === 'succeeded') {
+    if (!('data' in record) || 'error' in record) throw new Error('invalid_tool_call_result');
+  } else {
+    if (!('error' in record) || 'data' in record && record.data === undefined) throw new Error('invalid_tool_call_result');
+    AppErrorSchema.parse(record.error);
+  }
+  return { result: record as unknown as StoredToolResult, ...(formApplication === undefined ? {} : { formApplication }) };
+}
+
+type FormApplicationCall = {
+  toolCallId: DbId; runId: DbId; sessionId: DbId; nativeToolCallId: string; toolName: string; effect: string | null;
+  args: { final: unknown }; startedAt: string | null;
+};
+
+function deriveFormApplicationRequest(db: Database, call: FormApplicationCall): Extract<InvoiceFormBridgeRequest, { operation: 'apply' }> {
+  if (call.toolName !== 'fill_invoice_form' || call.effect !== 'LOCAL_WRITE') throw new Error('invalid_form_application_identity');
+  const run = db.query("SELECT session_id,job_id,scope_json,config_json FROM runs WHERE id=? AND kind='agent'")
+    .get(call.runId) as { session_id: number; job_id: number | null; scope_json: string; config_json: string } | null;
+  if (!run || run.session_id !== call.sessionId || run.job_id === null) throw new Error('invalid_form_application_run');
+  const config = validatedConfig(readJson(run.config_json, 'run_config'), 'agent');
+  const context = WorkspaceContextSchema.parse(config.workspaceContext);
+  const target = InvoiceFormTargetSchema.parse(config.formTarget);
+  const scope = RunScopeSchema.parse(readJson(run.scope_json, 'run_scope'));
+  const args = FillInvoiceFormInputSchema.parse(call.args.final);
+  const candidate = candidateSnapshot(queryCandidateRow(db, args.candidateId, run.job_id));
+  if (config.goalMode !== 'fill-form' || scope.allowedTools.length !== 1 || scope.allowedTools[0] !== 'fill_invoice_form'
+    || context.sessionId !== call.sessionId || context.jobId !== run.job_id
+    || context.documentRef?.id !== candidate.documentRef.id || context.documentRef.version !== candidate.documentRef.version
+    || !scope.allowedDocumentIds.includes(candidate.documentRef.id)
+    || context.candidateRef?.id !== args.candidateId || context.candidateRef.sequence !== candidate.snapshot.sequence) {
+    throw new Error('invalid_form_application_binding');
+  }
+  const request = InvoiceFormBridgeRequestSchema.parse({ operation: 'apply', runId: call.runId, sessionId: call.sessionId,
+    toolCallId: call.toolCallId, nativeToolCallId: call.nativeToolCallId, documentRef: candidate.documentRef, jobId: run.job_id,
+    candidateId: candidate.snapshot.candidateId, candidateSequence: candidate.snapshot.sequence, target,
+    candidate: { fields: candidate.snapshot.fields, lines: candidate.snapshot.lines, notes: candidate.snapshot.notes } });
+  if (request.operation !== 'apply') throw new Error('invalid_form_application_operation');
+  return request;
+}
+
+function validateFormApplication(db: Database, call: FormApplicationCall, receipt: InvoiceFormApplicationReceipt): void {
+  const request = deriveFormApplicationRequest(db, call);
+  if (receipt.toolCallId !== request.toolCallId || receipt.runId !== request.runId
+    || receipt.candidateId !== request.candidateId || receipt.candidateSequence !== request.candidateSequence
+    || receipt.formInstanceId !== request.target.formInstanceId
+    || receipt.outcome === 'applied' && (call.startedAt === null || !Number.isSafeInteger(request.target.expectedRevision + 1)
+      || receipt.appliedRevision !== request.target.expectedRevision + 1 || Date.parse(receipt.appliedAt) > Date.parse(receipt.observedAt))) {
+    throw new Error('invalid_form_application_receipt');
+  }
+}
+
+function toolResultCore(result: StoredToolResult): Omit<StoredToolResult, 'formApplication'> {
+  const { formApplication: _receipt, ...core } = result;
+  return core;
+}
+
+function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
   const row = value as {
     id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string;
     tool_version: string | null; effect: string | null; status: string; args_json: string; result_json: string | null;
@@ -611,38 +776,26 @@ function toolCallSnapshot(value: unknown): ToolCallSnapshot {
     || (deliveryObject.includedInCallSequence !== null && (!Number.isSafeInteger(deliveryObject.includedInCallSequence) || Number(deliveryObject.includedInCallSequence) < 1))
     || (deliveryObject.requestDispatchedAt !== null && typeof deliveryObject.requestDispatchedAt !== 'string')) throw new Error('invalid_tool_call_delivery');
   const deliveryError = deliveryObject.error === null ? null : AppErrorSchema.parse(deliveryObject.error);
-  const cleanupObject = exactRecord(readJson(row.cleanup_json, 'tool_call_cleanup'), 'tool_call_cleanup', ['version', 'stopReason', 'stopped', 'errors']);
-  if (cleanupObject.version !== 1 || (cleanupObject.stopReason !== null && typeof cleanupObject.stopReason !== 'string')
-    || typeof cleanupObject.stopped !== 'boolean' || !Array.isArray(cleanupObject.errors)) throw new Error('invalid_tool_call_cleanup');
-  const cleanupErrors = cleanupObject.errors.map((error) => AppErrorSchema.parse(error));
-  let result: StoredToolResult | null = null;
-  if (row.result_json !== null) {
-    const record = object(readJson(row.result_json, 'tool_call_result'), 'tool_call_result');
-    if (record.version !== 1 || !['succeeded', 'failed', 'cancelled'].includes(String(record.status))
-      || (record.committedCandidateId !== null && (!Number.isSafeInteger(record.committedCandidateId) || Number(record.committedCandidateId) < 1))) {
-      throw new Error('invalid_tool_call_result');
-    }
-    if (record.status === 'succeeded') {
-      if (!('data' in record) || 'error' in record) throw new Error('invalid_tool_call_result');
-    } else {
-      if (!('error' in record) || 'data' in record && record.data === undefined) throw new Error('invalid_tool_call_result');
-      AppErrorSchema.parse(record.error);
-    }
-    result = record as unknown as StoredToolResult;
-  }
+  const cleanup = readToolCleanup(readJson(row.cleanup_json, 'tool_call_cleanup'));
+  const { result, formApplication } = readToolEnvelope(row.result_json);
   const terminal = ['succeeded', 'failed', 'cancelled'].includes(row.status);
-  if (terminal !== (row.ended_at !== null) || terminal !== (result !== null)) throw new Error('invalid_tool_call_terminal');
+  if (terminal !== (row.ended_at !== null) || terminal !== (result !== null)
+    || result !== null && result.status !== row.status) throw new Error('invalid_tool_call_terminal');
   if (row.status === 'succeeded' && (row.started_at === null || row.stopped_at === null)) throw new Error('invalid_tool_call_success');
+  if (formApplication !== undefined) validateFormApplication(db, {
+    toolCallId: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id, toolName: row.tool_name, effect: row.effect,
+    args: { final: args.final }, startedAt: row.started_at,
+  }, formApplication);
   return {
     toolCallId: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
     toolName: row.tool_name, toolVersion: row.tool_version, effect: row.effect as ToolCallSnapshot['effect'],
     status: row.status as ToolCallStatus, args: args as unknown as ToolCallSnapshot['args'], result,
+    ...(formApplication === undefined ? {} : { formApplication }),
     delivery: { version: 1, state: deliveryObject.state as ToolCallDelivery['state'],
       messageObservedAt: deliveryObject.messageObservedAt as string | null,
       includedInCallSequence: deliveryObject.includedInCallSequence as number | null,
       requestDispatchedAt: deliveryObject.requestDispatchedAt as string | null, error: deliveryError },
-    cleanup: { version: 1, stopReason: cleanupObject.stopReason as string | null, stopped: cleanupObject.stopped,
-      errors: cleanupErrors },
+    cleanup,
     requestedAt: row.requested_at, startedAt: row.started_at, endedAt: row.ended_at, stoppedAt: row.stopped_at,
   };
 }
@@ -654,7 +807,8 @@ function businessEventSnapshot(value: unknown): BusinessEventSnapshot {
     run_id: number | null; result: string; safe_summary: string; error_code: string | null;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1
-    || !['document_imported', 'task_started', 'candidate_generated', 'candidate_selected'].includes(row.type)
+    || !['document_imported', 'task_started', 'candidate_generated', 'candidate_selected', 'candidate_edited',
+      'candidate_accepted', 'candidate_rejected', 'candidate_exported'].includes(row.type)
     || typeof row.occurred_at !== 'string' || !['user', 'agent', 'system'].includes(row.actor_source)
     || typeof row.operation_ref !== 'string' || row.operation_ref.length < 1 || row.operation_ref.length > 256
     || !['succeeded', 'failed'].includes(row.result) || typeof row.safe_summary !== 'string' || row.safe_summary.length > 512
@@ -670,24 +824,33 @@ function businessEventSnapshot(value: unknown): BusinessEventSnapshot {
 
 function candidateSnapshot(value: unknown): { snapshot: CandidateSnapshot; documentRef: { id: DbId; version: string } } {
   const row = value as {
-    id: number; job_id: number; run_id: number; tool_call_id: number; sequence: number; status: string;
+    id: number; job_id: number; run_id: number | null; tool_call_id: number | null; sequence: number; status: string;
+    origin: string; based_on_candidate_id?: number | null;
     fields_json: string; lines_json: string; issues_json: string; created_at: string; accepted_at: string | null;
     document_id: number; document_version: string;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.job_id) || row.job_id < 1
-    || !Number.isSafeInteger(row.run_id) || row.run_id < 1 || !Number.isSafeInteger(row.tool_call_id) || row.tool_call_id < 1
+    || (row.origin === 'model' ? !Number.isSafeInteger(row.run_id) || Number(row.run_id) < 1
+      || !Number.isSafeInteger(row.tool_call_id) || Number(row.tool_call_id) < 1 || (row.based_on_candidate_id ?? null) !== null
+      : row.origin !== 'human_edit' || row.run_id !== null || row.tool_call_id !== null
+        || !Number.isSafeInteger(row.based_on_candidate_id) || Number(row.based_on_candidate_id) < 1 || row.based_on_candidate_id === row.id)
     || !Number.isSafeInteger(row.sequence) || row.sequence < 1 || !['generated', 'accepted', 'rejected'].includes(row.status)
     || typeof row.created_at !== 'string' || (row.accepted_at !== null && typeof row.accepted_at !== 'string')
     || !Number.isSafeInteger(row.document_id) || row.document_id < 1 || typeof row.document_version !== 'string') {
     throw new Error('invalid_candidate_row');
   }
-  const fields = exactRecord(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields', ['version', 'values']);
+  const fields = exactRecord(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields',
+    row.origin === 'human_edit' ? ['version', 'values', 'editRequestHash'] : ['version', 'values']);
   const lines = exactRecord(readJson(row.lines_json, 'candidate_lines'), 'candidate_lines', ['version', 'items']);
   const persisted = exactRecord(readJson(row.issues_json, 'candidate_issues'), 'candidate_issues', ['version', 'notes', 'checks', 'items']);
   if (fields.version !== 1 || lines.version !== 1 || persisted.version !== 1 || !Array.isArray(persisted.notes)) {
     throw new Error('invalid_candidate_version');
   }
-  const candidate = CandidateDraftSchema.parse({ fields: fields.values, lines: lines.items, notes: persisted.notes });
+  if (row.origin === 'human_edit' && (typeof fields.editRequestHash !== 'string' || !/^[0-9a-f]{64}$/.test(fields.editRequestHash))) {
+    throw new Error('invalid_edit_request_hash');
+  }
+  const candidate = (row.origin === 'human_edit' ? StoredCandidateDraftSchema : CandidateDraftSchema)
+    .parse({ fields: fields.values, lines: lines.items, notes: persisted.notes });
   const checks = z.array(CheckResultSchema).max(1_000).parse(persisted.checks);
   const issues = z.array(InvoiceIssueSchema).max(1_000).parse(persisted.items);
   const sourceMap = new Map<string, CandidateDraft['fields'][keyof CandidateDraft['fields']]['sources'][number]>();
@@ -700,6 +863,7 @@ function candidateSnapshot(value: unknown): { snapshot: CandidateSnapshot; docum
     candidateId: row.id, jobId: row.job_id, runId: row.run_id, toolCallId: row.tool_call_id, sequence: row.sequence,
     status: row.status as CandidateSummary['status'], issueCount: issues.length, createdAt: row.created_at,
     fields: candidate.fields, lines: candidate.lines, notes: candidate.notes, checks, issues, sources: [...sourceMap.values()],
+    ...(row.origin === 'human_edit' ? { origin: 'human_edit' as const, basedOnCandidateId: row.based_on_candidate_id! } : {}),
   };
   return { snapshot, documentRef: DocumentRefSchema.parse({ id: row.document_id, version: row.document_version }) };
 }
@@ -1034,20 +1198,13 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
         const candidate = db.query('SELECT status FROM invoice_candidates WHERE id=? AND job_id=?')
           .get(input.candidateId, input.jobId) as { status: string } | null;
         if (!candidate) return fail(appError('candidate_not_found', 'input', '此 Job 下不存在该 Candidate。'));
-        if (candidate.status !== 'generated') return fail(appError('candidate_not_selectable', 'input', '只有 generated Candidate 可以选择。'));
+        if (!['generated', 'rejected'].includes(candidate.status)) return fail(appError('candidate_not_selectable', 'input', '只有未接受 Candidate 可以选择。'));
         if (job.current_candidate_id === input.candidateId) {
           return ok({ jobId: input.jobId, candidateId: input.candidateId, workspace: workspaceSnapshot(db, workspace, input.at) });
         }
         if (job.status === 'completed') return fail(appError('job_completed', 'input', '已完成 Job 不能更换候选。'));
         if (job.status === 'running') return fail(appError('state_conflict', 'runtime', 'Job 仍在运行，暂时不能选择候选。', true));
-        const relatedRuns = db.query('SELECT status,cleanup_json FROM runs WHERE job_id=?').all(input.jobId) as Array<{
-          status: string; cleanup_json: string;
-        }>;
-        if (relatedRuns.some((run) => {
-          if (run.status === 'created' || run.status === 'running') return true;
-          const cleanup = validatedCleanup(readJson(run.cleanup_json, 'cleanup'));
-          return !cleanup.stopped || cleanup.lateObservationRequired;
-        })) return fail(appError('state_conflict', 'runtime', 'Job 仍有未停止或未收尾的执行。', true));
+        if (!executionReleased(db, input.jobId)) return fail(appError('state_conflict', 'runtime', 'Job 仍有未停止或未收尾的执行。', true));
         if (!Number.isSafeInteger(workspace.revision + 1)) {
           return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         }
@@ -1205,7 +1362,22 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
   const byId = (toolCallId: DbId) => {
     const row = db.query('SELECT * FROM tool_calls WHERE id=?').get(toolCallId);
     if (!row) return fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
-    return ok(toolCallSnapshot(row));
+    return ok(toolCallSnapshot(db, row));
+  };
+  const trustedContext = (context: ProductToolContext): Result<string> => {
+    const row = db.query(`SELECT run.session_id,run.scope_json,run.config_json,run.status,session.status AS session_status,session.metadata_json
+      FROM runs run JOIN sessions session ON session.id=run.session_id WHERE run.id=? AND run.kind='agent'`)
+      .get(context.runId) as { session_id: number; scope_json: string; config_json: string; status: string; session_status: string; metadata_json: string } | null;
+    if (!row || row.session_id !== context.sessionId) return fail(appError('tool_access_denied', 'runtime', 'Native tool context does not match the Run.'));
+    if (row.status !== 'running' || row.session_status !== 'active') return fail(appError('run_state_invalid', 'runtime', 'Native tools require an active Run.'));
+    const scope = RunScopeSchema.parse(readJson(row.scope_json, 'run_scope'));
+    if (stableJson(scope) !== stableJson(context.scope)) return fail(appError('tool_access_denied', 'runtime', 'Native context does not match the frozen Run.'));
+    const config = validatedConfig(readJson(row.config_json, 'run_config'), 'agent');
+    if (parseSessionModelUse(row.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
+    if (typeof config.workingDirectory !== 'string') {
+      return fail(appError('tool_access_denied', 'runtime', 'The Run has no trusted working directory.'));
+    }
+    return ok(config.workingDirectory);
   };
   return {
     request(input) {
@@ -1217,11 +1389,12 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           || input.effect !== null && !ToolEffectSchema.safeParse(input.effect).success
           || (input.toolVersion === null) !== (input.effect === null)) return fail(appError('input_invalid', 'input', '原生 ToolCall 身份无效。'));
         const raw = JSON.stringify(input.rawArguments);
-        if (raw === undefined || Buffer.byteLength(raw, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', 'ToolCall 参数超过记录上限。'));
+        if (raw === undefined || !NATIVE_TOOL_NAMES.includes(input.toolName as (typeof NATIVE_TOOL_NAMES)[number])
+          && Buffer.byteLength(raw, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', 'ToolCall 参数超过记录上限。'));
         const existing = db.query('SELECT * FROM tool_calls WHERE session_id=? AND native_tool_call_id=?')
           .get(input.sessionId, input.nativeToolCallId);
         if (existing) {
-          const call = toolCallSnapshot(existing);
+          const call = toolCallSnapshot(db, existing);
           if (call.runId !== input.runId || call.toolName !== input.toolName || call.toolVersion !== input.toolVersion
             || call.effect !== input.effect || stableJson(call.args.raw) !== stableJson(input.rawArguments)) {
             return fail(appError('state_conflict', 'runtime', '原生 ToolCall ID 已属于不同的执行请求。'));
@@ -1255,7 +1428,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
       try {
         const row = db.query('SELECT * FROM tool_calls WHERE run_id=? AND session_id=? AND native_tool_call_id=?')
           .get(identity.runId, identity.sessionId, identity.nativeToolCallId);
-        return row ? ok(toolCallSnapshot(row)) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
+        return row ? ok(toolCallSnapshot(db, row)) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
       } catch {
         return fail(appError('storage_corrupt', 'storage', 'ToolCall 事实无法读取。'));
       }
@@ -1273,7 +1446,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
         const rows = input.beforeId === undefined
           ? db.query('SELECT * FROM tool_calls WHERE run_id=? ORDER BY id DESC LIMIT ?').all(input.runId, input.limit + 1)
           : db.query('SELECT * FROM tool_calls WHERE run_id=? AND id<? ORDER BY id DESC LIMIT ?').all(input.runId, input.beforeId, input.limit + 1);
-        const calls = (rows as unknown[]).map(toolCallSnapshot);
+        const calls = (rows as unknown[]).map((row) => toolCallSnapshot(db, row));
         const hasMore = calls.length > input.limit;
         const items = hasMore ? calls.slice(0, input.limit) : calls;
         return ok({ items, nextBeforeId: hasMore ? items.at(-1)?.toolCallId ?? null : null });
@@ -1284,8 +1457,11 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
 
     fixArguments(input) {
       try {
+        const before = byId(input.toolCallId);
+        if (!before.ok) return before;
         const serialized = JSON.stringify(input.finalArguments);
-        if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > 65_536) return fail(appError('tool_result_too_large', 'input', 'ToolCall 最终参数超过记录上限.'));
+        if (serialized === undefined || !NATIVE_TOOL_NAMES.includes(before.data.toolName as (typeof NATIVE_TOOL_NAMES)[number])
+          && Buffer.byteLength(serialized, 'utf8') > 65_536) return fail(appError('tool_result_too_large', 'input', 'ToolCall 最终参数超过记录上限.'));
         const changed = db.query(`UPDATE tool_calls SET args_json=json_set(args_json,'$.final',json(?)) WHERE id=? AND status='requested' AND json_type(args_json,'$.final')='null'`)
           .run(serialized, input.toolCallId).changes;
         if (changed === 1) return byId(input.toolCallId);
@@ -1311,36 +1487,76 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
 
     finish(input) {
       try {
-        if (!['succeeded', 'failed', 'cancelled'].includes(input.result.status)
-          || !Array.isArray(input.cleanup.errors) || (input.result.status === 'succeeded' && (!input.cleanup.stopped || input.stoppedAt === null))) {
-          return fail(appError('input_invalid', 'storage', 'ToolCall 终态事实无效。'));
-        }
-        const serialized = JSON.stringify(input.result);
-        if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
-        const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=?
-          WHERE id=? AND status='running'`).run(input.result.status, serialized, JSON.stringify(input.cleanup), input.endedAt,
-          input.stoppedAt, input.toolCallId).changes;
-        if (changed === 1) return byId(input.toolCallId);
-        const current = byId(input.toolCallId);
-        return current.ok && stableJson(current.data.result) === stableJson(input.result) ? current
-          : fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定或状态已变化。'));
+        const completed = transaction(db, () => {
+          if (!['succeeded', 'failed', 'cancelled'].includes(input.result.status)
+            || !Array.isArray(input.cleanup.errors) || (input.result.status === 'succeeded' && (!input.cleanup.stopped || input.stoppedAt === null))) {
+            return fail(appError('input_invalid', 'storage', 'ToolCall 终态事实无效。'));
+          }
+          const before = byId(input.toolCallId);
+          if (!before.ok) return before;
+          const incoming = readToolEnvelope(JSON.stringify(input.result)).result;
+          if (incoming === null) return fail(appError('input_invalid', 'storage', 'ToolCall 终态结果缺失。'));
+          if (incoming.formApplication !== undefined) {
+            try { validateFormApplication(db, before.data, incoming.formApplication); }
+            catch { return fail(appError('state_conflict', 'runtime', '表单回执与原调用不匹配。')); }
+          }
+          const cleanup = readToolCleanup({ ...input.cleanup,
+            ...(before.data.cleanup.nativeProcesses ? { nativeProcesses: before.data.cleanup.nativeProcesses } : {}),
+            ...(before.data.cleanup.nativeOutputs ? { nativeOutputs: before.data.cleanup.nativeOutputs } : {}) });
+          if (cleanup.nativeProcesses?.some((record) => !record.stopped)) cleanup.stopped = false;
+          if (input.result.status === 'succeeded' && !cleanup.stopped) return fail(appError('stop_not_confirmed', 'runtime', 'Native process termination has not been confirmed.'));
+          if (before.data.result !== null) return stableJson(toolResultCore(before.data.result)) === stableJson(toolResultCore(incoming))
+            && stableJson(before.data.cleanup) === stableJson(cleanup) && before.data.endedAt === input.endedAt
+            && before.data.stoppedAt === input.stoppedAt ? before : fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定。'));
+          if (incoming.formApplication !== undefined && before.data.formApplication !== undefined
+            && stableJson(incoming.formApplication) !== stableJson(before.data.formApplication)) {
+            return fail(appError('state_conflict', 'runtime', '表单应用事实已固定，请通过原调用补证。'));
+          }
+          const formApplication = before.data.formApplication ?? incoming.formApplication;
+          const serialized = JSON.stringify({ ...incoming, ...(formApplication === undefined ? {} : { formApplication }) });
+          if (!NATIVE_TOOL_NAMES.includes(before.data.toolName as (typeof NATIVE_TOOL_NAMES)[number])
+            && Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
+          const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=?
+            WHERE id=? AND status='running'`).run(input.result.status, serialized, JSON.stringify(cleanup), input.endedAt,
+            input.stoppedAt, input.toolCallId).changes;
+          if (changed === 1) return byId(input.toolCallId);
+          return fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定或状态已变化。'));
+        });
+        return completed.ok ? completed.data : completed;
       } catch { return fail(databaseError('ToolCall 终态保存失败。')); }
     },
 
     reject(input) {
       try {
-        if (!['failed', 'cancelled'].includes(input.result.status) || input.cleanup.version !== 1
-          || input.cleanup.stopped !== true || !Array.isArray(input.cleanup.errors)) {
-          return fail(appError('input_invalid', 'storage', '未执行调用的终态事实无效。'));
-        }
-        const serialized = JSON.stringify(input.result);
-        if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
-        const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=NULL
-          WHERE id=? AND status='requested'`).run(input.result.status, serialized, JSON.stringify(input.cleanup), input.endedAt, input.toolCallId).changes;
-        if (changed === 1) return byId(input.toolCallId);
-        const current = byId(input.toolCallId);
-        return current.ok && stableJson(current.data.result) === stableJson(input.result) ? current
-          : fail(appError('state_conflict', 'runtime', 'ToolCall 已开始或终态已固定。'));
+        const rejected = transaction(db, () => {
+          if (!['failed', 'cancelled'].includes(input.result.status) || input.cleanup.version !== 1
+            || input.cleanup.stopped !== true || !Array.isArray(input.cleanup.errors)) {
+            return fail(appError('input_invalid', 'storage', '未执行调用的终态事实无效。'));
+          }
+          const before = byId(input.toolCallId);
+          if (!before.ok) return before;
+          const incoming = readToolEnvelope(JSON.stringify(input.result)).result;
+          if (incoming === null) return fail(appError('input_invalid', 'storage', 'ToolCall 终态结果缺失。'));
+          if (incoming.formApplication !== undefined) {
+            try { validateFormApplication(db, before.data, incoming.formApplication); }
+            catch { return fail(appError('state_conflict', 'runtime', '表单回执与原调用不匹配。')); }
+          }
+          if (before.data.result !== null) return stableJson(toolResultCore(before.data.result)) === stableJson(toolResultCore(incoming))
+            && stableJson(before.data.cleanup) === stableJson(input.cleanup) && before.data.endedAt === input.endedAt
+            && before.data.stoppedAt === null ? before : fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定。'));
+          if (incoming.formApplication !== undefined && before.data.formApplication !== undefined
+            && stableJson(incoming.formApplication) !== stableJson(before.data.formApplication)) {
+            return fail(appError('state_conflict', 'runtime', '表单应用事实已固定，请通过原调用补证。'));
+          }
+          const formApplication = before.data.formApplication ?? incoming.formApplication;
+          const serialized = JSON.stringify({ ...incoming, ...(formApplication === undefined ? {} : { formApplication }) });
+          if (Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
+          const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=NULL
+            WHERE id=? AND status='requested'`).run(input.result.status, serialized, JSON.stringify(input.cleanup), input.endedAt, input.toolCallId).changes;
+          if (changed === 1) return byId(input.toolCallId);
+          return fail(appError('state_conflict', 'runtime', 'ToolCall 已开始或终态已固定。'));
+        });
+        return rejected.ok ? rejected.data : rejected;
       } catch { return fail(databaseError('ToolCall 拒绝记录保存失败。')); }
     },
 
@@ -1360,6 +1576,49 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
         return changed === 1 ? byId(input.toolCallId) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
       } catch { return fail(databaseError('ToolCall 回送事实保存失败。')); }
     },
+
+    recordFormApplication(input) {
+      const parsed = InvoiceFormApplicationReceiptSchema.safeParse(input.receipt);
+      if (!Number.isSafeInteger(input.toolCallId) || input.toolCallId < 1 || !parsed.success) {
+        return fail(appError('input_invalid', 'input', '表单应用回执无效。'));
+      }
+      const recorded = transaction(db, () => {
+        const before = byId(input.toolCallId);
+        if (!before.ok) return before;
+        try { validateFormApplication(db, before.data, parsed.data); }
+        catch { return fail(appError('state_conflict', 'runtime', '表单回执与原调用、候选或目标不匹配。')); }
+        const previous = before.data.formApplication;
+        if (previous !== undefined) {
+          if (stableJson(previous) === stableJson(parsed.data)) return before;
+          if (previous.outcome !== 'unknown' || parsed.data.outcome === 'unknown') {
+            return fail(appError('state_conflict', 'runtime', '表单应用事实不能回退或被矛盾回执覆盖。'));
+          }
+        }
+        const envelope = { ...(before.data.result ?? { version: 1 }), formApplication: parsed.data };
+        const changed = db.query('UPDATE tool_calls SET result_json=? WHERE id=?')
+          .run(JSON.stringify(envelope), input.toolCallId).changes;
+        return changed === 1 ? byId(input.toolCallId) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
+      });
+      return recorded.ok ? recorded.data : recorded;
+    },
+
+    readFormApplicationRequest(toolCallId) {
+      if (!Number.isSafeInteger(toolCallId) || toolCallId < 1) return fail(appError('input_invalid', 'input', 'ToolCall 身份无效。'));
+      try {
+        const before = byId(toolCallId);
+        if (!before.ok) return before;
+        try { return ok(deriveFormApplicationRequest(db, before.data)); }
+        catch { return fail(appError('state_conflict', 'runtime', '原调用没有可核验的填表依据。')); }
+      } catch { return fail(appError('storage_corrupt', 'storage', '原填表调用无法读取。')); }
+    },
+
+    getNativeWorkingDirectory(context) {
+      try {
+        const trusted = trustedContext(context);
+        return trusted;
+      } catch { return fail(appError('storage_corrupt', 'storage', 'Frozen native Run context is unreadable.')); }
+    },
+
 
   };
 }
@@ -1428,14 +1687,275 @@ export function createBusinessEventRepository(db: Database): BusinessEventReposi
   };
 }
 
-export function createCandidateRepository(db: Database): CandidateRepository {
-  const queryCandidate = (candidateId: DbId, jobId?: DbId) => {
-    const sql = `SELECT candidate.*,document.id AS document_id,document.version AS document_version
-      FROM invoice_candidates candidate JOIN jobs job ON job.id=candidate.job_id
-      JOIN documents document ON document.id=job.document_id WHERE candidate.id=?${jobId === undefined ? '' : ' AND candidate.job_id=?'}`;
-    return jobId === undefined ? db.query(sql).get(candidateId) : db.query(sql).get(candidateId, jobId);
+function queryCandidateRow(db: Database, candidateId: DbId, jobId?: DbId): unknown {
+  const sql = `SELECT candidate.*,document.id AS document_id,document.version AS document_version
+    FROM invoice_candidates candidate JOIN jobs job ON job.id=candidate.job_id
+    JOIN documents document ON document.id=job.document_id WHERE candidate.id=?${jobId === undefined ? '' : ' AND candidate.job_id=?'}`;
+  return jobId === undefined ? db.query(sql).get(candidateId) : db.query(sql).get(candidateId, jobId);
+}
+
+function invoiceRequestHash(value: unknown): string {
+  return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+function executionReleased(db: Database, jobId: DbId): boolean {
+  const runs = db.query('SELECT status,cleanup_json FROM runs WHERE job_id=? OR status IN (\'created\',\'running\')').all(jobId) as
+    Array<{ status: string; cleanup_json: string }>;
+  if (runs.some(run => {
+    if (run.status === 'created' || run.status === 'running') return true;
+    const cleanup = validatedCleanup(readJson(run.cleanup_json, 'cleanup'));
+    return !cleanup.stopped || cleanup.lateObservationRequired;
+  })) return false;
+  const calls = db.query('SELECT call.status,call.cleanup_json FROM tool_calls call JOIN runs run ON run.id=call.run_id WHERE run.job_id=?')
+    .all(jobId) as Array<{ status: string; cleanup_json: string }>;
+  return !calls.some(call => {
+    if (call.status === 'requested' || call.status === 'running') return true;
+    const cleanup = readToolCleanup(readJson(call.cleanup_json, 'tool_cleanup'));
+    return !cleanup.stopped || cleanup.nativeProcesses?.some(item => !item.stopped);
+  });
+}
+function humanField(name: string, text: string, before?: StoredInvoiceField): StoredInvoiceField {
+  if (before && text === invoiceFieldDisplayValue(name, before)) return structuredClone(before);
+  if (!text.trim()) return { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [], valueOrigin: 'user-provided' };
+  const normalized = text.trim();
+  if (!isLegalInvoiceNormalizedValue(name, normalized)) throw new Error('human_value_invalid');
+  return { raw: text, normalized, state: 'present', alternatives: [], sources: [], valueOrigin: 'user-provided' };
+}
+function humanDraft(input: SaveInvoiceCandidateRequest, before: CandidateSnapshot): StoredCandidateDraft {
+  return StoredCandidateDraftSchema.parse({
+    fields: Object.fromEntries(invoiceHeaderFields.map(name => [name, humanField(name, input.draft.fields[name], before.fields[name])])),
+    lines: input.draft.lines.map((line, index) => Object.fromEntries(invoiceLineFields.map(name =>
+      [name, humanField(name, line[name], before.lines[index]?.[name])]))), notes: [...input.draft.notes],
+  });
+}
+function invoiceOperationFacts(db: Database, input: { jobId: DbId; expectedCandidateId: DbId; expectedRevision: number }, at: string):
+  Result<{ job: JobSnapshot; workspace: WorkspaceSnapshot }> {
+  const workspace = workspaceSnapshot(db, ensureWorkspace(db, at), at);
+  const job = readJob(db, input.jobId);
+  if (!job) return fail(appError('job_not_found', 'input', 'Job 不存在。'));
+  if (workspace.revision !== input.expectedRevision || workspace.jobId !== input.jobId
+    || workspace.documentRef?.id !== job.documentRef.id || workspace.documentRef.version !== job.documentRef.version
+    || job.currentCandidateId !== input.expectedCandidateId || workspace.candidateRef?.id !== input.expectedCandidateId) {
+    return fail(appError('state_conflict', 'input', '候选或 Workspace 已变化，请重新读取。', true));
+  }
+  if (job.status === 'completed') return fail(appError('job_completed', 'input', '已接受结果不能修改。'));
+  const document = db.query('SELECT status,hidden_at FROM documents WHERE id=?').get(job.documentRef.id) as { status: string; hidden_at: string | null };
+  if (document.status !== 'available' || document.hidden_at !== null) return fail(appError('input_unavailable', 'input', '材料当前不可用于修改。'));
+  if (!executionReleased(db, input.jobId)) return fail(appError('state_conflict', 'runtime', '实际执行尚未释放，不能修改结果。', true));
+  if (!Number.isSafeInteger(workspace.revision + 1)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
+  return ok({ job, workspace });
+}
+function invoiceEvent(db: Database, type: BusinessEventType, operationRef: string): BusinessEventSnapshot | null {
+  const row = db.query("SELECT * FROM business_events WHERE type=? AND operation_ref=? AND result='succeeded'").get(type, operationRef);
+  return row ? businessEventSnapshot(row) : null;
+}
+function invoiceExportName(candidate: CandidateSnapshot, format: ExportInvoiceCandidateRequest['format']): string {
+  return `outputs/invoice-${candidate.jobId}-result-${candidate.sequence}.${format === 'markdown' ? 'md' : format}`;
+}
+function findInvoiceExport(db: Database, input: ExportInvoiceCandidateRequest): Result<InvoiceExportReference | null> {
+  if (!ExportInvoiceCandidateRequestSchema.safeParse(input).success) return fail(appError('input_invalid', 'input', '导出参数无效。'));
+  try {
+    const prior = invoiceEvent(db, 'candidate_exported', input.operationRef);
+    if (!prior) return ok(null);
+    const summary = object(readJson(prior.safeSummary, 'export_event'), 'export_event');
+    if (summary.requestHash !== invoiceRequestHash(input) || prior.candidateId !== input.candidateId) {
+      return fail(appError('state_conflict', 'input', '同一操作引用已有不同导出事实。'));
+    }
+    const artifact = db.query("SELECT * FROM artifacts WHERE id=? AND kind='export'").get(prior.artifactId!) as {
+      id: number; relative_path: string; bytes: number; metadata_json: string; created_at: string;
+    } | null;
+    if (!artifact) throw new Error('missing_export_artifact');
+    const meta = exactRecord(readJson(artifact.metadata_json, 'export_metadata'), 'export_metadata',
+      ['version', 'candidateId', 'basedOnCandidateId', 'format', 'sha256', 'requestHash']);
+    const saved = candidateSnapshot(queryCandidateRow(db, input.candidateId));
+    const job = readJob(db, saved.snapshot.jobId);
+    if (meta.version !== 1 || meta.candidateId !== input.candidateId || meta.format !== input.format
+      || typeof meta.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(meta.sha256)
+      || typeof meta.requestHash !== 'string' || !/^[0-9a-f]{64}$/.test(meta.requestHash)
+      || meta.basedOnCandidateId !== (saved.snapshot.basedOnCandidateId ?? null)
+      || saved.snapshot.status !== 'accepted' || job?.status !== 'completed' || job.acceptedCandidateId !== input.candidateId
+      || prior.jobId !== saved.snapshot.jobId || prior.documentId !== saved.documentRef.id
+      || !Number.isSafeInteger(artifact.bytes) || artifact.bytes <= 0
+      || artifact.relative_path !== invoiceExportName(saved.snapshot, input.format)) throw new Error('invalid_export_artifact');
+    return ok({ artifactId: artifact.id, candidateId: input.candidateId, format: input.format,
+      relativePath: artifact.relative_path, bytes: artifact.bytes, sha256: meta.sha256, createdAt: artifact.created_at });
+  } catch { return fail(appError('storage_corrupt', 'storage', '导出事实无法读取。')); }
+}
+function recordInvoiceEvent(db: Database, type: BusinessEventType, operationRef: string, candidate: CandidateSnapshot,
+  documentId: DbId, at: string, summary: string, artifactId: DbId | null = null): void {
+  db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,candidate_id,artifact_id,result,safe_summary)
+    VALUES (?,?,'user',?,?,?,?,?,'succeeded',?)`).run(type, at, operationRef, documentId, candidate.jobId, candidate.candidateId, artifactId, summary);
+}
+
+export function createCandidateRepository(db: Database): InvoiceEditRepository {
+  const readDecision = (candidateId: DbId, jobId: DbId, at: string): InvoiceCandidateDecisionResponse => {
+    const candidate = candidateSnapshot(queryCandidateRow(db, candidateId, jobId)).snapshot;
+    const job = readJob(db, jobId);
+    if (!job) throw new Error('job_not_found');
+    return { candidate, job, workspace: workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), at) };
+  };
+  const decision = (input: (AcceptInvoiceCandidateRequest | RejectInvoiceCandidateRequest) & { at: string; validate?: ValidateHumanInvoice }, accept: boolean): Result<InvoiceCandidateDecisionResponse> => {
+    const { at, validate, ...request } = input;
+    const schema = accept ? AcceptInvoiceCandidateRequestSchema : RejectInvoiceCandidateRequestSchema;
+    const parsed = schema.safeParse(request);
+    if (!parsed.success) return fail(appError('input_invalid', 'input', '候选确认参数无效。'));
+    const type = accept ? 'candidate_accepted' : 'candidate_rejected';
+    const hash = invoiceRequestHash(parsed.data);
+    const committed = transaction(db, () => {
+      const prior = invoiceEvent(db, type, input.operationRef);
+      if (prior) {
+        const summary = object(readJson(prior.safeSummary, 'decision'), 'decision');
+        if (summary.requestHash !== hash || prior.jobId !== input.jobId || prior.candidateId !== input.candidateId) {
+          return fail(appError('state_conflict', 'input', '同一操作引用已有不同事实。'));
+        }
+        return ok(readDecision(input.candidateId, input.jobId, at));
+      }
+      const facts = invoiceOperationFacts(db, input, at);
+      if (!facts.ok) return facts;
+      const row = queryCandidateRow(db, input.candidateId, input.jobId);
+      if (!row) return fail(appError('candidate_not_found', 'input', '当前 Job 不存在该候选。'));
+      const candidate = candidateSnapshot(row).snapshot;
+      if (candidate.status === 'accepted' || input.candidateId !== input.expectedCandidateId) {
+        return fail(appError('state_conflict', 'input', '候选不再满足确认条件。'));
+      }
+      if (!accept && candidate.status === 'rejected') return fail(appError('state_conflict', 'input', '候选已拒绝。'));
+      if (accept) {
+        if (!validate) return fail(appError('input_invalid', 'input', '接受缺少必要领域核验。'));
+        const validated = validate({ fields: candidate.fields, lines: candidate.lines, notes: candidate.notes }, facts.data.job.documentRef);
+        if (!validated.ok) return validated;
+      }
+      db.query('UPDATE invoice_candidates SET status=?,accepted_at=? WHERE id=? AND status IN (\'generated\',\'rejected\')')
+        .run(accept ? 'accepted' : 'rejected', accept ? at : null, input.candidateId);
+      if (accept) db.query("UPDATE jobs SET status='completed',status_reason='user_accepted',accepted_candidate_id=?,updated_at=? WHERE id=?")
+        .run(input.candidateId, at, input.jobId);
+      else db.query('UPDATE jobs SET current_candidate_id=NULL,updated_at=? WHERE id=?').run(at, input.jobId);
+      db.query('UPDATE workspace SET selection_json=NULL,revision=revision+1,updated_at=? WHERE id=1').run(at);
+      recordInvoiceEvent(db, type, input.operationRef, candidate, facts.data.job.documentRef.id, at,
+        asJson({ version: 1, requestHash: hash, ...('reason' in parsed.data ? { reason: parsed.data.reason } : {}) }));
+      return ok(readDecision(input.candidateId, input.jobId, at));
+    });
+    return committed.ok ? committed.data : committed;
   };
   return {
+    queryOperation(input) {
+      const { at, ...query } = input;
+      const parsed = InvoiceCandidateOperationQuerySchema.safeParse(query);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', '操作查询参数无效。'));
+      try {
+        const { kind, request } = parsed.data;
+        if (kind === 'export') return findInvoiceExport(db, request);
+        const type = kind === 'save' ? 'candidate_edited' : kind === 'accept' ? 'candidate_accepted' : 'candidate_rejected';
+        const prior = invoiceEvent(db, type, request.operationRef);
+        if (!prior) return ok(null);
+        if (prior.jobId !== request.jobId || prior.candidateId === null) return fail(appError('state_conflict', 'input', '同一操作引用已有不同事实。'));
+        const row = queryCandidateRow(db, prior.candidateId, request.jobId) as { fields_json: string } | null;
+        if (!row) throw new Error('missing_operation_candidate');
+        const hash = kind === 'save' ? object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestHash
+          : object(readJson(prior.safeSummary, 'decision'), 'decision').requestHash;
+        if (hash !== invoiceRequestHash(request)) return fail(appError('state_conflict', 'input', '同一操作引用已有不同载荷。'));
+        if (kind === 'save') return ok({ changed: true, candidate: candidateSnapshot(row).snapshot,
+          workspace: workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), at) });
+        return ok(readDecision(prior.candidateId, request.jobId, at));
+      } catch { return fail(appError('storage_corrupt', 'storage', '操作事实无法读取。')); }
+    },
+    saveHuman(input) {
+      const { at, validate, ...request } = input;
+      const parsed = SaveInvoiceCandidateRequestSchema.safeParse(request);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', '人工表单参数无效。'));
+      const hash = invoiceRequestHash(parsed.data);
+      const committed = transaction(db, () => {
+        const prior = invoiceEvent(db, 'candidate_edited', input.operationRef);
+        if (prior) {
+          const row = queryCandidateRow(db, prior.candidateId!, input.jobId) as { fields_json: string } | null;
+          if (!row || object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestHash !== hash) {
+            return fail(appError('state_conflict', 'input', '同一操作引用已有不同人工版本。'));
+          }
+          return ok({ changed: true, candidate: candidateSnapshot(row).snapshot,
+            workspace: workspaceSnapshot(db, ensureWorkspace(db, at), at) });
+        }
+        const facts = invoiceOperationFacts(db, input, at);
+        if (!facts.ok) return facts;
+        if (input.basedOnCandidateId !== input.expectedCandidateId) return fail(appError('state_conflict', 'input', '编辑依据不是当前候选。'));
+        const row = queryCandidateRow(db, input.basedOnCandidateId, input.jobId);
+        if (!row) return fail(appError('candidate_not_found', 'input', '编辑依据不存在。'));
+        const basis = candidateSnapshot(row).snapshot;
+        if (basis.status === 'accepted') return fail(appError('state_conflict', 'input', '已接受结果不能编辑。'));
+        let candidate: StoredCandidateDraft;
+        try { candidate = humanDraft(input, basis); }
+        catch { return fail(appError('input_invalid', 'input', '人工值不满足字段或精确数值规则。')); }
+        if (stableJson(candidate) === stableJson({ fields: basis.fields, lines: basis.lines, notes: basis.notes })) {
+          return ok({ changed: false, candidate: basis, workspace: facts.data.workspace });
+        }
+        const validation = validate(candidate, facts.data.job.documentRef);
+        if (!validation.ok) return validation;
+        const checks = z.array(CheckResultSchema).max(1_000).parse(validation.data.checks);
+        const issues = z.array(InvoiceIssueSchema).max(1_000).parse(validation.data.issues);
+        const fieldsJson = asJson({ version: 1, values: candidate.fields, editRequestHash: hash });
+        const linesJson = asJson({ version: 1, items: candidate.lines });
+        const issuesJson = asJson({ version: 1, notes: candidate.notes, checks, items: issues });
+        if (Buffer.byteLength(fieldsJson + linesJson + issuesJson, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', '人工候选超过保存上限。'));
+        const sequence = (db.query('SELECT COALESCE(MAX(sequence),0)+1 AS next FROM invoice_candidates WHERE job_id=?').get(input.jobId) as { next: number }).next;
+        if (!Number.isSafeInteger(sequence)) return fail(appError('state_conflict', 'input', '候选版本已到上限。'));
+        const inserted = db.query(`INSERT INTO invoice_candidates(job_id,run_id,tool_call_id,sequence,origin,based_on_candidate_id,status,
+          fields_json,lines_json,issues_json,created_at) VALUES (?,NULL,NULL,?,'human_edit',?,'generated',?,?,?,?)`)
+          .run(input.jobId, sequence, basis.candidateId, fieldsJson, linesJson, issuesJson, at);
+        const candidateId = Number(inserted.lastInsertRowid);
+        db.query('UPDATE jobs SET current_candidate_id=?,updated_at=? WHERE id=?').run(candidateId, at, input.jobId);
+        db.query('UPDATE workspace SET selection_json=NULL,revision=revision+1,updated_at=? WHERE id=1').run(at);
+        const saved = candidateSnapshot(queryCandidateRow(db, candidateId, input.jobId)).snapshot;
+        recordInvoiceEvent(db, 'candidate_edited', input.operationRef, saved, facts.data.job.documentRef.id, at, 'Human changes saved');
+        return ok({ changed: true, candidate: saved, workspace: workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), at) });
+      });
+      return committed.ok ? committed.data : committed;
+    },
+    accept(input) { return decision(input, true); },
+    reject(input) { return decision(input, false); },
+    readAccepted(candidateId) {
+      try {
+        const candidate = candidateSnapshot(queryCandidateRow(db, candidateId));
+        const job = readJob(db, candidate.snapshot.jobId);
+        if (candidate.snapshot.status !== 'accepted' || job?.status !== 'completed' || job.acceptedCandidateId !== candidateId
+          || job.currentCandidateId !== candidateId) return fail(appError('state_conflict', 'input', '只能导出指定的已接受结果。'));
+        return ok({ candidate: candidate.snapshot, documentRef: candidate.documentRef });
+      } catch { return fail(appError('storage_corrupt', 'storage', '已接受结果无法读取。')); }
+    },
+    findExport(input) { return findInvoiceExport(db, input); },
+    registerExport(input) {
+      const { at, relativePath, bytes, sha256, ...request } = input;
+      if (!ExportInvoiceCandidateRequestSchema.safeParse(request).success || !/^outputs\/invoice-[1-9]\d*-result-[1-9]\d*\.(json|csv|md)$/.test(relativePath)
+        || !Number.isSafeInteger(bytes) || bytes <= 0 || !/^[a-f0-9]{64}$/.test(sha256)) return fail(appError('input_invalid', 'input', '导出文件引用无效。'));
+      const committed = transaction(db, () => {
+        const prior = findInvoiceExport(db, request);
+        if (!prior.ok) return prior;
+        if (prior.data) return prior.data.relativePath === relativePath && prior.data.bytes === bytes && prior.data.sha256 === sha256
+          ? prior : fail(appError('state_conflict', 'input', '同一操作已有不同的文件登记事实。'));
+        const saved = candidateSnapshot(queryCandidateRow(db, input.candidateId));
+        const job = readJob(db, saved.snapshot.jobId);
+        if (saved.snapshot.status !== 'accepted' || job?.acceptedCandidateId !== input.candidateId || job.currentCandidateId !== input.candidateId
+          || job.status !== 'completed') return fail(appError('state_conflict', 'input', '导出结果不再满足接受条件。'));
+        if (relativePath !== invoiceExportName(saved.snapshot, input.format)) return fail(appError('state_conflict', 'input', '导出路径不属于指定的已接受版本。'));
+        const existing = db.query('SELECT * FROM artifacts WHERE relative_path=?').get(relativePath) as { id: number; kind: string; metadata_json: string; bytes: number } | null;
+        const metadata = { version: 1, candidateId: input.candidateId, basedOnCandidateId: saved.snapshot.basedOnCandidateId ?? null,
+          format: input.format, sha256, requestHash: invoiceRequestHash(request) };
+        let artifactId: number;
+        if (existing) {
+          const facts = object(readJson(existing.metadata_json, 'export'), 'export');
+          if (existing.kind !== 'export' || existing.bytes !== bytes || facts.candidateId !== input.candidateId || facts.format !== input.format || facts.sha256 !== sha256
+            || facts.basedOnCandidateId !== (saved.snapshot.basedOnCandidateId ?? null)) {
+            return fail(appError('state_conflict', 'input', '目标文件已有不同的登记事实。'));
+          }
+          artifactId = existing.id;
+        } else {
+          artifactId = Number(db.query("INSERT INTO artifacts(kind,relative_path,bytes,mime_type,metadata_json,created_at) VALUES ('export',?,?,?,?,?)")
+            .run(relativePath, bytes, input.format === 'json' ? 'application/json' : input.format === 'csv' ? 'text/csv' : 'text/markdown', asJson(metadata), at).lastInsertRowid);
+        }
+        recordInvoiceEvent(db, 'candidate_exported', input.operationRef, saved.snapshot, saved.documentRef.id, at,
+          asJson({ version: 1, requestHash: invoiceRequestHash(request), format: input.format }), artifactId);
+        return findInvoiceExport(db, request);
+      });
+      if (!committed.ok) return committed;
+      return committed.data.ok && committed.data.data ? ok(committed.data.data) : committed.data.ok
+        ? fail(appError('storage_corrupt', 'storage', '导出登记缺少事实。')) : committed.data;
+    },
     save(input) {
       try {
         const draft = CandidateDraftSchema.parse(input.candidate);
@@ -1475,7 +1995,7 @@ export function createCandidateRepository(db: Database): CandidateRepository {
           }
           const existing = db.query('SELECT id FROM invoice_candidates WHERE tool_call_id=?').get(facts.tool_call_id) as { id: number } | null;
           if (existing) {
-            const candidate = candidateSnapshot(queryCandidate(existing.id, facts.job_id));
+            const candidate = candidateSnapshot(queryCandidateRow(db, existing.id, facts.job_id));
             if (candidate.snapshot.runId !== input.runId || stableJson({ fields: candidate.snapshot.fields, lines: candidate.snapshot.lines, notes: candidate.snapshot.notes })
               !== stableJson(draft)) return { ok: false as const, error: appError('state_conflict', 'runtime', '同一 ToolCall 已提交了不同候选。') };
             return { ok: true as const, candidate, created: false };
@@ -1494,7 +2014,7 @@ export function createCandidateRepository(db: Database): CandidateRepository {
           db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,candidate_id,run_id,result,safe_summary)
             VALUES ('candidate_generated',?,'agent',?,?,?,?,?,'succeeded','Invoice candidate generated')`)
             .run(input.at, `tool-call-id:${facts.tool_call_id}`, input.documentId, facts.job_id, candidateId, input.runId);
-          const candidate = candidateSnapshot(queryCandidate(candidateId, facts.job_id));
+          const candidate = candidateSnapshot(queryCandidateRow(db, candidateId, facts.job_id));
           return { ok: true as const, candidate, created: true };
         });
         if (!committed.ok) return committed;
@@ -1520,9 +2040,10 @@ export function createCandidateRepository(db: Database): CandidateRepository {
           ? db.query('SELECT id FROM invoice_candidates WHERE job_id=? ORDER BY sequence DESC LIMIT ?').all(input.jobId, input.limit + 1)
           : db.query('SELECT id FROM invoice_candidates WHERE job_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?')
             .all(input.jobId, input.beforeSequence, input.limit + 1);
-        const items = (rows as Array<{ id: number }>).map(({ id }) => candidateSnapshot(queryCandidate(id, input.jobId)).snapshot)
-          .map(({ candidateId, jobId, runId, sequence, status, issueCount, createdAt }) =>
-            ({ candidateId, jobId, runId, sequence, status, issueCount, createdAt }));
+        const items = (rows as Array<{ id: number }>).map(({ id }) => candidateSnapshot(queryCandidateRow(db, id, input.jobId)).snapshot)
+          .map(({ candidateId, jobId, runId, sequence, status, issueCount, createdAt, origin, basedOnCandidateId }) =>
+            ({ candidateId, jobId, runId, sequence, status, issueCount, createdAt,
+              ...(origin === undefined ? {} : { origin, basedOnCandidateId }) }));
         const hasMore = items.length > input.limit;
         const page = hasMore ? items.slice(0, input.limit) : items;
         return ok({ items: page, nextBeforeSequence: hasMore ? page.at(-1)?.sequence ?? null : null });
@@ -1535,7 +2056,7 @@ export function createCandidateRepository(db: Database): CandidateRepository {
           return fail(appError('input_invalid', 'input', 'Candidate 查询参数无效。'));
         }
         if (!readJob(db, input.jobId)) return fail(appError('job_not_found', 'input', 'Job 不存在。'));
-        const row = queryCandidate(input.candidateId, input.jobId);
+        const row = queryCandidateRow(db, input.candidateId, input.jobId);
         if (!row) return fail(appError('candidate_not_found', 'input', '此 Job 下不存在该 Candidate。'));
         const { snapshot, documentRef } = candidateSnapshot(row);
         return ok({ documentRef, candidate: snapshot });
@@ -1553,13 +2074,10 @@ export function createCandidateRepository(db: Database): CandidateRepository {
         const rows = input.beforeSequence === null
           ? db.query('SELECT * FROM invoice_candidates WHERE job_id=? ORDER BY sequence DESC LIMIT ?').all(run.job_id, input.limit + 1)
           : db.query('SELECT * FROM invoice_candidates WHERE job_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?').all(run.job_id, input.beforeSequence, input.limit + 1);
-        const items = (rows as Array<Record<string, unknown>>).map((row) => {
-          const record = row as unknown as { id: number; job_id: number; run_id: number; sequence: number; status: string; issues_json: string; created_at: string };
-          const issues = exactRecord(readJson(record.issues_json, 'candidate_issues'), 'candidate_issues', ['version', 'notes', 'checks', 'items']);
-          const parsedIssues = z.array(InvoiceIssueSchema).parse(issues.items);
-          if (!Number.isSafeInteger(record.id) || !Number.isSafeInteger(record.sequence) || issues.version !== 1
-            || !['generated', 'accepted', 'rejected'].includes(record.status)) throw new Error('invalid_candidate_index_row');
-          return { candidateId: record.id, runId: record.run_id, sequence: record.sequence, issueCount: parsedIssues.length };
+        const items = (rows as Array<{ id: number }>).map((row) => {
+          const record = candidateSnapshot(queryCandidateRow(db, row.id, run.job_id!)).snapshot;
+          return { candidateId: record.candidateId, runId: record.runId, sequence: record.sequence, issueCount: record.issueCount,
+            ...(record.origin === undefined ? {} : { origin: record.origin, basedOnCandidateId: record.basedOnCandidateId }) };
         });
         const hasMore = items.length > input.limit;
         const page = hasMore ? items.slice(0, input.limit) : items;
@@ -1574,13 +2092,14 @@ export function createCandidateRepository(db: Database): CandidateRepository {
         }
         const run = db.query("SELECT job_id FROM runs WHERE id=? AND kind='agent'").get(input.runId) as { job_id: number | null } | null;
         if (!run?.job_id) return fail(appError('candidate_not_found', 'input', 'Candidate 不存在。'));
-        const row = queryCandidate(input.candidateId, run.job_id);
+        const row = queryCandidateRow(db, input.candidateId, run.job_id);
         if (!row) return fail(appError('candidate_not_found', 'input', 'Candidate 不存在。'));
         const { snapshot, documentRef } = candidateSnapshot(row);
         return ok({ candidateId: snapshot.candidateId, jobId: snapshot.jobId, runId: snapshot.runId,
           sequence: snapshot.sequence, issueCount: snapshot.issueCount,
           documentRef, toolCallId: snapshot.toolCallId,
-          candidate: { fields: snapshot.fields, lines: snapshot.lines, notes: snapshot.notes }, checks: snapshot.checks, issues: snapshot.issues });
+          candidate: { fields: snapshot.fields, lines: snapshot.lines, notes: snapshot.notes }, checks: snapshot.checks, issues: snapshot.issues,
+          ...(snapshot.origin === undefined ? {} : { origin: snapshot.origin, basedOnCandidateId: snapshot.basedOnCandidateId }) });
       } catch { return fail(appError('storage_corrupt', 'storage', 'Candidate 无法读取。')); }
     },
   };
@@ -1689,16 +2208,8 @@ function mergeUsage(current: UsageRecord, incoming: UsageRecord): UsageRecord {
 
 function transaction<T>(db: Database, fn: () => T): Result<T> {
   try {
-    db.exec('BEGIN IMMEDIATE');
-    const result = fn();
-    db.exec('COMMIT');
-    return ok(result);
+    return ok(db.transaction(fn).immediate());
   } catch (error) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      // Keep the original storage failure; the connection is closed by owner.
-    }
     if (isBusyConstraint(error)) {
       return fail(appError('runtime_busy', 'runtime', '已有 Provider Run 正在执行。'));
     }
@@ -1791,6 +2302,11 @@ function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessio
     db.query('INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json,run_id) VALUES (?,?,?,?,?)')
       .run(sessionId, index, entry.id, JSON.stringify(entry), context?.entryId === entry.id ? context.runId : null);
   }
+  if (context !== undefined && hasTable(db, 'session_inputs')) {
+    const entry = history.entries.find((candidate) => candidate.id === context.entryId)!;
+    const message = entry.message as { role?: unknown } | undefined;
+    if (entry.type === 'message' && message?.role === 'user') markInputConsumed(db, context.runId, entry.id, entry.timestamp);
+  }
   db.query('UPDATE session_native_history SET leaf_id=?,entry_count=?,unusable=? WHERE session_id=?')
     .run(history.leafId, history.entries.length, previous?.unusable || history.unusable ? 1 : 0, sessionId);
 }
@@ -1807,8 +2323,8 @@ export function createSessionRepository(db: Database): SessionRepository {
           const workspace = ensureWorkspace(db, input.at) as { revision: number };
           if (workspace.revision !== input.expectedRevision) return null;
         }
-        const result = db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at) VALUES (?,?,?,?)')
-          .run(input.nativeSessionId, input.title, input.at, input.at);
+        const result = db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at,metadata_json) VALUES (?,?,?,?,?)')
+          .run(input.nativeSessionId, input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }));
         const id = Number(result.lastInsertRowid);
         if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_session_id');
         if (input.nativeHistory) writeNativeHistory(db, id, input.nativeHistory);
@@ -1968,10 +2484,14 @@ export function createRunRepository(db: Database): RunRepository {
 
     createAgent(input) {
       const created = transaction(db, () => {
-        const session = db.query('SELECT status FROM sessions WHERE id=?').get(input.sessionId) as { status: string } | null;
+        const session = db.query('SELECT status,metadata_json,native_session_id FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string; native_session_id: string } | null;
         if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
-        validatedScope(input.scope);
+        const config = validatedConfig(input.config, 'agent');
+        const scope = validatedScope(input.scope);
+        if (scope.version === 3 || config.goalMode === 'local-task') return fail(appError('input_invalid', 'input', 'Legacy native Run formats are read only.'));
+        if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
+        if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
         const inserted = db.query(`INSERT INTO runs
           (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
           VALUES ('agent',?,?,'created',?,?,?,?,?,?)`)
@@ -1988,12 +2508,18 @@ export function createRunRepository(db: Database): RunRepository {
     createWorkspaceAgent(input) {
       const created = transaction(db, () => {
         const expected = WorkspaceExpectationSchema.safeParse(input.expected);
+        const target = input.formTarget === undefined ? null : InvoiceFormTargetSchema.safeParse(input.formTarget);
+        const fill = input.goalMode === 'fill-form';
         if (!expected.success || input.sessionId !== input.expected.sessionId
-          || !['answer', 'save-candidate'].includes(input.goalMode)) {
+          || !['answer', 'save-candidate', 'fill-form'].includes(input.goalMode)
+          || (fill ? !target?.success : input.formTarget !== undefined)
+          || !fill && 'formTarget' in input.config) {
           return fail(appError('input_invalid', 'input', 'P3 Workspace Run 参数无效。'));
         }
-        const session = db.query('SELECT status FROM sessions WHERE id=?').get(input.sessionId) as { status: string } | null;
+        const session = db.query('SELECT status,metadata_json FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string } | null;
         if (!session || session.status !== 'active') return fail(appError('session_archived', 'session', 'Session 不可用于新 Run。'));
+        if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
+        if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
         const rawWorkspace = ensureWorkspace(db, input.createdAt);
         const workspace = workspaceSnapshot(db, rawWorkspace, input.createdAt);
         const actualExpectation: WorkspaceExpectation = {
@@ -2026,23 +2552,26 @@ export function createRunRepository(db: Database): RunRepository {
           || job.documentRef.version !== document.version))) {
           return fail(appError('state_conflict', 'input', 'Job 与当前 Document 不匹配。'));
         }
-        if (input.goalMode === 'save-candidate' && (!job || !document)) {
+        if ((input.goalMode === 'save-candidate' || fill) && (!job || !document)) {
           return fail(appError('state_conflict', 'input', '保存候选需要当前 Document 和 Job。'));
         }
         if (job?.status === 'completed') return fail(appError('job_completed', 'input', '已完成 Job 不能继续运行。'));
 
         let candidate: WorkspaceInput['candidate'] = null;
         if (job?.currentCandidateId !== null && job?.currentCandidateId !== undefined) {
-          const row = db.query(`SELECT id,sequence,job_id,fields_json,lines_json,issues_json FROM invoice_candidates WHERE id=?`)
-            .get(job.currentCandidateId) as { id: number; sequence: number; job_id: number; fields_json: string; lines_json: string; issues_json: string } | null;
-          if (!row || row.job_id !== job.jobId) return fail(appError('state_conflict', 'input', '当前候选引用无效。'));
+          const row = queryCandidateRow(db, job.currentCandidateId, job.jobId);
+          if (!row) return fail(appError('state_conflict', 'input', '当前候选引用无效。'));
+          const saved = candidateSnapshot(row).snapshot;
+          if (fill && (saved.status !== 'generated' || saved.candidateId !== expected.data.candidateRef?.id
+            || saved.sequence !== expected.data.candidateRef.sequence)) {
+            return fail(appError('state_conflict', 'input', '填表需要当前 generated 候选的真实版本。'));
+          }
           candidate = {
-            id: row.id, sequence: row.sequence,
-            fields: CandidateDraftSchema.shape.fields.parse(readJson(row.fields_json, 'candidate_fields')),
-            lines: CandidateDraftSchema.shape.lines.parse(readJson(row.lines_json, 'candidate_lines')),
-            issues: z.array(InvoiceIssueSchema).max(1_000).parse(readJson(row.issues_json, 'candidate_issues')),
+            id: saved.candidateId, sequence: saved.sequence,
+            fields: saved.fields, lines: saved.lines, issues: saved.issues,
           };
         }
+        if (fill && candidate === null) return fail(appError('state_conflict', 'input', '填表需要已选候选。'));
         const workspaceContext = WorkspaceContextSchema.parse({
           formatVersion: 1, revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
           candidateRef: workspace.candidateRef, sessionId: input.sessionId, activeView: workspace.activeView, selection: null,
@@ -2055,26 +2584,37 @@ export function createRunRepository(db: Database): RunRepository {
         if (Buffer.byteLength(JSON.stringify(workspaceInput), 'utf8') > 512 * 1024) {
           return fail(appError('input_too_large', 'input', '冻结 Workspace 输入超过 512 KiB。'));
         }
-        const allowedTools = !document ? [INVOICE_TOOL_NAMES[6]!, INVOICE_TOOL_NAMES[7]!]
-          : !job ? INVOICE_TOOL_NAMES.slice(0, 9)
-            : input.goalMode === 'save-candidate' ? [...INVOICE_TOOL_NAMES] : INVOICE_TOOL_NAMES.slice(0, 12);
-        const scope = RunScopeSchema.parse({ version: 2, allowedTools,
+        const allowedTools = fill ? ['fill_invoice_form'] : !document ? [INVOICE_REVIEW_TOOL_NAMES[6]!, INVOICE_REVIEW_TOOL_NAMES[7]!]
+          : !job ? INVOICE_REVIEW_TOOL_NAMES.slice(0, 9)
+            : input.goalMode === 'save-candidate' ? [...INVOICE_REVIEW_TOOL_NAMES] : INVOICE_REVIEW_TOOL_NAMES.slice(0, 12);
+        const nativeNames = fill ? [] : input.nativeTools?.allowedTools ?? [];
+        const scope = RunScopeSchema.parse({ version: 2, allowedTools: [...allowedTools, ...nativeNames],
           allowedDocumentIds: document ? [document.id] : [],
           allowedArtifactIds: document ? [document.parsed_artifact_id] : [],
           allowedResourcePaths: [],
         });
         const inputRecord = { version: 2, goal: input.goal, text: input.text, messageTimestamp: input.messageTimestamp, workspaceInput };
-        const config = { ...input.config, goalMode: input.goalMode, workspaceContext };
+        let config: SafeConfigSnapshot & { agent: P3AgentConfigFacts; goalMode: GoalMode; workspaceContext: WorkspaceContext; workingDirectory?: string; formTarget?: InvoiceFormTarget } = {
+          ...input.config, goalMode: input.goalMode, workspaceContext,
+          ...(fill && target?.success ? { formTarget: target.data } : {}),
+        };
         const inserted = db.query(`INSERT INTO runs(kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
           VALUES ('agent',?,?,?,?,?,?,?,?,?,?)`)
           .run(input.sessionId, job?.jobId ?? null, asJson(scope), 'created', input.goal, asJson(inputRecord), asJson(config),
             asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const runId = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(runId) || runId <= 0) throw new Error('unsafe_run_id');
+        if (input.nativeTools && !fill) {
+          const workingDirectory = input.nativeTools.workingDirectory ?? join(input.nativeTools.runtimeDir, String(runId), 'work');
+          if (!isAbsolute(workingDirectory) || /[\x00-\x1f\x7f]/.test(workingDirectory)) throw new Error('invalid_native_runtime_directory');
+          config = { ...config, workingDirectory };
+          db.query('UPDATE runs SET config_json=? WHERE id=?').run(asJson(config), runId);
+        }
         if (job) db.query("UPDATE jobs SET status='running',status_reason=NULL,updated_at=? WHERE id=? AND status!='completed'")
           .run(input.createdAt, job.jobId);
         db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(input.createdAt, input.sessionId);
-        return ok({ runId, jobId: job?.jobId ?? null, scope, workspaceContext, workspaceInput });
+        return ok({ runId, jobId: job?.jobId ?? null, scope, workspaceContext, workspaceInput,
+          ...(fill && target?.success ? { formTarget: target.data } : {}) });
       });
       return created.ok ? created.data : created;
     },
@@ -2105,17 +2645,32 @@ export function createRunRepository(db: Database): RunRepository {
 
     finish(runId, terminal) {
       const result = transaction(db, () => {
-        const active = db.query("SELECT kind,session_id,job_id,config_json FROM runs WHERE id=? AND status IN ('created','running')")
-          .get(runId) as { kind: 'provider' | 'agent'; session_id: number | null; job_id: number | null; config_json: string } | null;
+        const current = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (terminal.nativeHistoryUnusable !== undefined && typeof terminal.nativeHistoryUnusable !== 'boolean'
-          || terminal.nativeHistoryUnusable === true && active?.kind === 'provider') throw new Error('invalid_native_history_terminal');
+          || terminal.nativeHistoryUnusable === true && current?.kind === 'provider') throw new Error('invalid_native_history_terminal');
+        if (current && ['completed', 'failed', 'cancelled'].includes(current.status)) {
+          if (terminal.nativeHistoryUnusable === true) {
+            const history = db.query('SELECT unusable FROM session_native_history WHERE session_id=?')
+              .get(current.session_id) as { unusable: number } | null;
+            if (history?.unusable !== 1) return false;
+          }
+          // Usage may have advanced independently. A repeated terminal only reads its fixed core facts.
+          return current.status === terminal.status
+            && stableJson(readJson(current.output_json ?? 'null', 'output')) === stableJson(readJson(asJson(terminal.output), 'output'))
+            && stableJson(readJson(current.error_json ?? 'null', 'error')) === stableJson(readJson(asJson(terminal.error === null ? null : { version: 1, ...terminal.error }), 'error'))
+            && stableJson(readJson(current.cleanup_json, 'cleanup')) === stableJson(readJson(asJson(terminal.cleanup), 'cleanup'))
+            && current.ended_at === terminal.endedAt && current.stopped_at === terminal.stoppedAt
+            && current.duration_ms === terminal.durationMs
+            && current.cancel_requested_at === (terminal.cancelRequestedAt ?? current.cancel_requested_at);
+        }
+        const active = current && ['created', 'running'].includes(current.status) ? current : null;
         const changed = db
           .query(
             `UPDATE runs SET
               status=?, output_json=?, error_json=?, cleanup_json=?, usage_json=?,
               input_tokens=?, output_tokens=?, total_tokens=?, cost=?, usage_complete=?,
               duration_ms=?, cancel_requested_at=COALESCE(cancel_requested_at,?), ended_at=?, stopped_at=?
-             WHERE id=? AND status IN ('created','running')`,
+             WHERE id=? AND (status='running' OR (status='created' AND ?!='completed'))`,
           )
           .run(
             terminal.status,
@@ -2133,23 +2688,27 @@ export function createRunRepository(db: Database): RunRepository {
             terminal.endedAt,
             terminal.stoppedAt,
             runId,
+            terminal.status,
           ).changes;
         if (changed === 1 && active?.kind === 'agent' && active.session_id !== null) {
           if (terminal.nativeHistoryUnusable === true) db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(active.session_id);
           db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(terminal.endedAt, active.session_id);
         }
-        if (changed === 1 && active?.kind === 'agent' && active.job_id !== null) {
+        if (changed === 1 && active?.kind === 'agent' && active.job_id != null) {
           const config = object(readJson(active.config_json, 'config'), 'config');
-          const goalMode = config.goalMode === 'save-candidate' ? 'save-candidate' : 'answer';
+          const goalMode = config.goalMode === 'save-candidate' ? 'save-candidate' : config.goalMode === 'fill-form' ? 'fill-form' : 'answer';
           const needsInput = terminal.status === 'failed' && terminal.error?.code === 'agent_goal_not_met' && goalMode === 'save-candidate';
           const jobStatus = terminal.status === 'completed' || needsInput ? 'waiting'
             : terminal.status === 'cancelled' ? 'cancelled' : 'failed';
           const reason = needsInput ? 'needs_input'
-            : terminal.status === 'completed' ? goalMode === 'save-candidate' ? 'review_candidate' : 'review_answer'
+            : terminal.status === 'completed' ? goalMode === 'save-candidate' ? 'review_candidate' : goalMode === 'fill-form' ? 'review_form' : 'review_answer'
               : terminal.error?.code ?? terminal.status;
           const jobChanged = db.query("UPDATE jobs SET status=?,status_reason=?,updated_at=? WHERE id=? AND status='running'")
             .run(jobStatus, reason, terminal.endedAt, active.job_id).changes;
           if (jobChanged !== 1) throw new Error('job_terminal_state_invalid');
+        }
+        if (changed === 1 && hasTable(db, 'session_inputs')) {
+          finishSessionInputs(db, runId, terminal.status, terminal.error, terminal.endedAt);
         }
         return changed === 1;
       });
@@ -2224,24 +2783,51 @@ export function createRunRepository(db: Database): RunRepository {
         const error = asJson({ version: 1, ...appError('runtime_interrupted', 'runtime', '上一次进程退出，Run 未收口。') });
         const cleanup = asJson({ version: 1, stopped: false, stopReason: 'process-exit', errors: [], lateObservationRequired: true });
         const recovered = transaction(db, () => {
-          const activeRuns = db.query("SELECT id FROM runs WHERE status IN ('created','running')").all() as Array<{ id: number }>;
-          if (activeRuns.length === 0) return 0;
           if (hasTable(db, 'session_native_history')) db.query(`UPDATE session_native_history SET unusable=1
-            WHERE session_id IN (SELECT session_id FROM runs WHERE kind='agent' AND status IN ('created','running'))`).run();
+            WHERE session_id IN (SELECT session_id FROM runs WHERE kind='agent' AND status IN ('created','running'))
+              OR session_id IN (SELECT session_id FROM tool_calls WHERE status IN ('requested','running'))`).run();
           if (hasTable(db, 'tool_calls')) db.query(`UPDATE tool_calls SET status='failed',
-              result_json=json_object('version',1,'status','failed',
-                'error',json_object('code','runtime_interrupted','category','runtime','message','The process exited during this tool call.','retryable',true),
+              result_json=json_patch(json_object('version',1,'status','failed',
+                'error',json_object('code','runtime_interrupted','category','runtime','message','The process exited during this tool call.','retryable',json('true')),
                 'committedCandidateId',(SELECT candidate.id FROM invoice_candidates candidate WHERE candidate.tool_call_id=tool_calls.id)),
-              cleanup_json=json_object('version',1,'stopReason','process-exit','stopped',1,'errors',json('[]')),
-              ended_at=COALESCE(ended_at,?),stopped_at=COALESCE(stopped_at,?)
-            WHERE status IN ('requested','running')
-              AND run_id IN (SELECT id FROM runs WHERE status IN ('created','running'))`).run(endedAt, endedAt);
+                CASE WHEN json_type(result_json,'$.formApplication') IS NULL THEN '{}'
+                  ELSE json_object('formApplication',json_extract(result_json,'$.formApplication')) END),
+              cleanup_json=json_set(cleanup_json,'$.stopReason','process-exit','$.stopped',json(CASE
+                WHEN EXISTS(SELECT 1 FROM json_each(tool_calls.cleanup_json,'$.nativeProcesses') process
+                  WHERE json_extract(process.value,'$.stopped')=0) THEN 'false'
+                WHEN status='requested' AND started_at IS NULL THEN 'true'
+                WHEN json_extract(cleanup_json,'$.stopped')=1 AND stopped_at IS NOT NULL THEN 'true'
+                ELSE 'false' END)),
+              ended_at=COALESCE(ended_at,?),stopped_at=CASE
+                WHEN EXISTS(SELECT 1 FROM json_each(tool_calls.cleanup_json,'$.nativeProcesses') process
+                  WHERE json_extract(process.value,'$.stopped')=0) THEN NULL
+                WHEN json_extract(cleanup_json,'$.stopped')=1 AND stopped_at IS NOT NULL THEN stopped_at
+                ELSE NULL END
+            WHERE status IN ('requested','running')`).run(endedAt);
+          // A stopped tool with an unreadable required result makes only its own
+          // persisted conversation unsafe to resume. Diagnostic delivery failures
+          // are still readable records and do not disable unrelated Sessions.
+          if (hasTable(db, 'tool_calls') && hasTable(db, 'session_native_history')) {
+            const calls = db.query("SELECT * FROM tool_calls WHERE status IN ('succeeded','failed','cancelled')")
+              .all() as Array<{ session_id: number; status: string; result_json: string | null }>;
+            for (const call of calls) {
+              try {
+                const envelope = readToolEnvelope(call.result_json);
+                if (envelope.formApplication !== undefined) toolCallSnapshot(db, call);
+                const result = envelope.result;
+                if (!result || result.status !== call.status) throw new Error('tool_result_missing');
+              }
+              catch { db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(call.session_id); }
+            }
+          }
           if (hasTable(db, 'jobs')) db.query(`UPDATE jobs SET status='failed',status_reason='runtime_interrupted',updated_at=?
             WHERE status!='completed' AND id IN (
               SELECT job_id FROM runs WHERE status IN ('created','running') AND job_id IS NOT NULL
             )`).run(endedAt);
-          return db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE status IN ('created','running')")
+          const changed = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE status IN ('created','running')")
             .run(error, cleanup, endedAt).changes;
+          if (hasTable(db, 'session_inputs')) recoverSessionInputs(db, endedAt);
+          return changed;
         });
         return recovered;
       } catch {
@@ -2249,4 +2835,40 @@ export function createRunRepository(db: Database): RunRepository {
       }
     },
   };
+}
+
+/** Recheck persisted stop facts; a controller lease is not actual stop evidence. */
+export function inspectRuntimeRecovery(db: Database): AppError | null {
+  // ponytail: one O(n) startup scan; index unresolved facts if measured history size makes startup slow.
+  let currentRunId: number | undefined;
+  let currentSessionId: number | undefined;
+  let currentToolCallId: string | undefined;
+  const blocked = (message: string) => appError('runtime_recovery_blocked', 'runtime', message, true,
+    currentRunId, currentSessionId, currentToolCallId);
+  try {
+    const runs = db.query('SELECT id,session_id,cleanup_json FROM runs ORDER BY id').all() as Array<{
+      id: number; session_id: number | null; cleanup_json: string;
+    }>;
+    for (const run of runs) {
+      currentRunId = run.id;
+      currentSessionId = run.session_id ?? undefined;
+      const saved = validatedCleanup(readJson(run.cleanup_json, 'cleanup'));
+      if (!saved.stopped || saved.lateObservationRequired) return blocked(
+        '原 Run 的实际停止或必要观察尚未确认；可查看原记录，取得实际停止及必要保存证据前不开放新执行。');
+    }
+    const calls = db.query('SELECT run_id,session_id,native_tool_call_id,cleanup_json FROM tool_calls ORDER BY id').all() as Array<{
+      run_id: number; session_id: number; native_tool_call_id: string; cleanup_json: string;
+    }>;
+    for (const call of calls) {
+      currentRunId = call.run_id;
+      currentSessionId = call.session_id;
+      currentToolCallId = call.native_tool_call_id;
+      const saved = readToolCleanup(readJson(call.cleanup_json, 'tool_call_cleanup'));
+      if (!saved.stopped || saved.nativeProcesses?.some((process) => !process.stopped)) return blocked(
+        '原 ToolCall 的实际停止尚未确认；旧 Host 退出和取得控制锁不能证明本机命令已停，缺证据时只允许查看原事实。');
+    }
+    return null;
+  } catch {
+    return blocked('原对象的必要停止事实无法读取；保留现有记录，只读核验成功前不开放新执行。');
+  }
 }

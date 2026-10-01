@@ -1,4 +1,4 @@
-import { AppErrorSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, appError, fail, ok } from '@flowmate/contracts';
+import { AppErrorSchema, FillInvoiceFormOutputSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, ToolExecutionFailure, NATIVE_TOOL_NAMES, appError, fail, ok } from '@flowmate/contracts';
 import type { AppError, DbId, Result, ToolCallDelivery, ToolDefinition, ToolExecutionContext, ToolResult, ToolCallSnapshot } from '@flowmate/contracts';
 import { createToolRecorder } from './recorder.ts';
 type Recorder = ReturnType<typeof createToolRecorder>;
@@ -100,7 +100,7 @@ export function createToolExecutor(input: {
     return updated.ok ? ok(undefined) : updated;
   }
 
-  async function execute(name: string, raw: unknown, context: ToolExecutionContext): Promise<ToolExecution> {
+  async function execute(name: string, finalArguments: unknown, context: ToolExecutionContext, rawArguments: unknown = finalArguments): Promise<ToolExecution> {
     const contextCheck = ToolExecutionContextSchema.safeParse(context);
     if (!contextCheck.success) {
       const failure = appError('tool_access_denied', 'runtime', '工具缺少可信 Run 上下文。');
@@ -111,9 +111,18 @@ export function createToolExecutor(input: {
     const identity = `${bound.runId}:${bound.nativeToolCallId}`;
     const budget = budgets.get(bound.runId) ?? { ids: new Set<string>(), resultsBytes: 0, closed: false, fatal: false };
     budgets.set(bound.runId, budget);
-    const requested = observeRequest(name, raw, bound);
+    const requested = observeRequest(name, rawArguments, bound);
     if (!requested.ok) return { call: unavailableCall(bound, name), result: { status: 'failed', error: requested.error }, fatal: true };
     const call = requested.data;
+    if (call.args.final !== null) {
+      const parsed = definition?.inputSchema.safeParse(finalArguments);
+      if (!parsed?.success) return { call, result: { status: 'failed', error: appError('tool_invalid_input', 'tool', '工具参数不符合输入 Schema。') }, fatal: budget.fatal };
+      const fixed = input.recorder.fixArguments(call.toolCallId, parsed.data);
+      if (!fixed.ok) {
+        budget.fatal = true;
+        return { call, result: { status: 'failed', error: fixed.error }, fatal: true };
+      }
+    }
     const running = active.get(identity);
     if (running) return running;
     if (call.result) return { call, result: call.result, fatal: budget.fatal };
@@ -134,7 +143,7 @@ export function createToolExecutor(input: {
       if (!rejected.ok) budget.fatal = true;
       return { call: rejected.ok ? rejected.data : call, result: { status: bound.signal.aborted ? 'cancelled' : 'failed', error: failure }, fatal: budget.fatal };
     }
-    const task = runCall(definition, raw, bound, call, budget);
+    const task = runCall(definition, finalArguments, bound, call, budget);
     active.set(identity, task);
     try { return await task; }
     finally { if (active.get(identity) === task) active.delete(identity); }
@@ -148,6 +157,7 @@ export function createToolExecutor(input: {
       return { call: persisted.ok ? persisted.data : requestedCall, result: { status: 'failed', error }, fatal: fatal || !persisted.ok };
     };
     if (!definition) return reject(appError('tool_not_found', 'tool', '此 Run 未注册请求的工具。'));
+    const native = NATIVE_TOOL_NAMES.includes(definition.name as (typeof NATIVE_TOOL_NAMES)[number]);
     if (!context.scope.allowedTools.includes(definition.name)) return reject(appError('tool_access_denied', 'runtime', '此 Run 未获准使用请求的工具。'));
     const sessionAccess = input.isSessionModelUseBlocked?.(context.sessionId);
     if (sessionAccess && (!sessionAccess.ok || sessionAccess.data)) {
@@ -155,7 +165,7 @@ export function createToolExecutor(input: {
     }
     let argumentsBytes: number;
     try { argumentsBytes = encodedSize(raw); } catch { return reject(appError('tool_invalid_input', 'tool', '工具参数不是可记录的 JSON。')); }
-    if (argumentsBytes > 256 * 1024) return reject(appError('tool_result_too_large', 'tool', '工具参数超过输入上限。'));
+    if (!native && argumentsBytes > 256 * 1024) return reject(appError('tool_result_too_large', 'tool', '工具参数超过输入上限。'));
     const parsed = definition.inputSchema.safeParse(raw);
     if (!parsed.success) return reject(appError('tool_invalid_input', 'tool', '工具参数不符合输入 Schema。'));
     const fixed = input.recorder.fixArguments(requestedCall.toolCallId, parsed.data);
@@ -178,12 +188,12 @@ export function createToolExecutor(input: {
       const call = Object.freeze({ nativeToolCallId: context.nativeToolCallId, signal });
       const product = Object.freeze({ runId: context.runId, sessionId: context.sessionId, scope: context.scope });
       data = await definition.execute(parsed.data, call, product);
-      commitId = candidateId(data);
+      commitId = definition.name === 'save_invoice_candidate' ? candidateId(data) : null;
       const output = definition.outputSchema?.safeParse(data);
       if (definition.outputSchema && !output?.success) {
         status = 'failed';
         error = appError('tool_invalid_output', 'tool', '工具返回值不符合输出 Schema。');
-      } else if (encodedSize(data) > 256 * 1024) {
+      } else if (!native && encodedSize(data) > 256 * 1024) {
         status = 'failed';
         error = appError('tool_result_too_large', 'tool', '工具结果超过输出上限。');
       } else if (timedOut || context.signal.aborted) {
@@ -196,21 +206,35 @@ export function createToolExecutor(input: {
         budget.fatal = true;
       } else budget.resultsBytes += encodedSize(data);
     } catch (thrown) {
+      if (thrown instanceof ToolExecutionFailure && thrown.data !== undefined) {
+        const checked = definition.outputSchema?.safeParse(thrown.data);
+        if (checked?.success && (native || encodedSize(checked.data) <= 256 * 1024
+          && budget.resultsBytes + encodedSize(checked.data) <= maxResultBytes)) {
+          data = checked.data;
+          budget.resultsBytes += encodedSize(data);
+        }
+      }
       status = context.signal.aborted ? 'cancelled' : timedOut ? 'failed' : 'failed';
       error = timedOut ? appError('tool_timeout', 'runtime', '工具执行超过时间上限。', false, context.runId, context.sessionId, context.nativeToolCallId)
         : context.signal.aborted ? appError('agent_cancelled', 'runtime', 'Run 已取消。', false, context.runId, context.sessionId, context.nativeToolCallId)
-          : safeError(thrown);
+          : safeError(thrown instanceof ToolExecutionFailure ? thrown.error : thrown);
+      if (thrown instanceof ToolExecutionFailure && thrown.error.code === 'stop_not_confirmed') {
+        error = thrown.error;
+        budget.fatal = true;
+        budget.closed = true;
+      }
     } finally {
       clearTimeout(timer);
     }
     if (status === 'succeeded') result = { status: 'succeeded', data };
     else result = { status, error: error ?? appError('tool_execution_failed', 'tool', '工具执行失败。'), ...(data === undefined ? {} : { data }) };
     const ended = input.recorder.finish({ toolCallId: requestedCall.toolCallId, status, ...(data === undefined ? {} : { data }),
-      ...(error ? { error } : {}), committedCandidateId: commitId, cleanup: { version: 1, stopReason: timedOut ? 'tool-timeout' : context.signal.aborted ? 'run-abort' : 'tool-settled', stopped: true, errors: [] },
-      stoppedAt: input.now() });
+      ...(error ? { error } : {}), committedCandidateId: commitId, cleanup: { version: 1, stopReason: timedOut ? 'tool-timeout' : context.signal.aborted ? 'run-abort' : 'tool-settled', stopped: error?.code !== 'stop_not_confirmed', errors: error?.code === 'stop_not_confirmed' ? [error] : [] },
+      stoppedAt: error?.code === 'stop_not_confirmed' ? null : input.now() });
     if (!ended.ok) {
       budget.fatal = true;
-      return { call: requestedCall, result: { status: 'failed', error: appError('storage_write_failed', 'storage', 'ToolCall 终态无法保存。', true, context.runId, context.sessionId, context.nativeToolCallId) }, fatal: true };
+      return { call: requestedCall, result: { status: 'failed', error: appError('storage_write_failed', 'storage', 'ToolCall 终态无法保存。', true, context.runId, context.sessionId, context.nativeToolCallId),
+        ...(native && data !== undefined ? { data } : {}) }, fatal: true };
     }
     if (error?.code === 'tool_context_limit' || status === 'cancelled' || timedOut) budget.fatal ||= timedOut;
     return { call: ended.data, result, fatal: budget.fatal };
@@ -235,7 +259,17 @@ export function createToolExecutor(input: {
       const candidateIds = [...new Set(calls.flatMap((call) => call.result?.committedCandidateId ? [call.result.committedCandidateId] : []))];
       const deliveredCandidateIds = [...new Set(calls.flatMap((call) => call.result?.committedCandidateId
         && call.result.status === 'succeeded' && call.delivery.state === 'request_observed' ? [call.result.committedCandidateId] : []))];
-      return ok({ candidateIds, deliveredCandidateIds });
+      const deliveredFormApplications = calls.flatMap(call => {
+        const receipt = call.formApplication;
+        const output = FillInvoiceFormOutputSchema.safeParse(call.result?.status === 'succeeded' ? call.result.data : null);
+        return call.toolName === 'fill_invoice_form' && call.status === 'succeeded' && call.delivery.state === 'request_observed'
+          && receipt?.outcome === 'applied' && receipt.runId === runId && receipt.toolCallId === call.toolCallId
+          && output.success && output.data.candidateId === receipt.candidateId
+          && output.data.candidateSequence === receipt.candidateSequence ? [receipt] : [];
+      });
+      const stopped = calls.every(call => call.cleanup.stopped);
+      const cleanupErrors = calls.flatMap(call => call.cleanup.errors);
+      return ok({ candidateIds, deliveredCandidateIds, deliveredFormApplications, stopped, cleanupErrors });
     },
     listTools: () => definitions,
   };

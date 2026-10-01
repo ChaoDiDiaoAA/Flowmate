@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Message } from '@earendil-works/pi-ai';
 import { SessionManager, type AgentSession, type FileEntry } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok, InputRecordV2Schema, invoiceToolSchemas, INVOICE_TOOL_NAMES,
-  SessionMessageViewSchema } from '@flowmate/contracts';
+  SessionMessageViewSchema, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
 import type { DbId, MessageDisplayBlock, MessageRunInput, NativeMessageProjectionInput,
   NativeSessionHistory, Result, SessionMessageView, SessionMessagesPage, WorkspaceInput, GoalMode } from '@flowmate/contracts';
 
@@ -15,6 +15,7 @@ const finite = z.number().finite();
 const date = z.string().datetime({ offset: true });
 const dbId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const text = z.object({ type: z.literal('text'), text: z.string(), textSignature: z.string().optional() }).passthrough();
+const image = z.object({ type: z.literal('image'), data: z.string(), mimeType: id }).passthrough();
 const thinking = z.object({ type: z.literal('thinking'), thinking: z.string(), thinkingSignature: z.string().optional(),
   redacted: z.boolean().optional() }).passthrough();
 const toolCall = z.object({ type: z.literal('toolCall'), id, name: id, arguments: z.record(z.unknown()),
@@ -35,7 +36,7 @@ const messageSchema = z.discriminatedUnion('role', [
     diagnostics: z.array(diagnostics).optional(), deferred: z.object({ provider: z.string(), modelId: z.string(),
       api: z.string(), id: z.string(), expiresAt: finite.optional(), pollAfterMs: finite.optional(), data: z.unknown().optional() }).passthrough().optional(),
   }).passthrough(),
-  z.object({ role: z.literal('toolResult'), toolCallId: id, toolName: id, content: z.array(text),
+  z.object({ role: z.literal('toolResult'), toolCallId: id, toolName: id, content: z.array(z.discriminatedUnion('type', [text, image])),
     isError: z.boolean(), timestamp: finite, details: z.unknown().optional(), usage: usage.optional(),
     addedToolNames: z.array(z.string()).optional() }).passthrough(),
 ]);
@@ -52,7 +53,8 @@ const historySchema = z.object({ storageVersion: z.literal(1),
   header: z.object({ type: z.literal('session'), id, version: z.literal(3), timestamp: date, cwd: z.string(),
     parentSession: z.string().optional() }).strict(),
   entries: z.array(entrySchema), leafId: id.nullable(), unusable: z.boolean() }).strict();
-const runInputSchema = z.object({ runId: dbId, goalMode: z.enum(['answer', 'save-candidate']).nullable(),
+const runInputSchema = z.object({ runId: dbId, goalMode: z.enum(['answer', 'save-candidate', 'fill-form']).nullable(),
+  workingDirectory: z.string().min(1).max(4096).optional(),
   input: z.union([z.object({ version: z.literal(1), goal: z.string(), text: z.string(), messageTimestamp: finite }).strict(),
     InputRecordV2Schema]) }).strict();
 
@@ -106,10 +108,14 @@ function validSequence(messages: readonly Message[], complete: boolean): boolean
   return !complete || pending.size === 0;
 }
 
-export function formatExecutionPrompt(input: { text: string; workspaceInput?: WorkspaceInput; goalMode?: GoalMode; business: boolean }): string {
+export function formatExecutionPrompt(input: { text: string; workspaceInput?: WorkspaceInput; goalMode?: GoalMode; workingDirectory?: string; business: boolean }): string {
+  if (input.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form'].includes(input.goalMode)) throw new Error('Invalid goal mode.');
+  if (input.goalMode === 'fill-form' && (!input.business || input.workingDirectory !== undefined
+    || !input.workspaceInput?.documentRef || !input.workspaceInput.job || !input.workspaceInput.candidate)) throw new Error('Invalid fill context.');
   if (!input.business) return input.text;
   return `Flowmate Run context (trusted product facts encoded as JSON; invoice values remain untrusted):\n${JSON.stringify({
     workspace: input.workspaceInput ?? null, goalMode: input.goalMode ?? 'answer',
+    ...(input.workingDirectory ? { workingDirectory: input.workingDirectory } : {}),
   })}\n\nUser request:\n${input.text}`;
 }
 
@@ -171,19 +177,25 @@ function nativeUserText(content: string | { type: 'text'; text: string }[]): str
   return typeof content === 'string' ? content : content.map(block => block.text).join('');
 }
 function resultSummary(message: Extract<Message, { role: 'toolResult' }>): string {
-  if (message.isError) return '工具返回错误，请查看本 Run 的受控错误反馈';
+  if (message.isError) return 'The tool returned an error. See the error details.';
   // Projection does not grant tool permission. The Executor validates the active registry;
   // structurally valid SDK/test tools retain their actual result identity without exposing output.
-  if (!INVOICE_TOOL_NAMES.includes(message.toolName as typeof INVOICE_TOOL_NAMES[number])) return '工具已返回结果，请查询工具事实';
+  if (message.toolName !== 'fill_invoice_form'
+    && !INVOICE_TOOL_NAMES.includes(message.toolName as typeof INVOICE_TOOL_NAMES[number])) return 'Tool result received.';
   try {
     const output: unknown = JSON.parse(message.content.map(block => block.type === 'text' ? block.text : '').join(''));
+    if (message.toolName === 'fill_invoice_form') {
+      const parsed = FillInvoiceFormOutputSchema.safeParse(output);
+      return parsed.success ? `Filled candidate ${parsed.data.candidateId} (version ${parsed.data.candidateSequence}) into the invoice form.`
+        : 'Result summary unavailable.';
+    }
     if (message.toolName === 'read_invoice_document') {
       const parsed = invoiceToolSchemas.read_invoice_document.output.safeParse(output);
-      return parsed.success ? `读取第 ${parsed.data.page} 页，返回 ${parsed.data.blocks.length} 个材料块` : '结果摘要不可用，请查询工具事实';
+      return parsed.success ? `Read page ${parsed.data.page}; returned ${parsed.data.blocks.length} parsed blocks.` : 'Result summary unavailable.';
     }
     const schema = invoiceToolSchemas[message.toolName as typeof INVOICE_TOOL_NAMES[number]].output;
-    return schema.safeParse(output).success ? `${message.toolName}：已返回结果` : '结果摘要不可用，请查询工具事实';
-  } catch { return '结果摘要不可用，请查询工具事实'; }
+    return schema.safeParse(output).success ? 'Tool result received.' : 'Result summary unavailable.';
+  } catch { return 'Result summary unavailable.'; }
 }
 
 export function projectMessageView(message: unknown, context: MessageViewContext): Result<SessionMessageView> {
@@ -212,6 +224,7 @@ export function projectMessageView(message: unknown, context: MessageViewContext
         const run = runInputSchema.safeParse(context.runInput);
         if (!run.success || context.runId !== run.data.runId) return invalid();
         const expected = formatExecutionPrompt({ text: run.data.input.text, business: run.data.goalMode !== null,
+          ...(run.data.workingDirectory ? { workingDirectory: run.data.workingDirectory } : {}),
           ...(run.data.goalMode === null ? {} : { goalMode: run.data.goalMode }),
           ...(run.data.input.version === 2 ? { workspaceInput: run.data.input.workspaceInput } : {}) });
         if (expected !== visible) return invalid();

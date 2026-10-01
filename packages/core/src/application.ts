@@ -33,11 +33,14 @@ import type {
   SessionRunsPage,
   SessionRunsRequest,
   SessionSnapshot,
+  NativeToolAvailability,
 } from '@flowmate/contracts';
 import type { BusinessEventRepository, DocumentRepository, JobRepository, RunRepository } from './storage/repositories.ts';
 import type { SessionService } from './sessions/service.ts';
 import type { WorkspaceService } from './workspace/service.ts';
 import type { JobService } from './jobs/service.ts';
+import type { InvoiceFormService } from './tools/invoice-form.ts';
+import type { InvoiceEditService } from './invoice-edit/service.ts';
 
 export interface RuntimeServicePort {
   callProvider(
@@ -45,6 +48,7 @@ export interface RuntimeServicePort {
     control?: ProviderControl,
   ): Promise<Result<ProviderOutcome>>;
   start(request: NormalizedAgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
+  queryNativeTools?(): Result<readonly NativeToolAvailability[]>;
   cancel(runId: DbId): Result<{ runId: DbId; accepted: boolean }>;
   revokeDocumentUse(documentId: DbId): Promise<Result<{ affectedSessionIds: DbId[]; stopRequested: boolean }>>;
   state(): RuntimeState;
@@ -59,6 +63,8 @@ type ProductApplicationOptions = {
   jobs: JobRepository;
   candidates: CandidateRepository;
   events: BusinessEventRepository;
+  invoiceForms?: Pick<InvoiceFormService, 'query'>;
+  invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'queryOperation'>;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
   hideDocument?: (documentId: DbId) => Result<{ documentId: DbId; affectedChatCount: number }>;
   readDocumentPage: (input: import('@flowmate/contracts').InvoiceToolInput<'read_invoice_document'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'read_invoice_document'>>;
@@ -79,6 +85,7 @@ export function makeApplication(
   workspace?: WorkspaceService,
   jobs?: JobService,
   products?: ProductApplicationOptions,
+  maxRunIdAtBoot = 0,
 ): Application {
   let closeInFlight: Promise<Result<CloseReport>> | null = null;
   let finalCloseResult: Result<CloseReport> | null = null;
@@ -93,6 +100,8 @@ export function makeApplication(
       const normalized = normalizeCreateSessionRequest(raw);
       return normalized.ok ? sessions?.create(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
     },
+    queryNativeTools: async () => runtime.queryNativeTools?.()
+      ?? fail(appError('tool_runtime_unavailable', 'runtime', 'Native tools are unavailable.')),
     renameSession: async (raw) => {
       const normalized = normalizeRenameSessionRequest(raw);
       return normalized.ok ? sessions?.rename(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
@@ -136,8 +145,10 @@ export function makeApplication(
       try { result = promptTrace.query(runId, callSequence); }
       catch { return ok({ availability: 'source-unavailable', calls: [], droppedCalls: null }); }
       if (result.availability === 'not-started') {
-        const session = sessions?.get(run.data.sessionId);
-        if (session?.ok && session.data.availability === 'history-unavailable') {
+        const agent = run.data.output?.agent;
+        const calls = agent && typeof agent === 'object' && 'modelCallCount' in agent ? agent.modelCallCount : undefined;
+        if (calls === 0) return ok(result);
+        if (runId <= maxRunIdAtBoot) {
           return ok({ availability: 'process-exited', calls: [], droppedCalls: null });
         }
       }
@@ -147,6 +158,20 @@ export function makeApplication(
       const normalized = normalizeAgentRunRequest(raw);
       return normalized.ok ? runtime.start(normalized.data, control) : normalized;
     },
+    submitInput: async (raw, control) => sessions?.submitInput(raw, control) ?? fail(sessionServiceUnavailable()),
+    querySessionInput: async (request) => sessions?.queryInput(request) ?? fail(sessionServiceUnavailable()),
+    queryInvoiceFormApplication: async (request) => products?.invoiceForms?.query(request)
+      ?? fail(appError('form_bridge_unavailable', 'runtime', 'The controlled invoice form is unavailable.')),
+    saveInvoiceCandidate: async request => products?.invoiceEdits?.save(request)
+      ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice editing is unavailable.')),
+    acceptInvoiceCandidate: async request => products?.invoiceEdits?.accept(request)
+      ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice acceptance is unavailable.')),
+    rejectInvoiceCandidate: async request => products?.invoiceEdits?.reject(request)
+      ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice rejection is unavailable.')),
+    exportInvoiceCandidate: async request => products?.invoiceEdits?.export(request)
+      ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice export is unavailable.')),
+    queryInvoiceCandidateOperation: async request => products?.invoiceEdits?.queryOperation(request)
+      ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice operation lookup is unavailable.')),
     readWorkspace: async () => workspace?.read() ?? fail(appError('workspace_unavailable', 'storage', 'Workspace 服务尚未组装。', true)),
     updateWorkspace: async (raw) => workspace?.update(raw) ?? fail(appError('workspace_unavailable', 'storage', 'Workspace 服务尚未组装。', true)),
     startTask: async (raw) => jobs?.create(raw) ?? fail(appError('job_service_unavailable', 'storage', 'Job 服务尚未组装。', true)),

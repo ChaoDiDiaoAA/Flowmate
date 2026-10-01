@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
+import { appError, ToolExecutionFailure, NativeToolOutputSchema } from '@flowmate/contracts';
 import type { ToolDefinition, ToolExecutionContext } from '@flowmate/contracts';
 import { deferCleanup } from '../../support/resources.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
@@ -36,6 +37,99 @@ function makeRuntime(names: string[], options: { maxToolCalls?: number; maxResul
 }
 
 describe('P3 Tool Executor', () => {
+  it('does not treat a referenced candidate in a read result as a newly committed candidate', async () => {
+    const store = makeRuntime(['get_invoice_candidate']);
+    const definition: ToolDefinition<{ value: number }, { candidateId: number }> = {
+      ...store.executor.listTools()[0]!, outputSchema: z.object({ candidateId: z.number().int().positive() }).strict(),
+      execute: async () => ({ candidateId: 123 }),
+    };
+    const executor = createToolExecutor({ definitions: [definition],
+      recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    const executed = await executor.execute('get_invoice_candidate', { value: 1 }, store.context('read-candidate'));
+    expect(executed).toMatchObject({ fatal: false, call: { status: 'succeeded',
+      result: { status: 'succeeded', committedCandidateId: null } },
+      result: { status: 'succeeded', data: { candidateId: 123 } } });
+    expect(executor.candidateFacts(1)).toMatchObject({ ok: true, data: { candidateIds: [], deliveredCandidateIds: [] } });
+  });
+
+  it('preserves the observed raw request while validating final arguments and deduplicating its execution', async () => {
+    const store = makeRuntime(['read_fixture']);
+    let executions = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const definition = store.executor.listTools()[0]!;
+    const executor = createToolExecutor({ definitions: [{ ...definition, execute: async ({ value }) => {
+      executions += 1; await barrier; return { value };
+    } }], recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    const raw = { value: '2', optional: null };
+    const final = { value: 2 };
+    const context = store.context('normalized-call');
+    expect(executor.observeRequest('read_fixture', raw, context).ok).toBe(true);
+    const pending = executor.execute('read_fixture', final, context, raw);
+    const duplicate = executor.execute('read_fixture', final, context, raw);
+    const activeInvalid = executor.execute('read_fixture', { value: '2' }, context, raw);
+    const activeConflict = executor.execute('read_fixture', { value: 3 }, context, raw);
+    release();
+    const executed = await pending;
+    expect(executed).toMatchObject({ call: { status: 'succeeded', args: { raw, final } },
+      result: { status: 'succeeded', data: final } });
+    expect((await duplicate).result).toEqual(executed.result);
+    expect(await activeInvalid).toMatchObject({ result: { status: 'failed', error: { code: 'tool_invalid_input' } } });
+    expect(await activeConflict).toMatchObject({ result: { status: 'failed', error: { code: 'state_conflict' } }, fatal: true });
+    expect((await executor.execute('read_fixture', final, context, raw)).result).toEqual(executed.call.result!);
+    expect(executions).toBe(1);
+    expect(store.db.query('SELECT tool_call_count FROM runs WHERE id=1').get()).toEqual({ tool_call_count: 1 });
+    expect(await executor.execute('read_fixture', { value: '2' }, context, raw))
+      .toMatchObject({ result: { status: 'failed', error: { code: 'tool_invalid_input' } } });
+    expect(await executor.execute('read_fixture', { value: 3 }, context, raw))
+      .toMatchObject({ result: { status: 'failed', error: { code: 'state_conflict' } }, fatal: true });
+    expect(executions).toBe(1);
+    expect(await executor.execute('read_fixture', final, context, { value: '3' }))
+      .toMatchObject({ result: { status: 'failed', error: { code: 'state_conflict' } }, fatal: true });
+    expect(executions).toBe(1);
+    expect(store.toolCalls.get({ runId: context.runId, sessionId: context.sessionId, nativeToolCallId: context.nativeToolCallId }))
+      .toEqual({ ok: true, data: executed.call });
+    expect(store.db.query('SELECT tool_call_count FROM runs WHERE id=1').get()).toEqual({ tool_call_count: 1 });
+  });
+
+  it('preserves SDK-sized native input/output and never repeats a write after its terminal record fails', async () => {
+    const store = makeRuntime(['write']);
+    let executions = 0;
+    const raw = { path: 'note.txt', content: 'x'.repeat(300_000) };
+    const output = { content: [{ type: 'text' as const, text: raw.content }], details: { fullOutputPath: 'SDK-output.log', truncated: false } };
+    const definition: ToolDefinition<any, any> = { name: 'write', version: '0.85.1', description: 'Native contract fixture',
+      effect: 'LOCAL_WRITE', executionMode: 'sequential', inputSchema: z.object({ path: z.string(), content: z.string() }).strict(),
+      outputSchema: NativeToolOutputSchema, execute: async () => { executions += 1; return output; } };
+    const executor = createToolExecutor({ definitions: [definition], recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    const first = await executor.execute('write', raw, store.context('native-large'));
+    expect(first).toMatchObject({ result: { status: 'succeeded', data: output }, fatal: false });
+    expect(first.call.args.final).toEqual(raw);
+    expect((await executor.execute('write', raw, store.context('native-large'))).result).toEqual(first.call.result!);
+    expect(executions).toBe(1);
+    store.db.exec(`CREATE TRIGGER fail_native_terminal BEFORE UPDATE OF status ON tool_calls
+      WHEN NEW.status='succeeded' BEGIN SELECT RAISE(ABORT,'fixture storage failure'); END;`);
+    expect(await executor.execute('write', raw, store.context('native-store-failed'))).toMatchObject({
+      result: { status: 'failed', error: { code: 'storage_write_failed' }, data: output }, fatal: true,
+    });
+    await executor.execute('write', raw, store.context('native-store-failed'));
+    expect(executions).toBe(2);
+  });
+  it('preserves schema-checked native failure output and leaves an unconfirmed stop fatal', async () => {
+    const store = makeRuntime(['read_fixture']);
+    const definition = store.executor.listTools()[0]!;
+    const executor = createToolExecutor({ definitions: [{ ...definition, execute: async () => {
+      throw new ToolExecutionFailure(appError('tool_execution_failed', 'tool', 'The process exited with code 7.'), { value: 7 });
+    } }], recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    expect(await executor.execute('read_fixture', { value: 1 }, store.context('native-failed'))).toMatchObject({
+      result: { status: 'failed', error: { code: 'tool_execution_failed', message: 'The process exited with code 7.' }, data: { value: 7 } }, fatal: false,
+    });
+    const unsafe = createToolExecutor({ definitions: [{ ...definition, execute: async () => {
+      throw new ToolExecutionFailure(appError('stop_not_confirmed', 'runtime', 'The owned process is not confirmed stopped.'));
+    } }], recorder: createToolRecorder(store.toolCalls, () => store.at), now: () => store.at });
+    expect(await unsafe.execute('read_fixture', { value: 1 }, store.context('native-unknown'))).toMatchObject({
+      result: { status: 'failed', error: { code: 'stop_not_confirmed' } }, fatal: true, call: { cleanup: { stopped: false } },
+    });
+  });
   it('validates and freezes the assembled definition list', () => {
     const store = makeRuntime(['read_fixture']);
     const definition = store.executor.listTools()[0]!;

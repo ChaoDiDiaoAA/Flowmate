@@ -13,6 +13,8 @@ const bridge: DesktopBridge = {
   callProvider: (input: ProviderTestRequest) => ipcRenderer.invoke('flowmate:call-provider', input),
   cancelProvider: (requestId: string) => ipcRenderer.invoke('flowmate:cancel-provider', requestId),
   createSession: (request = {}) => ipcRenderer.invoke('flowmate:create-session', request),
+  queryNativeTools: () => ipcRenderer.invoke('flowmate:query-native-tools'),
+  chooseWorkingDirectory: () => ipcRenderer.invoke('flowmate:choose-working-directory'),
   renameSession: (request) => ipcRenderer.invoke('flowmate:rename-session', request),
   deleteSession: (sessionId) => ipcRenderer.invoke('flowmate:delete-session', sessionId),
   listSessions: (request = {}) => ipcRenderer.invoke('flowmate:list-sessions', request),
@@ -21,6 +23,34 @@ const bridge: DesktopBridge = {
   listSessionMessages: (request) => ipcRenderer.invoke('flowmate:list-session-messages', request),
   queryPromptTrace: (runId, callSequence) => ipcRenderer.invoke('flowmate:query-prompt-trace', runId, callSequence),
   startRun: (input) => ipcRenderer.invoke('flowmate:start-run', input),
+  registerInvoiceFormTarget: input => ipcRenderer.invoke('flowmate:register-invoice-form-target', input),
+  invalidateInvoiceFormTarget: id => ipcRenderer.invoke('flowmate:invalidate-invoice-form-target', id),
+  setInvoiceFormDirty: (id, dirty, revision) => ipcRenderer.invoke('flowmate:set-invoice-form-dirty', id, dirty, revision),
+  saveInvoiceCandidate: input => ipcRenderer.invoke('flowmate:save-invoice-candidate', input),
+  acceptInvoiceCandidate: input => ipcRenderer.invoke('flowmate:accept-invoice-candidate', input),
+  rejectInvoiceCandidate: input => ipcRenderer.invoke('flowmate:reject-invoice-candidate', input),
+  exportInvoiceCandidate: input => ipcRenderer.invoke('flowmate:export-invoice-candidate', input),
+  queryInvoiceCandidateOperation: input => ipcRenderer.invoke('flowmate:query-invoice-candidate-operation', input),
+  replyInvoiceFormInspect: (id, value) => ipcRenderer.invoke('flowmate:reply-invoice-form-inspect', id, value),
+  onInvoiceFormInspect(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, value: { requestId: string; formInstanceId: string }) => listener(value.requestId, value.formInstanceId);
+    ipcRenderer.on('flowmate:invoice-form-inspect', handler);
+    return () => ipcRenderer.removeListener('flowmate:invoice-form-inspect', handler);
+  },
+  onInvoiceFormInspectFinished(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, value?: { unknownOperation?: import('@flowmate/contracts').InvoiceCandidateOperationQuery }) => listener(value?.unknownOperation);
+    ipcRenderer.on('flowmate:invoice-form-inspect-finished', handler);
+    return () => ipcRenderer.removeListener('flowmate:invoice-form-inspect-finished', handler);
+  },
+  startInvoiceFormRun: input => ipcRenderer.invoke('flowmate:start-invoice-form-run', input),
+  querySessionInput: input => ipcRenderer.invoke('flowmate:query-session-input', input),
+  queryInvoiceFormApplication: input => ipcRenderer.invoke('flowmate:query-invoice-form-application', input),
+  replyInvoiceFormRequest: (id, receipt) => ipcRenderer.invoke('flowmate:reply-invoice-form-request', id, receipt),
+  onInvoiceFormRequest(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, value: { requestId: string; request: import('@flowmate/contracts').InvoiceFormBridgeRequest }) => listener(value.requestId, value.request);
+    ipcRenderer.on('flowmate:invoice-form-request', handler);
+    return () => ipcRenderer.removeListener('flowmate:invoice-form-request', handler);
+  },
   cancelRun: (runId) => ipcRenderer.invoke('flowmate:cancel-run', runId),
   queryRuntimeState: () => ipcRenderer.invoke('flowmate:query-runtime-state'),
   queryRun: (runId: number) => ipcRenderer.invoke('flowmate:query-run', runId),

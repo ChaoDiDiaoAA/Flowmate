@@ -1,4 +1,4 @@
-import { expect, it } from 'bun:test';
+import { expect, test as it } from '@playwright/test';
 import { chromium, type Browser } from 'playwright';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -6,11 +6,13 @@ import { cpSync, existsSync, readFileSync, symlinkSync, writeFileSync } from 'no
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { Database } from 'bun:sqlite';
-import { mkdtemp } from '../support/resources.ts';
+import { cleanupResources, Database, mkdtemp } from '../support/resources.ts';
+
+it.afterEach(cleanupResources);
 
 it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT closes its owned resources', async () => {
-  const repo = resolve(import.meta.dir, '../..');
+  it.setTimeout(90_000);
+  const repo = resolve(import.meta.dirname, '../..');
   const root = await mkdtemp(join(tmpdir(), 'flowmate-dev-e2e-'));
   for (const path of ['apps', 'packages', 'scripts', 'package.json', 'electron.vite.config.ts']) {
     cpSync(join(repo, path), join(root, path), { recursive: true });
@@ -99,6 +101,18 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
     await waitFor(() => output.includes('[Flowmate test window]'));
     expect(output).toContain('[Flowmate test window] {"visible":true}');
     expect(requests).toBe(0);
+    await page.locator('.rail').getByRole('button', { name: 'Settings', exact: true }).click();
+    const theme = page.getByLabel('Theme');
+    await theme.click();
+    await page.waitForFunction(() => document.querySelector('.settings-appearance select')?.matches(':open'), undefined, { timeout: 3000 });
+    await theme.getByRole('option', { name: 'Dark', exact: true }).click({ timeout: 3000 });
+    expect(await theme.inputValue()).toBe('dark');
+    await page.getByRole('button', { name: 'Save appearance' }).click();
+    await page.getByText('Profile preferences saved.', { exact: true }).waitFor();
+    await theme.click();
+    await page.waitForFunction(() => document.querySelector('.settings-appearance select')?.matches(':open'), undefined, { timeout: 3000 });
+    expect(await theme.getByRole('option', { name: 'Light', exact: true }).isVisible()).toBe(true);
+    await page.keyboard.press('Escape');
     expect(await page.evaluate(async (port) => {
       const state = await window.flowmate.getState();
       if (!state.ok) return state;
@@ -155,6 +169,6 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
       if (child.exitCode === null && child.signalCode === null) { child.kill(); await exited; }
     }
     provider.closeAllConnections();
-    provider.close();
+    await new Promise<void>(resolveClosed => provider.close(() => resolveClosed()));
   }
-}, 90_000);
+});

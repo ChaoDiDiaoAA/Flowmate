@@ -183,6 +183,8 @@ h1 { margin-bottom: 0; color: var(--foreground); font-family: var(--font-display
 .field input::placeholder, .field textarea::placeholder { color: var(--foreground-subtle); opacity: .72; }
 .field input[spellcheck=false], .system-facts code { font-family: var(--font-numeric-stack); font-size: 11px; }
 .field textarea { min-height: 76px; resize: vertical; line-height: 1.5; }
+.run-tools-panel p { margin: 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.native-tool-availability ul { margin: 0; padding-left: 20px; columns: 2; font-weight: 400; line-height: 1.6; }
 .config-actions { display: flex; align-items: center; gap: 8px; padding: 0 16px 12px; }
 .action-spacer { flex: 1; }
 .config-note { display: flex; align-items: flex-start; gap: 8px; margin: 0 16px 14px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 5px; color: var(--foreground-muted); background: var(--surface-muted); font-size: 11px; line-height: 1.45; }
@@ -545,6 +547,10 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 .diagnostics-panel summary { min-height: 48px; padding: 14px 20px; cursor: pointer; font-size: 15px; font-weight: 650; }
 .diagnostics-panel > div { padding: 0 20px 16px; }
 .diagnostics-panel p { margin: 8px 0; color: var(--foreground-muted); font-size: 14px; }
+.settings-appearance select, .settings-appearance select::picker(select) { appearance: base-select; }
+.settings-appearance select::picker(select) { padding: 4px; border: 1px solid var(--input); border-radius: 6px; color: var(--foreground); background: var(--surface); }
+.settings-appearance option { min-height: 40px; padding: 8px 10px; }
+.settings-appearance option:hover, .settings-appearance option:checked { background: var(--surface-hover); }
 .generate-toggle { align-self: flex-start; min-height: 40px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--foreground-muted); background: var(--surface); font-size: 13px; }
 .generate-toggle.selected { border-color: var(--primary); color: var(--primary); background: color-mix(in srgb, var(--primary) 10%, var(--surface)); }
 @media (max-width: 1359px) {

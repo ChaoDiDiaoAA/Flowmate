@@ -1,4 +1,4 @@
-import { appError, fail, ok, SessionMessagesPageSchema } from '@flowmate/contracts';
+import { appError, fail, normalizeSessionInputRequest, ok, SessionMessagesPageSchema } from '@flowmate/contracts';
 import type {
   AgentPort,
   CreateSessionRequest,
@@ -14,8 +14,16 @@ import type {
   NormalizedSessionMessagesRequest,
   SessionMessagesPage,
   MessageRunInput,
+  AgentControl,
+  NormalizedAgentRunRequest,
+  NormalizedSessionInputRequest,
+  RunAccepted,
+  SessionInputRequest,
+  SessionInputQuery,
+  SessionInputQueryResult,
 } from '@flowmate/contracts';
 import type { SessionRepository, SessionRow, RunRepository } from '../storage/repositories.ts';
+import type { SessionInputLedger } from './input-ledger.ts';
 
 export class SessionService {
   private deleting = false;
@@ -26,7 +34,21 @@ export class SessionService {
     private readonly runtimeState: () => RuntimeState,
     private readonly now: () => string,
     private readonly runs: RunRepository,
+    private readonly inputs?: SessionInputLedger,
+    private readonly startInput?: (request: NormalizedAgentRunRequest, submission: NormalizedSessionInputRequest, control?: AgentControl) => Promise<Result<RunAccepted>>,
   ) {}
+
+  public submitInput(raw: SessionInputRequest, control?: AgentControl): Promise<Result<RunAccepted>> {
+    const normalized = normalizeSessionInputRequest(raw);
+    if (!normalized.ok) return Promise.resolve(normalized);
+    if (!this.inputs || !this.startInput) return Promise.resolve(fail(appError('session_input_unavailable', 'session', 'Session input is unavailable.')));
+    const { clientSequence: _clientSequence, mode: _mode, formTarget: _target, ...request } = normalized.data;
+    return this.startInput(request, normalized.data, control);
+  }
+
+  public queryInput(request: SessionInputQuery): Result<SessionInputQueryResult> {
+    return this.inputs?.query(request) ?? fail(appError('session_input_unavailable', 'session', 'Session input is unavailable.'));
+  }
 
   public async create(request: CreateSessionRequest): Promise<Result<SessionSnapshot>> {
     if (this.deleting) return deleteInProgress();
@@ -112,11 +134,12 @@ export class SessionService {
       }
       const config = run.data.config as Record<string, unknown>;
       const mode = config.goalMode;
-      const goalMode = mode === 'answer' || mode === 'save-candidate' ? mode : null;
+      const goalMode = mode === 'answer' || mode === 'save-candidate' || mode === 'fill-form' ? mode : null;
       if (run.data.input.version === 2 && goalMode === null) {
         return fail(appError('session_history_invalid', 'session', 'Saved message Run context is incomplete.'));
       }
-      runInputs.push({ runId, input: run.data.input, goalMode });
+      runInputs.push({ runId, input: run.data.input, goalMode,
+        ...(typeof config.workingDirectory === 'string' ? { workingDirectory: config.workingDirectory } : {}) });
     }
     const projected = this.agent.projectSessionMessages({ history: stored.data.history, bindings: stored.data.bindings,
       runInputs, limit: request.limit, ...(request.beforeEntryId === undefined ? {} : { beforeEntryId: request.beforeEntryId }) });

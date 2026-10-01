@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { z } from 'zod';
 import {
   appError,
   fail,
@@ -19,7 +20,13 @@ import {
   SelectCandidateRequestSchema,
   WorkspaceChangeSchema,
   WorkspaceExpectationSchema,
+  WorkingDirectorySchema,
   invoiceToolSchemas,
+  InvoiceFormApplicationReceiptSchema,
+  InvoiceFormTargetSchema,
+  SessionInputQuerySchema,
+  InvoiceCandidateOperationQuerySchema,
+  ok,
 } from '@flowmate/contracts';
 import type {
   DesktopAgentRunRequest,
@@ -36,12 +43,23 @@ import type {
   SessionMessagesPage,
   SessionSnapshot,
   RuntimeState,
+  InvoiceFormApplicationReceipt,
+  InvoiceFormBridgeRequest,
+  DesktopInvoiceFormWorkspace,
+  CandidateJobDetail,
+  WorkspaceSnapshot,
+  JobSnapshot,
+  DesktopInvoiceFormInspection,
+  InvoiceCandidateOperationQuery,
+  InvoiceCandidateOperationResult,
 } from '@flowmate/contracts';
 import { defaultProductSettings, validateProductSettings } from '../../../packages/core/src/configuration/settings.ts';
 import { createCredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import type { CredentialStore, SecureStoragePort } from '../../../packages/shared/src/secure-credential-store.ts';
 import { HostClient } from './host-client.ts';
 import type { HostCredentialRequest } from '../../host/protocol.ts';
+import { InvoiceFormRunInputSchema } from '../../host/protocol.ts';
+import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
 const channels = {
   getState: 'flowmate:get-state',
@@ -55,6 +73,8 @@ const channels = {
   cancelProvider: 'flowmate:cancel-provider',
   queryRun: 'flowmate:query-run',
   createSession: 'flowmate:create-session',
+  queryNativeTools: 'flowmate:query-native-tools',
+  chooseWorkingDirectory: 'flowmate:choose-working-directory',
   renameSession: 'flowmate:rename-session',
   deleteSession: 'flowmate:delete-session',
   listSessions: 'flowmate:list-sessions',
@@ -63,6 +83,19 @@ const channels = {
   listSessionMessages: 'flowmate:list-session-messages',
   queryPromptTrace: 'flowmate:query-prompt-trace',
   startRun: 'flowmate:start-run',
+  registerInvoiceFormTarget: 'flowmate:register-invoice-form-target',
+  invalidateInvoiceFormTarget: 'flowmate:invalidate-invoice-form-target',
+  setInvoiceFormDirty: 'flowmate:set-invoice-form-dirty',
+  startInvoiceFormRun: 'flowmate:start-invoice-form-run',
+  querySessionInput: 'flowmate:query-session-input',
+  queryInvoiceFormApplication: 'flowmate:query-invoice-form-application',
+  replyInvoiceFormRequest: 'flowmate:reply-invoice-form-request',
+  replyInvoiceFormInspect: 'flowmate:reply-invoice-form-inspect',
+  saveInvoiceCandidate: 'flowmate:save-invoice-candidate',
+  acceptInvoiceCandidate: 'flowmate:accept-invoice-candidate',
+  rejectInvoiceCandidate: 'flowmate:reject-invoice-candidate',
+  exportInvoiceCandidate: 'flowmate:export-invoice-candidate',
+  queryInvoiceCandidateOperation: 'flowmate:query-invoice-candidate-operation',
   cancelRun: 'flowmate:cancel-run',
   queryRuntimeState: 'flowmate:query-runtime-state',
   readWorkspace: 'flowmate:read-workspace',
@@ -108,10 +141,16 @@ let hostErrorCode = 'host_not_ready';
 let ipcRegistered = false;
 let userDataRoot = '';
 let appVersion = '0.1.0';
+let stateBroadcastSequence = 0;
 const host = new HostClient();
 const subscriptions = new Map<number, () => void>();
 const credentialStores = new Map<string, CredentialStore>();
 const piCredentialPrefix = 'pi-credential-v1:';
+type DesktopFormBinding = InvoiceFormTargetBinding & { currentRevision: number; mutationPending?: boolean; unknownOperationRef?: string; clientSequence?: number; requestId?: string; modelId?: string };
+let invoiceFormBinding: DesktopFormBinding | null = null;
+const pendingInvoiceForms = new Map<string, { request: InvoiceFormBridgeRequest; owner: DesktopFormBinding;
+  resolve(receipt: InvoiceFormApplicationReceipt): void }>();
+const pendingFormInspections = new Map<string, { owner: DesktopFormBinding; resolve(value: DesktopInvoiceFormInspection | null): void }>();
 
 const systemSecureStorage: SecureStoragePort = {
   async isAvailable() {
@@ -146,7 +185,7 @@ app.on('activate', () => {
 app.on('before-quit', (event) => {
   if (allowQuit) return;
   event.preventDefault();
-  void closeHostAndQuit();
+  void confirmInvoiceFormClose().then(confirmed => { if (confirmed) void closeHostAndQuit(); });
 });
 
 const startup = bootstrap().catch(async () => {
@@ -225,6 +264,7 @@ async function bootstrap(): Promise<void> {
     }
   });
   host.setCredentialHandler(handleHostCredentialRequest);
+  host.setInvoiceFormHandler(handleInvoiceFormRequest);
   const started = await host.start(userDataRoot, appVersion, appRoot, invoiceSourceRoot);
   if (started.ok && started.data.ready && retiredCredentialRef) {
     const removed = await credentialStore(retiredCredentialRef).remove();
@@ -288,7 +328,10 @@ function createMainWindow(): void {
   window.on('close', (event) => {
     if (allowWindowClose) return;
     event.preventDefault();
-    void closeHostAndQuit();
+    void confirmInvoiceFormClose().then(confirmed => { if (confirmed) void closeHostAndQuit(); });
+  });
+  window.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => {
+    if (isMainFrame && invoiceFormBinding) invoiceFormBinding.valid = false;
   });
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
   if (rendererUrl) void window.loadURL(rendererUrl);
@@ -367,6 +410,12 @@ function registerIpc(): void {
   handle(channels.cancelProvider, async (_event, requestIdRaw) => cancelProvider(requestIdRaw));
   handle(channels.queryRun, async (_event, runIdRaw) => queryRun(runIdRaw));
   handle(channels.createSession, async (_event, inputRaw) => createSession(inputRaw));
+  handle(channels.queryNativeTools, async () => productHostRequest({ type: 'query_native_tools' }, 'Native tool availability could not be loaded.'));
+  handle(channels.chooseWorkingDirectory, async () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return fail(appError('desktop_not_ready', 'runtime', 'The directory picker is not ready.', true));
+    const selected = await dialog.showOpenDialog(mainWindow, { title: 'Choose working directory', properties: ['openDirectory', 'dontAddToRecent'] });
+    return { ok: true, data: selected.canceled ? null : selected.filePaths[0] ?? null };
+  });
   handle(channels.renameSession, async (_event, inputRaw) => renameSession(inputRaw));
   handle(channels.deleteSession, async (_event, sessionIdRaw) => deleteSession(sessionIdRaw));
   handle(channels.listSessions, async (_event, inputRaw) => listSessions(inputRaw));
@@ -375,6 +424,53 @@ function registerIpc(): void {
   handle(channels.listSessionMessages, async (_event, inputRaw) => listSessionMessages(inputRaw));
   handle(channels.queryPromptTrace, async (_event, runIdRaw, sequenceRaw) => queryPromptTrace(runIdRaw, sequenceRaw));
   handle(channels.startRun, async (_event, inputRaw) => startRun(inputRaw));
+  handle(channels.registerInvoiceFormTarget, async (event, raw) => registerInvoiceFormTarget(event, raw));
+  handle(channels.invalidateInvoiceFormTarget, async (event, id) => {
+    if (!ownedInvoiceForm(event, id)) return fail(appError('state_conflict', 'input', 'Form target is no longer current.'));
+    invoiceFormBinding!.valid = false;
+    return ok(undefined);
+  });
+  handle(channels.setInvoiceFormDirty, async (event, id, dirty, revision) => {
+    if (!ownedInvoiceForm(event, id) || typeof dirty !== 'boolean' || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < invoiceFormBinding!.currentRevision)
+      return fail(appError('state_conflict', 'input', 'Form target is no longer current.'));
+    invoiceFormBinding!.dirty = dirty;
+    invoiceFormBinding!.currentRevision = revision;
+    return ok(undefined);
+  });
+  handle(channels.replyInvoiceFormInspect, async (event, id, raw) => {
+    const pending = typeof id === 'string' ? pendingFormInspections.get(id) : undefined;
+    if (!pending || pending.owner !== invoiceFormBinding) return fail(appError('state_conflict', 'input', 'Form inspection is no longer current.'));
+    const checked = checkedInvoiceFormInspection(pending.owner, raw, { frame: event.senderFrame!, contents: event.sender, epoch: host.connectionEpoch });
+    pending.resolve(checked);
+    return checked ? ok(undefined) : fail(appError('state_conflict', 'input', 'Form inspection does not match its owner or current revision.'));
+  });
+  for (const [channel, kind] of [[channels.saveInvoiceCandidate, 'save'], [channels.acceptInvoiceCandidate, 'accept'],
+    [channels.rejectInvoiceCandidate, 'reject'], [channels.exportInvoiceCandidate, 'export']] as const) {
+    handle(channel, async (event, raw) => {
+      try { return await submitInvoiceCandidateOperation({ kind, request: raw }, { frame: event.senderFrame!, contents: event.sender, epoch: host.connectionEpoch }); }
+      finally { if (!event.sender.isDestroyed()) event.sender.send('flowmate:invoice-form-inspect-finished'); }
+    });
+  }
+  handle(channels.queryInvoiceCandidateOperation, async (_event, raw) => {
+    const input = InvoiceCandidateOperationQuerySchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Original operation query is invalid.'));
+    const result = await productHostRequest<InvoiceCandidateOperationResult>({ type: 'query_invoice_candidate_operation', input: input.data }, 'Original operation could not be queried.');
+    if (result.ok && result.data !== null && invoiceFormBinding?.unknownOperationRef === input.data.request.operationRef)
+      delete invoiceFormBinding.unknownOperationRef;
+    return result;
+  });
+  handle(channels.startInvoiceFormRun, async (event, raw) => startInvoiceFormRun(event, raw));
+  handle(channels.querySessionInput, async (_event, raw) => {
+    const input = SessionInputQuerySchema.safeParse(raw);
+    return input.success ? productHostRequest({ type: 'query_session_input', input: input.data }, 'Fill input could not be queried.')
+      : fail(appError('input_invalid', 'input', 'Fill query is invalid.'));
+  });
+  handle(channels.queryInvoiceFormApplication, async (_event, raw) => {
+    const input = z.object({ runId: z.number().int().positive(), toolCallId: z.number().int().positive() }).strict().safeParse(raw);
+    return input.success ? productHostRequest({ type: 'query_invoice_form_application', input: input.data }, 'Form application could not be queried.')
+      : fail(appError('input_invalid', 'input', 'Form application query is invalid.'));
+  });
+  handle(channels.replyInvoiceFormRequest, async (event, id, raw) => replyInvoiceFormRequest(event, id, raw));
   handle(channels.cancelRun, async (_event, runIdRaw) => cancelRun(runIdRaw));
   handle(channels.queryRuntimeState, async () => queryRuntimeState());
   handle(channels.readWorkspace, async () => productHostRequest({ type: 'read_workspace' }, 'Workspace 暂不可用。'));
@@ -680,9 +776,9 @@ function pageInput(raw: unknown, extraKeys: readonly string[]): MainPageInput | 
 function validId(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0; }
 
 async function productHostRequest<T = unknown>(command: Parameters<HostClient['request']>[0], message: string,
-  timeoutMs = 10_000): Promise<Result<T>> {
+  timeoutMs = 10_000, transportErrorCode = hostErrorCode): Promise<Result<T>> {
   try { return await host.request(command, timeoutMs) as Result<T>; }
-  catch { return fail(appError(hostErrorCode, 'runtime', message, true)); }
+  catch { return fail(appError(transportErrorCode, 'runtime', message, true)); }
 }
 
 async function createSession(raw: unknown): Promise<Result<SessionSnapshot>> {
@@ -798,7 +894,8 @@ async function queryRuntimeState(): Promise<Result<RuntimeState>> {
 }
 
 function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunRequest {
-  if (!value || typeof value !== 'object') return false;
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).some((key) => !['sessionId', 'text', 'modelId', 'workspace', 'goalMode', 'workingDirectory', 'timeoutMs'].includes(key))) return false;
   const request = value as Partial<DesktopAgentRunRequest>;
   const workspace = request.workspace === undefined ? null : WorkspaceExpectationSchema.safeParse(request.workspace);
   return Number.isSafeInteger(request.sessionId) && Number(request.sessionId) > 0
@@ -807,6 +904,8 @@ function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunReque
     && typeof request.modelId === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(request.modelId)
     && (workspace === null || workspace.success && workspace.data.sessionId === request.sessionId)
     && (request.goalMode === 'answer' || request.goalMode === 'save-candidate')
+    && (request.workingDirectory === undefined || WorkingDirectorySchema.safeParse(request.workingDirectory).success)
+    && (request.workingDirectory === undefined || workspace?.success === true)
     && (request.goalMode !== 'save-candidate' || workspace?.success === true
       && workspace.data.documentRef !== null && workspace.data.jobId !== null)
     && (request.timeoutMs === undefined || Number.isInteger(request.timeoutMs) && request.timeoutMs >= 100 && request.timeoutMs <= 120_000);
@@ -857,7 +956,9 @@ async function requestHost(command: Parameters<HostClient['request']>[0]): Promi
 }
 
 async function broadcastState(): Promise<void> {
+  const sequence = ++stateBroadcastSequence;
   const result = await readDesktopState();
+  if (sequence !== stateBroadcastSequence) return;
   const state: DesktopState = result.ok ? result.data : {
     version: 1,
     ready: false,
@@ -873,8 +974,206 @@ async function broadcastState(): Promise<void> {
   }
 }
 
+function sameFormWorkspace(expected: DesktopInvoiceFormWorkspace, actual: DesktopInvoiceFormWorkspace): boolean {
+  return expected.revision === actual.revision && expected.sessionId === actual.sessionId && expected.jobId === actual.jobId
+    && expected.documentRef?.id === actual.documentRef?.id && expected.documentRef?.version === actual.documentRef?.version
+    && expected.candidateRef?.id === actual.candidateRef?.id && expected.candidateRef?.sequence === actual.candidateRef?.sequence;
+}
+
+function ownedInvoiceForm(event: Electron.IpcMainInvokeEvent, id: unknown): boolean {
+  return typeof id === 'string' && invoiceFormBinding !== null && invoiceFormBinding.target.formInstanceId === id
+    && invoiceFormBinding.frame === event.senderFrame && invoiceFormBinding.contents === event.sender;
+}
+
+async function registerInvoiceFormTarget(event: Electron.IpcMainInvokeEvent, raw: unknown) {
+  const input = z.object({ purpose: z.enum(['fill', 'edit']), formRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    workspace: WorkspaceExpectationSchema.extend({ sessionId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable() }).strict(),
+  }).strict().safeParse(raw);
+  if (!input.success || !input.data.workspace.documentRef || !input.data.workspace.jobId || !input.data.workspace.candidateRef
+    || input.data.purpose === 'fill' && input.data.workspace.sessionId === null) return fail(appError('input_invalid', 'input', 'Choose a saved candidate before preparing the form.'));
+  if (invoiceFormBinding?.dirty || invoiceFormBinding?.mutationPending) return fail(appError('state_conflict', 'input', 'Keep or discard the current edits first.'));
+  const expected = input.data.workspace;
+  const [current, job, candidate, runtime] = await Promise.all([
+    productHostRequest<WorkspaceSnapshot>({ type: 'read_workspace' }, 'Workspace is unavailable.'),
+    productHostRequest<JobSnapshot>({ type: 'query_job', jobId: expected.jobId! }, 'Task is unavailable.'),
+    productHostRequest<CandidateJobDetail>({ type: 'query_job_candidate', input: { jobId: expected.jobId!, candidateId: expected.candidateRef!.id } }, 'Candidate is unavailable.'),
+    queryRuntimeState(),
+  ]);
+  if (!current.ok) return current;
+  if (!job.ok) return job;
+  if (!candidate.ok) return candidate;
+  if (!runtime.ok) return runtime;
+  if (!sameFormWorkspace(expected, current.data) || current.data.invalidReferences.length
+    || job.data.currentCandidateId !== expected.candidateRef!.id || job.data.status === 'completed'
+    || candidate.data.candidate.status === 'accepted' || candidate.data.candidate.sequence !== expected.candidateRef!.sequence
+    || candidate.data.documentRef.id !== expected.documentRef!.id || candidate.data.documentRef.version !== expected.documentRef!.version) {
+    return fail(appError('state_conflict', 'input', 'The selected candidate or Workspace changed.'));
+  }
+  if (runtime.data.blocked || runtime.data.active) return fail(appError('runtime_busy', 'runtime', 'Wait for the actual execution to release the Runtime.'));
+  if (input.data.purpose === 'fill') {
+    const session = await querySession(expected.sessionId);
+    if (!session.ok) return session;
+    if (session.data.modelUseBlocked || session.data.availability !== 'ready') return fail(appError('session_scope_revoked', 'session', 'This Session is unavailable for model use.'));
+  }
+  const target = { formInstanceId: randomUUID(), expectedRevision: input.data.formRevision };
+  invoiceFormBinding = { frame: event.senderFrame!, contents: event.sender, epoch: host.connectionEpoch, currentRevision: input.data.formRevision,
+    workspace: expected, purpose: input.data.purpose, target, valid: true, dirty: false, runId: null, pendingFill: false };
+  return ok(target);
+}
+
+async function startInvoiceFormRun(event: Electron.IpcMainInvokeEvent, raw: unknown) {
+  const input = InvoiceFormRunInputSchema.safeParse(raw);
+  const binding = invoiceFormBinding;
+  if (!input.success || !binding || !ownedInvoiceForm(event, input.data.target.formInstanceId) || !binding.valid
+    || binding.epoch !== host.connectionEpoch || binding.purpose !== 'fill' || binding.dirty
+    || binding.target.expectedRevision !== input.data.target.expectedRevision || !sameFormWorkspace(binding.workspace, input.data.workspace)) {
+    return fail(appError('state_conflict', 'input', 'The form target changed. Prepare a new Fill after checking the current form.'));
+  }
+  if (binding.clientSequence !== undefined) {
+    if (binding.clientSequence !== input.data.clientSequence || binding.modelId !== input.data.modelId) return fail(appError('state_conflict', 'input', 'This target already belongs to a different input.'));
+    const original = await productHostRequest<import('@flowmate/contracts').SessionInputQueryResult>({ type: 'query_session_input',
+      input: { sessionId: input.data.workspace.sessionId, clientSequence: input.data.clientSequence } }, 'Fill admission is unknown.');
+    return original.ok && original.data.input?.runId ? ok({ runId: original.data.input.runId, sessionId: original.data.input.sessionId,
+      inputId: original.data.input.inputId, requestId: binding.requestId! }) : fail(appError('operation_result_unknown', 'runtime', 'Fill admission is unknown. Query its original input.'));
+  }
+  const current = await readDesktopState();
+  if (!current.ok) return current;
+  const profile = current.data.settings.models.find(model => model.id === input.data.modelId);
+  if (!current.data.ready || !profile || current.data.modelCredentials[profile.id] !== 'configured') return fail(appError('model_credential_missing', 'input', 'Configure a model before Fill with Agent.'));
+  binding.requestId = randomUUID(); binding.clientSequence = input.data.clientSequence; binding.modelId = input.data.modelId; binding.pendingFill = true;
+  try {
+    const accepted = await host.request({ type: 'submit_invoice_form_input', requestId: binding.requestId, input: input.data,
+      expectedSettingsRevision: current.data.settings.revision, expectedCredentialRef: profile.credentialRef }, 15_000) as Result<RunAccepted & { requestId: string }>;
+    if (!accepted.ok) { binding.pendingFill = accepted.error.code === 'operation_result_unknown'; return accepted; }
+    if (accepted.data.requestId !== binding.requestId || accepted.data.sessionId !== input.data.workspace.sessionId
+      || !validId(accepted.data.runId) || binding.runId !== null && binding.runId !== accepted.data.runId) return fail(appError('host_protocol_invalid', 'runtime', 'Fill Run association is invalid.'));
+    binding.runId = accepted.data.runId; binding.pendingFill = false;
+    return accepted;
+  } catch { return fail(appError('operation_result_unknown', 'runtime', 'Fill admission is unknown. Query its original input; do not send it again.')); }
+}
+
+function unknownInvoiceForm(request: InvoiceFormBridgeRequest): InvoiceFormApplicationReceipt {
+  return { runId: request.runId, toolCallId: request.toolCallId, formInstanceId: request.target.formInstanceId,
+    candidateId: request.candidateId, candidateSequence: request.candidateSequence, observedAt: new Date().toISOString(), outcome: 'unknown' };
+}
+
+async function handleInvoiceFormRequest(request: InvoiceFormBridgeRequest, epoch: number): Promise<InvoiceFormApplicationReceipt> {
+  const binding = invoiceFormBinding;
+  const window = mainWindow;
+  if (!binding || !window || window.webContents.isDestroyed() || epoch !== host.connectionEpoch
+    || !matchesInvoiceFormTarget(binding, request, { frame: window.webContents.mainFrame, contents: window.webContents, epoch })) return unknownInvoiceForm(request);
+  const run = await productHostRequest<RunSnapshot>({ type: 'query_run', runId: request.runId }, 'Fill Run could not be confirmed.', 1500);
+  if (!run.ok || !matchesInvoiceFormRun(binding, request, run.data) || invoiceFormBinding !== binding || !binding.valid
+    || host.connectionEpoch !== epoch || window.webContents.mainFrame !== binding.frame) return unknownInvoiceForm(request);
+  binding.runId = request.runId;
+  return new Promise(resolve => {
+    const requestId = randomUUID();
+    const timer = setTimeout(() => finish(unknownInvoiceForm(request)), 3000);
+    const finish = (receipt: InvoiceFormApplicationReceipt) => {
+      clearTimeout(timer); pendingInvoiceForms.delete(requestId); resolve(receipt);
+    };
+    pendingInvoiceForms.set(requestId, { request, owner: binding, resolve: finish });
+    window.webContents.send('flowmate:invoice-form-request', { requestId, request });
+  });
+}
+
+async function replyInvoiceFormRequest(event: Electron.IpcMainInvokeEvent, id: unknown, raw: unknown) {
+  const pending = typeof id === 'string' ? pendingInvoiceForms.get(id) : undefined;
+  const receipt = InvoiceFormApplicationReceiptSchema.safeParse(raw);
+  if (!pending || !receipt.success || pending.owner.frame !== event.senderFrame || pending.owner.contents !== event.sender
+    || pending.owner.epoch !== host.connectionEpoch || receipt.data.runId !== pending.request.runId
+    || receipt.data.toolCallId !== pending.request.toolCallId || receipt.data.formInstanceId !== pending.request.target.formInstanceId
+    || receipt.data.candidateId !== pending.request.candidateId || receipt.data.candidateSequence !== pending.request.candidateSequence
+    || receipt.data.outcome === 'applied' && receipt.data.appliedRevision !== pending.request.target.expectedRevision + 1) {
+    return fail(appError('state_conflict', 'input', 'Form receipt does not match its original request.'));
+  }
+  pending.resolve(receipt.data);
+  return ok(undefined);
+}
+
+async function inspectCurrentInvoiceForm(binding: DesktopFormBinding): Promise<DesktopInvoiceFormInspection | null> {
+  if (!mainWindow || binding !== invoiceFormBinding || !binding.valid || binding.epoch !== host.connectionEpoch
+    || binding.frame !== mainWindow.webContents.mainFrame || binding.contents !== mainWindow.webContents) return null;
+  return new Promise(resolve => {
+    const requestId = randomUUID();
+    const timer = setTimeout(() => finish(null), 2500);
+    const finish = (value: DesktopInvoiceFormInspection | null) => { clearTimeout(timer); pendingFormInspections.delete(requestId); resolve(value); };
+    pendingFormInspections.set(requestId, { owner: binding, resolve: finish });
+    mainWindow!.webContents.send('flowmate:invoice-form-inspect', { requestId, formInstanceId: binding.target.formInstanceId });
+  });
+}
+
+async function submitInvoiceCandidateOperation(raw: unknown, owner: InvoiceFormOwner,
+  inspected?: DesktopInvoiceFormInspection): Promise<Result<InvoiceCandidateOperationResult>> {
+  const query = InvoiceCandidateOperationQuerySchema.safeParse(raw);
+  if (!query.success) return fail(appError('input_invalid', 'input', 'Candidate operation is invalid.'));
+  const input = query.data;
+  // Resolve the exact original command before consulting a now-stale target or Workspace.
+  const prior = await productHostRequest<InvoiceCandidateOperationResult>({ type: 'query_invoice_candidate_operation', input }, 'Original candidate operation could not be queried.');
+  if (!prior.ok || prior.data !== null) return prior;
+  if (input.kind === 'export') return productHostRequest({ type: 'export_invoice_candidate', input: input.request }, 'Export result is unknown. Query the original operation.', 10_000, 'operation_result_unknown');
+  const binding = invoiceFormBinding;
+  if (!binding || !binding.valid || binding.frame !== owner.frame || binding.contents !== owner.contents || binding.epoch !== owner.epoch)
+    return fail(appError('state_conflict', 'input', 'Choose a current editable form before this operation.'));
+  if (binding.unknownOperationRef) return fail(appError('operation_result_unknown', 'input', 'Check the original operation before creating another operation.'));
+  if (binding.mutationPending) return fail(appError('state_conflict', 'input', 'The current form already has an operation in progress.'));
+  binding.mutationPending = true;
+  try {
+  const form = inspected ?? await inspectCurrentInvoiceForm(binding);
+  if (!form) return fail(appError('operation_result_unknown', 'input', 'Current form could not be inspected. Your local draft is retained.'));
+  if (binding !== invoiceFormBinding || !checkedInvoiceFormInspection(binding, form, owner)
+    || input.request.jobId !== form.basis.jobId || input.request.expectedCandidateId !== form.basis.candidateId
+    || input.request.expectedRevision !== binding.workspace.revision)
+    return fail(appError('state_conflict', 'input', 'Current form or selected result changed.'));
+  if (input.kind === 'save') {
+    if (input.request.basedOnCandidateId !== form.basis.candidateId || JSON.stringify(input.request.draft) !== JSON.stringify(form.draft))
+      return fail(appError('state_conflict', 'input', 'Save draft does not match the current form.'));
+    const result = await productHostRequest<InvoiceCandidateOperationResult>({ type: 'save_invoice_candidate', input: input.request }, 'Save result is unknown. Query the original operation.', 10_000, 'operation_result_unknown');
+    if (!result.ok && result.error.code === 'operation_result_unknown') binding.unknownOperationRef = input.request.operationRef;
+    return result;
+  }
+  if (form.dirty || input.request.candidateId !== form.basis.candidateId)
+    return fail(appError('state_conflict', 'input', 'Save or discard the actual local changes before making a decision.'));
+  const result = await (input.kind === 'accept'
+    ? productHostRequest<InvoiceCandidateOperationResult>({ type: 'accept_invoice_candidate', input: input.request }, 'Accept result is unknown. Query the original operation.', 10_000, 'operation_result_unknown')
+    : productHostRequest<InvoiceCandidateOperationResult>({ type: 'reject_invoice_candidate', input: input.request }, 'Reject result is unknown. Query the original operation.', 10_000, 'operation_result_unknown'));
+  if (!result.ok && result.error.code === 'operation_result_unknown') binding.unknownOperationRef = input.request.operationRef;
+  return result;
+  } finally { binding.mutationPending = false; }
+}
+
+async function confirmInvoiceFormClose(): Promise<boolean> {
+  if (!invoiceFormBinding?.dirty || !mainWindow) return true;
+  const choice = await dialog.showMessageBox(mainWindow, { type: 'warning', title: 'Unsaved invoice changes',
+    message: 'Save, keep editing or discard the local invoice changes before closing.', buttons: ['Continue editing', 'Discard changes', 'Save result'], defaultId: 0, cancelId: 0 });
+  const binding = invoiceFormBinding;
+  if (!binding) return false;
+  if (choice.response === 1) { binding.valid = false; binding.dirty = false; return true; }
+  if (choice.response !== 2) return false;
+  if (binding.unknownOperationRef) {
+    await dialog.showMessageBox(mainWindow, { type: 'warning', message: 'Check the original Save status in the invoice form before saving again.', buttons: ['Continue editing'] });
+    return false;
+  }
+  let unknownOperation: InvoiceCandidateOperationQuery | undefined;
+  try {
+    const form = await inspectCurrentInvoiceForm(binding);
+    if (!form) return false;
+    const operation: InvoiceCandidateOperationQuery = { kind: 'save', request: { operationRef: randomUUID(), jobId: form.basis.jobId,
+      basedOnCandidateId: form.basis.candidateId, expectedCandidateId: form.basis.candidateId,
+      expectedRevision: binding.workspace.revision, draft: form.draft } };
+    const result = await submitInvoiceCandidateOperation(operation, binding, form);
+    if (!result.ok) {
+      if (result.error.code === 'operation_result_unknown') unknownOperation = operation;
+      await dialog.showMessageBox(mainWindow, { type: 'error', message: result.error.message, buttons: ['Continue editing'] });
+      return false;
+    }
+    binding.dirty = false; return true;
+  } finally { if (mainWindow && !mainWindow.webContents.isDestroyed()) mainWindow.webContents.send('flowmate:invoice-form-inspect-finished', { unknownOperation }); }
+}
+
 function isTrustedSender(event: Electron.IpcMainInvokeEvent): boolean {
   if (!mainWindow || event.sender !== mainWindow.webContents || mainWindow.webContents.isDestroyed()) return false;
+  if (event.senderFrame !== mainWindow.webContents.mainFrame) return false;
   const frameUrl = event.senderFrame?.url;
   return typeof frameUrl === 'string' && isAllowedPage(frameUrl);
 }

@@ -1,4 +1,6 @@
-import { appError, fail, ok, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
+import { appError, fail, ok, normalizeSessionInputRequest, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
+import { join } from 'node:path';
+import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import type {
   AgentConfigFacts,
   P3AgentConfigFacts,
@@ -30,10 +32,14 @@ import type {
   RunAccepted,
   SafeConfigSnapshot,
   UsageRecord,
+  NativeToolAvailability,
+  RunScope,
+  NormalizedSessionInputRequest,
 } from '@flowmate/contracts';
 import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
 import { ensureNativeSession } from '../sessions/service.ts';
 import type { ToolExecutor } from '../tools/executor.ts';
+import type { SessionInputLedger } from '../sessions/input-ledger.ts';
 
 export interface RuntimeLogger {
   write(event: { at: string; level: 'info' | 'warn' | 'error'; component: string; runId?: number; event: string; code?: string }): void;
@@ -42,10 +48,16 @@ export interface RuntimeLogger {
 
 export type RuntimeDependencies = {
   runs: RunRepository;
+  recoveryError?: AppError | null;
   provider: ProviderPort;
   agent?: AgentPort;
   sessions?: SessionRepository;
+  sessionInputs?: SessionInputLedger;
   tools?: ToolExecutor;
+  nativeTools?: {
+    runtimeDir: string;
+    availability: readonly NativeToolAvailability[];
+  };
   log: RuntimeLogger;
   now: () => string;
   monotonicNow: () => number;
@@ -84,6 +96,9 @@ type AgentExecutionContext = {
   session: SessionRow;
   input: InputRecord;
   admission: WorkspaceRunAdmission | null;
+  scope: RunScope | null;
+  workingDirectory?: string;
+  inputId?: number;
   control: AgentControl;
   stopPromise: Promise<StopIntent>;
   readStop: () => StopIntent | undefined;
@@ -142,7 +157,8 @@ function initialP3AgentSnapshot(request: NormalizedAgentRunRequest, nativeSessio
     parameters: request.config.parameters,
     limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
     native: { authSource: 'unknown', modelsSelection: request.config.native.modelsPath },
-    agent: { ...p3AgentPolicy, nativeSessionId },
+    agent: { ...p3AgentPolicy, nativeSessionId,
+      ...(request.goalMode === 'fill-form' ? { systemPrompt: INVOICE_FILL_FORM_SYSTEM_PROMPT } : {}) },
   };
 }
 
@@ -225,14 +241,25 @@ export class RuntimeService {
 
   public constructor(dependencies: RuntimeDependencies) {
     this.dependencies = dependencies;
+    this.poisoned = dependencies.recoveryError != null;
   }
 
   public state(): RuntimeState {
     return {
       active: this.active ? { runId: this.active.runId, sessionId: this.active.sessionId, kind: this.active.kind } : null,
       blocked: this.poisoned,
-      error: this.poisoned ? appError('runtime_unusable', 'runtime', 'Runtime 暂不可复用，需要重启。') : null,
+      error: this.poisoned ? this.dependencies.recoveryError
+        ?? appError('runtime_unusable', 'runtime', 'Runtime 暂不可复用，需要重启。') : null,
     };
+  }
+
+  public queryNativeTools(): Result<readonly NativeToolAvailability[]> {
+    const registered = new Set(this.dependencies.tools?.listTools().map((tool) => tool.name) ?? []);
+    return ok(NATIVE_TOOL_NAMES.map((name) => {
+      const available = this.dependencies.nativeTools?.availability.find((tool) => tool.name === name);
+      return available?.available && registered.has(name) ? { name, available: true, reason: null }
+        : { name, available: false, reason: available?.reason ?? 'Native tool is not configured.' };
+    }));
   }
 
   public cancel(runId: number): Result<{ runId: number; accepted: boolean }> {
@@ -275,15 +302,42 @@ export class RuntimeService {
     return ok({ ...persisted.data, stopRequested });
   }
 
-  public async start(request: NormalizedAgentRunRequest, control: AgentControl = {}): Promise<Result<RunAccepted>> {
+  public async start(request: NormalizedAgentRunRequest, control: AgentControl = {}, inputSubmission?: NormalizedSessionInputRequest): Promise<Result<RunAccepted>> {
+    if (inputSubmission) {
+      const normalized = normalizeSessionInputRequest({ ...inputSubmission, ...request });
+      if (!normalized.ok || JSON.stringify(normalized.data) !== JSON.stringify(inputSubmission)) {
+        return fail(appError('input_invalid', 'input', 'Fill input and Run request do not match.'));
+      }
+      if (!this.dependencies.sessionInputs) return fail(appError('session_input_unavailable', 'session', 'Session input storage is unavailable.'));
+      const previous = this.dependencies.sessionInputs.lookup(inputSubmission);
+      if (!previous.ok) return previous;
+      if (previous.data) return previous.data.runId === null
+        ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
+        : ok({ runId: previous.data.runId, sessionId: previous.data.sessionId, inputId: previous.data.inputId });
+    } else if (request.goalMode === 'fill-form') {
+      return fail(appError('input_invalid', 'input', 'Fill requires the dedicated input admission.'));
+    }
     const { agent, sessions } = this.dependencies;
     if (!agent || !sessions) return fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'));
     if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Agent 停止或 Run 保存未确认，运行实例不可复用。'));
     if (this.closing || this.closed || this.active !== null) return fail(appError('runtime_busy', 'runtime', '已有 Run 正在执行。'));
+    if (inputSubmission && !this.dependencies.tools?.listTools().some(tool => tool.name === 'fill_invoice_form')) {
+      return fail(appError('tool_runtime_unavailable', 'runtime', 'The trusted invoice form tool is unavailable.'));
+    }
 
     const sessionResult = sessions.get(request.sessionId);
     if (!sessionResult.ok) return sessionResult;
     const session = sessionResult.data;
+    let workingDirectory: string | undefined;
+    const availability = this.queryNativeTools();
+    const nativeNames = availability.ok ? availability.data.filter((tool) => tool.available).map((tool) => tool.name) : [];
+    if (request.workingDirectory !== undefined) {
+      if (!request.workspace) return fail(appError('input_invalid', 'input', 'A working directory requires the current workspace context.'));
+      try {
+        workingDirectory = realpathSync(request.workingDirectory);
+        if (!statSync(workingDirectory).isDirectory()) throw new Error('not_directory');
+      } catch { return fail(appError('input_unavailable', 'input', 'The selected working directory is unavailable.')); }
+    }
     if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
     const modelUseBlocked = sessions.isModelUseBlocked(request.sessionId);
     if (!modelUseBlocked.ok) return modelUseBlocked;
@@ -304,18 +358,37 @@ export class RuntimeService {
       return fail(appError(code, 'session', message, false));
     }
     const createdAt = this.dependencies.now();
-    const input: InputRecord = { version: 1, goal: INVOICE_CHAT_GOAL, text: request.text, messageTimestamp: Date.now() };
+    const input: InputRecord = { version: 1, goal: INVOICE_CHAT_GOAL,
+      text: request.text, messageTimestamp: Date.now() };
     let admission: WorkspaceRunAdmission | null = null;
+    let scope: RunScope | null = null;
     let createdRunId: number;
+    let inputId: number | undefined;
     if (request.workspace) {
-      const accepted = this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
-        expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
+      const expectedWorkspace = request.workspace;
+      const createRun = () => this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
+        expected: expectedWorkspace, goalMode: request.goalMode ?? 'answer', text: request.text,
         messageTimestamp: Date.now(), goal: INVOICE_CHAT_GOAL,
         config: initialP3AgentSnapshot(request, session.nativeSessionId), usage: initialUsage(createdAt),
-        cleanup: initialCleanup(), createdAt });
+        cleanup: initialCleanup(), createdAt,
+        ...(inputSubmission ? { formTarget: inputSubmission.formTarget } : {}),
+        ...(this.dependencies.nativeTools && !inputSubmission ? { nativeTools: { runtimeDir: this.dependencies.nativeTools.runtimeDir,
+          allowedTools: nativeNames, ...(workingDirectory ? { workingDirectory } : {}) } } : {}) });
+      let accepted: Result<WorkspaceRunAdmission>;
+      if (inputSubmission) {
+        const admitted = this.dependencies.sessionInputs!.admit(inputSubmission, createRun, createdAt);
+        if (!admitted.ok) return admitted;
+        inputId = admitted.data.input.inputId;
+        if (!admitted.data.created || !admitted.data.admission) return admitted.data.input.runId === null
+          ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
+          : ok({ runId: admitted.data.input.runId, sessionId: request.sessionId, inputId });
+        accepted = ok(admitted.data.admission);
+      } else accepted = createRun();
       if (!accepted.ok) return accepted;
       admission = accepted.data;
+      scope = admission.scope;
       createdRunId = accepted.data.runId;
+      if (this.dependencies.nativeTools && !inputSubmission) workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(createdRunId), 'work');
     } else {
       const created = this.dependencies.runs.createAgent({
         goal: INVOICE_CHAT_GOAL, input,
@@ -376,7 +449,8 @@ export class RuntimeService {
     let resolveCompletion!: (result: Result<ProviderOutcome>) => void;
     active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
     this.active = active;
-    const context: AgentExecutionContext = { active, request, session, input, admission, control, stopPromise, readStop: () => stopIntent, emit };
+    const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory,
+      ...(inputId === undefined ? {} : { inputId }), control, stopPromise, readStop: () => stopIntent, emit };
     const timer = setTimeout(() => active.stop('timeout'), request.timeoutMs);
     emit({ type: 'run_progress', phase: 'created' });
     const execution = this.executeAgent(context).catch(() => this.finishAgent(context, null,
@@ -395,7 +469,7 @@ export class RuntimeService {
       resolveCompletion(failed);
       emit({ type: 'run_finished', result: failed });
     });
-    return ok({ runId, sessionId: request.sessionId });
+    return ok({ runId, sessionId: request.sessionId, ...(inputId === undefined ? {} : { inputId }) });
   }
 
   public async callProvider(request: ProviderRequest, control: ProviderControl = {}): Promise<Result<ProviderOutcome>> {
@@ -509,8 +583,19 @@ export class RuntimeService {
   private async executeAgent(context: AgentExecutionContext): Promise<Result<AgentOutcome>> {
     const { active, request, session, input } = context;
     const agent = this.dependencies.agent;
-    if (context.admission) this.dependencies.tools?.setRunDeadline(active.runId, active.startedAt + request.timeoutMs);
+    if (context.scope) this.dependencies.tools?.setRunDeadline(active.runId, active.startedAt + request.timeoutMs);
     if (!agent) return this.finishAgent(context, null, appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'), true);
+    if (context.admission && context.workingDirectory) {
+      try {
+        if (request.workingDirectory === undefined) mkdirSync(context.workingDirectory, { recursive: true });
+        if (!statSync(context.workingDirectory).isDirectory()) throw new Error('not_directory');
+        if (request.workingDirectory !== undefined && realpathSync(request.workingDirectory) !== context.workingDirectory) {
+          throw new Error('working_directory_changed');
+        }
+      } catch {
+        return this.finishAgent(context, null, appError('input_unavailable', 'input', 'The Run working directory is unavailable.', true, active.runId), true);
+      }
+    }
     const requestedStop = this.agentStop(context);
     if (requestedStop) return this.finishAgent(context, null, errorForStop(requestedStop.reason, active.runId, 'agent'), true);
 
@@ -519,7 +604,8 @@ export class RuntimeService {
       request.config,
       { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
       active.controller.signal,
-      context.admission ? { activeToolNames: context.admission.scope.allowedTools } : undefined,
+      context.scope ? { activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer',
+        ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) } : undefined,
     )).then(
       (result) => ({ ok: true as const, result }),
       () => ({ ok: false as const }),
@@ -571,12 +657,13 @@ export class RuntimeService {
     }
 
     let startedConfig: SafeConfigSnapshot = prepared.snapshot;
-    if (context.admission) {
+    if (context.scope) {
       const initial = this.dependencies.runs.get(active.runId);
       if (!initial.ok) return this.finishAgent(context, null, { ...initial.error, runId: active.runId }, false, true);
       const saved = initial.data.config as Record<string, unknown>;
       const preparedFacts = prepared.snapshot as SafeConfigSnapshot & Record<string, unknown>;
-      const { agent: _preparedAgent, ...preparedWithoutAgent } = preparedFacts;
+      const { agent: _preparedAgent, goalMode: _preparedGoal, workspaceContext: _preparedWorkspace,
+        workingDirectory: _preparedDirectory, formTarget: _preparedTarget, ...preparedWithoutAgent } = preparedFacts;
       const { agent: frozenAgent, ...frozenExtensions } = saved;
       startedConfig = { ...frozenExtensions, ...preparedWithoutAgent, agent: frozenAgent } as SafeConfigSnapshot;
     }
@@ -591,11 +678,11 @@ export class RuntimeService {
     const stopBeforePrompt = this.agentStop(context);
     if (stopBeforePrompt) return this.finishAgent(context, null, errorForStop(stopBeforePrompt.reason, active.runId, 'agent'), true);
 
-    if (context.admission && !this.dependencies.tools) {
+    if (context.scope && !this.dependencies.tools) {
       return this.finishAgent(context, null, appError('tool_runtime_unavailable', 'runtime', 'P3 工具执行链尚未组装。', true, active.runId), true);
     }
-    const productContext = context.admission ? Object.freeze({ runId: active.runId, sessionId: request.sessionId,
-      scope: context.admission.scope }) : undefined;
+    const productContext = context.scope ? Object.freeze({ runId: active.runId, sessionId: request.sessionId,
+      scope: context.scope }) : undefined;
     const agentInput: AgentExecutionInput = {
       ...input,
       runId: active.runId,
@@ -611,6 +698,7 @@ export class RuntimeService {
         return ok(undefined);
       },
       ...(context.admission ? { workspaceInput: context.admission.workspaceInput, goalMode: request.goalMode ?? 'answer' as const } : {}),
+      ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}),
       ...(productContext && this.dependencies.tools ? { toolBinding: {
         context: productContext,
         observeRequest: (name, raw, call) => {
@@ -624,12 +712,12 @@ export class RuntimeService {
           return result.ok ? ok(undefined) : result;
         },
         recordDelivery: (nativeToolCallId, delivery) => this.dependencies.tools!.recordDelivery(productContext, nativeToolCallId, delivery),
-        execute: async (name, raw, call) => {
+        execute: async (name, input, call, rawArguments = input) => {
           const label = this.dependencies.tools!.listTools().find((tool) => tool.name === name)?.label ?? 'Working';
           context.emit({ type: 'tool_progress', toolName: name, label, phase: 'running' });
-          const result = await this.dependencies.tools!.execute(name, raw, {
+          const result = await this.dependencies.tools!.execute(name, input, {
             ...productContext, nativeToolCallId: call.nativeToolCallId, signal: call.signal,
-          });
+          }, rawArguments);
           context.emit({ type: 'tool_progress', toolName: name, label,
             phase: result.result.status === 'succeeded' ? 'succeeded' : result.result.status === 'cancelled' ? 'cancelled' : 'failed' });
           return result;
@@ -637,6 +725,10 @@ export class RuntimeService {
       } } : {}),
     };
     let nativeWork: Promise<AgentNativeOutcome>;
+    if (context.inputId !== undefined) {
+      const dispatched = this.dependencies.sessionInputs!.dispatch(active.runId, this.dependencies.now());
+      if (!dispatched.ok) return this.finishAgent(context, null, dispatched.error, true);
+    }
     try {
       nativeWork = Promise.resolve(prepared.execute(agentInput, active.controller.signal, (event) => {
         if (event.type === 'display_message' && !active.terminalCommitted) {
@@ -685,29 +777,58 @@ export class RuntimeService {
   ): Result<AgentOutcome> {
     const { active, request, session } = context;
     if (active.terminalCommitted) return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已开始提交。', false, active.runId), active.runId);
-    const toolExecutor = context.admission ? this.dependencies.tools : undefined;
+    const toolExecutor = context.scope ? this.dependencies.tools : undefined;
     toolExecutor?.closeRun(active.runId);
     const intent = this.agentStop(context);
-    const cleanupFailure = outcome?.cleanupErrors[0];
+    let cleanupFailure = outcome?.cleanupErrors[0];
     let finalError: AppError | null = cleanupFailure ? { ...cleanupFailure, runId: active.runId }
       : intent ? errorForStop(intent.reason, active.runId, 'agent')
         : error ? { ...error, runId: active.runId } : null;
+    let inputUnconfirmed = false;
+    if (context.inputId !== undefined) {
+      const input = this.dependencies.sessionInputs!.getForRun(active.runId);
+      if (!input.ok) finalError ??= { ...input.error, runId: active.runId };
+      else if (!input.data || input.data.status !== 'consumed') {
+        inputUnconfirmed = input.data?.dispatchedAt !== null;
+        finalError ??= appError('input_delivery_unknown', 'session', 'Fill input consumption could not be confirmed.', false, active.runId);
+      }
+    }
     if (!finalError && (!outcome || !stopped)) finalError = appError('agent_stop_unconfirmed', 'runtime', 'Agent 执行结束，但停止状态未确认。', true, active.runId);
     if (!finalError && outcome && (outcome.partial || outcome.stopReason !== 'stop' || !outcome.text.trim())) {
       finalError = appError('agent_incomplete_response', 'runtime', 'Agent 未产生完整的文本回复。', false, active.runId);
     }
     let candidateIds: number[] = [];
     let deliveredCandidateIds: number[] = [];
-    if (context.admission && toolExecutor) {
+    let formAppliedAndDelivered = false;
+    const toolCleanupErrors: AppError[] = [];
+    if (context.scope && toolExecutor) {
       const facts = toolExecutor.candidateFacts(active.runId);
       if (!facts.ok) finalError ??= appError('storage_read_failed', 'storage', 'Run 候选事实无法核验。', true, active.runId);
       else {
-        candidateIds = facts.data.candidateIds;
-        deliveredCandidateIds = facts.data.deliveredCandidateIds;
+        if (context.admission) {
+          candidateIds = facts.data.candidateIds;
+          deliveredCandidateIds = facts.data.deliveredCandidateIds;
+          const target = context.admission.formTarget;
+          const candidate = context.admission.workspaceContext.candidateRef;
+          formAppliedAndDelivered = !!target && !!candidate && facts.data.deliveredFormApplications.some(receipt =>
+            receipt.formInstanceId === target.formInstanceId && receipt.appliedRevision === target.expectedRevision + 1
+            && receipt.candidateId === candidate.id && receipt.candidateSequence === candidate.sequence);
+        }
+        toolCleanupErrors.push(...facts.data.cleanupErrors);
+        if (!facts.data.stopped) {
+          stopped = false;
+          unconfirmed = true;
+          cleanupFailure ??= appError('stop_not_confirmed', 'runtime', 'A native tool process has not confirmed termination.', true, active.runId);
+          finalError ??= cleanupFailure;
+        }
+        if (facts.data.cleanupErrors.length) {
+          cleanupFailure ??= facts.data.cleanupErrors[0];
+          finalError ??= cleanupFailure!;
+        }
       }
     }
     if (!finalError && outcome) {
-      const p3 = context.admission !== null;
+      const p3 = context.scope !== null;
       const validCounts = p3
         ? outcome.agent.turnCount >= 1 && outcome.agent.turnCount <= 12 && outcome.agent.modelCallCount >= 1 && outcome.agent.modelCallCount <= 12
         : outcome.agent.turnCount === 1 && outcome.agent.modelCallCount === 1;
@@ -719,11 +840,15 @@ export class RuntimeService {
     if (!finalError && context.admission && request.goalMode === 'save-candidate' && deliveredCandidateIds.length === 0) {
       finalError = appError('agent_goal_not_met', 'runtime', '候选未在模型后续请求中成功回送，保存目标未完成。', false, active.runId);
     }
+    if (!finalError && request.goalMode === 'fill-form' && !formAppliedAndDelivered) {
+      finalError = appError('agent_goal_not_met', 'runtime', '表单应用及结果进入后续模型请求未确认，录入目标未完成。', false, active.runId);
+    }
     const status: AgentOutcome['status'] = cleanupFailure ? 'failed'
       : intent ? intent.reason === 'user' && stopped ? 'cancelled' : 'failed'
         : finalError ? 'failed' : 'completed';
     const cleanupErrors = new Map<string, AppError>();
     for (const cleanupError of outcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
+    for (const cleanupError of toolCleanupErrors) cleanupErrors.set(cleanupError.code, cleanupError);
     if (active.storageError) cleanupErrors.set(active.storageError.code, active.storageError);
     if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true, active.runId));
     const cleanup: CleanupRecord = {
@@ -741,7 +866,7 @@ export class RuntimeService {
     const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
     const terminal: TerminalWrite = {
       status,
-      nativeHistoryUnusable: unconfirmed || !stopped || this.dependencies.agent?.inspect(session.nativeSessionId).availability === 'unusable',
+      nativeHistoryUnusable: inputUnconfirmed || unconfirmed || !stopped || this.dependencies.agent?.inspect(session.nativeSessionId).availability === 'unusable',
       output,
       error: finalError,
       usage,

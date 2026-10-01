@@ -1,6 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, ProductSettings, RunSnapshot, SessionCursor, SessionMessageView, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
-import { applyMessageUpsert, mergeSavedHistory, type MessageViewState } from './message-state.ts';
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type ReactNode } from 'react';
+import { InvoiceFormBridgeRequestSchema, StoredCandidateDraftSchema } from '../../../../packages/contracts/src/invoice.ts';
+import type { DesktopInvoiceFormRunRequest, InvoiceCandidateOperationQuery, InvoiceFormApplicationReceipt, InvoiceFormDraft, SaveInvoiceCandidateResponse } from '@flowmate/contracts';
+import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoiceFormState, editInvoiceForm, invalidateInvoiceForm,
+  invoiceHeaderFields, invoiceLineFields, queryInvoiceFormApplication, type InvoiceFormState } from './invoice-form.ts';
+import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, NativeToolAvailability, ProductSettings, RunSnapshot, RuntimeState, SessionCursor, SessionMessageView, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
+import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type MessageViewState } from './message-state.ts';
 
 type Page = 'workspace' | 'tasks' | 'chats' | 'models' | 'settings';
 const pageLabels: Record<Page, string> = {
@@ -49,9 +53,20 @@ function errorMessage(value: unknown): string {
   return 'The operation could not be completed.';
 }
 
+function runtimeMessage(state: RuntimeState | null, readFailed: boolean, hostReady: boolean): string {
+  if (!hostReady) return 'Runtime status is unavailable while the application Host is not ready.';
+  if (readFailed) return 'Runtime status could not be confirmed. New requests are blocked. Check status again.';
+  if (!state) return 'Checking runtime status…';
+  if (state.blocked) return 'Runtime is blocked. A previous Run did not confirm stopping or saving. New requests are blocked.';
+  if (state.active) return `Runtime is still occupied by Run ${state.active.runId}. New requests are blocked.`;
+  return 'Runtime is ready for a new request.';
+}
+
 export function App() {
   const [page, setPage] = useState<Page>('workspace');
   const [state, setState] = useState<DesktopState | null>(null);
+  const [runtimeState, setRuntimeState] = useState<RuntimeState | null>(null);
+  const [runtimeReadFailed, setRuntimeReadFailed] = useState(false);
   const [draft, setDraft] = useState<ModelProfile>(blankModel);
   const [catalog, setCatalog] = useState<readonly ModelCatalogProvider[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -60,6 +75,9 @@ export function App() {
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [chatInput, setChatInput] = useState('');
+  const [workingDirectory, setWorkingDirectory] = useState('');
+  const [nativeTools, setNativeTools] = useState<readonly NativeToolAvailability[]>([]);
+  const [nativeToolsError, setNativeToolsError] = useState<string | null>(null);
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [messageState, setMessageState] = useState<MessageViewState | null>(null);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
@@ -79,6 +97,15 @@ export function App() {
   const [hidingDocumentId, setHidingDocumentId] = useState<number | null>(null);
   const [candidateSummaries, setCandidateSummaries] = useState<CandidateSummary[]>([]);
   const [candidateDetail, setCandidateDetail] = useState<CandidateJobDetail | null>(null);
+  const [invoiceForm, setInvoiceForm] = useState<InvoiceFormState | null>(null);
+  const [formFeedback, setFormFeedback] = useState('');
+  const [formPreparing, setFormPreparing] = useState(false);
+  const [formLeavePrompt, setFormLeavePrompt] = useState(false);
+  const [formSubmitting, setFormSubmitting] = useState(false);
+  const [formOutcomeUnknown, setFormOutcomeUnknown] = useState(false);
+  const [humanOperationUnknown, setHumanOperationUnknown] = useState(false);
+  const [rejectPrompt, setRejectPrompt] = useState(false);
+  const [rejectReason, setRejectReason] = useState('');
   const [activity, setActivity] = useState<BusinessEventSnapshot[]>([]);
   const [parsedPage, setParsedPage] = useState<InvoiceToolOutput<'read_invoice_document'> | null>(null);
   const [originalImage, setOriginalImage] = useState<DocumentOriginalImage | null>(null);
@@ -132,6 +159,7 @@ export function App() {
   const agentStopRequested = useRef(false);
   const selectedSessionIdRef = useRef<number | null>(null);
   const workspaceRef = useRef<WorkspaceSnapshot | null>(null);
+  const workspaceChanges = useRef<Promise<void>>(Promise.resolve());
   const sessionCursorRef = useRef<SessionCursor | null>(null);
   const sessionLoadSequence = useRef(0);
   const allowInitialSessionSelection = useRef(true);
@@ -142,6 +170,284 @@ export function App() {
   const chatTranscriptRef = useRef<HTMLDivElement | null>(null);
   const assistantWasToggled = useRef(false);
   const revisionLoaded = useRef<number | null>(null);
+  const runtimeQuerySequence = useRef(0);
+  const hostStateSequence = useRef(0);
+  const settingsRevision = useRef(-1);
+  const hostReadyRef = useRef(false);
+  const invoiceFormRef = useRef<InvoiceFormState | null>(null);
+  const pendingFill = useRef<DesktopInvoiceFormRunRequest | null>(null);
+  const formLastCall = useRef<{ runId: number; toolCallId: number } | null>(null);
+  const formLeaveResolve = useRef<((leave: boolean) => void) | null>(null);
+  const candidateQuerySequence = useRef(0);
+
+  function receiveDesktopState(next: DesktopState): boolean {
+    if (next.ready && next.settings.revision < settingsRevision.current) return false;
+    settingsRevision.current = Math.max(settingsRevision.current, next.settings.revision);
+    hostReadyRef.current = next.ready;
+    setState(current => current && next.settings.revision < current.settings.revision
+      ? { ...next, settings: current.settings, modelCredentials: current.modelCredentials } : next);
+    return true;
+  }
+  const formSubmittingRef = useRef(false);
+  const lastHumanOperation = useRef<InvoiceCandidateOperationQuery | null>(null);
+
+  function publishInvoiceForm(next: InvoiceFormState | null) {
+    invoiceFormRef.current = next;
+    setInvoiceForm(next);
+    if (next) void window.flowmate.setInvoiceFormDirty(next.formInstanceId, next.dirty, next.revision);
+  }
+
+  async function discardForm() {
+    const current = invoiceFormRef.current;
+    if (current) {
+      await window.flowmate.setInvoiceFormDirty(current.formInstanceId, false, current.revision);
+      await window.flowmate.invalidateInvoiceFormTarget(current.formInstanceId);
+    }
+    pendingFill.current = null;
+    formLastCall.current = null;
+    publishInvoiceForm(null);
+    setFormFeedback('');
+    setFormOutcomeUnknown(false);
+  }
+
+  async function confirmFormLeave(): Promise<boolean> {
+    if (!invoiceFormRef.current) return true;
+    if (formSubmittingRef.current) return false;
+    if (!invoiceFormRef.current?.dirty) { await discardForm(); return true; }
+    if (formLeaveResolve.current) return false;
+    setFormLeavePrompt(true);
+    return new Promise(resolve => { formLeaveResolve.current = resolve; });
+  }
+
+  async function resolveFormLeave(leave: boolean) {
+    if (leave) await discardForm();
+    const resolve = formLeaveResolve.current; formLeaveResolve.current = null;
+    setFormLeavePrompt(false); resolve?.(leave);
+  }
+
+  function setFormSubmission(value: boolean) { formSubmittingRef.current = value; setFormSubmitting(value); }
+
+  useEffect(() => {
+    const unsubscribe = window.flowmate.onInvoiceFormInspect((requestId, formInstanceId) => {
+      const form = invoiceFormRef.current;
+      if (!form || form.formInstanceId !== formInstanceId) { void window.flowmate.replyInvoiceFormInspect(requestId, null); return; }
+      setFormSubmission(true);
+      void window.flowmate.replyInvoiceFormInspect(requestId, { formInstanceId, revision: form.revision, dirty: form.dirty,
+        valid: form.valid, basis: structuredClone(form.basis), draft: structuredClone(form.draft) });
+    });
+    const finished = window.flowmate.onInvoiceFormInspectFinished(unknownOperation => {
+      setFormSubmission(false);
+      if (unknownOperation) {
+        lastHumanOperation.current = unknownOperation; setHumanOperationUnknown(true);
+        setFormFeedback('Close Save result is unknown. Check the original operation; your draft is retained.');
+      }
+    });
+    return () => { unsubscribe(); finished(); };
+  }, []);
+
+  useEffect(() => window.flowmate.onInvoiceFormRequest((requestId, raw) => {
+    const parsed = InvoiceFormBridgeRequestSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const request = parsed.data;
+    const stamp = new Date().toISOString();
+    const unknown: InvoiceFormApplicationReceipt = { runId: request.runId, toolCallId: request.toolCallId,
+      formInstanceId: request.target.formInstanceId, candidateId: request.candidateId,
+      candidateSequence: request.candidateSequence, outcome: 'unknown', observedAt: stamp };
+    let current = invoiceFormRef.current;
+    let receipt: InvoiceFormApplicationReceipt | null = unknown;
+    if (current?.formInstanceId === request.target.formInstanceId) {
+      // Main has verified the actual committed Run and the owning frame before forwarding.
+      if (request.operation === 'apply' && current.runId === null
+        && pendingFill.current?.target.formInstanceId === current.formInstanceId) {
+        const bound = bindInvoiceFormRun(current, request.runId);
+        if (bound) { current = bound; publishInvoiceForm(bound); trackFillRun(request.runId, request.sessionId); }
+      }
+      if (request.operation === 'query') receipt = queryInvoiceFormApplication(current, request, stamp);
+      else {
+        const result = applyInvoiceForm(current, request, stamp);
+        receipt = result.receipt; publishInvoiceForm(result.state);
+      }
+      formLastCall.current = { runId: request.runId, toolCallId: request.toolCallId };
+      showFormReceipt(receipt ?? unknown);
+    }
+    void window.flowmate.replyInvoiceFormRequest(requestId, receipt ?? unknown);
+  }), []);
+
+  function showFormReceipt(receipt: InvoiceFormApplicationReceipt) {
+    setFormOutcomeUnknown(receipt.outcome === 'unknown');
+    setFormFeedback(receipt.outcome === 'applied' ? 'Form draft applied; review before saving.'
+      : receipt.outcome === 'not_applied' ? `Form was not applied (${receipt.reason}). Review the form before trying again.`
+      : 'Fill result is unknown. Check the original status; do not repeat Fill.');
+  }
+
+  function trackFillRun(runId: number, sessionId: number) {
+    knownRunSessions.current.set(runId, sessionId);
+    if (latestAgentFinished.current.has(runId)) return;
+    activeAgentRunIdRef.current = runId; activeChatSessionId.current = sessionId;
+    setActiveAgentRunId(runId); setActiveAgentSessionId(sessionId); setRunId(runId); setBusy(true);
+  }
+
+  async function prepareInvoiceForm(purpose: 'fill' | 'edit', detail = candidateDetail): Promise<InvoiceFormState | null> {
+    const current = workspaceRef.current;
+    if (!current?.documentRef || !current.jobId || !current.candidateRef || !detail
+      || detail.candidate.candidateId !== current.candidateRef.id || detail.candidate.sequence !== current.candidateRef.sequence
+      || detail.documentRef.id !== current.documentRef.id || detail.documentRef.version !== current.documentRef.version) return null;
+    if (!await confirmFormLeave()) return null;
+    const expected = { revision: current.revision, sessionId: current.sessionId, documentRef: current.documentRef,
+      jobId: current.jobId, candidateRef: current.candidateRef };
+    const target = await window.flowmate.registerInvoiceFormTarget({ purpose, workspace: expected, formRevision: 0 });
+    if (!target.ok) { setNotice({ tone: 'bad', message: errorMessage(target) }); return null; }
+    if (workspaceRef.current?.revision !== current.revision || !hostReadyRef.current) {
+      await window.flowmate.invalidateInvoiceFormTarget(target.data.formInstanceId); return null;
+    }
+    const stored = StoredCandidateDraftSchema.safeParse({ fields: detail.candidate.fields, lines: detail.candidate.lines, notes: detail.candidate.notes });
+    if (!stored.success) return null;
+    const next = createInvoiceFormState({ formInstanceId: target.data.formInstanceId,
+      basis: { sessionId: current.sessionId, documentRef: current.documentRef, jobId: current.jobId,
+        candidateId: current.candidateRef.id, candidateSequence: current.candidateRef.sequence },
+      candidate: purpose === 'fill' ? null : stored.data, editable: true });
+    publishInvoiceForm(next); return next;
+  }
+
+  async function beginEditInvoiceForm() {
+    setFormPreparing(true);
+    try { if (await prepareInvoiceForm('edit')) setFormFeedback('Local draft ready. Changes are not saved until you save them.'); }
+    finally { setFormPreparing(false); }
+  }
+
+  async function fillInvoiceForm() {
+    if (!persistedModel || !modelReady || busy) return;
+    setFormPreparing(true);
+    try {
+      const next = await prepareInvoiceForm('fill');
+      const current = workspaceRef.current;
+      if (!next || !current?.sessionId) return;
+      const [session, ledger] = await Promise.all([window.flowmate.querySession(current.sessionId), window.flowmate.querySessionInput({ sessionId: current.sessionId })]);
+      if (!session.ok || !ledger.ok || ledger.data.nextClientSequence === null) {
+        setFormFeedback('Fill input could not be confirmed. Check status before trying again.'); return;
+      }
+      nativeSessionIds.current.set(session.data.sessionId, session.data.nativeSessionId);
+      const input: DesktopInvoiceFormRunRequest = { target: { formInstanceId: next.formInstanceId, expectedRevision: next.revision },
+        clientSequence: ledger.data.nextClientSequence, modelId: persistedModel.id,
+        workspace: { revision: current.revision, sessionId: current.sessionId, documentRef: current.documentRef, jobId: current.jobId, candidateRef: current.candidateRef } };
+      pendingFill.current = input; setFormFeedback('Waiting for the Fill tool to apply the draft.');
+      const accepted = await window.flowmate.startInvoiceFormRun(input);
+      if (!accepted.ok) {
+        setFormOutcomeUnknown(accepted.error.code === 'operation_result_unknown');
+        setFormFeedback(accepted.error.code === 'operation_result_unknown' ? 'Fill input delivery is unknown. Check the original status; do not repeat Fill.' : errorMessage(accepted));
+        if (accepted.error.code !== 'operation_result_unknown') pendingFill.current = null;
+        void refreshRuntimeState(); return;
+      }
+      const form = invoiceFormRef.current;
+      if (form?.formInstanceId === input.target.formInstanceId && form.runId === null) {
+        const bound = bindInvoiceFormRun(form, accepted.data.runId); if (bound) publishInvoiceForm(bound);
+      }
+      trackFillRun(accepted.data.runId, accepted.data.sessionId); void refreshRuntimeState();
+    } finally { setFormPreparing(false); }
+  }
+
+  async function checkFillStatus() {
+    const call = formLastCall.current;
+    if (call) {
+      const receipt = await window.flowmate.queryInvoiceFormApplication(call);
+      if (receipt.ok) showFormReceipt(receipt.data); else setFormFeedback(errorMessage(receipt));
+    } else if (pendingFill.current) {
+      const input = pendingFill.current;
+      const result = await window.flowmate.querySessionInput({ sessionId: input.workspace.sessionId, clientSequence: input.clientSequence });
+      if (result.ok && result.data.input?.runId) {
+        const saved = result.data.input;
+        const form = invoiceFormRef.current;
+        if (form?.formInstanceId === input.target.formInstanceId && form.runId === null) {
+          const bound = bindInvoiceFormRun(form, saved.runId!); if (bound) publishInvoiceForm(bound);
+        }
+        const run = await window.flowmate.queryRun(saved.runId!);
+        if (run.ok && (run.data.status === 'created' || run.data.status === 'running')) trackFillRun(saved.runId!, saved.sessionId);
+        setFormFeedback(`Original Fill input is ${saved.status}. Its form application has not been confirmed. Processing ${saved.processingStatus}${run.ok ? `; Run ${run.data.status}` : ''}.`);
+        void refreshRuntimeState();
+      } else setFormFeedback(result.ok ? 'Original Fill input has no confirmed delivery. Do not repeat it automatically.' : errorMessage(result));
+    }
+  }
+
+  function changeInvoiceFormDraft(value: InvoiceFormDraft) {
+    if (formSubmittingRef.current) return;
+    const current = invoiceFormRef.current; if (!current) return;
+    const next = editInvoiceForm(current, value); if (next) publishInvoiceForm(next);
+  }
+
+  async function saveInvoiceResult(): Promise<boolean> {
+    const form = invoiceFormRef.current; const current = workspaceRef.current;
+    if (!form?.valid || !current || formSubmittingRef.current || humanOperationUnknown) return false;
+    const request = { operationRef: crypto.randomUUID(), jobId: form.basis.jobId, basedOnCandidateId: form.basis.candidateId,
+      expectedCandidateId: form.basis.candidateId, expectedRevision: current.revision, draft: structuredClone(form.draft) };
+    lastHumanOperation.current = { kind: 'save', request }; setFormSubmission(true);
+    try {
+      const result = await window.flowmate.saveInvoiceCandidate(request);
+      if (!result.ok) { setHumanOperationUnknown(result.error.code === 'operation_result_unknown'); setFormFeedback(errorMessage(result)); return false; }
+      await discardForm(); acceptWorkspace(result.data.workspace);
+      const detail = await window.flowmate.queryJobCandidate({ jobId: request.jobId, candidateId: result.data.candidate.candidateId });
+      if (detail.ok) { setCandidateDetail(detail.data); await prepareInvoiceForm('edit', detail.data); }
+      setFormFeedback('Result saved for review.'); await loadTaskDetails(request.jobId); await loadProductLists(); return true;
+    } finally { setFormSubmission(false); }
+  }
+
+  async function decideInvoiceResult(kind: 'accept' | 'reject', reason?: string) {
+    const form = invoiceFormRef.current; const current = workspaceRef.current;
+    if (!form?.valid || form.dirty || !current || formSubmittingRef.current || humanOperationUnknown) return;
+    if (kind === 'reject' && !reason?.trim()) { setRejectReason(''); setRejectPrompt(true); return; }
+    setRejectPrompt(false);
+    const base = { operationRef: crypto.randomUUID(), jobId: form.basis.jobId, candidateId: form.basis.candidateId,
+      expectedCandidateId: form.basis.candidateId, expectedRevision: current.revision };
+    const operation: InvoiceCandidateOperationQuery = kind === 'accept'
+      ? { kind, request: { ...base, dirty: false } } : { kind, request: { ...base, reason: reason!.trim() } };
+    lastHumanOperation.current = operation; setFormSubmission(true);
+    try {
+      const result = operation.kind === 'accept' ? await window.flowmate.acceptInvoiceCandidate(operation.request)
+        : await window.flowmate.rejectInvoiceCandidate(operation.request);
+      if (!result.ok) { setHumanOperationUnknown(result.error.code === 'operation_result_unknown'); setFormFeedback(errorMessage(result)); return; }
+      await discardForm(); acceptWorkspace(result.data.workspace);
+      const detail = await window.flowmate.queryJobCandidate({ jobId: base.jobId, candidateId: base.candidateId });
+      if (detail.ok) setCandidateDetail(detail.data);
+      setNotice({ tone: 'good', message: kind === 'accept' ? 'Result accepted.' : 'Result rejected.' });
+      await loadTaskDetails(base.jobId); await loadProductLists();
+    } finally { setFormSubmission(false); }
+  }
+
+  async function exportInvoiceResult(format: 'json' | 'csv' | 'markdown') {
+    const candidate = candidateDetail?.candidate; if (!candidate || candidate.status !== 'accepted') return;
+    const request = { operationRef: crypto.randomUUID(), candidateId: candidate.candidateId, format };
+    lastHumanOperation.current = { kind: 'export', request }; setFormSubmission(true);
+    try {
+      const result = await window.flowmate.exportInvoiceCandidate(request);
+      if (!result.ok) setHumanOperationUnknown(result.error.code === 'operation_result_unknown');
+      setNotice(result.ok ? { tone: 'good', message: `Export created: ${result.data.relativePath}` }
+        : { tone: 'bad', message: errorMessage(result) });
+    } finally { setFormSubmission(false); }
+  }
+
+  async function checkHumanOperation() {
+    const operation = lastHumanOperation.current; if (!operation || formSubmittingRef.current) return;
+    const result = await window.flowmate.queryInvoiceCandidateOperation(operation);
+    setNotice(result.ok ? { tone: 'info', message: result.data ? `Original ${operation.kind} operation confirmed.`
+      : 'Original operation has no confirmed commit. Your local draft is retained.' } : { tone: 'bad', message: errorMessage(result) });
+    if (result.ok && result.data) { setHumanOperationUnknown(false); await loadWorkspace(); await loadProductLists(); if (workspaceRef.current?.jobId) await loadTaskDetails(workspaceRef.current.jobId); }
+  }
+
+  async function refreshRuntimeState(): Promise<RuntimeState | null> {
+    const sequence = ++runtimeQuerySequence.current;
+    setRuntimeState(null);
+    setRuntimeReadFailed(false);
+    if (!hostReadyRef.current) return null;
+    try {
+      const result = await window.flowmate.queryRuntimeState();
+      if (sequence !== runtimeQuerySequence.current || !hostReadyRef.current) return null;
+      if (!result.ok) { setRuntimeReadFailed(true); return null; }
+      setRuntimeState(result.data);
+      return result.data;
+    } catch {
+      if (sequence === runtimeQuerySequence.current && hostReadyRef.current) setRuntimeReadFailed(true);
+      return null;
+    }
+  }
 
   function draftKey(sessionId: number | null): string { return sessionId === null ? 'new' : String(sessionId); }
 
@@ -151,14 +457,16 @@ export function App() {
     setChatInput(value);
   }
 
-  function navigate(next: Page) {
+  async function navigate(next: Page) {
+    if (next !== page && !await confirmFormLeave()) return;
     setPage(next);
     setNavOpen(false);
     const selectedJobId = historyJobId ?? workspace?.jobId;
     if (next === 'tasks' && selectedJobId) void loadTaskDetails(selectedJobId);
   }
 
-  function openChat(sessionId: number) {
+  async function openChat(sessionId: number) {
+    if (!await confirmFormLeave()) return;
     selectSession(sessionId, true);
     setNavOpen(false);
     if (window.innerWidth < 1080) setChatCollapsed(false);
@@ -180,6 +488,13 @@ export function App() {
 
   function acceptWorkspace(snapshot: WorkspaceSnapshot) {
     const previous = workspaceRef.current;
+    const form = invoiceFormRef.current;
+    if (form && (previous?.sessionId !== snapshot.sessionId || previous?.jobId !== snapshot.jobId
+      || previous?.candidateRef?.id !== snapshot.candidateRef?.id || previous?.documentRef?.id !== snapshot.documentRef?.id
+      || previous?.documentRef?.version !== snapshot.documentRef?.version)) {
+      void window.flowmate.invalidateInvoiceFormTarget(form.formInstanceId);
+      publishInvoiceForm(invalidateInvoiceForm(form));
+    }
     if (previous?.documentRef?.id !== snapshot.documentRef?.id || previous?.documentRef?.version !== snapshot.documentRef?.version) {
       setParsedPage(null);
       setOriginalImage(null);
@@ -215,17 +530,22 @@ export function App() {
   }
 
   async function changeWorkspace(change: WorkspaceChange) {
-    let current = workspaceRef.current;
-    if (!current) current = await loadWorkspace();
-    if (!current) return null;
-    const result = await window.flowmate.updateWorkspace({ expectedRevision: current.revision, change });
-    if (!result.ok) {
-      setNotice({ tone: 'bad', message: errorMessage(result) });
-      if (result.error.code === 'state_conflict') void loadWorkspace();
-      return null;
-    }
-    acceptWorkspace(result.data);
-    return result.data;
+    if (!await confirmFormLeave()) return null;
+    const update = workspaceChanges.current.then(async () => {
+      let current = workspaceRef.current;
+      if (!current) current = await loadWorkspace();
+      if (!current) return null;
+      const result = await window.flowmate.updateWorkspace({ expectedRevision: current.revision, change });
+      if (!result.ok) {
+        setNotice({ tone: 'bad', message: errorMessage(result) });
+        if (result.error.code === 'state_conflict') await loadWorkspace();
+        return null;
+      }
+      acceptWorkspace(result.data);
+      return result.data;
+    });
+    workspaceChanges.current = update.then(() => undefined, () => undefined);
+    return update;
   }
 
   async function loadProductOverview() {
@@ -242,6 +562,7 @@ export function App() {
   }
 
   async function importInvoice() {
+    if (!await confirmFormLeave()) return;
     const result = await window.flowmate.chooseAndImportInvoice();
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     if (!result.data) return;
@@ -264,6 +585,7 @@ export function App() {
   }
 
   async function startTask() {
+    if (!await confirmFormLeave()) return;
     let current = workspaceRef.current;
     if (!current?.documentRef) return;
     if (!current.sessionId) {
@@ -305,12 +627,16 @@ export function App() {
   }
 
   async function openCandidate(jobId: number, candidateId: number) {
+    if (candidateDetail?.candidate.candidateId !== candidateId && !await confirmFormLeave()) return;
+    const sequence = ++candidateQuerySequence.current;
     const result = await window.flowmate.queryJobCandidate({ jobId, candidateId });
+    if (sequence !== candidateQuerySequence.current) return;
     if (result.ok) setCandidateDetail(result.data);
     else setNotice({ tone: 'bad', message: errorMessage(result) });
   }
 
   async function selectCandidate(jobId: number, candidateId: number) {
+    if (!await confirmFormLeave()) return;
     const current = workspaceRef.current;
     if (!current) return;
     const result = await window.flowmate.selectCandidate({
@@ -327,6 +653,7 @@ export function App() {
   }
 
   async function openJob(jobId: number) {
+    if (!await confirmFormLeave()) return;
     const job = jobs.find((item) => item.jobId === jobId);
     if (!job) return;
     const document = await window.flowmate.queryDocument(job.documentRef.id);
@@ -342,6 +669,7 @@ export function App() {
   }
 
   async function hideProcessing(jobId: number) {
+    if (!await confirmFormLeave()) return;
     if (!window.confirm('Remove this item from Recent processing? Saved results and activity will remain available.')) return;
     const result = await window.flowmate.hideJob(jobId);
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
@@ -356,6 +684,7 @@ export function App() {
   }
 
   async function hideInvoice(documentId: number) {
+    if (!await confirmFormLeave()) return;
     if (hidingDocumentId !== null) return;
     const document = documents.find((item) => item.documentRef.id === documentId);
     if (!document || !window.confirm(`Remove “${document.displayName}” from All invoices? Processing history and saved results will remain. Related chats will become read only. Reimport this invoice to show it again.`)) return;
@@ -405,6 +734,8 @@ export function App() {
     }
     coordinator.inFlight = true;
     const selection = sessionLoadSequence.current;
+    const historyQuery = beforeEntryId !== undefined ? { beforeEntryId }
+      : { afterEntryId: [...(messageStates.current.get(sessionId)?.byEntryId.keys() ?? [])].at(-1) ?? null };
     setHistoryLoading(true);
     let failed = false;
     try {
@@ -435,14 +766,12 @@ export function App() {
         knownRunSessions.current.set(item.runId, sessionId);
         if (item.status === 'completed' || item.status === 'failed' || item.status === 'cancelled') closedRuns.add(item.runId);
       }
-      const merged = mergeSavedHistory({ ...base, closedRuns }, messagesResult.data);
+      const merged = mergeSavedHistory({ ...base, closedRuns }, messagesResult.data, historyQuery);
       publishMessages(merged.state);
       setSelectedSession(sessionResult.data);
       setHistoryError(merged.queryRequired ? 'Saved message facts conflict with the displayed history. Refresh history to verify it.' : null);
       failed = merged.queryRequired;
-      if (beforeEntryId !== undefined || !messageCursors.current.has(sessionId)) {
-        messageCursors.current.set(sessionId, messagesResult.data.nextBeforeEntryId);
-      }
+      messageCursors.current.set(sessionId, messagesResult.data.nextBeforeEntryId);
       setMessageCursor(messageCursors.current.get(sessionId) ?? null);
       setRunCursor(runsResult.data.nextBeforeRunId);
       if (sessionResult.data.historyState === 'legacy-read-only') {
@@ -467,7 +796,7 @@ export function App() {
     }
   }
 
-  function selectSession(sessionId: number, focusComposer = false) {
+  function selectSession(sessionId: number | null, focusComposer = false) {
     chatDrafts.current.set(draftKey(selectedSessionIdRef.current), chatInputRef.current);
     focusComposerWhenReady.current = focusComposer;
     selectedSessionIdRef.current = sessionId;
@@ -478,22 +807,26 @@ export function App() {
     setSelectedSession(null);
     setRunCursor(null);
     setChatTurns([]);
-    setMessageState(messageStates.current.get(sessionId) ?? null);
-    setMessageCursor(messageCursors.current.get(sessionId) ?? null);
+    setMessageState(sessionId === null ? null : messageStates.current.get(sessionId) ?? null);
+    setMessageCursor(sessionId === null ? null : messageCursors.current.get(sessionId) ?? null);
+    if (sessionId === null) setHistoryLoading(false);
     setHistoryError(null);
     setRunFeedbacks([]);
     setNotice(null);
-    if (workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
-    void loadSession(sessionId);
+    if (sessionId !== null) {
+      if (workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
+      void loadSession(sessionId);
+    }
   }
 
   async function createNewSession(preserveDraft = false): Promise<SessionSnapshot | null> {
+    if (!await confirmFormLeave()) return null;
     if (!state?.ready || sessionLoading || sessionMutating) return null;
     const priorDraft = chatInputRef.current;
-    chatDrafts.current.set(draftKey(selectedSessionIdRef.current), priorDraft);
     allowInitialSessionSelection.current = false;
-    if (!preserveDraft) { chatInputRef.current = ''; setChatInput(''); }
-    focusComposerWhenReady.current = true;
+    chatDrafts.current.set('new', preserveDraft ? priorDraft : '');
+    selectSession(null, true);
+    const pendingSelection = sessionLoadSequence.current;
     setSessionLoading(true);
     chatComposerRef.current?.focus();
     const created = await window.flowmate.createSession();
@@ -501,9 +834,15 @@ export function App() {
     if (!created.ok) { setNotice({ tone: 'bad', message: errorMessage(created) }); return null; }
     const session = created.data;
     nativeSessionIds.current.set(session.sessionId, session.nativeSessionId);
+    const createdDraft = chatDrafts.current.get('new') ?? '';
+    chatDrafts.current.set(draftKey(session.sessionId), createdDraft);
+    setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
+    if (selectedSessionIdRef.current !== null || sessionLoadSequence.current !== pendingSelection) {
+      void loadSessionList();
+      return session;
+    }
     sessionLoadSequence.current += 1;
-    chatInputRef.current = preserveDraft ? priorDraft : '';
-    chatDrafts.current.set(draftKey(session.sessionId), chatInputRef.current);
+    chatInputRef.current = createdDraft;
     setChatInput(chatInputRef.current);
     selectedSessionIdRef.current = session.sessionId;
     setSelectedSessionId(session.sessionId);
@@ -517,10 +856,22 @@ export function App() {
     setRunFeedbacks([]);
     setRunCursor(null);
     setNotice(null);
-    setSessions((current) => [session, ...current.filter((item) => item.sessionId !== session.sessionId)]);
     if (workspaceRef.current?.sessionId !== session.sessionId) await changeWorkspace({ kind: 'session', sessionId: session.sessionId });
     void loadSessionList();
     return session;
+  }
+
+  async function loadNativeTools() {
+    const result = await window.flowmate.queryNativeTools();
+    if (result.ok) { setNativeTools(result.data); setNativeToolsError(null); }
+    else setNativeToolsError(errorMessage(result));
+  }
+
+  async function chooseWorkingDirectory() {
+    const result = await window.flowmate.chooseWorkingDirectory();
+    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    if (result.data === null) return;
+    setWorkingDirectory(result.data);
   }
 
   async function renameSession(sessionId: number, title: string): Promise<boolean> {
@@ -565,7 +916,8 @@ export function App() {
     setSessionCursor(nextCursor);
     sessionCursorRef.current = nextCursor;
     chatDrafts.current.delete(draftKey(sessionId));
-    const next = wasSelected ? remaining.find((item) => item.status === 'active') ?? null : null;
+    const next = wasSelected ? remaining.find((item) => item.status === 'active' && item.availability === 'ready'
+      && item.historyState === 'recoverable' && !item.modelUseBlocked) ?? null : null;
     if (wasSelected) {
       sessionLoadSequence.current += 1;
       allowInitialSessionSelection.current = false;
@@ -626,15 +978,25 @@ export function App() {
   useEffect(() => {
     let alive = true;
     const refresh = async () => {
+      const hostSequence = hostStateSequence.current;
       const result = await window.flowmate.getState();
-      if (alive && result.ok) setState(result.data);
-      else if (alive) setNotice({ tone: 'bad', message: errorMessage(result) });
+      if (!alive || hostSequence !== hostStateSequence.current) return;
+      if (result.ok) {
+        if (receiveDesktopState(result.data)) void refreshRuntimeState();
+      }
+      else setNotice({ tone: 'bad', message: errorMessage(result) });
     };
     void refresh();
     const unsubscribe = window.flowmate.subscribe((event) => {
       if (!alive) return;
       if (event.type === 'host_state') {
-        setState(event.state);
+        if (!receiveDesktopState(event.state)) return;
+        hostStateSequence.current += 1;
+        runtimeQuerySequence.current += 1;
+        setRuntimeState(null);
+        setRuntimeReadFailed(false);
+        if (!event.state.ready && invoiceFormRef.current) publishInvoiceForm(invalidateInvoiceForm(invoiceFormRef.current));
+        if (event.state.ready) void refreshRuntimeState();
         return;
       }
       if (event.type === 'model_auth_notice' || event.type === 'model_auth_prompt') return;
@@ -665,6 +1027,7 @@ export function App() {
         setActiveAgentSessionId(event.sessionId);
         setBusy(true);
         if (event.phase === 'created' && selectedSessionIdRef.current === event.sessionId) {
+          void refreshRuntimeState();
           setRunId(event.runId);
           const turnId = activeChatTurnId.current;
           if (turnId) setChatTurns((turns) => turns.map((turn) => turn.id === turnId ? { ...turn, runId: event.runId } : turn));
@@ -694,6 +1057,7 @@ export function App() {
           || nativeSessionIds.current.get(event.sessionId) !== event.nativeSessionId
           || knownRunSessions.current.get(event.runId) !== event.sessionId) return;
         latestAgentFinished.current.set(event.runId, event);
+        void refreshRuntimeState();
         const prior = messageStates.current.get(event.sessionId) ?? emptyMessageState(event.sessionId);
         publishMessages({ ...prior, closedRuns: new Set([...prior.closedRuns, event.runId]) });
         if (selectedSessionIdRef.current === event.sessionId) {
@@ -721,10 +1085,12 @@ export function App() {
       if (event.type === 'provider_observation') {
         if (event.observation === 'run_created') {
           setRunId(event.runId);
+          void refreshRuntimeState();
         }
         return;
       }
       if (event.type === 'provider_finished') {
+        void refreshRuntimeState();
         latestFinished.current = event;
         setRunId(event.runId);
         if (activeRequestIdRef.current === event.requestId) {
@@ -736,11 +1102,12 @@ export function App() {
         void loadRun(event.runId);
       }
     });
-    return () => { alive = false; unsubscribe(); };
+    return () => { alive = false; hostReadyRef.current = false; hostStateSequence.current += 1; runtimeQuerySequence.current += 1; unsubscribe(); };
   }, []);
 
   useEffect(() => {
     if (state?.ready) {
+      void loadNativeTools();
       void loadWorkspace().then((snapshot) => {
         if (!snapshot) return;
         void loadSessionList();
@@ -796,10 +1163,14 @@ export function App() {
   const modelReady = Boolean(state?.ready && persistedModel && isDraftSaved && persistedModel.kind !== 'legacy'
     && credentialStatus === 'configured'
     && (persistedModel.kind !== 'catalog' || selectedCatalogProvider?.authMethods.includes('api_key')));
-  const canTest = Boolean(modelReady && !busy && !saving);
+  const runtimeReady = Boolean(state?.ready && runtimeState && !runtimeState.blocked && runtimeState.active === null);
+  const runtimeFeedback = runtimeMessage(runtimeState, runtimeReadFailed, Boolean(state?.ready));
+  const runtimeStatus = <div data-testid="runtime-feedback"><p role="status">{runtimeFeedback}</p>
+    <button className="text-button" onClick={() => void refreshRuntimeState()} disabled={!state?.ready || busy}>Check runtime status</button></div>;
+  const canTest = Boolean(modelReady && runtimeReady && !busy && !saving);
   const inputEnabled = true;
   const selectedForSend = selectedSession ?? sessions.find((item) => item.sessionId === selectedSessionId) ?? null;
-  const canChat = Boolean(modelReady && !busy && !sessionLoading && !sessionMutating && !historyLoading && !historyError
+  const canChat = Boolean(modelReady && runtimeReady && !busy && !sessionLoading && !sessionMutating && !historyLoading && !historyError
     && (selectedSessionId === null || selectedForSend?.availability === 'ready' && !selectedForSend.modelUseBlocked
       && selectedForSend.historyState === 'recoverable')
     && (goalMode !== 'save-candidate' || (workspace?.documentRef && workspace.jobId)));
@@ -861,8 +1232,9 @@ export function App() {
     const result = await window.flowmate.logoutModel(persistedModel.id);
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     setApiKey('');
+    const hostSequence = hostStateSequence.current;
     const refreshed = await window.flowmate.getState();
-    if (refreshed.ok) setState(refreshed.data);
+    if (refreshed.ok && hostSequence === hostStateSequence.current) receiveDesktopState(refreshed.data);
     setNotice({ tone: 'good', message: 'API key removed. Add a key before testing or sending.' });
   }
 
@@ -889,8 +1261,9 @@ export function App() {
       return;
     }
     setApiKey('');
+    const hostSequence = hostStateSequence.current;
     const refreshed = await window.flowmate.getState();
-    if (refreshed.ok) setState(refreshed.data);
+    if (refreshed.ok && hostSequence === hostStateSequence.current) receiveDesktopState(refreshed.data);
     setNotice({ tone: 'good', message: 'Configuration saved. New runs will use this model profile.' });
   }
 
@@ -900,20 +1273,28 @@ export function App() {
     const result = await window.flowmate.saveSettings({ ...state.settings, profile: profileDraft });
     setSaving(false);
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+    const hostSequence = hostStateSequence.current;
     const refreshed = await window.flowmate.getState();
-    if (refreshed.ok) setState(refreshed.data);
+    if (refreshed.ok && hostSequence === hostStateSequence.current) receiveDesktopState(refreshed.data);
     setNotice({ tone: 'good', message: 'Profile preferences saved.' });
   }
 
   async function testConnection() {
     if (!canTest || !selectedModelId) return;
     setBusy(true);
+    const actualRuntime = await refreshRuntimeState();
+    if (!actualRuntime || actualRuntime.blocked || actualRuntime.active !== null) {
+      setBusy(false);
+      setNotice({ tone: 'bad', message: runtimeMessage(actualRuntime, !actualRuntime, hostReadyRef.current) });
+      return;
+    }
     setCancelPending(false);
     setRun(null);
     setRunId(null);
     setNotice({ tone: 'info', message: 'Sending a real Provider request. The request may incur usage charges.' });
     const accepted = await window.flowmate.callProvider({ goal: 'Verify this model connection.', text: 'Reply with OK.', modelId: selectedModelId });
     if (!accepted.ok) {
+      void refreshRuntimeState();
       setBusy(false);
       setNotice({ tone: 'bad', message: errorMessage(accepted) });
       return;
@@ -921,6 +1302,7 @@ export function App() {
     activeRequestIdRef.current = accepted.data.requestId;
     setActiveRequestId(accepted.data.requestId);
     setRunId(accepted.data.runId);
+    void refreshRuntimeState();
     const finished = latestFinished.current;
     if (finished?.requestId === accepted.data.requestId) {
       setBusy(false);
@@ -933,9 +1315,16 @@ export function App() {
 
   async function sendChatMessage(override?: { sessionId: number; prompt: string }) {
     const prompt = override?.prompt ?? chatInputRef.current.trim();
+    const directory = workingDirectory;
     const model = persistedModel;
     if ((!canChat && !override) || !modelReady || busy || !selectedModelId || !model || !prompt) return;
     setBusy(true);
+    const actualRuntime = await refreshRuntimeState();
+    if (!actualRuntime || actualRuntime.blocked || actualRuntime.active !== null) {
+      setBusy(false);
+      setNotice({ tone: 'bad', message: runtimeMessage(actualRuntime, !actualRuntime, hostReadyRef.current) });
+      return;
+    }
     setNotice({ tone: 'info', message: 'Preparing your request…' });
     let sessionId = override?.sessionId ?? selectedSessionIdRef.current;
     if (sessionId === null) {
@@ -944,8 +1333,8 @@ export function App() {
       sessionId = created.sessionId;
     }
     let current = workspaceRef.current ?? await loadWorkspace();
-    if (current?.documentRef && current.sessionId !== sessionId) current = await changeWorkspace({ kind: 'session', sessionId });
-    if (workspaceRef.current?.documentRef && !current) { setBusy(false); return; }
+    if (current && current.sessionId !== sessionId) current = await changeWorkspace({ kind: 'session', sessionId });
+    if (!current) { setBusy(false); return; }
     const turnId = newId();
     const newTurn: ChatTurn = { id: turnId, sessionId, runId: null, prompt, response: null, error: null, status: 'sending' };
     activeChatTurnId.current = turnId;
@@ -955,7 +1344,7 @@ export function App() {
     setActiveRunModel({ id: model.id, name: model.name, model: model.model });
     chatDrafts.current.set(draftKey(sessionId), '');
     if (selectedSessionIdRef.current === sessionId) updateChatInput('');
-    setChatTurns((turns) => [...turns, newTurn]);
+    if (selectedSessionIdRef.current === sessionId) setChatTurns((turns) => [...turns, newTurn]);
     setBusy(true);
     setCancelPending(false);
     setNotice(null);
@@ -963,17 +1352,19 @@ export function App() {
       sessionId,
       text: prompt,
       modelId: model.id,
-      ...(current?.documentRef ? { workspace: {
+      workspace: {
         revision: current.revision,
         documentRef: current.documentRef,
         jobId: current.jobId,
         candidateRef: current.candidateRef,
         sessionId,
-      } } : {}),
+      },
       goalMode,
+      ...(directory ? { workingDirectory: directory } : {}),
       ...(goalMode === 'save-candidate' ? { timeoutMs: 120_000 } : {}),
     });
     if (!accepted.ok) {
+      void refreshRuntimeState();
       setChatTurns((turns) => turns.filter((turn) => turn.id !== turnId));
       const restoredDraft = chatDrafts.current.get(draftKey(sessionId));
       const nextDraft = restoredDraft ? `${prompt}\n\n${restoredDraft}` : prompt;
@@ -992,6 +1383,7 @@ export function App() {
       return;
     }
     if (goalMode === 'save-candidate') setGoalMode('answer');
+    void refreshRuntimeState();
     knownRunSessions.current.set(accepted.data.runId, sessionId);
     const finished = latestAgentFinished.current.get(accepted.data.runId);
     if (!finished) {
@@ -1006,6 +1398,7 @@ export function App() {
       }
     }
     setRunId(accepted.data.runId);
+    void loadRun(accepted.data.runId);
     setChatTurns((turns) => turns.map((turn) => turn.id === turnId
       ? { ...turn, runId: accepted.data.runId }
       : turn));
@@ -1027,7 +1420,7 @@ export function App() {
 
   async function newChatAndSend() {
     const prompt = chatInputRef.current.trim();
-    if (!prompt) return;
+    if (!prompt || !runtimeReady || busy) return;
     const created = await createNewSession(true);
     if (!created) return;
     await sendChatMessage({ sessionId: created.sessionId, prompt });
@@ -1035,6 +1428,7 @@ export function App() {
 
   function applyAgentFinish(event: Extract<AgentRunEvent, { type: 'run_finished' }>, turnId: string) {
     setChatTurns((turns) => turns.filter((turn) => turn.id !== turnId));
+    if (selectedSessionIdRef.current !== event.sessionId) return;
     if (!event.result.ok) {
       setRunFeedbacks((items) => [...items.filter((item) => item.runId !== event.runId),
         { runId: event.runId, status: 'failed', error: errorMessage(event.result) }]);
@@ -1060,6 +1454,7 @@ export function App() {
   }
 
   async function requestAgentCancellation(runId: number) {
+    if (invoiceFormRef.current?.runId === runId) publishInvoiceForm(cancelInvoiceFormRun(invoiceFormRef.current));
     setCancelPending(true);
     const result = await window.flowmate.cancelRun(runId);
     if (!result.ok) {
@@ -1101,13 +1496,31 @@ export function App() {
       defaultModelId: models[0]?.id ?? null,
     });
     if (!saved.ok) { setNotice({ tone: 'bad', message: errorMessage(saved) }); return; }
-    setState({ ...state, settings: saved.data });
+    const hostSequence = hostStateSequence.current;
+    const refreshed = await window.flowmate.getState();
+    if (refreshed.ok && hostSequence === hostStateSequence.current) receiveDesktopState(refreshed.data);
     setRun(null);
     setNotice({ tone: 'good', message: 'Model profile removed.' });
   }
 
   return (
     <div className={`desktop-shell theme-${profileDraft.theme} ${chatCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''}`}>
+      {rejectPrompt && <div role="dialog" aria-modal="true" aria-label="Reject invoice result"
+        style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,.45)', display: 'grid', placeItems: 'center' }}>
+        <section className="panel" style={{ maxWidth: 440, padding: 24 }}><h2>Reject invoice result</h2>
+          <label className="field"><span>Reason for rejection</span><textarea autoFocus value={rejectReason} maxLength={256}
+            onChange={event => setRejectReason(event.target.value)} /></label><div className="button-row">
+            <button className="secondary-button" onClick={() => setRejectPrompt(false)}>Cancel</button>
+            <button className="danger-action" disabled={!rejectReason.trim()} onClick={() => void decideInvoiceResult('reject', rejectReason)}>Reject result</button>
+          </div></section></div>}
+      {formLeavePrompt && <div role="dialog" aria-modal="true" aria-label="Unsaved invoice changes"
+        style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,.45)', display: 'grid', placeItems: 'center' }}>
+        <section className="panel" style={{ maxWidth: 440, padding: 24 }}><h2>Unsaved invoice changes</h2>
+          <p>Your manual changes are still in this local draft.</p><div className="button-row">
+            <button className="secondary-button" autoFocus disabled={formSubmitting} onClick={() => void resolveFormLeave(false)}>Continue editing</button>
+            <button className="secondary-button" disabled={formSubmitting || !invoiceForm?.valid} onClick={() => void saveInvoiceResult().then(saved => { if (saved) void resolveFormLeave(true); })}>Save result</button>
+            <button className="danger-action" onClick={() => void resolveFormLeave(true)}>Discard changes</button>
+          </div></section></div>}
       {navOpen && <button className="nav-scrim" aria-label="Close navigation" onClick={() => { setNavOpen(false); navToggleRef.current?.focus(); }} />}
       <aside className={`rail ${navOpen ? 'expanded' : ''}`} data-testid="workspace-sidebar"
         onKeyDown={(event) => { if (event.key === 'Escape' && navOpen) { setNavOpen(false); navToggleRef.current?.focus(); } }}>
@@ -1188,6 +1601,20 @@ export function App() {
             documents={documents}
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
+            onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)}
+            formControls={invoiceForm || candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId ? <>
+              {candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId && candidateDetail.candidate.status !== 'accepted' && <div className="button-row"><button className="secondary-button" disabled={!runtimeReady || !modelReady || busy || formPreparing || formSubmitting || formOutcomeUnknown || humanOperationUnknown || invoiceForm?.dirty || !workspace?.sessionId || candidateDetail.candidate.status !== 'generated'}
+                onClick={() => void fillInvoiceForm()}>Fill form</button>
+                <button className="secondary-button" disabled={!runtimeReady || busy || formPreparing || formSubmitting}
+                  onClick={() => void beginEditInvoiceForm()}>Edit result</button></div>}
+              {invoiceForm && <InvoiceFormEditor state={invoiceForm} feedback={formFeedback} disabled={!invoiceForm.valid || busy || formPreparing || formSubmitting}
+                onChange={changeInvoiceFormDraft} onDiscard={() => void discardForm()} onQuery={() => void checkFillStatus()}
+                canQuery={invoiceForm.runId !== null || pendingFill.current !== null} canDiscard={!busy && !formPreparing && !formSubmitting}
+                operationUnknown={humanOperationUnknown} onSave={() => void saveInvoiceResult()} onAccept={() => void decideInvoiceResult('accept')} onReject={() => void decideInvoiceResult('reject')} />}
+              {candidateDetail?.candidate.status === 'accepted' && <div className="button-row">{(['json', 'csv', 'markdown'] as const).map(format =>
+                <button key={format} className="secondary-button" disabled={formSubmitting || humanOperationUnknown} onClick={() => void exportInvoiceResult(format)}>Export {format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>)}</div>}
+              <button className="text-button" disabled={formSubmitting} onClick={() => void checkHumanOperation()}>Check original operation</button>
+            </> : null}
             taskGoal={taskGoal}
             parsedPage={parsedPage}
             originalImage={originalImage}
@@ -1222,6 +1649,12 @@ export function App() {
           />
         ) : page === 'chats' ? (
           <ChatsPage sessions={sessions} selectedSessionId={selectedSessionId} hasMore={sessionCursor !== null}
+            workingDirectory={workingDirectory} onChooseDirectory={() => void chooseWorkingDirectory()}
+            onClearDirectory={() => setWorkingDirectory('')} nativeTools={nativeTools} nativeToolsError={nativeToolsError}
+            onRefreshTools={() => void loadNativeTools()}
+            runDirectory={run?.kind === 'agent' && typeof run.config.workingDirectory === 'string'
+              ? { runId: run.runId, directory: run.config.workingDirectory } : null}
+            ready={Boolean(state?.ready && !sessionLoading && !sessionMutating)}
             mutating={sessionMutating} notice={notice} onSelect={openChat}
             onRename={renameSession} onDelete={deleteSession} onLoadMore={() => void loadMoreSessions()} />
         ) : (
@@ -1310,6 +1743,7 @@ export function App() {
                 <section className="model-subsection model-check" aria-labelledby="model-check-heading">
                   <h3 id="model-check-heading">Connection check</h3>
                   <p>Testing sends a real model request and may incur usage charges. Saving or opening this page does not send a request.</p>
+                  {runtimeStatus}
                   <p role="status">{busy ? 'Checking your model connection…' : isDraftSaved && run
                     ? run.status === 'completed' ? 'Connection succeeded. Your model is ready.'
                       : run.status === 'cancelled' ? 'Connection check stopped.' : 'Connection failed. Check the model and API key.'
@@ -1329,7 +1763,7 @@ export function App() {
             </section>}
             {page === 'settings' && <details className="panel diagnostics-panel"><summary>Diagnostics</summary>
               <div><p>Application: {state?.ready ? 'Ready' : 'Unavailable'}</p>
-                <p>Selected model: {persistedModel ? credentialStatus === 'configured' ? 'Ready to connect' : 'Credential needs attention' : 'No model selected'}</p></div>
+                <p>Selected model: {persistedModel ? credentialStatus === 'configured' ? 'Ready to connect' : 'Credential needs attention' : 'No model selected'}</p>{runtimeStatus}</div>
             </details>}
           </section>
         )}
@@ -1343,10 +1777,7 @@ export function App() {
         onNewChatAndSend={() => void newChatAndSend()}
         onLoadOlderRuns={() => void loadOlderRuns()}
         turns={chatTurns}
-        messages={messageState ? [...messageState.byEntryId.values(), ...[...messageState.liveByRun]
-          .filter(([runId]) => !messageState.closedRuns.has(runId)).flatMap(([, items]) => [...items.values()])]
-          .sort((left, right) => left.timestamp - right.timestamp
-            || (left.runId === right.runId ? (left.liveOrdinal ?? 0) - (right.liveOrdinal ?? 0) : 0)) : []}
+        messages={messageState ? messageViewsForDisplay(messageState) : []}
         unconfirmedCount={messageState ? [...messageState.liveByRun]
           .filter(([runId]) => messageState.closedRuns.has(runId)).reduce((total, [, items]) => total + items.size, 0) : 0}
         historyLoading={historyLoading}
@@ -1372,7 +1803,7 @@ export function App() {
         goalMode={goalMode}
         canGenerate={Boolean(workspace?.documentRef && workspace.jobId)}
         onGoalModeChange={setGoalMode}
-        sessionHint={!selectedSession ? selectedSessionId !== null ? 'Loading this chat. You can write while it loads.' : 'Write a message to start a new chat.'
+        sessionHint={!runtimeReady ? runtimeFeedback : !selectedSession ? selectedSessionId !== null ? 'Loading this chat. You can write while it loads.' : 'Write a message to start a new chat.'
           : selectedSession.historyState === 'legacy-read-only' ? 'This older conversation is read only. Start a new chat to continue.'
             : selectedSession.historyState === 'invalid' ? 'Saved conversation history is invalid. Start a new chat.'
             : selectedSession.modelUseBlocked ? 'Model access was revoked for this chat. Start a new chat to continue.'
@@ -1386,7 +1817,8 @@ export function App() {
   );
 }
 
-function ChatsPage({ sessions, selectedSessionId, hasMore, mutating, notice, onSelect, onRename, onDelete, onLoadMore }: {
+function ChatsPage({ sessions, selectedSessionId, hasMore, mutating, notice, onSelect, onRename, onDelete, onLoadMore,
+  workingDirectory, onChooseDirectory, onClearDirectory, nativeTools, nativeToolsError, onRefreshTools, runDirectory, ready }: {
   sessions: readonly SessionSnapshot[];
   selectedSessionId: number | null;
   hasMore: boolean;
@@ -1396,6 +1828,14 @@ function ChatsPage({ sessions, selectedSessionId, hasMore, mutating, notice, onS
   onRename(sessionId: number, title: string): Promise<boolean>;
   onDelete(sessionId: number): Promise<void>;
   onLoadMore(): void;
+  workingDirectory: string;
+  onChooseDirectory(): void;
+  onClearDirectory(): void;
+  nativeTools: readonly NativeToolAvailability[];
+  nativeToolsError: string | null;
+  onRefreshTools(): void;
+  runDirectory: { runId: number; directory: string } | null;
+  ready: boolean;
 }) {
   const [renamingId, setRenamingId] = useState<number | null>(null);
   const [renameTitle, setRenameTitle] = useState('');
@@ -1406,6 +1846,21 @@ function ChatsPage({ sessions, selectedSessionId, hasMore, mutating, notice, onS
   return <section className="page-content chats-page">
     <div className="page-heading"><div><h1>Chats</h1><p>Pick a conversation to continue in Assistant.</p></div></div>
     {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
+    <section className="panel run-tools-panel" aria-label="Run tools">
+      <div className="panel-head"><h2>Run tools</h2><button className="quiet-button" type="button" disabled={!ready} onClick={onRefreshTools}>Refresh tools</button></div>
+      <div className="form-grid">
+        <label className="field full"><span>Working directory</span><input value={workingDirectory} readOnly placeholder="Automatic · current Run directory" /></label>
+        <button className="secondary-button" type="button" disabled={!ready} onClick={onChooseDirectory}>Choose directory</button>
+        <button className="quiet-button" type="button" disabled={!workingDirectory} onClick={onClearDirectory}>Use Run directory</button>
+        <p className="full">Optional for your next Run. Changing this directory does not affect an active request. Send a message in Assistant to run; choosing a directory and refreshing tools do not execute anything.</p>
+        {runDirectory && <p className="full">Run {runDirectory.runId} working directory: <code>{runDirectory.directory}</code></p>}
+        <p className="full">The working directory resolves relative paths. SDK tools use your operating system account; it is not a sandbox or file access permission.</p>
+        <div className="field full native-tool-availability" aria-label="Native tool availability"><span>Tools on this device</span>
+          {nativeToolsError ? <p role="alert">{nativeToolsError}</p> : nativeTools.length === 0 ? <p>Checking tools…</p>
+            : <ul>{nativeTools.map((tool) => <li key={tool.name}><strong>{tool.name}</strong>: {tool.available ? 'Available' : tool.reason ?? 'Unavailable'}</li>)}</ul>}
+        </div>
+      </div>
+    </section>
     <section className="panel chat-directory">
       <div className="panel-head"><h2>Conversations</h2><span>{sessions.length} loaded</span></div>
       {sessions.length === 0 && <div className="empty-route"><strong>No chats yet</strong><span>Use New chat in the sidebar to start one.</span></div>}
@@ -1415,7 +1870,8 @@ function ChatsPage({ sessions, selectedSessionId, hasMore, mutating, notice, onS
           aria-current={session.sessionId === selectedSessionId ? 'true' : undefined}>
           <strong>{chatTitle(session.title)}</strong>
           <small>{session.historyState === 'legacy-read-only' ? 'Read only' : session.historyState === 'invalid' ? 'History unavailable'
-            : session.modelUseBlocked ? 'Access revoked' : session.availability === 'busy' ? 'Responding' : 'Ready'}
+            : session.modelUseBlocked ? 'Access revoked' : session.availability === 'ready' ? 'Ready'
+              : session.availability === 'busy' ? 'Responding' : session.availability === 'unusable' ? 'Cannot continue' : 'Unavailable'}
             {' · '}{new Date(session.updatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</small>
         </button>
         {renamingId === session.sessionId ? <form className="chat-directory-rename" onSubmit={async (event) => {
@@ -1449,6 +1905,8 @@ function WorkspacePage(props: {
   documents: readonly DocumentSnapshot[];
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
+  formControls: ReactNode;
+  onSelectCandidate(jobId: number, candidateId: number): void;
   taskGoal: string;
   parsedPage: InvoiceToolOutput<'read_invoice_document'> | null;
   originalImage: DocumentOriginalImage | null;
@@ -1504,7 +1962,10 @@ function WorkspacePage(props: {
       {workspace.activeView === 'candidate' && <div className="invoice-results">{candidates.length === 0
         ? <div className="empty-route"><strong>No results yet</strong><span>Choose Process this invoice, then send the request in Assistant.</span></div>
         : <div className="model-list">{candidates.map((item) => <button className="route-row" key={item.candidateId} onClick={() => workspace.jobId && props.onOpenCandidate(workspace.jobId, item.candidateId)}><span className="route-icon">✓</span><span className="route-name"><strong>Result {item.sequence}</strong><small>{item.issueCount ? `${item.issueCount} issues to review` : 'No issues found'} · {new Date(item.createdAt).toLocaleDateString()}</small></span></button>)}</div>}
-        {candidateDetail && <CandidateDetails detail={candidateDetail} />}</div>}
+        {candidateDetail && <><CandidateDetails detail={candidateDetail} />
+          {workspace.jobId && <button className="secondary-button" disabled={workspace.candidateRef?.id === candidateDetail.candidate.candidateId}
+            onClick={() => props.onSelectCandidate(workspace.jobId!, candidateDetail.candidate.candidateId)}>Select result</button>}
+          </>}{props.formControls}</div>}
     </section>}
 
     <section className="panel invoice-process">
@@ -1564,7 +2025,49 @@ function TasksPage(props: {
 
 function activityLabel(type: BusinessEventSnapshot['type']): string {
   return ({ document_imported: 'Invoice imported', task_started: 'Processing started',
-    candidate_generated: 'Result prepared', candidate_selected: 'Result selected' })[type];
+    candidate_generated: 'Result prepared', candidate_selected: 'Result selected', candidate_edited: 'Result edited',
+    candidate_accepted: 'Result accepted', candidate_rejected: 'Result rejected', candidate_exported: 'Result exported' })[type];
+}
+
+const invoiceFieldLabels: Record<typeof invoiceHeaderFields[number] | typeof invoiceLineFields[number], string> = {
+  invoiceNumber: 'Invoice number', issueDate: 'Issue date', sellerName: 'Seller name', sellerTaxId: 'Seller tax ID',
+  buyerName: 'Buyer name', buyerTaxId: 'Buyer tax ID', currency: 'Currency', netAmount: 'Net amount', taxAmount: 'Tax amount', totalAmount: 'Total amount',
+  description: 'Description', quantity: 'Quantity', unitPrice: 'Unit price', taxRate: 'Tax rate', unit: 'Unit',
+};
+
+function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, operationUnknown, onChange, onDiscard, onQuery, onSave, onAccept, onReject }: {
+  state: InvoiceFormState; feedback: string; disabled: boolean;
+  canQuery: boolean; canDiscard: boolean;
+  operationUnknown: boolean;
+  onChange(value: InvoiceFormDraft): void; onDiscard(): void; onQuery(): void;
+  onSave(): void; onAccept(): void; onReject(): void;
+}) {
+  return <section className="panel" aria-label="Invoice form"><div className="panel-head"><h2>Invoice form</h2>
+    <span>{state.dirty ? 'Unsaved changes' : 'Local draft'} · Revision {state.revision}</span></div>
+    {feedback && <p role="status">{feedback}</p>}
+    {!state.valid && <p role="alert">This form target is no longer valid. Your local draft is retained.</p>}
+    {state.warnings.length > 0 && <ul>{state.warnings.map(warning => <li key={warning.path}>{warning.path}: {warning.reason.replaceAll('_', ' ')}</li>)}</ul>}
+    <div className="profile-fields">{invoiceHeaderFields.map(name => <label className="field" key={name}><span>{invoiceFieldLabels[name]}</span>
+      <input aria-label={invoiceFieldLabels[name]} value={state.draft.fields[name]} maxLength={1024} disabled={disabled}
+        onChange={event => onChange({ ...state.draft, fields: { ...state.draft.fields, [name]: event.target.value } })} /></label>)}</div>
+    <h3>Line items</h3>{state.draft.lines.map((line, index) => <fieldset key={index} disabled={disabled}><legend>Line {index + 1}</legend>
+      <div className="profile-fields">{invoiceLineFields.map(name => <label className="field" key={name}><span>{invoiceFieldLabels[name]}</span>
+        <input aria-label={`Line ${index + 1} ${invoiceFieldLabels[name]}`} value={line[name]} maxLength={1024}
+          onChange={event => onChange({ ...state.draft, lines: state.draft.lines.map((value, position) => position === index ? { ...value, [name]: event.target.value } : value) })} /></label>)}</div>
+      <button className="text-button" onClick={() => onChange({ ...state.draft, lines: state.draft.lines.filter((_, position) => position !== index) })}>Remove line {index + 1}</button>
+    </fieldset>)}
+    <button className="text-button" disabled={disabled || state.draft.lines.length >= 200} onClick={() => onChange({ ...state.draft,
+      lines: [...state.draft.lines, Object.fromEntries(invoiceLineFields.map(name => [name, ''])) as InvoiceFormDraft['lines'][number]] })}>Add line</button>
+    <h3>Notes</h3>{state.draft.notes.map((note, index) => <label className="field" key={index}><span>Note {index + 1}</span>
+      <input value={note} maxLength={1024} disabled={disabled} onChange={event => onChange({ ...state.draft, notes: state.draft.notes.map((value, position) => position === index ? event.target.value : value) })} />
+      <button className="text-button" disabled={disabled} onClick={() => onChange({ ...state.draft, notes: state.draft.notes.filter((_, position) => position !== index) })}>Remove note {index + 1}</button></label>)}
+    <button className="text-button" disabled={disabled || state.draft.notes.length >= 20} onClick={() => onChange({ ...state.draft, notes: [...state.draft.notes, ''] })}>Add note</button>
+    <div className="button-row"><button className="secondary-button" onClick={onQuery} disabled={!canQuery}>Check Fill status</button>
+      <button className="secondary-button" onClick={onSave} disabled={disabled || operationUnknown}>Save result</button>
+      <button className="secondary-button" onClick={onAccept} disabled={disabled || state.dirty || operationUnknown}>Accept result</button>
+      <button className="secondary-button" onClick={onReject} disabled={disabled || state.dirty || operationUnknown}>Reject result</button>
+      <button className="danger-action" onClick={onDiscard} disabled={!canDiscard}>Discard changes</button></div>
+  </section>;
 }
 
 function CandidateDetails({ detail }: { detail: CandidateJobDetail }) {

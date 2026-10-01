@@ -3,9 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
 import { appError } from '@flowmate/contracts';
-import type { ToolCallDelivery } from '@flowmate/contracts';
+import type { InvoiceFormApplicationReceipt, P3AgentConfigFacts, Result, SafeConfigSnapshot, ToolCallDelivery, UsageRecord } from '@flowmate/contracts';
 import { deferCleanup } from '../../support/resources.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { createToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 
 function paths(root: string) {
   return { root, databaseFile: join(root, 'data', 'flowmate.sqlite'), logsDir: join(root, 'logs'),
@@ -43,6 +44,221 @@ function addRunningInvoiceJob(store: ReturnType<typeof makeStore>) {
 function missingField() {
   return { raw: null, normalized: null, state: 'missing' as const, alternatives: [], sources: [] };
 }
+
+function required<T>(result: Result<T>): T {
+  if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
+  return result.data;
+}
+
+function makeFormStore(started = true) {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-form-call-'));
+  const store = required(openDatabase(paths(root)));
+  deferCleanup(() => store.close());
+  const stamp = '2026-10-01T00:00:00.000Z';
+  const metadata = { version: 1 as const, sourceKey: 'synthetic', sourceRecordId: 'form-invoice', sourceVersion: 'v1',
+    files: [{ relativePath: 'fixture.json', bytes: 1, mimeType: 'application/json' }] };
+  required(store.documents.register({ documentId: 1, sourceKey: 'synthetic', sourceRecordId: 'form-invoice', version: 'v1',
+    originalArtifact: { artifactId: 1, kind: 'original', relativePath: 'artifacts/1/original.pdf', bytes: 1,
+      mimeType: 'application/pdf', metadata, createdAt: stamp },
+    parsedArtifact: { artifactId: 2, kind: 'parsed', relativePath: 'artifacts/2/parsed.json', bytes: 1,
+      mimeType: 'application/json', metadata, createdAt: stamp },
+    status: 'available', metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'],
+      licenseVerification: 'not_verified', unavailableReason: null }, createdAt: stamp, updatedAt: stamp }));
+  const session = required(store.sessions.create({ nativeSessionId: 'native-form-storage', title: 'Form storage', at: stamp }));
+  let workspace = required(store.workspace.read(stamp));
+  workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
+    change: { kind: 'session', sessionId: session.sessionId }, at: stamp }));
+  workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
+    change: { kind: 'document', documentId: 1 }, at: stamp }));
+  const task = required(store.jobs.create({ clientSequence: 1, expectedRevision: workspace.revision,
+    documentRef: { id: 1, version: 'v1' }, goal: 'Review form fixture', at: stamp }));
+  workspace = task.workspace;
+  const agent: P3AgentConfigFacts = { policyVersion: 'p3-invoice-tools-v1', nativeSessionId: session.nativeSessionId,
+    systemPrompt: 'Form storage fixture.', thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
+    maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12,
+    maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false };
+  const config: SafeConfigSnapshot & { agent: P3AgentConfigFacts } = { version: 1, name: 'fixture', revision: 1,
+    requestedModel: { provider: 'fixture', model: 'offline' }, resolvedModel: { provider: 'fixture', model: 'offline' },
+    api: null, endpoint: null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 },
+    limits: { timeoutMs: 60_000, stopGraceMs: 5_000 }, native: { authSource: 'unknown', modelsSelection: null }, agent };
+  const usage: UsageRecord = { version: 1, source: 'unknown', reason: 'form-storage-fixture', sdkValues: null,
+    attempts: null, attemptsComplete: false, costSource: null, updatedAt: stamp };
+  const cleanup = { version: 1 as const, stopped: false, stopReason: null, errors: [], lateObservationRequired: false };
+  const first = required(store.runs.createWorkspaceAgent({ sessionId: session.sessionId,
+    expected: { revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
+      candidateRef: workspace.candidateRef, sessionId: session.sessionId }, goalMode: 'save-candidate',
+    text: 'Save fixture candidate.', messageTimestamp: 1, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }));
+  const firstConfig = { ...config, goalMode: 'save-candidate' as const, workspaceContext: first.workspaceContext };
+  required(store.runs.start(first.runId, firstConfig, stamp));
+  const candidate = { fields: { invoiceNumber: missingField(), issueDate: missingField(), sellerName: missingField(),
+    sellerTaxId: missingField(), buyerName: missingField(), buyerTaxId: missingField(), currency: missingField(),
+    netAmount: missingField(), taxAmount: missingField(), totalAmount: missingField() }, lines: [], notes: [] };
+  const args = { documentId: 1, candidate };
+  const saveCall = required(store.toolCalls.request({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
+    toolName: 'save_invoice_candidate', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: args, requestedAt: stamp }));
+  required(store.toolCalls.fixArguments({ toolCallId: saveCall.toolCallId, finalArguments: args }));
+  required(store.toolCalls.start({ toolCallId: saveCall.toolCallId, startedAt: stamp }));
+  const saved = required(store.candidates.save({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
+    documentId: 1, candidate, checks: [], issues: [], at: stamp }));
+  required(store.toolCalls.finish({ toolCallId: saveCall.toolCallId,
+    result: { version: 1, committedCandidateId: saved.receipt.candidateId, status: 'succeeded', data: saved.receipt },
+    cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] }, endedAt: stamp, stoppedAt: stamp }));
+  required(store.runs.finish(first.runId, { status: 'completed', output: { version: 1, text: 'Saved.', partial: false,
+    stopReason: 'stop', responseId: null, responseModel: 'offline', agent: { nativeSessionId: session.nativeSessionId, turnCount: 1, modelCallCount: 1 } },
+    error: null, usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+    cleanup: { ...cleanup, stopped: true, stopReason: 'native-stop' }, endedAt: stamp, stoppedAt: stamp, durationMs: 0 }));
+  const selected = required(store.workspace.selectCandidate({ jobId: task.job.jobId, candidateId: saved.receipt.candidateId,
+    expectedCandidateId: null, expectedRevision: workspace.revision, at: stamp })).workspace;
+  const target = { formInstanceId: 'form-storage-instance', expectedRevision: 4 };
+  // This trusted repository fixture exercises receipt persistence. It does not
+  // open a public fill mode or claim that SDK/Renderer application took place.
+  const form = required(store.runs.createWorkspaceAgent({ sessionId: session.sessionId,
+    expected: { revision: selected.revision, documentRef: selected.documentRef, jobId: selected.jobId,
+    candidateRef: selected.candidateRef, sessionId: session.sessionId }, goalMode: 'fill-form', formTarget: target,
+    text: 'Store a trusted form receipt.', messageTimestamp: 2, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }));
+  const frozenConfig = { ...config, goalMode: 'fill-form' as const, workspaceContext: form.workspaceContext, formTarget: target };
+  required(store.runs.start(form.runId, frozenConfig, stamp));
+  const call = required(store.toolCalls.request({ runId: form.runId, sessionId: session.sessionId, nativeToolCallId: 'fill-storage-1',
+    toolName: 'fill_invoice_form', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: { candidateId: saved.receipt.candidateId }, requestedAt: stamp }));
+  required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: { candidateId: saved.receipt.candidateId } }));
+  if (started) required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: stamp }));
+  const unknown: InvoiceFormApplicationReceipt = { runId: form.runId, toolCallId: call.toolCallId, formInstanceId: target.formInstanceId,
+    candidateId: saved.receipt.candidateId, candidateSequence: saved.receipt.sequence, observedAt: stamp, outcome: 'unknown' };
+  const applied: InvoiceFormApplicationReceipt = { ...unknown, outcome: 'applied', appliedRevision: target.expectedRevision + 1, appliedAt: stamp };
+  return { ...store, root, stamp, runId: form.runId, sessionId: session.sessionId, jobId: task.job.jobId, toolCallId: call.toolCallId, unknown, applied,
+    recorder: createToolRecorder(store.toolCalls, () => stamp) };
+}
+
+describe('ToolCall form application facts', () => {
+  it('derives the fixed apply request from the original call rather than the current Workspace or candidate lifecycle', () => {
+    const store = makeFormStore();
+    const expected = { operation: 'apply', runId: store.runId, sessionId: store.sessionId, toolCallId: store.toolCallId,
+      nativeToolCallId: 'fill-storage-1', documentRef: { id: 1, version: 'v1' }, jobId: store.jobId,
+      candidateId: store.applied.candidateId, candidateSequence: store.applied.candidateSequence,
+      target: { formInstanceId: store.applied.formInstanceId, expectedRevision: 4 } };
+    const first = required(store.toolCalls.readFormApplicationRequest(store.toolCallId));
+    expect(first).toMatchObject(expected);
+    expect(first.candidate.fields.invoiceNumber.state).toBe('missing');
+    const workspace = required(store.workspace.read(store.stamp));
+    required(store.workspace.update({ expectedRevision: workspace.revision, change: { kind: 'document', documentId: null }, at: store.stamp }));
+    store.db.query("UPDATE invoice_candidates SET status='accepted',accepted_at=? WHERE id=?")
+      .run(store.stamp, store.applied.candidateId);
+    expect(store.toolCalls.readFormApplicationRequest(store.toolCallId)).toEqual({ ok: true, data: first });
+    const saveCall = required(store.toolCalls.list({ runId: store.runId - 1, limit: 10 })).items[0]!;
+    expect(store.toolCalls.readFormApplicationRequest(saveCall.toolCallId))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  });
+
+  it('persists a pending observation without inventing a terminal result and merges it at finish', () => {
+    const store = makeFormStore();
+    const before = required(store.toolCalls.getById(store.toolCallId));
+    expect(store.recorder.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.unknown }))
+      .toMatchObject({ ok: true, data: { status: 'running', result: null, formApplication: store.unknown } });
+    expect(store.db.query('SELECT result_json FROM tool_calls WHERE id=?').get(store.toolCallId)).toEqual({
+      result_json: JSON.stringify({ version: 1, formApplication: store.unknown }),
+    });
+    const core = { version: 1 as const, committedCandidateId: null, status: 'succeeded' as const,
+      data: { candidateId: store.applied.candidateId, candidateSequence: store.applied.candidateSequence, applied: true } };
+    const finish = { toolCallId: store.toolCallId, result: core,
+      cleanup: { version: 1 as const, stopReason: 'tool-completed', stopped: true, errors: [] }, endedAt: store.stamp, stoppedAt: store.stamp };
+    expect(store.toolCalls.finish(finish)).toMatchObject({ ok: true, data: { status: 'succeeded',
+      result: { ...core, formApplication: store.unknown }, formApplication: store.unknown, delivery: before.delivery } });
+    const completed = required(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.applied }));
+    expect(completed).toMatchObject({ status: 'succeeded', result: { ...core, formApplication: store.applied }, formApplication: store.applied });
+    expect(completed.cleanup).toEqual(finish.cleanup);
+    expect(completed.delivery).toEqual(before.delivery);
+    expect(store.toolCalls.finish(finish)).toEqual({ ok: true, data: completed });
+    expect(store.toolCalls.finish({ ...finish, result: { ...core, data: { ...core.data, candidateSequence: 2 } } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    const unrecognizedCoreField = { ...core, unexpected: 'must remain part of the core comparison' };
+    expect(store.toolCalls.finish({ ...finish, result: unrecognizedCoreField }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(store.toolCalls.finish({ ...finish, endedAt: '2026-10-01T00:00:01.000Z' }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  });
+
+  it('preserves applied evidence when receipt or terminal persistence fails', () => {
+    const store = makeFormStore();
+    required(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.unknown }));
+    const pending = store.db.query('SELECT * FROM tool_calls WHERE id=?').get(store.toolCallId);
+    store.db.exec("CREATE TRIGGER reject_required_form_save BEFORE UPDATE OF result_json ON tool_calls BEGIN SELECT RAISE(ABORT,'required receipt write failed'); END;");
+    expect(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.applied }))
+      .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(store.db.query('SELECT * FROM tool_calls WHERE id=?').get(store.toolCallId)).toEqual(pending);
+    store.db.exec('DROP TRIGGER reject_required_form_save;');
+    required(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.applied }));
+    const applied = store.db.query('SELECT * FROM tool_calls WHERE id=?').get(store.toolCallId);
+    store.db.exec("CREATE TRIGGER reject_form_terminal BEFORE UPDATE OF status ON tool_calls BEGIN SELECT RAISE(ABORT,'terminal write failed'); END;");
+    expect(store.recorder.finish({ toolCallId: store.toolCallId, status: 'succeeded',
+      data: { candidateId: store.applied.candidateId, candidateSequence: store.applied.candidateSequence, applied: true },
+      committedCandidateId: null, cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] }, stoppedAt: store.stamp }))
+      .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(store.db.query('SELECT * FROM tool_calls WHERE id=?').get(store.toolCallId)).toEqual(applied);
+    expect(store.toolCalls.getById(store.toolCallId)).toMatchObject({ ok: true, data: {
+      status: 'running', result: null, formApplication: store.applied,
+    } });
+  });
+
+  it('deduplicates verified observations and rejects conflicts or foreign identities without changing core facts', () => {
+    const store = makeFormStore();
+    const first = required(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.applied }));
+    const original = store.db.query('SELECT * FROM tool_calls WHERE id=?').get(store.toolCallId);
+    store.db.exec("CREATE TRIGGER reject_form_rewrite BEFORE UPDATE OF result_json ON tool_calls BEGIN SELECT RAISE(ABORT,'duplicate receipt write'); END;");
+    expect(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.applied })).toEqual({ ok: true, data: first });
+    for (const receipt of [store.unknown,
+      { ...store.applied, appliedAt: '2026-10-01T00:00:01.000Z' },
+      { ...store.applied, formInstanceId: 'foreign-instance' }, { ...store.applied, runId: store.runId + 1 },
+      { ...store.applied, toolCallId: store.toolCallId + 1 }, { ...store.applied, candidateSequence: 2 },
+      { ...store.applied, appliedRevision: 9 }]) {
+      expect(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt }))
+        .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      expect(store.db.query('SELECT * FROM tool_calls WHERE id=?').get(store.toolCallId)).toEqual(original);
+    }
+  });
+
+  it('rejects invalid receipt structure and unreadable persisted bindings at every ToolCall read', () => {
+    const store = makeFormStore();
+    expect(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId,
+      receipt: { ...store.unknown, unexpected: 'not allowed' } as InvoiceFormApplicationReceipt }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(required(store.toolCalls.getById(store.toolCallId))).not.toHaveProperty('formApplication');
+    const conflictingResult = JSON.stringify({ version: 1, committedCandidateId: null, status: 'succeeded', data: {}, formApplication: store.applied });
+    store.db.query("UPDATE tool_calls SET status='failed',ended_at=?,result_json=? WHERE id=?")
+      .run(store.stamp, conflictingResult, store.toolCallId);
+    expect(store.toolCalls.getById(store.toolCallId)).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    store.db.query("UPDATE tool_calls SET status='running',ended_at=NULL,result_json=NULL WHERE id=?").run(store.toolCallId);
+    const corrupted = JSON.stringify({ version: 1, formApplication: { ...store.applied, candidateSequence: 2 } });
+    store.db.query('UPDATE tool_calls SET result_json=? WHERE id=?').run(corrupted, store.toolCallId);
+    expect(store.toolCalls.getById(store.toolCallId)).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    expect(store.toolCalls.get({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'fill-storage-1' }))
+      .toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    expect(store.toolCalls.list({ runId: store.runId, limit: 10 })).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    expect(store.db.query('SELECT result_json FROM tool_calls WHERE id=?').get(store.toolCallId)).toEqual({ result_json: corrupted });
+  });
+
+  it('preserves a not-applied observation when rejecting a call before execution', () => {
+    const store = makeFormStore(false);
+    const receipt: InvoiceFormApplicationReceipt = { ...store.unknown, outcome: 'not_applied', reason: 'not_dispatched' };
+    required(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt }));
+    expect(store.recorder.reject({ toolCallId: store.toolCallId, error: appError('run_cancelled', 'runtime', 'Stopped before dispatch.') }))
+      .toMatchObject({ ok: true, data: { status: 'failed', result: { status: 'failed', formApplication: receipt }, formApplication: receipt } });
+  });
+
+  it.each(['pending', 'terminal'] as const)('preserves the %s receipt through interrupted-process recovery', (phase) => {
+    const store = makeFormStore();
+    required(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.applied }));
+    if (phase === 'terminal') required(store.recorder.finish({ toolCallId: store.toolCallId, status: 'succeeded',
+      data: { candidateId: store.applied.candidateId, candidateSequence: store.applied.candidateSequence, applied: true },
+      committedCandidateId: null, cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] }, stoppedAt: store.stamp }));
+    store.close();
+    const reopened = required(openDatabase(paths(store.root)));
+    deferCleanup(() => reopened.close());
+    expect(reopened.toolCalls.getById(store.toolCallId)).toMatchObject({ ok: true, data: {
+      status: phase === 'pending' ? 'failed' : 'succeeded', formApplication: store.applied,
+      result: { status: phase === 'pending' ? 'failed' : 'succeeded', formApplication: store.applied },
+    } });
+  });
+});
 
 describe('ToolCall and business event storage', () => {
   it.each(['message_observed', 'request_observed', 'failed', 'unknown'] as const)('does not write an equivalent repeated %s delivery observation', (state) => {

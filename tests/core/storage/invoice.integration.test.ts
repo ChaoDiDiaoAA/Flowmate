@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
+import type { CandidateDraft, InvoiceIssue, P3AgentConfigFacts, Result, SafeConfigSnapshot, UsageRecord, WorkspaceSnapshot } from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 
@@ -17,6 +18,127 @@ function makePaths(root: string) {
     runtimeDir: join(root, 'runtime'),
   };
 }
+
+function required<T>(result: Result<T>): T {
+  if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
+  return result.data;
+}
+
+describe('selected candidate Workspace admission', () => {
+  it('allows a caller transaction to roll back nested repository writes as one unit', () => {
+    const store = required(openDatabase(makePaths(mkdtempSync(join(tmpdir(), 'flowmate-repository-transaction-')))));
+    deferCleanup(() => store.close());
+    const operation = store.db.transaction(() => {
+      required(store.sessions.create({ nativeSessionId: 'nested-session', title: 'Nested', at: '2026-10-01T00:00:00.000Z' }));
+      throw new Error('outer-write-failed');
+    });
+    expect(() => operation.immediate()).toThrow('outer-write-failed');
+    expect(store.db.query('SELECT COUNT(*) AS count FROM sessions').get()).toEqual({ count: 0 });
+  });
+
+  it('freezes the candidate saved by a real tool after user selection into the next Run', () => {
+    const store = required(openDatabase(makePaths(mkdtempSync(join(tmpdir(), 'flowmate-candidate-admission-')))));
+    deferCleanup(() => store.close());
+    const stamp = '2026-10-01T00:00:00.000Z';
+    const artifactMetadata = { version: 1 as const, sourceKey: 'synthetic', sourceRecordId: 'selected-invoice', sourceVersion: 'v1',
+      files: [{ relativePath: 'fixture.json', bytes: 1, mimeType: 'application/json' }] };
+    required(store.documents.register({ documentId: 1, sourceKey: 'synthetic', sourceRecordId: 'selected-invoice', version: 'v1',
+      originalArtifact: { artifactId: 1, kind: 'original', relativePath: 'artifacts/1/original.pdf', bytes: 1,
+        mimeType: 'application/pdf', metadata: artifactMetadata, createdAt: stamp },
+      parsedArtifact: { artifactId: 2, kind: 'parsed', relativePath: 'artifacts/2/parsed.json', bytes: 1,
+        mimeType: 'application/json', metadata: artifactMetadata, createdAt: stamp },
+      status: 'available', metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'],
+        licenseVerification: 'not_verified', unavailableReason: null }, createdAt: stamp, updatedAt: stamp }));
+    const session = required(store.sessions.create({ nativeSessionId: 'native-candidate-admission', title: 'Selected candidate', at: stamp }));
+    let workspace = required(store.workspace.read(stamp));
+    workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
+      change: { kind: 'session', sessionId: session.sessionId }, at: stamp }));
+    workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
+      change: { kind: 'document', documentId: 1 }, at: stamp }));
+    const task = required(store.jobs.create({ clientSequence: 1, expectedRevision: workspace.revision,
+      documentRef: { id: 1, version: 'v1' }, goal: 'Review invoice totals', at: stamp }));
+    workspace = task.workspace;
+    const agent: P3AgentConfigFacts = { policyVersion: 'p3-invoice-tools-v1', nativeSessionId: session.nativeSessionId,
+      systemPrompt: 'Review the selected invoice.', thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
+      maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12,
+      maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false };
+    const config: SafeConfigSnapshot & { agent: P3AgentConfigFacts } = { version: 1, name: 'fixture', revision: 1,
+      requestedModel: { provider: 'fixture', model: 'offline' }, resolvedModel: { provider: 'fixture', model: 'offline' },
+      api: null, endpoint: null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 },
+      limits: { timeoutMs: 60_000, stopGraceMs: 5_000 }, native: { authSource: 'unknown', modelsSelection: null }, agent };
+    const usage: UsageRecord = { version: 1, source: 'unknown', reason: 'repository-fixture', sdkValues: null,
+      attempts: null, attemptsComplete: false, costSource: null, updatedAt: stamp };
+    const cleanup = { version: 1 as const, stopped: false, stopReason: null, errors: [], lateObservationRequired: false };
+    const expectation = (snapshot: WorkspaceSnapshot) => ({ revision: snapshot.revision, documentRef: snapshot.documentRef,
+      jobId: snapshot.jobId, candidateRef: snapshot.candidateRef, sessionId: session.sessionId });
+    const first = required(store.runs.createWorkspaceAgent({ sessionId: session.sessionId, expected: expectation(workspace),
+      goalMode: 'save-candidate', text: 'Save a review candidate.', messageTimestamp: 1, goal: task.job.goal, config,
+      usage, cleanup, createdAt: stamp }));
+    const frozenConfig = { ...config, goalMode: 'save-candidate' as const, workspaceContext: first.workspaceContext };
+    required(store.runs.start(first.runId, frozenConfig, stamp));
+    const missing = () => ({ raw: null, normalized: null, state: 'missing' as const, alternatives: [], sources: [] });
+    const candidate: CandidateDraft = { fields: { invoiceNumber: missing(), issueDate: missing(), sellerName: missing(),
+      sellerTaxId: missing(), buyerName: missing(), buyerTaxId: missing(), currency: missing(), netAmount: missing(),
+      taxAmount: missing(), totalAmount: { raw: '113.00', normalized: '113.00', state: 'present', alternatives: [],
+        sources: [{ documentId: 1, version: 'v1', artifactId: 2, page: 1, blockId: 'b1', quote: 'Total 113.00' }] } },
+      lines: [], notes: ['Saved through the authorized tool.'] };
+    const issues: InvoiceIssue[] = [{ code: 'missing_invoice_number', severity: 'warning', origin: 'model',
+      fieldPaths: ['/fields/invoiceNumber'], message: 'Invoice number was not present in the material.', rule: null }];
+    const argumentsValue = { documentId: 1, candidate };
+    const call = required(store.toolCalls.request({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-selected-1',
+      toolName: 'save_invoice_candidate', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: argumentsValue, requestedAt: stamp }));
+    required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: argumentsValue }));
+    required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: stamp }));
+    const saved = required(store.candidates.save({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-selected-1',
+      documentId: 1, candidate, checks: [], issues, at: stamp }));
+    required(store.toolCalls.finish({ toolCallId: call.toolCallId,
+      result: { version: 1, committedCandidateId: saved.receipt.candidateId, status: 'succeeded', data: saved.receipt },
+      cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] }, endedAt: stamp, stoppedAt: stamp }));
+    required(store.runs.finish(first.runId, { status: 'completed', output: { version: 1, text: 'Candidate saved.', partial: false,
+      stopReason: 'stop', responseId: null, responseModel: 'offline', agent: { nativeSessionId: session.nativeSessionId, turnCount: 1, modelCallCount: 1 } },
+      error: null, usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+      cleanup: { ...cleanup, stopped: true, stopReason: 'native-stop' }, endedAt: stamp, stoppedAt: stamp, durationMs: 0 }));
+    expect(store.runs.createWorkspaceAgent({ sessionId: session.sessionId, expected: expectation(workspace), goalMode: 'fill-form',
+      formTarget: { formInstanceId: 'not-selected', expectedRevision: 0 }, text: 'Fill.', messageTimestamp: 2,
+      goal: task.job.goal, config, usage, cleanup, createdAt: stamp }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    const selected = required(store.workspace.selectCandidate({ jobId: task.job.jobId, candidateId: saved.receipt.candidateId,
+      expectedCandidateId: null, expectedRevision: workspace.revision, at: stamp }));
+    const nextRequest = { sessionId: session.sessionId, expected: expectation(selected.workspace),
+      goalMode: 'answer' as const, text: 'Explain the selected total.', messageTimestamp: 2, goal: task.job.goal, config, usage, cleanup, createdAt: stamp };
+    const target = { formInstanceId: 'form-admission', expectedRevision: 0 };
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, formTarget: target }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form' }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: { ...target, expectedRevision: -1 } }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    const next = store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: target,
+      nativeTools: { runtimeDir: join(tmpdir(), 'form-admission-runtime'), allowedTools: ['bash', 'read'] } });
+
+    expect(next).toMatchObject({ ok: true, data: { jobId: task.job.jobId,
+      workspaceContext: { candidateRef: { id: saved.receipt.candidateId, sequence: saved.receipt.sequence } },
+      workspaceInput: { candidate: { id: saved.receipt.candidateId, sequence: saved.receipt.sequence,
+        fields: candidate.fields, lines: candidate.lines, issues } } } });
+    if (!next.ok) return;
+    expect(next.data.scope.allowedTools).toEqual(['fill_invoice_form']);
+    expect(next.data.formTarget).toEqual(target);
+    const persisted = required(store.runs.get(next.data.runId));
+    expect(persisted.config).toMatchObject({ goalMode: 'fill-form', formTarget: target });
+    expect(persisted.config).not.toHaveProperty('workingDirectory');
+    expect(next.data.workspaceContext).not.toHaveProperty('formTarget');
+    expect(next.data.workspaceInput).not.toHaveProperty('formTarget');
+    store.db.query("UPDATE invoice_candidates SET status='rejected' WHERE id=?").run(saved.receipt.candidateId);
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: target }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    store.db.query("UPDATE invoice_candidates SET status='generated' WHERE id=?").run(saved.receipt.candidateId);
+    expect(required(store.runs.get(next.data.runId)).input).toMatchObject({
+      workspaceInput: { candidate: { fields: candidate.fields, lines: candidate.lines, issues } },
+    });
+    expect(required(store.candidates.readByJob({ jobId: task.job.jobId, candidateId: saved.receipt.candidateId })))
+      .toMatchObject({ candidate: { fields: candidate.fields, notes: candidate.notes, issues } });
+  });
+});
 
 const legacyRunColumns = [
   'id', 'kind', 'session_id', 'scope_json', 'status', 'goal', 'input_json', 'config_json', 'output_json',
@@ -96,7 +218,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -159,7 +281,7 @@ describe('P3 invoice storage migration', () => {
     expect(after.query('PRAGMA foreign_key_check').all()).toEqual([]);
     after.close();
   });
-  it('migrates schema 2 through 8 without changing existing Provider, Agent, or Session facts', () => {
+  it('migrates schema 2 through 10 without changing existing Provider, Agent, or Session facts', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-migration-'));
     const paths = makePaths(root);
     createVersion2Database(paths);
@@ -173,7 +295,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -181,7 +303,7 @@ describe('P3 invoice storage migration', () => {
     expect(db.query('SELECT job_id FROM runs ORDER BY id').all()).toEqual([{ job_id: null }, { job_id: null }]);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
-      .toHaveLength(12);
+      .toHaveLength(13);
     expect(db.query('PRAGMA table_info(runs)').all()).toHaveLength(25);
     expect(db.query('SELECT metadata_json FROM sessions WHERE id=7').get()).toEqual({
       metadata_json: '{"version":1,"model_use_blocked":null}',
@@ -416,7 +538,7 @@ describe('P3 invoice storage migration', () => {
     const db = recovered.data.db;
     expect(db.query('SELECT status,error_json FROM runs WHERE id=50').get()).toMatchObject({ status: 'failed' });
     expect(db.query('SELECT status,result_json,stopped_at FROM tool_calls WHERE id=60').get()).toMatchObject({
-      status: 'failed', stopped_at: expect.any(String),
+      status: 'failed', stopped_at: null,
       result_json: expect.stringContaining('"committedCandidateId":70'),
     });
     expect(db.query('SELECT status,status_reason FROM jobs WHERE id=4').get()).toMatchObject({ status: 'failed' });

@@ -1,14 +1,14 @@
 import { resolve } from 'node:path';
-import { createFileStore, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, makeApplication,
+import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, makeApplication,
   RuntimeService, SessionService, openDatabase } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
-import { createInvoiceTools, projectInvoiceDocumentPage } from '@flowmate/employee-invoice';
+import { createInvoiceTools, fillInvoiceForm, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
-import { PiAgentAdapter, PiProviderAdapter } from '@flowmate/runtime-pi';
+import { PiAgentAdapter, PiProviderAdapter, createNativeTools } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
 import type { Application, ProductPaths, PromptTraceBuffer, Result } from '@flowmate/contracts';
-import type { AgentPort, ProviderPort, ToolDefinition } from '@flowmate/contracts';
+import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ProviderPort, ToolDefinition } from '@flowmate/contracts';
 import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
@@ -19,6 +19,7 @@ export type ApplicationOptions = {
   agentFactory?: (tools: readonly ToolDefinition<any, any>[]) => AgentPort;
   promptTrace?: PromptTraceBuffer;
   logger?: SafeLogger;
+  invoiceFormBridge?: (request: InvoiceFormBridgeRequest, signal: AbortSignal) => Promise<InvoiceFormApplicationReceipt>;
 };
 
 export async function createApplication(options: ApplicationOptions): Promise<Result<Application>> {
@@ -45,9 +46,18 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const documents = createDocumentService({ paths: options.paths,
     allowedSourceRoot: options.invoiceSourceRoot ?? resolve(process.cwd(), 'data', 'invoices', 'agent-input'),
     repository: database.data.documents, files, now });
-  const definitions = createInvoiceTools({ documents, documentRepository: database.data.documents,
-    candidates: database.data.candidates, now });
-  const toolExecutor = createToolExecutor({ definitions, recorder: createToolRecorder(database.data.toolCalls, now),
+  const invoiceEdits = createInvoiceEditService({ candidates: database.data.candidates, files,
+    validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, documents), now });
+  const native = createNativeTools({
+    getWorkingDirectory: context => database.data.toolCalls.getNativeWorkingDirectory(context),
+  });
+  const recorder = createToolRecorder(database.data.toolCalls, now);
+  const invoiceForms = options.invoiceFormBridge ? createInvoiceFormService({ recorder, runs: database.data.runs,
+    sessions: database.data.sessions, documents: database.data.documents, jobs: database.data.jobs,
+    workspace: database.data.workspace, candidates: database.data.candidates, bridge: options.invoiceFormBridge, now }) : undefined;
+  const definitions = Object.freeze([...createInvoiceTools({ documents, documentRepository: database.data.documents,
+    candidates: database.data.candidates, now }), ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), ...native.definitions]);
+  const toolExecutor = createToolExecutor({ definitions, recorder,
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
     monotonicNow: () => performance.now() });
   const provider = options.provider ?? new PiProviderAdapter();
@@ -55,15 +65,19 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     tools: definitions });
   const runtime = new RuntimeService({
     runs: database.data.runs,
+    recoveryError: database.data.recoveryError,
     sessions: database.data.sessions,
+    sessionInputs: database.data.sessionInputs,
     provider,
     agent,
     log: logger,
     now,
     monotonicNow: () => performance.now(),
     tools: toolExecutor,
+    nativeTools: { runtimeDir: options.paths.runtimeDir, availability: native.availability },
   });
-  const sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs);
+  const sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs,
+    database.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
   const workspaceService = createWorkspaceService(database.data.workspace, now);
   const jobService = createJobService(database.data.jobs, now);
   return ok(makeApplication(runtime, database.data.runs, async () => {
@@ -86,6 +100,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     jobs: database.data.jobs,
     candidates: database.data.candidates,
     events: database.data.businessEvents,
+    ...(invoiceForms ? { invoiceForms } : {}),
+    invoiceEdits,
     importInvoiceMaterial: (sourceDirectory) => documents.importVoxel51({ sourceDirectory }),
     hideDocument: (documentId) => database.data.documents.hide(documentId, now()),
     readDocumentPage: (input) => {
@@ -97,5 +113,5 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       return image.ok ? ok({ documentRef: image.data.documentRef, mimeType: image.data.mimeType,
         base64: Buffer.from(image.data.bytes).toString('base64') }) : image;
     },
-  }));
+  }, database.data.maxRunIdAtBoot));
 }

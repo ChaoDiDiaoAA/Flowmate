@@ -302,6 +302,7 @@ export type NativeHistoryAppendContext = NativeEntryRunBinding;
 export type NativeHistoryDisplayRecord = { history: NativeSessionHistory | null; bindings: NativeEntryRunBinding[] };
 export type MessageRunInput = {
   runId: DbId; input: Readonly<InputRecord>; goalMode: import('./workspace.ts').GoalMode | null;
+  workingDirectory?: string;
 };
 export type NativeMessageProjectionInput = {
   history: NativeSessionHistory; bindings: NativeEntryRunBinding[]; runInputs: MessageRunInput[];
@@ -389,6 +390,7 @@ export type AgentRunRequest = {
   config: ProviderConfig;
   workspace?: import('./workspace.ts').WorkspaceExpectation;
   goalMode?: import('./workspace.ts').GoalMode;
+  workingDirectory?: string;
   timeoutMs?: number;
   stopGraceMs?: number;
 };
@@ -398,7 +400,7 @@ export type NormalizedAgentRunRequest = Omit<AgentRunRequest, 'timeoutMs' | 'sto
   stopGraceMs: number;
 };
 
-export type RunAccepted = { runId: DbId; sessionId: DbId };
+export type RunAccepted = { runId: DbId; sessionId: DbId; inputId?: DbId };
 
 export type AgentOutcome = ProviderOutcome & { sessionId: DbId; nativeSessionId: string };
 
@@ -459,7 +461,7 @@ export type AgentRunSnapshot = RunSnapshotBase & {
   kind: 'agent';
   jobId: DbId | null;
   sessionId: DbId;
-  scope: ChatScope | import('./tools.ts').RunScope;
+  scope: ChatScope | import('./tools.ts').RunScope | import('./tools.ts').LegacyRunScope;
 };
 
 export type RunSnapshot = ProviderRunSnapshot | AgentRunSnapshot;
@@ -477,6 +479,7 @@ export interface Application {
   ): Promise<Result<ProviderOutcome>>;
   queryRun(runId: DbId): Promise<Result<RunSnapshot>>;
   createSession(request?: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
+  queryNativeTools(): Promise<Result<readonly import('./tools.ts').NativeToolAvailability[]>>;
   renameSession(request: RenameSessionRequest): Promise<Result<SessionSnapshot>>;
   deleteSession(sessionId: DbId): Promise<Result<DeleteSessionResult>>;
   listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
@@ -485,6 +488,14 @@ export interface Application {
   listSessionMessages(request: SessionMessagesRequest): Promise<Result<SessionMessagesPage>>;
   queryPromptTrace(runId: DbId, callSequence?: number): Promise<Result<import('./diagnostics.ts').PromptTraceResult>>;
   startRun(request: AgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
+  submitInput(request: import('./session-inputs.ts').SessionInputRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
+  querySessionInput(request: import('./session-inputs.ts').SessionInputQuery): Promise<Result<import('./session-inputs.ts').SessionInputQueryResult>>;
+  queryInvoiceFormApplication(request: { runId: DbId; toolCallId: DbId }): Promise<Result<import('./invoice.ts').InvoiceFormApplicationReceipt>>;
+  saveInvoiceCandidate(request: import('./invoice.ts').SaveInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').SaveInvoiceCandidateResponse>>;
+  acceptInvoiceCandidate(request: import('./invoice.ts').AcceptInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
+  rejectInvoiceCandidate(request: import('./invoice.ts').RejectInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
+  exportInvoiceCandidate(request: import('./invoice.ts').ExportInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceExportReference>>;
+  queryInvoiceCandidateOperation(request: import('./invoice.ts').InvoiceCandidateOperationQuery): Promise<Result<import('./invoice.ts').InvoiceCandidateOperationResult>>;
   readWorkspace(): Promise<Result<import('./workspace.ts').WorkspaceSnapshot>>;
   updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<Result<import('./workspace.ts').WorkspaceSnapshot>>;
   startTask(input: import('./workspace.ts').StartTaskRequest): Promise<Result<import('./workspace.ts').TaskOperation>>;

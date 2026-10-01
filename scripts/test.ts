@@ -23,8 +23,8 @@ const env: Record<string, string> = {};
 for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA']) {
   if (process.env[key]) env[key] = process.env[key]!;
 }
-async function run(args: string[]) {
-  const child = Bun.spawn([process.execPath, '--no-env-file', ...args], { cwd: root, env, stdout: 'inherit', stderr: 'inherit', stdin: 'inherit' });
+async function run(args: string[], executable = process.execPath) {
+  const child = Bun.spawn([executable, ...(executable === process.execPath ? ['--no-env-file'] : []), ...args], { cwd: root, env, stdout: 'inherit', stderr: 'inherit', stdin: 'inherit' });
   const code = await child.exited;
   if (code !== 0) process.exit(code || 1);
 }
@@ -34,5 +34,9 @@ for (const layer of selected === 'all' ? layers : [selected]) {
   const tests = discovered.filter(p => p.endsWith(`.${layer}.test.ts`));
   if (!tests.length) throw new Error(`No ${layer} tests found`);
   console.log(`${layer}: ${tests.length} test files`);
-  await run(['test', '--isolate', '--timeout', layer === 'e2e' ? '60000' : '15000', ...tests.map(p => './' + p)]);
+  if (layer === 'e2e') {
+    const node = Bun.which('node');
+    if (!node) throw new Error('Electron E2E requires the installed Node.js runtime.');
+    await run([require.resolve('@playwright/test/cli'), 'test', '--workers=1', '--reporter=line', ...tests], node);
+  } else await run(['test', '--isolate', '--timeout', '15000', ...tests.map(p => './' + p)]);
 }

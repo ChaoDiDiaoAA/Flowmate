@@ -241,7 +241,9 @@ describe('RuntimeService Agent lifecycle', () => {
     const accepted = await service.start(request, finished);
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
-    await finished.done.promise;
+    const terminalEvent = await finished.done.promise;
+    expect(terminalEvent).toMatchObject({ type: 'run_finished', result: { ok: false, runId: accepted.data.runId,
+      error: { code: 'storage_write_failed', runId: accepted.data.runId } } });
     expect(db.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'running', endedAt: null } });
     expect(service.state()).toMatchObject({ active: null, blocked: true, error: { code: 'runtime_unusable' } });
     expect(await service.start(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });

@@ -1,15 +1,17 @@
-import { Database } from 'bun:sqlite';
 import { _electron as electron, type Page } from 'playwright';
-import { expect, it } from 'bun:test';
+import { expect, test as it } from '@playwright/test';
+import { INVOICE_REVIEW_TOOL_NAMES as INVOICE_TOOL_NAMES, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtemp } from '../support/resources.ts';
+import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, mkdtemp, waitFor } from '../support/resources.ts';
 
-const electronPath = resolve(import.meta.dir, '../../node_modules/electron/dist/electron.exe');
+it.afterEach(cleanupResources);
+
+const electronPath = resolve(import.meta.dirname, '../../node_modules/electron/dist/electron.exe');
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64');
 
 function writeInvoiceSample(directory: string) {
@@ -134,6 +136,7 @@ async function capturePiModelViews(page: Page) {
 
 for (const action of ['last-window', 'quit', 'main-exit'] as const) {
   it(`desktop ${action} aborts an in-flight Provider and releases its storage`, async () => {
+    it.setTimeout(40_000);
     const userData = await mkdtemp(join(tmpdir(), `flowmate-desktop-${action}-`));
     let requests = 0;
     let markStarted!: () => void;
@@ -161,9 +164,10 @@ for (const action of ['last-window', 'quit', 'main-exit'] as const) {
     env.FLOWMATE_TEST_MODE = '1';
     env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
     let electronApp: Awaited<ReturnType<typeof electron.launch>> | null = null;
+    let failure: Error | undefined;
     try {
-      electronApp = await electron.launch({ executablePath: electronPath,
-        args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+      electronApp = await electron.launch({
+        args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
       const page = await electronApp.firstWindow();
       await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ state: 'visible', timeout: 20_000 });
       const saved = await page.evaluate(async (port) => {
@@ -190,6 +194,7 @@ for (const action of ['last-window', 'quit', 'main-exit'] as const) {
       if (action === 'quit') await electronApp.evaluate(({ app }) => { app.quit(); });
       if (action === 'main-exit') await electronApp.evaluate(() => { process.exit(0); }).catch(() => undefined);
       await Promise.all([exited, disconnected]);
+      electronApp = null;
       const databaseFile = join(userData, 'data', 'app.sqlite');
       for (let attempt = 0; existsSync(`${databaseFile}.lock`) && attempt < 200; attempt += 1) {
         await new Promise((resolveWait) => setTimeout(resolveWait, 25));
@@ -208,24 +213,25 @@ for (const action of ['last-window', 'quit', 'main-exit'] as const) {
         expect(db.query('SELECT count(*) AS count FROM runs').get()).toEqual({ count: 1 });
         expect(requests).toBe(1);
       } finally { db.close(); }
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+      throw failure;
     } finally {
-      if (electronApp) await electronApp.close().catch(() => undefined);
-      server.closeAllConnections();
-      server.close();
+      try { if (electronApp) await closeDesktopFixture(electronApp, userData, failure); }
+      finally { server.closeAllConnections(); await new Promise<void>(resolveClosed => server.close(() => resolveClosed())); }
     }
-  }, 40_000);
+  });
 }
 
 it('desktop sends directly, keeps drafts editable and restores native history after restart', async () => {
+  it.setTimeout(120_000);
   if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E requires Windows');
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-chat-e2e-'));
   const requestBodies: unknown[] = [];
   let releaseLiveText: (() => void) | null = null;
   let holdNextConnection = false;
   let connectionStarted: (() => void) | null = null;
-  const server = Bun.serve({
-    hostname: '127.0.0.1', port: 0,
-    async fetch(request) {
+  const server = await createHttpProvider(async request => {
       const body = await request.json();
       requestBodies.push(body);
       if (holdNextConnection) {
@@ -250,7 +256,6 @@ it('desktop sends directly, keeps drafts editable and restores native history af
         }), { headers: { 'content-type': 'text/event-stream' } });
       }
       return streamText('Desktop connection verified.');
-    },
   });
   const env: Record<string, string> = {};
   for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA']) {
@@ -259,9 +264,10 @@ it('desktop sends directly, keeps drafts editable and restores native history af
   env.FLOWMATE_TEST_MODE = '1';
   env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
   env.DEEPSEEK_API_KEY = 'synthetic-ambient-key';
-  const launch = () => electron.launch({ executablePath: electronPath,
-    args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+  const launch = () => electron.launch({
+    args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
   let electronApp: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
   try {
     electronApp = await launch();
     let page = await electronApp.firstWindow();
@@ -354,11 +360,28 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByRole('button', { name: 'Save changes' }).click();
     await page.getByText('write only', { exact: true }).waitFor({ state: 'visible' });
     expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
+    const olderSettings = await page.evaluate(async () => {
+      const result = await window.flowmate.getState();
+      if (!result.ok) throw new Error('older_settings_missing');
+      return result.data;
+    });
     await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
     await page.getByLabel(/API Key/).fill('synthetic-desktop-key');
     await page.getByRole('button', { name: 'Save changes' }).click();
     await page.getByText(/Configuration saved/).waitFor({ state: 'visible', timeout: 10_000 });
     expect(requestBodies).toHaveLength(0);
+    const latestSettings = await page.evaluate(async () => {
+      const result = await window.flowmate.getState();
+      if (!result.ok) throw new Error('latest_settings_missing');
+      return result.data;
+    });
+    expect(latestSettings.settings.revision).toBeGreaterThan(olderSettings.settings.revision);
+    await electronApp.evaluate(({ BrowserWindow }, state) => {
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state });
+    }, olderSettings);
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await expect(page.getByLabel(/Base URL/)).toHaveValue(`http://127.0.0.1:${server.port}/v1`);
+    await expect(page.getByRole('button', { name: 'Test connection' })).toBeEnabled();
 
     await composer.fill('Invoice total is 1060 CNY.');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
@@ -370,7 +393,8 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     expect(await page.locator('[data-message-role="assistant"]').count()).toBe(1);
     expect(await page.locator('[data-message-role="assistant"]').getByText('Saved', { exact: true }).count()).toBe(1);
     expect(requestBodies).toHaveLength(1);
-    expect((requestBodies[0] as { tools?: unknown[] }).tools ?? []).toHaveLength(0);
+    expect(((requestBodies[0] as { tools?: Array<{ function: { name: string } }> }).tools ?? []).map(tool => tool.function.name).sort())
+      .toEqual([...NATIVE_TOOL_NAMES, 'calculate_invoice_amounts', 'normalize_invoice_values'].sort());
     const firstSessionId = Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'));
     expect(firstSessionId).toBeGreaterThan(0);
     await composer.fill('What was the total?');
@@ -380,16 +404,127 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     expect(JSON.stringify(requestBodies[1])).toContain('Invoice total is 1060 CNY.');
     expect(JSON.stringify(requestBodies[1])).toContain('Desktop connection verified.');
 
+    await electronApp.evaluate(({ ipcMain }) => {
+      const gate = { channels: ['flowmate:create-session'], calls: 0, failCreateNext: true, release: null as (() => void) | null,
+        waiting: null as Promise<void> | null };
+      gate.waiting = new Promise<void>((resolveGate) => { gate.release = resolveGate; });
+      (globalThis as unknown as { sessionIpcGate: typeof gate }).sessionIpcGate = gate;
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      for (const channel of ['flowmate:create-session', 'flowmate:query-session', 'flowmate:list-session-runs', 'flowmate:list-session-messages']) {
+        const original = handlers.get(channel);
+        if (!original) throw new Error(`Missing Session IPC: ${channel}`);
+        ipcMain.removeHandler(channel);
+        ipcMain.handle(channel, async (event, ...args) => {
+          if (gate.channels.includes(channel)) { gate.calls += 1; await gate.waiting; }
+          if (channel === 'flowmate:create-session' && gate.failCreateNext) {
+            gate.failCreateNext = false;
+            return { ok: false, error: { code: 'storage_write_failed', category: 'storage', message: 'Controlled creation failure.', retryable: true } };
+          }
+          return original(event, ...args);
+        });
+      }
+    });
     await page.locator('.sidebar-new-chat').click();
+    await page.keyboard.type('Draft after creation failure.');
+    await electronApp.evaluate(() => (globalThis as unknown as { sessionIpcGate: { release: (() => void) | null } }).sessionIpcGate.release?.());
+    await page.getByText('Controlled creation failure.', { exact: true }).waitFor({ state: 'visible' });
+    expect(await page.locator('.sidebar-chat.selected').count()).toBe(0);
+    expect(await composer.inputValue()).toBe('Draft after creation failure.');
+    expect(requestBodies).toHaveLength(2);
+    await page.locator(`.sidebar-chat[data-session-id="${firstSessionId}"]`).click();
+    expect(await composer.inputValue()).toBe('');
+    await electronApp.evaluate(() => {
+      const gate = (globalThis as unknown as { sessionIpcGate: { calls: number; waiting: Promise<void> | null; release: (() => void) | null } }).sessionIpcGate;
+      gate.calls = 0;
+      gate.waiting = new Promise<void>((resolveGate) => { gate.release = resolveGate; });
+    });
+    await page.locator('.sidebar-new-chat').click();
+    expect(await composer.evaluate((element) => element === document.activeElement)).toBe(true);
+    await page.keyboard.type('Draft for second conversation.');
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2_000);
+    expect(await composer.inputValue()).toBe('Draft for second conversation.');
+    expect(requestBodies).toHaveLength(2);
+    await electronApp.evaluate(() => {
+      const gate = (globalThis as unknown as { sessionIpcGate: { channels: string[]; calls: number; release: (() => void) | null } }).sessionIpcGate;
+      if (gate.calls !== 1) throw new Error('New Session did not reach the held IPC');
+      gate.channels = [];
+      gate.release?.();
+    });
     await page.waitForFunction((firstId) => {
       const selected = document.querySelector('.sidebar-chat.selected')?.getAttribute('data-session-id');
       return selected !== null && Number(selected) !== firstId;
     }, firstSessionId, { timeout: 10_000 });
     const secondSessionId = Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'));
     expect(secondSessionId).not.toBe(firstSessionId);
-    await composer.fill('Draft for second conversation.');
+    expect(await composer.inputValue()).toBe('Draft for second conversation.');
+    await electronApp.evaluate(() => {
+      const gate = (globalThis as unknown as { sessionIpcGate: { channels: string[]; waiting: Promise<void> | null; release: (() => void) | null } }).sessionIpcGate;
+      gate.channels = ['flowmate:create-session'];
+      gate.waiting = new Promise<void>((resolveGate) => { gate.release = resolveGate; });
+    });
+    await page.locator('.sidebar-new-chat').click();
+    await page.keyboard.type('Draft for the pending conversation.');
     await page.locator(`.sidebar-chat[data-session-id="${firstSessionId}"]`).click();
-    await composer.fill('Draft for first conversation.');
+    expect(await composer.inputValue()).toBe('');
+    await electronApp.evaluate(() => {
+      const gate = (globalThis as unknown as { sessionIpcGate: { channels: string[]; release: (() => void) | null } }).sessionIpcGate;
+      gate.channels = [];
+      gate.release?.();
+    });
+    await page.waitForFunction(() => document.querySelectorAll('.sidebar-chat').length === 3);
+    expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(firstSessionId);
+    const pendingChatId = await page.locator('.sidebar-chat').evaluateAll((elements, existingIds) =>
+      elements.map((element) => Number(element.getAttribute('data-session-id'))).find((id) => !existingIds.includes(id))!,
+    [firstSessionId, secondSessionId]);
+    expect(pendingChatId).not.toBe(firstSessionId);
+    expect(pendingChatId).not.toBe(secondSessionId);
+    await page.locator(`.sidebar-chat[data-session-id="${pendingChatId}"]`).click();
+    expect(await composer.inputValue()).toBe('Draft for the pending conversation.');
+    await page.locator(`.sidebar-chat[data-session-id="${secondSessionId}"]`).click();
+    expect(await composer.inputValue()).toBe('Draft for second conversation.');
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats' }).click();
+    const deletePending = page.waitForEvent('dialog').then((dialog) => dialog.accept());
+    await page.locator(`.chat-directory-row[data-session-id="${pendingChatId}"]`).getByRole('button', { name: 'Delete' }).click();
+    await deletePending;
+    await page.locator(`.chat-directory-row[data-session-id="${pendingChatId}"]`).waitFor({ state: 'detached' });
+    expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(secondSessionId);
+    await electronApp.evaluate(() => {
+      const gate = (globalThis as unknown as { sessionIpcGate: { channels: string[]; waiting: Promise<void> | null; release: (() => void) | null } }).sessionIpcGate;
+      gate.channels = ['flowmate:query-session', 'flowmate:list-session-runs', 'flowmate:list-session-messages'];
+      gate.waiting = new Promise<void>((resolveGate) => { gate.release = resolveGate; });
+    });
+    await page.locator(`.sidebar-chat[data-session-id="${firstSessionId}"]`).click();
+    expect(await composer.evaluate((element) => element === document.activeElement)).toBe(true);
+    await page.keyboard.type('Draft for first conversation.');
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2_000);
+    expect(await composer.inputValue()).toBe('Draft for first conversation.');
+    expect(requestBodies).toHaveLength(2);
+    await page.locator('.sidebar-new-chat').click();
+    await page.keyboard.type('Draft while the previous history is loading.');
+    await page.waitForFunction((previousId) => {
+      const selected = document.querySelector('.sidebar-chat.selected')?.getAttribute('data-session-id');
+      return selected !== null && Number(selected) !== previousId;
+    }, firstSessionId);
+    const createdWhileLoadingId = Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'));
+    expect(await composer.inputValue()).toBe('Draft while the previous history is loading.');
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(false);
+    await electronApp.evaluate(() => {
+      const gate = (globalThis as unknown as { sessionIpcGate: { channels: string[]; release: (() => void) | null } }).sessionIpcGate;
+      gate.channels = [];
+      gate.release?.();
+    });
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats' }).click();
+    const deleteLoadingChat = page.waitForEvent('dialog').then((dialog) => dialog.accept());
+    await page.locator(`.chat-directory-row[data-session-id="${createdWhileLoadingId}"]`).getByRole('button', { name: 'Delete' }).click();
+    await deleteLoadingChat;
+    await page.locator(`.chat-directory-row[data-session-id="${createdWhileLoadingId}"]`).waitFor({ state: 'detached' });
+    await page.locator(`.sidebar-chat[data-session-id="${firstSessionId}"]`).click();
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.chat-composer button[type="submit"]')?.disabled);
+    expect(await composer.inputValue()).toBe('Draft for first conversation.');
     await page.locator(`.sidebar-chat[data-session-id="${secondSessionId}"]`).click();
     expect(await composer.inputValue()).toBe('Draft for second conversation.');
     await page.evaluate(() => {
@@ -430,7 +565,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByText('Request cancelled.', { exact: true }).waitFor({ state: 'visible', timeout: 20_000 });
     expect(await composer.inputValue()).toBe('Next message drafted during response.');
 
-    await electronApp.close();
+    await closeDesktopFixture(electronApp, userData);
     electronApp = null;
     const databaseFile = join(userData, 'data', 'app.sqlite');
     const database = new Database(databaseFile);
@@ -439,6 +574,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     expect(native?.entry_count).toBeGreaterThan(2);
     expect(native?.leaf_id).toBeTruthy();
     expect(JSON.parse(native!.header_json).type).toBe('session');
+    database.query('UPDATE sessions SET updated_at=? WHERE id=?').run('2099-01-01T00:00:00.000Z', secondSessionId);
     database.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at) VALUES (?,?,?,?)')
       .run('old-native-without-history', 'Older chat', '2026-09-24T00:00:00.000Z', '2026-09-24T00:00:00.000Z');
     const legacyId = Number((database.query("SELECT id FROM sessions WHERE title='Older chat'").get() as { id: number }).id);
@@ -468,11 +604,70 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByRole('button', { name: 'Open chat Renamed older chat' }).waitFor({ state: 'visible', timeout: 10_000 });
     await restartedComposer.fill('Continue the older chat.');
     expect(await restartedComposer.isDisabled()).toBe(false);
+    await electronApp.evaluate(({ ipcMain }) => {
+      const gate = { releaseCreate: null as (() => void) | null, releaseStart: null as (() => void) | null,
+        enterStart: null as (() => void) | null, enterWorkspace: null as (() => void) | null,
+        releaseWorkspace: null as (() => void) | null, applyWorkspace: null as (() => void) | null, sessionId: 0 };
+      const creating = new Promise<void>((done) => { gate.releaseCreate = done; });
+      const starting = new Promise<void>((done) => { gate.releaseStart = done; });
+      const startEntered = new Promise<void>((done) => { gate.enterStart = done; });
+      const workspaceEntered = new Promise<void>(done => { gate.enterWorkspace = done; });
+      const workspaceWaiting = new Promise<void>(done => { gate.releaseWorkspace = done; });
+      const workspaceApplied = new Promise<void>(done => { gate.applyWorkspace = done; });
+      (globalThis as unknown as { newChatSendGate: typeof gate & { startEntered: Promise<void>; workspaceEntered: Promise<void> } }).newChatSendGate = { ...gate, startEntered, workspaceEntered };
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      let firstWorkspace = true;
+      for (const channel of ['flowmate:create-session', 'flowmate:start-run', 'flowmate:update-workspace']) {
+        const original = handlers.get(channel);
+        if (!original) throw new Error(`Missing IPC: ${channel}`);
+        ipcMain.removeHandler(channel);
+        ipcMain.handle(channel, async (event, ...args) => {
+          if (channel === 'flowmate:create-session') await creating;
+          else if (channel === 'flowmate:start-run') {
+            const current = (globalThis as unknown as { newChatSendGate: typeof gate }).newChatSendGate;
+            current.sessionId = (args[0] as { sessionId: number }).sessionId;
+            current.enterStart?.();
+            await starting;
+          } else if (firstWorkspace) {
+            firstWorkspace = false;
+            gate.enterWorkspace?.();
+            await workspaceWaiting;
+            const result = await original(event, ...args);
+            gate.applyWorkspace?.();
+            return result;
+          } else {
+            // A concurrent Send must use the revision after the earlier selection commits.
+            await workspaceApplied;
+          }
+          return original(event, ...args);
+        });
+      }
+    });
     await page.getByRole('button', { name: 'New chat and send' }).click();
+    await page.locator(`.sidebar-chat[data-session-id="${firstSessionId}"]`).click();
+    await electronApp.evaluate(() => (globalThis as unknown as { newChatSendGate: { workspaceEntered: Promise<void> } }).newChatSendGate.workspaceEntered);
+    await electronApp.evaluate(() => (globalThis as unknown as { newChatSendGate: { releaseCreate: (() => void) | null } }).newChatSendGate.releaseCreate?.());
+    await page.waitForTimeout(100);
+    await electronApp.evaluate(() => (globalThis as unknown as { newChatSendGate: { releaseWorkspace: (() => void) | null } }).newChatSendGate.releaseWorkspace?.());
+    const currentSessionId = await electronApp.evaluate(async () => {
+      const gate = (globalThis as unknown as { newChatSendGate: { startEntered: Promise<void>; sessionId: number } }).newChatSendGate;
+      await Promise.race([gate.startEntered, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('New chat Send did not reach start-run')), 5000))]);
+      return gate.sessionId;
+    });
+    await page.locator('.chat-run-model').waitFor({ state: 'visible' });
+    await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'visible' });
+    expect(currentSessionId).not.toBe(legacyId);
+    expect(currentSessionId).not.toBe(firstSessionId);
+    expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(firstSessionId);
+    expect(await page.locator('.chat-input-intent').filter({ hasText: 'Continue the older chat.' }).count()).toBe(0);
+    await electronApp.evaluate(() => (globalThis as unknown as { newChatSendGate: { releaseStart: (() => void) | null } }).newChatSendGate.releaseStart?.());
+    await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'detached', timeout: 20_000 });
+    expect(JSON.stringify(requestBodies.at(-1))).toContain('Continue the older chat.');
+    expect(JSON.stringify(requestBodies.at(-1))).not.toContain('Invoice total is 1060 CNY.');
+    await page.locator(`.sidebar-chat[data-session-id="${currentSessionId}"]`).click();
     await page.locator('[data-testid="chat-turn"]').filter({ hasText: 'Continue the older chat.' })
       .waitFor({ state: 'visible', timeout: 20_000 });
-    const currentSessionId = Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'));
-    expect(currentSessionId).not.toBe(legacyId);
+    expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(currentSessionId);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats' }).click();
     const olderRow = page.locator(`.chat-directory-row[data-session-id="${legacyId}"]`);
     const cancelDelete = page.waitForEvent('dialog').then(async (dialog) => {
@@ -488,6 +683,12 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await olderRow.waitFor({ state: 'detached', timeout: 10_000 });
     expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(currentSessionId);
     await page.getByText('Chat deleted.', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });
+    const deleteCurrent = page.waitForEvent('dialog').then((dialog) => dialog.accept());
+    await page.locator(`.chat-directory-row[data-session-id="${currentSessionId}"]`).getByRole('button', { name: 'Delete' }).click();
+    await deleteCurrent;
+    await page.locator(`.chat-directory-row[data-session-id="${currentSessionId}"]`).waitFor({ state: 'detached', timeout: 10_000 });
+    expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(firstSessionId);
+    expect(await page.locator(`.sidebar-chat[data-session-id="${secondSessionId}"]`).count()).toBe(1);
     const beforeCheck = requestBodies.length;
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
     expect(requestBodies).toHaveLength(beforeCheck);
@@ -501,13 +702,330 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByRole('button', { name: 'Stop check' }).click();
     await page.getByText('Connection check stopped.').waitFor({ state: 'visible', timeout: 20_000 });
     expect(requestBodies).toHaveLength(beforeCheck + 2);
+  } catch (error) {
+    const diagnostic = await electronApp?.firstWindow().then(page => page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      const runtime = await window.flowmate.queryRuntimeState();
+      return { state: state.ok ? { ready: state.data.ready, revision: state.data.settings.revision,
+        defaultModelId: state.data.settings.defaultModelId, models: state.data.settings.models.map(model => ({ id: model.id, model: model.model })),
+        credentials: state.data.modelCredentials } : { error: state.error.code }, runtime,
+        selectedSession: document.querySelector('.sidebar-chat.selected')?.getAttribute('data-session-id'),
+        selectedModel: document.querySelector('.route-row.selected .route-name')?.textContent,
+        feedback: document.querySelector('[data-testid="runtime-feedback"]')?.textContent,
+        statuses: [...document.querySelectorAll('[role="status"]')].map(element => element.textContent),
+        modelFields: [...document.querySelectorAll<HTMLInputElement>('.config-panel input:not([type="password"])')]
+          .map(element => ({ name: element.name, value: element.value })),
+        alerts: [...document.querySelectorAll('[role="alert"]')].map(element => element.textContent) };
+    })).catch(() => null);
+    failure = new Error(`Direct Send regression: ${JSON.stringify(diagnostic)}`, { cause: error });
+    throw failure;
   } finally {
-    if (electronApp) await electronApp.close().catch(() => undefined);
-    server.stop(true);
+    try { if (electronApp) await closeDesktopFixture(electronApp, userData, failure); }
+    finally { await server.stop(true); }
   }
-}, 120_000);
+});
 
-it('keeps an ambient-only Pi provider visible but unavailable without API-key support', async () => {
+it('desktop keeps requests blocked by actual Runtime state after finish and ignores stale state queries', async () => {
+  it.setTimeout(60_000);
+  if (process.platform !== 'win32') throw new Error('desktop E2E requires Windows');
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-runtime-state-'));
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP',
+    'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'BUN_INSTALL']) {
+    if (process.env[name]) env[name] = process.env[name]!;
+  }
+  env.FLOWMATE_TEST_MODE = '1';
+  env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  const app = await electron.launch({
+    args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+  let runtimeCheckpoint = 'real Host readiness';
+  let runtimePage: Page | null = null;
+  let runtimeFailure: Error | undefined;
+  try {
+    const page = await app.firstWindow();
+    runtimePage = page;
+    page.setDefaultTimeout(10_000);
+    await waitFor(() => page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      return state.ok && state.data.ready && state.data.host === 'ready';
+    }));
+    runtimeCheckpoint = 'save synthetic model';
+    const saved = await page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      if (!state.ok) throw new Error('desktop_state_missing');
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'runtime-check-model',
+        credentialRef: 'runtime_check_credential', name: 'Runtime check', kind: 'custom', providerId: null,
+        baseUrl: 'http://127.0.0.1:1/v1', model: 'controlled-runtime-model', api: 'openai-completions',
+        contextWindow: 16_384, maxTokens: 4_096, reasoning: false }], defaultModelId: 'runtime-check-model' },
+      { modelId: 'runtime-check-model', apiKey: 'synthetic-runtime-ui-key' });
+    });
+    expect(saved.ok).toBe(true);
+    await app.evaluate(({ ipcMain }) => {
+      const gate = { state: { active: null, blocked: true, error: { code: 'runtime_unusable', category: 'runtime',
+        message: 'Controlled stop was not confirmed.', retryable: false } } as import('@flowmate/contracts').RuntimeState,
+        queries: 0, dispatches: 0, holdNext: false, failNext: false,
+        heldQuery: null as number | null, settledQueries: [] as number[], release: null as (() => void) | null };
+      (globalThis as unknown as { runtimeUiGate: typeof gate }).runtimeUiGate = gate;
+      ipcMain.removeHandler('flowmate:query-runtime-state');
+      ipcMain.handle('flowmate:query-runtime-state', async () => {
+        const query = ++gate.queries;
+        const snapshot = structuredClone(gate.state);
+        const failThisQuery = gate.failNext;
+        gate.failNext = false;
+        try {
+          if (gate.holdNext) {
+            gate.holdNext = false;
+            gate.heldQuery = query;
+            await new Promise<void>(resolveQuery => { gate.release = resolveQuery; });
+          }
+          if (failThisQuery) return { ok: false, error: { code: 'runtime_state_unavailable', category: 'runtime',
+            message: 'Controlled Runtime read failed.', retryable: true } };
+          return { ok: true, data: snapshot };
+        } finally {
+          gate.settledQueries.push(query);
+        }
+      });
+      for (const channel of ['flowmate:call-provider', 'flowmate:start-run']) {
+        ipcMain.removeHandler(channel);
+        ipcMain.handle(channel, async () => { gate.dispatches += 1; return { ok: false, error: {
+          code: 'runtime_unusable', category: 'runtime', message: 'Controlled Runtime is blocked.', retryable: false } }; });
+      }
+    });
+    runtimeCheckpoint = 'initial blocked Runtime';
+    await page.reload();
+    await page.getByRole('button', { name: 'Models', exact: true }).click();
+    const check = page.getByRole('button', { name: 'Test connection', exact: true });
+    await check.waitFor({ state: 'visible' });
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Runtime is blocked'));
+    expect(await check.isDisabled()).toBe(true);
+    expect(await page.getByTestId('runtime-feedback').textContent()).toContain('blocked');
+    const openAssistant = page.getByRole('button', { name: 'Open Assistant', exact: true });
+    if (await openAssistant.isVisible()) await openAssistant.click();
+    const composer = page.getByRole('textbox', { name: 'Message to model' });
+    await composer.fill('Preserve this unsent draft.');
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+
+    // A newer finish-triggered read must win over an older idle snapshot.
+    runtimeCheckpoint = 'older idle query enters Main';
+    await app.evaluate(() => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState; holdNext: boolean } }).runtimeUiGate;
+      gate.state = { active: null, blocked: false, error: null };
+      gate.holdNext = true;
+    });
+    await page.getByRole('button', { name: 'Check runtime status', exact: true }).click();
+    await app.evaluate(async () => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { release: (() => void) | null } }).runtimeUiGate;
+      for (let attempt = 0; gate.release === null && attempt < 100; attempt += 1) await new Promise(resolveWait => setTimeout(resolveWait, 10));
+      if (!gate.release) throw new Error('Runtime state query did not reach Main');
+    });
+    runtimeCheckpoint = 'finish preserves blocked Runtime';
+    await app.evaluate(({ BrowserWindow }) => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState } }).runtimeUiGate;
+      gate.state = { active: { runId: 7, sessionId: null, kind: 'provider' }, blocked: true,
+        error: { code: 'runtime_unusable', category: 'runtime', message: 'Controlled stop was not confirmed.', retryable: false } };
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'provider_finished',
+        requestId: 'controlled-finished-provider', runId: 7,
+        result: { ok: false, error: { code: 'storage_write_failed', category: 'storage',
+          message: 'Controlled terminal save failed.', retryable: true, runId: 7 } } });
+    });
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('blocked'));
+    await app.evaluate(async () => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { release: (() => void) | null; heldQuery: number | null; settledQueries: number[] } }).runtimeUiGate;
+      const query = gate.heldQuery;
+      gate.release?.();
+      for (let attempt = 0; query !== null && !gate.settledQueries.includes(query) && attempt < 100; attempt += 1) await new Promise(resolveWait => setTimeout(resolveWait, 10));
+      if (query === null || !gate.settledQueries.includes(query)) throw new Error('Older idle query did not settle after release');
+    });
+    await page.waitForTimeout(100);
+    expect(await check.isDisabled()).toBe(true);
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    expect(await composer.inputValue()).toBe('Preserve this unsent draft.');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByText('Diagnostics', { exact: true }).click();
+    expect(await page.getByTestId('runtime-feedback').textContent()).toContain('blocked');
+
+    runtimeCheckpoint = 'explicit next-query failure';
+    await app.evaluate(() => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState; failNext: boolean } }).runtimeUiGate;
+      gate.state = { active: null, blocked: false, error: null };
+      gate.failNext = true;
+    });
+    await page.getByRole('button', { name: 'Check runtime status', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('could not be confirmed'));
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    runtimeCheckpoint = 'explicit successful Runtime refresh';
+    await page.getByRole('button', { name: 'Check runtime status', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('ready for a new request'));
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isEnabled()).toBe(true);
+    // Admission rechecks the actual owner even when the displayed snapshot was idle.
+    runtimeCheckpoint = 'Send admission rechecks active Run';
+    await app.evaluate(() => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState } }).runtimeUiGate;
+      gate.state = { active: { runId: 8, sessionId: null, kind: 'provider' }, blocked: false, error: null };
+    });
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('still occupied by Run 8'));
+    expect(await composer.inputValue()).toBe('Preserve this unsent draft.');
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    await app.evaluate(() => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState } }).runtimeUiGate;
+      gate.state = { active: null, blocked: false, error: null };
+    });
+    await page.getByRole('button', { name: 'Check runtime status', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('ready for a new request'));
+    runtimeCheckpoint = 'Test connection admission rechecks blocked Runtime';
+    await page.getByRole('button', { name: 'Models', exact: true }).click();
+    await app.evaluate(() => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState } }).runtimeUiGate;
+      gate.state = { active: null, blocked: true, error: { code: 'runtime_unusable', category: 'runtime',
+        message: 'Controlled persistence is unconfirmed.', retryable: false } };
+    });
+    await check.click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('blocked'));
+    expect(await check.isDisabled()).toBe(true);
+
+    // An idle response from an old Host connection must not reopen admission.
+    runtimeCheckpoint = 'held Runtime query survives Host exit';
+    await app.evaluate(() => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState; holdNext: boolean; release: (() => void) | null } }).runtimeUiGate;
+      gate.state = { active: null, blocked: false, error: null };
+      gate.holdNext = true;
+      gate.release = null;
+    });
+    await page.getByRole('button', { name: 'Check runtime status', exact: true }).click();
+    await app.evaluate(async () => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { release: (() => void) | null } }).runtimeUiGate;
+      for (let attempt = 0; gate.release === null && attempt < 100; attempt += 1) await new Promise(resolveWait => setTimeout(resolveWait, 10));
+      if (!gate.release) throw new Error('Held Host query did not enter Main');
+    });
+    const connectedState = await page.evaluate(() => window.flowmate.getState());
+    if (!connectedState.ok) throw new Error('desktop_state_missing');
+    await app.evaluate(({ BrowserWindow }, desktop) => {
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state',
+        state: { ...desktop, ready: false, host: 'error' } });
+    }, connectedState.data);
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Host is not ready'));
+    await app.evaluate(async () => {
+      const gate = (globalThis as unknown as { runtimeUiGate: { release: (() => void) | null; heldQuery: number | null; settledQueries: number[] } }).runtimeUiGate;
+      const query = gate.heldQuery;
+      gate.release?.();
+      for (let attempt = 0; query !== null && !gate.settledQueries.includes(query) && attempt < 100; attempt += 1) await new Promise(resolveWait => setTimeout(resolveWait, 10));
+      if (query === null || !gate.settledQueries.includes(query)) throw new Error('Old Host Runtime query did not settle after release');
+    });
+    await page.waitForTimeout(100);
+    expect(await check.isDisabled()).toBe(true);
+    expect(await page.getByTestId('runtime-feedback').textContent()).toContain('Host is not ready');
+    await app.evaluate(({ BrowserWindow }, desktop) => {
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state: desktop });
+    }, connectedState.data);
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('ready for a new request'));
+    expect(await check.isEnabled()).toBe(true);
+
+    // The initial Desktop snapshot has the same stale-Host boundary as Runtime reads.
+    runtimeCheckpoint = 'initial Desktop query survives Host exit';
+    await app.evaluate(({ ipcMain }, desktop) => {
+      const gate = { release: null as (() => void) | null };
+      (globalThis as unknown as { desktopStateUiGate: typeof gate }).desktopStateUiGate = gate;
+      const original = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers.get('flowmate:get-state');
+      if (!original) throw new Error('Missing Desktop state IPC');
+      let first = true;
+      ipcMain.removeHandler('flowmate:get-state');
+      ipcMain.handle('flowmate:get-state', async (event, ...args) => {
+        if (!first) return original(event, ...args);
+        first = false;
+        await new Promise<void>(releaseState => { gate.release = releaseState; });
+        return { ok: true, data: desktop };
+      });
+    }, connectedState.data);
+    await page.reload();
+    await page.getByRole('button', { name: 'Models', exact: true }).click();
+    await app.evaluate(async () => {
+      const gate = (globalThis as unknown as { desktopStateUiGate: { release: (() => void) | null } }).desktopStateUiGate;
+      for (let attempt = 0; gate.release === null && attempt < 100; attempt += 1) await new Promise(resolveWait => setTimeout(resolveWait, 10));
+      if (!gate.release) throw new Error('Initial Desktop state query did not enter Main');
+    });
+    await app.evaluate(({ BrowserWindow }, desktop) => {
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state',
+        state: { ...desktop, ready: false, host: 'error' } });
+    }, connectedState.data);
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Host is not ready'));
+    await app.evaluate(() => (globalThis as unknown as { desktopStateUiGate: { release: (() => void) | null } }).desktopStateUiGate.release?.());
+    await page.waitForTimeout(100);
+    expect(await check.isDisabled()).toBe(true);
+    expect(await page.getByTestId('runtime-feedback').textContent()).toContain('Host is not ready');
+    await app.evaluate(({ BrowserWindow }, desktop) => {
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state: desktop });
+    }, connectedState.data);
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('ready for a new request'));
+    expect(await check.isEnabled()).toBe(true);
+    expect(await app.evaluate(() => (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate.dispatches)).toBe(0);
+
+    runtimeCheckpoint = 'late real model-removal reply cannot overwrite Host unavailability';
+    await app.evaluate(({ ipcMain }) => {
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      const save = handlers.get('flowmate:save-settings');
+      const read = handlers.get('flowmate:get-state');
+      if (!save || !read) throw new Error('Missing settings IPC');
+      const gate = { committed: false, release: null as (() => void) | null,
+        unavailable: null as import('@flowmate/contracts').DesktopState | null };
+      (globalThis as unknown as { modelRemovalGate: typeof gate }).modelRemovalGate = gate;
+      ipcMain.removeHandler('flowmate:save-settings');
+      ipcMain.handle('flowmate:save-settings', async (event, ...args) => {
+        const result = await save(event, ...args) as { ok: boolean };
+        if (!result.ok) return result;
+        gate.committed = true;
+        await new Promise<void>(release => { gate.release = release; });
+        return result;
+      });
+      ipcMain.removeHandler('flowmate:get-state');
+      ipcMain.handle('flowmate:get-state', (event, ...args) => gate.unavailable
+        ? { ok: true, data: gate.unavailable } : read(event, ...args));
+    });
+    await page.getByRole('button', { name: 'Remove model', exact: true }).click();
+    await waitFor(() => app.evaluate(() => {
+      const gate = (globalThis as unknown as { modelRemovalGate: { committed: boolean; release: (() => void) | null } }).modelRemovalGate;
+      return gate.committed && gate.release !== null;
+    }));
+    const removedState = await page.evaluate(() => window.flowmate.getState());
+    if (!removedState.ok) throw new Error('removed_model_state_missing');
+    expect(removedState.data.settings.models).toHaveLength(0);
+    await app.evaluate(({ BrowserWindow }, desktop) => {
+      const gate = (globalThis as unknown as { modelRemovalGate: { unavailable: import('@flowmate/contracts').DesktopState | null } }).modelRemovalGate;
+      gate.unavailable = { ...desktop, ready: false, host: 'error' };
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state: gate.unavailable });
+    }, removedState.data);
+    await expect(page.getByTestId('runtime-feedback')).toContainText('Host is not ready');
+    await app.evaluate(() => (globalThis as unknown as { modelRemovalGate: { release: (() => void) | null } }).modelRemovalGate.release?.());
+    await page.getByText('Model profile removed.', { exact: true }).waitFor({ state: 'visible' });
+    await expect(page.getByTestId('runtime-feedback')).toContainText('Host is not ready');
+    await expect(page.getByRole('button', { name: 'Check runtime status', exact: true })).toBeDisabled();
+    expect(await app.evaluate(() => (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate.dispatches)).toBe(0);
+    runtimeCheckpoint = 'normal desktop close';
+  } catch (error) {
+    const gate = await app.evaluate(() => {
+      const value = (globalThis as unknown as { runtimeUiGate?: { queries: number; dispatches: number; heldQuery: number | null;
+        settledQueries: number[]; holdNext: boolean; failNext: boolean; state: import('@flowmate/contracts').RuntimeState; release: (() => void) | null } }).runtimeUiGate;
+      const desktop = (globalThis as unknown as { desktopStateUiGate?: { release: (() => void) | null } }).desktopStateUiGate;
+      return value ? { queries: value.queries, dispatches: value.dispatches, heldQuery: value.heldQuery,
+        settledQueries: value.settledQueries, holdNext: value.holdNext, failNext: value.failNext,
+        state: value.state, hasRelease: value.release !== null, desktopQueryHeld: Boolean(desktop?.release) } : null;
+    }).catch(() => null);
+    const view = await runtimePage?.evaluate(() => ({
+      feedback: document.querySelector('[data-testid="runtime-feedback"]')?.textContent,
+      buttons: [...document.querySelectorAll('.model-check button,.agent-chat-panel button')].map(element => ({ text: element.textContent,
+        disabled: element instanceof HTMLButtonElement && element.disabled })),
+    })).catch(() => null);
+    runtimeFailure = new Error(`Runtime admission checkpoint ${runtimeCheckpoint}: ${JSON.stringify({ gate, view })}`, { cause: error });
+    throw runtimeFailure;
+  } finally {
+    await app.evaluate(() => (globalThis as unknown as { runtimeUiGate?: { release: (() => void) | null } }).runtimeUiGate?.release?.()).catch(() => undefined);
+    await app.evaluate(() => (globalThis as unknown as { desktopStateUiGate?: { release: (() => void) | null } }).desktopStateUiGate?.release?.()).catch(() => undefined);
+    await app.evaluate(() => (globalThis as unknown as { modelRemovalGate?: { release: (() => void) | null } }).modelRemovalGate?.release?.()).catch(() => undefined);
+    await closeDesktopFixture(app, userData, runtimeFailure);
+  }
+});
+
+async function verifyAmbientCatalog(failHostStartup = false) {
   if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E requires Windows');
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-ambient-e2e-'));
   const env: Record<string, string> = {};
@@ -518,49 +1036,94 @@ it('keeps an ambient-only Pi provider visible but unavailable without API-key su
   }
   env.FLOWMATE_TEST_MODE = '1';
   env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
-  const app = await electron.launch({ executablePath: electronPath,
-    args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+  if (failHostStartup) env.FLOWMATE_BUN_EXECUTABLE = join(userData, 'missing-bun.exe');
+  const app = await electron.launch({
+    args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+  let ambientCheckpoint = 'first window';
+  let ambientPage: Page | null = null;
+  let ambientFailure: Error | undefined;
   try {
     const page = await app.firstWindow();
-    await page.waitForFunction(async () => {
+    ambientPage = page;
+    page.setDefaultTimeout(10_000);
+    ambientCheckpoint = 'real Host readiness';
+    await waitFor(() => page.evaluate(async () => {
       const state = await window.flowmate.getState();
       return state.ok && state.data.ready;
-    }, null, { timeout: 20_000 });
+    }), failHostStartup ? 1000 : 20_000);
     await app.evaluate(({ ipcMain }) => {
+      (globalThis as unknown as { ambientCatalogCalls: string[] }).ambientCatalogCalls = [];
       ipcMain.removeHandler('flowmate:list-model-catalog');
-      ipcMain.handle('flowmate:list-model-catalog', async () => ({ ok: false, error: {
+      ipcMain.handle('flowmate:list-model-catalog', async () => {
+        (globalThis as unknown as { ambientCatalogCalls: string[] }).ambientCatalogCalls.push('unavailable');
+        return { ok: false, error: {
         code: 'provider_catalog_unavailable', category: 'provider', message: 'Pi model catalog is unavailable.', retryable: true,
-      } }));
+      } }; });
     });
 
-
+    ambientCheckpoint = 'reload with unavailable catalog';
     await page.reload();
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
+    ambientCheckpoint = 'catalog error visible';
+    await page.getByRole('alert').filter({ hasText: 'Pi model catalog is unavailable.' }).waitFor({ state: 'visible' });
     expect(await page.getByRole('alert').filter({ hasText: 'Pi model catalog is unavailable.' }).isVisible()).toBe(true);
     expect(await page.getByRole('button', { name: 'Reload providers' }).isEnabled()).toBe(true);
     await app.evaluate(({ ipcMain }) => {
       ipcMain.removeHandler('flowmate:list-model-catalog');
-      ipcMain.handle('flowmate:list-model-catalog', async () => ({ ok: true, data: [{
+      ipcMain.handle('flowmate:list-model-catalog', async () => {
+        (globalThis as unknown as { ambientCatalogCalls: string[] }).ambientCatalogCalls.push('ambient-only');
+        return { ok: true, data: [{
         id: 'deepseek', name: 'DeepSeek', authMethods: ['ambient'], models: [{
           id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', api: 'openai-completions',
           endpoint: null, contextWindow: 128000, maxTokens: 32768, reasoning: false,
         }],
-      }] }));
+      }] }; });
     });
+    ambientCheckpoint = 'reload ambient-only provider';
     await page.getByRole('button', { name: 'Reload providers' }).click();
     const desktopState = await page.evaluate(() => window.flowmate.getState());
     expect(desktopState.ok ? { ready: desktopState.data.ready, host: desktopState.data.host }
       : { error: desktopState.error.code }).toEqual({ ready: true, host: 'ready' });
     const provider = page.getByLabel('Pi provider').locator('option[value="deepseek"]');
+    ambientCheckpoint = 'provider remains disabled';
     await page.waitForFunction(() => document.querySelector<HTMLOptionElement>('.config-panel option[value="deepseek"]')?.disabled === true);
     expect(await provider.evaluate((option) => (option as HTMLOptionElement).disabled)).toBe(true);
     expect(await provider.textContent()).toContain('API key unavailable');
     expect(await page.getByLabel('Service URL').count()).toBe(0);
     expect(await page.locator('.config-panel input[type="password"]').count()).toBe(1);
     expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
-  } finally { await app.close(); }
-}, 60_000);
+    ambientCheckpoint = 'normal desktop close';
+  } catch (error) {
+    const calls = await app.evaluate(() => (globalThis as unknown as { ambientCatalogCalls?: string[] }).ambientCatalogCalls).catch(() => null);
+    const view = await ambientPage?.evaluate(() => ({
+      feedback: document.querySelector('[data-testid="runtime-feedback"]')?.textContent,
+      alerts: [...document.querySelectorAll('[role="alert"]')].map(element => element.textContent),
+      options: [...document.querySelectorAll<HTMLSelectElement>('.config-panel select')].map(element => ({ value: element.value, text: element.textContent })),
+    })).catch(() => null);
+    ambientFailure = new Error(`Ambient catalog checkpoint ${ambientCheckpoint}: ${JSON.stringify({ calls, view })}`, { cause: error });
+    throw ambientFailure;
+  } finally {
+    await closeDesktopFixture(app, userData, ambientFailure);
+  }
+}
+it('keeps an ambient-only Pi provider visible but unavailable without API-key support', async () => {
+  it.setTimeout(60_000);
+  await verifyAmbientCatalog();
+});
+it('reports the ambient catalog startup checkpoint when its Host cannot start', async () => {
+  it.setTimeout(30_000);
+  try { await verifyAmbientCatalog(true); }
+  catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    if (!(error instanceof Error)) throw error;
+    expect(error.message).toContain('Ambient catalog checkpoint real Host readiness:');
+    expect(error.message).not.toContain('; cleanup:');
+    return;
+  }
+  throw new Error('Controlled missing Host unexpectedly became ready.');
+});
 it('reconciles Renderer messages from the public history IPC without replaying an input', async () => {
+  it.setTimeout(60_000);
   if (process.platform !== 'win32') throw new Error('desktop E2E requires Windows');
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-message-receipt-e2e-'));
   const env: Record<string, string> = {};
@@ -570,13 +1133,23 @@ it('reconciles Renderer messages from the public history IPC without replaying a
   }
   env.FLOWMATE_TEST_MODE = '1';
   env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
-  const app = await electron.launch({ executablePath: electronPath,
-    args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+  const app = await electron.launch({
+    args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+  let historyCheckpoint = 'real Host readiness';
+  let historyPage: Page | null = null;
+  let historyFailure: Error | undefined;
   try {
     const page = await app.firstWindow();
+    historyPage = page;
+    page.setDefaultTimeout(10_000);
+    await waitFor(() => page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      return state.ok && state.data.ready && state.data.host === 'ready';
+    }));
+    historyCheckpoint = 'install controlled history';
     const desktop = await page.evaluate(() => window.flowmate.getState());
     if (!desktop.ok) throw new Error('desktop_state_missing');
-    await app.evaluate(({ ipcMain }, data) => {
+    await app.evaluate(({ ipcMain, BrowserWindow }, data) => {
       const replace = (channel: string, value: unknown) => {
         ipcMain.removeHandler(channel);
         ipcMain.handle(channel, async () => ({ ok: true, data: value }));
@@ -607,7 +1180,11 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       ipcMain.handle('flowmate:list-session-runs', async (_event, input) => ({ ok: true,
         data: input.sessionId === 13 ? { items: [], nextBeforeRunId: null } : runPage }));
       const receipt = { session, items: [user] as unknown[], historyCalls: 0, activeQueries: 0, maxQueries: 0,
+        navigation: 0, queries: [] as Array<{ id: number; navigation: number; frame: string; held: boolean; phase: string }>,
         startCalls: 0, hold: false, failNext: false, release: null as (() => void) | null };
+      BrowserWindow.getAllWindows()[0]?.webContents.on('did-start-navigation', (_event, _url, _inPlace, mainFrame) => {
+        if (mainFrame) receipt.navigation += 1;
+      });
       (globalThis as unknown as { rendererReceipt: typeof receipt }).rendererReceipt = receipt;
       ipcMain.removeHandler('flowmate:list-session-messages');
       ipcMain.handle('flowmate:list-session-messages', async (_event, input) => {
@@ -615,24 +1192,34 @@ it('reconciles Renderer messages from the public history IPC without replaying a
           items: [{ ...user, entryId: 'renderer-t1', runId: null, liveOrdinal: null, textOrigin: 'native-content',
             blocks: [{ type: 'text', text: 'Other Session question' }] }], nextBeforeEntryId: null } };
         receipt.historyCalls += 1;
+        const query = { id: receipt.historyCalls, navigation: receipt.navigation,
+          frame: `${_event.senderFrame?.processId}:${_event.senderFrame?.routingId}`, held: receipt.hold, phase: 'entered' };
+        receipt.queries.push(query);
         receipt.activeQueries += 1;
         receipt.maxQueries = Math.max(receipt.maxQueries, receipt.activeQueries);
         const snapshot = structuredClone(receipt.items);
+        const failThisQuery = receipt.failNext;
+        receipt.failNext = false;
         try {
           if (receipt.hold) await new Promise<void>((resolve) => { receipt.release = resolve; });
-          if (receipt.failNext) {
-            receipt.failNext = false;
+          if (failThisQuery) {
             return { ok: false, error: { code: 'storage_read_failed', category: 'storage', message: 'Controlled history unavailable.', retryable: true } };
           }
-          return { ok: true, data: { session, leafId: 'renderer-e1', entryCount: snapshot.length,
-            items: snapshot, nextBeforeEntryId: null } };
-        } finally { receipt.activeQueries -= 1; }
+          const entries = snapshot as Array<{ entryId: string }>;
+          const end = input.beforeEntryId === undefined ? entries.length
+            : entries.findIndex((item) => item.entryId === input.beforeEntryId);
+          const start = Math.max(0, end - input.limit);
+          return { ok: true, data: { session, leafId: entries.at(-1)?.entryId ?? null, entryCount: snapshot.length,
+            items: entries.slice(start, end), nextBeforeEntryId: start > 0 ? entries[start]!.entryId : null } };
+        } finally { query.phase = 'settled'; receipt.activeQueries -= 1; }
       });
       ipcMain.removeHandler('flowmate:start-run');
       ipcMain.handle('flowmate:start-run', async () => { receipt.startCalls += 1; return { ok: false }; });
     }, desktop.data);
+    historyCheckpoint = 'initial saved message';
     await page.reload();
     await page.locator('[data-message-entry="renderer-e1"]').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.getByRole('button', { name: 'Refresh history', exact: true }).waitFor({ state: 'visible' });
     expect(await page.locator('[data-message-role="user"]').textContent()).toContain('Controlled question');
     expect(await page.locator('[data-message-role="user"]').getByText('Saved', { exact: true }).count()).toBe(1);
     expect(await page.locator('.chat-user-message').count()).toBe(1);
@@ -643,9 +1230,22 @@ it('reconciles Renderer messages from the public history IPC without replaying a
     await page.waitForTimeout(50);
     expect(await page.getByRole('button', { name: 'Stop', exact: true }).count()).toBe(0);
     await page.getByRole('textbox', { name: 'Message to model' }).fill('Draft stays editable');
-    await app.evaluate(({ BrowserWindow }) => {
-      type Receipt = { hold: boolean };
-      (globalThis as unknown as { rendererReceipt: Receipt }).rendererReceipt.hold = true;
+    await page.evaluate(() => {
+      window.flowmate.subscribe((event) => {
+        if (event.type === 'message_upsert' && event.runId === 102 && event.sequence === 4) {
+          (window as unknown as { historyEventsConsumed: boolean }).historyEventsConsumed = true;
+        }
+      });
+    });
+    // The Main fixture spans the old and reloaded Renderer. Measure only the
+    // controlled reconciliation window, after the new view has finished loading.
+    const historyBaseline = await app.evaluate(({ BrowserWindow }) => {
+      type Receipt = { hold: boolean; historyCalls: number; activeQueries: number; maxQueries: number };
+      const receipt = (globalThis as unknown as { rendererReceipt: Receipt }).rendererReceipt;
+      if (receipt.activeQueries !== 0) throw new Error('Initial history is still in flight.');
+      const baseline = receipt.historyCalls;
+      receipt.maxQueries = 0;
+      receipt.hold = true;
       const send = (value: unknown) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', value);
       const envelope = { runId: 102, sessionId: 12, nativeSessionId: 'renderer-native-s', at: '2026-09-30T00:00:00.000Z' };
       const view = { entryId: null, runId: 102, liveOrdinal: 1, timestamp: 1790726400001, persistence: 'pending',
@@ -658,10 +1258,20 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       send({ ...envelope, type: 'message_upsert', sequence: 2, message: { ...view, blocks: [{ type: 'text', text: 'A' }] } });
       send({ ...envelope, type: 'message_upsert', sequence: 3, message: view });
       send({ ...envelope, type: 'message_upsert', sequence: 3, message: { ...view, blocks: [{ type: 'text', text: 'CONFLICT' }] } });
+      return baseline;
     });
+    historyCheckpoint = 'pending assistant messages';
     await page.locator('[data-message-role="assistant"]').filter({ hasText: 'AB' }).waitFor({ state: 'visible' });
     expect(await page.locator('[data-message-role="assistant"]').count()).toBe(2);
     expect(await page.locator('.chat-transcript').textContent()).not.toContain('CONFLICT');
+    await app.evaluate(async () => {
+      const receipt = (globalThis as unknown as { rendererReceipt: { activeQueries: number; release: (() => void) | null } }).rendererReceipt;
+      const deadline = Date.now() + 10_000;
+      while (!receipt.release || receipt.activeQueries !== 1) {
+        if (Date.now() >= deadline) throw new Error('Controlled history never entered its hold.');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    });
     await app.evaluate(({ BrowserWindow }) => {
       const send = (value: unknown) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', value);
       const envelope = { runId: 102, sessionId: 12, nativeSessionId: 'renderer-native-s', at: '2026-09-30T00:00:00.000Z' };
@@ -673,10 +1283,12 @@ it('reconciles Renderer messages from the public history IPC without replaying a
         blocks: [{ type: 'text', text: 'LATE' }], phase: 'streaming', stopReason: 'pending', toolCallId: null,
         toolName: null, isError: null, textOrigin: 'native-content' } });
     });
+    historyCheckpoint = 'finish preserves pending messages';
     await page.getByText('2 messages have not been confirmed as saved.', { exact: false }).waitFor({ state: 'visible' });
     expect(await page.getByRole('button', { name: 'Stop', exact: true }).count()).toBe(0);
     expect(await page.locator('.chat-transcript').textContent()).not.toContain('LATE');
     expect(await page.locator('.chat-transcript').textContent()).not.toContain('RUN TEXT IS NOT A MESSAGE');
+    await page.waitForFunction(() => (window as unknown as { historyEventsConsumed?: boolean }).historyEventsConsumed === true);
     await app.evaluate(() => {
       type Receipt = { hold: boolean; items: unknown[]; release: (() => void) | null };
       const receipt = (globalThis as unknown as { rendererReceipt: Receipt }).rendererReceipt;
@@ -687,20 +1299,23 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       receipt.hold = false;
       receipt.release?.();
     });
+    historyCheckpoint = 'held history reconciles saved messages';
     await page.locator('[data-message-entry="renderer-e3"]').waitFor({ state: 'visible' });
+    await page.getByRole('button', { name: 'Refresh history', exact: true }).waitFor({ state: 'visible' });
     expect(await page.locator('[data-message-role="assistant"][data-persistence="saved"]').count()).toBe(2);
     expect(await page.getByRole('textbox', { name: 'Message to model' }).inputValue()).toBe('Draft stays editable');
     const counts = await app.evaluate(() => {
       const receipt = (globalThis as unknown as { rendererReceipt: { historyCalls: number; maxQueries: number; startCalls: number } }).rendererReceipt;
       return { historyCalls: receipt.historyCalls, maxQueries: receipt.maxQueries, startCalls: receipt.startCalls };
     });
-    expect(counts).toEqual({ historyCalls: 3, maxQueries: 1, startCalls: 0 });
+    expect(counts).toEqual({ historyCalls: historyBaseline + 2, maxQueries: 1, startCalls: 0 });
     await app.evaluate(() => { (globalThis as unknown as { rendererReceipt: { failNext: boolean } }).rendererReceipt.failNext = true; });
+    historyCheckpoint = 'explicit failed history refresh';
     await page.getByRole('button', { name: 'Refresh history', exact: true }).click();
     await page.getByRole('alert').filter({ hasText: 'Controlled history unavailable.' }).waitFor({ state: 'visible' });
     expect(await page.locator('[data-message-entry="renderer-e3"]').count()).toBe(1);
     await page.waitForTimeout(100);
-    expect(await app.evaluate(() => (globalThis as unknown as { rendererReceipt: { historyCalls: number } }).rendererReceipt.historyCalls)).toBe(4);
+    expect(await app.evaluate(() => (globalThis as unknown as { rendererReceipt: { historyCalls: number } }).rendererReceipt.historyCalls)).toBe(historyBaseline + 3);
     await app.evaluate(({ BrowserWindow }) => {
       const send = (value: unknown) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event', value);
       const envelope = { sessionId: 12, nativeSessionId: 'renderer-native-s', at: '2026-09-30T00:00:00.000Z' };
@@ -709,10 +1324,12 @@ it('reconciles Renderer messages from the public history IPC without replaying a
         sessionId: 12, nativeSessionId: 'renderer-native-s', status: 'completed', text: 'OLD RUN TEXT',
         error: null, stopped: false, cleanupErrors: [] } } });
     });
+    historyCheckpoint = 'new Run stays active after old finish';
     await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'visible' });
     expect(await page.getByRole('textbox', { name: 'Message to model' }).inputValue()).toBe('Draft stays editable');
     expect(await page.locator('.chat-transcript').textContent()).not.toContain('OLD RUN TEXT');
     await app.evaluate(() => { (globalThis as unknown as { rendererReceipt: { hold: boolean } }).rendererReceipt.hold = true; });
+    historyCheckpoint = 'switch Session while history is pending';
     await page.getByRole('button', { name: 'Refresh history', exact: true }).click();
     await page.locator('.sidebar-chat[data-session-id="13"]').click();
     await page.locator('[data-message-entry="renderer-t1"]').waitFor({ state: 'visible' });
@@ -730,10 +1347,53 @@ it('reconciles Renderer messages from the public history IPC without replaying a
     expect(await page.locator('[data-message-entry="renderer-t1"]').count()).toBe(1);
     expect(await page.locator('[data-message-entry="renderer-e1"]').count()).toBe(0);
     expect(await page.locator('.chat-transcript').textContent()).not.toContain('WRONG SESSION');
-  } finally { await app.close(); }
-}, 60_000);
+
+    // The original short page exhausted its cursor. After missed observations,
+    // the refreshed newest page must make the intervening saved history reachable.
+    await app.evaluate(() => {
+      const receipt = (globalThis as unknown as { rendererReceipt: { items: unknown[] } }).rendererReceipt;
+      for (let index = 0; index < 60; index++) receipt.items.push({ entryId: `renderer-gap-${index}`,
+        runId: null, liveOrdinal: null, timestamp: 1790726400010, persistence: 'saved', truncated: false,
+        role: 'assistant', blocks: [{ type: 'text', text: `Recovered message ${index}` }], phase: 'ended',
+        stopReason: 'stop', toolCallId: null, toolName: null, isError: null, textOrigin: 'native-content' });
+    });
+    historyCheckpoint = 'refreshed latest page restores its older cursor';
+    await page.locator('.sidebar-chat[data-session-id="12"]').click();
+    await page.locator('[data-message-entry="renderer-gap-59"]').waitFor({ state: 'visible' });
+    await page.getByRole('button', { name: 'Earlier messages', exact: true }).waitFor({ state: 'visible', timeout: 1000 });
+    expect(await page.locator('[data-message-entry="renderer-gap-0"]').count()).toBe(0);
+    await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
+    await page.locator('[data-message-entry="renderer-gap-0"]').waitFor({ state: 'visible' });
+    expect(await page.locator('[data-message-entry]').count()).toBe(63);
+    expect(await page.locator('[data-message-entry]').evaluateAll((items) => items.slice(3)
+      .map((item) => item.getAttribute('data-message-entry')))).toEqual(Array.from({ length: 60 }, (_, index) => `renderer-gap-${index}`));
+    expect(await page.getByRole('button', { name: 'Earlier messages', exact: true }).count()).toBe(0);
+    expect(await app.evaluate(() => (globalThis as unknown as { rendererReceipt: { startCalls: number } })
+      .rendererReceipt.startCalls)).toBe(0);
+  } catch (error) {
+    const receipt = await app.evaluate(() => {
+      const value = (globalThis as unknown as { rendererReceipt?: { historyCalls: number; activeQueries: number; maxQueries: number; startCalls: number; hold: boolean; queries: unknown[]; release: (() => void) | null } }).rendererReceipt;
+      return value ? { historyCalls: value.historyCalls, activeQueries: value.activeQueries, maxQueries: value.maxQueries,
+        startCalls: value.startCalls, hold: value.hold, queries: value.queries, hasRelease: value.release !== null } : null;
+    }).catch(() => null);
+    const view = await historyPage?.evaluate(() => ({
+      entries: [...document.querySelectorAll('[data-message-entry]')].map(element => element.getAttribute('data-message-entry')),
+      buttons: [...document.querySelectorAll('.agent-chat-panel button')].map(element => element.textContent),
+      alerts: [...document.querySelectorAll('[role="alert"]')].map(element => element.textContent),
+    })).catch(() => null);
+    historyFailure = new Error(`Renderer history checkpoint ${historyCheckpoint}: ${JSON.stringify({ receipt, view })}`, { cause: error });
+    throw historyFailure;
+  } finally {
+    await app.evaluate(() => {
+      const receipt = (globalThis as unknown as { rendererReceipt?: { hold: boolean; release: (() => void) | null } }).rendererReceipt;
+      if (receipt) { receipt.hold = false; receipt.release?.(); }
+    }).catch(() => undefined);
+    await closeDesktopFixture(app, userData, historyFailure);
+  }
+});
 
 it('desktop completes import, Start Task, Run, candidate source and Activity without leaving the local fixture', async () => {
+  it.setTimeout(120_000);
   if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E currently requires the Windows developer host');
   if (!existsSync(electronPath)) throw new Error('Electron runtime binary is not installed; run the Electron install script');
 
@@ -772,9 +1432,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     ['compare_invoice_candidates', { leftCandidateId: 1, rightCandidateId: 1, afterPath: null, limit: 10 }],
   ] as const;
   const requests: Array<{ body: { tools?: unknown[]; messages?: unknown[] }; authorization: string | null }> = [];
-  const server = Bun.serve({
-    hostname: '127.0.0.1', port: 0,
-    async fetch(request) {
+  const server = await createHttpProvider(async request => {
       requests.push({ body: await request.json(), authorization: request.headers.get('authorization') });
       if (requests.length === 1) {
         return streamToolCall('save_invoice_candidate', 'desktop-p3-save-1', { documentId: 1, candidate });
@@ -785,10 +1443,10 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
       if (requests.length === 4) return streamToolCall('validate_invoice_candidate',
         'desktop-p3-validate-only-1', { documentId: 1, candidate });
       return streamText('Candidate saved from the imported invoice and all twelve read tools returned results.');
-    },
   });
 
   let electronApp: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
   try {
     const env: Record<string, string> = {};
     for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'BUN_INSTALL']) {
@@ -797,7 +1455,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     env.FLOWMATE_TEST_MODE = '1';
     env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
     env.FLOWMATE_TEST_INVOICE_SOURCE_ROOT = sourceRoot;
-    electronApp = await electron.launch({ executablePath: electronPath, args: [resolve(import.meta.dir, '../../out/main/index.js')], env, timeout: 30_000 });
+    electronApp = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await electronApp.firstWindow();
     await page.getByRole('heading', { name: 'Invoices' }).waitFor({ state: 'visible', timeout: 20_000 });
 
@@ -815,7 +1473,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     await page.getByRole('button', { name: /Import invoice/ }).click();
     const selectedDefaultPath = await electronApp.evaluate(({ dialog }) =>
       (dialog as unknown as { __selectedDefaultPath?: string }).__selectedDefaultPath);
-    expect(selectedDefaultPath).toBe(join(resolve(import.meta.dir, '../..'), 'data', 'invoices', 'agent-input'));
+    expect(selectedDefaultPath).toBe(join(resolve(import.meta.dirname, '../..'), 'data', 'invoices', 'agent-input'));
     await page.getByRole('heading', { name: 'Invoice 000001' }).waitFor({ state: 'visible', timeout: 10_000 });
     await page.locator('img[alt="Original invoice document page 1"]').waitFor({ state: 'visible', timeout: 10_000 });
     await page.getByRole('button', { name: 'Parsed', exact: true }).click();
@@ -875,13 +1533,10 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     expect(requests).toHaveLength(3);
     expect(requests.every(({ authorization }) => authorization === 'Bearer synthetic-desktop-p3-key')).toBe(true);
     const toolNames = (requests[0]?.body.tools ?? []).map((tool) => (tool as { function?: { name?: string } }).function?.name ?? '').sort();
-    expect(toolNames).toHaveLength(13);
-    expect(toolNames).not.toContain('');
-    expect(toolNames).toContain('get_invoice_candidate');
-    expect(toolNames).toContain('save_invoice_candidate');
+    expect(toolNames).toEqual([...INVOICE_TOOL_NAMES, ...NATIVE_TOOL_NAMES].sort());
     const toolEvents = await page.evaluate(() =>
       (window as unknown as { toolEvents: Array<{ toolName: string; phase: string; [key: string]: unknown }> }).toolEvents);
-    expect(toolEvents.filter((event) => event.phase === 'running').map((event) => event.toolName).sort()).toEqual(toolNames);
+    expect(toolEvents.filter((event) => event.phase === 'running').map((event) => event.toolName).sort()).toEqual([...INVOICE_TOOL_NAMES].sort());
     expect(toolEvents.every((event) => !('args' in event) && !('input' in event))).toBe(true);
     expect(JSON.stringify(requests[1]?.body.messages)).toContain('desktop-p3-save-1');
     const saveResult = ((requests[1]?.body.messages ?? []) as Array<{ role?: string; content?: unknown }>).find((message) => message.role === 'tool');
@@ -991,7 +1646,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     await page.locator(`.chat-directory-row[data-session-id="${selectedChatId}"]`).waitFor({ state: 'detached', timeout: 10_000 });
     expect(await page.locator('.chats-page .notice').textContent()).toContain('Chat removed from Conversations');
 
-    await electronApp.close();
+    await closeDesktopFixture(electronApp, userData);
     electronApp = null;
     const database = new Database(join(userData, 'data', 'app.sqlite'), { readonly: true });
     try {
@@ -1030,8 +1685,11 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
         && (database.query('SELECT metadata_json FROM sessions WHERE id=(SELECT session_id FROM runs WHERE job_id=1)').get() as { metadata_json: string }).metadata_json)))
         .toMatchObject({ model_use_blocked: { documentIds: [1], reason: 'document_use_revoked' } });
     } finally { database.close(); }
+  } catch (error) {
+    failure = error instanceof Error ? error : new Error(String(error));
+    throw failure;
   } finally {
-    if (electronApp) await electronApp.close().catch(() => undefined);
-    server.stop(true);
+    try { if (electronApp) await closeDesktopFixture(electronApp, userData, failure); }
+    finally { await server.stop(true); }
   }
-}, 120_000);
+});

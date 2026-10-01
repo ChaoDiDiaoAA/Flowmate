@@ -8,7 +8,7 @@ function denied(context: ProductToolContext) {
   return fail(appError('tool_access_denied', 'runtime', 'This run cannot access the document.', false, context.runId, context.sessionId));
 }
 
-function checkSource(source: SourceRef, document: DocumentSnapshot, parsed: StoredParsedDocument):
+export function checkSource(source: SourceRef, document: DocumentSnapshot, parsed: StoredParsedDocument):
   { status: 'valid' | 'invalid'; code: 'parsed_quote_matched' | 'reference_mismatch' | 'block_not_found' | 'quote_mismatch' } {
   if (source.documentId !== document.documentRef.id || source.version !== document.documentRef.version
     || source.artifactId !== document.parsedArtifactId) return { status: 'invalid', code: 'reference_mismatch' };

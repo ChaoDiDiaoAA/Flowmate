@@ -120,7 +120,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     query() { if (options.failTraceQuery) throw new Error('diagnostic source failed'); return { availability: 'not-started', calls: [], droppedCalls: 0 }; },
   };
   const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService, promptTrace);
-  return { app, db: opened.data, counts: () => ({ created, preparations }), released, clearedTraceSessions,
+  return { app, db: opened.data, runtime, promptTrace, counts: () => ({ created, preparations }), released, clearedTraceSessions,
     setReleaseFailure(value: boolean) { failSessionRelease = value; } };
 }
 
@@ -227,5 +227,31 @@ describe('P2 Application Agent entry', () => {
     expect(await app.queryPromptTrace(accepted.data.runId)).toMatchObject({ ok: true, data: { availability: 'source-unavailable', calls: [] } });
     expect(await app.queryRun(accepted.data.runId)).toMatchObject({ ok: true, data: { kind: 'agent', status: 'completed' } });
     expect(db.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'completed' } });
+  });
+
+  it('uses the boot Run boundary only for missing old Agent diagnostics', async () => {
+    const { app, db, runtime, promptTrace } = harness();
+    const session = await app.createSession();
+    if (!session.ok) throw new Error(session.error.message);
+    const finished = deferred<void>();
+    const accepted = await app.startRun({ sessionId: session.data.sessionId, text: 'trace boundary', config }, { onEvent(event) {
+      if (event.type === 'run_finished') finished.resolve();
+    } });
+    if (!accepted.ok) throw new Error(accepted.error.message);
+    await finished.promise;
+    const runId = accepted.data.runId;
+    const restarted = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }),
+      undefined, promptTrace, undefined, undefined, undefined, runId);
+    expect(await app.queryPromptTrace(runId)).toMatchObject({ ok: true, data: { availability: 'not-started' } });
+    expect(await restarted.queryPromptTrace(runId)).toMatchObject({ ok: true, data: { availability: 'process-exited', droppedCalls: null } });
+
+    db.db.query("UPDATE runs SET output_json=json_set(output_json,'$.agent.modelCallCount',0) WHERE id=?").run(runId);
+    expect(await restarted.queryPromptTrace(runId)).toMatchObject({ ok: true, data: { availability: 'not-started', droppedCalls: 0 } });
+    for (const availability of ['available', 'evicted'] as const) {
+      promptTrace.query = () => ({ availability, calls: [], droppedCalls: 2 });
+      expect(await restarted.queryPromptTrace(runId)).toMatchObject({ ok: true, data: { availability, droppedCalls: 2 } });
+    }
+    await app.callProvider({ goal: 'Trace classification', text: 'provider failure fixture', config, timeoutMs: 60_000, stopGraceMs: 2_000 });
+    expect(await restarted.queryPromptTrace(runId + 1)).toMatchObject({ ok: true, data: { availability: 'not-collected', droppedCalls: null } });
   });
 });

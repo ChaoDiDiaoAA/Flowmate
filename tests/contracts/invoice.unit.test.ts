@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { CandidateDraftSchema, INVOICE_TOOL_NAMES, invoiceToolSchemas, ParsedBlockSchema } from '../../packages/contracts/src/invoice.ts';
+import { CandidateDraftSchema, FillInvoiceFormInputSchema, FillInvoiceFormOutputSchema, InvoiceFormApplicationReceiptSchema,
+  InvoiceFormTargetSchema, INVOICE_REVIEW_TOOL_NAMES, INVOICE_TOOL_NAMES, invoiceToolSchemas, ParsedBlockSchema } from '../../packages/contracts/src/invoice.ts';
 import { RunScopeSchema, ToolExecutionContextSchema, ToolExecutionModeSchema } from '../../packages/contracts/src/tools.ts';
 import type { AgentTool, ProductToolContext, ToolCallContext, ToolDefinition } from '../../packages/contracts/src/tools.ts';
 import { AppErrorSchema, InputRecordV2Schema, UsageRecordV2Schema } from '../../packages/contracts/src/runtime.ts';
@@ -51,11 +52,63 @@ const outputExamples = {
   get_invoice_candidate: { candidateId: 4, jobId: 3, runId: 2, sequence: 1, issueCount: 0, documentRef, toolCallId: 9, candidate, checks: [], issues: [] },
   compare_invoice_candidates: { jobId: 3, leftCandidateId: 4, rightCandidateId: 5, differences: [], nextAfterPath: null, complete: true },
   save_invoice_candidate: { candidateId: 4, jobId: 3, sequence: 1, issueCount: 0, checks: [] },
+  fill_invoice_form: { candidateId: 4, candidateSequence: 1, applied: true },
 } as const;
 
 describe('P3 invoice tool contracts', () => {
-  it('defines thirteen strict input and output schemas and bounds candidate and arithmetic inputs', () => {
-    expect(INVOICE_TOOL_NAMES).toEqual([
+  it('keeps form targets and application evidence out of the model tool input and output', () => {
+    const target = { formInstanceId: 'form-1', expectedRevision: 0 };
+    const base = { runId: 2, toolCallId: 9, formInstanceId: 'form-1', candidateId: 4, candidateSequence: 1,
+      observedAt: '2026-10-01T00:00:00.000Z' };
+    expect(InvoiceFormTargetSchema.safeParse(target).success).toBe(true);
+    expect(InvoiceFormTargetSchema.safeParse({ ...target, expectedRevision: -1 }).success).toBe(false);
+    expect(FillInvoiceFormInputSchema.parse({ candidateId: 4 })).toEqual({ candidateId: 4 });
+    expect(FillInvoiceFormInputSchema.safeParse({ candidateId: 4, ...target }).success).toBe(false);
+    expect(FillInvoiceFormOutputSchema.safeParse({ candidateId: 4, candidateSequence: 1, applied: true }).success).toBe(true);
+    expect(FillInvoiceFormOutputSchema.safeParse({ candidateId: 4, candidateSequence: 1, applied: false }).success).toBe(false);
+    expect(FillInvoiceFormOutputSchema.safeParse({ candidateId: 4, candidateSequence: 1, applied: true, ...target }).success).toBe(false);
+    expect(InvoiceFormApplicationReceiptSchema.safeParse({ ...base, outcome: 'applied', appliedRevision: 1,
+      appliedAt: base.observedAt }).success).toBe(true);
+    expect(InvoiceFormApplicationReceiptSchema.safeParse({ ...base, outcome: 'not_applied', reason: 'revision_changed' }).success).toBe(true);
+    expect(InvoiceFormApplicationReceiptSchema.safeParse({ ...base, outcome: 'unknown' }).success).toBe(true);
+    expect(InvoiceFormApplicationReceiptSchema.safeParse({ ...base, outcome: 'unknown', appliedRevision: 1 }).success).toBe(false);
+    expect(InvoiceFormApplicationReceiptSchema.safeParse({ ...base, outcome: 'applied', appliedRevision: 1 }).success).toBe(false);
+    expect(InvoiceFormApplicationReceiptSchema.safeParse({ ...base, outcome: 'unknown', observedAt: '2026-10-01T08:00:00+08:00' }).success).toBe(false);
+  });
+
+  it('reads human edits with explicit provenance while rejecting them as model submissions', () => {
+    const edited = { ...candidate, fields: { ...candidate.fields,
+      invoiceNumber: { ...field, raw: 'MANUAL-1', normalized: 'MANUAL-1', state: 'present', valueOrigin: 'user-provided' },
+    } };
+    const human = { ...outputExamples.get_invoice_candidate, runId: null, toolCallId: null,
+      origin: 'human_edit', basedOnCandidateId: 3, candidate: edited };
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse(human).success).toBe(true);
+    expect(invoiceToolSchemas.list_invoice_candidates.output.safeParse({ jobId: 3,
+      candidates: [{ candidateId: 4, runId: null, sequence: 1, issueCount: 0,
+        origin: 'human_edit', basedOnCandidateId: 3 }], nextBeforeSequence: null,
+    }).success).toBe(true);
+    for (const name of ['validate_invoice_candidate', 'save_invoice_candidate'] as const) {
+      expect(invoiceToolSchemas[name].input.safeParse({ documentId: 1, candidate: edited }).success).toBe(false);
+    }
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse({ ...human, runId: 2 }).success).toBe(false);
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse({ ...human, toolCallId: 9 }).success).toBe(false);
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse({ ...human, basedOnCandidateId: 4 }).success).toBe(false);
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse({ ...human, basedOnCandidateId: null }).success).toBe(false);
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse({ ...human, origin: 'model' }).success).toBe(false);
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse({ ...human, candidate: { ...edited,
+      fields: { ...edited.fields, invoiceNumber: { ...edited.fields.invoiceNumber, sources: [source] } },
+    } }).success).toBe(false);
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse({ ...outputExamples.get_invoice_candidate, candidate: edited }).success).toBe(false);
+    const { origin, ...missingOrigin } = human;
+    expect(invoiceToolSchemas.get_invoice_candidate.output.safeParse(missingOrigin).success).toBe(false);
+    const legacy = invoiceToolSchemas.get_invoice_candidate.output.parse(outputExamples.get_invoice_candidate);
+    expect(legacy).toEqual(JSON.parse(JSON.stringify(outputExamples.get_invoice_candidate)));
+    expect(Object.hasOwn(legacy, 'origin')).toBe(false);
+    expect(Object.hasOwn(legacy.candidate.fields.invoiceNumber, 'valueOrigin')).toBe(false);
+  });
+
+  it('defines fourteen catalog schemas while retaining the thirteen review tool subset', () => {
+    expect(INVOICE_REVIEW_TOOL_NAMES).toEqual([
       'list_invoice_pages',
       'read_invoice_document',
       'search_invoice_document',
@@ -70,6 +123,7 @@ describe('P3 invoice tool contracts', () => {
       'compare_invoice_candidates',
       'save_invoice_candidate',
     ]);
+    expect(INVOICE_TOOL_NAMES).toEqual([...INVOICE_REVIEW_TOOL_NAMES, 'fill_invoice_form']);
     expect(Object.keys(invoiceToolSchemas)).toEqual([...INVOICE_TOOL_NAMES]);
     for (const name of INVOICE_TOOL_NAMES) {
       expect(invoiceToolSchemas[name].input).toBeDefined();
@@ -198,7 +252,7 @@ describe('P3 invoice tool contracts', () => {
     };
     expect(unbound).toBeDefined();
     expect(bound.executionMode).toBe('parallel');
-    expect(INVOICE_TOOL_NAMES).toHaveLength(13);
+    expect(INVOICE_REVIEW_TOOL_NAMES).toHaveLength(13);
   });
 
   it('retains optional Session and native call identity when normalizing AppError', () => {

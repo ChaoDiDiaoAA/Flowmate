@@ -14,23 +14,81 @@ export const ToolIdentitySchema = z.object({
   executionMode: ToolExecutionModeSchema,
 }).strict();
 
-export const RunScopeSchema = z.object({
-  version: z.literal(2),
+const scopeShape = {
   allowedTools: z.array(z.string().min(1).max(128)).max(64),
   allowedDocumentIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(64),
   allowedArtifactIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(128),
   allowedResourcePaths: z.array(z.string().min(1).max(4096)).max(64),
-}).strict();
+};
+export const RunScopeSchema = z.object({ version: z.literal(2), ...scopeShape }).strict();
 
 type RunScopeValues = z.infer<typeof RunScopeSchema>;
-export type RunScope = Readonly<Omit<RunScopeValues,
-  'allowedTools' | 'allowedDocumentIds' | 'allowedArtifactIds' | 'allowedResourcePaths'>> & {
-  readonly allowedTools: readonly string[];
-  readonly allowedDocumentIds: readonly number[];
-  readonly allowedArtifactIds: readonly number[];
-  readonly allowedResourcePaths: readonly string[];
+type ReadonlyScope<T> = {
+  readonly [K in keyof T]: T[K] extends readonly unknown[] ? Readonly<T[K]> : T[K];
 };
+export type RunScope = ReadonlyScope<RunScopeValues>;
+/** Historical draft records only. New executions use RunScope. */
+export type LegacyRunScope = Readonly<Omit<RunScope, 'version'> & {
+  version: 3; allowedWritePaths: readonly string[]; commandAccess: 'none' | 'trusted-local';
+}>;
 export type ToolIdentity = z.infer<typeof ToolIdentitySchema>;
+
+export const NATIVE_TOOL_NAMES = ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'] as const;
+export type NativeToolName = typeof NATIVE_TOOL_NAMES[number];
+export type NativeToolAvailability = { name: NativeToolName; available: boolean; reason: string | null };
+
+function isJsonData(value: unknown): boolean {
+  const pending = [value];
+  const seen = new Set<object>();
+  while (pending.length) {
+    const item = pending.pop();
+    if (item === null || typeof item === 'string' || typeof item === 'boolean') continue;
+    if (typeof item === 'number') { if (!Number.isFinite(item)) return false; continue; }
+    if (typeof item !== 'object' || Object.getOwnPropertySymbols(item).length) return false;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    const array = Array.isArray(item);
+    if (!array && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) return false;
+    const descriptors = Object.getOwnPropertyDescriptors(item);
+    if (array && (Object.keys(descriptors).length !== item.length + 1 || Object.keys(descriptors).some(key =>
+      key !== 'length' && (!/^(0|[1-9]\d*)$/.test(key) || Number(key) >= item.length)))) return false;
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (array && key === 'length') continue;
+      if (!descriptor.enumerable || !('value' in descriptor)) return false;
+      pending.push(descriptor.value);
+    }
+  }
+  return true;
+}
+
+export const NativeToolOutputSchema = z.object({
+  content: z.array(z.discriminatedUnion('type', [
+    z.object({ type: z.literal('text'), text: z.string() }).strict(),
+    z.object({ type: z.literal('image'), data: z.string(), mimeType: z.string().min(1) }).strict(),
+  ])),
+  details: z.unknown().optional(),
+}).strict().superRefine((output, context) => {
+  try {
+    if (!isJsonData(output)) {
+      context.addIssue({ code: 'custom', message: 'Native tool output must be JSON data.' });
+    }
+    JSON.stringify(output);
+  } catch {
+    context.addIssue({ code: 'custom', message: 'Native tool output must be JSON data.' });
+  }
+});
+export type NativeToolOutput = z.infer<typeof NativeToolOutputSchema>;
+
+export class ToolExecutionFailure<O = unknown> extends Error {
+  readonly error: AppError;
+  readonly data: O | undefined;
+  constructor(error: AppError, data?: O) {
+    super(error.message);
+    this.name = 'ToolExecutionFailure';
+    this.error = error;
+    this.data = data;
+  }
+}
 
 export const ToolExecutionContextSchema = z.object({
   runId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),

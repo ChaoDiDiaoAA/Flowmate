@@ -3,8 +3,8 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import { appError, fail, ok } from '@flowmate/contracts';
-import type { Result } from '@flowmate/contracts';
+import { InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, appError, fail, ok } from '@flowmate/contracts';
+import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, Result } from '@flowmate/contracts';
 import type { HostCommand, HostCredentialRequest, HostEvent, HostOutput } from '../../host/protocol.ts';
 
 type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
@@ -24,8 +24,14 @@ export class HostClient {
   private resolveExit: ((code: number | null) => void) | null = null;
   private closedReport: { closed: boolean; stopped: boolean; errors: readonly unknown[] } | null = null;
   private credentialHandler: ((request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>) | null = null;
+  private epoch = 0;
+  private invoiceFormHandler: ((request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>) | null = null;
 
   public get state(): HostState | null { return this.currentState; }
+  public get connectionEpoch(): number { return this.epoch; }
+  public setInvoiceFormHandler(handler: (request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>): void {
+    this.invoiceFormHandler = handler;
+  }
 
   public setCredentialHandler(handler: (request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>): void {
     this.credentialHandler = handler;
@@ -49,6 +55,10 @@ export class HostClient {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
+    this.epoch++;
+    this.expectedExit = false;
+    this.processExited = false;
+    this.closedReport = null;
     this.exited = new Promise<number | null>((resolveExit) => { this.resolveExit = resolveExit; });
     child.stdin.on('error', () => this.failAll('host_write_failed', 'Bun Host 输入通道已关闭。'));
     child.stderr.on('data', (chunk: Buffer) => {
@@ -68,6 +78,7 @@ export class HostClient {
       settleStartup(fail(appError('host_spawn_failed', 'runtime', 'Bun Host 无法启动。', true)));
     });
     child.on('exit', (code) => {
+      if (this.child !== child) return;
       this.processExited = true;
       this.resolveExit?.(code);
       this.resolveExit = null;
@@ -118,7 +129,7 @@ export class HostClient {
 
   public async close(): Promise<Result<{ closed: boolean; stopped: boolean; errors: readonly unknown[] }>> {
     if (this.closedReport && this.processExited) return ok(this.closedReport);
-    if (!this.child) return ok({ closed: true, stopped: true, errors: [] });
+    if (!this.child || this.child.pid === undefined) return ok({ closed: true, stopped: true, errors: [] });
     if (this.processExited || this.child.exitCode !== null) return ok({ closed: true, stopped: false,
       errors: [appError('host_exited', 'runtime', 'Bun Host 已退出，执行停止与清理未确认。', true)] });
     try {
@@ -145,6 +156,7 @@ export class HostClient {
   private readProtocol(child: ChildProcessWithoutNullStreams, onReady: (output: Extract<HostOutput, { type: 'ready' }>) => void, userDataPath: string): void {
     const input = createInterface({ input: child.stdout, crlfDelay: Infinity });
     input.on('line', (line) => {
+      if (this.child !== child) return;
       let output: HostOutput;
       try { output = JSON.parse(line) as HostOutput; }
       catch {
@@ -153,6 +165,26 @@ export class HostClient {
       }
       if (output.version !== 1 || typeof output.type !== 'string') return;
       if (output.type === 'ready') { onReady(output); return; }
+      if (output.type === 'invoice_form_request') {
+        const request = InvoiceFormBridgeRequestSchema.safeParse(output.request);
+        if (!request.success || typeof output.requestId !== 'string' || !output.requestId || output.requestId.length > 128) return;
+        const original = request.data;
+        const epoch = this.epoch;
+        const unknown = (): InvoiceFormApplicationReceipt => ({ runId: original.runId, toolCallId: original.toolCallId,
+          formInstanceId: original.target.formInstanceId, candidateId: original.candidateId, candidateSequence: original.candidateSequence,
+          observedAt: new Date().toISOString(), outcome: 'unknown' });
+        void Promise.resolve().then(() => this.invoiceFormHandler?.(original, epoch) ?? unknown())
+          .catch(unknown).then(value => {
+            if (this.child !== child || this.epoch !== epoch || !child.stdin.writable) return;
+            const receipt = InvoiceFormApplicationReceiptSchema.safeParse(value);
+            const matched = receipt.success && receipt.data.runId === original.runId && receipt.data.toolCallId === original.toolCallId
+              && receipt.data.formInstanceId === original.target.formInstanceId && receipt.data.candidateId === original.candidateId
+              && receipt.data.candidateSequence === original.candidateSequence;
+            child.stdin.write(`${JSON.stringify({ version: 1, type: 'invoice_form_response', requestId: output.requestId,
+              receipt: matched ? receipt.data : unknown() })}\n`);
+          });
+        return;
+      }
       if (output.type === 'credential_request') {
         void Promise.resolve().then(() => this.credentialHandler?.(output) ?? { ok: false })
           .catch(() => ({ ok: false })).then((value) => {
@@ -173,6 +205,7 @@ export class HostClient {
       }
     });
     input.on('close', () => {
+      if (this.child !== child) return;
       // Exit can precede stdout draining its buffered close acknowledgement.
       this.failAll('host_exited', 'Bun Host 输出通道已关闭。');
       if (!this.expectedExit) this.emit({ type: 'host_state', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath } });
@@ -198,6 +231,7 @@ export class HostClient {
 export function safeChildEnvironment(): NodeJS.ProcessEnv {
   const allowed = ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'BUN_INSTALL'];
   const env: NodeJS.ProcessEnv = {};
+  env.PI_OFFLINE = '1';
   for (const name of allowed) if (process.env[name]) env[name] = process.env[name];
   for (const [name, value] of Object.entries(process.env)) {
     if (value && !/^(FLOWMATE_|LANGFUSE_|CODEX_)/.test(name)

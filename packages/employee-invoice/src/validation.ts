@@ -4,7 +4,14 @@ import type {
   InvoiceField,
   InvoiceIssue,
   InvoiceToolOutput,
+  StoredCandidateDraft,
+  StoredInvoiceField,
+  DocumentRef,
+  Result,
 } from '@flowmate/contracts';
+import { StoredCandidateDraftSchema, appError, fail, ok } from '@flowmate/contracts';
+import type { DocumentService } from '@flowmate/data';
+import { checkSource } from './tools/check_invoice_sources.ts';
 import { absoluteDecimalAtMost, addDecimal, multiplyDecimal, parseDecimal, roundDecimal, subtractDecimal, taxAmount, toDecimalString } from '@flowmate/shared';
 
 export const currencyScales: Readonly<Record<string, number>> = { CNY: 2, USD: 2, EUR: 2, GBP: 2, JPY: 0, KWD: 3, BHD: 3 };
@@ -17,9 +24,30 @@ export function evaluateCandidate(candidate: CandidateDraft,
   sourceResults: readonly InvoiceToolOutput<'check_invoice_sources'>['results'][number][]): {
     violations: { code: string; fieldPaths: string[] }[]; checks: CheckResult[]; issues: InvoiceIssue[];
   } {
+  return evaluateFields(candidate, sourceResults, false);
+}
+
+export function validateHumanInvoiceCandidate(raw: StoredCandidateDraft, documentRef: DocumentRef,
+  documents: DocumentService): Result<{ checks: CheckResult[]; issues: InvoiceIssue[] }> {
+  const parsed = StoredCandidateDraftSchema.safeParse(raw);
+  if (!parsed.success) return fail(appError('input_invalid', 'input', '人工候选结构或来源标记无效。'));
+  const loaded = documents.readParsedForWorkspace(documentRef.id);
+  if (!loaded.ok) return loaded;
+  if (loaded.data.document.documentRef.version !== documentRef.version) return fail(appError('state_conflict', 'input', '编辑依据材料版本已变化。'));
+  const sources = candidateFields(parsed.data).flatMap(field => field.value.sources);
+  const results = sources.map((source, index) => ({ index, ...checkSource(source, loaded.data.document, loaded.data.parsed) }));
+  const evaluated = evaluateFields(parsed.data, results, true);
+  return evaluated.violations.length ? fail(appError('input_invalid', 'input', '人工候选未通过来源、字段或精确数值校验。'))
+    : ok({ checks: evaluated.checks, issues: evaluated.issues });
+}
+
+function evaluateFields(candidate: StoredCandidateDraft,
+  sourceResults: readonly InvoiceToolOutput<'check_invoice_sources'>['results'][number][], trustedHuman: boolean): {
+    violations: { code: string; fieldPaths: string[] }[]; checks: CheckResult[]; issues: InvoiceIssue[];
+  } {
   const violations: { code: string; fieldPaths: string[] }[] = [];
   const checks: CheckResult[] = [];
-  const issues: InvoiceIssue[] = candidate.notes.map((message) => ({
+  const issues: InvoiceIssue[] = trustedHuman ? [] : candidate.notes.map((message) => ({
     code: 'model_note', severity: 'warning', origin: 'model', fieldPaths: [], message, rule: null,
   }));
   const fields = candidateFields(candidate);
@@ -34,7 +62,7 @@ export function evaluateCandidate(candidate: CandidateDraft,
     if (value.normalized !== null && !value.normalized.trim()) addViolation(violations, 'normalized_value_blank', [path]);
     if (value.state === 'present') {
       if (value.raw === null || !value.raw.trim()) addViolation(violations, 'present_value_missing', [path]);
-      if (value.sources.length === 0) addViolation(violations, 'present_source_missing', [path]);
+      if (value.sources.length === 0 && !(trustedHuman && value.valueOrigin === 'user-provided')) addViolation(violations, 'present_source_missing', [path]);
       if (value.normalized === null) addIssue(issues, 'normalization_unresolved', 'warning', [path], 'No normalized value is available.', null);
     } else {
       if (value.normalized !== null) addViolation(violations, 'non_present_value_normalized', [path]);
@@ -79,9 +107,11 @@ export function evaluateCandidate(candidate: CandidateDraft,
 
   if (badSourcePaths.length > 0) addViolation(violations, 'source_invalid', badSourcePaths);
   const allSourcesAccounted = sourceResults.length === sources.length && validSourceCount === sources.length;
+  const sourceFreeUserValues = trustedHuman && fields.some(({ value }) => value.state === 'present')
+    && fields.filter(({ value }) => value.state === 'present').every(({ value }) => value.valueOrigin === 'user-provided');
   checks.push(check('source-reference', sources.length === 0 ? 'not_applicable' : !allSourcesAccounted || badSourcePaths.length > 0 ? 'failed' : 'passed',
   unique(sources.length === 0 ? fields.filter(({ value }) => value.state === 'present').map(({ path }) => path) : badSourcePaths),
-  null, null, null, null, sources.length === 0 ? 'present_source_missing' : null));
+  null, null, null, null, sources.length === 0 ? sourceFreeUserValues ? 'user_provided_values' : 'present_source_missing' : null));
 
   const missingRequired = requiredHeader.filter((name) => candidate.fields[name].state === 'missing'
     || candidate.fields[name].state === 'unreadable' || candidate.fields[name].state === 'ambiguous'
@@ -130,7 +160,7 @@ export function evaluateCandidate(candidate: CandidateDraft,
   return { violations: uniqueViolations(violations), checks, issues: uniqueIssues(issues) };
 }
 
-function candidateFields(candidate: CandidateDraft): { path: string; name: string; value: InvoiceField }[] {
+function candidateFields(candidate: StoredCandidateDraft): { path: string; name: string; value: StoredInvoiceField }[] {
   const header = Object.entries(candidate.fields).map(([name, value]) => ({ path: `/fields/${name}`, name, value }));
   const lines = candidate.lines.flatMap((line, index) => Object.entries(line).map(([name, value]) => ({
     path: `/lines/${index}/${name}`, name: `lines.${name}`, value,

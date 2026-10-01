@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import type { AgentRunEvent, DesktopState, ModelAuthNotice, ModelAuthPrompt } from '@flowmate/contracts';
-import { SessionMessagesRequestSchema } from '@flowmate/contracts';
+import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionInputQuerySchema,
+  SessionMessagesRequestSchema, WorkingDirectorySchema, WorkspaceExpectationSchema, SaveInvoiceCandidateRequestSchema,
+  AcceptInvoiceCandidateRequestSchema, RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema,
+  InvoiceCandidateOperationQuerySchema } from '@flowmate/contracts';
+import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
 const modelId = z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/);
@@ -9,6 +13,10 @@ const pageLimit = z.number().int().min(1).max(100);
 const sessionTitle = z.string().trim().min(1).refine((value) => [...value].length <= 120 && new TextEncoder().encode(value).byteLength <= 480);
 const credentialRef = z.string().regex(/^[a-zA-Z0-9_-]{16,80}$/);
 const boundedText = z.string().refine((value) => new TextEncoder().encode(value).byteLength <= 65_536);
+export const InvoiceFormRunInputSchema = z.object({ modelId, clientSequence: dbId,
+  target: InvoiceFormTargetSchema, workspace: WorkspaceExpectationSchema,
+}).strict().refine(value => value.workspace.documentRef !== null && value.workspace.jobId !== null
+  && value.workspace.candidateRef !== null, 'Fill requires a selected candidate.');
 const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).strict();
 const workspaceChange = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('document'), documentId: dbId.nullable() }).strict(),
@@ -19,9 +27,21 @@ const workspaceChange = z.discriminatedUnion('kind', [
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
+  z.object({ version: z.literal(1), requestId, type: z.literal('save_invoice_candidate'), input: SaveInvoiceCandidateRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('accept_invoice_candidate'), input: AcceptInvoiceCandidateRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('reject_invoice_candidate'), input: RejectInvoiceCandidateRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('export_invoice_candidate'), input: ExportInvoiceCandidateRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_invoice_candidate_operation'), input: InvoiceCandidateOperationQuerySchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('get_state') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('credential_response'),
     value: z.object({ ok: z.boolean(), credential: z.unknown().optional() }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('invoice_form_response'),
+    receipt: InvoiceFormApplicationReceiptSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('submit_invoice_form_input'), input: InvoiceFormRunInputSchema,
+    expectedSettingsRevision: dbId, expectedCredentialRef: credentialRef }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_session_input'), input: SessionInputQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_invoice_form_application'),
+    input: z.object({ runId: dbId, toolCallId: dbId }).strict() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_model_catalog'),
     providerId: z.string().min(1).max(128).optional(), refresh: z.boolean() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('login_model'), modelId,
@@ -71,6 +91,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('read_document_original'), documentId: dbId, page: z.literal(1) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('revoke_document_use'), documentId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('create_session'), input: z.object({ title: sessionTitle.optional() }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_native_tools') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('rename_session'), input: z.object({ sessionId: dbId, title: sessionTitle }).strict() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('delete_session'), sessionId: dbId }).strict(),
   z.object({
@@ -98,8 +119,14 @@ const hostCommandSchema = z.discriminatedUnion('type', [
         candidateRef: z.object({ id: dbId, sequence: dbId }).strict().nullable(), sessionId: dbId,
       }).strict().optional(),
       goalMode: z.enum(['answer', 'save-candidate']),
+      workingDirectory: WorkingDirectorySchema.optional(),
       timeoutMs: z.number().int().min(100).max(120_000).optional(),
-    }).strict(),
+    }).strict().superRefine((input, ctx) => {
+      if (input.workingDirectory !== undefined && input.workspace === undefined)
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Working directory requires a Workspace Run.' });
+      if (input.goalMode === 'save-candidate' && (!input.workspace?.documentRef || !input.workspace.jobId))
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invoice context and processing task are required.' });
+    }),
     expectedSettingsRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     expectedCredentialRef: credentialRef,
   }).strict(),
@@ -119,6 +146,7 @@ export type HostReady = {
 export type HostResponse = { version: 1; type: 'response'; requestId: string; value: unknown };
 export type HostCredentialRequest = { version: 1; type: 'credential_request'; requestId: string;
   credentialRef: string; operation: 'read' | 'write' | 'delete'; credential?: unknown };
+export type HostInvoiceFormRequest = { version: 1; type: 'invoice_form_request'; requestId: string; request: InvoiceFormBridgeRequest };
 
 export type HostEvent = {
   version: 1;
@@ -132,7 +160,7 @@ export type HostEvent = {
     | { type: 'agent_run_event'; requestId: string; value: AgentRunEvent };
 };
 
-export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest;
+export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest | HostInvoiceFormRequest;
 
 export function parseHostCommand(value: unknown): HostCommand | null {
   const parsed = hostCommandSchema.safeParse(value);

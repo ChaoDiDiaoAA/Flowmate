@@ -2,12 +2,13 @@ import type { TSchema } from '@earendil-works/pi-ai';
 import type { AgentToolResult, ToolDefinition as PiToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { ToolDefinition } from '@flowmate/contracts';
 import { toPiParameters } from './schema.ts';
+import { getNativeToolParameters } from './native-tools.ts';
 
 export function toPiTool(
   definition: ToolDefinition<any, any>,
   execute: (toolCallId: string, input: unknown, signal?: AbortSignal) => Promise<AgentToolResult<unknown>>,
 ): PiToolDefinition {
-  const parameters = toPiParameters(definition.inputSchema) as TSchema;
+  const parameters = getNativeToolParameters(definition) ?? toPiParameters(definition.inputSchema) as TSchema;
   return {
     name: definition.name,
     label: definition.label ?? definition.name,

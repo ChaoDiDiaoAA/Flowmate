@@ -75,6 +75,100 @@ export const CandidateDraftSchema = z.object({
   notes: z.array(z.string().max(1024)).max(20),
 }).strict();
 export type CandidateDraft = z.infer<typeof CandidateDraftSchema>;
+// Model write inputs stay strict; provenance is accepted only by stored read projections.
+export const StoredInvoiceFieldSchema = InvoiceFieldSchema.extend({
+  valueOrigin: z.literal('user-provided').optional(),
+}).strict().refine(field => field.valueOrigin !== 'user-provided' || field.sources.length === 0,
+  'User-provided values cannot claim document sources.');
+export type StoredInvoiceField = z.infer<typeof StoredInvoiceFieldSchema>;
+export const StoredCandidateDraftSchema = CandidateDraftSchema.extend({
+  fields: z.object({
+    invoiceNumber: StoredInvoiceFieldSchema,
+    issueDate: StoredInvoiceFieldSchema,
+    sellerName: StoredInvoiceFieldSchema,
+    sellerTaxId: StoredInvoiceFieldSchema,
+    buyerName: StoredInvoiceFieldSchema,
+    buyerTaxId: StoredInvoiceFieldSchema,
+    currency: StoredInvoiceFieldSchema,
+    netAmount: StoredInvoiceFieldSchema,
+    taxAmount: StoredInvoiceFieldSchema,
+    totalAmount: StoredInvoiceFieldSchema,
+  }).strict(),
+  lines: z.array(z.object({
+    description: StoredInvoiceFieldSchema,
+    quantity: StoredInvoiceFieldSchema,
+    unit: StoredInvoiceFieldSchema,
+    unitPrice: StoredInvoiceFieldSchema,
+    netAmount: StoredInvoiceFieldSchema,
+    taxRate: StoredInvoiceFieldSchema,
+    taxAmount: StoredInvoiceFieldSchema,
+    totalAmount: StoredInvoiceFieldSchema,
+  }).strict()).max(200),
+}).strict();
+export type StoredCandidateDraft = z.infer<typeof StoredCandidateDraftSchema>;
+
+// The local form sends values, never evidence or model field metadata.
+export const invoiceHeaderFields = ['invoiceNumber', 'issueDate', 'sellerName', 'sellerTaxId', 'buyerName',
+  'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount'] as const;
+export const invoiceLineFields = ['description', 'quantity', 'unit', 'unitPrice', 'netAmount', 'taxRate',
+  'taxAmount', 'totalAmount'] as const;
+const formHeaderShape = Object.fromEntries(invoiceHeaderFields.map(name => [name, z.string().max(1024)])) as {
+  [Name in typeof invoiceHeaderFields[number]]: z.ZodString;
+};
+const formLineShape = Object.fromEntries(invoiceLineFields.map(name => [name, z.string().max(1024)])) as {
+  [Name in typeof invoiceLineFields[number]]: z.ZodString;
+};
+export const InvoiceFormDraftSchema = z.object({ fields: z.object(formHeaderShape).strict(),
+  lines: z.array(z.object(formLineShape).strict()).max(200), notes: z.array(z.string().max(1024)).max(20) }).strict();
+export type InvoiceFormDraft = z.infer<typeof InvoiceFormDraftSchema>;
+
+export function isLegalInvoiceNormalizedValue(name: string, value: string): boolean {
+  if (['netAmount', 'taxAmount', 'totalAmount', 'quantity', 'unitPrice', 'taxRate'].includes(name)) return decimalTextSchema.safeParse(value).success;
+  if (name === 'currency') return /^[A-Z]{3}$/.test(value);
+  if (name === 'issueDate') {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return false;
+    const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+    if (year < 1 || month < 1 || month > 12) return false;
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return day >= 1 && day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
+  }
+  return value.trim().length > 0;
+}
+export function invoiceFieldDisplayValue(name: string, field: StoredInvoiceField): string {
+  if (field.state === 'missing' || field.state === 'not_applicable') return '';
+  return field.state === 'present' && field.normalized !== null && isLegalInvoiceNormalizedValue(name, field.normalized)
+    ? field.normalized : field.raw ?? '';
+}
+
+const invoiceOperationShape = { operationRef: z.string().min(1).max(256), jobId: idSchema,
+  expectedCandidateId: idSchema, expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) };
+export const SaveInvoiceCandidateRequestSchema = z.object({ ...invoiceOperationShape,
+  basedOnCandidateId: idSchema, draft: InvoiceFormDraftSchema }).strict();
+export type SaveInvoiceCandidateRequest = z.infer<typeof SaveInvoiceCandidateRequestSchema>;
+export const AcceptInvoiceCandidateRequestSchema = z.object({ ...invoiceOperationShape,
+  candidateId: idSchema, dirty: z.literal(false) }).strict();
+export type AcceptInvoiceCandidateRequest = z.infer<typeof AcceptInvoiceCandidateRequestSchema>;
+export const RejectInvoiceCandidateRequestSchema = z.object({ ...invoiceOperationShape,
+  candidateId: idSchema, reason: z.string().trim().min(1).max(256) }).strict();
+export type RejectInvoiceCandidateRequest = z.infer<typeof RejectInvoiceCandidateRequestSchema>;
+export const ExportInvoiceCandidateRequestSchema = z.object({ operationRef: z.string().min(1).max(256),
+  candidateId: idSchema, format: z.enum(['json', 'csv', 'markdown']) }).strict();
+export type ExportInvoiceCandidateRequest = z.infer<typeof ExportInvoiceCandidateRequestSchema>;
+export type SaveInvoiceCandidateResponse = { changed: boolean; candidate: import('./activity.ts').CandidateSnapshot;
+  workspace: import('./workspace.ts').WorkspaceSnapshot };
+export type InvoiceCandidateDecisionResponse = { candidate: import('./activity.ts').CandidateSnapshot;
+  job: import('./workspace.ts').JobSnapshot; workspace: import('./workspace.ts').WorkspaceSnapshot };
+export type InvoiceExportReference = { artifactId: number; candidateId: number; format: ExportInvoiceCandidateRequest['format'];
+  relativePath: string; bytes: number; sha256: string; createdAt: string };
+export const InvoiceCandidateOperationQuerySchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('save'), request: SaveInvoiceCandidateRequestSchema }).strict(),
+  z.object({ kind: z.literal('accept'), request: AcceptInvoiceCandidateRequestSchema }).strict(),
+  z.object({ kind: z.literal('reject'), request: RejectInvoiceCandidateRequestSchema }).strict(),
+  z.object({ kind: z.literal('export'), request: ExportInvoiceCandidateRequestSchema }).strict(),
+]);
+export type InvoiceCandidateOperationQuery = z.infer<typeof InvoiceCandidateOperationQuerySchema>;
+export type InvoiceCandidateOperationResult = SaveInvoiceCandidateResponse | InvoiceCandidateDecisionResponse | InvoiceExportReference | null;
 const maxCandidateFieldPaths = 10 + 8 * 200;
 
 export const CheckResultSchema = z.object({
@@ -108,6 +202,44 @@ export const CandidateReceiptSchema = z.object({
   checks: z.array(CheckResultSchema).max(1_000),
 }).strict();
 export type CandidateReceipt = z.infer<typeof CandidateReceiptSchema>;
+
+export const FillInvoiceFormInputSchema = z.object({ candidateId: idSchema }).strict();
+export type FillInvoiceFormInput = z.infer<typeof FillInvoiceFormInputSchema>;
+export const FillInvoiceFormOutputSchema = z.object({
+  candidateId: idSchema, candidateSequence: idSchema, applied: z.literal(true),
+}).strict();
+export type FillInvoiceFormOutput = Readonly<z.infer<typeof FillInvoiceFormOutputSchema>>;
+export const InvoiceFormTargetSchema = z.object({
+  formInstanceId: z.string().min(1).max(128),
+  expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+export type InvoiceFormTarget = Readonly<z.infer<typeof InvoiceFormTargetSchema>>;
+const invoiceFormReceiptIdentity = {
+  runId: idSchema,
+  toolCallId: idSchema,
+  formInstanceId: InvoiceFormTargetSchema.shape.formInstanceId,
+  candidateId: idSchema,
+  candidateSequence: idSchema,
+  observedAt: z.string().datetime(),
+};
+export const InvoiceFormApplicationReceiptSchema = z.discriminatedUnion('outcome', [
+  z.object({ ...invoiceFormReceiptIdentity, outcome: z.literal('applied'),
+    appliedRevision: idSchema, appliedAt: z.string().datetime() }).strict(),
+  z.object({ ...invoiceFormReceiptIdentity, outcome: z.literal('not_applied'),
+    reason: z.string().min(1).max(128) }).strict(),
+  z.object({ ...invoiceFormReceiptIdentity, outcome: z.literal('unknown') }).strict(),
+]);
+export type InvoiceFormApplicationReceipt = Readonly<z.infer<typeof InvoiceFormApplicationReceiptSchema>>;
+const invoiceFormCallIdentity = {
+  runId: idSchema, sessionId: idSchema, toolCallId: idSchema,
+  nativeToolCallId: z.string().min(1).max(256), documentRef: DocumentRefSchema, jobId: idSchema,
+  candidateId: idSchema, candidateSequence: idSchema, target: InvoiceFormTargetSchema,
+};
+export const InvoiceFormBridgeRequestSchema = z.discriminatedUnion('operation', [
+  z.object({ ...invoiceFormCallIdentity, operation: z.literal('apply'), candidate: StoredCandidateDraftSchema }).strict(),
+  z.object({ ...invoiceFormCallIdentity, operation: z.literal('query') }).strict(),
+]);
+export type InvoiceFormBridgeRequest = Readonly<z.infer<typeof InvoiceFormBridgeRequestSchema>>;
 
 const pageRequestInput = {
   documentId: idSchema,
@@ -223,14 +355,23 @@ const candidateValidationSchema = z.object({
 
 const candidateSummarySchema = z.object({
   candidateId: idSchema,
-  runId: idSchema,
+  runId: idSchema.nullable(),
+  origin: z.enum(['model', 'human_edit']).optional(),
+  basedOnCandidateId: idSchema.nullable().optional(),
   sequence: idSchema,
   issueCount: z.number().int().min(0).max(20_000),
 }).strict();
 
+function validCandidateOrigin(candidate: z.infer<typeof candidateSummarySchema>): boolean {
+  return candidate.origin === 'human_edit'
+    ? candidate.runId === null && candidate.basedOnCandidateId != null
+      && candidate.basedOnCandidateId !== candidate.candidateId
+    : candidate.runId !== null && candidate.basedOnCandidateId == null;
+}
+
 const candidateIndexSchema = z.object({
   jobId: idSchema,
-  candidates: z.array(candidateSummarySchema).max(50),
+  candidates: z.array(candidateSummarySchema.refine(validCandidateOrigin, 'Invalid candidate provenance.')).max(50),
   nextBeforeSequence: idSchema.nullable(),
 }).strict();
 
@@ -238,11 +379,15 @@ const candidateDetailSchema = z.object({
   ...candidateSummarySchema.shape,
   jobId: idSchema,
   documentRef: DocumentRefSchema,
-  toolCallId: idSchema,
-  candidate: CandidateDraftSchema,
+  toolCallId: idSchema.nullable(),
+  candidate: StoredCandidateDraftSchema,
   checks: z.array(CheckResultSchema).max(1_000),
   issues: z.array(InvoiceIssueSchema).max(1_000),
-}).strict();
+}).strict().refine((candidate) => validCandidateOrigin(candidate)
+  && (candidate.origin === 'human_edit'
+    ? candidate.toolCallId === null
+    : candidate.toolCallId !== null && CandidateDraftSchema.safeParse(candidate.candidate).success),
+  'Invalid candidate provenance.');
 
 const candidateDiffPageSchema = z.object({
   jobId: idSchema,
@@ -267,7 +412,7 @@ const readPageInputSchema = z.object({
 
 const listBlocksInputSchema = z.object(pageRequestInput).strict();
 
-export const INVOICE_TOOL_NAMES = [
+export const INVOICE_REVIEW_TOOL_NAMES = [
   'list_invoice_pages',
   'read_invoice_document',
   'search_invoice_document',
@@ -282,6 +427,7 @@ export const INVOICE_TOOL_NAMES = [
   'compare_invoice_candidates',
   'save_invoice_candidate',
 ] as const;
+export const INVOICE_TOOL_NAMES = [...INVOICE_REVIEW_TOOL_NAMES, 'fill_invoice_form'] as const;
 
 export const invoiceToolSchemas = {
   list_invoice_pages: {
@@ -339,6 +485,7 @@ export const invoiceToolSchemas = {
     input: z.object({ documentId: idSchema, candidate: CandidateDraftSchema }).strict(),
     output: CandidateReceiptSchema,
   },
+  fill_invoice_form: { input: FillInvoiceFormInputSchema, output: FillInvoiceFormOutputSchema },
 } as const;
 
 export type InvoiceToolName = typeof INVOICE_TOOL_NAMES[number];

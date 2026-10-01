@@ -15,6 +15,13 @@ export type MessageViewState = {
 
 export type MessageMergeResult = { state: MessageViewState; queryRequired: boolean };
 
+export function messageViewsForDisplay(state: MessageViewState): SessionMessageView[] {
+  return [...state.byEntryId.values(), ...[...state.liveByRun]
+    .filter(([runId]) => !state.closedRuns.has(runId)).flatMap(([, items]) => [...items.values()])]
+    .sort((left, right) => left.runId === right.runId && left.liveOrdinal !== null && right.liveOrdinal !== null
+      ? left.liveOrdinal - right.liveOrdinal : 0);
+}
+
 export function applyMessageUpsert(state: MessageViewState,
   event: Extract<AgentRunEvent, { type: 'message_upsert' }>): MessageMergeResult {
   const next = copyState(state);
@@ -62,7 +69,8 @@ export function applyMessageUpsert(state: MessageViewState,
   return { state: next, queryRequired: gap };
 }
 
-export function mergeSavedHistory(state: MessageViewState, page: SessionMessagesPage): MessageMergeResult {
+export function mergeSavedHistory(state: MessageViewState, page: SessionMessagesPage,
+  query?: { beforeEntryId?: string; afterEntryId?: string | null }): MessageMergeResult {
   const next = copyState(state);
   const parsed = SessionMessagesPageSchema.safeParse(page);
   if (!parsed.success) return { state: next, queryRequired: true };
@@ -83,12 +91,35 @@ export function mergeSavedHistory(state: MessageViewState, page: SessionMessages
       identities.set(key, entryId);
     }
   }
+  const priorIds = [...state.byEntryId.keys()];
+  const remainingIds = priorIds.filter((entryId) => !entries.has(entryId));
+  let insertion = 0;
+  if (entries.size > 0) {
+    if (query?.beforeEntryId !== undefined) {
+      insertion = remainingIds.indexOf(query.beforeEntryId);
+      if (insertion < 0 || entries.has(query.beforeEntryId)) return { state: next, queryRequired: true };
+    } else {
+      const overlap = priorIds.findIndex((entryId) => entries.has(entryId));
+      if (overlap >= 0) insertion = priorIds.slice(0, overlap).filter((entryId) => !entries.has(entryId)).length;
+      else if (query?.afterEntryId !== undefined) {
+        const anchor = query.afterEntryId === null ? -1 : remainingIds.indexOf(query.afterEntryId);
+        if (query.afterEntryId !== null && anchor < 0) return { state: next, queryRequired: true };
+        insertion = anchor + 1;
+      } else if (priorIds.length > 0) return { state: next, queryRequired: true };
+    }
+  }
   let queryRequired = false;
   for (const view of entries.values()) {
     if (!writeSaved(next, view)) queryRequired = true;
   }
+  if (!queryRequired && entries.size > 0) {
+    const orderedIds = [...remainingIds.slice(0, insertion), ...entries.keys(), ...remainingIds.slice(insertion)];
+    next.byEntryId = new Map(orderedIds.map((entryId) => [entryId, next.byEntryId.get(entryId)!]));
+  }
   // A page is a saved-history observation, not an event revision. Keep items
-  // outside this page and leave sequence watermarks and Run closure unchanged.
+  // outside this page and order it by real query/overlap anchors, never timestamps.
+  // Dispatch anchors also retain newer saved observations beyond an older response.
+  // Sequence watermarks and Run closure remain unchanged.
   return { state: next, queryRequired };
 }
 
@@ -136,7 +167,18 @@ function writeSaved(state: MessageViewState, view: SessionMessageView): boolean 
     if (pending && !canAdvance(pending, view)) return false;
   }
 
-  state.byEntryId.set(view.entryId, view);
+  if (!existing && view.runId !== null && view.liveOrdinal !== null) {
+    const ordered = [...state.byEntryId];
+    const nextSibling = ordered.findIndex(([, item]) => item.runId === view.runId
+      && item.liveOrdinal !== null && item.liveOrdinal > view.liveOrdinal!);
+    const priorSibling = ordered.map(([, item]) => item.runId === view.runId
+      && item.liveOrdinal !== null && item.liveOrdinal < view.liveOrdinal!).lastIndexOf(true);
+    // Saved observations may arrive out of order. Establish the actual within-Run
+    // order before a later query uses this map's overlap or dispatch anchors.
+    ordered.splice(nextSibling >= 0 ? nextSibling : priorSibling >= 0 ? priorSibling + 1 : ordered.length,
+      0, [view.entryId, view]);
+    state.byEntryId = new Map(ordered);
+  } else state.byEntryId.set(view.entryId, view);
   if (key !== null) {
     state.aliases.set(key, view.entryId);
     const messages = state.liveByRun.get(view.runId!);

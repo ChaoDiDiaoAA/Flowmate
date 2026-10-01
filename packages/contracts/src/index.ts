@@ -8,3 +8,4 @@ export * from './tools.ts';
 export * from './invoice.ts';
 export * from './workspace.ts';
 export * from './activity.ts';
+export * from './session-inputs.ts';

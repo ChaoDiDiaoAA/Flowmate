@@ -2,6 +2,8 @@ import {
   createAssistantMessageEventStream,
   type AssistantMessage,
 } from '@earendil-works/pi-ai';
+import { isAbsolute } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import {
   createAgentSession,
   createExtensionRuntime,
@@ -43,12 +45,14 @@ import type {
   NativeMessageProjectionInput,
   SessionMessagesPage,
   SessionMessageView,
+  GoalMode,
 } from '@flowmate/contracts';
 import type { ProviderConfig } from '@flowmate/contracts';
-import { INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
+import { INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NativeToolOutputSchema, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
 import { normalizeUsage, modelRuntimeSnapshot, observedFetch, prepareModelRuntime, safeUrl } from './model-runtime.ts';
 import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import { toPiTool } from './tools.ts';
+import { getNativeToolParameters } from './native-tools.ts';
 import { formatExecutionPrompt, validateNativeHistory, validateModelMessages, projectSessionMessages, projectMessageView } from './messages.ts';
 
 const maxContextBytes = 512 * 1024;
@@ -78,7 +82,8 @@ type ActiveExecution = {
   signal: AbortSignal;
   observe: (event: AgentObservation) => void;
   p3: boolean;
-  goalMode: 'answer' | 'save-candidate';
+  goalMode: GoalMode;
+  nativeFailures: Set<string>;
   toolBinding?: AgentToolBinding;
   toolRequests: Map<string, ToolRequestState>;
   modelCallUsages: ModelCallUsage[];
@@ -109,7 +114,8 @@ type SessionRecord = {
   model?: NonNullable<ReturnType<ModelRuntime['getModel']>>;
   config?: ProviderConfig;
   snapshot?: SafeConfigSnapshot;
-  policy?: 'p2' | 'p3';
+  policy?: 'p2' | 'p3' | 'fill';
+  workingDirectory?: string;
   preparing: boolean;
   running: boolean;
   unusable: boolean;
@@ -161,7 +167,7 @@ function canReuseRuntime(previous: ProviderConfig | undefined, next: ProviderCon
 }
 
 function sameModel(a: NonNullable<ReturnType<ModelRuntime['getModel']>> | undefined, b: NonNullable<ReturnType<ModelRuntime['getModel']>>): boolean {
-  return Boolean(a && a.provider === b.provider && a.id === b.id && a.api === b.api && a.baseUrl === b.baseUrl);
+  return isDeepStrictEqual(a, b);
 }
 
 function systemError(error: ReturnType<typeof appError>, model: StreamModel, stopReason: 'error' | 'aborted' = 'error', text = ''): AssistantMessage {
@@ -397,7 +403,8 @@ export class PiAgentAdapter implements AgentPort {
       runInput: { runId: active.runId, input: {
         ...(active.input.workspaceInput ? { version: 2 as const, workspaceInput: active.input.workspaceInput } : { version: 1 as const }),
         goal: active.input.goal, text: active.input.text, messageTimestamp: active.input.messageTimestamp },
-        goalMode: active.input.toolBinding ? active.goalMode : null } });
+        goalMode: active.input.toolBinding ? active.goalMode : null,
+        ...(active.input.workingDirectory ? { workingDirectory: active.input.workingDirectory } : {}) } });
     if (view.ok) {
       try { active.observe({ type: 'display_message', message: structuredClone(view.data), ...now() }); } catch { /* display loss is repaired by querying native history */ }
     } else this.failToolRun(record, active, view.error);
@@ -416,7 +423,7 @@ export class PiAgentAdapter implements AgentPort {
     config: ProviderConfig,
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
-    options?: { activeToolNames?: readonly string[] },
+    options?: { activeToolNames?: readonly string[]; workingDirectory?: string; goalMode?: GoalMode },
   ): Promise<Result<PreparedAgent>> {
     const record = this.sessions.get(nativeSessionId);
     if (this.closed) return fail(appError('agent_port_closed', 'runtime', 'Agent Runtime 已关闭。'));
@@ -425,8 +432,19 @@ export class PiAgentAdapter implements AgentPort {
     if (record.preparing || record.running) return fail(appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
     if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
-    const policy = options ? 'p3' : 'p2';
-    const activeToolNames = policy === 'p3' ? [...(options?.activeToolNames ?? [])] : [];
+    if (options?.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form'].includes(options.goalMode))
+      return fail(appError('input_invalid', 'input', 'The goal mode is invalid.'));
+    const policy = options?.goalMode === 'fill-form' ? 'fill' : options ? 'p3' : 'p2';
+    const cwd = options?.workingDirectory ?? this.dependencies.cwd ?? process.cwd();
+    if (options?.workingDirectory) {
+      if (!isAbsolute(cwd) || !cwd.trim() || /[\u0000-\u001f\u007f]/.test(cwd))
+        return fail(appError('input_invalid', 'input', 'The working directory must be an absolute local path.'));
+    }
+    const activeToolNames = policy !== 'p2' ? [...(options?.activeToolNames ?? [])] : [];
+    if (policy === 'fill' ? activeToolNames.length !== 1 || activeToolNames[0] !== 'fill_invoice_form'
+      || options?.workingDirectory !== undefined : activeToolNames.includes('fill_invoice_form')) {
+      return fail(appError('tool_access_denied', 'runtime', 'Form application is available only in a dedicated fill Run.'));
+    }
     if (new Set(activeToolNames).size !== activeToolNames.length
       || activeToolNames.some((name) => !this.toolsByName.has(name))) {
       return fail(appError('tool_runtime_unavailable', 'runtime', 'Run 获准的工具未在 Pi Runtime 注册。', true));
@@ -453,14 +471,13 @@ export class PiAgentAdapter implements AgentPort {
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
       let session = record.session;
-      if (session && (runtime !== record.runtime || record.policy !== policy)) {
+      if (session && (runtime !== record.runtime || record.policy !== policy || record.workingDirectory !== cwd)) {
         session.dispose();
         record.session = undefined;
         session = undefined;
         replacingSession = true;
       }
       if (!session) {
-        const cwd = this.dependencies.cwd ?? process.cwd();
         sessionCreationStarted = true;
         const created = await createAgentSession({
           cwd,
@@ -469,15 +486,29 @@ export class PiAgentAdapter implements AgentPort {
           model,
           sessionManager: record.manager,
           settingsManager: inMemorySettings(),
-          resourceLoader: emptyResourceLoader(policy === 'p3' ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT),
-          ...(policy === 'p2' ? { noTools: 'all' as const, tools: [] } : {}),
-          customTools: policy === 'p3' ? [...this.toolsByName.values()].map((definition) => toPiTool(
+          resourceLoader: emptyResourceLoader(policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
+            : policy === 'p3' ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT),
+          noTools: 'all', tools: policy === 'p2' ? [] : [...this.toolsByName.keys()],
+          customTools: policy !== 'p2' ? [...this.toolsByName.values()].map((definition) => toPiTool(
             definition,
             (toolCallId, input, toolSignal) => this.executePiTool(record, definition, toolCallId, input, toolSignal),
           )) : [],
           thinkingLevel: 'off',
         });
         session = created.session;
+        const installed = session.getAllTools().map(tool => tool.name);
+        const expected = policy === 'p2' ? [] : [...this.toolsByName.keys()];
+        if (installed.length !== expected.length || new Set(installed).size !== installed.length
+          || expected.some(name => !installed.includes(name))) {
+          session.dispose();
+          throw new Error('Controlled tool registry mismatch.');
+        }
+        const afterToolCall = session.agent.afterToolCall;
+        session.agent.afterToolCall = async (context, hookSignal) => {
+          const result = await afterToolCall?.(context, hookSignal);
+          if (record.active?.nativeFailures.delete(context.toolCall.id)) return { ...result, isError: true };
+          return result;
+        };
         session.agent.toolExecution = 'parallel';
         session.setActiveToolsByName(activeToolNames);
         session.agent.streamFunction = this.wrapStream(record, session, session.agent.streamFunction);
@@ -518,9 +549,10 @@ export class PiAgentAdapter implements AgentPort {
       record.config = structuredClone(config);
       record.snapshot = snapshot;
       record.policy = policy;
+      record.workingDirectory = cwd;
       replacingSession = false;
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
-      const agent: AgentConfigFacts | P3AgentConfigFacts = policy === 'p3' ? {
+      const agent: AgentConfigFacts | P3AgentConfigFacts = policy !== 'p2' ? {
         policyVersion: 'p3-invoice-tools-v1', nativeSessionId, systemPrompt: session.systemPrompt,
         thinkingLevel: session.thinkingLevel, resourcePolicy: 'none', historyPolicy: 'memory-only',
         maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12,
@@ -615,15 +647,26 @@ export class PiAgentAdapter implements AgentPort {
   }
 
   private validateMessages(record: SessionRecord, messages: Parameters<typeof validateModelMessages>[0]): Result<void> {
-    if (messages.some((message) => 'content' in message && Array.isArray(message.content)
-      && message.content.some((block) => block && typeof block === 'object' && 'type' in block && block.type === 'image'))) {
-      return fail(appError('agent_image_history_blocked', 'session', '当前 Session 历史包含图像内容，未向模型发送。请通过 New Session 新建会话后继续。',
+    for (const message of messages) {
+      if (!('content' in message) || !Array.isArray(message.content)
+        || !message.content.some(block => block && typeof block === 'object' && 'type' in block && block.type === 'image')) continue;
+      if (message.role !== 'toolResult' || !NATIVE_TOOL_NAMES.includes(message.toolName as typeof NATIVE_TOOL_NAMES[number])) {
+        return fail(appError('agent_image_history_blocked', 'session', '当前 Session 历史包含不兼容的图像内容，未向模型发送。请通过 New Session 新建会话后继续。',
+          false, record.active?.runId, record.active?.sessionId));
+      }
+      if (!record.model?.input.includes('image')) return fail(appError('agent_model_image_unsupported', 'session',
+        'The selected model does not support image tool results. The saved image was not sent or removed.',
         false, record.active?.runId, record.active?.sessionId));
     }
     return validateModelMessages(messages);
   }
 
   private failToolRun(record: SessionRecord, active: ActiveExecution, error: ReturnType<typeof appError>): void {
+    if (error.code === 'session_history_invalid') {
+      // SDK may append after notifying observers; keep only the confirmed prefix.
+      record.historyFailure ??= error;
+      record.unusable = true;
+    }
     active.failure ??= error;
     active.stopReason = active.failure.code;
     this.stop(record, active);
@@ -747,7 +790,7 @@ export class PiAgentAdapter implements AgentPort {
 
     let invocation;
     try {
-      invocation = await binding.execute(definition.name, input, toolCall);
+      invocation = await binding.execute(definition.name, input, toolCall, request.raw);
     } catch {
       const error = appError('tool_execution_failed', 'tool', '工具执行失败。');
       this.failToolRun(record, active, error);
@@ -762,6 +805,14 @@ export class PiAgentAdapter implements AgentPort {
         : result.error;
       this.failToolRun(record, active, error);
       throw new Error(error.message);
+    }
+    if (getNativeToolParameters(definition)) {
+      const native = NativeToolOutputSchema.safeParse(result.data);
+      if (native.success) {
+        if (result.status !== 'succeeded') active.nativeFailures.add(nativeToolCallId);
+        return { content: native.data.content, details: native.data.details };
+      }
+      if (result.status === 'succeeded') throw new Error('The native tool returned an invalid result.');
     }
     if (result.status !== 'succeeded') throw new Error(result.error.message);
 
@@ -1074,9 +1125,15 @@ export class PiAgentAdapter implements AgentPort {
       return this.notStarted(nativeSessionId, appError('agent_execution_invalid', 'input', 'Agent Run 身份无效。'));
     }
     if (signal.aborted) return this.notStarted(nativeSessionId, appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'), 'aborted');
+    if ((record.policy === 'fill') !== (input.goalMode === 'fill-form')) {
+      return this.notStarted(nativeSessionId, appError('tool_access_denied', 'runtime', 'The execution does not match its prepared form policy.'));
+    }
+    if (input.workingDirectory !== undefined && input.workingDirectory !== record.workingDirectory) {
+      return this.notStarted(nativeSessionId, appError('tool_access_denied', 'runtime', 'The execution does not match its prepared working directory.'));
+    }
 
     const active: ActiveExecution = {
-      input, nextLiveOrdinal: 0, liveOrdinals: new WeakMap(),
+      input, nextLiveOrdinal: 0, liveOrdinals: new WeakMap(), nativeFailures: new Set(),
       runId: input.runId, sessionId: input.sessionId, nativeSessionId, signal, observe,
       p3: input.toolBinding !== undefined,
       goalMode: input.goalMode ?? 'answer',
@@ -1092,17 +1149,34 @@ export class PiAgentAdapter implements AgentPort {
     const unsubscribe = session.subscribe((event) => {
       if (event.type === 'turn_start') active.turnOrdinal += 1;
       if (event.type === 'message_start' || event.type === 'message_update' || event.type === 'message_end') {
+        if (record.historyFailure) return;
         const message = event.message;
         let ordinal = active.liveOrdinals.get(message);
+        const assistant = message.role === 'assistant';
         if (event.type === 'message_start') {
+          if (ordinal !== undefined || assistant && active.assistantOrdinal !== undefined) {
+            this.failToolRun(record, active, appError('session_history_invalid', 'session', 'Native message generation identity is inconsistent.'));
+            return;
+          }
           ordinal = ++active.nextLiveOrdinal;
-          if (message.role === 'assistant') active.assistantOrdinal = ordinal;
-        } else if (ordinal === undefined && message.role === 'assistant') ordinal = active.assistantOrdinal;
-        if (ordinal !== undefined) {
-          active.liveOrdinals.set(message, ordinal);
-          this.publishMessage(record, active, message, ordinal, 'pending',
-            event.type !== 'message_end' && message.role === 'assistant' ? 'streaming' : 'ended');
+          if (assistant) active.assistantOrdinal = ordinal;
+        } else {
+          if (assistant && (active.assistantOrdinal === undefined
+            || ordinal !== undefined && ordinal !== active.assistantOrdinal)) {
+            this.failToolRun(record, active, appError('session_history_invalid', 'session', 'Native message generation identity is inconsistent.'));
+            return;
+          }
+          // SDK partial/final objects can differ; only an open assistant may share its ordinal.
+          if (assistant) ordinal ??= active.assistantOrdinal;
+          if (ordinal === undefined) {
+            this.failToolRun(record, active, appError('session_history_invalid', 'session', 'Native message has no actual live identity.'));
+            return;
+          }
         }
+        active.liveOrdinals.set(message, ordinal);
+        this.publishMessage(record, active, message, ordinal, 'pending',
+          event.type !== 'message_end' && assistant ? 'streaming' : 'ended');
+        if (event.type === 'message_end' && assistant) delete active.assistantOrdinal;
       }
       const name = event.type;
       if (name === 'agent_start' || name === 'agent_end' || name === 'agent_settled'

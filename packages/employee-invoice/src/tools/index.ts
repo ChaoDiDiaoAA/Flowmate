@@ -1,10 +1,11 @@
-import { INVOICE_TOOL_NAMES } from '@flowmate/contracts';
+import { INVOICE_REVIEW_TOOL_NAMES } from '@flowmate/contracts';
 import type { ToolDefinition } from '@flowmate/contracts';
 import type { DocumentRepository, DocumentService } from '@flowmate/data';
 import type { CandidateRepository } from '@flowmate/contracts';
 import { listInvoicePages } from './list_invoice_pages.ts';
 import { readInvoiceDocument } from './read_invoice_document.ts';
 export { projectInvoiceDocumentPage } from './read_invoice_document.ts';
+export { fillInvoiceForm } from './fill_invoice_form.ts';
 import { searchInvoiceDocument } from './search_invoice_document.ts';
 import { listInvoiceTables } from './list_invoice_tables.ts';
 import { readInvoiceEvidence } from './read_invoice_evidence.ts';
@@ -26,7 +27,7 @@ export function createInvoiceTools(services: { documents: DocumentService; docum
     normalizeInvoiceValuesTool(), calculateInvoiceAmountsTool(), validateInvoiceCandidate(services.documents, services.documentRepository),
     listInvoiceCandidates(services.candidates), getInvoiceCandidate(services.candidates), compareInvoiceCandidates(services.candidates),
     saveInvoiceCandidate(services.documents, services.documentRepository, services.candidates, services.now)];
-  if (tools.length !== INVOICE_TOOL_NAMES.length || tools.some((tool, index) => tool.name !== INVOICE_TOOL_NAMES[index])) {
+  if (tools.length !== INVOICE_REVIEW_TOOL_NAMES.length || tools.some((tool, index) => tool.name !== INVOICE_REVIEW_TOOL_NAMES[index])) {
     throw new Error('invoice_tool_manifest_invalid');
   }
   return Object.freeze(tools);

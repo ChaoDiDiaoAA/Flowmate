@@ -1,8 +1,9 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, linkSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Dirent } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { appError, fail, ok } from '@flowmate/contracts';
-import type { DbId, ProductPaths, Result } from '@flowmate/contracts';
+import type { DbId, ProductPaths, Result, ExportInvoiceCandidateRequest, InvoiceExportReference } from '@flowmate/contracts';
 import type { DocumentRepository, StoredArtifact } from './repositories.ts';
 
 export type ArtifactPayload = {
@@ -78,6 +79,65 @@ export class FileStore {
   public constructor(private readonly paths: ProductPaths, private readonly documents: DocumentRepository) {
     this.root = resolve(paths.root);
     this.artifactRoot = resolve(paths.artifactsDir);
+  }
+
+  public publishInvoiceExport(input: { candidateId: DbId; jobId: DbId; sequence: number;
+    format: ExportInvoiceCandidateRequest['format']; bytes: Uint8Array }): Result<{ relativePath: string; bytes: number; sha256: string }> {
+    if (![input.candidateId, input.jobId, input.sequence].every(value => Number.isSafeInteger(value) && value > 0)
+      || !['json', 'csv', 'markdown'].includes(input.format) || input.bytes.byteLength < 1 || input.bytes.byteLength > 64 * 1024 * 1024) {
+      return fail(appError('input_invalid', 'input', '导出文件参数无效。'));
+    }
+    const relativePath = `outputs/invoice-${input.jobId}-result-${input.sequence}.${input.format === 'markdown' ? 'md' : input.format}`;
+    let temporary: string | null = null;
+    try {
+      const target = this.invoiceExportPath(relativePath);
+      const sha256 = createHash('sha256').update(input.bytes).digest('hex');
+      if (existsSync(target)) {
+        if (!lstatSync(target).isFile() || lstatSync(target).isSymbolicLink()
+          || !Buffer.from(readFileSync(target)).equals(Buffer.from(input.bytes))) {
+          return fail(appError('state_conflict', 'input', '导出目标存在不同内容，不能覆盖。'));
+        }
+        return ok({ relativePath, bytes: input.bytes.byteLength, sha256 });
+      }
+      temporary = join(dirname(target), `.invoice-export-${randomUUID()}.tmp`);
+      writeFileSync(temporary, input.bytes, { flag: 'wx' });
+      if (!Buffer.from(readFileSync(temporary)).equals(Buffer.from(input.bytes))) throw new Error('export_content_check_failed');
+      // A same-directory hard link publishes the complete file atomically and
+      // fails if another writer created the target, unlike rename-overwrite.
+      try { linkSync(temporary, target); }
+      catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+        if (!lstatSync(target).isFile() || lstatSync(target).isSymbolicLink()
+          || !Buffer.from(readFileSync(target)).equals(Buffer.from(input.bytes))) {
+          return fail(appError('state_conflict', 'input', '导出目标在发布期间变化，不能覆盖。'));
+        }
+      }
+      return ok({ relativePath, bytes: input.bytes.byteLength, sha256 });
+    } catch { return fail(appError('storage_write_failed', 'storage', '导出文件发布失败；已发布内容保留供核对。', true)); }
+    finally { if (temporary !== null) try { rmSync(temporary); } catch { /* preserve publication result */ } }
+  }
+
+  public readInvoiceExport(reference: InvoiceExportReference): Result<Uint8Array> {
+    try {
+      if (!/^[0-9a-f]{64}$/.test(reference.sha256) || !Number.isSafeInteger(reference.bytes) || reference.bytes < 1
+        || reference.bytes > 64 * 1024 * 1024) throw new Error('invalid_export_reference');
+      const path = this.invoiceExportPath(reference.relativePath);
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== reference.bytes) throw new Error('invalid_export_file');
+      const bytes = readFileSync(path);
+      if (createHash('sha256').update(bytes).digest('hex') !== reference.sha256) throw new Error('export_hash_mismatch');
+      return ok(bytes);
+    } catch { return fail(appError('artifact_unavailable', 'storage', '已导出文件缺失或变化，需按原事实核对。')); }
+  }
+
+  private invoiceExportPath(relativePath: string): string {
+    if (!/^outputs\/invoice-[1-9]\d*-result-[1-9]\d*\.(json|csv|md)$/.test(relativePath)) throw new Error('invalid_export_path');
+    const outputRoot = resolve(this.paths.outputsDir);
+    if (!within(this.root, outputRoot) || lstatSync(outputRoot).isSymbolicLink()
+      || !lstatSync(outputRoot).isDirectory() || relative(outputRoot, realpathSync(outputRoot)) !== '') throw new Error('invalid_export_root');
+    const target = join(outputRoot, relativePath.slice('outputs/'.length));
+    if (!within(outputRoot, target)) throw new Error('invalid_export_target');
+    return target;
   }
 
   public publish(input: PublishArtifactInput): Promise<Result<PublishedArtifactPair>> {

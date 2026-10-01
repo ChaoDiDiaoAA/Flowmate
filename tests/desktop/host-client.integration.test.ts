@@ -3,15 +3,90 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { createServer } from 'node:http';
 import { openDatabase } from '@flowmate/core';
 import { resolveProductPaths } from '@flowmate/shared';
 import { SessionMessageViewSchema } from '@flowmate/contracts';
-import type { SessionMessagesPage, SessionMessageView, Result } from '@flowmate/contracts';
+import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, SessionMessagesPage, SessionMessageView, Result,
+  DocumentSnapshot, WorkspaceSnapshot, TaskOperation, CandidateSelection, RunAccepted } from '@flowmate/contracts';
 import { mkdtemp } from '../support/resources.ts';
 import { HostClient, safeChildEnvironment } from '../../apps/desktop/main/host-client.ts';
+
+async function formBridgeFixture() {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-host-form-bridge-'));
+  mkdirSync(join(root, 'apps', 'host'), { recursive: true });
+  writeFileSync(join(root, 'apps', 'host', 'main.ts'), [
+    "import { createInterface } from 'node:readline';",
+    "console.log(JSON.stringify({ version: 1, type: 'ready', state: { version: 1, ready: true, host: 'ready', userDataPath: 'synthetic' } }));",
+    'const input = createInterface({ input: process.stdin }); let original;',
+    "input.on('line', line => { const command = JSON.parse(line); if (command.type === 'get_state') { original = command.requestId; console.log(JSON.stringify({ version: 1, type: 'invoice_form_request', requestId: 'form-call-1', request: { operation: 'query', runId: 101, toolCallId: 21, nativeToolCallId: 'native-call-1', sessionId: 12, documentRef: { id: 4, version: 'v1' }, jobId: 7, candidateId: 9, candidateSequence: 1, target: { formInstanceId: 'form-1', expectedRevision: 0 } } })); } else if (command.type === 'invoice_form_response') console.log(JSON.stringify({ version: 1, type: 'response', requestId: original, value: command.receipt })); });",
+    "input.on('close', () => process.exit(0));",
+  ].join('\n'));
+  return root;
+}
+
+it('routes a typed private form query through the current Host connection and preserves its original receipt', async () => {
+  const root = await formBridgeFixture();
+  const client = new HostClient();
+  let observedEpoch = 0;
+  client.setInvoiceFormHandler(async (request, epoch) => {
+    observedEpoch = epoch;
+    return { runId: request.runId, toolCallId: request.toolCallId, formInstanceId: request.target.formInstanceId,
+      candidateId: request.candidateId, candidateSequence: request.candidateSequence, outcome: 'applied',
+      appliedRevision: 1, observedAt: '2026-10-01T00:00:00.000Z', appliedAt: '2026-10-01T00:00:00.000Z' };
+  });
+  expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: true });
+  try {
+    expect(await client.request({ type: 'get_state' })).toMatchObject({ outcome: 'applied', toolCallId: 21, appliedRevision: 1 });
+    expect(observedEpoch).toBe(client.connectionEpoch);
+    expect(observedEpoch).toBeGreaterThan(0);
+  } finally {
+    const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    const exited = once(child, 'exit'); child.stdin.end(); await exited;
+  }
+}, 5_000);
+
+it('reports unknown for missing or mismatched form replies without claiming non-application', async () => {
+  const root = await formBridgeFixture();
+  const client = new HostClient();
+  expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: true });
+  try {
+    expect(await client.request({ type: 'get_state' })).toMatchObject({ outcome: 'unknown', runId: 101, toolCallId: 21 });
+    client.setInvoiceFormHandler(async () => ({ runId: 999, toolCallId: 21, formInstanceId: 'form-1', candidateId: 9,
+      candidateSequence: 1, outcome: 'not_applied', reason: 'wrong-run', observedAt: '2026-10-01T00:00:00.000Z' }));
+    expect(await client.request({ type: 'get_state' })).toMatchObject({ outcome: 'unknown', runId: 101, toolCallId: 21 });
+  } finally {
+    const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    const exited = once(child, 'exit'); child.stdin.end(); await exited;
+  }
+}, 5_000);
+
+it('closes promptly after a missing executable leaves Host unstarted', async () => {
+  const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-unstarted-'));
+  const previousExecutable = process.env.FLOWMATE_BUN_EXECUTABLE;
+  const client = new HostClient();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    process.env.FLOWMATE_BUN_EXECUTABLE = join(userDataRoot, 'missing-bun.exe');
+    expect(await client.start(userDataRoot, '0.1.0', resolve(import.meta.dir, '../..')))
+      .toMatchObject({ ok: false, error: { code: 'host_spawn_failed' } });
+    const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    expect(child.pid).toBeUndefined();
+    expect(existsSync(join(userDataRoot, 'data', 'app.sqlite'))).toBe(false);
+    const closed = await Promise.race([client.close(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Unstarted Host closure did not complete promptly')), 1_000);
+    })]);
+    expect(closed).toEqual({ ok: true, data: { stopped: true, closed: true, errors: [] } });
+    expect(await client.close()).toEqual(closed);
+    await expect(client.request({ type: 'get_state' })).rejects.toThrow('host_not_writable');
+  } finally {
+    clearTimeout(timer);
+    if (previousExecutable === undefined) delete process.env.FLOWMATE_BUN_EXECUTABLE;
+    else process.env.FLOWMATE_BUN_EXECUTABLE = previousExecutable;
+  }
+}, 5_000);
 
 it('does not report Host closure from an acknowledgement while its process is still alive', async () => {
   const root = await mkdtemp(join(tmpdir(), 'flowmate-host-exit-confirmation-'));
@@ -135,6 +210,7 @@ it('passes Pi provider ambient auth to Host without Judge or platform credential
     process.env.FLOWMATE_JUDGE_API_KEY = 'judge-fixture';
     process.env.LANGFUSE_SECRET_KEY = 'platform-fixture';
     const env = safeChildEnvironment();
+    expect(env.PI_OFFLINE).toBe('1');
     expect(env.DEEPSEEK_API_KEY).toBe('ambient-fixture');
     expect(env.FLOWMATE_JUDGE_API_KEY).toBeUndefined();
     expect(env.LANGFUSE_SECRET_KEY).toBeUndefined();
@@ -375,8 +451,8 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     expect(credentialRequests).toContain('read');
     expect(requestBodies.map(({ body }) => (body.tools ?? []).map((tool) =>
       (tool as { function?: { name?: string } }).function?.name).sort())).toEqual([
-      ['calculate_invoice_amounts', 'normalize_invoice_values'],
-      ['calculate_invoice_amounts', 'normalize_invoice_values'],
+      ['bash', 'calculate_invoice_amounts', 'edit', 'find', 'grep', 'ls', 'normalize_invoice_values', 'powershell', 'read', 'write'],
+      ['bash', 'calculate_invoice_amounts', 'edit', 'find', 'grep', 'ls', 'normalize_invoice_values', 'powershell', 'read', 'write'],
     ]);
     expect(JSON.stringify(requestBodies[0].body.messages)).toContain('INV-2048');
     expect(JSON.stringify(requestBodies[1].body.messages)).toContain('INV-2048');
@@ -580,6 +656,10 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     expect(recovered.data.items).toEqual(all.data.items.map((message) => ({ ...message, liveOrdinal: null })));
     expect(recovered.data.leafId).toBe(all.data.leafId);
     expect(recovered.data.session).toMatchObject({ availability: 'ready', historyState: 'recoverable' });
+    expect(await restarted.request({ type: 'query_prompt_trace', runId: first.data.runId }))
+      .toMatchObject({ ok: true, data: { availability: 'process-exited', calls: [], droppedCalls: null } });
+    expect(await restarted.request({ type: 'query_prompt_trace', runId: isolated.data.runId, callSequence: 1 }))
+      .toMatchObject({ ok: true, data: { availability: 'process-exited', calls: [], droppedCalls: null } });
     expect(await restarted.request({ type: 'list_session_messages', input: { sessionId: other.data.sessionId, limit: 100 } }))
       .toMatchObject({ ok: true, data: { items: [{ runId: isolated.data.runId, liveOrdinal: null }, { runId: isolated.data.runId, liveOrdinal: null }] } });
     expect({ requests: requests.length, credentials: credentials.length, events: upserts.length }).toEqual(beforeRead);
@@ -620,6 +700,122 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     server.stop(true);
   }
 }, 30_000);
+
+it('retains the actual Host late applied receipt after cancellation without changing terminal core or delivery', async () => {
+  const repoRoot = resolve(import.meta.dir, '../..');
+  const userDataRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-late-form-'));
+  const sourceRoot = await mkdtemp(join(tmpdir(), 'flowmate-host-late-source-')), source = join(sourceRoot, '000001');
+  mkdirSync(source, { recursive: true });
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64');
+  const content = JSON.stringify([{ type: 'text', text: 'Synthetic late receipt invoice', bbox: [0, 0, 1, 1], page_idx: 0 }]);
+  const pages = JSON.stringify([{ pageNumber: 1, text: 'Synthetic late receipt invoice', blockCount: 1 }]);
+  writeFileSync(join(source, 'original.png'), png); writeFileSync(join(source, 'content.json'), content); writeFileSync(join(source, 'pages.json'), pages);
+  writeFileSync(join(source, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId: '000001',
+    datasetId: 'voxel51-hq-invoice-ocr', sourceRecordId: 'host-late-form', datasetRevision: 'host-late-fixture', qualityStatus: 'complete',
+    allowedUsesClaim: ['local test'], licenseVerification: 'not_verified', files: [{ path: 'original.png', bytes: png.length },
+      { path: 'content.json', bytes: Buffer.byteLength(content) }, { path: 'pages.json', bytes: Buffer.byteLength(pages) }] }));
+  const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
+  const candidate = { fields: Object.fromEntries(['invoiceNumber', 'issueDate', 'sellerName', 'sellerTaxId', 'buyerName',
+    'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount'].map(name => [name, missing])), lines: [], notes: [] };
+  const requests: Array<{ tools?: Array<{ function: { name: string } }>; messages: Array<{ tool_call_id?: string }> }> = [];
+  const response = (value: string | { name: string; id: string; args: unknown }) => {
+    const chunk = (delta: unknown, finish_reason: string | null) => `data: ${JSON.stringify({ id: 'host-late-form', object: 'chat.completion.chunk',
+      created: 1, model: 'host-late-model', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    const delta = typeof value === 'string' ? { role: 'assistant', content: value } : { role: 'assistant', tool_calls: [{ index: 0,
+      id: value.id, type: 'function', function: { name: value.name, arguments: JSON.stringify(value.args) } }] };
+    return new Response(`${chunk(delta, null)}${chunk({}, typeof value === 'string' ? 'stop' : 'tool_calls')}data: [DONE]\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } });
+  };
+  let candidateId = 0, documentId = 0;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    const body = await request.json() as typeof requests[number]; requests.push(body);
+    if (body.tools?.some(tool => tool.function.name === 'fill_invoice_form'))
+      return response({ name: 'fill_invoice_form', id: 'host-late-apply', args: { candidateId } });
+    return body.messages.some(message => message.tool_call_id === 'host-late-save') ? response('Candidate ready.')
+      : response({ name: 'save_invoice_candidate', id: 'host-late-save', args: { documentId, candidate } });
+  } });
+  const client = new HostClient();
+  client.setCredentialHandler(async () => ({ ok: true, credential: { type: 'api_key', key: 'synthetic-host-late-form-key' } }));
+  const finished: number[] = [], bridgeCalls: InvoiceFormBridgeRequest[] = [];
+  client.subscribe(event => { if (event.type === 'agent_run_event' && event.value.type === 'run_finished') finished.push(event.value.runId); });
+  let replyLate!: (receipt: InvoiceFormApplicationReceipt) => void, dispatchedAt = 0;
+  client.setInvoiceFormHandler(async request => {
+    bridgeCalls.push(request);
+    if (request.operation === 'query') return { runId: request.runId, toolCallId: request.toolCallId, formInstanceId: request.target.formInstanceId,
+      candidateId: request.candidateId, candidateSequence: request.candidateSequence, outcome: 'unknown', observedAt: new Date().toISOString() };
+    dispatchedAt = Date.now();
+    return new Promise(resolveReply => { replyLate = resolveReply; });
+  });
+  const need = <T>(result: Result<T>): T => { if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`); return result.data; };
+  let db: Database | null = null;
+  try {
+    expect(await client.start(userDataRoot, '0.1.0', repoRoot, sourceRoot)).toMatchObject({ ok: true, data: { ready: true } });
+    const model = { id: 'host-late-model', credentialRef: 'host_late_form_credential', name: 'Host late form', kind: 'custom' as const,
+      providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'host-late-model', api: 'openai-completions',
+      contextWindow: 64_000, maxTokens: 16_384, reasoning: false };
+    expect(await client.request({ type: 'save_settings', settings: { version: 2, revision: 0, profile: { displayName: 'Host late form', theme: 'system' },
+      models: [model], defaultModelId: model.id, updatedAt: '2026-10-01T00:00:00.000Z' } })).toMatchObject({ ok: true, data: { revision: 1 } });
+    const document = need(await client.request({ type: 'import_invoice_material', sourceDirectory: source }) as Result<DocumentSnapshot>);
+    documentId = document.documentRef.id;
+    const session = need(await client.request({ type: 'create_session', input: {} }) as Result<{ sessionId: number }>);
+    let workspace = need(await client.request({ type: 'read_workspace' }) as Result<WorkspaceSnapshot>);
+    workspace = need(await client.request({ type: 'update_workspace', input: { expectedRevision: workspace.revision,
+      change: { kind: 'session', sessionId: session.sessionId } } }) as Result<WorkspaceSnapshot>);
+    workspace = need(await client.request({ type: 'update_workspace', input: { expectedRevision: workspace.revision,
+      change: { kind: 'document', documentId } } }) as Result<WorkspaceSnapshot>);
+    const task = need(await client.request({ type: 'start_task', input: { clientSequence: 1, expectedRevision: workspace.revision,
+      documentRef: document.documentRef, goal: 'Prepare selected candidate for a late form receipt.' } }) as Result<TaskOperation>);
+    const expectation = (value: WorkspaceSnapshot) => ({ revision: value.revision, sessionId: session.sessionId,
+      documentRef: value.documentRef, jobId: value.jobId, candidateRef: value.candidateRef });
+    const generated = need(await client.request({ type: 'start_run', input: { sessionId: session.sessionId, text: 'Save the controlled candidate.',
+      modelId: model.id, goalMode: 'save-candidate', workspace: expectation(task.workspace) }, expectedSettingsRevision: 1,
+      expectedCredentialRef: model.credentialRef }) as Result<RunAccepted>);
+    await waitFor(() => finished.includes(generated.runId));
+    const list = need(await client.request({ type: 'list_job_candidates', input: { jobId: task.job.jobId } }) as Result<{ items: Array<{ candidateId: number }> }>);
+    candidateId = list.items[0]!.candidateId;
+    workspace = need(await client.request({ type: 'read_workspace' }) as Result<WorkspaceSnapshot>);
+    const selected = need(await client.request({ type: 'select_candidate', input: { jobId: task.job.jobId, candidateId,
+      expectedCandidateId: workspace.candidateRef?.id ?? null, expectedRevision: workspace.revision } }) as Result<CandidateSelection>);
+    const fill = need(await client.request({ type: 'submit_invoice_form_input', input: { modelId: model.id, clientSequence: 1,
+      target: { formInstanceId: 'host-late-form-instance', expectedRevision: 0 }, workspace: expectation(selected.workspace) },
+      expectedSettingsRevision: 1, expectedCredentialRef: model.credentialRef }) as Result<RunAccepted>);
+    await waitFor(() => bridgeCalls.some(call => call.operation === 'apply'));
+    const apply = bridgeCalls.find(call => call.operation === 'apply')!;
+    const appliedAt = new Date().toISOString(); // The action occurred before cancel; its reply is still in transit.
+    expect(await client.request({ type: 'cancel_run', runId: fill.runId })).toMatchObject({ ok: true });
+    await waitFor(() => finished.includes(fill.runId));
+    const beforeRun = await client.request({ type: 'query_run', runId: fill.runId }), beforeRequests = requests.length;
+    expect(beforeRun).toMatchObject({ ok: true, data: { status: 'cancelled' } });
+    expect(await client.request({ type: 'query_invoice_form_application', input: { runId: fill.runId, toolCallId: apply.toolCallId } }))
+      .toMatchObject({ ok: true, data: { outcome: 'unknown' } });
+    expect(Date.now() - dispatchedAt).toBeLessThan(3_000);
+    replyLate({ runId: apply.runId, toolCallId: apply.toolCallId, formInstanceId: apply.target.formInstanceId, candidateId: apply.candidateId,
+      candidateSequence: apply.candidateSequence, outcome: 'applied', appliedRevision: 1, observedAt: new Date().toISOString(), appliedAt });
+    // Allow the original Host response to cross the pipe, then use a public read barrier.
+    // SQLite is EXCLUSIVE while Host lives; authoritative SQL is read only after normal close.
+    await new Promise(resolveWait => setTimeout(resolveWait, 100));
+    await client.request({ type: 'get_state' });
+    expect(await client.request({ type: 'query_run', runId: fill.runId })).toEqual(beforeRun);
+    expect(requests).toHaveLength(beforeRequests);
+    expect(bridgeCalls.filter(call => call.operation === 'apply')).toHaveLength(1);
+    expect(await client.request({ type: 'query_invoice_form_application', input: { runId: fill.runId, toolCallId: apply.toolCallId } }))
+      .toMatchObject({ ok: true, data: { outcome: 'applied', appliedRevision: 1, appliedAt } });
+    expect(await client.close()).toMatchObject({ ok: true, data: { closed: true } });
+    db = new Database(join(userDataRoot, 'data', 'app.sqlite'), { readonly: true });
+    const saved = db.query('SELECT status,result_json,delivery_json FROM tool_calls WHERE id=?').get(apply.toolCallId) as {
+      status: string; result_json: string; delivery_json: string };
+    expect(['failed', 'cancelled']).toContain(saved.status);
+    expect(JSON.parse(saved.result_json)).toMatchObject({ formApplication: { outcome: 'applied' } });
+    expect(JSON.parse(saved.result_json).data?.applied).not.toBe(true);
+    expect(JSON.parse(saved.delivery_json).state).not.toBe('request_observed');
+  } finally {
+    db?.close();
+    if (replyLate && bridgeCalls[0]) { const original = bridgeCalls[0]; replyLate({ runId: original.runId, toolCallId: original.toolCallId,
+      formInstanceId: original.target.formInstanceId, candidateId: original.candidateId, candidateSequence: original.candidateSequence,
+      outcome: 'unknown', observedAt: new Date().toISOString() }); }
+    await client.close(); server.stop(true);
+  }
+}, 15_000);
 
 async function waitFor(check: () => boolean): Promise<void> {
   const deadline = Date.now() + 10_000;

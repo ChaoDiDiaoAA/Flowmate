@@ -59,7 +59,7 @@ const input = {
 };
 
 describe('P1 SQLite storage', () => {
-  it('persists a provider run and projects the terminal fact through query', () => {
+  it('[F-run-state-contract] persists only permitted provider Run transitions and immutable terminal facts', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-storage-'));
     const opened = openDatabase(makePaths(root));
     expect(opened.ok).toBe(true);
@@ -71,7 +71,10 @@ describe('P1 SQLite storage', () => {
     if (!created.ok) return;
     const runId = created.data;
 
-    expect(opened.data.runs.start(runId, config, '2026-09-21T00:00:00.010Z').ok).toBe(true);
+    const createdSnapshot = opened.data.runs.get(runId);
+    expect(createdSnapshot).toMatchObject({ ok: true, data: {
+      status: 'created', output: null, error: null, cleanup, startedAt: null, endedAt: null, stoppedAt: null,
+    } });
     const terminal: TerminalWrite = {
       status: 'completed',
       output: { version: 1, text: '完成', partial: false, stopReason: 'stop', responseId: null, responseModel: 'deepseek-v4-flash' },
@@ -83,6 +86,16 @@ describe('P1 SQLite storage', () => {
       stoppedAt: '2026-09-21T00:00:00.019Z',
       durationMs: 10,
     };
+    expect(opened.data.runs.finish(runId, terminal)).toEqual({ ok: true, data: false });
+    expect(opened.data.runs.get(runId)).toEqual(createdSnapshot);
+    expect(opened.data.runs.start(runId, config, '2026-09-21T00:00:00.010Z').ok).toBe(true);
+    const runningSnapshot = opened.data.runs.get(runId);
+    expect(runningSnapshot).toMatchObject({ ok: true, data: {
+      status: 'running', output: null, error: null, cleanup, startedAt: '2026-09-21T00:00:00.010Z', endedAt: null,
+    } });
+    expect(opened.data.runs.start(runId, { ...config, name: 'late-config' }, '2026-09-21T00:00:00.011Z'))
+      .toMatchObject({ ok: false, error: { code: 'run_state_invalid' } });
+    expect(opened.data.runs.get(runId)).toEqual(runningSnapshot);
     expect(opened.data.runs.finish(runId, terminal)).toEqual({ ok: true, data: true });
 
     const queried = opened.data.runs.get(runId);
@@ -94,6 +107,38 @@ describe('P1 SQLite storage', () => {
       expect(queried.data.tokens).toEqual({ inputTokens: 10, outputTokens: 4, totalTokens: 14, cost: '0.001', usageComplete: true });
       expect(queried.data.durationMs).toBe(10);
     }
+    expect(opened.data.runs.finish(runId, { ...terminal, output: {
+      responseModel: 'deepseek-v4-flash', responseId: null, stopReason: 'stop', partial: false, text: '完成', version: 1,
+    }, cleanup: { errors: [], lateObservationRequired: false, stopReason: 'native-stop', stopped: true, version: 1 } }))
+      .toEqual({ ok: true, data: true });
+    expect(opened.data.runs.get(runId)).toEqual(queried);
+    expect(opened.data.runs.supplementUsage(runId, { ...terminal.usage,
+      sdkValues: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 14,
+        costInput: 0.0005, costOutput: 0.0005, costCacheRead: 0, costCacheWrite: 0, costTotal: 0.001 },
+    }, terminal.tokens)).toEqual({ ok: true, data: true });
+    const afterLateUsage = opened.data.runs.get(runId);
+    expect(afterLateUsage).toMatchObject({ ok: true, data: { usage: { sdkValues: { totalTokens: 14 } } } });
+    expect(opened.data.runs.finish(runId, terminal)).toEqual({ ok: true, data: true });
+    expect(opened.data.runs.finish(runId, { ...terminal, usage,
+      tokens: { inputTokens: 99, outputTokens: 99, totalTokens: 198, cost: '99', usageComplete: false } }))
+      .toEqual({ ok: true, data: true });
+    expect(opened.data.runs.get(runId)).toEqual(afterLateUsage);
+    const conflicts: Partial<TerminalWrite>[] = [
+      { output: { ...terminal.output!, text: 'Changed answer' } },
+      { error: { code: 'late-failure', category: 'provider', message: 'Late failure', retryable: false } },
+      { cleanup: { ...terminal.cleanup, stopped: false } },
+      { cleanup: { ...terminal.cleanup, stopReason: 'user' } },
+      { cleanup: { ...terminal.cleanup, errors: [{ code: 'late-cleanup', category: 'runtime', message: 'Late cleanup', retryable: false }] } },
+      { cleanup: { ...terminal.cleanup, lateObservationRequired: true } },
+      { endedAt: '2026-09-21T00:00:00.030Z' }, { stoppedAt: null }, { durationMs: 20 },
+      { cancelRequestedAt: '2026-09-21T00:00:00.015Z' },
+    ];
+    for (const conflict of conflicts) {
+      expect(opened.data.runs.finish(runId, { ...terminal, ...conflict })).toEqual({ ok: true, data: false });
+      expect(opened.data.runs.get(runId)).toEqual(afterLateUsage);
+    }
+    expect(opened.data.runs.finish(runId, { ...terminal, nativeHistoryUnusable: true })).toMatchObject({ ok: false });
+    expect(opened.data.runs.get(runId)).toEqual(afterLateUsage);
     expect(opened.data.runs.supplementUsage(runId, {
       ...usage,
       source: 'unknown',
@@ -108,11 +153,16 @@ describe('P1 SQLite storage', () => {
       expect(afterUnknown.data.usage.source).toBe('sdk');
       expect(afterUnknown.data.tokens).toEqual({ inputTokens: 10, outputTokens: 4, totalTokens: 14, cost: '0.001', usageComplete: true });
     }
-    expect(opened.data.runs.finish(runId, terminal)).toEqual({ ok: true, data: false });
+    expect(opened.data.runs.start(runId, config, '2026-09-21T00:00:00.030Z'))
+      .toMatchObject({ ok: false, error: { code: 'run_state_invalid' } });
+    expect(opened.data.runs.finish(runId, { ...terminal, status: 'failed', output: null,
+      error: { code: 'late-failure', category: 'provider', message: 'Late failure', retryable: false } }))
+      .toEqual({ ok: true, data: false });
+    expect(opened.data.runs.get(runId)).toEqual(afterUnknown);
     opened.data.close();
   });
 
-  it('[F-single-owner] rejects a second active provider run and keeps a cancelled terminal immutable', () => {
+  it.each(['failed', 'cancelled'] as const)('[F-single-owner] rejects a second active provider run and keeps a %s terminal immutable', (status) => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-storage-'));
     const opened = openDatabase(makePaths(root));
     expect(opened.ok).toBe(true);
@@ -126,18 +176,38 @@ describe('P1 SQLite storage', () => {
     if (!second.ok) expect(second.error.code).toBe('runtime_busy');
     expect(opened.data.runs.recordCancel(first.data, '2026-09-21T00:00:00.100Z')).toEqual({ ok: true, data: true });
 
-    expect(opened.data.runs.finish(first.data, {
-      status: 'cancelled',
+    const terminal: TerminalWrite = {
+      status,
       output: { version: 1, text: '', partial: true, stopReason: 'aborted', responseId: null, responseModel: null },
-      error: { version: 1, code: 'provider_cancelled', category: 'provider', message: '请求已取消。', retryable: false, runId: first.data },
+      error: { version: 1, code: status === 'cancelled' ? 'provider_cancelled' : 'provider_network_error', category: 'provider', message: '请求结束。', retryable: false, runId: first.data },
       usage,
       tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
       cleanup: { ...cleanup, stopped: true, stopReason: 'user' },
       endedAt: '2026-09-21T00:00:00.200Z',
       stoppedAt: '2026-09-21T00:00:00.150Z',
       durationMs: 100,
-    })).toEqual({ ok: true, data: true });
+    };
+    expect(opened.data.runs.finish(first.data, terminal)).toEqual({ ok: true, data: true });
+    const saved = opened.data.runs.get(first.data);
+    expect(saved).toMatchObject({ ok: true, data: {
+      status, startedAt: null, output: terminal.output, error: terminal.error, cleanup: terminal.cleanup,
+      cancelRequestedAt: '2026-09-21T00:00:00.100Z', endedAt: terminal.endedAt, stoppedAt: terminal.stoppedAt,
+    } });
+    expect(opened.data.runs.finish(first.data, terminal)).toEqual({ ok: true, data: true });
+    expect(opened.data.runs.finish(first.data, { ...terminal, cancelRequestedAt: '2026-09-21T00:00:00.100Z' }))
+      .toEqual({ ok: true, data: true });
+    expect(opened.data.runs.finish(first.data, { ...terminal,
+      error: { ...terminal.error!, message: 'Different failure' } })).toEqual({ ok: true, data: false });
+    expect(opened.data.runs.finish(first.data, { ...terminal, cancelRequestedAt: '2026-09-21T00:00:00.101Z' }))
+      .toEqual({ ok: true, data: false });
+    expect(opened.data.runs.get(first.data)).toEqual(saved);
     expect(opened.data.runs.recordCancel(first.data, '2026-09-21T00:00:00.300Z')).toEqual({ ok: true, data: false });
+    expect(opened.data.runs.start(first.data, config, '2026-09-21T00:00:00.300Z'))
+      .toMatchObject({ ok: false, error: { code: 'run_state_invalid' } });
+    expect(opened.data.runs.finish(first.data, { ...terminal, status: 'completed', error: null,
+      output: { ...terminal.output!, text: 'Late success', partial: false, stopReason: 'stop' } }))
+      .toEqual({ ok: true, data: false });
+    expect(opened.data.runs.get(first.data)).toEqual(saved);
     opened.data.close();
   });
 

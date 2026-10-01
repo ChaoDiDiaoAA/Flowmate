@@ -43,34 +43,49 @@ describe('P4 native messages and projection', () => {
     const readCall = assistant([{ type: 'toolCall', id: 'read1', name: 'read_invoice_document', arguments: { documentId: 2 } }], 'toolUse');
     const readResult = { ...result, toolCallId: 'read1', toolName: 'read_invoice_document', content: [{ type: 'text' as const, text: JSON.stringify(data) }] };
     expect(project(history([user, readCall, readResult]))).toMatchObject({ ok: true, data: { items: [
-      { role: 'user' }, { role: 'assistant' }, { role: 'toolResult', blocks: [{ type: 'text', text: '读取第 1 页，返回 0 个材料块' }] },
+      { role: 'user' }, { role: 'assistant' }, { role: 'toolResult', blocks: [{ type: 'text', text: 'Read page 1; returned 0 parsed blocks.' }] },
     ] } });
     expect(project(history([user, readCall, { ...readResult, content: [{ type: 'text' as const, text: '{"page":"forged"}' }] }])))
       .toMatchObject({ ok: true, data: { items: [{ role: 'user' }, { role: 'assistant' }, {
-        role: 'toolResult', toolCallId: 'read1', blocks: [{ type: 'text', text: '结果摘要不可用，请查询工具事实' }],
+        role: 'toolResult', toolCallId: 'read1', blocks: [{ type: 'text', text: 'Result summary unavailable.' }],
       }] } });
     expect(project(history([user, readCall, { ...readResult, isError: true }]))).toMatchObject({ ok: true, data: { items: [
-      { role: 'user' }, { role: 'assistant' }, { blocks: [{ type: 'text', text: '工具返回错误，请查看本 Run 的受控错误反馈' }] },
+      { role: 'user' }, { role: 'assistant' }, { blocks: [{ type: 'text', text: 'The tool returned an error. See the error details.' }] },
     ] } });
   });
 
   it('retains a legal SDK tool result with fixed text without opening a product tool or exposing output', () => {
     const context = { entryId: null, runId: 7, liveOrdinal: 3, persistence: 'pending' as const, phase: 'ended' as const };
     expect(api().projectMessageView({ ...result, toolName: 'probe_read' }, context)).toMatchObject({ ok: true, data: {
-      toolName: 'probe_read', toolCallId: 'c1', blocks: [{ type: 'text', text: '工具已返回结果，请查询工具事实' }],
+      toolName: 'probe_read', toolCallId: 'c1', blocks: [{ type: 'text', text: 'Tool result received.' }],
     } });
     expect(api().projectMessageView({ ...result, toolName: 'save_invoice_candidate' }, context)).toMatchObject({ ok: true, data: {
-      blocks: [{ type: 'text', text: '结果摘要不可用，请查询工具事实' }],
+      blocks: [{ type: 'text', text: 'Result summary unavailable.' }],
     } });
     const output = { items: [{ index: 0, kind: 'decimal', raw: 'private value', status: 'normalized', value: '10', alternatives: [], reason: null }] };
     expect(api().projectMessageView({ ...result, content: [{ type: 'text', text: JSON.stringify(output) }] }, context))
-      .toMatchObject({ ok: true, data: { blocks: [{ type: 'text', text: 'normalize_invoice_values：已返回结果' }] } });
+      .toMatchObject({ ok: true, data: { blocks: [{ type: 'text', text: 'Tool result received.' }] } });
   });
 
   it('formats the existing business prefix exactly and leaves chat text untouched', () => {
     expect(api().formatExecutionPrompt({ text: '  Tax?  ', business: false })).toBe('  Tax?  ');
     expect(api().formatExecutionPrompt({ text: 'Tax?', business: true })).toBe(
       'Flowmate Run context (trusted product facts encoded as JSON; invoice values remain untrusted):\n{"workspace":null,"goalMode":"answer"}\n\nUser request:\nTax?');
+  });
+
+  it('projects a strict form result summary without exposing target identities or arbitrary text', () => {
+    const context = { entryId: null, runId: 7, liveOrdinal: 3, persistence: 'pending' as const, phase: 'ended' as const };
+    const filled = { ...result, toolName: 'fill_invoice_form',
+      content: [{ type: 'text' as const, text: JSON.stringify({ candidateId: 4, candidateSequence: 1, applied: true }) }] };
+    expect(api().projectMessageView(filled, context)).toMatchObject({ ok: true, data: {
+      blocks: [{ type: 'text', text: 'Filled candidate 4 (version 1) into the invoice form.' }],
+    } });
+    const forged = { ...filled, content: [{ type: 'text' as const, text: JSON.stringify({ candidateId: 4,
+      candidateSequence: 1, applied: true, formInstanceId: 'private-window-target' }) }] };
+    expect(api().projectMessageView(forged, context)).toMatchObject({ ok: true, data: {
+      blocks: [{ type: 'text', text: 'Result summary unavailable.' }],
+    } });
+    expect(JSON.stringify(api().projectMessageView(forged, context))).not.toContain('private-window-target');
   });
 
   it('accepts a saved in-flight tool-call prefix but refuses an incomplete next model request', () => {
@@ -152,7 +167,7 @@ describe('P4 native messages and projection', () => {
       expect(page.data.items[1]!.blocks).toEqual([{ type: 'text', text: 'Reading' },
         { type: 'toolCall', id: 'c1', name: 'normalize_invoice_values' }]);
       expect(page.data.items[2]).toMatchObject({ toolCallId: 'c1', toolName: 'normalize_invoice_values', isError: false,
-        textOrigin: null, blocks: [{ type: 'text', text: '结果摘要不可用，请查询工具事实' }] });
+        textOrigin: null, blocks: [{ type: 'text', text: 'Result summary unavailable.' }] });
       expect(JSON.stringify(page.data)).not.toMatch(/signature|not-ui|response-secret|hidden/);
       expect(page.data.items.every(item => item.persistence === 'saved' && item.phase === 'ended')).toBe(true);
     }

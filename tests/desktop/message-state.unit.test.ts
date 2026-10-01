@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import type { AgentRunEvent, SessionAssistantMessageView, SessionMessagesPage } from '@flowmate/contracts';
-import { applyMessageUpsert, mergeSavedHistory, type MessageViewState } from '../../apps/desktop/renderer/src/message-state.ts';
+import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type MessageViewState } from '../../apps/desktop/renderer/src/message-state.ts';
 
 function state(): MessageViewState {
   return { sessionId: 12, byEntryId: new Map(), liveByRun: new Map(), lastSequenceByMessage: new Map(),
@@ -30,6 +30,12 @@ function saved(overrides: Partial<SessionAssistantMessageView> = {}): SessionAss
 }
 
 describe('P4 message snapshots', () => {
+  it('displays out-of-order saved observations by their real within-Run ordinals', () => {
+    const first = applyMessageUpsert(state(), event(2, saved({ entryId: 'entry-2', liveOrdinal: 2 })));
+    const result = applyMessageUpsert(first.state, event(1, saved({ entryId: 'entry-1', liveOrdinal: 1 })));
+    expect(messageViewsForDisplay(result.state).map((view) => view.entryId)).toEqual(['entry-1', 'entry-2']);
+  });
+
   it('keeps the newer complete snapshot when the same message arrives out of order', () => {
     const first = applyMessageUpsert(state(), event(2, message({ blocks: [{ type: 'text', text: 'AB' }] })));
     const result = applyMessageUpsert(first.state, event(1));
@@ -139,6 +145,43 @@ describe('P4 message snapshots', () => {
 });
 
 describe('P4 saved history reconciliation', () => {
+  it('keeps an earlier saved Run before the next Run across partial overlapping pages', () => {
+    const earlier = (ordinal: number) => saved({ entryId: `earlier-${ordinal}`, liveOrdinal: ordinal });
+    const later = (ordinal: number) => saved({ entryId: `later-${ordinal}`, runId: 102, liveOrdinal: ordinal });
+    const first = applyMessageUpsert(state(), event(100, earlier(100))).state;
+    const reordered = applyMessageUpsert(first, event(1, earlier(1))).state;
+    const firstPage = mergeSavedHistory(reordered, page(Array.from({ length: 50 }, (_, index) => earlier(index + 51))),
+      { afterEntryId: 'earlier-100' }).state;
+    firstPage.closedRuns.add(101);
+    const secondRun = applyMessageUpsert(firstPage, { ...event(1, later(1)), runId: 102 }).state;
+    const nextSaved = applyMessageUpsert(secondRun, { ...event(2, later(2)), runId: 102 }).state;
+    const refreshed = mergeSavedHistory(nextSaved, page([
+      ...Array.from({ length: 48 }, (_, index) => earlier(index + 53)), later(1), later(2),
+    ]), { afterEntryId: 'later-2' });
+    expect(refreshed.queryRequired).toBe(false);
+    const expected = ['earlier-1', ...Array.from({ length: 50 }, (_, index) => `earlier-${index + 51}`), 'later-1', 'later-2'];
+    expect([...refreshed.state.byEntryId.keys()]).toEqual(expected);
+    expect(messageViewsForDisplay(refreshed.state).map((view) => view.entryId)).toEqual(expected);
+  });
+
+  it('places an older query page before its real cursor even when timestamps and ordinals cannot order it', () => {
+    const first = mergeSavedHistory(state(), page([saved({ entryId: 'entry-2', liveOrdinal: null })]));
+    const result = mergeSavedHistory(first.state, page([saved({ entryId: 'entry-1', liveOrdinal: null })]),
+      { beforeEntryId: 'entry-2' });
+    expect(result.queryRequired).toBe(false);
+    expect([...result.state.byEntryId.keys()]).toEqual(['entry-1', 'entry-2']);
+  });
+
+  it('keeps saved observations which arrived after a latest query beyond its older response page', () => {
+    const initial = mergeSavedHistory(state(), page([saved({ entryId: 'entry-1', liveOrdinal: null })])).state;
+    const later = mergeSavedHistory(initial, page([saved({ entryId: 'entry-3', liveOrdinal: null })]),
+      { afterEntryId: 'entry-1' }).state;
+    const result = mergeSavedHistory(later, page([saved({ entryId: 'entry-2', liveOrdinal: null })]),
+      { afterEntryId: 'entry-1' });
+    expect(result.queryRequired).toBe(false);
+    expect([...result.state.byEntryId.keys()]).toEqual(['entry-1', 'entry-2', 'entry-3']);
+  });
+
   it('establishes the same alias when query wins the race with the saved notification', () => {
     const first = applyMessageUpsert(state(), event(1));
     const queried = mergeSavedHistory(first.state, page([saved()]));
@@ -176,8 +219,8 @@ describe('P4 saved history reconciliation', () => {
   it('retains saved items outside the latest queried page and merges older pages idempotently', () => {
     const first = mergeSavedHistory(state(), page([saved({ entryId: 'entry-2', liveOrdinal: 2, timestamp: 1790726400001 })]));
     const olderPage = { ...page([saved({ liveOrdinal: null })]), nextBeforeEntryId: 'entry-1' };
-    const second = mergeSavedHistory(first.state, olderPage);
-    const result = mergeSavedHistory(second.state, olderPage);
+    const second = mergeSavedHistory(first.state, olderPage, { beforeEntryId: 'entry-2' });
+    const result = mergeSavedHistory(second.state, olderPage, { beforeEntryId: 'entry-2' });
     expect(result.queryRequired).toBe(false);
     expect([...result.state.byEntryId.keys()].sort()).toEqual(['entry-1', 'entry-2']);
     expect(result.state.byEntryId.get('entry-2')?.liveOrdinal).toBe(2);

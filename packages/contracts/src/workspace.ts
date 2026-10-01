@@ -1,12 +1,12 @@
-import type { CandidateDraft, DocumentRef, InvoiceIssue } from './invoice.ts';
+import type { StoredCandidateDraft, DocumentRef, InvoiceIssue } from './invoice.ts';
 import type { DbId } from './runtime.ts';
-import { CandidateDraftSchema, DocumentRefSchema, InvoiceIssueSchema } from './invoice.ts';
+import { StoredCandidateDraftSchema, DocumentRefSchema, InvoiceIssueSchema } from './invoice.ts';
 import { z } from 'zod';
 
 const idSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 
 export type WorkspaceView = 'original' | 'parsed' | 'candidate';
-export type GoalMode = 'answer' | 'save-candidate';
+export type GoalMode = 'answer' | 'save-candidate' | 'fill-form';
 
 export type WorkspaceExpectation = {
   revision: number;
@@ -62,8 +62,8 @@ export type WorkspaceInput = {
   candidate: {
     id: DbId;
     sequence: number;
-    fields: CandidateDraft['fields'];
-    lines: CandidateDraft['lines'];
+    fields: StoredCandidateDraft['fields'];
+    lines: StoredCandidateDraft['lines'];
     issues: InvoiceIssue[];
   } | null;
 };
@@ -85,8 +85,8 @@ export const WorkspaceInputSchema = z.object({
   candidate: z.object({
     id: idSchema,
     sequence: idSchema,
-    fields: CandidateDraftSchema.shape.fields,
-    lines: CandidateDraftSchema.shape.lines,
+    fields: StoredCandidateDraftSchema.shape.fields,
+    lines: StoredCandidateDraftSchema.shape.lines,
     issues: z.array(InvoiceIssueSchema).max(1_000),
   }).strict().nullable(),
 }).strict();

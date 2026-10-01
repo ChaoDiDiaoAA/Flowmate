@@ -72,8 +72,25 @@ export type DesktopAgentRunRequest = {
   text: string;
   modelId: string;
   workspace?: import('./workspace.ts').WorkspaceExpectation;
-  goalMode: import('./workspace.ts').GoalMode;
+  goalMode: 'answer' | 'save-candidate';
+  workingDirectory?: string;
   timeoutMs?: number;
+};
+
+export type DesktopInvoiceFormRunRequest = {
+  workspace: import('./workspace.ts').WorkspaceExpectation;
+  target: import('./invoice.ts').InvoiceFormTarget;
+  clientSequence: import('./runtime.ts').DbId;
+  modelId: string;
+};
+export type DesktopInvoiceFormWorkspace = Omit<import('./workspace.ts').WorkspaceExpectation, 'sessionId'> & {
+  sessionId: import('./runtime.ts').DbId | null;
+};
+export type DesktopInvoiceFormInspection = {
+  formInstanceId: string; revision: number; dirty: boolean; valid: boolean;
+  basis: { sessionId: import('./runtime.ts').DbId | null; documentRef: import('./invoice.ts').DocumentRef;
+    jobId: import('./runtime.ts').DbId; candidateId: import('./runtime.ts').DbId; candidateSequence: number };
+  draft: import('./invoice.ts').InvoiceFormDraft;
 };
 
 export type DesktopBridge = {
@@ -87,6 +104,8 @@ export type DesktopBridge = {
   callProvider(input: ProviderTestRequest): Promise<import('./runtime.ts').Result<{ requestId: string; runId: number }>>;
   cancelProvider(requestId: string): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: number | null }>>;
   createSession(request?: import('./runtime.ts').CreateSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
+  queryNativeTools(): Promise<import('./runtime.ts').Result<readonly import('./tools.ts').NativeToolAvailability[]>>;
+  chooseWorkingDirectory(): Promise<import('./runtime.ts').Result<string | null>>;
   renameSession(request: import('./runtime.ts').RenameSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
   deleteSession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<import('./runtime.ts').DeleteSessionResult>>;
   listSessions(request?: import('./runtime.ts').ListSessionsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionPage>>;
@@ -95,6 +114,22 @@ export type DesktopBridge = {
   listSessionMessages(request: import('./runtime.ts').SessionMessagesRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionMessagesPage>>;
   queryPromptTrace(runId: import('./runtime.ts').DbId, callSequence?: number): Promise<import('./runtime.ts').Result<import('./diagnostics.ts').PromptTraceResult>>;
   startRun(input: DesktopAgentRunRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunAccepted & { requestId: string }>>;
+  registerInvoiceFormTarget(input: { purpose: 'fill' | 'edit'; workspace: DesktopInvoiceFormWorkspace; formRevision: number }): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceFormTarget>>;
+  invalidateInvoiceFormTarget(formInstanceId: string): Promise<import('./runtime.ts').Result<void>>;
+  setInvoiceFormDirty(formInstanceId: string, dirty: boolean, formRevision: number): Promise<import('./runtime.ts').Result<void>>;
+  onInvoiceFormInspect(listener: (requestId: string, formInstanceId: string) => void): () => void;
+  onInvoiceFormInspectFinished(listener: (unknownOperation?: import('./invoice.ts').InvoiceCandidateOperationQuery) => void): () => void;
+  replyInvoiceFormInspect(requestId: string, value: DesktopInvoiceFormInspection | null): Promise<import('./runtime.ts').Result<void>>;
+  saveInvoiceCandidate(input: import('./invoice.ts').SaveInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<import('./invoice.ts').SaveInvoiceCandidateResponse>>;
+  acceptInvoiceCandidate(input: import('./invoice.ts').AcceptInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
+  rejectInvoiceCandidate(input: import('./invoice.ts').RejectInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
+  exportInvoiceCandidate(input: import('./invoice.ts').ExportInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceExportReference>>;
+  queryInvoiceCandidateOperation(input: import('./invoice.ts').InvoiceCandidateOperationQuery): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceCandidateOperationResult>>;
+  startInvoiceFormRun(input: DesktopInvoiceFormRunRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunAccepted & { requestId: string }>>;
+  querySessionInput(input: import('./session-inputs.ts').SessionInputQuery): Promise<import('./runtime.ts').Result<import('./session-inputs.ts').SessionInputQueryResult>>;
+  queryInvoiceFormApplication(input: { runId: import('./runtime.ts').DbId; toolCallId: import('./runtime.ts').DbId }): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceFormApplicationReceipt>>;
+  onInvoiceFormRequest(listener: (requestId: string, request: import('./invoice.ts').InvoiceFormBridgeRequest) => void): () => void;
+  replyInvoiceFormRequest(requestId: string, receipt: import('./invoice.ts').InvoiceFormApplicationReceipt): Promise<import('./runtime.ts').Result<void>>;
   cancelRun(runId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: import('./runtime.ts').DbId }>>;
   queryRuntimeState(): Promise<import('./runtime.ts').Result<import('./runtime.ts').RuntimeState>>;
   queryRun(runId: number): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunSnapshot>>;

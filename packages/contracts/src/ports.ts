@@ -101,7 +101,8 @@ export type AgentToolBinding = {
   observeRequest(name: string, raw: unknown, call: ToolCallContext): Result<void>;
   rejectRequest(name: string, raw: unknown, call: ToolCallContext, error: AppError): Result<void>;
   recordDelivery(nativeToolCallId: string, delivery: ToolCallDelivery): Result<void>;
-  execute(name: string, input: unknown, call: ToolCallContext): Promise<AgentToolInvocation>;
+  /** Keep the observed model arguments separate from the SDK/Hook's final input. */
+  execute(name: string, input: unknown, call: ToolCallContext, rawArguments?: unknown): Promise<AgentToolInvocation>;
 };
 
 export type AgentExecutionInput = NativeInput & {
@@ -109,6 +110,7 @@ export type AgentExecutionInput = NativeInput & {
   sessionId: DbId;
   workspaceInput?: WorkspaceInput;
   goalMode?: GoalMode;
+  workingDirectory?: string;
   toolBinding?: AgentToolBinding;
   verifyModelUse: () => Result<void>;
 };
@@ -197,7 +199,7 @@ export interface AgentPort {
     config: ProviderConfig,
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
-    options?: { activeToolNames?: readonly string[] },
+    options?: { activeToolNames?: readonly string[]; workingDirectory?: string; goalMode?: GoalMode },
   ): Promise<Result<PreparedAgent>>;
   releaseSession(nativeSessionId: string): Promise<CloseReport>;
   close(): Promise<CloseReport>;

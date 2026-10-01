@@ -40,6 +40,7 @@ const examples: Record<(typeof INVOICE_TOOL_NAMES)[number], unknown> = {
   get_invoice_candidate: { candidateId: 2 },
   compare_invoice_candidates: { leftCandidateId: 2, rightCandidateId: 3, afterPath: null, limit: 20 },
   save_invoice_candidate: { documentId: 1, candidate },
+  fill_invoice_form: { candidateId: 2 },
 };
 
 function writeFaultInvoice(directory: string) {
@@ -57,7 +58,7 @@ function writeFaultInvoice(directory: string) {
 }
 
 describe('P4 real candidate commit and message persistence failures', () => {
-  it.each(['toolResult-save', 'assistant-save', 'delivery-conflict', 'blocking-write-failure'] as const)
+  it.each(['toolResult-save', 'assistant-save', 'delivery-conflict', 'blocking-write-failure', 'job-terminal-write-failure'] as const)
     ('preserves the committed candidate and actual tool facts after %s, then blocks continuation across restart', async (fault) => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-p4-tool-fault-'));
     const product = join(root, 'product');
@@ -66,11 +67,17 @@ describe('P4 real candidate commit and message persistence failures', () => {
     const sourceRoot = join(root, 'source');
     const source = join(sourceRoot, '000001');
     writeFaultInvoice(source);
-    if (fault === 'blocking-write-failure') {
+    const terminalWriteFailed = fault === 'blocking-write-failure' || fault === 'job-terminal-write-failure';
+    const toolResultSaveFailed = fault !== 'assistant-save' && fault !== 'delivery-conflict';
+    if (terminalWriteFailed) {
       const seeded = openDatabase(paths);
       if (!seeded.ok) throw new Error(seeded.error.code);
-      seeded.data.db.exec("CREATE TRIGGER reject_unsafe_marker BEFORE UPDATE OF unusable ON session_native_history WHEN NEW.unusable=1 BEGIN SELECT RAISE(ABORT,'unsafe marker failed'); END;");
-      seeded.data.db.exec("CREATE TRIGGER reject_failed_terminal BEFORE UPDATE ON runs WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'terminal failed'); END;");
+      if (fault === 'job-terminal-write-failure') {
+        seeded.data.db.exec("CREATE TRIGGER reject_job_terminal BEFORE UPDATE OF status ON jobs WHEN OLD.status='running' AND NEW.status!='running' BEGIN SELECT RAISE(ABORT,'job terminal failed'); END;");
+      } else {
+        seeded.data.db.exec("CREATE TRIGGER reject_unsafe_marker BEFORE UPDATE OF unusable ON session_native_history WHEN NEW.unusable=1 BEGIN SELECT RAISE(ABORT,'unsafe marker failed'); END;");
+        seeded.data.db.exec("CREATE TRIGGER reject_failed_terminal BEFORE UPDATE ON runs WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'terminal failed'); END;");
+      }
       seeded.data.close();
     }
     const callId = `p4-save-${fault}`;
@@ -191,7 +198,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
     const terminal = await completion;
-    expect(terminal.result).toMatchObject(fault === 'blocking-write-failure'
+    expect(terminal.result).toMatchObject(terminalWriteFailed
       ? { ok: false, error: { code: 'storage_write_failed' } }
       : { ok: true, data: { status: 'failed', stopped: true, error: { code: 'storage_write_failed' } } });
     expect(injected).toBe(true);
@@ -210,11 +217,15 @@ describe('P4 real candidate commit and message persistence failures', () => {
     const candidates = await app.listJobCandidates({ jobId, limit: 20 });
     expect(candidates).toMatchObject({ ok: true, data: { items: [{ candidateId: 1, jobId, sequence: 1 }] } });
     expect(await app.queryJobCandidate({ jobId, candidateId: 1 })).toMatchObject({ ok: true });
+    const jobBeforeRestart = await app.queryJob(jobId);
+    expect(jobBeforeRestart).toMatchObject({ ok: true, data: { jobId,
+      status: terminalWriteFailed ? 'running' : 'failed', reason: terminalWriteFailed ? null : 'storage_write_failed',
+      currentCandidateId: null, acceptedCandidateId: null } });
     const page = await app.listSessionMessages({ sessionId, limit: 100 });
     expect(page.ok).toBe(true);
     if (!page.ok) return;
     expect(page.data.session.availability).toBe('unusable');
-    expect(page.data.items.map((message) => message.role)).toEqual(fault === 'toolResult-save' || fault === 'blocking-write-failure'
+    expect(page.data.items.map((message) => message.role)).toEqual(toolResultSaveFailed
       ? ['user', 'assistant'] : fault === 'delivery-conflict'
         ? ['user', 'assistant', 'toolResult', 'assistant'] : ['user', 'assistant', 'toolResult']);
     if (fault === 'delivery-conflict') expect(page.data.items.at(-1)).toMatchObject({ role: 'assistant', stopReason: 'aborted' });
@@ -223,7 +234,12 @@ describe('P4 real candidate commit and message persistence failures', () => {
       expect(events.some((event) => event.type === 'message_upsert' && event.message.persistence === 'failed')).toBe(true);
       expect(events.some((event) => event.type === 'message_upsert' && event.message.entryId === failedEntryId && event.message.persistence === 'saved')).toBe(false);
     } else expect(deliveries.find((delivery) => delivery.state === 'conflict')?.result).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
-    if (fault === 'blocking-write-failure') expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: true } });
+    if (terminalWriteFailed) {
+      expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: true } });
+      expect(await app.queryRun(accepted.data.runId)).toMatchObject({ ok: true, data: {
+        status: 'running', output: null, error: null, endedAt: null, stoppedAt: null } });
+      expect(await app.startRun(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
+    }
     else {
       expect(await app.queryRun(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'failed', cleanup: { stopped: true }, stoppedAt: expect.any(String) } });
       expect(await app.startRun(request)).toMatchObject({ ok: false, error: { code: 'agent_session_unusable' } });
@@ -249,12 +265,24 @@ describe('P4 real candidate commit and message persistence failures', () => {
     expect(db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 1 });
     expect(db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
     expect(db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 1 });
+    expect(db.query(`SELECT run.status AS runStatus,job.status AS jobStatus,job.status_reason AS reason,
+      job.current_candidate_id AS currentCandidateId FROM runs run JOIN jobs job ON job.id=run.job_id WHERE run.id=?`)
+      .get(accepted.data.runId)).toEqual({ runStatus: terminalWriteFailed ? 'running' : 'failed',
+        jobStatus: terminalWriteFailed ? 'running' : 'failed', reason: terminalWriteFailed ? null : 'storage_write_failed',
+        currentCandidateId: null });
+    if (fault === 'job-terminal-write-failure') {
+      // A real Job UPDATE aborts after the Run UPDATE in the same transaction.
+      // Both objects retain their last committed running facts.
+      expect(db.query('SELECT output_json,error_json,ended_at,stopped_at FROM runs WHERE id=?').get(accepted.data.runId))
+        .toEqual({ output_json: null, error_json: null, ended_at: null, stopped_at: null });
+      db.exec('DROP TRIGGER reject_job_terminal;');
+    }
     const tool = db.query('SELECT status,result_json,delivery_json FROM tool_calls WHERE native_tool_call_id=?').get(callId) as { status: string; result_json: string; delivery_json: string };
     expect(tool.status).toBe('succeeded');
     expect(JSON.parse(tool.result_json)).toMatchObject({ status: 'succeeded', committedCandidateId: 1 });
     expect(JSON.parse(tool.delivery_json).state).toBe(fault === 'assistant-save' ? 'request_observed'
       : fault === 'delivery-conflict' ? 'message_observed' : 'not_attempted');
-    if (fault === 'toolResult-save' || fault === 'blocking-write-failure') expect(deliveries).toEqual([]);
+    if (toolResultSaveFailed) expect(deliveries).toEqual([]);
     if (fault === 'blocking-write-failure') {
       expect(db.query('SELECT status FROM runs WHERE id=?').get(accepted.data.runId)).toEqual({ status: 'running' });
       db.exec('DROP TRIGGER reject_unsafe_marker;');
@@ -277,14 +305,39 @@ describe('P4 real candidate commit and message persistence failures', () => {
     const recoveredPage = await recovered.data.listSessionMessages({ sessionId, limit: 100 });
     expect(recoveredPage).toMatchObject({ ok: true, data: { session: { availability: 'unusable' },
       items: page.data.items.map((message) => ({ ...message, liveOrdinal: null })) } });
-    expect(await recovered.data.startRun(request)).toMatchObject({ ok: false, error: { code: 'agent_session_unusable' } });
-    expect(await recovered.data.queryRun(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'failed' } });
+    expect(await recovered.data.queryRuntimeState()).toMatchObject(terminalWriteFailed
+      ? { ok: true, data: { active: null, blocked: true, error: {
+        code: 'runtime_recovery_blocked', runId: accepted.data.runId, sessionId,
+      } } }
+      : { ok: true, data: { active: null, blocked: false, error: null } });
+    expect(await recovered.data.startRun(request)).toMatchObject({ ok: false, error: {
+      code: terminalWriteFailed ? 'runtime_unusable' : 'agent_session_unusable',
+    } });
+    expect(await recovered.data.queryRun(accepted.data.runId)).toMatchObject({ ok: true, data: {
+      runId: accepted.data.runId, sessionId, status: 'failed',
+      ...(terminalWriteFailed
+        ? { error: { code: 'runtime_interrupted' }, stoppedAt: null,
+          cleanup: { stopped: false, stopReason: 'process-exit', lateObservationRequired: true } }
+        : { stoppedAt: expect.any(String), cleanup: { stopped: true, lateObservationRequired: false } }),
+    } });
+    expect(await recovered.data.queryJob(jobId)).toMatchObject({ ok: true, data: { jobId, status: 'failed',
+      reason: terminalWriteFailed ? 'runtime_interrupted' : 'storage_write_failed',
+      currentCandidateId: null, acceptedCandidateId: null } });
+    if (!terminalWriteFailed) expect(await recovered.data.queryJob(jobId)).toEqual(jobBeforeRestart);
     expect(await recovered.data.listJobCandidates({ jobId, limit: 20 })).toEqual(candidates);
     expect(recoveredPrepareCount).toBe(0);
     expect(prepareCount).toBe(1);
     expect(requests).toHaveLength(callsExpected);
     expect(executions).toBe(1);
     expect(priorPrefix?.entries.map((entry) => entry.id)).toEqual(committedEntries.map((entry) => (entry as { entry_id: string }).entry_id));
+    expect(await recovered.data.close()).toMatchObject({ ok: true, data: { closed: true } });
+    const recoveredDb = new Database(paths.databaseFile, { readonly: true });
+    try {
+      expect(recoveredDb.query(`SELECT run.status AS runStatus,job.status AS jobStatus,job.status_reason AS reason,
+        job.current_candidate_id AS currentCandidateId FROM runs run JOIN jobs job ON job.id=run.job_id WHERE run.id=?`)
+        .get(accepted.data.runId)).toEqual({ runStatus: 'failed', jobStatus: 'failed',
+          reason: terminalWriteFailed ? 'runtime_interrupted' : 'storage_write_failed', currentCandidateId: null });
+    } finally { recoveredDb.close(); }
   }, 30_000);
 });
 

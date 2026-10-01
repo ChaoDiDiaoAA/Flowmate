@@ -1,4 +1,4 @@
-import type { AppError, DbId, ProductToolContext, StoredToolResult, ToolCallCleanup, ToolCallContext, ToolCallDelivery, ToolCallSnapshot, ToolDefinition } from '@flowmate/contracts';
+import type { AppError, DbId, InvoiceFormApplicationReceipt, ProductToolContext, StoredToolResult, ToolCallCleanup, ToolCallContext, ToolCallDelivery, ToolCallSnapshot, ToolDefinition } from '@flowmate/contracts';
 import type { ToolCallRepository } from '../storage/repositories.ts';
 
 export function createToolRecorder(repository: ToolCallRepository, now: () => string) {
@@ -35,6 +35,12 @@ export function createToolRecorder(repository: ToolCallRepository, now: () => st
     },
     recordDelivery(toolCallId: DbId, delivery: ToolCallDelivery) {
       return repository.recordDelivery({ toolCallId, delivery });
+    },
+    recordFormApplication(input: { toolCallId: DbId; receipt: InvoiceFormApplicationReceipt }) {
+      return repository.recordFormApplication(input);
+    },
+    readFormApplicationRequest(toolCallId: DbId) {
+      return repository.readFormApplicationRequest(toolCallId);
     },
     queryById(toolCallId: DbId) {
       return repository.getById(toolCallId);

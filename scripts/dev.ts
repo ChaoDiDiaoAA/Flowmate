@@ -74,7 +74,8 @@ export async function runDev(root = process.cwd()): Promise<void> {
     await initialization;
     try { await stopDesktop(); }
     catch (error) { console.error(`[Flowmate dev] ${error instanceof Error ? error.message : 'Shutdown failed.'}`); code = 1; }
-    const results = await Promise.allSettled([...watchers.map((watcher) => watcher.close()), renderer?.close()]);
+    // Pending Vite transforms can add files back after its first watcher close.
+    const results = await Promise.allSettled([...watchers.map((watcher) => watcher.close()), renderer?.close().then(() => renderer?.watcher.close())]);
     if (results.some((result) => result.status === 'rejected')) code = 1;
     http.closeAllConnections();
     if (http.listening) await new Promise<void>((resolveClosed) => http.close(() => resolveClosed()));
@@ -105,7 +106,15 @@ export async function runDev(root = process.cwd()): Promise<void> {
         child.once('exit', (code) => {
           clearTimeout(readinessTimer);
           resolveExited();
-          if (!stopInFlight && !closing) void finish(confirmedClose ? code ?? 1 : 1);
+          if (!closing) {
+            // Exit may precede a rejected close reply; that failure still owns
+            // launcher cleanup even though the build watcher reports ERROR.
+            if (stopInFlight) void stopInFlight.catch((error) => {
+              console.error(`[Flowmate dev] ${error instanceof Error ? error.message : 'Shutdown failed.'}`);
+              return finish(1);
+            });
+            else void finish(confirmedClose ? code ?? 1 : 1);
+          }
         });
       });
       child.on('error', () => { console.error('[Flowmate dev] Desktop process failed.'); void finish(1); });
