@@ -2,6 +2,66 @@ import { describe, expect, it } from 'bun:test';
 import { parseHostCommand } from '../../apps/host/protocol.ts';
 
 describe('versioned desktop Host protocol', () => {
+  it('shares new Run budget bounds across chat, ordinary Run, and Fill while active inputs cannot override them', () => {
+    const overrides = { budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 }, timeoutMs: 1_800_000, stopGraceMs: 10_000 };
+    const workspace = { revision: 2, documentRef: { id: 4, version: 'v1' }, jobId: 7, candidateRef: { id: 9, sequence: 1 }, sessionId: 12 };
+    const commands = [
+      { type: 'submit_session_input', input: { sessionId: 12, clientSequence: 4, mode: 'prompt', text: 'Review', modelId: 'model', goalMode: 'answer', ...overrides } },
+      { type: 'start_run', input: { sessionId: 12, text: 'Review', modelId: 'model', goalMode: 'answer', ...overrides } },
+      { type: 'submit_invoice_form_input', input: { modelId: 'model', clientSequence: 4, target: { formInstanceId: 'form-1', expectedRevision: 0 }, workspace, ...overrides } },
+    ];
+    for (const command of commands) {
+      const envelope = { version: 1, requestId: 'budget-input', expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234', ...command };
+      expect(parseHostCommand(envelope)).not.toBeNull();
+      expect(parseHostCommand({ ...envelope, input: { ...command.input, budget: { maxModelCalls: 65 } } })).toBeNull();
+      expect(parseHostCommand({ ...envelope, input: { ...command.input, timeoutMs: 1_800_001 } })).toBeNull();
+    }
+    for (const mode of ['steer', 'followUp']) expect(parseHostCommand({ version: 1, requestId: 'active-budget', type: 'submit_session_input',
+      input: { sessionId: 12, clientSequence: 5, mode, runId: 21, text: 'Next', budget: {} } })).toBeNull();
+  });
+  it('validates stable ordinary and active inputs without allowing active configuration changes', () => {
+    const prompt = { version: 1, requestId: 'input-prompt', type: 'submit_session_input',
+      input: { sessionId: 12, clientSequence: 4, mode: 'prompt', text: 'First input', modelId: 'profile-1', goalMode: 'answer' },
+      expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' } as const;
+    expect(parseHostCommand(prompt)).toEqual(prompt);
+    expect(parseHostCommand({ ...prompt, expectedSettingsRevision: undefined, expectedCredentialRef: undefined })).not.toBeNull();
+    expect(parseHostCommand({ ...prompt, input: { ...prompt.input, desktopRequestHash: 'a'.repeat(64) } })).toBeNull();
+    for (const mode of ['steer', 'followUp'] as const) {
+      const active = { version: 1, requestId: `input-${mode}`, type: 'submit_session_input',
+        input: { sessionId: 12, clientSequence: 5, mode, runId: 21, text: 'Additional input' } } as const;
+      expect(parseHostCommand(active)).toEqual(active);
+      for (const field of [{ modelId: 'profile-2' }, { goalMode: 'answer' }, { timeoutMs: 1000 },
+        { stopGraceMs: 1000 }, { workingDirectory: 'D:\\work' }, { config: {} }, { formTarget: {} }])
+        expect(parseHostCommand({ ...active, input: { ...active.input, ...field } })).toBeNull();
+      expect(parseHostCommand({ ...active, expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' })).toBeNull();
+    }
+    expect(parseHostCommand({ ...prompt, input: { ...prompt.input, clientSequence: 0 } })).toBeNull();
+    expect(parseHostCommand({ ...prompt, input: { ...prompt.input, mode: 'steer' } })).toBeNull();
+    expect(parseHostCommand({ ...prompt, expectedCredentialRef: undefined })).toBeNull();
+    expect(parseHostCommand({ ...prompt, input: { ...prompt.input, formTarget: {} } })).toBeNull();
+  });
+
+  it('bounds input lookup and listing and exposes strict archive and saved-position commands', () => {
+    const query = { version: 1, requestId: 'input-query', type: 'query_session_input' } as const;
+    expect(parseHostCommand({ ...query, input: { sessionId: 12, inputId: 9 } })).not.toBeNull();
+    expect(parseHostCommand({ ...query, input: { sessionId: 12, clientSequence: 4, inputId: 9 } })).toBeNull();
+    const list = { version: 1, requestId: 'input-list', type: 'list_session_inputs', input: { sessionId: 12 } } as const;
+    expect(parseHostCommand(list)).toMatchObject({ ...list, input: { sessionId: 12, limit: 50 } });
+    expect(parseHostCommand({ ...list, input: { sessionId: 12, runId: 21, beforeInputId: 9, limit: 100 } })).not.toBeNull();
+    for (const input of [{ sessionId: 12, limit: 101 }, { sessionId: 12, beforeInputId: null }, { sessionId: 12, mode: 'prompt' }])
+      expect(parseHostCommand({ ...list, input })).toBeNull();
+    const archive = { version: 1, requestId: 'archive', type: 'set_session_status',
+      input: { sessionId: 12, expectedStatus: 'active', status: 'archived' } } as const;
+    expect(parseHostCommand(archive)).toEqual(archive);
+    expect(parseHostCommand({ ...archive, input: { ...archive.input, status: 'hidden' } })).toBeNull();
+    expect(parseHostCommand({ ...archive, input: { ...archive.input, hiddenAt: null } })).toBeNull();
+    const branch = { version: 1, requestId: 'branch', type: 'branch_session',
+      input: { sessionId: 12, expectedLeafId: 'leaf-2', expectedEntryCount: 5, targetEntryId: 'assistant-1' } } as const;
+    expect(parseHostCommand(branch)).toEqual(branch);
+    expect(parseHostCommand({ ...branch, input: { ...branch.input, newSessionId: 13 } })).toBeNull();
+    expect(parseHostCommand({ ...branch, input: { ...branch.input, expectedEntryCount: -1 } })).toBeNull();
+  });
+
   it('validates human candidate commands and original-operation lookup without model or Run fields', () => {
     const base = { operationRef: 'human-fixture-1', jobId: 7, candidateId: 9, expectedCandidateId: 9, expectedRevision: 3 };
     for (const command of [

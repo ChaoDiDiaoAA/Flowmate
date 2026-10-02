@@ -11,6 +11,7 @@ import type {
   Result,
 } from './runtime.ts';
 import { WorkspaceContextSchema } from './workspace.ts';
+import { RuntimeRequestOverridesSchema } from './runtime.ts';
 
 const modelRefSchema = z
   .object({
@@ -95,8 +96,7 @@ const agentRunRequestSchema = z.object({
   workspace: WorkspaceContextSchema.omit({ formatVersion: true, activeView: true, selection: true }).optional(),
   goalMode: z.enum(['answer', 'save-candidate']).default('answer'),
   workingDirectory: WorkingDirectorySchema.optional(),
-  timeoutMs: z.number().int().min(100).max(120_000).default(60_000),
-  stopGraceMs: z.number().int().min(100).max(10_000).default(5_000),
+  ...RuntimeRequestOverridesSchema.shape,
 }).strict();
 
 function byteLength(value: string): number {

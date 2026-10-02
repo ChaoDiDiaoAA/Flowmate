@@ -14,6 +14,117 @@ import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, SessionMe
 import { mkdtemp } from '../support/resources.ts';
 import { HostClient, safeChildEnvironment } from '../../apps/desktop/main/host-client.ts';
 
+it('returns the original P5 Desktop prompt after credentials or settings change without redelivery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-host-p5-dedup-'));
+  let requests = 0, credentialReads = 0, credentialAvailable = true;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() {
+    requests++;
+    const chunk = (delta: unknown, finish_reason: string | null) => `data: ${JSON.stringify({ id: 'p5-dedup',
+      choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    return new Response(`${chunk({ role: 'assistant', content: 'Controlled P5 reply' }, null)}${chunk({}, 'stop')}data: [DONE]\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const client = new HostClient();
+  client.setCredentialHandler(async () => {
+    credentialReads++;
+    return credentialAvailable ? { ok: true, credential: { type: 'api_key', key: 'synthetic-p5-dedup' } } : { ok: false };
+  });
+  const finished: number[] = [];
+  client.subscribe(event => { if (event.type === 'agent_run_event' && event.value.type === 'run_finished') finished.push(event.value.runId); });
+  try {
+    expect(await client.start(root, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true });
+    const settings = { version: 2 as const, revision: 0, profile: { displayName: 'P5', theme: 'system' as const },
+      models: [{ id: 'p5-dedup-model', credentialRef: 'p5_dedup_credential', name: 'P5 model', kind: 'custom' as const,
+        providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'p5-dedup-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p5-dedup-model', updatedAt: '2026-10-01T00:00:00.000Z' };
+    expect(await client.request({ type: 'save_settings', settings })).toMatchObject({ ok: true, data: { revision: 1 } });
+    const session = await client.request({ type: 'create_session', input: { title: 'P5 dedup' } }) as Result<{ sessionId: number }>;
+    if (!session.ok) throw new Error(session.error.code);
+    const input = { sessionId: session.data.sessionId, clientSequence: 1, mode: 'prompt' as const,
+      goalMode: 'answer' as const, text: 'Original request', modelId: 'p5-dedup-model' };
+    const submit = (value = input) => client.request({ type: 'submit_session_input', input: value,
+      expectedSettingsRevision: 1, expectedCredentialRef: settings.models[0]!.credentialRef }) as Promise<Result<import('@flowmate/contracts').SessionInputAccepted>>;
+    const [original, concurrent] = await Promise.all([submit(), submit()]);
+    if (!original.ok) throw new Error(original.error.code);
+    expect(concurrent).toMatchObject({ ok: true, data: { inputId: original.data.inputId, runId: original.data.runId } });
+    await waitFor(() => finished.includes(original.data.runId));
+    const collisions = await Promise.all([submit({ ...input, clientSequence: 2, text: 'Window A' }),
+      submit({ ...input, clientSequence: 2, text: 'Window B' })]);
+    const winner = collisions.find(result => result.ok);
+    if (!winner?.ok) throw new Error('Concurrent input had no accepted request');
+    expect(collisions.filter(result => result.ok)).toHaveLength(1);
+    expect(collisions.find(result => !result.ok)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    await waitFor(() => finished.includes(winner.data.runId));
+    let reads = credentialReads;
+    expect(await client.request({ type: 'submit_session_input', input: { ...input, clientSequence: 3 } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    credentialAvailable = false;
+    expect(await submit({ ...input, clientSequence: 3 })).toMatchObject({ ok: false, error: { code: 'model_credential_unavailable' } });
+    expect(credentialReads).toBe(reads + 1);
+    reads = credentialReads;
+    expect(await submit()).toMatchObject({ ok: true, data: { inputId: original.data.inputId, runId: original.data.runId } });
+    // New identities retain the caller's intent, including omitted values.
+    expect(await client.request({ type: 'submit_session_input', input: { ...input, goalMode: 'answer', timeoutMs: 60_000, stopGraceMs: 5000 },
+      expectedSettingsRevision: 1, expectedCredentialRef: settings.models[0]!.credentialRef }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await client.request({ type: 'submit_session_input', input: { ...input, stopGraceMs: 5000 },
+      expectedSettingsRevision: 1, expectedCredentialRef: settings.models[0]!.credentialRef }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await client.request({ type: 'save_settings', settings: { ...settings, version: 3, runtime: {
+      budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 }, timeoutMs: 1_800_000 }, revision: 1, models: [], defaultModelId: null } }))
+      .toMatchObject({ ok: true, data: { revision: 2 } });
+    expect(await submit()).toMatchObject({ ok: true, data: { inputId: original.data.inputId, runId: original.data.runId } });
+    expect(await submit({ ...input, text: 'Different request' })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await client.request({ type: 'submit_session_input', input: { ...input, clientSequence: 3 } }))
+      .toMatchObject({ ok: false, error: { code: 'model_not_configured' } });
+    expect(credentialReads).toBe(reads);
+    expect(requests).toBe(2);
+    const page = await client.request({ type: 'list_session_inputs', input: { sessionId: input.sessionId, limit: 50 } }) as Result<import('@flowmate/contracts').SessionInputsPage>;
+    if (!page.ok) throw new Error(page.error.code);
+    expect(page.data.items).toHaveLength(2);
+    expect(page.data.items.find(item => item.inputId === original.data.inputId))
+      .toMatchObject({ inputId: original.data.inputId, status: 'consumed', processingStatus: 'completed',
+        content: { version: 2, requestIdentityVersion: 1, originalBudgetOverrides: {}, desktopRequestHash: expect.stringMatching(/^[a-f0-9]{64}$/) } });
+  } finally { await client.close(); server.stop(true); }
+}, 15_000);
+
+it.each(['prompt', 'connection'] as const)('rejects a Settings change during the Host credential read before %s admission', async mode => {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-host-credential-revision-'));
+  let requests = 0;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() { requests++; return new Response('Unexpected request', { status: 500 }); } });
+  const client = new HostClient();
+  const settings = { version: 3 as const, revision: 0, profile: { displayName: 'Revision race', theme: 'system' as const }, runtime: {},
+    models: [{ id: 'revision-model', credentialRef: 'revision_model_credential', name: 'Revision model', kind: 'custom' as const,
+      providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'revision-model', api: 'openai-completions',
+      contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'revision-model', updatedAt: '2026-10-01T00:00:00.000Z' };
+  let changed = false;
+  client.setCredentialHandler(async () => {
+    if (!changed) {
+      changed = true;
+      expect(await client.request({ type: 'save_settings', settings: { ...settings, revision: 1,
+        runtime: { budget: { maxModelCalls: 64 }, timeoutMs: 1000 } } })).toMatchObject({ ok: true, data: { revision: 2 } });
+    }
+    return { ok: true, credential: { type: 'api_key', key: 'synthetic-revision-key' } };
+  });
+  try {
+    expect(await client.start(root, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true });
+    expect(await client.request({ type: 'save_settings', settings })).toMatchObject({ ok: true, data: { revision: 1 } });
+    const session = await client.request({ type: 'create_session', input: {} }) as Result<{ sessionId: number }>;
+    if (!session.ok) throw new Error(session.error.code);
+    const result = mode === 'prompt' ? await client.request({ type: 'submit_session_input', input: {
+      mode: 'prompt', goalMode: 'answer', sessionId: session.data.sessionId, clientSequence: 1, text: 'Stale request', modelId: 'revision-model' },
+      expectedSettingsRevision: 1, expectedCredentialRef: settings.models[0]!.credentialRef })
+      : await client.request({ type: 'call_provider', input: { modelId: 'revision-model', goal: 'Connection test', text: 'Stale request' } });
+    expect(result).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await client.request({ type: 'list_session_runs', input: { sessionId: session.data.sessionId } }))
+      .toMatchObject({ ok: true, data: { items: [] } });
+    expect(await client.request({ type: 'list_session_inputs', input: { sessionId: session.data.sessionId, limit: 50 } }))
+      .toMatchObject({ ok: true, data: { items: [] } });
+    expect(requests).toBe(0);
+    expect(changed).toBe(true);
+  } finally { await client.close(); server.stop(true); }
+}, 15_000);
+
 async function formBridgeFixture() {
   const root = await mkdtemp(join(tmpdir(), 'flowmate-host-form-bridge-'));
   mkdirSync(join(root, 'apps', 'host'), { recursive: true });
@@ -776,7 +887,9 @@ it('retains the actual Host late applied receipt after cancellation without chan
     workspace = need(await client.request({ type: 'read_workspace' }) as Result<WorkspaceSnapshot>);
     const selected = need(await client.request({ type: 'select_candidate', input: { jobId: task.job.jobId, candidateId,
       expectedCandidateId: workspace.candidateRef?.id ?? null, expectedRevision: workspace.revision } }) as Result<CandidateSelection>);
-    const fill = need(await client.request({ type: 'submit_invoice_form_input', input: { modelId: model.id, clientSequence: 1,
+    const nextInput = need(await client.request({ type: 'query_session_input', input: { sessionId: session.sessionId } }) as Result<{ nextClientSequence: number | null }>);
+    if (nextInput.nextClientSequence === null) throw new Error('Fixture input sequence is exhausted.');
+    const fill = need(await client.request({ type: 'submit_invoice_form_input', input: { modelId: model.id, clientSequence: nextInput.nextClientSequence,
       target: { formInstanceId: 'host-late-form-instance', expectedRevision: 0 }, workspace: expectation(selected.workspace) },
       expectedSettingsRevision: 1, expectedCredentialRef: model.credentialRef }) as Result<RunAccepted>);
     await waitFor(() => bridgeCalls.some(call => call.operation === 'apply'));

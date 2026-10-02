@@ -152,6 +152,87 @@ function createLegacyV7(paths: ProductPaths) {
   return db;
 }
 
+function createLegacyV10(paths: ProductPaths) {
+  const db = createLegacyV7(paths);
+  for (const file of ['008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql']) {
+    for (const sql of readFileSync(new URL(`../../../packages/core/src/storage/migrations/${file}`, import.meta.url), 'utf8')
+      .split(';').map(value => value.trim()).filter(Boolean)) db.exec(sql);
+    if (file === '010_human_candidates.sql') { db.exec('COMMIT'); db.exec('PRAGMA foreign_keys=ON'); }
+  }
+  return db;
+}
+
+describe('P5 migration compatibility', () => {
+  const stamp = '2026-10-02T00:00:00.000Z';
+  const metadata = JSON.stringify({ version: 1, model_use_blocked: null, tool_profile: 'invoice' });
+  function seedLegacy(paths: ProductPaths) {
+    const db = createLegacyV10(paths);
+    for (const [id, status, hidden] of [[1, 'archived', null], [2, 'active', null], [3, 'archived', stamp]] as const) {
+      db.query('INSERT INTO sessions(id,native_session_id,title,status,created_at,updated_at,metadata_json,hidden_at) VALUES(?,?,?,?,?,?,?,?)')
+        .run(id, `native-old-${id}`, 'Old input', status, stamp, stamp, metadata, hidden);
+    }
+    const header = { type: 'session', version: 3, id: 'native-old-1', timestamp: stamp, cwd: paths.runtimeDir };
+    const entry = { type: 'message', id: 'u1', parentId: null, timestamp: stamp,
+      message: { role: 'user', content: [{ type: 'text', text: 'Frozen request' }], timestamp: 1 } };
+    db.query('INSERT INTO session_native_history(session_id,storage_version,header_json,leaf_id,entry_count,unusable) VALUES(1,1,?,?,1,0)')
+      .run(JSON.stringify(header), 'u1');
+    db.query('INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json,run_id) VALUES(1,0,?,?,NULL)')
+      .run('u1', JSON.stringify(entry));
+    const content = { version: 1, text: 'Frozen request', workspaceContext: { formatVersion: 1, revision: 0,
+      documentRef: null, jobId: null, candidateRef: null, sessionId: 1, activeView: 'original', selection: null },
+      allowedDocumentIds: [], allowedArtifactIds: [] };
+    db.query("INSERT INTO session_inputs(id,session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,native_entry_id,created_at,updated_at) VALUES(1,1,7,'prompt','fill-form',?,NULL,?,'consumed','completed','u1',?,?)")
+      .run('a'.repeat(64), JSON.stringify(content), stamp, stamp);
+    return db;
+  }
+
+  it('preserves v1 input bytes and identifies unfinished legacy Delete without hiding normal Sessions', () => withDatabase(paths => {
+    const legacy = seedLegacy(paths);
+    const before = legacy.query('SELECT * FROM session_inputs').get(); legacy.close();
+    const opened = openDatabase(paths);
+    expect(opened.ok).toBe(true); if (!opened.ok) return;
+    deferCleanup(() => opened.data.close());
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 12 });
+    expect(opened.data.db.query('SELECT * FROM session_inputs').get()).toEqual({ ...before as object, result_entry_id: null });
+    const rows = opened.data.db.query('SELECT id,metadata_json,hidden_at,updated_at FROM sessions ORDER BY id').all() as Array<{ id: number; metadata_json: string; hidden_at: string | null; updated_at: string }>;
+    expect(JSON.parse(rows[0]!.metadata_json)).toEqual({ version: 1, model_use_blocked: null, tool_profile: 'invoice', delete_pending: true });
+    expect(rows[0]!.hidden_at).toBeNull(); expect(rows[0]!.updated_at).toBe(stamp);
+    expect(rows[1]!.metadata_json).toBe(metadata); expect(rows[2]!.metadata_json).toBe(metadata);
+    expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  }));
+
+  it('rolls back the input-table rebuild and Delete marker when the v11 commit marker fails', () => withDatabase(paths => {
+    const legacy = seedLegacy(paths);
+    const before = legacy.query('SELECT * FROM session_inputs').get();
+    legacy.exec("CREATE TRIGGER reject_schema_11 BEFORE INSERT ON schema_migrations WHEN NEW.version=11 BEGIN SELECT RAISE(ABORT,'v11 rejected'); END;");
+    legacy.close();
+    expect(openDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+    const after = new Database(paths.databaseFile); deferCleanup(() => after.close());
+    expect(after.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 10 });
+    expect(after.query('SELECT * FROM session_inputs').get()).toEqual(before);
+    expect(after.query('SELECT metadata_json FROM sessions WHERE id=1').get()).toEqual({ metadata_json: metadata });
+    expect(after.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  }));
+
+  it('requires v2 result references while retaining legacy completions and allowing shared results', () => withDatabase(paths => {
+    const legacy = seedLegacy(paths); legacy.close();
+    const opened = openDatabase(paths); expect(opened.ok).toBe(true); if (!opened.ok) return;
+    deferCleanup(() => opened.data.close()); const db = opened.data.db;
+    expect((db.query('PRAGMA table_info(session_inputs)').all() as Array<{ name: string }>).map(value => value.name)).toContain('result_entry_id');
+    const v2 = JSON.stringify({ version: 2, text: 'Frozen request', workspaceContext: null, workspaceInput: null,
+      allowedDocumentIds: [], allowedArtifactIds: [], promptText: 'Frozen request' });
+    expect(() => db.query('UPDATE session_inputs SET content_json=? WHERE id=1').run(v2)).toThrow();
+    db.query("INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json,run_id) VALUES(1,1,'a1','{}',NULL),(1,2,'u2','{}',NULL)").run();
+    db.query("UPDATE session_inputs SET mode='steer',goal_mode='answer',content_json=?,result_entry_id='a1' WHERE id=1").run(v2);
+    db.query("INSERT INTO session_inputs(id,session_id,client_sequence,mode,goal_mode,request_hash,content_json,status,processing_status,native_entry_id,result_entry_id,created_at,updated_at) VALUES(2,1,8,'followUp','answer',?,?,'consumed','completed','u2','a1',?,?)")
+      .run('b'.repeat(64), v2, stamp, stamp);
+    expect(db.query("SELECT COUNT(*) AS count FROM session_inputs WHERE result_entry_id='a1'").get()).toEqual({ count: 2 });
+    expect(() => db.query("UPDATE session_inputs SET mode='followUp',goal_mode='fill-form' WHERE id=1").run()).toThrow();
+    expect(() => db.query('UPDATE session_inputs SET session_id=2 WHERE id=2').run()).toThrow();
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  }));
+});
+
 const legacyColumns = [
   'id', 'kind', 'status', 'goal', 'input_json', 'config_json', 'output_json', 'error_json', 'cleanup_json', 'usage_json',
   'input_tokens', 'output_tokens', 'total_tokens', 'cost', 'duration_ms', 'tool_call_count', 'usage_complete', 'created_at',
@@ -163,12 +244,12 @@ describe('P2 Session and Agent Run storage', () => {
     const store = nativeFixture(paths);
     const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
     expect(typeof store.sessions.readHistoryForDisplay).toBe('function');
-    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history: store.history, bindings: [] } });
-    expect(store.sessions.readHistoryForDisplay(999_999)).toEqual({ ok: true, data: { history: null, bindings: [] } });
+    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history: store.history, bindings: [], sessionInputs: [] } });
+    expect(store.sessions.readHistoryForDisplay(999_999)).toEqual({ ok: true, data: { history: null, bindings: [], sessionInputs: [] } });
     const context = { entryId: store.entry.id, runId: store.runId };
     expect(store.sessions.saveHistory(store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
     expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history,
-      bindings: [{ entryId: 'p4-e1', runId: store.runId }] } });
+      bindings: [{ entryId: 'p4-e1', runId: store.runId }], sessionInputs: [] } });
     expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: history });
     store.db.exec("CREATE TRIGGER reject_duplicate_append BEFORE INSERT ON session_native_entries BEGIN SELECT RAISE(ABORT,'duplicate append'); END;");
     expect(store.sessions.saveHistory(store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
@@ -263,11 +344,11 @@ describe('P2 Session and Agent Run storage', () => {
     expect(reopened.data.db.query("SELECT COUNT(*) AS count FROM runs WHERE status IN ('created','running')").get()).toEqual({ count: 0 });
   }));
 
-  it('migrates a real new database through version 10 before exposing repositories', () => withDatabase((paths) => {
+  it('migrates a real new database through version 12 before exposing repositories', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }]);
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     opened.data.close();
   }));
@@ -285,7 +366,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
     try {
-      expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 10 });
+      expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 12 });
       expect(migrated.data.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: entry, run_id: null });
       expect(migrated.data.db.query('SELECT header_json,storage_version,leaf_id,entry_count FROM session_native_history').get())
         .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });

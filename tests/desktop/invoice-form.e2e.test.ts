@@ -31,6 +31,7 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
     let buffered = Buffer.alloc(0); let targetRequestId: string | null = null;
     const gate = { saveRequests: [] as Array<{ requestId: string; operationRef: string }>,
       inputRequests: [] as Array<{ requestId: string; clientSequence: number }>, dropped: 0,
+      originalInput: undefined as unknown, corruptQueryRunId: null as number | null, queryRequests: new Set<string>(),
       originalResult: undefined as unknown, restore: () => {
         child.stdin.write = write; child.stdout.emit = emit;
         if (buffered.length) { Reflect.apply(emit, child.stdout, ['data', buffered]); buffered = Buffer.alloc(0); }
@@ -48,9 +49,11 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
         }
         if (command.type === 'submit_invoice_form_input' && command.requestId && command.input?.clientSequence !== undefined) {
           gate.inputRequests.push({ requestId: command.requestId, clientSequence: command.input.clientSequence });
+          gate.originalInput ??= command.input;
           recordIdentities();
           if (command.type === commandType) targetRequestId ??= command.requestId;
         }
+        if (command.type === 'query_session_input' && command.requestId && command.input?.clientSequence !== undefined) gate.queryRequests.add(command.requestId);
       } catch { /* Observe complete commands only; forward their original bytes unchanged. */ }
       return Reflect.apply(write, child.stdin, args);
     } as typeof write;
@@ -66,6 +69,13 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
           if (!gate.dropped && targetRequestId !== null && response.type === 'response' && response.requestId === targetRequestId) {
             gate.dropped += 1; gate.originalResult = response.value; drop = true;
           }
+          if (gate.corruptQueryRunId !== null && response.requestId && gate.queryRequests.has(response.requestId)) {
+            const value = response.value as { ok?: boolean; data?: { input?: { runId: number } } };
+            if (value?.ok && value.data?.input) {
+              value.data.input.runId = gate.corruptQueryRunId;
+              forward.push(Buffer.from(`${JSON.stringify(response)}\n`)); continue;
+            }
+          }
         } catch { /* Invalid bytes retain the production parser's normal handling. */ }
         if (!drop) forward.push(line);
       }
@@ -75,7 +85,7 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
   }, { ownedRoot: userData, commandType, tracePath: join(userData, 'form-transport-identities.json') });
 }
 
-for (const outcome of ['accept-export', 'save-on-close', 'discard-on-close', 'reject-reselect', 'unknown-close-save', 'unknown-ui-save-close', 'unknown-fill-input'] as const)
+for (const outcome of ['accept-export', 'save-on-close', 'discard-on-close', 'reject-reselect', 'unknown-close-save', 'unknown-ui-save-close', 'unknown-fill-input', 'concurrent-fill-input'] as const)
 it(`real Fill and manual form public chain: ${outcome}`, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-form-desktop-'));
   const sourceRoot = await mkdtemp(join(tmpdir(), 'flowmate-form-source-'));
@@ -105,7 +115,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     const body = await request.json() as Body; requests.push(body);
     const fill = body.tools?.some(tool => tool.function.name === 'fill_invoice_form');
     if (fill) {
-      if (outcome === 'unknown-fill-input' && !fillRequestHeld && !body.messages.some(message => message.tool_call_id === 'form-apply')) {
+      if ((outcome === 'unknown-fill-input' || outcome === 'concurrent-fill-input') && !fillRequestHeld && !body.messages.some(message => message.tool_call_id === 'form-apply')) {
         fillRequestHeld = true; await heldFill;
       }
       return body.messages.some(message => message.tool_call_id === 'form-apply') ? stream('Form draft ready for review.')
@@ -127,7 +137,9 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     expect((await page.evaluate(() => window.flowmate.chooseAndImportInvoice())).ok).toBe(true);
     const prepared = await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error('Settings unavailable');
-      const saved = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'form-model', credentialRef: 'form_fixture_credential',
+      const saved = await window.flowmate.saveSettings({ ...state.data.settings, version: 3,
+        runtime: { budget: { maxModelCalls: 32, maxToolCalls: 40, toolTimeoutMs: 20_000 }, timeoutMs: 90_000, stopGraceMs: 500 },
+        models: [{ id: 'form-model', credentialRef: 'form_fixture_credential',
         name: 'Form fixture', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'form-fixture', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'form-model' }, { modelId: 'form-model', apiKey: 'synthetic-form-key' });
       if (!saved.ok) throw new Error('Settings failed');
@@ -151,8 +163,87 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     await page.getByRole('button', { name: 'Results', exact: true }).click();
     await page.getByRole('button', { name: /Result 1/ }).click();
     await page.getByRole('button', { name: 'Select result', exact: true }).click();
+    if (outcome === 'concurrent-fill-input') {
+      checkpoint = 'three same-target calls all await Desktop state before one fixes its identity';
+      await app.evaluate(({ ipcMain }, ownedRoot) => {
+        const handles = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles();
+        const child = handles.find(value => value && typeof value === 'object' && 'spawnargs' in value
+          && Array.isArray(value.spawnargs) && value.spawnargs.includes('apps/host/main.ts') && value.spawnargs.includes(ownedRoot)) as import('node:child_process').ChildProcessWithoutNullStreams;
+        const write = child.stdin.write; const emit = child.stdout.emit;
+        const gate = { states: new Set<string>(), held: [] as Buffer[], buffered: Buffer.alloc(0), armed: false,
+          fills: [] as Array<{ requestId: string; input: import('@flowmate/contracts').DesktopInvoiceFormRunRequest }>,
+          input: undefined as import('@flowmate/contracts').DesktopInvoiceFormRunRequest | undefined, results: [] as unknown[],
+          restore() { child.stdin.write = write; child.stdout.emit = emit; } };
+        child.stdin.write = function (...args: Parameters<typeof write>) {
+          const command = JSON.parse(String(args[0])) as { type: string; requestId: string; input: import('@flowmate/contracts').DesktopInvoiceFormRunRequest };
+          if (gate.armed && command.type === 'get_state') gate.states.add(command.requestId);
+          if (command.type === 'submit_invoice_form_input') gate.fills.push({ requestId: command.requestId, input: command.input });
+          const written = Reflect.apply(write, child.stdin, args);
+          if (command.type === 'submit_invoice_form_input' && gate.held.length === 2) {
+            const remaining = gate.held; gate.held = [];
+            Reflect.apply(emit, child.stdout, ['data', Buffer.concat(remaining)]);
+          }
+          return written;
+        } as typeof write;
+        child.stdout.emit = function (event: string | symbol, ...args: unknown[]) {
+          if (event !== 'data' || !Buffer.isBuffer(args[0])) return Reflect.apply(emit, child.stdout, [event, ...args]);
+          gate.buffered = Buffer.concat([gate.buffered, args[0]]); const forward: Buffer[] = [];
+          for (let newline = gate.buffered.indexOf(10); newline !== -1; newline = gate.buffered.indexOf(10)) {
+            const line = gate.buffered.subarray(0, newline + 1); gate.buffered = gate.buffered.subarray(newline + 1);
+            const response = JSON.parse(line.toString('utf8')) as { type: string; requestId: string };
+            if (gate.armed && response.type === 'response' && gate.states.has(response.requestId)) {
+              gate.held.push(line);
+              if (gate.held.length === 3) { gate.armed = false; forward.push(gate.held.shift()!); }
+            } else forward.push(line);
+          }
+          return forward.length ? Reflect.apply(emit, child.stdout, [event, Buffer.concat(forward), ...args.slice(1)]) : true;
+        };
+        const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+        const original = handlers.get('flowmate:start-invoice-form-run'); if (!original) throw new Error('Missing Fill handler.');
+        ipcMain.removeHandler('flowmate:start-invoice-form-run');
+        ipcMain.handle('flowmate:start-invoice-form-run', async (event, raw) => {
+          const input = raw as import('@flowmate/contracts').DesktopInvoiceFormRunRequest;
+          gate.input = input; gate.armed = true;
+          gate.results = await Promise.all([original(event, input), original(event, { ...input, clientSequence: input.clientSequence + 1 }), original(event, input)]);
+          gate.restore(); ipcMain.removeHandler('flowmate:start-invoice-form-run'); ipcMain.handle('flowmate:start-invoice-form-run', original);
+          return gate.results[0];
+        });
+        (globalThis as typeof globalThis & { concurrentFillGate?: typeof gate }).concurrentFillGate = gate;
+      }, userData);
+      await page.getByRole('button', { name: 'Fill form', exact: true }).click();
+      await waitFor(() => app!.evaluate(() => (globalThis as typeof globalThis & { concurrentFillGate: { results: unknown[] } }).concurrentFillGate.results.length === 3));
+      const concurrent = await app.evaluate(() => {
+        const gate = (globalThis as typeof globalThis & { concurrentFillGate: { fills: unknown[]; states: Set<string>;
+          input: import('@flowmate/contracts').DesktopInvoiceFormRunRequest; results: Array<import('@flowmate/contracts').Result<import('@flowmate/contracts').SessionInputAccepted & { requestId: string }>> } }).concurrentFillGate;
+        return { fills: gate.fills, stateCount: gate.states.size, input: gate.input, results: gate.results };
+      });
+      expect(concurrent.stateCount).toBe(3);
+      expect(concurrent.fills).toHaveLength(1);
+      expect(concurrent.results[0]).toMatchObject({ ok: true, data: { inputId: expect.any(Number), runId: expect.any(Number) } });
+      expect(concurrent.results[1]).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      if (concurrent.results[2]?.ok) expect(concurrent.results[2]).toEqual(concurrent.results[0]);
+      else expect(concurrent.results[2]).toMatchObject({ ok: false, error: { code: 'operation_result_unknown' } });
+      expect(await page.evaluate(input => window.flowmate.startInvoiceFormRun(input), concurrent.input)).toEqual(concurrent.results[0]);
+      const beforeChangedReplay = requests.length;
+      expect(await page.evaluate(input => window.flowmate.startInvoiceFormRun({ ...input, budget: { maxModelCalls: 63 } }), concurrent.input))
+        .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      expect(requests).toHaveLength(beforeChangedReplay);
+      releaseHeldFill?.();
+      await page.waitForFunction(() => (document.querySelector('[aria-label="Invoice number"]') as HTMLInputElement)?.value === 'INV-FORM-1');
+      await waitFor(() => page.evaluate(async () => { const state = await window.flowmate.queryRuntimeState(); return state.ok && state.data.active === null; }));
+      expect(requests.filter(body => body.tools?.some(tool => tool.function.name === 'fill_invoice_form'))).toHaveLength(2);
+      expect(await page.evaluate(sessionId => window.flowmate.listSessionRuns({ sessionId }), concurrent.input.workspace.sessionId))
+        .toMatchObject({ ok: true, data: { items: [{ runId: (concurrent.results[0] as { ok: true; data: { runId: number } }).data.runId }, { runId: prepared.data.runId }] } });
+      expect(await page.evaluate(sessionId => window.flowmate.listSessionInputs({ sessionId }), concurrent.input.workspace.sessionId))
+        .toMatchObject({ ok: true, data: { items: [{ clientSequence: concurrent.input.clientSequence }, { clientSequence: 1 }] } });
+      return;
+    }
     if (outcome === 'unknown-fill-input') {
       checkpoint = 'Fill input accepted but its actual Host reply is lost before any apply';
+      const openAssistant = page.getByRole('button', { name: 'Open Assistant', exact: true });
+      if (await openAssistant.isVisible()) await openAssistant.click();
+      await page.getByText('Next Run limits', { exact: true }).click();
+      await page.getByLabel('Next Run model requests', { exact: true }).fill('31');
       await dropOneOwnedHostResponse(app, userData, 'submit_invoice_form_input');
       await page.getByRole('button', { name: 'Fill form', exact: true }).click();
       await page.getByText('Fill input delivery is unknown. Check the original status; do not repeat Fill.', { exact: true }).waitFor({ timeout: 20_000 });
@@ -167,9 +258,24 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       expect(await page.getByLabel('Invoice number', { exact: true }).inputValue()).toBe('');
       const beforeCheck = requests.length;
       expect(await page.getByRole('button', { name: 'Check Fill status', exact: true }).isEnabled()).toBe(true);
+      await app.evaluate((_electron, wrongRunId) => {
+        (globalThis as typeof globalThis & { saveTransportGate: { corruptQueryRunId: number | null } }).saveTransportGate.corruptQueryRunId = wrongRunId;
+      }, prepared.data.runId);
+      const originalInput = await app.evaluate(() =>
+        (globalThis as typeof globalThis & { saveTransportGate: { originalInput: import('@flowmate/contracts').DesktopInvoiceFormRunRequest } }).saveTransportGate.originalInput);
+      expect(await page.evaluate(input => window.flowmate.startInvoiceFormRun(input), originalInput))
+        .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      await page.getByRole('button', { name: 'Check Fill status', exact: true }).click();
+      await page.getByText('The saved input belongs to another form target. Your draft is preserved; check the original Fill again.', { exact: true }).waitFor();
+      expect(await page.getByLabel('Next Run model requests', { exact: true }).inputValue()).toBe('31');
+      expect(await page.getByLabel('Invoice number', { exact: true }).inputValue()).toBe('');
+      expect(await page.getByRole('button', { name: 'Check Fill status', exact: true }).isEnabled()).toBe(true);
+      expect(await page.getByRole('button', { name: 'Fill form', exact: true }).isDisabled()).toBe(true);
+      expect(requests).toHaveLength(beforeCheck);
       await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { restore(): void } }).saveTransportGate.restore());
       await page.getByRole('button', { name: 'Check Fill status', exact: true }).click();
       await page.getByText(/Original Fill input is (queued|consumed)\. Its form application has not been confirmed\./).waitFor();
+      expect(await page.getByLabel('Next Run model requests', { exact: true }).inputValue()).toBe('');
       expect(requests).toHaveLength(beforeCheck);
       expect(await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { inputRequests: unknown[] } }).saveTransportGate.inputRequests.length)).toBe(1);
       releaseHeldFill?.();
@@ -180,6 +286,15 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       expect(JSON.stringify(completedFill[1]!.messages.find(message => message.tool_call_id === 'form-apply'))).toContain('applied');
       return;
     }
+    if (outcome === 'accept-export') {
+      const openAssistant = page.getByRole('button', { name: 'Open Assistant', exact: true });
+      if (await openAssistant.isVisible()) await openAssistant.click();
+      await page.getByText('Next Run limits', { exact: true }).click();
+      await page.getByLabel('Next Run model requests', { exact: true }).fill('64');
+      await page.getByLabel('Next Run tool calls', { exact: true }).fill('100');
+      await page.getByLabel('Next Run Run timeout (ms)', { exact: true }).fill('150000');
+      await page.getByLabel('Next Run stop wait (ms)', { exact: true }).fill('900');
+    }
     await page.getByRole('button', { name: 'Fill form', exact: true }).click();
     await page.getByLabel('Invoice number', { exact: true }).waitFor();
     await page.waitForFunction(() => (document.querySelector('[aria-label="Invoice number"]') as HTMLInputElement)?.value === 'INV-FORM-1');
@@ -188,6 +303,21 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     expect(fillRequests).toHaveLength(2); expect(fillRequests[0]!.tools!.map(tool => tool.function.name)).toEqual(['fill_invoice_form']);
     expect(JSON.stringify(fillRequests[1]!.messages.find(message => message.tool_call_id === 'form-apply'))).toContain('applied');
     expect(JSON.stringify(fillRequests)).not.toContain('formInstanceId');
+    if (outcome === 'accept-export') {
+      const frozen = await page.evaluate(async sessionId => {
+        const runs = await window.flowmate.listSessionRuns({ sessionId });
+        const inputs = await window.flowmate.listSessionInputs({ sessionId });
+        if (!runs.ok || !inputs.ok) throw new Error('Fill records unavailable');
+        const run = await window.flowmate.queryRun(runs.data.items[0]!.runId);
+        if (!run.ok) throw new Error('Fill Run unavailable');
+        return { run: run.data, input: inputs.data.items[0]! };
+      }, prepared.data.sessionId);
+      expect(frozen.run.config).toMatchObject({ version: 2, limits: { timeoutMs: 150_000, stopGraceMs: 900 },
+        runtimeBudget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 20_000 } });
+      expect(frozen.input.content).toMatchObject({ version: 2, requestIdentityVersion: 1,
+        originalBudgetOverrides: { budget: { maxModelCalls: 64, maxToolCalls: 100 }, timeoutMs: 150_000, stopGraceMs: 900 } });
+      expect(await page.getByLabel('Next Run model requests', { exact: true }).inputValue()).toBe('');
+    }
     const beforeQuery = requests.length;
     await page.getByRole('button', { name: 'Check Fill status', exact: true }).click();
     await page.getByText('Form draft applied; review before saving.', { exact: true }).waitFor(); expect(requests).toHaveLength(beforeQuery);
@@ -361,6 +491,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     await server.stop(true);
     if (app) {
       await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate?: { restore(): void } }).saveTransportGate?.restore()).catch(() => undefined);
+      await app.evaluate(() => (globalThis as typeof globalThis & { concurrentFillGate?: { restore(): void } }).concurrentFillGate?.restore()).catch(() => undefined);
       await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false }); }).catch(() => undefined);
       await closeDesktopFixture(app, userData, failure);
     }

@@ -5,7 +5,7 @@ import { describe, expect, it } from 'bun:test';
 import { appError, INVOICE_CHAT_SYSTEM_PROMPT, ok } from '@flowmate/contracts';
 import type {
   AgentExecutionInput,
-  AgentConfigFacts,
+  P5ChatAgentConfigFacts,
   AgentNativeOutcome,
   AgentPort,
   PreparedAgent,
@@ -17,6 +17,7 @@ import type {
 import type { SessionRepository } from '../../../packages/core/src/storage/repositories.ts';
 import { makeApplication, RuntimeService, SessionService } from '../../../packages/core/src/index.ts';
 import { openTestDatabase } from '../../support/database.ts';
+import { createAgentHistoryFixture } from './agent-history-fixture.ts';
 
 const config: ProviderConfig = {
   version: 1,
@@ -38,7 +39,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolean; failSessionRelease?: boolean } = {}) {
+function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolean; failSessionRelease?: boolean; legacyHistory?: boolean } = {}) {
   const opened = openTestDatabase(dbPaths(mkdtempSync(join(tmpdir(), 'flowmate-app-agent-'))));
   if (!opened.ok) throw new Error(opened.error.message);
   let created = 0;
@@ -47,12 +48,15 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
   const clearedTraceSessions: number[] = [];
   let failSessionRelease = options.failSessionRelease ?? false;
   const records = new Map<string, { busy: boolean }>();
+  const history = createAgentHistoryFixture(tmpdir(), () => '2026-09-24T00:00:00.000Z');
   const agent: AgentPort = {
     createSession() {
       const nativeSessionId = `native-${++created}`;
       records.set(nativeSessionId, { busy: false });
+      history.create(nativeSessionId);
       return ok({ nativeSessionId });
     },
+    ...(!options.legacyHistory ? { exportSession: history.exportSession, watchSession: history.watchSession } : {}),
     inspect(nativeSessionId) {
       const record = records.get(nativeSessionId);
       return { availability: !record ? 'missing' : record.busy ? 'busy' : 'ready' };
@@ -62,12 +66,12 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
       if (signal.aborted) return { ok: false, error: appError('agent_cancelled', 'runtime', 'cancelled', false) };
       const record = records.get(nativeSessionId);
       if (!record) return { ok: false, error: appError('session_history_unavailable', 'session', 'missing', false) };
-      const agentFacts: AgentConfigFacts = {
-        policyVersion: 'p2-invoice-chat-v1', nativeSessionId, systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT, thinkingLevel: 'off',
+      const agentFacts: P5ChatAgentConfigFacts = {
+        policyVersion: 'p5-session-inputs-v1', nativeSessionId, systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT, thinkingLevel: 'off',
         resourcePolicy: 'none', historyPolicy: 'memory-only', maxContextBytes: 524_288, maxOutputBytes: 262_144,
-        maxAssistantContentBytes: 524_288, maxModelCalls: 1, sessionRetry: false,
+        maxAssistantContentBytes: 524_288, maxModelCalls: 12, sessionRetry: false,
       };
-      const snapshot: SafeConfigSnapshot & { agent: AgentConfigFacts } = {
+      const snapshot: SafeConfigSnapshot & { agent: P5ChatAgentConfigFacts } = {
         version: 1, name: receivedConfig.name, revision: receivedConfig.revision, requestedModel: receivedConfig.modelRef,
         resolvedModel: receivedConfig.modelRef, api: receivedConfig.connection?.api ?? null,
         endpoint: receivedConfig.connection?.baseUrl ?? null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
@@ -78,6 +82,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
         snapshot,
         async execute(input: AgentExecutionInput, _runSignal) {
           record.busy = true;
+          history.saveUser(nativeSessionId, input);
           const outcome: AgentNativeOutcome = {
             text: input.text === 'first invoice summary' ? '发票 INV-1，金额 100 元，缺少日期。' : '根据上文，缺少开票日期。',
             partial: false, stopReason: 'stop', responseId: `response-${input.runId}`, responseModel: receivedConfig.modelRef.model,
@@ -85,6 +90,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
             tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
             stopped: true, cleanupErrors: [], agent: { nativeSessionId, turnCount: 1, modelCallCount: 1 },
           };
+          history.saveResult(nativeSessionId, input, outcome);
           record.busy = false;
           return outcome;
         },
@@ -101,7 +107,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     async prepare() { return { ok: false, error: appError('unused', 'provider', 'unused', false) }; },
     async close() { return { stopped: true, closed: true, errors: [] }; },
   };
-  const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, agent, provider,
+  const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider,
     log: { write: () => undefined, close: async () => undefined }, now: () => '2026-09-24T00:00:00.000Z', monotonicNow: () => performance.now() });
   const sessionRepository: SessionRepository = options.failSessionInsert ? {
     ...opened.data.sessions,
@@ -114,7 +120,8 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     prepareDelete: (sessionId, at) => opened.data.sessions.prepareDelete(sessionId, at),
     delete: (sessionId, at) => opened.data.sessions.delete(sessionId, at),
   } : opened.data.sessions;
-  const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z', opened.data.runs);
+  const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z', opened.data.runs,
+    opened.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
   const promptTrace: PromptTraceBuffer = {
     begin() {}, append() {}, end() {}, clearSession(sessionId) { clearedTraceSessions.push(sessionId); },
     query() { if (options.failTraceQuery) throw new Error('diagnostic source failed'); return { availability: 'not-started', calls: [], droppedCalls: 0 }; },
@@ -126,7 +133,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
 
 describe('P2 Application Agent entry', () => {
   it('rejects invalid message queries and reports legacy native history without preparing a model', async () => {
-    const { app, counts } = harness();
+    const { app, counts } = harness({ legacyHistory: true });
     const created = await app.createSession({});
     if (!created.ok) throw new Error(created.error.message);
     expect(typeof app.listSessionMessages).toBe('function');
@@ -198,9 +205,12 @@ describe('P2 Application Agent entry', () => {
     if (!first.ok || !second.ok) throw new Error('fixture sessions failed');
 
     const deleting = app.deleteSession(second.data.sessionId);
-    expect(await app.createSession()).toMatchObject({ ok: false, error: { code: 'session_delete_in_progress' } });
+    expect(await app.deleteSession(second.data.sessionId)).toMatchObject({ ok: false, error: { code: 'session_busy' } });
+    const third = await app.createSession({ title: 'Unrelated' });
+    expect(third).toMatchObject({ ok: true, data: { sessionId: 3, nativeSessionId: 'native-3' } });
     expect(await deleting).toMatchObject({ ok: false, error: { code: 'session_delete_incomplete' } });
     expect(await app.listSessions({ limit: 10 })).toMatchObject({ ok: true, data: { items: [
+      { sessionId: 3, status: 'active' },
       { sessionId: second.data.sessionId, status: 'archived' },
       { sessionId: first.data.sessionId, status: 'active' },
     ] } });
@@ -208,7 +218,9 @@ describe('P2 Application Agent entry', () => {
 
     setReleaseFailure(false);
     expect(await app.deleteSession(second.data.sessionId)).toEqual({ ok: true, data: { deletedSessionId: second.data.sessionId, disposition: 'permanent' } });
-    expect(await app.listSessions({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: first.data.sessionId, status: 'active' }] } });
+    expect(await app.listSessions({ limit: 10 })).toMatchObject({ ok: true, data: { items: [
+      { sessionId: 3, status: 'active' }, { sessionId: first.data.sessionId, status: 'active' },
+    ] } });
     expect(clearedTraceSessions).toEqual([second.data.sessionId]);
     expect(released).toEqual(['native-2']);
   });

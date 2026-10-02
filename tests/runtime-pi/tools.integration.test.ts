@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Database } from 'bun:sqlite';
 import { appError, fail } from '@flowmate/contracts';
-import type { AgentNativeOutcome, AgentRunEvent, Application, NativeSessionHistory, ProviderConfig, Result } from '@flowmate/contracts';
+import type { AgentNativeOutcome, AgentRunEvent, AgentToolBinding, Application, NativeSessionHistory, ProviderConfig, Result, ToolCallSnapshot } from '@flowmate/contracts';
 import { createApplication } from '../../apps/composition.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import { openDatabase } from '../../packages/core/src/storage/database.ts';
@@ -58,8 +58,8 @@ function writeFaultInvoice(directory: string) {
 }
 
 describe('P4 real candidate commit and message persistence failures', () => {
-  it.each(['toolResult-save', 'assistant-save', 'delivery-conflict', 'blocking-write-failure', 'job-terminal-write-failure'] as const)
-    ('preserves the committed candidate and actual tool facts after %s, then blocks continuation across restart', async (fault) => {
+  it.each(['toolResult-save', 'assistant-save', 'delivery-conflict', 'blocking-write-failure', 'job-terminal-write-failure', 'sdk-after-receipt', 'sdk-after-sources'] as const)
+    ('preserves the committed candidate and actual tool facts after %s', async (fault) => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-p4-tool-fault-'));
     const product = join(root, 'product');
     const paths = { root: product, databaseFile: join(product, 'data', 'app.sqlite'), logsDir: join(product, 'logs'),
@@ -68,6 +68,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
     const source = join(sourceRoot, '000001');
     writeFaultInvoice(source);
     const terminalWriteFailed = fault === 'blocking-write-failure' || fault === 'job-terminal-write-failure';
+    const afterFault = fault.startsWith('sdk-after-');
     const toolResultSaveFailed = fault !== 'assistant-save' && fault !== 'delivery-conflict';
     if (terminalWriteFailed) {
       const seeded = openDatabase(paths);
@@ -100,6 +101,8 @@ describe('P4 real candidate commit and message persistence failures', () => {
     let executions = 0;
     let prepareCount = 0;
     let injected = false;
+    let queryCall: AgentToolBinding['queryCall'];
+    let fixedFacts: Pick<ToolCallSnapshot, 'result' | 'runtimeObservation' | 'endedAt' | 'stoppedAt'> | undefined;
     let priorPrefix: NativeSessionHistory | undefined;
     let prefixAtFailure: NativeSessionHistory | undefined;
     let failedEntryId: string | undefined;
@@ -112,14 +115,28 @@ describe('P4 real candidate commit and message persistence failures', () => {
     const opened = await createApplication({ paths, invoiceSourceRoot: sourceRoot,
       logger: { write: () => undefined, close: async () => undefined }, agentFactory: (tools) => {
         adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
-          credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p4-fault-key' });
+          credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p4-fault-key',
+          ...(afterFault ? { sessionSetup(session) {
+            const originalAfter = session.agent.afterToolCall;
+            session.agent.afterToolCall = async (...call) => {
+              const saved = queryCall?.(call[0].toolCall.id);
+              if (!saved?.ok) throw new Error('Missing saved candidate ToolCall before SDK after.');
+              fixedFacts = { result: saved.data.result, runtimeObservation: saved.data.runtimeObservation,
+                endedAt: saved.data.endedAt, stoppedAt: saved.data.stoppedAt };
+              const original = await originalAfter?.(...call);
+              injected = true;
+              Reflect.set(call[0].result.details as object, fault === 'sdk-after-receipt' ? 'candidateId' : 'sources',
+                fault === 'sdk-after-receipt' ? 999 : [{ documentId: 999, quote: 'Forged source.' }]);
+              return original;
+            };
+          } } : {}) });
         const watch = adapter.watchSession.bind(adapter);
         adapter.watchSession = (nativeId, save) => watch(nativeId, (history, context) => {
           const entry = history.entries.at(-1);
           const message = entry?.type === 'message' ? entry.message as Record<string, unknown> : null;
           const target = fault === 'assistant-save' ? message?.role === 'assistant' && message.stopReason === 'stop'
             : message?.role === 'toolResult';
-          if (fault !== 'delivery-conflict' && context && target && !injected) {
+          if (!afterFault && fault !== 'delivery-conflict' && context && target && !injected) {
             injected = true;
             prefixAtFailure = priorPrefix && structuredClone(priorPrefix);
             failedEntryId = context.entryId;
@@ -137,6 +154,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
           const nativeExecute = result.data.execute.bind(result.data);
           return { ...result, data: { ...result.data, execute: async (input, signal, observe) => {
             const binding = input.toolBinding!;
+            queryCall = binding.queryCall;
             outcome = await nativeExecute({ ...input, toolBinding: { ...binding,
               execute: async (...call) => { executions += 1; return binding.execute(...call); },
               recordDelivery: (id, delivery) => {
@@ -198,6 +216,26 @@ describe('P4 real candidate commit and message persistence failures', () => {
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
     const terminal = await completion;
+    if (afterFault) {
+      expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true, error: { code: 'tool_feedback_conflict' } } });
+      expect(injected).toBe(true);
+      expect(executions).toBe(1);
+      expect(requests).toHaveLength(1);
+      expect(await app.queryJobCandidate({ jobId, candidateId: 1 })).toMatchObject({ ok: true, data: { candidate } });
+      expect(await app.close()).toMatchObject({ ok: true, data: { closed: true } });
+      const db = new Database(paths.databaseFile, { readonly: true });
+      try {
+        const row = db.query('SELECT status,result_json,runtime_observation_json,ended_at,stopped_at,delivery_json FROM tool_calls').get() as {
+          status: string; result_json: string; runtime_observation_json: string; ended_at: string; stopped_at: string; delivery_json: string };
+        expect(row.status).toBe('succeeded');
+        expect(fixedFacts).toEqual({ result: JSON.parse(row.result_json), runtimeObservation: JSON.parse(row.runtime_observation_json),
+          endedAt: row.ended_at, stoppedAt: row.stopped_at });
+        expect(JSON.parse(row.result_json)).toMatchObject({ status: 'succeeded', committedCandidateId: 1, data: { candidateId: 1 } });
+        expect(JSON.parse(row.delivery_json)).toMatchObject({ state: 'failed', includedInCallSequence: null, requestDispatchedAt: null });
+        expect(db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 1 });
+      } finally { db.close(); }
+      return;
+    }
     expect(terminal.result).toMatchObject(terminalWriteFailed
       ? { ok: false, error: { code: 'storage_write_failed' } }
       : { ok: true, data: { status: 'failed', stopped: true, error: { code: 'storage_write_failed' } } });

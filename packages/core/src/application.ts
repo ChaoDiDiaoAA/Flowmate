@@ -160,6 +160,9 @@ export function makeApplication(
     },
     submitInput: async (raw, control) => sessions?.submitInput(raw, control) ?? fail(sessionServiceUnavailable()),
     querySessionInput: async (request) => sessions?.queryInput(request) ?? fail(sessionServiceUnavailable()),
+    listSessionInputs: async request => sessions?.listInputs(request) ?? fail(sessionServiceUnavailable()),
+    setSessionStatus: async request => sessions?.setStatus(request) ?? fail(sessionServiceUnavailable()),
+    branchSession: async request => sessions?.branch(request) ?? fail(sessionServiceUnavailable()),
     queryInvoiceFormApplication: async (request) => products?.invoiceForms?.query(request)
       ?? fail(appError('form_bridge_unavailable', 'runtime', 'The controlled invoice form is unavailable.')),
     saveInvoiceCandidate: async request => products?.invoiceEdits?.save(request)

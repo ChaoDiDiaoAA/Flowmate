@@ -38,10 +38,13 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
   ];
   type Body = { tools?: Array<{ function: { name: string } }>; messages: Array<{ role: string; content: unknown; tool_call_id?: string }> };
   const requests: Body[] = [];
+  let budgetRequests = 0;
   const server = await createHttpProvider(async request => {
     const body = await request.json() as Body; requests.push(body);
     const user = JSON.stringify(body.messages.filter(message => message.role === 'user').at(-1)?.content);
     const results = body.messages.filter(message => message.role === 'tool');
+    if (user.includes('NATIVE_BUDGET')) return streamResponse({ name: 'read', id: `native-budget-${++budgetRequests}`,
+      args: { path: 'seed.txt' } });
     if (user.includes('NATIVE_STOP')) return streamResponse({ name: 'powershell', id: 'native-stop',
       args: { command: "Set-Content -LiteralPath 'started.txt' -Value 'started'; Start-Sleep -Seconds 60; Set-Content -LiteralPath 'late.txt' -Value 'late'" } });
     if (user.includes('NATIVE_SECOND')) {
@@ -141,6 +144,24 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
     const stoppedRow = page.locator(`.chat-directory-row[data-session-id="${sessionId}"] small`);
     await stoppedRow.waitFor({ state: 'visible' });
     expect(await stoppedRow.textContent()).toContain('Cannot continue');
+    expect(await page.getByText('This chat cannot continue safely. Start a new chat.', { exact: true }).count()).toBe(0);
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    checkpoint = 'bounded model calls with visible cause and no unsafe-chat banner';
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    const budgetSessions = await page.evaluate(() => window.flowmate.listSessions());
+    if (!budgetSessions.ok) throw new Error('Budget Session unavailable');
+    const budgetSessionId = budgetSessions.data.items.find(item => item.sessionId !== sessionId)!.sessionId;
+    await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, directoryB);
+    await page.getByRole('button', { name: 'Choose directory', exact: true }).click();
+    await page.waitForFunction(directory => (document.querySelector('.run-tools-panel input') as HTMLInputElement)?.value === directory, directoryB);
+    await page.getByRole('textbox', { name: 'Message to model' }).fill('NATIVE_BUDGET');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await page.getByRole('log').getByText('The assistant reached the request limit before finishing. Check Processing History for any saved result.', { exact: true })
+      .waitFor({ timeout: 10_000 });
+    await waitFor(() => page.evaluate(async () => { const value = await window.flowmate.queryRuntimeState(); return value.ok && value.data.active === null && !value.data.blocked; }));
+    expect(budgetRequests).toBe(16);
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    expect(await page.getByText('This chat cannot continue safely. Start a new chat.', { exact: true }).count()).toBe(0);
     checkpoint = 'normal desktop close after confirmed Stop';
     await closeDesktopFixture(app, userData); app = null;
     checkpoint = 'persisted Run and tool facts';
@@ -155,9 +176,15 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
         expect(scope.version).toBe(2); expect(scope).not.toHaveProperty('commandAccess'); expect(scope).not.toHaveProperty('allowedWritePaths');
       }
       expect(db.query('SELECT count(*) AS count FROM jobs').get()).toEqual({ count: 0 });
-      expect(db.query('SELECT tool_name AS name,status FROM tool_calls ORDER BY id').all()).toEqual([
+      expect(db.query('SELECT tool_name AS name,status FROM tool_calls WHERE session_id=? ORDER BY id').all(sessionId)).toEqual([
         ...calls.map(call => ({ name: call.name, status: 'succeeded' })), { name: 'read', status: 'succeeded' }, { name: 'powershell', status: 'cancelled' },
       ]);
+      const budgetRun = db.query('SELECT id,status,config_json,error_json FROM runs WHERE session_id=?').get(budgetSessionId) as {
+        id: number; status: string; config_json: string; error_json: string };
+      expect(budgetRun.status).toBe('failed');
+      expect(JSON.parse(budgetRun.config_json).agent.maxModelCalls).toBe(16);
+      expect(JSON.parse(budgetRun.error_json).code).toBe('agent_model_call_budget');
+      expect(db.query('SELECT count(*) AS count FROM tool_calls WHERE run_id=?').get(budgetRun.id)).toEqual({ count: 16 });
     } finally { db.close(); }
   } catch (error) {
     failure = new Error(`Native tools checkpoint ${checkpoint}`, { cause: error });

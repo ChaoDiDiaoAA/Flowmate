@@ -310,10 +310,12 @@ describe('P3 invoice tool contracts', () => {
       version: 1 as const, source: 'unknown' as const, reason: null, sdkValues: null,
       attempts: 0, attemptsComplete: true, costSource: null, updatedAt: usage.updatedAt,
     };
-    expect(UsageRecordV2Schema.safeParse({ ...usage, calls: Array.from({ length: 13 }, (_, index) => ({
-      callSequence: index + 1, usage: callUsage,
-      tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
-    })) }).success).toBe(false);
+    for (const length of [12, 13, 16, 17, 64, 65]) {
+      expect(UsageRecordV2Schema.safeParse({ ...usage, calls: Array.from({ length }, (_, index) => ({
+        callSequence: index + 1, usage: callUsage,
+        tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+      })) }).success).toBe(length <= 64);
+    }
     expect(AppErrorSchema.safeParse({
       code: 'tool_failed', category: 'tool', message: 'Tool failed.', retryable: false,
       runId: 4, sessionId: 3, toolCallId: 'native-call-1',

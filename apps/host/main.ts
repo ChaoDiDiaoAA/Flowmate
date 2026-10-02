@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
-import { appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok } from '@flowmate/contracts';
+import { appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings } from '@flowmate/core';
 import { createPromptTraceBuffer } from '@flowmate/logging';
@@ -141,6 +141,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     provider: new PiProviderAdapter({ credentialsFor }),
     agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace, tools }),
     promptTrace,
+    runtimeDefaults: () => ok(currentSettings.runtime ?? {}),
     invoiceFormBridge,
   });
   if (!created.ok) {
@@ -151,14 +152,18 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
   application = created.data;
   const catalog = await createPiModelCatalog();
   const requireDesktopPiKey = async (profile: ModelProfile): Promise<Result<void>> => {
-    if (profile.kind !== 'catalog') return ok(undefined);
-    let provider;
-    try { provider = (await catalog.list(profile.providerId ?? undefined)).find((item) => item.id === profile.providerId); }
-    catch { return fail(appError('provider_catalog_unavailable', 'provider', 'Pi model catalog is unavailable.', true)); }
-    if (!provider?.authMethods.includes('api_key'))
-      return fail(appError('model_api_key_unsupported', 'input', 'This Pi provider does not support API key access.'));
+    const revision = currentSettings.revision;
+    if (profile.kind === 'catalog') {
+      let provider;
+      try { provider = (await catalog.list(profile.providerId ?? undefined)).find((item) => item.id === profile.providerId); }
+      catch { return fail(appError('provider_catalog_unavailable', 'provider', 'Pi model catalog is unavailable.', true)); }
+      if (!provider?.authMethods.includes('api_key'))
+        return fail(appError('model_api_key_unsupported', 'input', 'This Pi provider does not support API key access.'));
+    }
     try {
       const credential = await credentialRequest(profile.credentialRef, 'read');
+      if (currentSettings.revision !== revision)
+        return fail(appError('state_conflict', 'input', 'Model settings changed while checking the API key. Reload before sending.', true));
       if (credential?.type === 'api_key' && typeof credential.key === 'string' && credential.key.trim()) return ok(undefined);
     } catch { return fail(appError('model_credential_unavailable', 'storage', 'The saved API key could not be read.')); }
     return fail(appError('model_credential_missing', 'input', 'Save an API key for this model in Models.'));
@@ -202,6 +207,26 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     if (command.type === 'query_invoice_candidate_operation') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryInvoiceCandidateOperation(command.input) }); return; }
     if (command.type === 'query_session_input') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.querySessionInput(command.input) });
+      return;
+    }
+    if (command.type === 'list_session_inputs') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listSessionInputs(command.input) });
+      return;
+    }
+    if (command.type === 'set_session_status') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.setSessionStatus(command.input) });
+      return;
+    }
+    if (command.type === 'branch_session') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.branchSession(command.input) });
+      return;
+    }
+    if (command.type === 'submit_session_input' && command.input.mode !== 'prompt') {
+      const accepted = await application.submitInput(command.input, { onEvent(event: AgentRunEvent) {
+        send({ version: 1, type: 'event', event: { type: 'agent_run_event', requestId: command.requestId, value: event } });
+      } });
+      send({ version: 1, type: 'response', requestId: command.requestId,
+        value: accepted.ok ? ok({ ...accepted.data, requestId: command.requestId }) : accepted });
       return;
     }
     if (command.type === 'query_invoice_form_application') {
@@ -479,18 +504,57 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       }
       return;
     }
-    if (command.type === 'start_run' || command.type === 'submit_invoice_form_input') {
+    if (command.type === 'start_run' || command.type === 'submit_invoice_form_input' || command.type === 'submit_session_input') {
       if (!claimRequestId(command.requestId)) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('request_duplicate', 'input', '该请求身份已使用，未重复执行。')) });
         return;
       }
-      const profile = currentSettings.models.find((model) => model.id === command.input.modelId);
-      if (currentSettings.revision !== command.expectedSettingsRevision || profile && profile.credentialRef !== command.expectedCredentialRef) {
+      if (!('modelId' in command.input)) return;
+      const input = command.input;
+      let desktopRequestHash: string | undefined;
+      if (command.type === 'submit_session_input' && command.input.mode === 'prompt') {
+        desktopRequestHash = createHash('sha256').update(serializeDesktopPromptRequest(command.input, 1)).digest('hex');
+      }
+      if (command.type === 'submit_invoice_form_input') {
+        desktopRequestHash = createHash('sha256').update(serializeDesktopInvoiceFormRequest(command.input)).digest('hex');
+        const original = await application.querySessionInput({ sessionId: command.input.workspace.sessionId, clientSequence: command.input.clientSequence });
+        if (!original.ok) { send({ version: 1, type: 'response', requestId: command.requestId, value: original }); return; }
+        if (original.data.input) {
+          const prior = original.data.input;
+          const value = prior.mode === 'prompt' && prior.goalMode === 'fill-form' && prior.content.version === 2
+            && prior.content.desktopRequestHash === desktopRequestHash && prior.runId !== null
+            ? ok({ inputId: prior.inputId, sessionId: prior.sessionId, runId: prior.runId, requestId: command.requestId })
+            : fail(appError('state_conflict', 'input', 'This client sequence belongs to another Fill request.'));
+          send({ version: 1, type: 'response', requestId: command.requestId, value }); return;
+        }
+      }
+      if (desktopRequestHash !== undefined && command.type === 'submit_session_input') {
+        const original = await application.querySessionInput({ sessionId: command.input.sessionId, clientSequence: command.input.clientSequence });
+        if (!original.ok) { send({ version: 1, type: 'response', requestId: command.requestId, value: original }); return; }
+        if (original.data.input) {
+          const prior = original.data.input;
+          if (prior.content.version === 2 && command.input.mode === 'prompt') desktopRequestHash = createHash('sha256')
+            .update(serializeDesktopPromptRequest(command.input, prior.content.requestIdentityVersion)).digest('hex');
+          const value = prior.content.version === 2 && prior.content.desktopRequestHash === desktopRequestHash
+            ? prior.runId === null ? fail(appError('operation_result_unknown', 'session', 'The original Run cannot be confirmed.'))
+              : ok({ inputId: prior.inputId, sessionId: prior.sessionId, runId: prior.runId, requestId: command.requestId })
+            : fail(appError('state_conflict', 'input', 'This client sequence belongs to another input. Query the original input.'));
+          send({ version: 1, type: 'response', requestId: command.requestId, value }); return;
+        }
+      }
+      const profile = currentSettings.models.find((model) => model.id === input.modelId);
+      if (command.expectedSettingsRevision !== undefined && (currentSettings.revision !== command.expectedSettingsRevision
+        || profile && profile.credentialRef !== command.expectedCredentialRef)) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('state_conflict', 'input', '模型配置已变化，请重新加载后再发送。', true)) });
         return;
       }
       if (!profile) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('model_not_configured', 'input', '所选模型配置不存在。')) });
+        return;
+      }
+      if (command.type === 'submit_session_input' && (command.expectedSettingsRevision === undefined || command.expectedCredentialRef === undefined)) {
+        send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('state_conflict', 'input', 'Model preparation is missing. Reload the model before submitting a new input.', true)) });
         return;
       }
       if (profile.kind === 'legacy') {
@@ -519,7 +583,9 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
         ...(command.input.workspace === undefined ? {} : { workspace: command.input.workspace }),
         ...(command.input.workingDirectory === undefined ? {} : { workingDirectory: command.input.workingDirectory }),
         goalMode: command.input.goalMode,
+        ...(command.input.budget === undefined ? {} : { budget: command.input.budget }),
         ...(command.input.timeoutMs === undefined ? {} : { timeoutMs: command.input.timeoutMs }),
+        ...(command.input.stopGraceMs === undefined ? {} : { stopGraceMs: command.input.stopGraceMs }),
       }) : null;
       if (normalized && !normalized.ok) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: normalized });
@@ -527,14 +593,21 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       }
       let accepted;
       try {
-        const control = { onEvent(event: AgentRunEvent) {
+        const control = { ...(desktopRequestHash === undefined ? {} : { desktopRequestHash }), onEvent(event: AgentRunEvent) {
           send({ version: 1, type: 'event', event: { type: 'agent_run_event', requestId: command.requestId, value: event } });
         } };
         if (command.type === 'submit_invoice_form_input') accepted = await application.submitInput({
           sessionId: command.input.workspace.sessionId, clientSequence: command.input.clientSequence, mode: 'prompt', goalMode: 'fill-form',
           text: '将当前已选候选录入发票表单，保留供人工检查。', config,
           workspace: command.input.workspace, formTarget: command.input.target,
+          ...(command.input.budget === undefined ? {} : { budget: command.input.budget }),
+          ...(command.input.timeoutMs === undefined ? {} : { timeoutMs: command.input.timeoutMs }),
+          ...(command.input.stopGraceMs === undefined ? {} : { stopGraceMs: command.input.stopGraceMs }),
         }, control);
+        else if (command.type === 'submit_session_input' && command.input.mode === 'prompt') {
+          const { modelId: _modelId, ...request } = command.input;
+          accepted = await application.submitInput({ ...request, config }, control);
+        }
         else if (normalized?.ok) accepted = await application.startRun(normalized.data, control);
         else throw new Error('invalid_request');
       } catch {

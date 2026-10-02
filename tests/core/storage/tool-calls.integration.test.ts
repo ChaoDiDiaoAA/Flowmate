@@ -2,11 +2,14 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
-import { appError } from '@flowmate/contracts';
-import type { InvoiceFormApplicationReceipt, P3AgentConfigFacts, Result, SafeConfigSnapshot, ToolCallDelivery, UsageRecord } from '@flowmate/contracts';
+import { Database } from 'bun:sqlite';
+import { appError, CandidateDraftSchema, CandidateReceiptSchema, ToolExecutionFailure } from '@flowmate/contracts';
+import { z } from 'zod';
+import type { InvoiceFormApplicationReceipt, P3AgentConfigFacts, Result, SafeConfigSnapshot, ToolCallDelivery, UsageRecord, ToolRuntimeObservation } from '@flowmate/contracts';
 import { deferCleanup } from '../../support/resources.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 import { createToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
+import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 
 function paths(root: string) {
   return { root, databaseFile: join(root, 'data', 'flowmate.sqlite'), logsDir: join(root, 'logs'),
@@ -49,6 +52,183 @@ function required<T>(result: Result<T>): T {
   if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
   return result.data;
 }
+
+const observation: ToolRuntimeObservation = { version: 1, groupKey: 'fixture-read', strategyVersion: 'runtime-v1',
+  sampleSource: 'test', beforeOutcome: 'allowed', failureStage: null, diagnosticCode: null,
+  afterStructure: 'valid', afterDomain: 'not_applicable', executionDurationMs: 12, timingComplete: true,
+  effectiveTimeoutMs: 1000, timeoutSource: 'configured', runDeadlineTruncated: false,
+  commit: 'none_confirmed', commitError: null };
+
+describe('Runtime fixed observations', () => {
+  it.each(['throws', 'foreign-receipt', 'terminal-write-fails'] as const)('keeps the original candidate commit when execution %s and never repeats its write', async (mode) => {
+    const store = makeStore();
+    addRunningInvoiceJob(store);
+    const candidate = { fields: { invoiceNumber: missingField(), issueDate: missingField(), sellerName: missingField(),
+      sellerTaxId: missingField(), buyerName: missingField(), buyerTaxId: missingField(), currency: missingField(),
+      netAmount: missingField(), taxAmount: missingField(), totalAmount: missingField() }, lines: [], notes: [] };
+    const scope = { version: 2 as const, allowedTools: ['save_invoice_candidate'], allowedDocumentIds: [1], allowedArtifactIds: [1, 2], allowedResourcePaths: [] };
+    let executions = 0;
+    const recorder = createToolRecorder(store.toolCalls, () => store.stamp);
+    const executor = createToolExecutor({ recorder, now: () => store.stamp, definitions: [{ name: 'save_invoice_candidate', version: '1',
+      description: 'Commit fault fixture', effect: 'LOCAL_WRITE', executionMode: 'sequential',
+      inputSchema: z.object({ documentId: z.number().int(), candidate: CandidateDraftSchema }).strict(), outputSchema: CandidateReceiptSchema,
+      execute: async (args, call, context) => {
+        executions++;
+        const saved = required(store.candidates.save({ runId: context.runId, sessionId: context.sessionId,
+          nativeToolCallId: call.nativeToolCallId, documentId: args.documentId, candidate: args.candidate,
+          checks: [], issues: [], at: store.stamp }));
+        if (mode === 'throws') throw new ToolExecutionFailure(appError('tool_execution_failed', 'tool', 'Failed after commit.'));
+        return mode === 'foreign-receipt' ? { ...saved.receipt, jobId: 99 } : saved.receipt;
+      },
+    }] });
+    const context = { runId: 1, sessionId: store.sessionId, nativeToolCallId: 'committed-write', scope, signal: new AbortController().signal };
+    if (mode === 'terminal-write-fails') store.db.exec(`CREATE TRIGGER reject_commit_terminal BEFORE UPDATE OF status ON tool_calls
+      WHEN NEW.status IN ('succeeded','failed') BEGIN SELECT RAISE(ABORT,'terminal unavailable'); END;`);
+    const executed = await executor.execute('save_invoice_candidate', { documentId: 1, candidate }, context);
+    expect(executed).toMatchObject({ fatal: true, result: { status: 'failed', error: {
+      code: mode === 'throws' ? 'tool_execution_failed' : mode === 'foreign-receipt' ? 'tool_invalid_output' : 'storage_write_failed',
+    } } });
+    const original = required(recorder.query({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'committed-write' }));
+    expect(required(recorder.queryCandidateCommit({ toolCallId: original.toolCallId, runId: 1, sessionId: store.sessionId })))
+      .toMatchObject({ candidateId: 1, jobId: 4, sequence: 1 });
+    expect(original).toMatchObject(mode === 'terminal-write-fails' ? { status: 'running', result: null, runtimeObservation: null }
+      : { status: 'failed', result: { committedCandidateId: 1 }, runtimeObservation: { commit: 'committed' } });
+    await executor.execute('save_invoice_candidate', { documentId: 1, candidate }, context);
+    expect(executions).toBe(1);
+    expect(store.db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 1 });
+  });
+  it('migrates an existing database with NULL observations and rolls back failed version registration', () => {
+    for (const registrationFails of [false, true]) {
+      const root = mkdtempSync(join(tmpdir(), 'flowmate-observation-migration-'));
+      const store = required(openDatabase(paths(root)));
+      const stamp = '2026-10-02T00:00:00.000Z';
+      const session = required(store.sessions.create({ nativeSessionId: 'observation-migration', title: 'Fixture', at: stamp }));
+      store.db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+        VALUES ('agent',?,'{"version":2,"allowedTools":[],"allowedDocumentIds":[],"allowedArtifactIds":[],"allowedResourcePaths":[]}',
+        'running','fixture','{}','{}','{}','{}',?)`).run(session.sessionId, stamp);
+      const call = required(store.toolCalls.request({ runId: 1, sessionId: session.sessionId, nativeToolCallId: 'old-row',
+        toolName: 'unknown_tool', toolVersion: null, effect: null, rawArguments: {}, requestedAt: stamp }));
+      store.db.exec('DROP INDEX tool_calls_runtime_observation_recent');
+      store.db.exec('ALTER TABLE tool_calls DROP COLUMN runtime_observation_json');
+      store.db.exec('DELETE FROM schema_migrations WHERE version=12');
+      if (registrationFails) store.db.exec(`CREATE TRIGGER reject_migration_registration BEFORE INSERT ON schema_migrations
+        WHEN NEW.version=12 BEGIN SELECT RAISE(ABORT,'registration unavailable'); END;`);
+      store.close();
+      const reopened = openDatabase(paths(root));
+      expect(reopened.ok).toBe(!registrationFails);
+      const db = reopened.ok ? reopened.data.db : new Database(paths(root).databaseFile);
+      deferCleanup(() => reopened.ok ? reopened.data.close() : db.close());
+      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 12 });
+      const columns = db.query('PRAGMA table_info(tool_calls)').all() as Array<{ name: string }>;
+      expect(columns.some(column => column.name === 'runtime_observation_json')).toBe(!registrationFails);
+      expect(db.query('SELECT id,native_tool_call_id FROM tool_calls WHERE id=?').get(call.toolCallId))
+        .toEqual({ id: call.toolCallId, native_tool_call_id: 'old-row' });
+      if (!reopened.ok) continue;
+      expect(required(reopened.data.toolCalls.getById(call.toolCallId)).runtimeObservation).toBeNull();
+      expect(db.query("SELECT name FROM sqlite_master WHERE type='index' AND name='tool_calls_runtime_observation_recent'").get())
+        .toEqual({ name: 'tool_calls_runtime_observation_recent' });
+      for (const invalid of ['no-json', '{}', '{"version":2}', '{"version":1.0}', '{"version":"1"}']) {
+        expect(() => db.query('UPDATE tool_calls SET runtime_observation_json=? WHERE id=?').run(invalid, call.toolCallId)).toThrow();
+      }
+      db.query('UPDATE tool_calls SET runtime_observation_json=? WHERE id=?').run('{"version":1}', call.toolCallId);
+      expect(reopened.data.toolCalls.getById(call.toolCallId)).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    }
+  });
+  it('commits terminal and strict observation atomically and preserves them after delivery failure', () => {
+    const store = makeStore();
+    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'atomic-observation',
+      toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
+    expect(call.runtimeObservation).toBeNull();
+    required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
+    required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: store.stamp }));
+    const facts = { toolCallId: call.toolCallId,
+      result: { version: 1 as const, status: 'succeeded' as const, data: {}, committedCandidateId: null },
+      cleanup: { version: 1 as const, stopped: true, stopReason: 'settled', errors: [] },
+      endedAt: store.stamp, stoppedAt: store.stamp, runtimeObservation: observation };
+    expect(store.toolCalls.finish({ ...facts, runtimeObservation: { ...observation, executionDurationMs: -1 } }).ok).toBe(false);
+    store.db.exec(`CREATE TRIGGER reject_observation BEFORE UPDATE OF runtime_observation_json ON tool_calls
+      WHEN NEW.runtime_observation_json IS NOT NULL BEGIN SELECT RAISE(ABORT,'observation unavailable'); END;`);
+    expect(store.toolCalls.finish(facts).ok).toBe(false);
+    expect(required(store.toolCalls.getById(call.toolCallId))).toMatchObject({ status: 'running', result: null, runtimeObservation: null });
+    store.db.exec('DROP TRIGGER reject_observation');
+    expect(required(store.toolCalls.finish(facts)).runtimeObservation).toEqual(observation);
+    expect(store.toolCalls.finish(facts).ok).toBe(true);
+    expect(store.toolCalls.finish({ ...facts, runtimeObservation: { ...observation, failureStage: 'delivery' } }).ok).toBe(false);
+    required(store.toolCalls.recordDelivery({ toolCallId: call.toolCallId, delivery: { version: 1, state: 'failed',
+      messageObservedAt: null, includedInCallSequence: null, requestDispatchedAt: null,
+      error: appError('delivery_failed', 'runtime', 'Delivery failed.') } }));
+    expect(required(store.toolCalls.getById(call.toolCallId)).runtimeObservation).toEqual(observation);
+  });
+
+  it('recovers a committed terminal after response loss without generating another end time', () => {
+    const store = makeStore();
+    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'response-loss',
+      toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
+    required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
+    required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: store.stamp }));
+    let tick = 0;
+    const recorder = createToolRecorder({ ...store.toolCalls, finish(input) {
+      const result = store.toolCalls.finish(input);
+      if (result.ok) return { ok: false, error: appError('storage_write_failed', 'storage', 'Response lost.') };
+      return result;
+    } }, () => `2026-10-02T00:00:0${tick++}.000Z`);
+    const saved = required(recorder.finish({ toolCallId: call.toolCallId, status: 'succeeded', data: {},
+      committedCandidateId: null, cleanup: { version: 1, stopped: true, stopReason: 'settled', errors: [] },
+      stoppedAt: store.stamp, runtimeObservation: observation }));
+    expect(saved).toMatchObject({ status: 'succeeded', endedAt: '2026-10-02T00:00:00.000Z', runtimeObservation: observation });
+    expect(tick).toBe(1);
+  });
+
+  it.each(['finish', 'reject'] as const)('recovers the original %s facts when its committed response throws', (operation) => {
+    const store = makeStore();
+    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: `thrown-${operation}`,
+      toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
+    if (operation === 'finish') {
+      required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
+      required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: store.stamp }));
+    }
+    let saves = 0;
+    let ticks = 0;
+    const recorder = createToolRecorder({ ...store.toolCalls,
+      finish(input) { saves++; required(store.toolCalls.finish(input)); throw new Error('Committed response lost.'); },
+      reject(input) { saves++; required(store.toolCalls.reject(input)); throw new Error('Committed response lost.'); },
+    }, () => `2026-10-02T00:00:0${ticks++}.000Z`);
+    const result = operation === 'finish'
+      ? recorder.finish({ toolCallId: call.toolCallId, status: 'succeeded', data: {}, committedCandidateId: null,
+        cleanup: { version: 1, stopped: true, stopReason: 'settled', errors: [] }, stoppedAt: store.stamp, runtimeObservation: observation })
+      : recorder.reject({ toolCallId: call.toolCallId, error: appError('tool_invalid_input', 'tool', 'SDK rejected.'),
+        runtimeObservation: { ...observation, beforeOutcome: 'rejected', failureStage: 'sdk_arguments', diagnosticCode: 'tool_invalid_input',
+          afterStructure: 'not_applicable', afterDomain: 'not_applicable', executionDurationMs: null, timingComplete: false,
+          effectiveTimeoutMs: null, timeoutSource: null } });
+    const saved = required(result);
+    expect(saved).toEqual(required(store.toolCalls.getById(call.toolCallId)));
+    expect(saved.endedAt).toBe('2026-10-02T00:00:00.000Z');
+    expect(saved.status).toBe(operation === 'finish' ? 'succeeded' : 'failed');
+    expect(saved.runtimeObservation?.beforeOutcome).toBe(operation === 'finish' ? 'allowed' : 'rejected');
+    expect(saves).toBe(1);
+    expect(ticks).toBe(1);
+    expect(store.db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
+  });
+
+  it.each(['returned', 'thrown'] as const)('keeps terminal response loss unknown when its recovery query is %s', (queryFailure) => {
+    const store = makeStore();
+    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: `query-${queryFailure}`,
+      toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
+    required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
+    required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: store.stamp }));
+    const recorder = createToolRecorder({ ...store.toolCalls,
+      finish(input) { required(store.toolCalls.finish(input)); throw new Error('Private transport detail.'); },
+      getById() {
+        if (queryFailure === 'thrown') throw new Error('Private query detail.');
+        return { ok: false, error: appError('storage_corrupt', 'storage', 'Original facts unavailable.') };
+      },
+    }, () => store.stamp);
+    expect(recorder.finish({ toolCallId: call.toolCallId, status: 'succeeded', data: {}, committedCandidateId: null,
+      cleanup: { version: 1, stopped: true, stopReason: 'settled', errors: [] }, stoppedAt: store.stamp, runtimeObservation: observation }))
+      .toMatchObject({ ok: false, error: { code: 'storage_corrupt', category: 'storage' } });
+    expect(required(store.toolCalls.getById(call.toolCallId))).toMatchObject({ status: 'succeeded', runtimeObservation: observation });
+  });
+});
 
 function makeFormStore(started = true) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-form-call-'));

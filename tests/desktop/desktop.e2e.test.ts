@@ -223,6 +223,315 @@ for (const action of ['last-window', 'quit', 'main-exit'] as const) {
   });
 }
 
+for (const unknownCode of ['operation_result_unknown', 'input_delivery_unknown'] as const) {
+it(`desktop manages same-Run inputs, recovers ${unknownCode} and continues from a saved reply`, async () => {
+  it.setTimeout(90_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-p5-'));
+  const requests: unknown[] = [];
+  const firstResponse = { release: null as (() => void) | null };
+  const server = await createHttpProvider(async request => {
+    const body = await request.json();
+    requests.push(body);
+    if (JSON.stringify(body).includes('P5 stop input')) return new Promise<Response>(() => {});
+    if (requests.length !== 1) return streamText(`P5 saved reply ${requests.length}`);
+    const chunk = (delta: Record<string, unknown>, finish_reason: string | null = null) =>
+      `data: ${JSON.stringify({ id: 'p5-held', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode(chunk({ role: 'assistant', content: 'P5 first reply' })));
+      firstResponse.release = () => { controller.enqueue(encoder.encode(`${chunk({}, 'stop')}data: [DONE]\n\n`)); controller.close(); };
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA'])
+    if (process.env[name]) env[name] = process.env[name];
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  let electronApp: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
+  try {
+    electronApp = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+    const page = await electronApp.firstWindow();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    expect(await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p5-model', credentialRef: 'p5_desktop_credential',
+        name: 'P5 model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'p5-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p5-model' },
+      { modelId: 'p5-model', apiKey: 'synthetic-p5-key' });
+    }, `http://127.0.0.1:${server.port}`)).toMatchObject({ ok: true });
+    await page.locator('.rail').getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByLabel('Default model requests', { exact: true }).fill('32');
+    await page.getByLabel('Default tool calls', { exact: true }).fill('40');
+    await page.getByLabel('Default tool timeout (ms)', { exact: true }).fill('20000');
+    await page.getByLabel('Default Run timeout (ms)', { exact: true }).fill('90000');
+    await page.getByRole('button', { name: 'Save Run limits', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Run limits saved.' })).toBeVisible();
+    expect(requests).toHaveLength(0);
+    await page.getByText('Next Run limits', { exact: true }).click();
+    await page.getByLabel('Next Run model requests', { exact: true }).fill('64');
+    await page.getByLabel('Next Run tool calls', { exact: true }).fill('50');
+    await page.getByLabel('Next Run Run timeout (ms)', { exact: true }).fill('120000');
+    await electronApp.evaluate(({ ipcMain }) => {
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      const original = handlers.get('flowmate:submit-input'); if (!original) throw new Error('Missing submit-input');
+      ipcMain.removeHandler('flowmate:submit-input');
+      ipcMain.handle('flowmate:submit-input', async (event, ...args) => {
+        const saved = globalThis as unknown as { originalP5Request?: import('@flowmate/contracts').DesktopSessionInputRequest };
+        saved.originalP5Request ??= args[0] as import('@flowmate/contracts').DesktopSessionInputRequest;
+        return original(event, ...args);
+      });
+    });
+    const composer = page.getByRole('textbox', { name: 'Message to model' });
+    await composer.fill('P5 initial input');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect.poll(() => requests.length).toBe(1);
+    expect(await page.evaluate(async () => {
+      const active = await window.flowmate.queryRuntimeState();
+      if (!active.ok || !active.data.active) throw new Error('Missing active Run');
+      return window.flowmate.queryRun(active.data.active.runId);
+    })).toMatchObject({ ok: true, data: { config: { version: 2,
+      runtimeBudget: { maxModelCalls: 64, maxToolCalls: 50, toolTimeoutMs: 20000 },
+      limits: { timeoutMs: 120000, stopGraceMs: 5000 } } } });
+    const active = await page.evaluate(() => window.flowmate.queryRuntimeState());
+    expect(active).toMatchObject({ ok: true, data: { active: { runId: expect.any(Number), sessionId: expect.any(Number) } } });
+    if (!active.ok || !active.data.active || active.data.active.sessionId === null) throw new Error('P5 Run did not start');
+    const { runId, sessionId } = active.data.active;
+    const crossSession = await page.evaluate(async ({ sessionId, runId }) => {
+      const other = await window.flowmate.createSession({ title: 'Other P5 chat' });
+      if (!other.ok) return other;
+      return window.flowmate.submitInput({ sessionId: other.data.sessionId, runId, clientSequence: 1, mode: 'steer', text: 'Wrong Run' });
+    }, { sessionId, runId });
+    expect(crossSession.ok).toBe(false);
+    await electronApp.evaluate(({ ipcMain }, code) => {
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      const original = handlers.get('flowmate:submit-input'); if (!original) throw new Error('Missing submit-input');
+      ipcMain.removeHandler('flowmate:submit-input'); let lost = false;
+      ipcMain.handle('flowmate:submit-input', async (event, ...args) => {
+        const result = await original(event, ...args);
+        if (!lost) { lost = true; return { ok: false, error: { code, category: 'session', message: 'Controlled active input receipt loss', retryable: true } }; }
+        return result;
+      });
+    }, unknownCode);
+    await composer.fill('P5 steer input');
+    await page.getByRole('button', { name: 'Steer', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
+    await expect(composer).toHaveValue('P5 steer input');
+    await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Follow up', exact: true })).toBeDisabled();
+    await composer.fill('P5 steer input\n\nExtra draft while receipt unknown');
+    await page.getByRole('button', { name: 'Check input status', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toHaveCount(0);
+    await expect(composer).toHaveValue('Extra draft while receipt unknown');
+    await composer.fill('P5 follow-up input');
+    await page.getByRole('button', { name: 'Follow up', exact: true }).click();
+    await expect.poll(async () => {
+      const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
+      return inputs.ok ? inputs.data.items.map(input => [input.mode, input.runId]) : [];
+    }).toEqual([['followUp', runId], ['steer', runId], ['prompt', runId]]);
+    await expect(page.locator('[data-testid="session-input"]')).toHaveCount(3);
+    expect(requests).toHaveLength(1);
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats', exact: true }).click();
+    await expect(page.locator(`.chat-directory-row[data-session-id="${sessionId}"]`).getByRole('button', { name: 'Archive', exact: true })).toBeDisabled();
+    firstResponse.release?.();
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible({ timeout: 20_000 });
+    await expect.poll(async () => {
+      const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
+      return inputs.ok ? inputs.data.items.map(input => [input.status, input.processingStatus, Boolean(input.nativeEntryId), Boolean(input.resultEntryId)]) : [];
+    }).toEqual(Array.from({ length: 3 }, () => ['consumed', 'completed', true, true]));
+    expect(await page.evaluate(id => window.flowmate.listSessionRuns({ sessionId: id }), sessionId))
+      .toMatchObject({ ok: true, data: { items: [{ runId }] } });
+    await expect(page.locator('[data-testid="chat-turn"][data-message-role="user"]')).toHaveCount(3);
+    const callsBeforeManagement = requests.length;
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats', exact: true }).click();
+    const row = page.locator(`.chat-directory-row[data-session-id="${sessionId}"]`);
+    await row.getByRole('button', { name: 'Archive', exact: true }).click();
+    await expect(row.getByRole('button', { name: 'Unarchive', exact: true })).toBeVisible();
+    await expect(page.locator('.chat-config-hint')).toHaveText('This chat is archived. Unarchive it in Chats to continue.');
+    await composer.fill('P5 preserved archived draft');
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+    await row.getByRole('button', { name: 'Unarchive', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+    expect(await composer.inputValue()).toBe('P5 preserved archived draft');
+    const reply = page.locator('[data-testid="chat-turn"][data-message-role="assistant"]').first();
+    const targetEntryId = await reply.getAttribute('data-message-entry');
+    await reply.getByRole('button', { name: 'Continue from this reply', exact: true }).click();
+    const branch = await page.evaluate(id => window.flowmate.listSessionMessages({ sessionId: id }), sessionId);
+    expect(branch).toMatchObject({ ok: true, data: { leafId: targetEntryId } });
+    expect(requests).toHaveLength(callsBeforeManagement);
+    await electronApp.evaluate(({ ipcMain }, code) => {
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      const original = handlers.get('flowmate:submit-input'); if (!original) throw new Error('Missing submit-input');
+      ipcMain.removeHandler('flowmate:submit-input'); let lost = false;
+      ipcMain.handle('flowmate:submit-input', async (event, ...args) => {
+        const result = await original(event, ...args);
+        if (!lost) { lost = true; return { ok: false, error: { code, category: 'runtime', message: 'Controlled receipt loss', retryable: true } }; }
+        return result;
+      });
+    }, unknownCode);
+    await page.getByLabel('Next Run model requests', { exact: true }).fill('31');
+    await composer.fill('P5 unknown receipt input');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
+    await expect(composer).toHaveValue('P5 unknown receipt input');
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+    await expect(page.getByLabel('Next Run model requests', { exact: true })).toHaveValue('31');
+    await page.getByRole('button', { name: 'Check input status', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toHaveCount(0);
+    await expect(composer).toHaveValue('');
+    await expect(page.getByLabel('Next Run model requests', { exact: true })).toHaveValue('');
+    await expect.poll(async () => {
+      const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
+      return inputs.ok ? inputs.data.items.length : 0;
+    }).toBe(4);
+    await waitFor(() => page.evaluate(async () => { const runtime = await window.flowmate.queryRuntimeState();
+      return runtime.ok && runtime.data.active === null && !runtime.data.blocked; }));
+    await composer.fill('P5 stop input');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect.poll(async () => JSON.stringify(requests.at(-1)).includes('P5 stop input')).toBe(true);
+    for (const button of await page.getByRole('button', { name: 'Continue from this reply', exact: true }).all())
+      await expect(button).toBeDisabled();
+    await composer.fill('Draft typed while stopping');
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible({ timeout: 20_000 });
+    await waitFor(() => page.evaluate(async () => { const runtime = await window.flowmate.queryRuntimeState();
+      return runtime.ok && runtime.data.active === null && !runtime.data.blocked; }));
+    await expect(composer).toHaveValue('Draft typed while stopping');
+    await expect.poll(async () => {
+      const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
+      return inputs.ok ? inputs.data.items[0]?.processingStatus : null;
+    }).toBe('cancelled');
+    const callsAfterStop = requests.length;
+    await row.getByRole('button', { name: 'Archive', exact: true }).click();
+    await row.getByRole('button', { name: 'Unarchive', exact: true }).click();
+    await expect(row.getByRole('button', { name: 'Archive', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+    await expect(composer).toHaveValue('Draft typed while stopping');
+    expect(requests).toHaveLength(callsAfterStop);
+    const originalPrompt = await electronApp.evaluate(() =>
+      (globalThis as unknown as { originalP5Request: import('@flowmate/contracts').DesktopSessionInputRequest }).originalP5Request);
+    if (originalPrompt.mode !== 'prompt') throw new Error('Original prompt request was not retained.');
+    const originalInput = await page.evaluate(id => window.flowmate.querySessionInput({ sessionId: id, clientSequence: 1 }), sessionId);
+    if (!originalInput.ok || !originalInput.data.input) throw new Error('Original input was not saved.');
+    const originalReceipt = { ok: true, data: { sessionId, runId, inputId: originalInput.data.input.inputId } };
+    expect(await page.evaluate(async () => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: state.data.settings.models.map(model => ({ ...model,
+        name: 'Changed after admission', model: 'changed-model', baseUrl: 'http://127.0.0.1:1/v1' })) });
+    })).toMatchObject({ ok: true });
+    expect(await page.evaluate(async () => {
+      const state = await window.flowmate.getState();
+      return state.ok ? state.data.modelCredentials['p5-model'] : null;
+    })).toBe('missing');
+    expect(await page.evaluate(request => window.flowmate.submitInput(request), originalPrompt)).toMatchObject(originalReceipt);
+    expect(await page.evaluate(request => window.flowmate.submitInput({ ...request, text: 'Changed original input' }), originalPrompt))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await page.evaluate(async () => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [], defaultModelId: null });
+    })).toMatchObject({ ok: true });
+    expect(await page.evaluate(request => window.flowmate.submitInput(request), originalPrompt)).toMatchObject(originalReceipt);
+    expect(requests).toHaveLength(callsAfterStop);
+    expect(await page.locator('.rail .nav-item').count()).toBe(5);
+    const closingApp = electronApp;
+    electronApp = null;
+    await closeDesktopFixture(closingApp, userData);
+    const db = new Database(join(userData, 'data', 'app.sqlite'), { readonly: true });
+    try {
+      expect(db.query('SELECT count(*) AS count FROM runs WHERE session_id=?').get(sessionId)).toEqual({ count: 3 });
+      expect(db.query('SELECT count(*) AS count FROM session_inputs WHERE session_id=?').get(sessionId)).toEqual({ count: 5 });
+      expect(db.query('SELECT mode,run_id,status,processing_status,native_entry_id IS NOT NULL AS user_saved,result_entry_id IS NOT NULL AS reply_saved FROM session_inputs WHERE run_id=? ORDER BY id').all(runId))
+        .toEqual(['prompt', 'steer', 'followUp'].map(mode => ({ mode, run_id: runId, status: 'consumed', processing_status: 'completed', user_saved: 1, reply_saved: 1 })));
+    } finally { db.close(); }
+  } catch (error) {
+    failure = error instanceof Error ? error : new Error(String(error));
+    if (electronApp) {
+      console.error('P5 desktop state at failure', await electronApp.firstWindow().then(page => page.evaluate(async () => ({
+        runtime: await window.flowmate.queryRuntimeState(), sessions: await window.flowmate.listSessions(),
+        assistant: document.querySelector('[data-testid="agent-chat-panel"]')?.textContent,
+        draft: (document.querySelector('#agent-chat-input') as HTMLTextAreaElement | null)?.value,
+      }))).catch(() => null));
+    }
+    throw failure;
+  }
+  finally { try { if (electronApp) await closeDesktopFixture(electronApp, userData, failure); } finally { await server.stop(true); } }
+});
+}
+
+for (const recovery of ['prompt-collision', 'active-collision', 'missing-prompt-hash'] as const) {
+it(`desktop unknown input recovery preserves its draft for ${recovery}`, async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-p5-collision-'));
+  const requests: unknown[] = [];
+  let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; });
+  const server = await createHttpProvider(async request => {
+    requests.push(await request.json());
+    if (recovery === 'active-collision' && requests.length === 1) await barrier;
+    return streamText('Saved winning reply.');
+  });
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA'])
+    if (process.env[name]) env[name] = process.env[name];
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  let electronApp: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
+  try {
+    electronApp = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+    const page = await electronApp.firstWindow();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    expect(await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'collision-model', credentialRef: 'p5_collision_credential',
+        name: 'Collision model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'collision-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'collision-model' },
+      { modelId: 'collision-model', apiKey: 'synthetic-collision-key' });
+    }, `http://127.0.0.1:${server.port}`)).toMatchObject({ ok: true });
+    const composer = page.getByRole('textbox', { name: 'Message to model' });
+    if (recovery === 'active-collision') {
+      await composer.fill('Initial held input'); await page.getByRole('button', { name: 'Send', exact: true }).click();
+      await expect.poll(() => requests.length).toBe(1);
+    }
+    await electronApp.evaluate(({ ipcMain }, kind) => {
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      const original = handlers.get('flowmate:submit-input'); if (!original) throw new Error('Missing submit-input');
+      ipcMain.removeHandler('flowmate:submit-input');
+      ipcMain.handle('flowmate:submit-input', async (event, request) => {
+        const input = request as import('@flowmate/contracts').DesktopSessionInputRequest;
+        const winner = kind === 'prompt-collision' ? { ...input, text: 'Another window winning input' }
+          : kind === 'active-collision' ? { ...input, mode: 'followUp' } : input;
+        const result = await original(event, winner);
+        if (!(result as { ok: boolean }).ok) throw new Error('Winning input was not accepted.');
+        return { ok: false, error: { code: 'input_delivery_unknown', category: 'session', message: 'Controlled competing receipt', retryable: true } };
+      });
+      if (kind === 'missing-prompt-hash') {
+        const query = handlers.get('flowmate:query-session-input'); if (!query) throw new Error('Missing input query');
+        ipcMain.removeHandler('flowmate:query-session-input');
+        ipcMain.handle('flowmate:query-session-input', async (event, ...args) => {
+          const result = await query(event, ...args) as { ok: boolean; data?: { input?: { content: { desktopRequestHash?: string } } } };
+          if (result.ok && result.data?.input) delete result.data.input.content.desktopRequestHash;
+          return result;
+        });
+      }
+    }, recovery);
+    await composer.fill('My retained input draft');
+    await page.getByRole('button', { name: recovery === 'active-collision' ? 'Steer' : 'Send', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Check input status', exact: true }).click();
+    await expect(composer).toHaveValue('My retained input draft');
+    if (recovery === 'missing-prompt-hash') {
+      await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+    } else {
+      await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toHaveCount(0);
+      await expect(page.getByText('This input sequence belongs to another request. Your draft is preserved. Review it and send again.', { exact: true })).toBeVisible();
+      await expect(page.getByRole('button', { name: recovery === 'active-collision' ? 'Steer' : 'Send', exact: true })).toBeEnabled();
+    }
+    expect(requests).toHaveLength(1);
+    release();
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { release(); try { if (electronApp) await closeDesktopFixture(electronApp, userData, failure); } finally { await server.stop(true); } }
+});
+}
+
 it('desktop sends directly, keeps drafts editable and restores native history after restart', async () => {
   it.setTimeout(120_000);
   if (process.platform !== 'win32') throw new Error('safeStorage desktop E2E requires Windows');
@@ -617,13 +926,13 @@ it('desktop sends directly, keeps drafts editable and restores native history af
       (globalThis as unknown as { newChatSendGate: typeof gate & { startEntered: Promise<void>; workspaceEntered: Promise<void> } }).newChatSendGate = { ...gate, startEntered, workspaceEntered };
       const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
       let firstWorkspace = true;
-      for (const channel of ['flowmate:create-session', 'flowmate:start-run', 'flowmate:update-workspace']) {
+      for (const channel of ['flowmate:create-session', 'flowmate:submit-input', 'flowmate:update-workspace']) {
         const original = handlers.get(channel);
         if (!original) throw new Error(`Missing IPC: ${channel}`);
         ipcMain.removeHandler(channel);
         ipcMain.handle(channel, async (event, ...args) => {
           if (channel === 'flowmate:create-session') await creating;
-          else if (channel === 'flowmate:start-run') {
+          else if (channel === 'flowmate:submit-input') {
             const current = (globalThis as unknown as { newChatSendGate: typeof gate }).newChatSendGate;
             current.sessionId = (args[0] as { sessionId: number }).sessionId;
             current.enterStart?.();
@@ -785,7 +1094,7 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
           gate.settledQueries.push(query);
         }
       });
-      for (const channel of ['flowmate:call-provider', 'flowmate:start-run']) {
+      for (const channel of ['flowmate:call-provider', 'flowmate:submit-input']) {
         ipcMain.removeHandler(channel);
         ipcMain.handle(channel, async () => { gate.dispatches += 1; return { ok: false, error: {
           code: 'runtime_unusable', category: 'runtime', message: 'Controlled Runtime is blocked.', retryable: false } }; });
@@ -796,14 +1105,18 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
     await page.getByRole('button', { name: 'Models', exact: true }).click();
     const check = page.getByRole('button', { name: 'Test connection', exact: true });
     await check.waitFor({ state: 'visible' });
-    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Runtime is blocked'));
     expect(await check.isDisabled()).toBe(true);
+    expect(await page.getByTestId('runtime-feedback').count()).toBe(0);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByText('Diagnostics', { exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Runtime is blocked'));
     expect(await page.getByTestId('runtime-feedback').textContent()).toContain('blocked');
     const openAssistant = page.getByRole('button', { name: 'Open Assistant', exact: true });
     if (await openAssistant.isVisible()) await openAssistant.click();
     const composer = page.getByRole('textbox', { name: 'Message to model' });
     await composer.fill('Preserve this unsent draft.');
     expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    await expect.soft(page.locator('.chat-composer')).not.toContainText('Runtime is blocked', { timeout: 1000 });
 
     // A newer finish-triggered read must win over an older idle snapshot.
     runtimeCheckpoint = 'older idle query enters Main';
@@ -837,11 +1150,8 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
       if (query === null || !gate.settledQueries.includes(query)) throw new Error('Older idle query did not settle after release');
     });
     await page.waitForTimeout(100);
-    expect(await check.isDisabled()).toBe(true);
     expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
     expect(await composer.inputValue()).toBe('Preserve this unsent draft.');
-    await page.getByRole('button', { name: 'Settings', exact: true }).click();
-    await page.getByText('Diagnostics', { exact: true }).click();
     expect(await page.getByTestId('runtime-feedback').textContent()).toContain('blocked');
 
     runtimeCheckpoint = 'explicit next-query failure';
@@ -867,12 +1177,26 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('still occupied by Run 8'));
     expect(await composer.inputValue()).toBe('Preserve this unsent draft.');
     expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
+    await expect.soft(page.locator('.chat-composer')).not.toContainText('Runtime is still occupied', { timeout: 1000 });
     await app.evaluate(() => {
       const gate = (globalThis as unknown as { runtimeUiGate: { state: import('@flowmate/contracts').RuntimeState } }).runtimeUiGate;
       gate.state = { active: null, blocked: false, error: null };
     });
     await page.getByRole('button', { name: 'Check runtime status', exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('ready for a new request'));
+    runtimeCheckpoint = 'tool budget failure keeps the draft and explains the limit';
+    await app.evaluate(({ ipcMain }) => {
+      ipcMain.removeHandler('flowmate:submit-input');
+      ipcMain.handle('flowmate:submit-input', async () => {
+        const gate = (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate;
+        gate.dispatches += 1;
+        return { ok: false, error: { code: 'tool_budget_exceeded', category: 'runtime', message: '工具调用超过本轮上限。', retryable: false } };
+      });
+    });
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect.soft(page.locator('.notice.bad')).toContainText('The assistant reached the tool limit before finishing. Check Processing History for any saved result.', { timeout: 1000 });
+    expect(await composer.inputValue()).toBe('Preserve this unsent draft.');
+    expect(await app.evaluate(() => (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate.dispatches)).toBe(1);
     runtimeCheckpoint = 'Test connection admission rechecks blocked Runtime';
     await page.getByRole('button', { name: 'Models', exact: true }).click();
     await app.evaluate(() => {
@@ -881,8 +1205,11 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
         message: 'Controlled persistence is unconfirmed.', retryable: false } };
     });
     await check.click();
+    await expect(check).toBeDisabled();
+    expect(await page.getByTestId('runtime-feedback').count()).toBe(0);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByText('Diagnostics', { exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('blocked'));
-    expect(await check.isDisabled()).toBe(true);
 
     // An idle response from an old Host connection must not reopen admission.
     runtimeCheckpoint = 'held Runtime query survives Host exit';
@@ -913,13 +1240,13 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
       if (query === null || !gate.settledQueries.includes(query)) throw new Error('Old Host Runtime query did not settle after release');
     });
     await page.waitForTimeout(100);
-    expect(await check.isDisabled()).toBe(true);
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
     expect(await page.getByTestId('runtime-feedback').textContent()).toContain('Host is not ready');
     await app.evaluate(({ BrowserWindow }, desktop) => {
       BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state: desktop });
     }, connectedState.data);
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('ready for a new request'));
-    expect(await check.isEnabled()).toBe(true);
+    expect(await page.getByRole('button', { name: 'Check runtime status', exact: true }).isEnabled()).toBe(true);
 
     // The initial Desktop snapshot has the same stale-Host boundary as Runtime reads.
     runtimeCheckpoint = 'initial Desktop query survives Host exit';
@@ -948,19 +1275,22 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
       BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state',
         state: { ...desktop, ready: false, host: 'error' } });
     }, connectedState.data);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByText('Diagnostics', { exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Host is not ready'));
     await app.evaluate(() => (globalThis as unknown as { desktopStateUiGate: { release: (() => void) | null } }).desktopStateUiGate.release?.());
     await page.waitForTimeout(100);
-    expect(await check.isDisabled()).toBe(true);
+    expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
     expect(await page.getByTestId('runtime-feedback').textContent()).toContain('Host is not ready');
     await app.evaluate(({ BrowserWindow }, desktop) => {
       BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state: desktop });
     }, connectedState.data);
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('ready for a new request'));
-    expect(await check.isEnabled()).toBe(true);
-    expect(await app.evaluate(() => (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate.dispatches)).toBe(0);
+    expect(await page.getByRole('button', { name: 'Check runtime status', exact: true }).isEnabled()).toBe(true);
+    expect(await app.evaluate(() => (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate.dispatches)).toBe(1);
 
     runtimeCheckpoint = 'late real model-removal reply cannot overwrite Host unavailability';
+    await page.getByRole('button', { name: 'Models', exact: true }).click();
     await app.evaluate(({ ipcMain }) => {
       const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
       const save = handlers.get('flowmate:save-settings');
@@ -994,12 +1324,14 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
       gate.unavailable = { ...desktop, ready: false, host: 'error' };
       BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state: gate.unavailable });
     }, removedState.data);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByText('Diagnostics', { exact: true }).click();
     await expect(page.getByTestId('runtime-feedback')).toContainText('Host is not ready');
     await app.evaluate(() => (globalThis as unknown as { modelRemovalGate: { release: (() => void) | null } }).modelRemovalGate.release?.());
     await page.getByText('Model profile removed.', { exact: true }).waitFor({ state: 'visible' });
     await expect(page.getByTestId('runtime-feedback')).toContainText('Host is not ready');
     await expect(page.getByRole('button', { name: 'Check runtime status', exact: true })).toBeDisabled();
-    expect(await app.evaluate(() => (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate.dispatches)).toBe(0);
+    expect(await app.evaluate(() => (globalThis as unknown as { runtimeUiGate: { dispatches: number } }).runtimeUiGate.dispatches)).toBe(1);
     runtimeCheckpoint = 'normal desktop close';
   } catch (error) {
     const gate = await app.evaluate(() => {
@@ -1156,7 +1488,7 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       };
       const session = { sessionId: 12, nativeSessionId: 'renderer-native-s', title: 'Controlled receipt', status: 'active',
         createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:00.000Z', availability: 'ready',
-        historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: false };
+        historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, deletePending: false, hasBusinessHistory: false };
       const otherSession = { ...session, sessionId: 13, nativeSessionId: 'renderer-native-t', title: 'Other receipt' };
       const user = { entryId: 'renderer-e1', runId: 101, liveOrdinal: 1, timestamp: 1790726400000,
         persistence: 'saved', truncated: false, role: 'user', blocks: [{ type: 'text', text: 'Controlled question' }],
@@ -1213,8 +1545,8 @@ it('reconciles Renderer messages from the public history IPC without replaying a
             items: entries.slice(start, end), nextBeforeEntryId: start > 0 ? entries[start]!.entryId : null } };
         } finally { query.phase = 'settled'; receipt.activeQueries -= 1; }
       });
-      ipcMain.removeHandler('flowmate:start-run');
-      ipcMain.handle('flowmate:start-run', async () => { receipt.startCalls += 1; return { ok: false }; });
+      ipcMain.removeHandler('flowmate:submit-input');
+      ipcMain.handle('flowmate:submit-input', async () => { receipt.startCalls += 1; return { ok: false }; });
     }, desktop.data);
     historyCheckpoint = 'initial saved message';
     await page.reload();
@@ -1581,7 +1913,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     expect(await page.getByRole('button', { name: 'Generate result for next message' }).getAttribute('aria-pressed')).toBe('true');
     await composer.fill('Save another result.');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
-    await page.getByText('No result was saved. Ask the assistant to generate and save a result.')
+    await page.getByRole('log').getByText('The requested outcome was not confirmed. Check Processing History for any saved result.', { exact: true })
       .waitFor({ state: 'visible', timeout: 10_000 });
     expect(requests).toHaveLength(5);
     const validationMessage = ((requests[4]?.body.messages ?? []) as Array<{ role?: string; tool_call_id?: string; content?: unknown }>)

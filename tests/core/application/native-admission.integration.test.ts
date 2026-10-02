@@ -2,12 +2,13 @@ import { describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdirSync, realpathSync } from 'node:fs';
-import { appError, ok, INVOICE_TOOLS_SYSTEM_PROMPT, ToolExecutionFailure } from '@flowmate/contracts';
+import { appError, ok, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, ToolExecutionFailure } from '@flowmate/contracts';
 import type { AgentPort, AgentExecutionInput, ProviderConfig, AgentRunEvent } from '@flowmate/contracts';
 import { createToolExecutor, createToolRecorder, makeApplication, RuntimeService, SessionService, createWorkspaceService } from '@flowmate/core';
 import { z } from 'zod';
 import { openTestDatabase } from '../../support/database.ts';
 import { mkdtempSync } from '../../support/resources.ts';
+import { createAgentHistoryFixture } from './agent-history-fixture.ts';
 
 const config: ProviderConfig = { version: 1, name: 'offline', revision: 1,
   modelRef: { provider: 'fixture', model: 'offline' }, native: { authPath: 'C:\\fixture\\auth.json', modelsPath: null },
@@ -27,29 +28,38 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
   let nativeId = 0;
   const executions: AgentExecutionInput[] = [];
   const preparations: Array<Parameters<AgentPort['prepare']>[4]> = [];
+  const history = createAgentHistoryFixture(runtimeDir, now);
   const agent: AgentPort = {
-    createSession: () => ok({ nativeSessionId: `native-local-${++nativeId}` }),
+    createSession: () => { const nativeSessionId = `native-local-${++nativeId}`; history.create(nativeSessionId); return ok({ nativeSessionId }); },
+    exportSession: history.exportSession,
+    watchSession: history.watchSession,
     inspect: () => ({ availability: 'ready' }),
     prepare: async (nativeSessionId, selected, limits, _signal, settings) => { preparations.push(settings); return ok({ snapshot: {
       version: 1, name: selected.name, revision: selected.revision,
       requestedModel: selected.modelRef, resolvedModel: selected.modelRef, api: selected.connection?.api ?? null,
       endpoint: selected.connection?.baseUrl ?? null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
       parameters: selected.parameters, limits, native: { authSource: 'pi-native', modelsSelection: null },
-      agent: { policyVersion: 'p3-invoice-tools-v1', nativeSessionId, systemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT,
+      agent: settings?.activeToolNames === undefined ? { policyVersion: 'p5-session-inputs-v1', nativeSessionId,
+        systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT, thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
+        maxContextBytes: 524_288, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12, sessionRetry: false }
+        : { policyVersion: 'p3-invoice-tools-v1', nativeSessionId, systemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT,
         thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only', maxContextBytes: 8_388_608,
-        maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12, maxToolCalls: 24,
+        maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 16, maxToolCalls: 24,
         toolTimeoutMs: 10_000, sessionRetry: false },
       ...(options.conflictingSnapshot ? { workingDirectory: runtimeDir, goalMode: 'save-candidate',
         workspaceContext: { formatVersion: 1, revision: 999, sessionId: 999, documentRef: null,
           jobId: null, candidateRef: null, activeView: 'original', selection: null } } : {}),
     }, execute: async (input, signal) => {
       executions.push(input);
+      history.saveUser(nativeSessionId, input);
       if (options.unconfirmedTool) await input.toolBinding?.execute('powershell', {}, { nativeToolCallId: 'unconfirmed-process', signal });
-      return { text: 'Done.', partial: false, stopReason: 'stop', responseId: null, responseModel: null,
+      const outcome = { text: 'Done.', partial: false, stopReason: 'stop', responseId: null, responseModel: null,
         error: null, stopped: true, cleanupErrors: [], usage: { version: 1, source: 'unknown', reason: 'offline',
-          sdkValues: null, attempts: 1, attemptsComplete: true, costSource: null, updatedAt: now() },
+          sdkValues: null, attempts: 1, attemptsComplete: true, costSource: null, updatedAt: now() } as const,
         tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
         agent: { nativeSessionId, turnCount: 1, modelCallCount: 1 } };
+      history.saveResult(nativeSessionId, input, outcome);
+      return outcome;
     } }); },
     releaseSession: async () => ({ stopped: true, closed: true, errors: [] }),
     close: async () => ({ stopped: true, closed: true, errors: [] }),
@@ -62,7 +72,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
       return {};
     } })),
     recorder: createToolRecorder(db.toolCalls, now), now });
-  const runtime = new RuntimeService({ runs: db.runs, sessions: db.sessions, agent, tools,
+  const runtime = new RuntimeService({ runs: db.runs, sessions: db.sessions, sessionInputs: db.sessionInputs, agent, tools,
     provider: { prepare: async () => ({ ok: false, error: appError('unused', 'provider', 'Unused.') }),
       close: async () => ({ stopped: true, closed: true, errors: [] }) },
     log: { write() {}, close: async () => {} }, now, monotonicNow: () => performance.now(),
@@ -70,7 +80,8 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
       { name: 'powershell', available: true, reason: null }, { name: 'bash', available: false, reason: 'Not installed.' }],
  },
   });
-  const sessions = new SessionService(db.sessions, agent, () => runtime.state(), now, db.runs);
+  const sessions = new SessionService(db.sessions, agent, () => runtime.state(), now, db.runs,
+    db.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
   const app = makeApplication(runtime, db.runs, async () => {
     db.close(); return { stopped: true, closed: true, errors: [] };
   }, sessions, undefined, createWorkspaceService(db.workspace, now));
@@ -143,7 +154,7 @@ describe('ordinary native tool Run admission', () => {
       expect(JSON.parse((db.query('SELECT config_json FROM runs WHERE id=?').get(event.runId) as { config_json: string }).config_json).workingDirectory).toBe(directory);
       const legacy = await app.createSession(); if (!legacy.ok) throw new Error(legacy.error.code);
       await run(app, { sessionId: legacy.data.sessionId, text: 'Legacy chat.', config });
-      expect(preparations[1]).toBeUndefined();
+      expect(preparations[1]).toMatchObject({ sessionInputs: true });
       expect(executions[1]?.toolBinding).toBeUndefined();
     } finally { await app.close(); }
   });

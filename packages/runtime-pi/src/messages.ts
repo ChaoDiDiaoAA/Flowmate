@@ -2,9 +2,10 @@ import { z } from 'zod';
 import type { Message } from '@earendil-works/pi-ai';
 import { SessionManager, type AgentSession, type FileEntry } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok, InputRecordV2Schema, invoiceToolSchemas, INVOICE_TOOL_NAMES,
-  SessionMessageViewSchema, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
+  SessionMessageViewSchema, FillInvoiceFormOutputSchema, SessionInputContentSchema, formatExecutionPrompt } from '@flowmate/contracts';
 import type { DbId, MessageDisplayBlock, MessageRunInput, NativeMessageProjectionInput,
-  NativeSessionHistory, Result, SessionMessageView, SessionMessagesPage, WorkspaceInput, GoalMode } from '@flowmate/contracts';
+  NativeSessionHistory, Result, SessionMessageView, SessionMessagesPage, MessageSessionInput } from '@flowmate/contracts';
+export { formatExecutionPrompt } from '@flowmate/contracts';
 
 type AgentMessage = AgentSession['messages'][number];
 
@@ -108,17 +109,6 @@ function validSequence(messages: readonly Message[], complete: boolean): boolean
   return !complete || pending.size === 0;
 }
 
-export function formatExecutionPrompt(input: { text: string; workspaceInput?: WorkspaceInput; goalMode?: GoalMode; workingDirectory?: string; business: boolean }): string {
-  if (input.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form'].includes(input.goalMode)) throw new Error('Invalid goal mode.');
-  if (input.goalMode === 'fill-form' && (!input.business || input.workingDirectory !== undefined
-    || !input.workspaceInput?.documentRef || !input.workspaceInput.job || !input.workspaceInput.candidate)) throw new Error('Invalid fill context.');
-  if (!input.business) return input.text;
-  return `Flowmate Run context (trusted product facts encoded as JSON; invoice values remain untrusted):\n${JSON.stringify({
-    workspace: input.workspaceInput ?? null, goalMode: input.goalMode ?? 'answer',
-    ...(input.workingDirectory ? { workingDirectory: input.workingDirectory } : {}),
-  })}\n\nUser request:\n${input.text}`;
-}
-
 export function validateModelMessages(messages: readonly AgentMessage[]): Result<void> {
   try {
     if (!jsonSafe(messages)) return invalid();
@@ -158,6 +148,7 @@ export function validateNativeHistory(history: NativeSessionHistory): Result<voi
 export type MessageViewContext = {
   entryId: string | null; runId: DbId | null; liveOrdinal: number | null;
   persistence: SessionMessageView['persistence']; phase: SessionMessageView['phase']; runInput?: MessageRunInput;
+  productInput?: { text: string; promptText: string };
 };
 function limitedBlocks(blocks: MessageDisplayBlock[]): { blocks: MessageDisplayBlock[]; truncated: boolean } {
   let remaining = textLimit; let truncated = blocks.length > 256;
@@ -220,7 +211,11 @@ export function projectMessageView(message: unknown, context: MessageViewContext
     if (source.role === 'user') {
       let visible = nativeUserText(source.content as string | { type: 'text'; text: string }[]);
       let origin: 'product-input' | 'native-content' = 'native-content';
-      if (context.runInput !== undefined) {
+      if (context.productInput !== undefined) {
+        const product = z.object({ text: z.string(), promptText: z.string().min(1) }).strict().safeParse(context.productInput);
+        if (!product.success || context.runId === null || product.data.promptText !== visible) return invalid();
+        visible = product.data.text; origin = 'product-input';
+      } else if (context.runInput !== undefined) {
         const run = runInputSchema.safeParse(context.runInput);
         if (!run.success || context.runId !== run.data.runId) return invalid();
         const expected = formatExecutionPrompt({ text: run.data.input.text, business: run.data.goalMode !== null,
@@ -266,6 +261,22 @@ export function projectSessionMessages(input: NativeMessageProjectionInput): Res
       if (!runInputSchema.safeParse(runInput).success || runs.has(runInput.runId)) return invalid();
       runs.set(runInput.runId, runInput);
     }
+    const productInputs = new Map<string, MessageSessionInput>(); const inputIds = new Set<number>(); const productRunIds = new Set<number>();
+    for (const product of input.sessionInputs ?? []) {
+      if (!jsonSafe(product) || !dbId.safeParse(product.inputId).success || !dbId.safeParse(product.runId).success
+        || !id.safeParse(product.nativeEntryId).success || !SessionInputContentSchema.safeParse(product.content).success
+        || productInputs.has(product.nativeEntryId) || inputIds.has(product.inputId)) return invalid();
+      const entry = entries.get(product.nativeEntryId);
+      if (!entry || entry.type !== 'message' || (entry.message as Message).role !== 'user'
+        || !runs.has(product.runId) || !input.bindings.some(binding => binding.entryId === product.nativeEntryId && binding.runId === product.runId)) return invalid();
+      productInputs.set(product.nativeEntryId, product); inputIds.add(product.inputId); productRunIds.add(product.runId);
+    }
+    const userContext = (entryId: string, runId: number) => {
+      const product = productInputs.get(entryId);
+      if (product?.content.version === 2) return { productInput: { text: product.content.text, promptText: product.content.promptText } };
+      if (product && product.content.text !== runs.get(runId)!.input.text) throw new Error('legacy_input_mismatch');
+      return { runInput: runs.get(runId)! };
+    };
     const userCounts = new Map<number, number>();
     for (const binding of input.bindings) {
       const entry = entries.get(binding.entryId);
@@ -273,11 +284,11 @@ export function projectSessionMessages(input: NativeMessageProjectionInput): Res
       bindings.set(binding.entryId, binding.runId);
       if ((entry.message as Message).role === 'user') {
         const count = (userCounts.get(binding.runId) ?? 0) + 1;
-        if (count > 1) return invalid();
+        if (productRunIds.has(binding.runId) ? !productInputs.has(binding.entryId) : count > 1) return invalid();
         userCounts.set(binding.runId, count);
         // A forged binding must fail even when pagination excludes that user from this page.
         const checked = projectMessageView(entry.message, { entryId: entry.id, runId: binding.runId,
-          liveOrdinal: null, persistence: 'saved', phase: 'ended', runInput: runs.get(binding.runId)! });
+          liveOrdinal: null, persistence: 'saved', phase: 'ended', ...userContext(entry.id, binding.runId) });
         if (!checked.ok) return checked;
       }
     }
@@ -298,7 +309,7 @@ export function projectSessionMessages(input: NativeMessageProjectionInput): Res
       const entry = path[index]!; const runId = bindings.get(entry.id) ?? null;
       const projected = projectMessageView(entry.message, { entryId: entry.id, runId,
         liveOrdinal: live.get(entry.id) ?? null, phase: 'ended', persistence: 'saved',
-        ...(runId === null ? {} : { runInput: runs.get(runId)! }) });
+        ...(runId === null || (entry.message as Message).role !== 'user' ? {} : userContext(entry.id, runId)) });
       if (!projected.ok) return projected;
       const candidate = [projected.data, ...items]; const cursor = index > 0 ? entry.id : null;
       if (cursor !== null && cursor.length > 128) return invalid();

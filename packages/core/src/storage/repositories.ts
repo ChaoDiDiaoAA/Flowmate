@@ -2,8 +2,9 @@ import type { Database } from 'bun:sqlite';
 import { join, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { finishSessionInputs, markInputConsumed, recoverSessionInputs } from '../sessions/input-ledger.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, appError, fail, ok } from '@flowmate/contracts';
+import { associateInputResult, completeSessionInputs, createSessionInputLedger, finishSessionInputs, markInputConsumed, recoverSessionInputs } from '../sessions/input-ledger.ts';
+import type { InputResultBatch, SessionInputAdmission } from '../sessions/input-ledger.ts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeBudgetOverridesSchema, RuntimeStrategySnapshotSchema, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -56,6 +57,7 @@ import type {
   ToolCallCleanup,
   StoredToolResult,
   ToolCallStatus,
+  ToolRuntimeObservation,
   BusinessEventSnapshot,
   BusinessEventType,
   Page,
@@ -74,8 +76,10 @@ import type {
   InvoiceExportReference,
   InvoiceCandidateOperationQuery,
   InvoiceCandidateOperationResult,
+  SetSessionStatusRequest,
+  MessageSessionInput,
 } from '@flowmate/contracts';
-import type { RunAgentConfigFacts, AgentFacts, RunScope, LegacyRunScope } from '@flowmate/contracts';
+import type { RunAgentConfigFacts, RuntimeAgentConfigFacts, AgentFacts, RunScope, LegacyRunScope } from '@flowmate/contracts';
 import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_REVIEW_TOOL_NAMES, NATIVE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, InvoiceFormTargetSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, FillInvoiceFormInputSchema } from '@flowmate/contracts';
 import { StoredCandidateDraftSchema, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandidateRequestSchema,
   RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields,
@@ -116,7 +120,7 @@ export type NewWorkspaceAgentRun = {
   text: string;
   messageTimestamp: number;
   goal: string;
-  config: SafeConfigSnapshot & { agent: P3AgentConfigFacts };
+  config: SafeConfigSnapshot & { agent: P3AgentConfigFacts | RuntimeAgentConfigFacts };
   usage: UsageRecord;
   cleanup: CleanupRecord;
   createdAt: string;
@@ -144,6 +148,7 @@ export type SessionRow = {
   hasBusinessHistory: boolean;
   historyState: SessionHistoryState;
   nativeUnusable: boolean;
+  deletePending: boolean;
 };
 
 export type NewSession = { nativeSessionId: string; title: string; at: string; expectedRevision?: number; nativeHistory?: NativeSessionHistory };
@@ -244,8 +249,14 @@ export interface ToolCallRepository {
   list(input: NormalizedPageRequest & { runId: DbId }): Result<Page<ToolCallSnapshot>>;
   fixArguments(input: { toolCallId: DbId; finalArguments: unknown }): Result<ToolCallSnapshot>;
   start(input: { toolCallId: DbId; startedAt: string }): Result<ToolCallSnapshot>;
-  finish(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string; stoppedAt: string | null }): Result<ToolCallSnapshot>;
-  reject(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string }): Result<ToolCallSnapshot>;
+  finish(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string; stoppedAt: string | null; runtimeObservation?: ToolRuntimeObservation }): Result<ToolCallSnapshot>;
+  reject(input: { toolCallId: DbId; result: StoredToolResult; cleanup: ToolCallCleanup; endedAt: string; runtimeObservation?: ToolRuntimeObservation }): Result<ToolCallSnapshot>;
+  queryCandidateCommit(input: { toolCallId: DbId; runId: DbId; sessionId: DbId }): Result<CandidateReceipt | null>;
+  observationCutoff(): Result<DbId>;
+  recentStarted(input: { groupKey: string; cutoff: DbId }): Result<ToolCallSnapshot[]>;
+  recentObservations(input: { groupKey: string; cutoff: DbId }): Result<ToolCallSnapshot[]>;
+  verifyUse(context: ProductToolContext): Result<void>;
+  validateOutput(input: { toolCallId: DbId; data: unknown }): Result<'valid' | 'not_applicable'>;
   recordDelivery(input: { toolCallId: DbId; delivery: ToolCallDelivery }): Result<ToolCallSnapshot>;
   recordFormApplication(input: { toolCallId: DbId; receipt: InvoiceFormApplicationReceipt }): Result<ToolCallSnapshot>;
   readFormApplicationRequest(toolCallId: DbId): Result<Extract<InvoiceFormBridgeRequest, { operation: 'apply' }>>;
@@ -266,9 +277,10 @@ export interface SessionRepository {
   isModelUseBlocked(sessionId: DbId): Result<boolean>;
   revokeDocumentUse(input: { documentId: DbId; at: string }): Result<{ affectedSessionIds: DbId[] }>;
   prepareDelete(sessionId: DbId, at: string): Result<SessionRow>;
+  setStatus(input: SetSessionStatusRequest & { at: string }): Result<SessionRow>;
   delete(sessionId: DbId, at: string): Result<'hidden' | 'permanent'>;
   loadHistory(sessionId: DbId): Result<NativeSessionHistory | null>;
-  readHistoryForDisplay(sessionId: DbId): Result<NativeHistoryDisplayRecord>;
+  readHistoryForDisplay(sessionId: DbId): Result<NativeHistoryDisplayRecord & { sessionInputs: MessageSessionInput[] }>;
   saveHistory(sessionId: DbId, history: NativeSessionHistory, context?: NativeHistoryAppendContext): Result<void>;
 }
 
@@ -284,12 +296,15 @@ export type TerminalWrite = {
   durationMs: number | null;
   cancelRequestedAt?: string;
   nativeHistoryUnusable?: boolean;
+  inputResults?: readonly InputResultBatch[];
+  confirmedUnconsumedInputIds?: readonly DbId[];
 };
 
 export interface RunRepository {
   create(input: NewProviderRun): Result<DbId>;
   createAgent(input: NewAgentRun): Result<DbId>;
   createWorkspaceAgent(input: NewWorkspaceAgentRun): Result<WorkspaceRunAdmission>;
+  freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }): Result<SessionInputAdmission>;
   listBySession(request: NormalizedSessionRunsRequest): Result<{ items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null }>;
   start(runId: DbId, config: SafeConfigSnapshot, startedAt: string): Result<void>;
   recordCancel(runId: DbId, requestedAt: string): Result<boolean>;
@@ -388,16 +403,27 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
       || agent.maxAssistantContentBytes !== 524_288 || agent.maxModelCalls !== 1);
   const p3Invalid = agent.policyVersion === 'p3-invoice-tools-v1'
     && (commonInvalid || agent.maxContextBytes !== 8_388_608 || agent.maxOutputBytes !== 262_144
-      || agent.maxAssistantContentBytes !== 524_288 || agent.maxModelCalls !== 12
+      || agent.maxAssistantContentBytes !== 524_288 || (agent.maxModelCalls !== 12 && agent.maxModelCalls !== 16)
       || agent.maxToolCalls !== 24 || agent.toolTimeoutMs !== 10_000);
-  if (p2Invalid || p3Invalid || (agent.policyVersion !== 'p2-invoice-chat-v1' && agent.policyVersion !== 'p3-invoice-tools-v1')) {
+  const p5Invalid = agent.policyVersion === 'p5-session-inputs-v1'
+    && (commonInvalid || agent.maxContextBytes !== 524_288 || agent.maxOutputBytes !== 262_144
+      || agent.maxAssistantContentBytes !== 524_288 || agent.maxModelCalls !== 12);
+  const runtimeInvalid = agent.policyVersion === 'runtime-v1' && (commonInvalid
+    || !['p2-invoice-chat-v1', 'p3-invoice-tools-v1', 'p5-session-inputs-v1'].includes(String(agent.taskPolicyVersion))
+    || agent.maxContextBytes !== (agent.taskPolicyVersion === 'p3-invoice-tools-v1' ? 8_388_608 : 524_288)
+    || agent.maxOutputBytes !== 262_144 || agent.maxAssistantContentBytes !== 524_288
+    || !RuntimeBudgetOverridesSchema.required().safeParse({ maxToolCalls: agent.maxToolCalls,
+      maxModelCalls: agent.maxModelCalls, toolTimeoutMs: agent.toolTimeoutMs }).success);
+  if (p2Invalid || p3Invalid || p5Invalid || runtimeInvalid
+    || !['p2-invoice-chat-v1', 'p3-invoice-tools-v1', 'p5-session-inputs-v1', 'runtime-v1'].includes(String(agent.policyVersion))) {
     throw new Error('invalid_agent_config_shape');
   }
   return agent;
 }
 
 function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
-  const record = versioned(value, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
+  const raw = object(value, 'config');
+  const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
   if (typeof record.name !== 'string' || !Number.isSafeInteger(record.revision) || Number(record.revision) <= 0) throw new Error('invalid_config_shape');
   const model = (candidate: unknown, label: string) => {
     if (candidate === null && label === 'resolvedModel') return;
@@ -411,8 +437,18 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
   object(record.limits, 'config_limits');
   object(record.native, 'config_native');
   if (record.outputBudget !== undefined) versioned(record.outputBudget, 'outputBudget', ['policy', 'selectedMaxTokens', 'source']);
-  if (kind === 'agent') validatedAgentConfig(record.agent);
+  if (kind === 'agent') {
+    const agent = validatedAgentConfig(record.agent);
+    if ((raw.version === 2) !== (agent.policyVersion === 'runtime-v1')) throw new Error('invalid_runtime_config_version');
+    if (raw.version === 2 && record.runtimeBudget === undefined) throw new Error('missing_runtime_budget');
+    if (record.runtimeBudget !== undefined) {
+      const budget = RuntimeBudgetOverridesSchema.required().parse(record.runtimeBudget);
+      if (budget.maxToolCalls !== agent.maxToolCalls || budget.maxModelCalls !== agent.maxModelCalls
+        || budget.toolTimeoutMs !== agent.toolTimeoutMs) throw new Error('invalid_runtime_config_budget');
+    }
+  }
   else if (record.agent !== undefined) throw new Error('unexpected_provider_agent_config');
+  if (record.runtimeStrategy !== undefined) RuntimeStrategySnapshotSchema.parse(record.runtimeStrategy);
   if (record.workspaceContext !== undefined) WorkspaceContextSchema.parse(record.workspaceContext);
   if (record.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form', 'local-task'].includes(String(record.goalMode))) throw new Error('invalid_goal_mode');
   if (record.formTarget !== undefined) {
@@ -423,17 +459,22 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
     || !isAbsolute(record.workingDirectory) || /[\x00-\x1f\x7f]/.test(record.workingDirectory))) throw new Error('invalid_working_directory');
   if (record.goalMode === 'local-task' && (typeof record.workingDirectory !== 'string'
     || record.workspaceContext !== undefined)) throw new Error('invalid_local_task_config');
-  return record;
+  return { ...record, version: raw.version };
 }
 
-function validatedAgentFacts(value: unknown): Record<string, unknown> {
+function validatedAgentFacts(value: unknown, runtime = false): Record<string, unknown> {
   const agent = object(value, 'output_agent');
   if (typeof agent.nativeSessionId !== 'string' || agent.nativeSessionId.length < 1 || agent.nativeSessionId.length > 128
     || !Number.isSafeInteger(agent.turnCount) || Number(agent.turnCount) < 0
     || !Number.isSafeInteger(agent.modelCallCount) || Number(agent.modelCallCount) < 0) throw new Error('invalid_agent_output_shape');
-  if (agent.candidateIds !== undefined && (!Array.isArray(agent.candidateIds) || agent.candidateIds.length > 24
+  if (agent.candidateIds !== undefined && (!Array.isArray(agent.candidateIds) || agent.candidateIds.length > (runtime ? 100 : 24)
     || !agent.candidateIds.every((id) => Number.isSafeInteger(id) && Number(id) > 0)
     || new Set(agent.candidateIds).size !== agent.candidateIds.length)) throw new Error('invalid_agent_candidate_ids');
+  if (agent.modelCalls !== undefined) z.array(z.object({ callSequence: z.number().int().min(1).max(64),
+    durationMs: z.number().finite().nonnegative(), complete: z.boolean() }).strict()).max(64)
+    .superRefine((calls, context) => {
+      if (new Set(calls.map(call => call.callSequence)).size !== calls.length) context.addIssue({ code: 'custom', message: 'Model call sequences must be unique.' });
+    }).parse(agent.modelCalls);
   return agent;
 }
 
@@ -462,12 +503,13 @@ function validatedScope(value: unknown): ChatScope | RunScope | LegacyRunScope {
 }
 
 function validatedOutput(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
-  const record = versioned(value, 'output', ['text', 'partial', 'stopReason', 'responseId', 'responseModel']);
+  const raw = object(value, 'output');
+  const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'output', ['text', 'partial', 'stopReason', 'responseId', 'responseModel']);
   if (typeof record.text !== 'string' || typeof record.partial !== 'boolean' || typeof record.stopReason !== 'string'
     || (record.wireMaxTokens !== undefined && record.wireMaxTokens !== null && (!Number.isSafeInteger(record.wireMaxTokens) || Number(record.wireMaxTokens) < 1))) throw new Error('invalid_output_shape');
-  if (kind === 'agent') validatedAgentFacts(record.agent);
+  if (kind === 'agent') validatedAgentFacts(record.agent, raw.version === 2);
   else if (record.agent !== undefined) throw new Error('unexpected_provider_agent_output');
-  return record;
+  return { ...record, version: raw.version };
 }
 
 function validatedUsage(value: unknown): UsageRecord {
@@ -518,13 +560,15 @@ function sessionRow(value: unknown, hasHistory = false): SessionRow {
     hasBusinessHistory: hasHistory,
     historyState: 'legacy-read-only',
     nativeUnusable: false,
+    deletePending: parseSessionMetadata(row.metadata_json).delete_pending === true,
   };
 }
 
 function parseSessionMetadata(value: string): Record<string, unknown> {
-  const metadata = recordWithOptional(readJson(value, 'session_metadata'), 'session_metadata', ['version', 'model_use_blocked'], ['tool_profile']);
+  const metadata = recordWithOptional(readJson(value, 'session_metadata'), 'session_metadata', ['version', 'model_use_blocked'], ['tool_profile', 'delete_pending']);
   if (metadata.version !== 1) throw new Error('invalid_session_metadata_version');
   if (metadata.tool_profile !== undefined && !['invoice', 'trusted-local'].includes(String(metadata.tool_profile))) throw new Error('invalid_session_tool_profile');
+  if (metadata.delete_pending !== undefined && metadata.delete_pending !== true) throw new Error('invalid_session_delete_pending');
   return metadata;
 }
 function parseSessionModelUse(value: string): { documentIds: number[]; at: string; reason: 'document_use_revoked' } | null {
@@ -753,7 +797,7 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
     id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string;
     tool_version: string | null; effect: string | null; status: string; args_json: string; result_json: string | null;
     delivery_json: string; cleanup_json: string; requested_at: string; started_at: string | null;
-    ended_at: string | null; stopped_at: string | null;
+    ended_at: string | null; stopped_at: string | null; runtime_observation_json: string | null;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.run_id) || row.run_id < 1
     || !Number.isSafeInteger(row.session_id) || row.session_id < 1 || typeof row.native_tool_call_id !== 'string'
@@ -779,6 +823,11 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
   const cleanup = readToolCleanup(readJson(row.cleanup_json, 'tool_call_cleanup'));
   const { result, formApplication } = readToolEnvelope(row.result_json);
   const terminal = ['succeeded', 'failed', 'cancelled'].includes(row.status);
+  const runtimeObservation = row.runtime_observation_json == null ? null
+    : ToolRuntimeObservationSchema.parse(readJson(row.runtime_observation_json, 'tool_runtime_observation'));
+  if (runtimeObservation !== null && (!terminal || runtimeObservation.beforeOutcome === 'rejected' && row.started_at !== null)) {
+    throw new Error('invalid_tool_runtime_observation_state');
+  }
   if (terminal !== (row.ended_at !== null) || terminal !== (result !== null)
     || result !== null && result.status !== row.status) throw new Error('invalid_tool_call_terminal');
   if (row.status === 'succeeded' && (row.started_at === null || row.stopped_at === null)) throw new Error('invalid_tool_call_success');
@@ -795,7 +844,7 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
       messageObservedAt: deliveryObject.messageObservedAt as string | null,
       includedInCallSequence: deliveryObject.includedInCallSequence as number | null,
       requestDispatchedAt: deliveryObject.requestDispatchedAt as string | null, error: deliveryError },
-    cleanup,
+    cleanup, runtimeObservation,
     requestedAt: row.requested_at, startedAt: row.started_at, endedAt: row.ended_at, stoppedAt: row.stopped_at,
   };
 }
@@ -1439,6 +1488,121 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
       catch { return fail(appError('storage_corrupt', 'storage', 'ToolCall 事实无法读取。', false, toolCallId)); }
     },
 
+    queryCandidateCommit(input) {
+      try {
+        const call = byId(input.toolCallId);
+        if (!call.ok) return call;
+        if (call.data.runId !== input.runId || call.data.sessionId !== input.sessionId) {
+          return fail(appError('state_conflict', 'runtime', 'Candidate commit query does not match the original ToolCall.'));
+        }
+        const row = db.query(`SELECT candidate.id FROM invoice_candidates candidate
+          JOIN tool_calls tool ON tool.id=candidate.tool_call_id JOIN runs run ON run.id=tool.run_id
+          WHERE tool.id=? AND tool.run_id=? AND tool.session_id=? AND candidate.run_id=run.id AND run.session_id=tool.session_id`)
+          .get(input.toolCallId, input.runId, input.sessionId) as { id: number } | null;
+        if (!row) return ok(null);
+        const { snapshot } = candidateSnapshot(queryCandidateRow(db, row.id));
+        return ok({ candidateId: snapshot.candidateId, jobId: snapshot.jobId, sequence: snapshot.sequence,
+          issueCount: snapshot.issueCount, checks: snapshot.checks });
+      } catch { return fail(appError('storage_corrupt', 'storage', 'Candidate commit could not be verified.')); }
+    },
+
+    observationCutoff() {
+      try { return ok((db.query('SELECT COALESCE(MAX(id),0) AS cutoff FROM tool_calls').get() as { cutoff: number }).cutoff); }
+      catch { return fail(appError('storage_corrupt', 'storage', 'Observation cutoff could not be read.')); }
+    },
+
+    recentStarted(input) {
+      try {
+        const rows = db.query(`SELECT tool.* FROM tool_calls tool JOIN runs run ON run.id=tool.run_id
+          WHERE tool.started_at IS NOT NULL AND tool.id<=? AND (
+            tool.runtime_observation_json IS NOT NULL AND json_extract(tool.runtime_observation_json,'$.groupKey')=?
+            OR tool.runtime_observation_json IS NULL AND EXISTS (
+              SELECT 1 FROM json_each(run.config_json,'$.runtimeStrategy.calibration.groups') strategy
+              WHERE json_extract(strategy.value,'$.groupKey')=? AND json_extract(strategy.value,'$.toolName')=tool.tool_name
+              AND json_extract(strategy.value,'$.toolVersion')=tool.tool_version))
+          ORDER BY tool.id DESC LIMIT 200`).all(input.cutoff, input.groupKey, input.groupKey);
+        return ok(rows.map(row => toolCallSnapshot(db, row)));
+      } catch { return fail(appError('storage_corrupt', 'storage', 'Runtime observations could not be read.')); }
+    },
+
+    recentObservations(input) {
+      try {
+        return ok(db.query(`SELECT * FROM tool_calls WHERE runtime_observation_json IS NOT NULL
+          AND json_extract(runtime_observation_json,'$.groupKey')=? AND id<=? ORDER BY id DESC LIMIT 200`)
+          .all(input.groupKey, input.cutoff).map(row => toolCallSnapshot(db, row)));
+      } catch { return fail(appError('storage_corrupt', 'storage', 'Runtime experience could not be read.')); }
+    },
+
+    verifyUse(context) {
+      try {
+        const row = db.query(`SELECT run.session_id,run.scope_json,run.status,run.cancel_requested_at,
+          session.status AS session_status,session.metadata_json FROM runs run JOIN sessions session ON session.id=run.session_id
+          WHERE run.id=? AND run.kind='agent'`).get(context.runId) as {
+            session_id: number; scope_json: string; status: string; cancel_requested_at: string | null;
+            session_status: string; metadata_json: string;
+          } | null;
+        if (!row || row.session_id !== context.sessionId
+          || stableJson(RunScopeSchema.parse(readJson(row.scope_json, 'run_scope'))) !== stableJson(context.scope)) {
+          return fail(appError('tool_access_denied', 'runtime', 'Tool context does not match the frozen Run.'));
+        }
+        if (row.status !== 'running' || row.session_status !== 'active') return fail(appError('run_state_invalid', 'runtime', 'Tool execution requires an active Run.'));
+        if (row.cancel_requested_at !== null) return fail(appError('agent_cancelled', 'runtime', 'Run cancellation was requested.'));
+        if (parseSessionModelUse(row.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
+        return ok(undefined);
+      } catch { return fail(appError('storage_corrupt', 'storage', 'The trusted Run context could not be verified.')); }
+    },
+
+    validateOutput(input) {
+      try {
+        const call = byId(input.toolCallId);
+        if (!call.ok) return call;
+        const run = db.query(`SELECT run.job_id,run.scope_json,job.document_id AS job_document_id FROM runs run
+          LEFT JOIN jobs job ON job.id=run.job_id WHERE run.id=? AND run.session_id=?`).get(call.data.runId, call.data.sessionId) as
+          { job_id: number | null; scope_json: string; job_document_id: number | null } | null;
+        if (!run) return fail(appError('storage_corrupt', 'storage', 'Original output ownership could not be verified.'));
+        const scope = RunScopeSchema.parse(readJson(run.scope_json, 'run_scope'));
+        const args = call.data.args.final as Record<string, unknown> | null;
+        const expectedDocumentId = args?.documentId ?? run.job_document_id ?? (input.data as { documentRef?: { id: number } })?.documentRef?.id;
+        let checked = false;
+        const documents = new Map<number, { version: string; parsed_artifact_id: number } | null>();
+        const document = (id: number) => {
+          if (!documents.has(id)) documents.set(id, db.query('SELECT version,parsed_artifact_id FROM documents WHERE id=?').get(id) as
+            { version: string; parsed_artifact_id: number } | null);
+          return documents.get(id);
+        };
+        const visit = (value: unknown): boolean => {
+          if (Array.isArray(value)) return value.every(visit);
+          if (!value || typeof value !== 'object') return true;
+          const data = value as Record<string, any>;
+          if (data.documentRef) {
+            checked = true;
+            const ref = data.documentRef;
+            if (!scope.allowedDocumentIds.includes(ref.id) || expectedDocumentId !== undefined && ref.id !== expectedDocumentId
+              || document(ref.id)?.version !== ref.version) return false;
+            if (data.parsedArtifactId !== undefined && (!scope.allowedArtifactIds.includes(data.parsedArtifactId)
+              || document(ref.id)?.parsed_artifact_id !== data.parsedArtifactId)) return false;
+          }
+          if (data.documentId !== undefined && data.artifactId !== undefined && data.version !== undefined) {
+            checked = true;
+            if (!scope.allowedDocumentIds.includes(data.documentId) || !scope.allowedArtifactIds.includes(data.artifactId)
+              || expectedDocumentId !== undefined && data.documentId !== expectedDocumentId
+              || args?.page != null && data.page !== args.page || args?.blockId != null && data.blockId !== args.blockId
+              || document(data.documentId)?.version !== data.version
+              || document(data.documentId)?.parsed_artifact_id !== data.artifactId) return false;
+          }
+          if (data.source && (data.page !== undefined && data.source.page !== data.page
+            || (data.blockId ?? data.id) !== undefined && data.source.blockId !== (data.blockId ?? data.id))) return false;
+          if (data.jobId !== undefined) { checked = true; if (data.jobId !== run.job_id) return false; }
+          for (const key of ['candidateId', 'leftCandidateId', 'rightCandidateId']) {
+            if (data[key] !== undefined && args?.[key] !== undefined) { checked = true; if (data[key] !== args[key]) return false; }
+          }
+          return Object.values(data).every(visit);
+        };
+        return visit(input.data) ? ok(checked ? 'valid' : 'not_applicable')
+          : fail(appError('tool_invalid_output', 'tool', 'Invoice output references do not match the original Run.'));
+      } catch { return fail(appError('storage_corrupt', 'storage', 'Invoice output ownership could not be verified.')); }
+    },
+
     list(input) {
       try {
         if (!Number.isSafeInteger(input.runId) || input.runId < 1 || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100
@@ -1494,6 +1658,8 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           }
           const before = byId(input.toolCallId);
           if (!before.ok) return before;
+          const observation = input.runtimeObservation === undefined ? null : ToolRuntimeObservationSchema.parse(input.runtimeObservation);
+          if (observation?.beforeOutcome === 'rejected') return fail(appError('input_invalid', 'storage', 'An executed call requires an allowed before observation.'));
           const incoming = readToolEnvelope(JSON.stringify(input.result)).result;
           if (incoming === null) return fail(appError('input_invalid', 'storage', 'ToolCall 终态结果缺失。'));
           if (incoming.formApplication !== undefined) {
@@ -1507,7 +1673,8 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           if (input.result.status === 'succeeded' && !cleanup.stopped) return fail(appError('stop_not_confirmed', 'runtime', 'Native process termination has not been confirmed.'));
           if (before.data.result !== null) return stableJson(toolResultCore(before.data.result)) === stableJson(toolResultCore(incoming))
             && stableJson(before.data.cleanup) === stableJson(cleanup) && before.data.endedAt === input.endedAt
-            && before.data.stoppedAt === input.stoppedAt ? before : fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定。'));
+            && before.data.stoppedAt === input.stoppedAt && stableJson(before.data.runtimeObservation ?? null) === stableJson(observation)
+            ? before : fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定。'));
           if (incoming.formApplication !== undefined && before.data.formApplication !== undefined
             && stableJson(incoming.formApplication) !== stableJson(before.data.formApplication)) {
             return fail(appError('state_conflict', 'runtime', '表单应用事实已固定，请通过原调用补证。'));
@@ -1516,9 +1683,9 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           const serialized = JSON.stringify({ ...incoming, ...(formApplication === undefined ? {} : { formApplication }) });
           if (!NATIVE_TOOL_NAMES.includes(before.data.toolName as (typeof NATIVE_TOOL_NAMES)[number])
             && Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
-          const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=?
+          const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=?,runtime_observation_json=?
             WHERE id=? AND status='running'`).run(input.result.status, serialized, JSON.stringify(cleanup), input.endedAt,
-            input.stoppedAt, input.toolCallId).changes;
+            input.stoppedAt, observation === null ? null : JSON.stringify(observation), input.toolCallId).changes;
           if (changed === 1) return byId(input.toolCallId);
           return fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定或状态已变化。'));
         });
@@ -1535,6 +1702,8 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           }
           const before = byId(input.toolCallId);
           if (!before.ok) return before;
+          const observation = input.runtimeObservation === undefined ? null : ToolRuntimeObservationSchema.parse(input.runtimeObservation);
+          if (observation !== null && observation.beforeOutcome !== 'rejected') return fail(appError('input_invalid', 'storage', 'A rejected call requires a rejected before observation.'));
           const incoming = readToolEnvelope(JSON.stringify(input.result)).result;
           if (incoming === null) return fail(appError('input_invalid', 'storage', 'ToolCall 终态结果缺失。'));
           if (incoming.formApplication !== undefined) {
@@ -1543,7 +1712,8 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           }
           if (before.data.result !== null) return stableJson(toolResultCore(before.data.result)) === stableJson(toolResultCore(incoming))
             && stableJson(before.data.cleanup) === stableJson(input.cleanup) && before.data.endedAt === input.endedAt
-            && before.data.stoppedAt === null ? before : fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定。'));
+            && before.data.stoppedAt === null && stableJson(before.data.runtimeObservation ?? null) === stableJson(observation)
+            ? before : fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定。'));
           if (incoming.formApplication !== undefined && before.data.formApplication !== undefined
             && stableJson(incoming.formApplication) !== stableJson(before.data.formApplication)) {
             return fail(appError('state_conflict', 'runtime', '表单应用事实已固定，请通过原调用补证。'));
@@ -1551,8 +1721,9 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           const formApplication = before.data.formApplication ?? incoming.formApplication;
           const serialized = JSON.stringify({ ...incoming, ...(formApplication === undefined ? {} : { formApplication }) });
           if (Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
-          const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=NULL
-            WHERE id=? AND status='requested'`).run(input.result.status, serialized, JSON.stringify(input.cleanup), input.endedAt, input.toolCallId).changes;
+          const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=NULL,runtime_observation_json=?
+            WHERE id=? AND status='requested'`).run(input.result.status, serialized, JSON.stringify(input.cleanup), input.endedAt,
+            observation === null ? null : JSON.stringify(observation), input.toolCallId).changes;
           if (changed === 1) return byId(input.toolCallId);
           return fail(appError('state_conflict', 'runtime', 'ToolCall 已开始或终态已固定。'));
         });
@@ -2288,7 +2459,7 @@ function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessio
     throw new Error('native_history_diverged');
   }
   if (context !== undefined) {
-    const binding = exactRecord(context, 'native_entry_run_binding', ['entryId', 'runId']);
+    const binding = recordWithOptional(context, 'native_entry_run_binding', ['entryId', 'runId'], ['inputId', 'resultInputIds']);
     const index = history.entries.findIndex((entry) => entry.id === binding.entryId);
     const run = db.query('SELECT kind,session_id FROM runs WHERE id=?').get(context.runId) as { kind: string; session_id: number | null } | null;
     if (typeof binding.entryId !== 'string' || !Number.isSafeInteger(binding.runId) || Number(binding.runId) <= 0
@@ -2305,7 +2476,13 @@ function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessio
   if (context !== undefined && hasTable(db, 'session_inputs')) {
     const entry = history.entries.find((candidate) => candidate.id === context.entryId)!;
     const message = entry.message as { role?: unknown } | undefined;
-    if (entry.type === 'message' && message?.role === 'user') markInputConsumed(db, context.runId, entry.id, entry.timestamp);
+    if (context.inputId !== undefined) {
+      if (!Number.isSafeInteger(context.inputId) || context.inputId <= 0 || message?.role !== 'user' || context.resultInputIds !== undefined)
+        throw new Error('input_consumption_identity_invalid');
+      markInputConsumed(db, context.inputId, context.runId, entry.id, entry.timestamp);
+    } else if (message?.role === 'user'
+      && db.query('SELECT id FROM session_inputs WHERE run_id=? LIMIT 1').get(context.runId)) throw new Error('input_consumption_identity_missing');
+    if (context.resultInputIds !== undefined) associateInputResult(db, context.runId, context.resultInputIds, entry.id, entry.timestamp);
   }
   db.query('UPDATE session_native_history SET leaf_id=?,entry_count=?,unusable=? WHERE session_id=?')
     .run(history.leafId, history.entries.length, previous?.unusable || history.unusable ? 1 : 0, sessionId);
@@ -2358,11 +2535,15 @@ export function createSessionRepository(db: Database): SessionRepository {
 
     readHistoryForDisplay(sessionId) {
       try {
-        return ok(db.transaction((): NativeHistoryDisplayRecord => {
+        return ok(db.transaction(() => {
           const history = readNativeHistory(db, sessionId);
           const bindings = db.query('SELECT entry_id,run_id FROM session_native_entries WHERE session_id=? AND run_id IS NOT NULL ORDER BY sequence')
             .all(sessionId) as Array<{ entry_id: string; run_id: number }>;
-          return { history, bindings: bindings.map((entry) => ({ entryId: entry.entry_id, runId: entry.run_id })) };
+          const rows = db.query('SELECT id,run_id,native_entry_id,content_json FROM session_inputs WHERE session_id=? AND native_entry_id IS NOT NULL ORDER BY id')
+            .all(sessionId) as { id: number; run_id: number; native_entry_id: string; content_json: string }[];
+          return { history, bindings: bindings.map((entry) => ({ entryId: entry.entry_id, runId: entry.run_id })),
+            sessionInputs: rows.map(row => ({ inputId: row.id, runId: row.run_id, nativeEntryId: row.native_entry_id,
+              content: JSON.parse(row.content_json) })) };
         }).deferred());
       } catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
     },
@@ -2429,15 +2610,33 @@ export function createSessionRepository(db: Database): SessionRepository {
         if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
           return fail(appError('session_busy', 'session', 'An Agent Run is active in this Session. Wait for it to finish before deleting this Session.', true));
         }
-        db.query("UPDATE sessions SET status='archived',updated_at=? WHERE id=? AND status!='archived'").run(at, sessionId);
+        const metadata = parseSessionMetadata((row as { metadata_json: string }).metadata_json);
+        db.query("UPDATE sessions SET status='archived',metadata_json=?,updated_at=? WHERE id=?")
+          .run(asJson({ ...metadata, delete_pending: true }), at, sessionId);
         return ok(readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(sessionId)));
       });
       return prepared.ok ? prepared.data : prepared;
     },
 
+    setStatus(input) {
+      const changed = transaction(db, () => {
+        const raw = db.query('SELECT * FROM sessions WHERE id=?').get(input.sessionId) as { hidden_at: string | null } | null;
+        if (!raw || raw.hidden_at !== null) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
+        const row = readSessionRow(db, raw);
+        if (row.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
+        if (db.query("SELECT id FROM runs WHERE session_id=? AND kind='agent' AND status IN ('created','running') LIMIT 1").get(input.sessionId))
+          return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
+        if (row.status === input.status) return ok(row);
+        if (row.status !== input.expectedStatus) return fail(appError('state_conflict', 'session', 'Session status has changed.', true));
+        db.query('UPDATE sessions SET status=?,updated_at=? WHERE id=?').run(input.status, input.at, input.sessionId);
+        return ok(readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(input.sessionId)));
+      });
+      return changed.ok ? changed.data : changed;
+    },
+
     delete(sessionId, at) {
       const deleted = transaction(db, () => {
-        const row = db.query('SELECT status,hidden_at FROM sessions WHERE id=?').get(sessionId) as { status: string; hidden_at: string | null } | null;
+        const row = db.query('SELECT status,hidden_at,metadata_json FROM sessions WHERE id=?').get(sessionId) as { status: string; hidden_at: string | null; metadata_json: string } | null;
         if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (row.status !== 'archived') {
           return fail(appError('session_delete_not_prepared', 'session', 'Session deletion has not been prepared.'));
@@ -2445,13 +2644,19 @@ export function createSessionRepository(db: Database): SessionRepository {
         if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
           return fail(appError('session_busy', 'session', 'An Agent Run is active in this Session. Wait for it to finish before deleting this Session.', true));
         }
-        if (row.hidden_at !== null) return ok('hidden' as const);
+        const metadata = parseSessionMetadata(row.metadata_json);
+        const { delete_pending: _pending, ...completedMetadata } = metadata;
+        if (row.hidden_at !== null) {
+          db.query('UPDATE sessions SET metadata_json=? WHERE id=?').run(asJson(completedMetadata), sessionId);
+          return ok('hidden' as const);
+        }
         db.query('UPDATE workspace SET active_session_id=NULL,revision=revision+1,updated_at=? WHERE id=1 AND active_session_id=?')
           .run(at, sessionId);
         if (hasBusinessHistory(db, sessionId)) {
-          db.query('UPDATE sessions SET hidden_at=?,updated_at=? WHERE id=?').run(at, at, sessionId);
+          db.query('UPDATE sessions SET hidden_at=?,metadata_json=?,updated_at=? WHERE id=?').run(at, asJson(completedMetadata), at, sessionId);
           return ok('hidden' as const);
         }
+        db.query('DELETE FROM session_inputs WHERE session_id=?').run(sessionId);
         db.query("DELETE FROM runs WHERE kind='agent' AND session_id=?").run(sessionId);
         // Bun counts rows removed by the native-history cascades too.
         if (db.query('DELETE FROM sessions WHERE id=?').run(sessionId).changes < 1) {
@@ -2464,62 +2669,10 @@ export function createSessionRepository(db: Database): SessionRepository {
   };
 }
 
-export function createRunRepository(db: Database): RunRepository {
-  return {
-    create(input) {
-      const result = transaction(db, () => {
-        const inserted = db
-          .query(
-            `INSERT INTO runs
-              (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
-             VALUES ('provider',NULL,NULL,'created',?,?,?,?,?,?)`,
-          )
-          .run(input.goal, asJson(input.input), asJson(input.config), asJson(input.cleanup), asJson(input.usage), input.createdAt);
-        const id = Number(inserted.lastInsertRowid);
-        if (!Number.isSafeInteger(id)) throw new Error('unsafe_run_id');
-        return id;
-      });
-      return result;
-    },
-
-    createAgent(input) {
-      const created = transaction(db, () => {
-        const session = db.query('SELECT status,metadata_json,native_session_id FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string; native_session_id: string } | null;
-        if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
-        if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
-        const config = validatedConfig(input.config, 'agent');
-        const scope = validatedScope(input.scope);
-        if (scope.version === 3 || config.goalMode === 'local-task') return fail(appError('input_invalid', 'input', 'Legacy native Run formats are read only.'));
-        if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
-        if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
-        const inserted = db.query(`INSERT INTO runs
-          (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
-          VALUES ('agent',?,?,'created',?,?,?,?,?,?)`)
-          .run(input.sessionId, asJson(input.scope), input.goal, asJson(input.input), asJson(input.config),
-            asJson(input.cleanup), asJson(input.usage), input.createdAt);
-        const id = Number(inserted.lastInsertRowid);
-        if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_run_id');
-        db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(input.createdAt, input.sessionId);
-        return ok(id);
-      });
-      return created.ok ? created.data : created;
-    },
-
-    createWorkspaceAgent(input) {
-      const created = transaction(db, () => {
-        const expected = WorkspaceExpectationSchema.safeParse(input.expected);
-        const target = input.formTarget === undefined ? null : InvoiceFormTargetSchema.safeParse(input.formTarget);
-        const fill = input.goalMode === 'fill-form';
-        if (!expected.success || input.sessionId !== input.expected.sessionId
-          || !['answer', 'save-candidate', 'fill-form'].includes(input.goalMode)
-          || (fill ? !target?.success : input.formTarget !== undefined)
-          || !fill && 'formTarget' in input.config) {
-          return fail(appError('input_invalid', 'input', 'P3 Workspace Run 参数无效。'));
-        }
-        const session = db.query('SELECT status,metadata_json FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string } | null;
-        if (!session || session.status !== 'active') return fail(appError('session_archived', 'session', 'Session 不可用于新 Run。'));
-        if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
-        if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
+function freezeWorkspaceInput(db: Database, input: Pick<NewWorkspaceAgentRun, 'sessionId' | 'expected' | 'goalMode' | 'createdAt'>) {
+  const expected = WorkspaceExpectationSchema.safeParse(input.expected);
+  if (!expected.success) return fail(appError('input_invalid', 'input', 'Workspace expectation is invalid.'));
+  const fill = input.goalMode === 'fill-form';
         const rawWorkspace = ensureWorkspace(db, input.createdAt);
         const workspace = workspaceSnapshot(db, rawWorkspace, input.createdAt);
         const actualExpectation: WorkspaceExpectation = {
@@ -2584,6 +2737,70 @@ export function createRunRepository(db: Database): RunRepository {
         if (Buffer.byteLength(JSON.stringify(workspaceInput), 'utf8') > 512 * 1024) {
           return fail(appError('input_too_large', 'input', '冻结 Workspace 输入超过 512 KiB。'));
         }
+  return ok({ document, job, workspaceContext, workspaceInput });
+}
+
+export function createRunRepository(db: Database): RunRepository {
+  return {
+    create(input) {
+      const result = transaction(db, () => {
+        const inserted = db
+          .query(
+            `INSERT INTO runs
+              (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+             VALUES ('provider',NULL,NULL,'created',?,?,?,?,?,?)`,
+          )
+          .run(input.goal, asJson(input.input), asJson(input.config), asJson(input.cleanup), asJson(input.usage), input.createdAt);
+        const id = Number(inserted.lastInsertRowid);
+        if (!Number.isSafeInteger(id)) throw new Error('unsafe_run_id');
+        return id;
+      });
+      return result;
+    },
+
+    createAgent(input) {
+      const created = transaction(db, () => {
+        const session = db.query('SELECT status,metadata_json,native_session_id FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string; native_session_id: string } | null;
+        if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+        if (parseSessionMetadata(session.metadata_json).delete_pending === true) return fail(appError('session_delete_incomplete', 'session', 'Session deletion is incomplete.', true));
+        if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
+        const config = validatedConfig(input.config, 'agent');
+        const scope = validatedScope(input.scope);
+        if (scope.version === 3 || config.goalMode === 'local-task') return fail(appError('input_invalid', 'input', 'Legacy native Run formats are read only.'));
+        if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
+        if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
+        const inserted = db.query(`INSERT INTO runs
+          (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+          VALUES ('agent',?,?,'created',?,?,?,?,?,?)`)
+          .run(input.sessionId, asJson(input.scope), input.goal, asJson(input.input), asJson(input.config),
+            asJson(input.cleanup), asJson(input.usage), input.createdAt);
+        const id = Number(inserted.lastInsertRowid);
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_run_id');
+        db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(input.createdAt, input.sessionId);
+        return ok(id);
+      });
+      return created.ok ? created.data : created;
+    },
+
+    createWorkspaceAgent(input) {
+      const created = transaction(db, () => {
+        const expected = WorkspaceExpectationSchema.safeParse(input.expected);
+        const target = input.formTarget === undefined ? null : InvoiceFormTargetSchema.safeParse(input.formTarget);
+        const fill = input.goalMode === 'fill-form';
+        if (!expected.success || input.sessionId !== input.expected.sessionId
+          || !['answer', 'save-candidate', 'fill-form'].includes(input.goalMode)
+          || (fill ? !target?.success : input.formTarget !== undefined)
+          || !fill && 'formTarget' in input.config) {
+          return fail(appError('input_invalid', 'input', 'P3 Workspace Run 参数无效。'));
+        }
+        const session = db.query('SELECT status,metadata_json FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string } | null;
+        if (!session || session.status !== 'active') return fail(appError('session_archived', 'session', 'Session 不可用于新 Run。'));
+        if (parseSessionMetadata(session.metadata_json).delete_pending === true) return fail(appError('session_delete_incomplete', 'session', 'Session deletion is incomplete.', true));
+        if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
+        if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
+        const frozen = freezeWorkspaceInput(db, input);
+        if (!frozen.ok) return frozen;
+        const { document, job, workspaceContext, workspaceInput } = frozen.data;
         const allowedTools = fill ? ['fill_invoice_form'] : !document ? [INVOICE_REVIEW_TOOL_NAMES[6]!, INVOICE_REVIEW_TOOL_NAMES[7]!]
           : !job ? INVOICE_REVIEW_TOOL_NAMES.slice(0, 9)
             : input.goalMode === 'save-candidate' ? [...INVOICE_REVIEW_TOOL_NAMES] : INVOICE_REVIEW_TOOL_NAMES.slice(0, 12);
@@ -2594,7 +2811,7 @@ export function createRunRepository(db: Database): RunRepository {
           allowedResourcePaths: [],
         });
         const inputRecord = { version: 2, goal: input.goal, text: input.text, messageTimestamp: input.messageTimestamp, workspaceInput };
-        let config: SafeConfigSnapshot & { agent: P3AgentConfigFacts; goalMode: GoalMode; workspaceContext: WorkspaceContext; workingDirectory?: string; formTarget?: InvoiceFormTarget } = {
+        let config: SafeConfigSnapshot & { agent: P3AgentConfigFacts | RuntimeAgentConfigFacts; goalMode: GoalMode; workspaceContext: WorkspaceContext; workingDirectory?: string; formTarget?: InvoiceFormTarget } = {
           ...input.config, goalMode: input.goalMode, workspaceContext,
           ...(fill && target?.success ? { formTarget: target.data } : {}),
         };
@@ -2617,6 +2834,47 @@ export function createRunRepository(db: Database): RunRepository {
           ...(fill && target?.success ? { formTarget: target.data } : {}) });
       });
       return created.ok ? created.data : created;
+    },
+
+    freezeInput(input) {
+      try {
+        const raw = db.query('SELECT * FROM runs WHERE id=?').get(input.runId) as RunRow | null;
+        if (!raw || raw.kind !== 'agent' || raw.session_id !== input.sessionId || !['created', 'running'].includes(raw.status)
+          || raw.cancel_requested_at !== null) return fail(appError('run_state_invalid', 'runtime', 'Input requires its active Run.'));
+        const session = db.query('SELECT * FROM sessions WHERE id=? AND hidden_at IS NULL').get(input.sessionId);
+        if (!session) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
+        const current = readSessionRow(db, session);
+        if (current.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Session deletion is incomplete.', true));
+        if (current.status !== 'active') return fail(appError('session_archived', 'session', 'Session is archived.'));
+        if (current.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
+        if (current.nativeUnusable || current.historyState === 'invalid') return fail(appError('session_history_invalid', 'session', 'Saved history is unusable.'));
+        const config = validatedConfig(readJson(raw.config_json, 'config'), 'agent');
+        const scope = validatedScope(readJson(raw.scope_json!, 'scope'));
+        const goalMode = config.goalMode ?? 'answer';
+        if (goalMode === 'fill-form') return fail(appError('input_invalid', 'input', 'Fill does not accept active input.'));
+        if (scope.version === 1) {
+          if (input.expected !== undefined) return fail(appError('state_conflict', 'input', 'This Chat Run has no Workspace.'));
+          return ok({ runId: input.runId, content: { version: 2, text: input.text, workspaceContext: null,
+            workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [], promptText: input.text } });
+        }
+        if (scope.version !== 2 || input.expected === undefined || !config.workspaceContext)
+          return fail(appError('state_conflict', 'input', 'This Run requires its compatible current Workspace.'));
+        const original = WorkspaceContextSchema.parse(config.workspaceContext);
+        const expected = input.expected;
+        if (expected.documentRef?.id !== original.documentRef?.id || expected.documentRef?.version !== original.documentRef?.version
+          || expected.jobId !== original.jobId || expected.candidateRef?.id !== original.candidateRef?.id
+          || expected.candidateRef?.sequence !== original.candidateRef?.sequence)
+          return fail(appError('state_conflict', 'input', 'Input Workspace differs from the Run admission.'));
+        const frozen = freezeWorkspaceInput(db, { sessionId: input.sessionId, expected, goalMode: goalMode as GoalMode, createdAt: input.at });
+        if (!frozen.ok) return frozen;
+        const { document, workspaceContext, workspaceInput } = frozen.data;
+        if (document && (!scope.allowedDocumentIds.includes(document.id) || !scope.allowedArtifactIds.includes(document.parsed_artifact_id)))
+          return fail(appError('state_conflict', 'input', 'Input would expand the Run scope.'));
+        return ok({ runId: input.runId, content: { version: 2, text: input.text, workspaceContext, workspaceInput,
+          allowedDocumentIds: [...scope.allowedDocumentIds], allowedArtifactIds: [...scope.allowedArtifactIds],
+          promptText: formatExecutionPrompt({ text: input.text, workspaceInput, goalMode: goalMode as GoalMode, business: true,
+            ...(typeof config.workingDirectory === 'string' ? { workingDirectory: config.workingDirectory } : {}) }) } });
+      } catch { return fail(appError('storage_read_failed', 'storage', 'Input admission facts cannot be read.', true)); }
     },
 
     start(runId, config, startedAt) {
@@ -2708,7 +2966,8 @@ export function createRunRepository(db: Database): RunRepository {
           if (jobChanged !== 1) throw new Error('job_terminal_state_invalid');
         }
         if (changed === 1 && hasTable(db, 'session_inputs')) {
-          finishSessionInputs(db, runId, terminal.status, terminal.error, terminal.endedAt);
+          for (const batch of terminal.inputResults ?? []) completeSessionInputs(db, runId, batch.inputIds, batch.resultEntryId, terminal.endedAt);
+          finishSessionInputs(db, runId, terminal.status, terminal.error, terminal.endedAt, terminal.confirmedUnconsumedInputIds);
         }
         return changed === 1;
       });
@@ -2826,7 +3085,8 @@ export function createRunRepository(db: Database): RunRepository {
             )`).run(endedAt);
           const changed = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE status IN ('created','running')")
             .run(error, cleanup, endedAt).changes;
-          if (hasTable(db, 'session_inputs')) recoverSessionInputs(db, endedAt);
+          if (hasTable(db, 'session_inputs')) recoverSessionInputs(db, endedAt,
+            (runId, inputIds, resultEntryId, completed) => qualifyRecoveredInputResult(db, runId, inputIds, resultEntryId, completed));
           return changed;
         });
         return recovered;
@@ -2835,6 +3095,48 @@ export function createRunRepository(db: Database): RunRepository {
       }
     },
   };
+}
+
+function qualifyRecoveredInputResult(db: Database, runId: DbId, inputIds: readonly DbId[], resultEntryId: string, completed = false): boolean {
+  try {
+    const raw = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
+    if (!raw || raw.kind !== 'agent' || (completed ? !['completed', 'failed', 'cancelled'].includes(raw.status) : raw.status !== 'completed')
+      || raw.session_id === null || raw.stopped_at === null) return false;
+    const cleanup = validatedCleanup(readJson(raw.cleanup_json, 'cleanup'));
+    if (!cleanup.stopped || cleanup.lateObservationRequired || !completed && cleanup.errors.length) return false;
+    const row = db.query('SELECT * FROM sessions WHERE id=?').get(raw.session_id);
+    if (!row) return false;
+    const session = readSessionRow(db, row);
+    if (session.historyState !== 'recoverable' || !completed && (session.deletePending || session.modelUseBlocked || session.nativeUnusable)) return false;
+    const config = validatedConfig(readJson(raw.config_json, 'config'), 'agent');
+    const evidence = createSessionInputLedger(db).resultEvidence(runId, inputIds, resultEntryId);
+    if (!evidence.ok) return false;
+    const all = db.query('SELECT * FROM tool_calls WHERE run_id=?').all(runId);
+    const calls = all.map(row => toolCallSnapshot(db, row)).filter(call => evidence.data.toolCallIds.includes(call.nativeToolCallId));
+    if (calls.length !== new Set(evidence.data.toolCallIds).size || calls.some(call => !call.cleanup.stopped || call.cleanup.errors.length
+      || call.cleanup.nativeProcesses?.some(process => !process.stopped))) return false;
+    if (config.goalMode === 'save-candidate' && evidence.data.inputs.some(input => input.mode === 'prompt')) {
+      return calls.some(call => call.status === 'succeeded' && call.result?.status === 'succeeded'
+        && call.result.committedCandidateId !== null && call.delivery.state === 'request_observed');
+    }
+    if (config.goalMode === 'fill-form') {
+      const target = InvoiceFormTargetSchema.parse(config.formTarget);
+      const context = WorkspaceContextSchema.parse(config.workspaceContext);
+      const job = raw.job_id == null ? null : readJob(db, raw.job_id);
+      if (!job || !['waiting', 'completed'].includes(job.status) || context.candidateRef === null) return false;
+      return calls.some(call => {
+        const output = FillInvoiceFormOutputSchema.safeParse(call.result?.data);
+        const receipt = call.formApplication;
+        return call.toolName === 'fill_invoice_form' && call.status === 'succeeded' && call.result?.status === 'succeeded'
+          && call.delivery.state === 'request_observed' && receipt?.outcome === 'applied'
+          && receipt.runId === runId && receipt.toolCallId === call.toolCallId && receipt.formInstanceId === target.formInstanceId
+          && receipt.appliedRevision === target.expectedRevision + 1 && receipt.candidateId === context.candidateRef!.id
+          && receipt.candidateSequence === context.candidateRef!.sequence && output.success
+          && output.data.candidateId === receipt.candidateId && output.data.candidateSequence === receipt.candidateSequence;
+      });
+    }
+    return true;
+  } catch { return false; }
 }
 
 /** Recheck persisted stop facts; a controller lease is not actual stop evidence. */

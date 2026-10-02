@@ -21,7 +21,7 @@ function event(sequence: number, view = message()): Extract<AgentRunEvent, { typ
 function page(items: SessionMessagesPage['items']): SessionMessagesPage {
   return { session: { sessionId: 12, nativeSessionId: 'native-session-s', title: 'Invoice', status: 'active',
     createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:00.000Z', availability: 'ready',
-    historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: true },
+    historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, deletePending: false, hasBusinessHistory: true },
     leafId: 'entry-1', entryCount: items.length, items, nextBeforeEntryId: null };
 }
 

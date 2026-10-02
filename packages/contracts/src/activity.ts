@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { AppErrorSchema } from './runtime.ts';
 import type { AppError, DbId } from './runtime.ts';
 import type { StoredCandidateDraft, CheckResult, DocumentRef, InvoiceIssue, SourceRef, InvoiceFormApplicationReceipt } from './invoice.ts';
 import type { ToolEffect, ToolResult } from './tools.ts';
@@ -80,6 +82,41 @@ export type ToolCallCleanup = {
   nativeProcesses?: NativeProcessRecord[];
   nativeOutputs?: NativeOutputRecord[];
 };
+
+const observationConclusion = z.enum(['valid', 'invalid', 'not_applicable', 'unknown']);
+export const ToolRuntimeObservationSchema = z.object({
+  version: z.literal(1),
+  groupKey: z.string().min(1).max(2048),
+  strategyVersion: z.literal('runtime-v1'),
+  sampleSource: z.enum(['production', 'test', 'evaluation']),
+  beforeOutcome: z.enum(['allowed', 'rejected']),
+  failureStage: z.enum(['identity', 'sdk_arguments', 'sdk_before', 'before', 'execute', 'commit', 'validation',
+    'storage', 'sdk_after', 'delivery', 'history', 'unknown']).nullable(),
+  diagnosticCode: z.string().min(1).max(128).nullable(),
+  afterStructure: observationConclusion,
+  afterDomain: observationConclusion,
+  executionDurationMs: z.number().finite().nonnegative().nullable(),
+  timingComplete: z.boolean(),
+  effectiveTimeoutMs: z.number().finite().positive().max(1_800_000).nullable(),
+  timeoutSource: z.enum(['configured', 'statistical', 'native', 'run_remaining']).nullable(),
+  runDeadlineTruncated: z.boolean(),
+  commit: z.enum(['none_confirmed', 'committed', 'unknown']),
+  commitError: AppErrorSchema.nullable(),
+}).strict().superRefine((record, context) => {
+  if (record.beforeOutcome === 'rejected' && (record.executionDurationMs !== null || record.timingComplete)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'A rejected call has no execution timing.' });
+  }
+  if (record.timingComplete && record.executionDurationMs === null) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Complete timing requires monotonic duration.' });
+  }
+  if ((record.commit === 'unknown') !== (record.commitError !== null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Unknown commit requires its query error.' });
+  }
+  if ((record.effectiveTimeoutMs === null) !== (record.timeoutSource === null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'An effective timeout requires its source.' });
+  }
+});
+export type ToolRuntimeObservation = z.infer<typeof ToolRuntimeObservationSchema>;
 export type StoredToolResult = {
   version: 1;
   committedCandidateId: DbId | null;
@@ -100,6 +137,7 @@ export type ToolCallSnapshot = {
   formApplication?: InvoiceFormApplicationReceipt;
   delivery: ToolCallDelivery;
   cleanup: ToolCallCleanup;
+  runtimeObservation?: ToolRuntimeObservation | null;
   requestedAt: string;
   startedAt: string | null;
   endedAt: string | null;

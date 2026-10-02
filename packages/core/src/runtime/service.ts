@@ -1,4 +1,4 @@
-import { appError, fail, ok, normalizeSessionInputRequest, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
+import { appError, fail, ok, RuntimeRequestOverridesSchema, normalizeSessionInputRequest, formatExecutionPrompt, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
 import { join } from 'node:path';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import type {
@@ -35,6 +35,14 @@ import type {
   NativeToolAvailability,
   RunScope,
   NormalizedSessionInputRequest,
+  NormalizedActiveInputRequest,
+  SessionInputContentV2,
+  SessionInputAccepted,
+  RuntimeAgentConfigFacts,
+  RuntimeRequestOverrides,
+  ResolvedRuntimeBudget,
+  RuntimeStrategySnapshot,
+  RuntimeStrategyPolicy,
 } from '@flowmate/contracts';
 import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
 import { ensureNativeSession } from '../sessions/service.ts';
@@ -53,7 +61,11 @@ export type RuntimeDependencies = {
   agent?: AgentPort;
   sessions?: SessionRepository;
   sessionInputs?: SessionInputLedger;
+  isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
+  runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  runtimePolicy?: RuntimeStrategyPolicy;
+  sampleSource?: 'production' | 'test' | 'evaluation';
   nativeTools?: {
     runtimeDir: string;
     availability: readonly NativeToolAvailability[];
@@ -80,6 +92,8 @@ type ActiveCall = {
   providerFailureBeforeStop?: boolean;
   completion: Promise<Result<ProviderOutcome>>;
   poisoned: boolean;
+  inputAdmissionClosed?: boolean;
+  inputStreamingStarted?: boolean;
   observe: (type: ProviderObservation['type'], data?: Readonly<Record<string, unknown>>) => void;
 };
 
@@ -92,18 +106,29 @@ type AgentEventPayload =
 
 type AgentExecutionContext = {
   active: ActiveCall;
-  request: NormalizedAgentRunRequest;
+  request: FrozenAgentRunRequest;
   session: SessionRow;
   input: InputRecord;
   admission: WorkspaceRunAdmission | null;
   scope: RunScope | null;
+  maxModelCalls?: number;
+  runtimeStrategy?: RuntimeStrategySnapshot;
   workingDirectory?: string;
   inputId?: number;
+  promptText: string;
   control: AgentControl;
   stopPromise: Promise<StopIntent>;
   readStop: () => StopIntent | undefined;
   emit: (event: AgentEventPayload) => void;
 };
+type FrozenAgentRunRequest = NormalizedAgentRunRequest & { goalMode: import('@flowmate/contracts').GoalMode;
+  timeoutMs: number; stopGraceMs: number; budget: ResolvedRuntimeBudget };
+
+function originalOverrides(request: NormalizedAgentRunRequest): RuntimeRequestOverrides {
+  return { ...(request.budget === undefined ? {} : { budget: request.budget }),
+    ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+    ...(request.stopGraceMs === undefined ? {} : { stopGraceMs: request.stopGraceMs }) };
+}
 
 const chatScope: ChatScope = { version: 1, mode: 'chat-text', toolNames: [], resourcePaths: [] };
 const agentPolicy: Omit<AgentConfigFacts, 'nativeSessionId'> = {
@@ -124,12 +149,12 @@ const p3AgentPolicy: Omit<P3AgentConfigFacts, 'nativeSessionId'> = {
   systemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT,
   thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
   maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288,
-  maxModelCalls: 12, maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false,
+  maxModelCalls: 16, maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false,
 };
 
-function initialAgentSnapshot(request: NormalizedAgentRunRequest, nativeSessionId: string): SafeConfigSnapshot & { agent: AgentConfigFacts } {
+function initialAgentSnapshot(request: FrozenAgentRunRequest, nativeSessionId: string): SafeConfigSnapshot & { agent: RuntimeAgentConfigFacts } {
   return {
-    version: 1,
+    version: 2,
     name: request.config.name,
     revision: request.config.revision,
     requestedModel: request.config.modelRef,
@@ -140,13 +165,14 @@ function initialAgentSnapshot(request: NormalizedAgentRunRequest, nativeSessionI
     parameters: request.config.parameters,
     limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
     native: { authSource: 'unknown', modelsSelection: request.config.native.modelsPath },
-    agent: { ...agentPolicy, nativeSessionId },
+    runtimeBudget: request.budget,
+    agent: { ...agentPolicy, policyVersion: 'runtime-v1', taskPolicyVersion: 'p5-session-inputs-v1', ...request.budget, nativeSessionId },
   };
 }
 
-function initialP3AgentSnapshot(request: NormalizedAgentRunRequest, nativeSessionId: string): SafeConfigSnapshot & { agent: P3AgentConfigFacts } {
+function initialP3AgentSnapshot(request: FrozenAgentRunRequest, nativeSessionId: string): SafeConfigSnapshot & { agent: RuntimeAgentConfigFacts } {
   return {
-    version: 1,
+    version: 2,
     name: request.config.name,
     revision: request.config.revision,
     requestedModel: request.config.modelRef,
@@ -157,7 +183,8 @@ function initialP3AgentSnapshot(request: NormalizedAgentRunRequest, nativeSessio
     parameters: request.config.parameters,
     limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
     native: { authSource: 'unknown', modelsSelection: request.config.native.modelsPath },
-    agent: { ...p3AgentPolicy, nativeSessionId,
+    runtimeBudget: request.budget,
+    agent: { ...p3AgentPolicy, policyVersion: 'runtime-v1', taskPolicyVersion: 'p3-invoice-tools-v1', ...request.budget, nativeSessionId,
       ...(request.goalMode === 'fill-form' ? { systemPrompt: INVOICE_FILL_FORM_SYSTEM_PROMPT } : {}) },
   };
 }
@@ -272,6 +299,101 @@ export class RuntimeService {
     return existing.ok ? ok({ runId, accepted: false }) : existing;
   }
 
+  public verifySessionMutation(sessionId: number): Result<void> {
+    if (this.poisoned || this.closing || this.closed) return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot manage Sessions.', true));
+    if (this.active?.kind === 'agent' && this.active.sessionId === sessionId)
+      return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
+    return ok(undefined);
+  }
+
+  public async appendInput(request: NormalizedActiveInputRequest): Promise<Result<SessionInputAccepted>> {
+    const { sessionInputs: ledger, agent, runs } = this.dependencies;
+    if (!ledger) return fail(appError('session_input_unavailable', 'session', 'Session input storage is unavailable.'));
+    const prior = ledger.lookup(request);
+    if (!prior.ok) return prior;
+    if (prior.data) return prior.data.runId === null ? fail(appError('operation_result_unknown', 'session', 'Original Run is unknown.'))
+      : ok({ inputId: prior.data.inputId, runId: prior.data.runId, sessionId: prior.data.sessionId });
+    const active = this.active;
+    if (this.poisoned || this.closing || this.closed || !active || active.kind !== 'agent' || active.runId !== request.runId
+      || active.sessionId !== request.sessionId || !active.inputStreamingStarted || active.terminalCommitted || active.stopIntent || active.inputAdmissionClosed)
+      return fail(appError('input_admission_closed', 'session', 'The Run is no longer accepting input.', true));
+    if (this.dependencies.isSessionManaging?.(request.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+    if (!agent?.enqueueInput || !active.nativeSessionId) return fail(appError('agent_input_unavailable', 'runtime', 'Active input dispatch is unavailable.'));
+    try {
+      if (agent.inspect(active.nativeSessionId).availability !== 'busy') return fail(appError('input_admission_closed', 'session', 'The native Run is not streaming.', true));
+    } catch { return fail(appError('agent_session_unavailable', 'session', 'Native state cannot be confirmed.', true)); }
+    const at = this.dependencies.now();
+    const admitted = ledger.admit(request, () => runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
+      text: request.text, expected: request.workspace, at }), at);
+    if (!admitted.ok) return admitted;
+    const input = admitted.data.input;
+    if (!admitted.data.created) return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
+    if (input.content.version !== 2) return fail(appError('input_processing_unconfirmed', 'runtime', 'Frozen input is invalid.'));
+    const dispatched = ledger.dispatch(input.inputId, this.dependencies.now());
+    if (!dispatched.ok) { active.stop('user'); return dispatched; }
+    let enqueued: Result<void>;
+    try { enqueued = await agent.enqueueInput(active.nativeSessionId, { inputId: input.inputId, runId: request.runId,
+      sessionId: request.sessionId, mode: request.mode, text: input.content.text, promptText: input.content.promptText }); }
+    catch { enqueued = fail(appError('input_delivery_unknown', 'session', 'Native input delivery could not be confirmed.', true, request.runId)); }
+    if (!enqueued.ok) { active.stop('user'); return enqueued; }
+    return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
+  }
+
+  private verifyInputUse(context: AgentExecutionContext, inputId: number): Result<void> {
+    const { active, session } = context;
+    const stored = this.dependencies.sessionInputs?.get(inputId);
+    if (!stored || !stored.ok || !stored.data || stored.data.runId !== active.runId || stored.data.sessionId !== session.sessionId
+      || stored.data.content.version !== 2 || !['queued', 'consumed'].includes(stored.data.status))
+      return fail(appError('input_delivery_unknown', 'session', 'Input identity cannot be confirmed.', true, active.runId));
+    const row = this.dependencies.sessions?.get(session.sessionId);
+    const run = this.dependencies.runs.get(active.runId);
+    if (!row || !row.ok || !run.ok) return fail(appError('storage_read_failed', 'storage', 'Input use cannot be confirmed.', true, active.runId));
+    if (this.poisoned || active.poisoned || active.terminalCommitted || active.stopIntent || run.data.cancelRequestedAt !== null
+      || !['created', 'running'].includes(run.data.status)) return fail(appError('input_admission_closed', 'session', 'Input use is closed.', true, active.runId));
+    if (row.data.deletePending || row.data.status !== 'active' || row.data.nativeSessionId !== session.nativeSessionId)
+      return fail(appError('session_history_invalid', 'session', 'Input Session is unavailable.', false, active.runId));
+    if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', 'Input material access was revoked.', false, active.runId));
+    if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'Saved history is unusable.', false, active.runId));
+    return ok(undefined);
+  }
+
+  private qualifyInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Result<boolean> {
+    const evidence = this.dependencies.sessionInputs!.resultEvidence(context.active.runId, inputIds, resultEntryId);
+    if (!evidence.ok) return evidence;
+    for (const input of evidence.data.inputs) {
+      const allowed = this.verifyInputUse(context, input.inputId);
+      if (!allowed.ok) return allowed;
+    }
+    if (context.scope && this.dependencies.tools) {
+      const facts = this.dependencies.tools.candidateFacts(context.active.runId, evidence.data.toolCallIds);
+      if (!facts.ok) return facts;
+      if (facts.data.cleanupErrors.length) return fail(facts.data.cleanupErrors[0]!);
+      if (!facts.data.stopped) return ok(false);
+      if (context.request.goalMode === 'save-candidate' && evidence.data.inputs.some(input => input.mode === 'prompt') && !facts.data.deliveredCandidateIds.length)
+        return fail(appError('agent_goal_not_met', 'runtime', 'This response batch did not deliver a saved candidate.', false, context.active.runId));
+      if (context.request.goalMode === 'fill-form') return ok(false);
+    }
+    return ok(true);
+  }
+
+  private completeInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Result<void> {
+    const qualified = this.qualifyInputResult(context, inputIds, resultEntryId);
+    let completed: Result<void>;
+    if (!qualified.ok) {
+      if (qualified.error.code !== 'agent_goal_not_met') return qualified;
+      completed = this.dependencies.sessionInputs!.failResult(context.active.runId, inputIds, resultEntryId, qualified.error, this.dependencies.now());
+    } else {
+      if (!qualified.data) return ok(undefined);
+      completed = this.dependencies.sessionInputs!.completeResult(context.active.runId, inputIds, resultEntryId, this.dependencies.now());
+    }
+    if (!completed.ok) {
+      context.active.storageError = completed.error;
+      context.active.stop('shutdown');
+      context.active.poisoned = this.poisoned = true;
+    }
+    return completed;
+  }
+
   private persistCancellation(active: ActiveCall, at: string): boolean {
     try {
       const recorded = this.dependencies.runs.recordCancel(active.runId, at);
@@ -302,26 +424,39 @@ export class RuntimeService {
     return ok({ ...persisted.data, stopRequested });
   }
 
-  public async start(request: NormalizedAgentRunRequest, control: AgentControl = {}, inputSubmission?: NormalizedSessionInputRequest): Promise<Result<RunAccepted>> {
+  public async start(rawRequest: NormalizedAgentRunRequest, control: AgentControl = {}, inputSubmission?: NormalizedSessionInputRequest): Promise<Result<RunAccepted>> {
+    if (!this.dependencies.sessionInputs) return fail(appError('session_input_unavailable', 'session', 'Session input storage is unavailable.'));
     if (inputSubmission) {
-      const normalized = normalizeSessionInputRequest({ ...inputSubmission, ...request });
-      if (!normalized.ok || JSON.stringify(normalized.data) !== JSON.stringify(inputSubmission)) {
-        return fail(appError('input_invalid', 'input', 'Fill input and Run request do not match.'));
+      const normalized = normalizeSessionInputRequest({ ...inputSubmission, ...rawRequest });
+      if (inputSubmission.mode !== 'prompt' || !normalized.ok || JSON.stringify(normalized.data) !== JSON.stringify(inputSubmission)) {
+        return fail(appError('input_invalid', 'input', 'Input and Run request do not match.'));
       }
-      if (!this.dependencies.sessionInputs) return fail(appError('session_input_unavailable', 'session', 'Session input storage is unavailable.'));
-      const previous = this.dependencies.sessionInputs.lookup(inputSubmission);
+      const previous = this.dependencies.sessionInputs.lookup(inputSubmission, control.desktopRequestHash);
       if (!previous.ok) return previous;
       if (previous.data) return previous.data.runId === null
         ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
         : ok({ runId: previous.data.runId, sessionId: previous.data.sessionId, inputId: previous.data.inputId });
-    } else if (request.goalMode === 'fill-form') {
+    } else if (rawRequest.goalMode === 'fill-form') {
       return fail(appError('input_invalid', 'input', 'Fill requires the dedicated input admission.'));
     }
+    const settings = this.dependencies.runtimeDefaults?.() ?? ok({});
+    if (!settings.ok) return settings;
+    const defaults = RuntimeRequestOverridesSchema.safeParse(settings.data);
+    if (!defaults.success) return fail(appError('config_settings_invalid', 'input', 'Runtime defaults are invalid.'));
+    if (!rawRequest.workspace && (rawRequest.budget?.maxToolCalls ?? 0) !== 0)
+      return fail(appError('input_invalid', 'input', 'A text-only Run cannot receive tool permission.'));
+    const request: FrozenAgentRunRequest = { ...rawRequest,
+      goalMode: rawRequest.goalMode ?? 'answer',
+      timeoutMs: rawRequest.timeoutMs ?? defaults.data.timeoutMs ?? (rawRequest.goalMode === 'save-candidate' ? 120_000 : 60_000),
+      stopGraceMs: rawRequest.stopGraceMs ?? defaults.data.stopGraceMs ?? 5000,
+      budget: Object.freeze({ maxToolCalls: 24, maxModelCalls: rawRequest.workspace ? 16 : 12, toolTimeoutMs: 10_000,
+        ...defaults.data.budget, ...rawRequest.budget, ...(!rawRequest.workspace ? { maxToolCalls: 0 } : {}) }) };
     const { agent, sessions } = this.dependencies;
     if (!agent || !sessions) return fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'));
     if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Agent 停止或 Run 保存未确认，运行实例不可复用。'));
     if (this.closing || this.closed || this.active !== null) return fail(appError('runtime_busy', 'runtime', '已有 Run 正在执行。'));
-    if (inputSubmission && !this.dependencies.tools?.listTools().some(tool => tool.name === 'fill_invoice_form')) {
+    if (this.dependencies.isSessionManaging?.(request.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+    if (request.goalMode === 'fill-form' && !this.dependencies.tools?.listTools().some(tool => tool.name === 'fill_invoice_form')) {
       return fail(appError('tool_runtime_unavailable', 'runtime', 'The trusted invoice form tool is unavailable.'));
     }
 
@@ -338,6 +473,7 @@ export class RuntimeService {
         if (!statSync(workingDirectory).isDirectory()) throw new Error('not_directory');
       } catch { return fail(appError('input_unavailable', 'input', 'The selected working directory is unavailable.')); }
     }
+    if (session.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
     if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
     const modelUseBlocked = sessions.isModelUseBlocked(request.sessionId);
     if (!modelUseBlocked.ok) return modelUseBlocked;
@@ -362,44 +498,59 @@ export class RuntimeService {
       text: request.text, messageTimestamp: Date.now() };
     let admission: WorkspaceRunAdmission | null = null;
     let scope: RunScope | null = null;
-    let createdRunId: number;
     let inputId: number | undefined;
-    if (request.workspace) {
-      const expectedWorkspace = request.workspace;
-      const createRun = () => this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
-        expected: expectedWorkspace, goalMode: request.goalMode ?? 'answer', text: request.text,
-        messageTimestamp: Date.now(), goal: INVOICE_CHAT_GOAL,
-        config: initialP3AgentSnapshot(request, session.nativeSessionId), usage: initialUsage(createdAt),
-        cleanup: initialCleanup(), createdAt,
-        ...(inputSubmission ? { formTarget: inputSubmission.formTarget } : {}),
-        ...(this.dependencies.nativeTools && !inputSubmission ? { nativeTools: { runtimeDir: this.dependencies.nativeTools.runtimeDir,
-          allowedTools: nativeNames, ...(workingDirectory ? { workingDirectory } : {}) } } : {}) });
-      let accepted: Result<WorkspaceRunAdmission>;
-      if (inputSubmission) {
-        const admitted = this.dependencies.sessionInputs!.admit(inputSubmission, createRun, createdAt);
-        if (!admitted.ok) return admitted;
-        inputId = admitted.data.input.inputId;
-        if (!admitted.data.created || !admitted.data.admission) return admitted.data.input.runId === null
-          ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
-          : ok({ runId: admitted.data.input.runId, sessionId: request.sessionId, inputId });
-        accepted = ok(admitted.data.admission);
-      } else accepted = createRun();
-      if (!accepted.ok) return accepted;
-      admission = accepted.data;
-      scope = admission.scope;
-      createdRunId = accepted.data.runId;
-      if (this.dependencies.nativeTools && !inputSubmission) workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(createdRunId), 'work');
-    } else {
-      const created = this.dependencies.runs.createAgent({
-        goal: INVOICE_CHAT_GOAL, input,
-        config: initialAgentSnapshot(request, session.nativeSessionId), usage: initialUsage(createdAt),
-        cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: chatScope,
+    let frozenContent: SessionInputContentV2 | undefined;
+    const createInput = (submission: NormalizedSessionInputRequest) => this.dependencies.sessionInputs!.admit(submission, () => {
+      if (submission.mode !== 'prompt') return fail(appError('input_invalid', 'input', 'Initial input must be a prompt.'));
+      let runId: number;
+      if (request.workspace) {
+        const created = this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
+          expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
+          messageTimestamp: input.messageTimestamp, goal: INVOICE_CHAT_GOAL,
+          config: initialP3AgentSnapshot(request, session.nativeSessionId), usage: initialUsage(createdAt),
+          cleanup: initialCleanup(), createdAt,
+          ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
+          ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
+            runtimeDir: this.dependencies.nativeTools.runtimeDir, allowedTools: nativeNames,
+            ...(workingDirectory ? { workingDirectory } : {}) } } : {}) });
+        if (!created.ok) return created;
+        admission = created.data;
+        scope = created.data.scope;
+        runId = created.data.runId;
+        if (this.dependencies.nativeTools && submission.goalMode !== 'fill-form')
+          workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(runId), 'work');
+      } else {
+        const created = this.dependencies.runs.createAgent({ goal: INVOICE_CHAT_GOAL, input,
+          config: initialAgentSnapshot(request, session.nativeSessionId), usage: initialUsage(createdAt),
+          cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: chatScope });
+        if (!created.ok) return created;
+        runId = created.data;
+      }
+      const content: SessionInputContentV2 = { version: 2, text: request.text,
+        requestIdentityVersion: 1, originalBudgetOverrides: originalOverrides(rawRequest),
+        workspaceContext: admission?.workspaceContext ?? null, workspaceInput: admission?.workspaceInput ?? null,
+        allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : [],
+        allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : [],
+        ...(control.desktopRequestHash === undefined ? {} : { desktopRequestHash: control.desktopRequestHash }),
+        promptText: formatExecutionPrompt({ text: request.text, business: admission !== null,
+          ...(admission ? { workspaceInput: admission.workspaceInput, goalMode: request.goalMode ?? 'answer' } : {}),
+          ...(workingDirectory ? { workingDirectory } : {}) }) };
+      return ok({ runId, content });
+    }, createdAt, control.desktopRequestHash);
+    const accepted = inputSubmission ? createInput(inputSubmission)
+      : this.dependencies.sessionInputs.allocateSequence(request.sessionId, sequence => {
+        const normalized = normalizeSessionInputRequest({ ...rawRequest, mode: 'prompt', clientSequence: sequence });
+        return normalized.ok ? createInput(normalized.data) : normalized;
       });
-      if (!created.ok) return created;
-      createdRunId = created.data;
-    }
-
-    const runId = createdRunId;
+    if (!accepted.ok) return accepted;
+    inputId = accepted.data.input.inputId;
+    if (!accepted.data.created) return accepted.data.input.runId === null
+      ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
+      : ok({ runId: accepted.data.input.runId, sessionId: request.sessionId, inputId });
+    if (accepted.data.input.content.version !== 2 || accepted.data.input.runId === null)
+      return fail(appError('input_processing_unconfirmed', 'runtime', 'New input evidence is invalid.'));
+    frozenContent = accepted.data.input.content;
+    const runId = accepted.data.input.runId;
     const controller = new AbortController();
     let sequence = 0;
     let stopIntent: StopIntent | undefined;
@@ -437,6 +588,7 @@ export class RuntimeService {
       if (stopIntent || active.poisoned || active.terminalCommitted) return false;
       stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
       active.stopIntent = stopIntent;
+      active.inputAdmissionClosed = true;
       try {
         if (reason === 'user') this.persistCancellation(active, stopIntent.at);
       } finally {
@@ -449,7 +601,7 @@ export class RuntimeService {
     let resolveCompletion!: (result: Result<ProviderOutcome>) => void;
     active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
     this.active = active;
-    const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory,
+    const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: frozenContent.promptText,
       ...(inputId === undefined ? {} : { inputId }), control, stopPromise, readStop: () => stopIntent, emit };
     const timer = setTimeout(() => active.stop('timeout'), request.timeoutMs);
     emit({ type: 'run_progress', phase: 'created' });
@@ -533,6 +685,7 @@ export class RuntimeService {
       if (stopIntent || active.poisoned || active.terminalCommitted) return false;
       stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
       active.stopIntent = stopIntent;
+      active.inputAdmissionClosed = true;
       const elapsedMs = Math.max(0, Math.round(stopIntent.monotonicMs - active.startedAt));
       let cancelPersisted: boolean | undefined;
       try {
@@ -604,8 +757,9 @@ export class RuntimeService {
       request.config,
       { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
       active.controller.signal,
-      context.scope ? { activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer',
-        ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) } : undefined,
+      context.scope ? { activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,
+        sessionInputs: true, ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) }
+        : { sessionInputs: true, runtimeBudget: request.budget },
     )).then(
       (result) => ({ ok: true as const, result }),
       () => ({ ok: false as const }),
@@ -657,7 +811,7 @@ export class RuntimeService {
     }
 
     let startedConfig: SafeConfigSnapshot = prepared.snapshot;
-    if (context.scope) {
+    if (context.inputId !== undefined) {
       const initial = this.dependencies.runs.get(active.runId);
       if (!initial.ok) return this.finishAgent(context, null, { ...initial.error, runId: active.runId }, false, true);
       const saved = initial.data.config as Record<string, unknown>;
@@ -665,8 +819,37 @@ export class RuntimeService {
       const { agent: _preparedAgent, goalMode: _preparedGoal, workspaceContext: _preparedWorkspace,
         workingDirectory: _preparedDirectory, formTarget: _preparedTarget, ...preparedWithoutAgent } = preparedFacts;
       const { agent: frozenAgent, ...frozenExtensions } = saved;
-      startedConfig = { ...frozenExtensions, ...preparedWithoutAgent, agent: frozenAgent } as SafeConfigSnapshot;
+      const actualAgent = prepared.snapshot.agent;
+      const frozenFacts = frozenAgent as typeof actualAgent;
+      const frozenRuntime = frozenFacts as RuntimeAgentConfigFacts;
+      const compatiblePolicy = actualAgent.policyVersion === 'runtime-v1'
+        ? actualAgent.taskPolicyVersion === frozenRuntime.taskPolicyVersion : actualAgent.policyVersion === frozenRuntime.taskPolicyVersion;
+      const actualBudget = { maxModelCalls: actualAgent.maxModelCalls,
+        maxToolCalls: 'maxToolCalls' in actualAgent ? actualAgent.maxToolCalls : 0,
+        toolTimeoutMs: 'toolTimeoutMs' in actualAgent ? actualAgent.toolTimeoutMs : 10_000 };
+      if (actualAgent.nativeSessionId !== frozenFacts.nativeSessionId || !compatiblePolicy
+        || actualAgent.maxContextBytes !== frozenFacts.maxContextBytes
+        || actualBudget.maxModelCalls !== request.budget.maxModelCalls || actualBudget.maxToolCalls !== request.budget.maxToolCalls
+        || actualBudget.toolTimeoutMs !== request.budget.toolTimeoutMs)
+        return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared Agent policy differs from Run admission.', false, active.runId), true);
+      startedConfig = { ...frozenExtensions, ...preparedWithoutAgent, version: 2, runtimeBudget: request.budget,
+        limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
+        agent: { ...actualAgent, policyVersion: 'runtime-v1', taskPolicyVersion: frozenRuntime.taskPolicyVersion,
+          ...request.budget } } as SafeConfigSnapshot;
     }
+    if (context.scope && this.dependencies.tools) {
+      const strategy = this.dependencies.tools.freezeStrategy({ allowedTools: context.scope.allowedTools,
+        configuredToolTimeoutMs: request.budget.toolTimeoutMs, sdk: prepared.snapshot.sdk,
+        environment: `${process.platform}-${process.arch}-${process.versions.bun ? 'bun' : 'node'}`,
+        sampleSource: this.dependencies.sampleSource ?? 'production', taskType: request.goalMode,
+        modelKey: JSON.stringify(prepared.snapshot.resolvedModel ?? prepared.snapshot.requestedModel), promptVersion: 'runtime-v1' });
+      if (!strategy.ok) return this.finishAgent(context, null, strategy.error, true);
+      context.runtimeStrategy = strategy.data;
+      startedConfig = { ...startedConfig, runtimeStrategy: strategy.data };
+      this.dependencies.tools.configureRun(active.runId, { budget: request.budget, strategy: strategy.data,
+        deadlineAt: active.startedAt + request.timeoutMs });
+    }
+    context.maxModelCalls = request.budget.maxModelCalls;
     const started = this.dependencies.runs.start(active.runId, startedConfig, this.dependencies.now());
     if (!started.ok) {
       active.poisoned = true;
@@ -687,10 +870,18 @@ export class RuntimeService {
       ...input,
       runId: active.runId,
       sessionId: request.sessionId,
+      inputId: context.inputId,
+      promptText: context.promptText,
+      runtimeBudget: request.budget, runtimeStrategy: context.runtimeStrategy,
+      budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
+      remainingRunMs: () => Math.max(0, active.startedAt + request.timeoutMs - this.dependencies.monotonicNow()),
+      verifyInputUse: inputId => this.verifyInputUse(context, inputId),
+      completeInputResult: (inputIds, resultEntryId) => this.completeInputResult(context, inputIds, resultEntryId),
+      onInputAdmissionClosed: () => { active.inputAdmissionClosed = true; },
       verifyModelUse: () => {
         const row = this.dependencies.sessions?.get(request.sessionId);
         if (!row || !row.ok) return fail(appError('storage_read_failed', 'storage', 'Session 使用资格无法确认。', true, active.runId, request.sessionId));
-        if (row.data.nativeSessionId !== session.nativeSessionId || row.data.status !== 'active') {
+        if (row.data.nativeSessionId !== session.nativeSessionId || row.data.status !== 'active' || row.data.deletePending) {
           return fail(appError('session_history_invalid', 'session', 'Run 与 Session 身份不一致。', false, active.runId, request.sessionId));
         }
         if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
@@ -706,12 +897,13 @@ export class RuntimeService {
             nativeToolCallId: call.nativeToolCallId, signal: call.signal });
           return result.ok ? ok(undefined) : result;
         },
-        rejectRequest: (name, raw, call, error) => {
+        rejectRequest: (name, raw, call, error, stage) => {
           const result = this.dependencies.tools!.rejectRequest(name, raw, { ...productContext,
-            nativeToolCallId: call.nativeToolCallId, signal: call.signal }, error);
+            nativeToolCallId: call.nativeToolCallId, signal: call.signal }, error, stage);
           return result.ok ? ok(undefined) : result;
         },
         recordDelivery: (nativeToolCallId, delivery) => this.dependencies.tools!.recordDelivery(productContext, nativeToolCallId, delivery),
+        queryCall: nativeToolCallId => this.dependencies.tools!.queryCall(productContext, nativeToolCallId),
         execute: async (name, input, call, rawArguments = input) => {
           const label = this.dependencies.tools!.listTools().find((tool) => tool.name === name)?.label ?? 'Working';
           context.emit({ type: 'tool_progress', toolName: name, label, phase: 'running' });
@@ -726,11 +918,12 @@ export class RuntimeService {
     };
     let nativeWork: Promise<AgentNativeOutcome>;
     if (context.inputId !== undefined) {
-      const dispatched = this.dependencies.sessionInputs!.dispatch(active.runId, this.dependencies.now());
+      const dispatched = this.dependencies.sessionInputs!.dispatch(context.inputId, this.dependencies.now());
       if (!dispatched.ok) return this.finishAgent(context, null, dispatched.error, true);
     }
     try {
       nativeWork = Promise.resolve(prepared.execute(agentInput, active.controller.signal, (event) => {
+        if (event.type === 'agent_event' && event.data.eventName === 'agent_start') active.inputStreamingStarted = true;
         if (event.type === 'display_message' && !active.terminalCommitted) {
           context.emit({ type: 'message_upsert', message: event.message });
         }
@@ -777,6 +970,7 @@ export class RuntimeService {
   ): Result<AgentOutcome> {
     const { active, request, session } = context;
     if (active.terminalCommitted) return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已开始提交。', false, active.runId), active.runId);
+    active.inputAdmissionClosed = true;
     const toolExecutor = context.scope ? this.dependencies.tools : undefined;
     toolExecutor?.closeRun(active.runId);
     const intent = this.agentStop(context);
@@ -785,12 +979,16 @@ export class RuntimeService {
       : intent ? errorForStop(intent.reason, active.runId, 'agent')
         : error ? { ...error, runId: active.runId } : null;
     let inputUnconfirmed = false;
+    let unresolvedDispatched: number[] = [];
     if (context.inputId !== undefined) {
-      const input = this.dependencies.sessionInputs!.getForRun(active.runId);
-      if (!input.ok) finalError ??= { ...input.error, runId: active.runId };
-      else if (!input.data || input.data.status !== 'consumed') {
-        inputUnconfirmed = input.data?.dispatchedAt !== null;
-        finalError ??= appError('input_delivery_unknown', 'session', 'Fill input consumption could not be confirmed.', false, active.runId);
+      const inputs = this.dependencies.sessionInputs!.forRun(active.runId);
+      if (!inputs.ok) finalError ??= { ...inputs.error, runId: active.runId };
+      else if (inputs.data.some(input => input.processingStatus === 'failed')) {
+        finalError ??= inputs.data.find(input => input.processingStatus === 'failed')!.error
+          ?? appError('input_processing_unconfirmed', 'runtime', 'An input failed processing.', true, active.runId);
+      }
+      else if (!inputs.data.length || inputs.data.some(input => input.status !== 'consumed')) {
+        unresolvedDispatched = inputs.data.filter(input => input.status !== 'consumed' && input.dispatchedAt !== null).map(input => input.inputId);
       }
     }
     if (!finalError && (!outcome || !stopped)) finalError = appError('agent_stop_unconfirmed', 'runtime', 'Agent 执行结束，但停止状态未确认。', true, active.runId);
@@ -828,13 +1026,11 @@ export class RuntimeService {
       }
     }
     if (!finalError && outcome) {
-      const p3 = context.scope !== null;
-      const validCounts = p3
-        ? outcome.agent.turnCount >= 1 && outcome.agent.turnCount <= 12 && outcome.agent.modelCallCount >= 1 && outcome.agent.modelCallCount <= 12
-        : outcome.agent.turnCount === 1 && outcome.agent.modelCallCount === 1;
+      const modelCallLimit = context.maxModelCalls ?? 0;
+      const validCounts = outcome.agent.turnCount >= 1 && outcome.agent.turnCount <= modelCallLimit
+        && outcome.agent.modelCallCount >= 1 && outcome.agent.modelCallCount <= modelCallLimit;
       if (outcome.agent.nativeSessionId !== session.nativeSessionId || !validCounts) {
-        finalError = appError('agent_mechanical_check_failed', 'runtime', p3
-          ? 'Agent 执行未满足 P3 的多轮调用预算。' : 'Agent 执行未满足 P2 的单次无工具运行条件。', false, active.runId);
+        finalError = appError('agent_mechanical_check_failed', 'runtime', 'Agent execution exceeded its model call budget.', false, active.runId);
       }
     }
     if (!finalError && context.admission && request.goalMode === 'save-candidate' && deliveredCandidateIds.length === 0) {
@@ -842,6 +1038,29 @@ export class RuntimeService {
     }
     if (!finalError && request.goalMode === 'fill-form' && !formAppliedAndDelivered) {
       finalError = appError('agent_goal_not_met', 'runtime', '表单应用及结果进入后续模型请求未确认，录入目标未完成。', false, active.runId);
+    }
+    const confirmedUnconsumedInputIds = stopped && !unconfirmed ? outcome?.agent.confirmedUnconsumedInputIds : undefined;
+    inputUnconfirmed ||= unresolvedDispatched.some(id => !confirmedUnconsumedInputIds?.includes(id));
+    if (inputUnconfirmed && !intent) finalError ??= appError('input_delivery_unknown', 'session', 'Input consumption could not be confirmed.', false, active.runId);
+    const inputResults: import('../sessions/input-ledger.ts').InputResultBatch[] = [];
+    if (!finalError && context.inputId !== undefined) {
+      const inputs = this.dependencies.sessionInputs!.forRun(active.runId);
+      if (!inputs.ok) finalError = inputs.error;
+      else {
+        const pending = inputs.data.filter(input => input.processingStatus === 'pending' && input.status === 'consumed');
+        for (const input of pending) if (input.resultEntryId === null) {
+          finalError = appError('input_processing_unconfirmed', 'runtime', 'Input has no saved final result.', true, active.runId);
+          inputUnconfirmed = true;
+        }
+        for (const resultEntryId of new Set(pending.flatMap(input => input.resultEntryId ? [input.resultEntryId] : []))) {
+          const members = inputs.data.filter(input => input.resultEntryId === resultEntryId).map(input => input.inputId);
+          const qualified = this.qualifyInputResult(context, members, resultEntryId);
+          if (!qualified.ok) finalError ??= qualified.error;
+          else if (qualified.data || request.goalMode === 'fill-form' && formAppliedAndDelivered && stopped)
+            inputResults.push({ inputIds: members, resultEntryId });
+          else finalError ??= appError('input_processing_unconfirmed', 'runtime', 'Input result is not qualified.', true, active.runId);
+        }
+      }
     }
     const status: AgentOutcome['status'] = cleanupFailure ? 'failed'
       : intent ? intent.reason === 'user' && stopped ? 'cancelled' : 'failed'
@@ -858,14 +1077,18 @@ export class RuntimeService {
       errors: [...cleanupErrors.values()],
       lateObservationRequired: unconfirmed || !stopped,
     };
+    const { confirmedUnconsumedInputIds: _proof, ...productAgent } = outcome?.agent ?? { nativeSessionId: session.nativeSessionId, turnCount: 0, modelCallCount: 0 };
     const output: AgentOutputRecord | null = outcome ? {
       ...outputRecord(outcome),
-      agent: { ...outcome.agent, ...(context.admission ? { candidateIds } : {}) },
+      version: 2,
+      agent: { ...productAgent, ...(context.admission ? { candidateIds } : {}) },
     } : null;
     const usage = outcome?.usage ?? initialUsage(this.dependencies.now());
     const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
     const terminal: TerminalWrite = {
       status,
+      inputResults: status === 'completed' ? inputResults : [],
+      confirmedUnconsumedInputIds,
       nativeHistoryUnusable: inputUnconfirmed || unconfirmed || !stopped || this.dependencies.agent?.inspect(session.nativeSessionId).availability === 'unusable',
       output,
       error: finalError,

@@ -617,3 +617,12 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 .chat-save-feedback { color: var(--foreground-muted); font-size: 12px; line-height: 1.5; }
 .chat-input-intent { margin: 12px 0; padding: 10px; border: 1px dashed var(--border); border-radius: 8px; color: var(--foreground-muted); font-size: 12px; }
 .chat-input-intent p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-input-queue { max-height: 150px; overflow: auto; margin: 0 16px 8px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+.chat-input-queue ul { margin: 8px 0 0; padding: 0; list-style: none; }
+.chat-input-queue li { display: flex; flex-direction: column; gap: 3px; padding: 6px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.chat-input-queue li small { color: var(--foreground-muted); }
+.chat-composer-foot { flex-wrap: wrap; }
+.runtime-limit-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; }
+.next-run-limits { font-size: 12px; margin-bottom: 10px; }
+.next-run-limits > summary { cursor: pointer; }
+.next-run-limits .runtime-limit-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }

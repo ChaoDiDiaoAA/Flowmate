@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
@@ -20,16 +20,23 @@ import {
   SelectCandidateRequestSchema,
   WorkspaceChangeSchema,
   WorkspaceExpectationSchema,
+  WorkspaceContextSchema,
   WorkingDirectorySchema,
+  RuntimeRequestOverridesSchema,
+  serializeDesktopInvoiceFormRequest,
   invoiceToolSchemas,
   InvoiceFormApplicationReceiptSchema,
   InvoiceFormTargetSchema,
   SessionInputQuerySchema,
+  SessionInputsRequestSchema,
+  SetSessionStatusRequestSchema,
+  BranchSessionRequestSchema,
   InvoiceCandidateOperationQuerySchema,
   ok,
 } from '@flowmate/contracts';
 import type {
   DesktopAgentRunRequest,
+  SessionInputAccepted,
   DesktopEvent,
   DesktopState,
   ProductSettings,
@@ -55,10 +62,11 @@ import type {
 } from '@flowmate/contracts';
 import { defaultProductSettings, validateProductSettings } from '../../../packages/core/src/configuration/settings.ts';
 import { createCredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
-import type { CredentialStore, SecureStoragePort } from '../../../packages/shared/src/secure-credential-store.ts';
+import type { CredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
+import { systemSecureStorage } from './secure-storage.ts';
 import { HostClient } from './host-client.ts';
 import type { HostCredentialRequest } from '../../host/protocol.ts';
-import { InvoiceFormRunInputSchema } from '../../host/protocol.ts';
+import { DesktopSessionInputRequestSchema, InvoiceFormRunInputSchema } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
 const channels = {
@@ -83,6 +91,10 @@ const channels = {
   listSessionMessages: 'flowmate:list-session-messages',
   queryPromptTrace: 'flowmate:query-prompt-trace',
   startRun: 'flowmate:start-run',
+  submitInput: 'flowmate:submit-input',
+  listSessionInputs: 'flowmate:list-session-inputs',
+  setSessionStatus: 'flowmate:set-session-status',
+  branchSession: 'flowmate:branch-session',
   registerInvoiceFormTarget: 'flowmate:register-invoice-form-target',
   invalidateInvoiceFormTarget: 'flowmate:invalidate-invoice-form-target',
   setInvoiceFormDirty: 'flowmate:set-invoice-form-dirty',
@@ -151,21 +163,6 @@ let invoiceFormBinding: DesktopFormBinding | null = null;
 const pendingInvoiceForms = new Map<string, { request: InvoiceFormBridgeRequest; owner: DesktopFormBinding;
   resolve(receipt: InvoiceFormApplicationReceipt): void }>();
 const pendingFormInspections = new Map<string, { owner: DesktopFormBinding; resolve(value: DesktopInvoiceFormInspection | null): void }>();
-
-const systemSecureStorage: SecureStoragePort = {
-  async isAvailable() {
-    try {
-      const available = await safeStorage.isAsyncEncryptionAvailable();
-      const backend = process.platform === 'linux' ? safeStorage.getSelectedStorageBackend() : 'system';
-      return available && safeStorage.isEncryptionAvailable() && backend !== 'basic_text' && backend !== 'unknown';
-    } catch { return false; }
-  },
-  encrypt: (plaintext) => safeStorage.encryptStringAsync(plaintext),
-  async decrypt(ciphertext) {
-    const result = await safeStorage.decryptStringAsync(Buffer.from(ciphertext));
-    return { plaintext: result.result, shouldReEncrypt: result.shouldReEncrypt };
-  },
-};
 
 app.setName('Flowmate');
 app.on('web-contents-created', (_event, contents) => {
@@ -424,6 +421,22 @@ function registerIpc(): void {
   handle(channels.listSessionMessages, async (_event, inputRaw) => listSessionMessages(inputRaw));
   handle(channels.queryPromptTrace, async (_event, runIdRaw, sequenceRaw) => queryPromptTrace(runIdRaw, sequenceRaw));
   handle(channels.startRun, async (_event, inputRaw) => startRun(inputRaw));
+  handle(channels.submitInput, async (_event, inputRaw) => submitInput(inputRaw));
+  handle(channels.listSessionInputs, async (_event, raw) => {
+    const input = SessionInputsRequestSchema.safeParse(raw);
+    return input.success ? productHostRequest({ type: 'list_session_inputs', input: input.data }, 'Chat inputs could not be queried.')
+      : fail(appError('input_invalid', 'input', 'Chat input list request is invalid.'));
+  });
+  handle(channels.setSessionStatus, async (_event, raw) => {
+    const input = SetSessionStatusRequestSchema.safeParse(raw);
+    return input.success ? productHostRequest({ type: 'set_session_status', input: input.data }, 'Chat status could not be changed.')
+      : fail(appError('input_invalid', 'input', 'Chat status request is invalid.'));
+  });
+  handle(channels.branchSession, async (_event, raw) => {
+    const input = BranchSessionRequestSchema.safeParse(raw);
+    return input.success ? productHostRequest({ type: 'branch_session', input: input.data }, 'Chat position could not be saved.')
+      : fail(appError('input_invalid', 'input', 'Chat position request is invalid.'));
+  });
   handle(channels.registerInvoiceFormTarget, async (event, raw) => registerInvoiceFormTarget(event, raw));
   handle(channels.invalidateInvoiceFormTarget, async (event, id) => {
     if (!ownedInvoiceForm(event, id)) return fail(appError('state_conflict', 'input', 'Form target is no longer current.'));
@@ -462,8 +475,8 @@ function registerIpc(): void {
   handle(channels.startInvoiceFormRun, async (event, raw) => startInvoiceFormRun(event, raw));
   handle(channels.querySessionInput, async (_event, raw) => {
     const input = SessionInputQuerySchema.safeParse(raw);
-    return input.success ? productHostRequest({ type: 'query_session_input', input: input.data }, 'Fill input could not be queried.')
-      : fail(appError('input_invalid', 'input', 'Fill query is invalid.'));
+    return input.success ? productHostRequest({ type: 'query_session_input', input: input.data }, 'Chat input could not be queried.')
+      : fail(appError('input_invalid', 'input', 'Chat input query is invalid.'));
   });
   handle(channels.queryInvoiceFormApplication, async (_event, raw) => {
     const input = z.object({ runId: z.number().int().positive(), toolCallId: z.number().int().positive() }).strict().safeParse(raw);
@@ -882,6 +895,34 @@ async function startRun(raw: unknown): Promise<Result<RunAccepted & { requestId:
   }
 }
 
+async function submitInput(raw: unknown): Promise<Result<SessionInputAccepted & { requestId: string }>> {
+  const parsed = DesktopSessionInputRequestSchema.safeParse(raw);
+  if (!parsed.success) return fail(appError('input_invalid', 'input', 'Chat input is invalid.'));
+  const input = parsed.data;
+  const requestId = randomUUID();
+  let preparation: { expectedSettingsRevision: number; expectedCredentialRef: string } | undefined;
+  if (input.mode === 'prompt') {
+    const state = await readDesktopState();
+    if (!state.ok) return state;
+    if (!state.data.ready) return fail(appError(hostErrorCode, 'runtime', 'Bun Host is not ready.', true));
+    const profile = state.data.settings.models.find(item => item.id === input.modelId);
+    // Host compares the original input before resolving today's profile or credential.
+    if (profile) preparation = { expectedSettingsRevision: state.data.settings.revision, expectedCredentialRef: profile.credentialRef };
+  }
+  try {
+    const value = await host.request({ type: 'submit_session_input', requestId, input, ...preparation }, 15_000) as Result<SessionInputAccepted & { requestId: string }>;
+    if (!value.ok) return value;
+    if (value.data.requestId !== requestId || value.data.sessionId !== input.sessionId
+      || !Number.isSafeInteger(value.data.runId) || value.data.runId <= 0
+      || !Number.isSafeInteger(value.data.inputId) || value.data.inputId <= 0
+      || input.mode !== 'prompt' && value.data.runId !== input.runId)
+      return fail(appError('operation_result_unknown', 'runtime', 'Chat input receipt could not be confirmed. Check input status.', true));
+    return value;
+  } catch {
+    return fail(appError('operation_result_unknown', 'runtime', 'Chat input receipt is unknown. Check input status before sending again.', true));
+  }
+}
+
 async function cancelRun(value: unknown): Promise<Result<{ accepted: boolean; runId: number }>> {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
   try { return await host.request({ type: 'cancel_run', runId: Number(value) }) as Result<{ accepted: boolean; runId: number }>; }
@@ -895,7 +936,7 @@ async function queryRuntimeState(): Promise<Result<RuntimeState>> {
 
 function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some((key) => !['sessionId', 'text', 'modelId', 'workspace', 'goalMode', 'workingDirectory', 'timeoutMs'].includes(key))) return false;
+    || Object.keys(value).some((key) => !['sessionId', 'text', 'modelId', 'workspace', 'goalMode', 'workingDirectory', 'budget', 'timeoutMs', 'stopGraceMs'].includes(key))) return false;
   const request = value as Partial<DesktopAgentRunRequest>;
   const workspace = request.workspace === undefined ? null : WorkspaceExpectationSchema.safeParse(request.workspace);
   return Number.isSafeInteger(request.sessionId) && Number(request.sessionId) > 0
@@ -908,7 +949,7 @@ function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunReque
     && (request.workingDirectory === undefined || workspace?.success === true)
     && (request.goalMode !== 'save-candidate' || workspace?.success === true
       && workspace.data.documentRef !== null && workspace.data.jobId !== null)
-    && (request.timeoutMs === undefined || Number.isInteger(request.timeoutMs) && request.timeoutMs >= 100 && request.timeoutMs <= 120_000);
+    && RuntimeRequestOverridesSchema.safeParse({ budget: request.budget, timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs }).success;
 }
 
 function credentialStore(reference: string): CredentialStore {
@@ -1033,10 +1074,33 @@ async function startInvoiceFormRun(event: Electron.IpcMainInvokeEvent, raw: unkn
     if (binding.clientSequence !== input.data.clientSequence || binding.modelId !== input.data.modelId) return fail(appError('state_conflict', 'input', 'This target already belongs to a different input.'));
     const original = await productHostRequest<import('@flowmate/contracts').SessionInputQueryResult>({ type: 'query_session_input',
       input: { sessionId: input.data.workspace.sessionId, clientSequence: input.data.clientSequence } }, 'Fill admission is unknown.');
-    return original.ok && original.data.input?.runId ? ok({ runId: original.data.input.runId, sessionId: original.data.input.sessionId,
-      inputId: original.data.input.inputId, requestId: binding.requestId! }) : fail(appError('operation_result_unknown', 'runtime', 'Fill admission is unknown. Query its original input.'));
+    if (!original.ok || !original.data.input?.runId) return fail(appError('operation_result_unknown', 'runtime', 'Fill admission is unknown. Query its original input.'));
+    const saved = original.data.input;
+    if (saved.content.version === 2 && saved.content.requestIdentityVersion === 1
+      && saved.content.desktopRequestHash !== createHash('sha256').update(serializeDesktopInvoiceFormRequest(input.data)).digest('hex'))
+      return fail(appError('state_conflict', 'input', 'This input sequence belongs to another Fill request.'));
+    if (saved.sessionId !== input.data.workspace.sessionId || saved.clientSequence !== input.data.clientSequence || saved.mode !== 'prompt'
+      || saved.goalMode !== 'fill-form' || saved.content.version !== 2 || saved.content.workspaceContext === null
+      || !sameFormWorkspace(input.data.workspace, saved.content.workspaceContext))
+      return fail(appError('state_conflict', 'input', 'This input sequence belongs to another form request.'));
+    const run = await productHostRequest<RunSnapshot>({ type: 'query_run', runId: saved.runId! }, 'Original Fill Run is unavailable.');
+    if (!run.ok) return fail(appError('operation_result_unknown', 'runtime', 'Original Fill Run cannot be verified. Query its original input.'));
+    const target = InvoiceFormTargetSchema.safeParse(run.data.config.formTarget);
+    const runWorkspace = WorkspaceContextSchema.safeParse(run.data.config.workspaceContext);
+    if (run.data.kind !== 'agent' || run.data.sessionId !== saved.sessionId || run.data.config.goalMode !== 'fill-form'
+      || !target.success || target.data.formInstanceId !== input.data.target.formInstanceId || target.data.expectedRevision !== input.data.target.expectedRevision
+      || !runWorkspace.success || !sameFormWorkspace(input.data.workspace, runWorkspace.data)
+      || binding.runId !== null && binding.runId !== saved.runId)
+      return fail(appError('state_conflict', 'input', 'This input sequence belongs to another form target.'));
+    binding.runId = saved.runId; binding.pendingFill = false;
+    return ok({ runId: saved.runId, sessionId: saved.sessionId, inputId: saved.inputId, requestId: binding.requestId! });
   }
   const current = await readDesktopState();
+  if (invoiceFormBinding !== binding || !ownedInvoiceForm(event, input.data.target.formInstanceId) || !binding.valid
+    || binding.epoch !== host.connectionEpoch || binding.purpose !== 'fill' || binding.dirty
+    || binding.target.expectedRevision !== input.data.target.expectedRevision || !sameFormWorkspace(binding.workspace, input.data.workspace))
+    return fail(appError('state_conflict', 'input', 'The form target changed while preparing Fill. Check the current form.'));
+  if (binding.clientSequence !== undefined) return startInvoiceFormRun(event, raw);
   if (!current.ok) return current;
   const profile = current.data.settings.models.find(model => model.id === input.data.modelId);
   if (!current.data.ready || !profile || current.data.modelCredentials[profile.id] !== 'configured') return fail(appError('model_credential_missing', 'input', 'Configure a model before Fill with Agent.'));
@@ -1046,7 +1110,8 @@ async function startInvoiceFormRun(event: Electron.IpcMainInvokeEvent, raw: unkn
       expectedSettingsRevision: current.data.settings.revision, expectedCredentialRef: profile.credentialRef }, 15_000) as Result<RunAccepted & { requestId: string }>;
     if (!accepted.ok) { binding.pendingFill = accepted.error.code === 'operation_result_unknown'; return accepted; }
     if (accepted.data.requestId !== binding.requestId || accepted.data.sessionId !== input.data.workspace.sessionId
-      || !validId(accepted.data.runId) || binding.runId !== null && binding.runId !== accepted.data.runId) return fail(appError('host_protocol_invalid', 'runtime', 'Fill Run association is invalid.'));
+      || !validId(accepted.data.runId) || !validId(accepted.data.inputId)
+      || binding.runId !== null && binding.runId !== accepted.data.runId) return fail(appError('operation_result_unknown', 'runtime', 'Fill Run association is unknown. Query its original input.'));
     binding.runId = accepted.data.runId; binding.pendingFill = false;
     return accepted;
   } catch { return fail(appError('operation_result_unknown', 'runtime', 'Fill admission is unknown. Query its original input; do not send it again.')); }

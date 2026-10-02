@@ -35,7 +35,7 @@ describe('Pi native tool contracts', () => {
     expect(contracts.normalizeCreateSessionRequest({ title: 'Task', toolProfile: 'trusted-local' })).toMatchObject({ ok: false });
     const session = { sessionId: 4, nativeSessionId: 'native-session', title: 'Task', status: 'active',
       createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z', availability: 'ready',
-      historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: false };
+      historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, deletePending: false, hasBusinessHistory: false };
     expect(contracts.SessionSnapshotSchema.safeParse(session).success).toBe(true);
     expect(contracts.SessionSnapshotSchema.safeParse({ ...session, toolProfile: 'trusted-local' }).success).toBe(false);
   });

@@ -20,6 +20,21 @@ const model = {
 };
 
 describe('desktop settings', () => {
+  it('upgrades old settings and persists bounded Runtime defaults with revision checks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
+    const file = join(root, 'settings.json');
+    const legacy = { ...defaultProductSettings(), version: 2 };
+    delete (legacy as Record<string, unknown>).runtime;
+    await writeFile(file, JSON.stringify(legacy));
+    const loaded = await readProductSettings(file);
+    expect(loaded).toMatchObject({ ok: true, data: { version: 3, runtime: {} } });
+    if (!loaded.ok) return;
+    const runtime = { budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 },
+      timeoutMs: 1_800_000, stopGraceMs: 10_000 };
+    expect(await saveProductSettings(file, { ...loaded.data, runtime })).toMatchObject({ ok: true, data: { revision: 1, runtime } });
+    for (const change of [{ budget: { maxModelCalls: 65 } }, { timeoutMs: 99 }, { toolTimeoutMs: 1000 }, { stopGraceMs: 10_001 }])
+      expect(await saveProductSettings(file, { ...loaded.data, runtime: change })).toMatchObject({ ok: false, error: { code: 'config_settings_invalid' } });
+  });
   it('writes versioned non-secret settings with compare-and-swap revision', async () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
     const file = join(root, 'data', 'settings.json');
@@ -61,6 +76,7 @@ describe('desktop settings', () => {
         baseUrl: model.baseUrl, model: model.model, api: model.api, maxTokens: 2048 }],
       defaultModelId: model.id,
     };
+    delete (legacy as Record<string, unknown>).runtime;
     await writeFile(file, JSON.stringify(legacy), 'utf8');
 
     const loaded = await readProductSettings(file);
@@ -78,13 +94,14 @@ describe('desktop settings', () => {
   it('removes only the retired DeepSeek Responses profile while preserving other legacy routes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
     const file = join(root, 'settings.json');
-    await writeFile(file, JSON.stringify({ ...defaultProductSettings(), version: 1,
+    const { runtime: _runtime, ...legacyDefaults } = defaultProductSettings();
+    await writeFile(file, JSON.stringify({ ...legacyDefaults, version: 1,
       models: [{ id: 'old-deepseek', credentialRef: 'old-deepseek-credential', name: 'Old',
         baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash', api: 'openai-responses' },
       { id: 'other', credentialRef: 'other-credential-ref', name: 'Other', baseUrl: 'https://other.example/v1',
         model: 'other-model', api: 'openai-completions' }], defaultModelId: 'old-deepseek' }), 'utf8');
     const loaded = await readProductSettings(file);
-    expect(loaded).toMatchObject({ ok: true, data: { version: 2, defaultModelId: null,
+    expect(loaded).toMatchObject({ ok: true, data: { version: 3, defaultModelId: null,
       models: [{ id: 'other', kind: 'legacy' }] } });
   });
 

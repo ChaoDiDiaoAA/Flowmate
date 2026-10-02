@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import * as messages from '../../packages/contracts/src/runtime.ts';
+import * as inputs from '../../packages/contracts/src/session-inputs.ts';
+import * as ports from '../../packages/contracts/src/ports.ts';
+import { serializeDesktopPromptRequest } from '../../packages/contracts/src/settings.ts';
 import {
   normalizeAgentRunRequest,
   normalizeCreateSessionRequest,
@@ -17,6 +20,131 @@ const config = {
   native: { authPath: 'C:\\Users\\test\\.pi\\auth.json', modelsPath: null },
   parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
 };
+
+describe('P5 input and management contracts', () => {
+  const prompt = { sessionId: 4, clientSequence: 7, mode: 'prompt', text: 'Review tax', config };
+  const active = { sessionId: 4, clientSequence: 8, mode: 'steer', runId: 12, text: 'Check source' };
+
+  it('validates frozen strategy bounds and rejects duplicated calibration groups', () => {
+    expect(ports.RuntimeStrategySnapshotSchema).toBeDefined();
+    if (!ports.RuntimeStrategySnapshotSchema) return;
+    const group = { toolName: 'read_invoice_document', toolVersion: '1', groupKey: 'group', attemptCount: 20,
+      eligibleCount: 20, p95Ms: 100, selectedTimeoutMs: 1000, timeoutSource: 'statistical', fallbackReason: null };
+    const strategy = { version: 'runtime-v1', sampleSource: 'test',
+      calibration: { sourceCutoffToolCallId: 20, groups: [group] },
+      experience: { version: 1, modelKey: 'fixture', promptVersion: 'runtime-v1', taskType: 'answer', items: [] } };
+    expect(ports.RuntimeStrategySnapshotSchema.safeParse(strategy).success).toBe(true);
+    for (const groups of [[{ ...group, attemptCount: 201 }], [{ ...group, eligibleCount: 21 }],
+      [{ ...group, selectedTimeoutMs: Infinity }], [group, group]])
+      expect(ports.RuntimeStrategySnapshotSchema.safeParse({ ...strategy, calibration: { ...strategy.calibration, groups } }).success).toBe(false);
+  });
+
+  it('preserves old Desktop identity bytes and distinguishes new omitted and explicit limits', () => {
+    const request = { sessionId: 4, clientSequence: 7, mode: 'prompt' as const, text: 'Review', modelId: 'model' };
+    expect(serializeDesktopPromptRequest(request)).toBe(serializeDesktopPromptRequest({ ...request, timeoutMs: 60_000 }));
+    expect(serializeDesktopPromptRequest(request)).not.toBe(serializeDesktopPromptRequest({ ...request, budget: {} }));
+    expect(serializeDesktopPromptRequest(request)).not.toBe(serializeDesktopPromptRequest({ ...request, budget: { maxModelCalls: 32 } }));
+    expect(serializeDesktopPromptRequest(request, 1)).not.toBe(serializeDesktopPromptRequest({ ...request, timeoutMs: 60_000 }, 1));
+    expect(serializeDesktopPromptRequest({ ...request, budget: { maxModelCalls: 32, maxToolCalls: 40 } }, 1))
+      .toBe(serializeDesktopPromptRequest({ ...request, budget: { maxToolCalls: 40, maxModelCalls: 32 } }, 1));
+  });
+
+  it('reads up to 64 logical request Usage facts while rejecting an overflow', () => {
+    const usage = { version: 1 as const, source: 'unknown' as const, reason: null, sdkValues: null, attempts: null,
+      attemptsComplete: false, costSource: null, updatedAt: '2026-10-02T00:00:00Z' };
+    const tokens = { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
+    const record = { ...usage, version: 2, calls: Array.from({ length: 64 }, (_, index) => ({ callSequence: index + 1, usage, tokens })) };
+    expect(messages.UsageRecordV2Schema.safeParse(record).success).toBe(true);
+    expect(messages.UsageRecordV2Schema.safeParse({ ...record, calls: [...record.calls, { callSequence: 65, usage, tokens }] }).success).toBe(false);
+  });
+
+  it('preserves new prompt budget intent and bounds it without letting active inputs change a Run', () => {
+    const request = { ...prompt, timeoutMs: 1_800_000, stopGraceMs: 10_000,
+      budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 } };
+    expect(inputs.normalizeSessionInputRequest(request)).toMatchObject({ ok: true, data: request });
+    const absent = inputs.normalizeSessionInputRequest(prompt);
+    expect(absent.ok && absent.data.mode === 'prompt' && absent.data.timeoutMs).toBeUndefined();
+    for (const budget of [{ maxModelCalls: 0 }, { maxModelCalls: 65 }, { maxToolCalls: -1 },
+      { maxToolCalls: 101 }, { toolTimeoutMs: 99 }, { toolTimeoutMs: 1_800_001 }, { maxToolCalls: 1.5 }, { scope: [] }]) {
+      expect(inputs.normalizeSessionInputRequest({ ...prompt, budget }).ok).toBe(false);
+    }
+    expect(inputs.normalizeSessionInputRequest({ ...active, budget: {} }).ok).toBe(false);
+  });
+
+  it('keeps input content v2 and requires paired original request identity fields', () => {
+    const content = { version: 2, text: 'Review', workspaceContext: null, workspaceInput: null,
+      allowedDocumentIds: [], allowedArtifactIds: [], promptText: 'Review' };
+    expect(inputs.SessionInputContentV2Schema.safeParse({ ...content, requestIdentityVersion: 1,
+      originalBudgetOverrides: {} }).success).toBe(true);
+    expect(inputs.SessionInputContentV2Schema.safeParse({ ...content, requestIdentityVersion: 1 }).success).toBe(false);
+    expect(inputs.SessionInputContentV2Schema.safeParse({ ...content, originalBudgetOverrides: {} }).success).toBe(false);
+    expect(inputs.SessionInputContentV2Schema.safeParse(content).success).toBe(true);
+    expect(inputs.SessionInputContentV2Schema.safeParse({ ...content, version: 3 }).success).toBe(false);
+  });
+
+  it('accepts ordinary prompts with bounded defaults and rejects invalid identities or payloads', () => {
+    expect(inputs.normalizeSessionInputRequest(prompt)).toMatchObject({ ok: true,
+      data: { mode: 'prompt', goalMode: 'answer' } });
+    for (const request of [{ ...prompt, text: ' ' }, { ...prompt, text: '票'.repeat(22000) },
+      { ...prompt, clientSequence: 0 }, { ...prompt, clientSequence: Number.MAX_SAFE_INTEGER + 1 },
+      { ...prompt, mode: 'unknown' }, { ...prompt, scope: {} }, { ...prompt, timeoutMs: 99 }]) {
+      expect(inputs.normalizeSessionInputRequest(request).ok).toBe(false);
+    }
+  });
+
+  it('accepts both active modes without allowing changes to the frozen execution configuration', () => {
+    for (const mode of ['steer', 'followUp'] as const) {
+      expect(inputs.normalizeSessionInputRequest({ ...active, mode })).toEqual({ ok: true, data: { ...active, mode } });
+    }
+    for (const field of [{ config }, { goalMode: 'answer' }, { workingDirectory: 'D:/other' },
+      { timeoutMs: 1000 }, { stopGraceMs: 100 }, { formTarget: {} }, { modelId: 'other' }]) {
+      expect(inputs.normalizeSessionInputRequest({ ...active, ...field }).ok).toBe(false);
+    }
+    expect(inputs.normalizeSessionInputRequest({ ...active, runId: 0 }).ok).toBe(false);
+  });
+
+  it('keeps Fill as prompt with a complete same-Session target and rejects unsupported goal changes', () => {
+    expect(inputs.normalizeSessionInputRequest({ ...prompt, goalMode: 'fill-form' }).ok).toBe(false);
+    expect(inputs.normalizeSessionInputRequest({ ...active, goalMode: 'fill-form' }).ok).toBe(false);
+    expect(inputs.normalizeSessionInputRequest({ ...prompt, goalMode: 'save-candidate' }).ok).toBe(false);
+  });
+
+  it('allows original-key or input-id queries but rejects ambiguous selectors', () => {
+    expect(inputs.SessionInputQuerySchema.safeParse({ sessionId: 4, inputId: 9 }).success).toBe(true);
+    expect(inputs.SessionInputQuerySchema.safeParse({ sessionId: 4 }).success).toBe(true);
+    expect(inputs.SessionInputQuerySchema.safeParse({ sessionId: 4, inputId: 9, clientSequence: 7 }).success).toBe(false);
+  });
+
+  it('bounds input pages without accepting execution or cursor aliases', () => {
+    expect(inputs.normalizeSessionInputsRequest).toBeFunction();
+    expect(inputs.normalizeSessionInputsRequest({ sessionId: 4 })).toEqual({ ok: true, data: { sessionId: 4, limit: 50 } });
+    expect(inputs.normalizeSessionInputsRequest({ sessionId: 4, runId: 12, beforeInputId: 9, limit: 100 }).ok).toBe(true);
+    for (const request of [{ sessionId: 4, limit: 101 }, { sessionId: 4, beforeInputId: 0 },
+      { sessionId: 4, runId: 0 }, { sessionId: 4, config }, { sessionId: 4, inputId: 9 }]) {
+      expect(inputs.normalizeSessionInputsRequest(request).ok).toBe(false);
+    }
+  });
+
+  it('normalizes status expectations and rejects arbitrary lifecycle states', () => {
+    expect(messages.normalizeSetSessionStatusRequest).toBeFunction();
+    expect(messages.normalizeSetSessionStatusRequest({ sessionId: 4, expectedStatus: 'active', status: 'archived' }).ok).toBe(true);
+    for (const request of [{ sessionId: 4, expectedStatus: 'active', status: 'running' },
+      { sessionId: 4, status: 'archived' }, { sessionId: 0, expectedStatus: 'active', status: 'archived' },
+      { sessionId: 4, expectedStatus: 'active', status: 'archived', nativeSessionId: 'forged' }]) {
+      expect(messages.normalizeSetSessionStatusRequest(request).ok).toBe(false);
+    }
+  });
+
+  it('requires explicit committed position expectations for native branches', () => {
+    expect(messages.normalizeBranchSessionRequest).toBeFunction();
+    expect(messages.normalizeBranchSessionRequest({ sessionId: 4, expectedLeafId: null, expectedEntryCount: 0, targetEntryId: 'reply-1' }).ok).toBe(true);
+    for (const request of [{ sessionId: 4, targetEntryId: 'reply-1' },
+      { sessionId: 4, expectedLeafId: null, expectedEntryCount: -1, targetEntryId: 'reply-1' },
+      { sessionId: 4, expectedLeafId: 'leaf', expectedEntryCount: 1, targetEntryId: '' }]) {
+      expect(messages.normalizeBranchSessionRequest(request).ok).toBe(false);
+    }
+  });
+});
 
 describe('session and Agent contracts', () => {
   it('normalizes and bounds session titles without accepting unknown fields', () => {
@@ -47,13 +175,13 @@ describe('session and Agent contracts', () => {
     expect(normalizeSessionId('7')).toMatchObject({ ok: false });
   });
 
-  it('preserves valid input text, sets bounded execution defaults, and rejects privileged or oversized input', () => {
+  it('preserves valid input text and omitted Runtime limits, rejecting privileged or oversized input', () => {
     const result = normalizeAgentRunRequest({ sessionId: 4, text: '  Invoice: INV-7  ', config });
     expect(result).toMatchObject({ ok: true });
     if (result.ok) {
       expect(result.data.text).toBe('  Invoice: INV-7  ');
-      expect(result.data.timeoutMs).toBe(60_000);
-      expect(result.data.stopGraceMs).toBe(5_000);
+      expect(result.data.timeoutMs).toBeUndefined();
+      expect(result.data.stopGraceMs).toBeUndefined();
       expect(result.data.sessionId).toBe(4);
       expect('goal' in result.data).toBe(false);
     }
@@ -118,7 +246,7 @@ describe('P4 message wire contracts', () => {
   const session = { sessionId: 2, nativeSessionId: 'native-2', title: 'Invoice', status: 'active',
     createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:00.000Z',
     availability: 'ready', historyState: 'recoverable', activeRunId: null, modelUseBlocked: false,
-    hasBusinessHistory: false };
+    hasBusinessHistory: false, deletePending: false };
 
   it('rejects role-mixed fields and unknown properties while retaining all three legal variants', () => {
     expect(messages.SessionMessageViewSchema).toBeDefined();

@@ -3,11 +3,12 @@ import { tmpdir } from 'node:os';
 import type { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import { appError, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, ok } from '@flowmate/contracts';
-import type { AgentConfigFacts, AgentNativeOutcome, AgentPort, P3AgentConfigFacts, PreparedAgent, ProviderConfig, ProviderPort, SafeConfigSnapshot } from '@flowmate/contracts';
+import type { RunAgentConfigFacts, AgentNativeOutcome, AgentPort, P3AgentConfigFacts, PreparedAgent, ProviderConfig, ProviderPort, SafeConfigSnapshot } from '@flowmate/contracts';
 import { createToolExecutor, createToolRecorder, JobService, makeApplication, RuntimeService, SessionService, WorkspaceService } from '@flowmate/core';
 import type { RuntimeServicePort } from '@flowmate/core';
 import { openTestDatabase } from '../../support/database.ts';
 import { mkdtempSync } from '../../support/resources.ts';
+import { createAgentHistoryFixture } from './agent-history-fixture.ts';
 
 const now = () => '2026-09-28T00:00:00.000Z';
 const config: ProviderConfig = {
@@ -36,28 +37,35 @@ function seedDocument(db: { db: Database }) {
 }
 
 function preparedP2Agent(onPrepare: () => void, onExecute: () => void): AgentPort {
+  const history = createAgentHistoryFixture(process.cwd(), now);
   return {
     createSession: () => ok({ nativeSessionId: 'native-fixture' }),
+    exportSession: history.exportSession,
+    watchSession: history.watchSession,
     inspect: () => ({ availability: 'ready' }),
-    async prepare(nativeSessionId, receivedConfig, limits): Promise<ReturnType<typeof ok<PreparedAgent>>> {
+    async prepare(nativeSessionId, receivedConfig, limits, _signal, options): Promise<ReturnType<typeof ok<PreparedAgent>>> {
       onPrepare();
-      const facts: AgentConfigFacts = { policyVersion: 'p2-invoice-chat-v1', nativeSessionId,
+      const facts: RunAgentConfigFacts = { policyVersion: 'p5-session-inputs-v1', nativeSessionId,
         systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT, thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
-        maxContextBytes: 524_288, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 1, sessionRetry: false };
-      const snapshot: SafeConfigSnapshot & { agent: AgentConfigFacts } = { version: 1, name: receivedConfig.name,
+        maxContextBytes: 524_288, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12, sessionRetry: false };
+      const preparedFacts: RunAgentConfigFacts = options?.activeToolNames ? { ...facts, policyVersion: 'p3-invoice-tools-v1',
+        maxContextBytes: 8_388_608, maxModelCalls: 16, maxToolCalls: 24, toolTimeoutMs: 10_000 } : facts;
+      const snapshot: SafeConfigSnapshot & { agent: RunAgentConfigFacts } = { version: 1, name: receivedConfig.name,
         revision: receivedConfig.revision, requestedModel: receivedConfig.modelRef, resolvedModel: receivedConfig.modelRef,
         api: receivedConfig.connection?.api ?? null, endpoint: receivedConfig.connection?.baseUrl ?? null,
         sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: receivedConfig.parameters, limits,
-        native: { authSource: 'pi-native', modelsSelection: null }, agent: facts };
-      return ok({ snapshot, async execute(_input, signal) {
+        native: { authSource: 'pi-native', modelsSelection: null }, agent: preparedFacts };
+      return ok({ snapshot, async execute(input, signal) {
+        history.saveUser(nativeSessionId, input);
         onExecute();
-        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+        if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
         const outcome: AgentNativeOutcome = { text: 'stopped', partial: false, stopReason: 'stop', responseId: null,
           responseModel: 'offline', error: null,
           usage: { version: 1, source: 'unknown', reason: 'test', sdkValues: null, attempts: 1, attemptsComplete: true,
             costSource: null, updatedAt: now() },
           tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
           stopped: true, cleanupErrors: [], agent: { nativeSessionId, turnCount: 1, modelCallCount: 1 } };
+        history.saveResult(nativeSessionId, input, outcome, false);
         return outcome;
       } });
     },
@@ -140,7 +148,9 @@ describe('P3 Workspace and Run admission', () => {
     const opened = openTestDatabase(paths(mkdtempSync(join(tmpdir(), 'flowmate-app-stale-run-'))));
     if (!opened.ok) throw new Error(opened.error.message);
     seedDocument(opened.data);
-    const native = opened.data.sessions.create({ nativeSessionId: 'native-fixture', title: 'Fixture', at: now() });
+    const native = opened.data.sessions.create({ nativeSessionId: 'native-fixture', title: 'Fixture', at: now(),
+      nativeHistory: { storageVersion: 1, header: { type: 'session', version: 3, id: 'native-fixture', timestamp: now(), cwd: process.cwd() },
+        entries: [], leafId: null, unusable: false } });
     expect(native.ok).toBe(true);
     if (!native.ok) return;
     const workspace = new WorkspaceService(opened.data.workspace, now);
@@ -152,8 +162,9 @@ describe('P3 Workspace and Run admission', () => {
     let preparations = 0;
     let executes = 0;
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executes += 1; });
+    agent.watchSession!('native-fixture', (history, context) => opened.data.sessions.saveHistory(native.data.sessionId, history, context));
     const tools = createToolExecutor({ definitions: [], recorder: createToolRecorder(opened.data.toolCalls, now), now });
-    const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, agent, provider, tools,
+    const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const stale = { revision: current.data.revision - 1, documentRef: current.data.documentRef, jobId: current.data.jobId,
       candidateRef: current.data.candidateRef, sessionId: native.data.sessionId };
@@ -199,7 +210,7 @@ describe('P3 Workspace and Run admission', () => {
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executions += 1; executionStarted(); });
     const toolExecutor = createToolExecutor({ definitions: [],
       recorder: createToolRecorder(opened.data.toolCalls, now), isSessionModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId), now });
-    const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, agent, provider, tools: toolExecutor,
+    const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools: toolExecutor,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs);
     const workspaceService = new WorkspaceService(opened.data.workspace, now);

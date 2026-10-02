@@ -3,6 +3,20 @@ import { WorkspaceInputSchema } from './workspace.ts';
 
 export type DbId = number;
 
+export const RuntimeBudgetOverridesSchema = z.object({
+  maxToolCalls: z.number().int().min(0).max(100).optional(),
+  maxModelCalls: z.number().int().min(1).max(64).optional(),
+  toolTimeoutMs: z.number().int().min(100).max(1_800_000).optional(),
+}).strict();
+export type RuntimeBudgetOverrides = z.infer<typeof RuntimeBudgetOverridesSchema>;
+export const RuntimeRequestOverridesSchema = z.object({
+  budget: RuntimeBudgetOverridesSchema.optional(),
+  timeoutMs: z.number().int().min(100).max(1_800_000).optional(),
+  stopGraceMs: z.number().int().min(100).max(10_000).optional(),
+}).strict();
+export type RuntimeRequestOverrides = z.infer<typeof RuntimeRequestOverridesSchema>;
+export type ResolvedRuntimeBudget = Required<RuntimeBudgetOverrides>;
+
 export type ModelRef = {
   provider: string;
   model: string;
@@ -168,7 +182,7 @@ export const UsageRecordV2Schema = z.object({
     callSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     usage: usageRecordV1Schema,
     tokens: tokenColumnsSchema,
-  }).strict()).max(12),
+  }).strict()).max(64),
 }).strict();
 
 export type SdkUsageValues = {
@@ -210,7 +224,7 @@ export const InputRecordV2Schema = z.object({
 }).strict();
 
 export type OutputRecord = {
-  version: 1;
+  version: 1 | 2;
   wireMaxTokens?: number | null;
   text: string;
   partial: boolean;
@@ -267,6 +281,7 @@ export type SessionSnapshot = {
   activeRunId: DbId | null;
   modelUseBlocked: boolean;
   hasBusinessHistory: boolean;
+  deletePending: boolean;
 };
 
 export type MessageTextBlock = { type: 'text'; text: string };
@@ -298,7 +313,7 @@ export type SessionMessagesPage = {
 };
 export type NativeEntryRunBinding = { entryId: string; runId: DbId };
 export type NativeEntryLiveBinding = NativeEntryRunBinding & { liveOrdinal: number };
-export type NativeHistoryAppendContext = NativeEntryRunBinding;
+export type NativeHistoryAppendContext = NativeEntryRunBinding & { inputId?: DbId; resultInputIds?: DbId[] };
 export type NativeHistoryDisplayRecord = { history: NativeSessionHistory | null; bindings: NativeEntryRunBinding[] };
 export type MessageRunInput = {
   runId: DbId; input: Readonly<InputRecord>; goalMode: import('./workspace.ts').GoalMode | null;
@@ -306,12 +321,33 @@ export type MessageRunInput = {
 };
 export type NativeMessageProjectionInput = {
   history: NativeSessionHistory; bindings: NativeEntryRunBinding[]; runInputs: MessageRunInput[];
+  sessionInputs?: readonly MessageSessionInput[];
   beforeEntryId?: string; limit: number; liveBindings?: readonly NativeEntryLiveBinding[];
 };
+export type MessageSessionInput = { inputId: DbId; runId: DbId; nativeEntryId: string;
+  content: import('./session-inputs.ts').SessionInputContent };
+export type SetSessionStatusRequest = { sessionId: DbId; expectedStatus: SessionStatus; status: SessionStatus };
+export type BranchSessionRequest = { sessionId: DbId; expectedLeafId: string | null; expectedEntryCount: number; targetEntryId: string };
+export type BranchSessionResult = { session: SessionSnapshot; leafId: string; entryCount: number };
 
 const messageDbIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const messageIdSchema = z.string().min(1);
 const messageCursorSchema = messageIdSchema.max(128);
+export const SetSessionStatusRequestSchema = z.object({ sessionId: messageDbIdSchema,
+  expectedStatus: z.enum(['active', 'archived']), status: z.enum(['active', 'archived']) }).strict();
+export const BranchSessionRequestSchema = z.object({ sessionId: messageDbIdSchema,
+  expectedLeafId: messageCursorSchema.nullable(), expectedEntryCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  targetEntryId: messageCursorSchema }).strict();
+export function normalizeSetSessionStatusRequest(raw: unknown): Result<SetSessionStatusRequest> {
+  const parsed = SetSessionStatusRequestSchema.safeParse(raw);
+  return parsed.success ? { ok: true, data: parsed.data } : { ok: false,
+    error: { code: 'input_invalid', category: 'input', message: 'Session status request is invalid.', retryable: false } };
+}
+export function normalizeBranchSessionRequest(raw: unknown): Result<BranchSessionRequest> {
+  const parsed = BranchSessionRequestSchema.safeParse(raw);
+  return parsed.success ? { ok: true, data: parsed.data } : { ok: false,
+    error: { code: 'input_invalid', category: 'input', message: 'Session branch request is invalid.', retryable: false } };
+}
 const messageTextBlockSchema = z.object({ type: z.literal('text'), text: z.string() }).strict();
 const messageToolCallBlockSchema = z.object({ type: z.literal('toolCall'), id: messageIdSchema, name: messageIdSchema }).strict();
 const messageBaseShape = {
@@ -351,7 +387,7 @@ export const SessionSnapshotSchema: z.ZodType<SessionSnapshot> = z.object({
   status: z.enum(['active', 'archived']), createdAt: z.string().datetime({ offset: true }), updatedAt: z.string().datetime({ offset: true }),
   availability: z.enum(['ready', 'busy', 'unusable', 'history-unavailable', 'archived']),
   historyState: z.enum(['recoverable', 'legacy-read-only', 'invalid']), activeRunId: messageDbIdSchema.nullable(),
-  modelUseBlocked: z.boolean(), hasBusinessHistory: z.boolean(),
+  modelUseBlocked: z.boolean(), hasBusinessHistory: z.boolean(), deletePending: z.boolean(),
 }).strict();
 export const SessionMessagesPageSchema: z.ZodType<SessionMessagesPage> = z.object({
   session: SessionSnapshotSchema, leafId: messageIdSchema.nullable(), entryCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -391,14 +427,12 @@ export type AgentRunRequest = {
   workspace?: import('./workspace.ts').WorkspaceExpectation;
   goalMode?: import('./workspace.ts').GoalMode;
   workingDirectory?: string;
+  budget?: RuntimeBudgetOverrides;
   timeoutMs?: number;
   stopGraceMs?: number;
 };
 
-export type NormalizedAgentRunRequest = Omit<AgentRunRequest, 'timeoutMs' | 'stopGraceMs'> & {
-  timeoutMs: number;
-  stopGraceMs: number;
-};
+export type NormalizedAgentRunRequest = AgentRunRequest;
 
 export type RunAccepted = { runId: DbId; sessionId: DbId; inputId?: DbId };
 
@@ -424,7 +458,9 @@ export type AgentRunEvent = {
   | { type: 'run_finished'; result: Result<AgentOutcome> }
 );
 
-export type AgentControl = { onEvent?: (event: AgentRunEvent) => void };
+export type AgentControl = { onEvent?: (event: AgentRunEvent) => void;
+  /** Trusted Host digest of the canonical Desktop prompt, never a Renderer input field. */
+  desktopRequestHash?: string };
 
 export type SessionRunsRequest = { sessionId: DbId; beforeRunId?: DbId; limit?: number };
 export type NormalizedSessionRunsRequest = { sessionId: DbId; beforeRunId?: DbId; limit: number };
@@ -488,8 +524,11 @@ export interface Application {
   listSessionMessages(request: SessionMessagesRequest): Promise<Result<SessionMessagesPage>>;
   queryPromptTrace(runId: DbId, callSequence?: number): Promise<Result<import('./diagnostics.ts').PromptTraceResult>>;
   startRun(request: AgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
-  submitInput(request: import('./session-inputs.ts').SessionInputRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
+  submitInput(request: import('./session-inputs.ts').SessionInputRequest, control?: AgentControl): Promise<Result<import('./session-inputs.ts').SessionInputAccepted>>;
   querySessionInput(request: import('./session-inputs.ts').SessionInputQuery): Promise<Result<import('./session-inputs.ts').SessionInputQueryResult>>;
+  listSessionInputs(request: import('./session-inputs.ts').SessionInputsRequest): Promise<Result<import('./session-inputs.ts').SessionInputsPage>>;
+  setSessionStatus(request: SetSessionStatusRequest): Promise<Result<SessionSnapshot>>;
+  branchSession(request: BranchSessionRequest): Promise<Result<BranchSessionResult>>;
   queryInvoiceFormApplication(request: { runId: DbId; toolCallId: DbId }): Promise<Result<import('./invoice.ts').InvoiceFormApplicationReceipt>>;
   saveInvoiceCandidate(request: import('./invoice.ts').SaveInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').SaveInvoiceCandidateResponse>>;
   acceptInvoiceCandidate(request: import('./invoice.ts').AcceptInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;

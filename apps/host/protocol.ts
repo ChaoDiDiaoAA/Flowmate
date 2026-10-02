@@ -1,9 +1,10 @@
 import { z } from 'zod';
 import type { AgentRunEvent, DesktopState, ModelAuthNotice, ModelAuthPrompt } from '@flowmate/contracts';
 import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionInputQuerySchema,
+  SessionInputsRequestSchema, SetSessionStatusRequestSchema, BranchSessionRequestSchema,
   SessionMessagesRequestSchema, WorkingDirectorySchema, WorkspaceExpectationSchema, SaveInvoiceCandidateRequestSchema,
   AcceptInvoiceCandidateRequestSchema, RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema,
-  InvoiceCandidateOperationQuerySchema } from '@flowmate/contracts';
+  InvoiceCandidateOperationQuerySchema, RuntimeRequestOverridesSchema } from '@flowmate/contracts';
 import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
@@ -13,8 +14,26 @@ const pageLimit = z.number().int().min(1).max(100);
 const sessionTitle = z.string().trim().min(1).refine((value) => [...value].length <= 120 && new TextEncoder().encode(value).byteLength <= 480);
 const credentialRef = z.string().regex(/^[a-zA-Z0-9_-]{16,80}$/);
 const boundedText = z.string().refine((value) => new TextEncoder().encode(value).byteLength <= 65_536);
+const inputText = z.string().refine(value => value.trim().length > 0 && new TextEncoder().encode(value).byteLength <= 65_000);
+export const DesktopSessionInputRequestSchema = z.discriminatedUnion('mode', [
+  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('prompt'), text: inputText, modelId,
+    goalMode: z.enum(['answer', 'save-candidate']).default('answer'), workspace: WorkspaceExpectationSchema.optional(),
+    workingDirectory: WorkingDirectorySchema.optional(), ...RuntimeRequestOverridesSchema.shape,
+  }).strict(),
+  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('steer'), runId: dbId, text: inputText,
+    workspace: WorkspaceExpectationSchema.optional() }).strict(),
+  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('followUp'), runId: dbId, text: inputText,
+    workspace: WorkspaceExpectationSchema.optional() }).strict(),
+]).superRefine((input, ctx) => {
+  if (input.workspace && input.workspace.sessionId !== input.sessionId)
+    ctx.addIssue({ code: 'custom', message: 'Workspace must refer to the same Session.' });
+  if (input.mode === 'prompt' && input.workingDirectory !== undefined && input.workspace === undefined)
+    ctx.addIssue({ code: 'custom', message: 'Working directory requires a Workspace Run.' });
+  if (input.mode === 'prompt' && input.goalMode === 'save-candidate' && (!input.workspace?.documentRef || !input.workspace.jobId))
+    ctx.addIssue({ code: 'custom', message: 'Invoice context and processing task are required.' });
+});
 export const InvoiceFormRunInputSchema = z.object({ modelId, clientSequence: dbId,
-  target: InvoiceFormTargetSchema, workspace: WorkspaceExpectationSchema,
+  target: InvoiceFormTargetSchema, workspace: WorkspaceExpectationSchema, ...RuntimeRequestOverridesSchema.shape,
 }).strict().refine(value => value.workspace.documentRef !== null && value.workspace.jobId !== null
   && value.workspace.candidateRef !== null, 'Fill requires a selected candidate.');
 const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).strict();
@@ -27,6 +46,11 @@ const workspaceChange = z.discriminatedUnion('kind', [
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
+  z.object({ version: z.literal(1), requestId, type: z.literal('submit_session_input'), input: DesktopSessionInputRequestSchema,
+    expectedSettingsRevision: dbId.optional(), expectedCredentialRef: credentialRef.optional() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_session_inputs'), input: SessionInputsRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('set_session_status'), input: SetSessionStatusRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('branch_session'), input: BranchSessionRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('save_invoice_candidate'), input: SaveInvoiceCandidateRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('accept_invoice_candidate'), input: AcceptInvoiceCandidateRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('reject_invoice_candidate'), input: RejectInvoiceCandidateRequestSchema }).strict(),
@@ -120,7 +144,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
       }).strict().optional(),
       goalMode: z.enum(['answer', 'save-candidate']),
       workingDirectory: WorkingDirectorySchema.optional(),
-      timeoutMs: z.number().int().min(100).max(120_000).optional(),
+      ...RuntimeRequestOverridesSchema.shape,
     }).strict().superRefine((input, ctx) => {
       if (input.workingDirectory !== undefined && input.workspace === undefined)
         ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Working directory requires a Workspace Run.' });
@@ -133,7 +157,13 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_run'), runId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_runtime_state') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('close') }).strict(),
-]);
+]).superRefine((command, ctx) => {
+  if (command.type !== 'submit_session_input') return;
+  const hasSettings = command.expectedSettingsRevision !== undefined;
+  const hasCredential = command.expectedCredentialRef !== undefined;
+  if (command.input.mode === 'prompt' ? hasSettings !== hasCredential : hasSettings || hasCredential)
+    ctx.addIssue({ code: 'custom', message: 'Only initial inputs carry model preparation references.' });
+});
 
 export type HostCommand = z.infer<typeof hostCommandSchema>;
 

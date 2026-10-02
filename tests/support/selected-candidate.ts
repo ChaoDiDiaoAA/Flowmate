@@ -94,9 +94,16 @@ export function makeSelectedCandidate(schema9 = false, withSource = false) {
   required(store.toolCalls.start({ toolCallId: saveCall.toolCallId, startedAt: stamp }));
   const saved = required(store.candidates.save({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
     documentId: 1, candidate, checks: [], issues: [], at: stamp }));
-  required(store.toolCalls.finish({ toolCallId: saveCall.toolCallId,
+  const terminal: Parameters<typeof store.toolCalls.finish>[0] = { toolCallId: saveCall.toolCallId,
     result: { version: 1, committedCandidateId: saved.receipt.candidateId, status: 'succeeded', data: saved.receipt },
-    cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] }, endedAt: stamp, stoppedAt: stamp }));
+    cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] }, endedAt: stamp, stoppedAt: stamp };
+  if (schema9) {
+    // Seed historical bytes without calling the current Repository against a pre-012 schema.
+    const changed = store.db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=?
+      WHERE id=? AND status='running'`).run(terminal.result.status, JSON.stringify(terminal.result), JSON.stringify(terminal.cleanup),
+      terminal.endedAt, terminal.stoppedAt, terminal.toolCallId).changes;
+    if (changed !== 1) throw new Error('schema9_tool_terminal_fixture_failed');
+  } else required(store.toolCalls.finish(terminal));
   required(store.runs.finish(first.runId, { status: 'completed', output: { version: 1, text: 'Saved.', partial: false,
     stopReason: 'stop', responseId: null, responseModel: 'offline', agent: { nativeSessionId: session.nativeSessionId, turnCount: 1, modelCallCount: 1 } },
     error: null, usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },

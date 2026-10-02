@@ -7,7 +7,7 @@ import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createNativeTools } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
-import type { Application, ProductPaths, PromptTraceBuffer, Result } from '@flowmate/contracts';
+import type { Application, ProductPaths, PromptTraceBuffer, Result, RuntimeRequestOverrides, RuntimeStrategyPolicy } from '@flowmate/contracts';
 import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ProviderPort, ToolDefinition } from '@flowmate/contracts';
 import type { SafeLogger } from '@flowmate/shared';
 
@@ -19,6 +19,10 @@ export type ApplicationOptions = {
   agentFactory?: (tools: readonly ToolDefinition<any, any>[]) => AgentPort;
   promptTrace?: PromptTraceBuffer;
   logger?: SafeLogger;
+  runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  runtimePolicy?: RuntimeStrategyPolicy;
+  sampleSource?: 'production' | 'test' | 'evaluation';
+  toolDefinitions?: (definitions: readonly ToolDefinition<any, any>[]) => readonly ToolDefinition<any, any>[];
   invoiceFormBridge?: (request: InvoiceFormBridgeRequest, signal: AbortSignal) => Promise<InvoiceFormApplicationReceipt>;
 };
 
@@ -55,29 +59,37 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const invoiceForms = options.invoiceFormBridge ? createInvoiceFormService({ recorder, runs: database.data.runs,
     sessions: database.data.sessions, documents: database.data.documents, jobs: database.data.jobs,
     workspace: database.data.workspace, candidates: database.data.candidates, bridge: options.invoiceFormBridge, now }) : undefined;
-  const definitions = Object.freeze([...createInvoiceTools({ documents, documentRepository: database.data.documents,
-    candidates: database.data.candidates, now }), ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), ...native.definitions]);
+  const assembled = [...createInvoiceTools({ documents, documentRepository: database.data.documents,
+    candidates: database.data.candidates, now }), ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), ...native.definitions];
+  const definitions = Object.freeze([...(options.toolDefinitions?.(assembled) ?? assembled)]);
   const toolExecutor = createToolExecutor({ definitions, recorder,
+    strategyPolicy: options.runtimePolicy, sampleSource: options.sampleSource,
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
     monotonicNow: () => performance.now() });
   const provider = options.provider ?? new PiProviderAdapter();
   const agent = options.agentFactory?.(definitions) ?? options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace,
     tools: definitions });
+  let sessionService: SessionService;
   const runtime = new RuntimeService({
     runs: database.data.runs,
     recoveryError: database.data.recoveryError,
     sessions: database.data.sessions,
     sessionInputs: database.data.sessionInputs,
+    isSessionManaging: sessionId => sessionService?.isManaging(sessionId) ?? false,
     provider,
     agent,
+    runtimeDefaults: options.runtimeDefaults,
+    runtimePolicy: options.runtimePolicy, sampleSource: options.sampleSource,
     log: logger,
     now,
     monotonicNow: () => performance.now(),
     tools: toolExecutor,
-    nativeTools: { runtimeDir: options.paths.runtimeDir, availability: native.availability },
+    nativeTools: { runtimeDir: options.paths.runtimeDir,
+      availability: native.availability.filter(item => definitions.some(definition => definition.name === item.name)) },
   });
-  const sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs,
-    database.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
+  sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs,
+    database.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission),
+    request => runtime.appendInput(request), sessionId => runtime.verifySessionMutation(sessionId));
   const workspaceService = createWorkspaceService(database.data.workspace, now);
   const jobService = createJobService(database.data.jobs, now);
   return ok(makeApplication(runtime, database.data.runs, async () => {

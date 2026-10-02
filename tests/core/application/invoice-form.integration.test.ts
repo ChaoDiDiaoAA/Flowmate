@@ -7,9 +7,10 @@ import { Database } from 'bun:sqlite';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { appError, fail, InvoiceFormDraftSchema } from '@flowmate/contracts';
 import type { AgentRunEvent, AgentRunRequest, Application, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest,
-  ProviderConfig, Result, SessionInputRequest, WorkspaceSnapshot } from '@flowmate/contracts';
+  ProviderConfig, Result, FillInputRequest, WorkspaceSnapshot } from '@flowmate/contracts';
 import { createApplication } from '../../../apps/composition.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
+import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 
 function need<T>(result: Result<T>): T {
@@ -46,15 +47,266 @@ function expectation(workspace: WorkspaceSnapshot) {
   return { revision: workspace.revision, sessionId: workspace.sessionId, documentRef: workspace.documentRef,
     jobId: workspace.jobId, candidateRef: workspace.candidateRef };
 }
-async function run(app: Application, request: AgentRunRequest | SessionInputRequest, fill = false) {
+async function run(app: Application, request: AgentRunRequest | FillInputRequest, fill = false) {
   let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
   const terminal = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finish = resolve; });
   const control = { onEvent(event: AgentRunEvent) { if (event.type === 'run_finished') finish(event); } };
-  const accepted = need(await (fill ? app.submitInput(request as SessionInputRequest, control) : app.startRun(request, control)));
-  return { accepted, finished: await terminal };
+  const accepted = need(await (fill ? app.submitInput(request as FillInputRequest, control) : app.startRun(request, control)));
+  if (accepted.inputId === undefined) throw new Error('P5 Run requires a durable input ID.');
+  return { accepted: { ...accepted, inputId: accepted.inputId }, finished: await terminal };
 }
 
 describe('Fill backend through the public Application', () => {
+  it.each(['schema', 'ambiguity', 'source'] as const)('delivers actionable %s failure feedback before a corrected candidate is saved', async scenario => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-candidate-feedback-'));
+    const paths = productPaths(join(root, 'product'));
+    const sourceRoot = join(root, 'source'); const sourcePath = join(sourceRoot, '000001'); writeInvoice(sourcePath);
+    const requests: { messages: { role: string; tool_call_id?: string; content?: unknown }[] }[] = [];
+    let bad: unknown; let corrected: unknown;
+    const expected = scenario === 'schema' ? 'candidate.notes' : scenario === 'ambiguity' ? 'ambiguous_alternatives_missing' : 'source_invalid';
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      requests.push(await request.json());
+      const ordinal = requests.length;
+      const feedback = String(requests.at(-1)?.messages.find(message => message.tool_call_id === 'feedback-bad')?.content ?? '');
+      const args = ordinal === 1 ? bad : ordinal === 2 && feedback.includes(expected) ? corrected : null;
+      const delta = args ? { role: 'assistant', tool_calls: [{ index: 0, id: ordinal === 1 ? 'feedback-bad' : 'feedback-fixed', type: 'function',
+        function: { name: 'save_invoice_candidate', arguments: JSON.stringify(args) } }] }
+        : { role: 'assistant', content: 'Controlled repair finished.' };
+      const chunk = (value: unknown, reason: string | null) => `data: ${JSON.stringify({ id: `feedback-${ordinal}`,
+        model: 'feedback-model', choices: [{ index: 0, delta: value, finish_reason: reason }] })}\n\n`;
+      return new Response(`${chunk(delta, null)}${chunk({}, args ? 'tool_calls' : 'stop')}data: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    deferCleanup(() => server.stop(true));
+    const config: ProviderConfig = { version: 1, name: 'Controlled candidate feedback', revision: 1,
+      modelRef: { provider: 'feedback-fixture', model: 'feedback-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
+      connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
+      parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+    const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-feedback-key' }) }));
+    deferCleanup(async () => { await app.close(); });
+    const doc = need(await app.importInvoiceMaterial(sourcePath));
+    corrected = { documentId: doc.documentRef.id, candidate };
+    if (scenario === 'schema') {
+      const { notes: _notes, ...withoutNotes } = candidate;
+      bad = { documentId: doc.documentRef.id, candidate: { ...withoutNotes, unexpected: 'PRIVATE_DIAGNOSTIC_SENTINEL' } };
+    } else if (scenario === 'ambiguity') {
+      bad = { documentId: doc.documentRef.id, candidate: { ...candidate, fields: { ...candidate.fields,
+        currency: { ...missing, raw: '$', state: 'ambiguous', alternatives: ['USD'] } } } };
+    } else {
+      const field = { raw: '100.00', normalized: '100.00', state: 'present', alternatives: [],
+        sources: [{ documentId: doc.documentRef.id, version: doc.documentRef.version, artifactId: doc.parsedArtifactId,
+          page: 1, blockId: 'b1', quote: '100.00' }] };
+      corrected = { documentId: doc.documentRef.id, candidate: { ...candidate, fields: { ...candidate.fields, totalAmount: field } } };
+      bad = { documentId: doc.documentRef.id, candidate: { ...candidate, fields: { ...candidate.fields,
+        totalAmount: { ...field, sources: [{ ...field.sources[0], version: 'incorrect-version' }] } } } };
+    }
+    const initial = need(await app.readWorkspace());
+    const session = need(await app.createSession({ title: 'Candidate feedback', expectedRevision: initial.revision }));
+    let workspace = need(await app.readWorkspace());
+    workspace = need(await app.updateWorkspace({ expectedRevision: workspace.revision, change: { kind: 'document', documentId: doc.documentRef.id } }));
+    const task = need(await app.startTask({ clientSequence: 1, expectedRevision: workspace.revision, documentRef: doc.documentRef, goal: 'Save a candidate.' }));
+    const generated = await run(app, { sessionId: session.sessionId, goalMode: 'save-candidate', text: 'Save a candidate.',
+      workspace: expectation(task.workspace), config, timeoutMs: 5000, stopGraceMs: 500 });
+    const feedback = String(requests[1]?.messages.find(message => message.tool_call_id === 'feedback-bad')?.content ?? '');
+    expect(feedback).toContain(expected);
+    expect(feedback).not.toContain('PRIVATE_DIAGNOSTIC_SENTINEL');
+    expect(new TextEncoder().encode(feedback).byteLength).toBeLessThan(4096);
+    if (scenario !== 'schema') expect(feedback).toContain(scenario === 'source' ? '/fields/totalAmount' : '/fields/currency');
+    if (scenario === 'source') expect(feedback).toContain(doc.documentRef.version);
+    expect(generated.finished.result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(requests).toHaveLength(3);
+    expect(need(await app.listJobCandidates({ jobId: task.job.jobId })).items).toHaveLength(1);
+    expect(need(await app.querySessionInput({ sessionId: session.sessionId, inputId: generated.accepted.inputId })).input)
+      .toMatchObject({ status: 'consumed', processingStatus: 'completed' });
+    need(await app.close());
+    const db = new Database(paths.databaseFile, { readonly: true });
+    try {
+      const rows = db.query('SELECT status,result_json FROM tool_calls WHERE run_id=? ORDER BY id').all(generated.accepted.runId) as
+        { status: string; result_json: string }[];
+      expect(rows.map(row => row.status)).toEqual(['failed', 'succeeded']);
+      expect(JSON.parse(rows[0]!.result_json).committedCandidateId).toBeNull();
+      expect(JSON.parse(rows[1]!.result_json).committedCandidateId).toBeNumber();
+      const entries = db.query('SELECT entry_json FROM session_native_entries WHERE run_id=?').all(generated.accepted.runId) as { entry_json: string }[];
+      expect(entries.map(row => JSON.parse(row.entry_json).message).find(message => message?.toolCallId === 'feedback-bad'))
+        .toMatchObject({ role: 'toolResult', isError: true });
+    } finally { db.close(); }
+  });
+
+  it('finishes the saved candidate and input when saving uses the twelfth model call and the receipt needs the thirteenth', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-late-save-budget-'));
+    const paths = productPaths(join(root, 'product'));
+    const sourceRoot = join(root, 'source'); const source = join(sourceRoot, '000001'); writeInvoice(source);
+    let documentId = 0;
+    const requests: { messages: { role: string; content?: unknown; tool_call_id?: string }[] }[] = [];
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      requests.push(await request.json());
+      const ordinal = requests.length;
+      const tool = ordinal <= 12 ? { name: ordinal === 12 ? 'save_invoice_candidate' : 'validate_invoice_candidate',
+        arguments: { documentId, candidate } } : null;
+      const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `budget-call-${ordinal}`, type: 'function',
+        function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } }] }
+        : { role: 'assistant', content: 'The candidate was saved for review.' };
+      const chunk = (value: unknown, reason: string | null) => `data: ${JSON.stringify({ id: `budget-response-${ordinal}`,
+        model: 'budget-model', choices: [{ index: 0, delta: value, finish_reason: reason }] })}\n\n`;
+      return new Response(`${chunk(delta, null)}${chunk({}, tool ? 'tool_calls' : 'stop')}data: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    deferCleanup(() => server.stop(true));
+    const config: ProviderConfig = { version: 1, name: 'Controlled late save', revision: 1,
+      modelRef: { provider: 'budget-fixture', model: 'budget-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
+      connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
+      parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+    const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-budget-key' }) }));
+    deferCleanup(async () => { await app.close(); });
+    const doc = need(await app.importInvoiceMaterial(source)); documentId = doc.documentRef.id;
+    const initial = need(await app.readWorkspace());
+    const session = need(await app.createSession({ title: 'Late save budget', expectedRevision: initial.revision }));
+    let workspace = need(await app.readWorkspace());
+    workspace = need(await app.updateWorkspace({ expectedRevision: workspace.revision, change: { kind: 'document', documentId } }));
+    const task = need(await app.startTask({ clientSequence: 1, expectedRevision: workspace.revision,
+      documentRef: doc.documentRef, goal: 'Save a candidate for review.' }));
+    const generated = await run(app, { sessionId: session.sessionId, goalMode: 'save-candidate', text: 'Save a candidate.',
+      workspace: expectation(task.workspace), config, timeoutMs: 5000, stopGraceMs: 500 });
+    expect(need(await app.listJobCandidates({ jobId: task.job.jobId })).items).toHaveLength(1);
+    expect(generated.finished.result).toMatchObject({ ok: true, data: { status: 'completed', text: 'The candidate was saved for review.' } });
+    expect(requests).toHaveLength(13);
+    expect(requests[12]!.messages.find(message => message.role === 'tool' && message.tool_call_id === 'budget-call-12')).toBeDefined();
+    expect(need(await app.queryRun(generated.accepted.runId))).toMatchObject({ status: 'completed', config: { agent: { maxModelCalls: 16 } } });
+    expect(need(await app.querySessionInput({ sessionId: session.sessionId, inputId: generated.accepted.inputId })).input)
+      .toMatchObject({ status: 'consumed', processingStatus: 'completed', nativeEntryId: expect.any(String), resultEntryId: expect.any(String) });
+    expect(need(await app.queryJob(task.job.jobId))).toMatchObject({ status: 'waiting', reason: 'review_candidate', acceptedCandidateId: null });
+    need(await app.close());
+    const proof = new Database(paths.databaseFile, { readonly: true });
+    try {
+      const savedTool = proof.query('SELECT result_json,delivery_json FROM tool_calls WHERE run_id=? AND native_tool_call_id=?')
+        .get(generated.accepted.runId, 'budget-call-12') as { result_json: string; delivery_json: string };
+      expect(JSON.parse(savedTool.result_json)).toMatchObject({ status: 'succeeded', committedCandidateId: expect.any(Number) });
+      expect(JSON.parse(savedTool.delivery_json)).toMatchObject({ state: 'request_observed', includedInCallSequence: 13 });
+    } finally { proof.close(); }
+  });
+
+  it.each(['normal', 'failure-save', 'workspace-change', 'revoke'] as const)('keeps an unmet initial save goal failed when a later FollowUp saves a candidate, and freezes each compatible Workspace: %s', async scenario => {
+    const rejectFailureSave = scenario === 'failure-save';
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-p5-late-candidate-'));
+    const paths = productPaths(join(root, 'product'));
+    const sourceRoot = join(root, 'source'); const source = join(sourceRoot, '000001'); writeInvoice(source);
+    let documentId = 0;
+    let entered!: () => void; const firstRequest = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; });
+    const requests: { messages: { role: string; content?: unknown }[] }[] = [];
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      requests.push(await request.json());
+      const ordinal = requests.length;
+      if (ordinal === 1) { entered(); await barrier; }
+      const delta = ordinal === 2 ? { role: 'assistant', tool_calls: [{ index: 0, id: 'late-candidate-tool', type: 'function',
+        function: { name: 'save_invoice_candidate', arguments: JSON.stringify({ documentId, candidate }) } }] }
+        : { role: 'assistant', content: ordinal === 1 ? 'Initial reply without a saved candidate.' : 'Later candidate delivered.' };
+      const chunk = (value: unknown, reason: string | null) => `data: ${JSON.stringify({ id: `late-candidate-${ordinal}`,
+        model: 'late-model', choices: [{ index: 0, delta: value, finish_reason: reason }] })}\n\n`;
+      return new Response(`${chunk(delta, null)}${chunk({}, ordinal === 2 ? 'tool_calls' : 'stop')}data: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    deferCleanup(() => server.stop(true));
+    const config: ProviderConfig = { version: 1, name: 'Controlled late candidate', revision: 1,
+      modelRef: { provider: 'late-fixture', model: 'late-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
+      connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
+      parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+    if (rejectFailureSave) {
+      const fault = need(openDatabase(paths));
+      try { fault.db.exec("CREATE TRIGGER reject_goal_failure BEFORE UPDATE OF processing_status ON session_inputs WHEN NEW.processing_status='failed' AND json_extract(NEW.error_json,'$.code')='agent_goal_not_met' BEGIN SELECT RAISE(ABORT,'goal failure save rejected'); END;"); }
+      finally { fault.close(); }
+    }
+    const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-late-candidate-key' }) }));
+    deferCleanup(async () => { await app.close(); });
+    deferCleanup(() => release());
+    const doc = need(await app.importInvoiceMaterial(source)); documentId = doc.documentRef.id;
+    const initial = need(await app.readWorkspace());
+    const session = need(await app.createSession({ title: 'Late candidate', expectedRevision: initial.revision }));
+    let workspace = need(await app.readWorkspace());
+    workspace = need(await app.updateWorkspace({ expectedRevision: workspace.revision, change: { kind: 'document', documentId } }));
+    const task = need(await app.startTask({ clientSequence: 1, expectedRevision: workspace.revision, documentRef: doc.documentRef, goal: 'Save candidate.' }));
+    const originalWorkspace = expectation(task.workspace);
+    let finished!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+    const terminal = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finished = resolve; });
+    const prompt = { sessionId: session.sessionId, clientSequence: 1, mode: 'prompt' as const, goalMode: 'save-candidate' as const,
+      text: 'Initially save a candidate.', workspace: originalWorkspace, config, timeoutMs: 5000, stopGraceMs: 500 };
+    const accepted = need(await app.submitInput(prompt, { onEvent(event) { if (event.type === 'run_finished') finished(event); } }));
+    await firstRequest;
+    const changedView = need(await app.updateWorkspace({ expectedRevision: task.workspace.revision, change: { kind: 'view', view: 'parsed' } }));
+    const compatibleWorkspace = expectation(changedView);
+    const follow = need(await app.submitInput({ sessionId: session.sessionId, clientSequence: 2, mode: 'followUp', runId: accepted.runId,
+      text: 'Now save the candidate in this later response.', workspace: compatibleWorkspace }));
+    expect(await app.submitInput({ sessionId: session.sessionId, clientSequence: 3, mode: 'steer', runId: accepted.runId,
+      text: 'Cross another document.', workspace: { ...compatibleWorkspace, documentRef: { id: documentId + 100, version: 'other' } } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await app.submitInput(prompt)).toEqual({ ok: true, data: accepted });
+    const frozen = need(await app.listSessionInputs({ sessionId: session.sessionId })).items;
+    expect(frozen).toHaveLength(2);
+    expect(frozen.find(input => input.inputId === accepted.inputId)?.content.workspaceContext?.revision).toBe(originalWorkspace.revision);
+    expect(frozen.find(input => input.inputId === follow.inputId)?.content.workspaceContext?.revision).toBe(compatibleWorkspace.revision);
+    expect(frozen.every(input => JSON.stringify(input.content.allowedDocumentIds) === JSON.stringify([documentId]))).toBe(true);
+    const frozenFollow = frozen.find(input => input.inputId === follow.inputId)!;
+    expect(frozenFollow).toMatchObject({ status: 'queued', processingStatus: 'pending', nativeEntryId: null, runId: accepted.runId });
+    if (scenario === 'workspace-change') {
+      const otherSession = need(await app.createSession({ title: 'Selected while input is queued', expectedRevision: changedView.revision }));
+      const current = need(await app.readWorkspace());
+      const changed = need(await app.updateWorkspace({ expectedRevision: current.revision, change: { kind: 'document', documentId: null } }));
+      expect(changed).toMatchObject({ sessionId: otherSession.sessionId, documentRef: null, jobId: null, candidateRef: null });
+      expect(need(await app.querySessionInput({ sessionId: session.sessionId, inputId: follow.inputId })).input?.content).toEqual(frozenFollow.content);
+      expect(need(await app.queryRun(accepted.runId))).toMatchObject({ sessionId: session.sessionId,
+        scope: { allowedDocumentIds: [documentId] }, config: { workspaceContext: { sessionId: session.sessionId, documentRef: doc.documentRef, jobId: task.job.jobId } } });
+    }
+    if (scenario === 'revoke') {
+      expect(await app.revokeDocumentUse(documentId)).toEqual({ ok: true, data: { affectedSessionIds: [session.sessionId], stopRequested: true } });
+      expect(need(await app.querySession(session.sessionId)).modelUseBlocked).toBe(true);
+    }
+    release();
+    const end = await terminal;
+    if (scenario === 'revoke') {
+      expect(end.result).toMatchObject({ ok: true, data: { status: 'cancelled', stopped: true } });
+      const inputs = need(await app.listSessionInputs({ sessionId: session.sessionId })).items;
+      expect(inputs.find(input => input.inputId === follow.inputId)).toMatchObject({ status: 'cancelled', processingStatus: 'cancelled',
+        nativeEntryId: null, resultEntryId: null, content: frozenFollow.content });
+      expect(inputs.find(input => input.inputId === accepted.inputId)).toMatchObject({ status: 'consumed', processingStatus: 'cancelled',
+        nativeEntryId: expect.any(String), resultEntryId: null });
+      expect(await app.submitInput(prompt)).toEqual({ ok: true, data: accepted });
+      expect(await app.submitInput({ ...prompt, clientSequence: 4 })).toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
+      expect(requests).toHaveLength(1);
+      expect(need(await app.listJobCandidates({ jobId: task.job.jobId })).items).toEqual([]);
+      return;
+    }
+    if (rejectFailureSave) {
+      expect(need(await app.queryRuntimeState()).blocked).toBe(true);
+      expect(end.result).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      expect(need(await app.querySessionInput({ sessionId: session.sessionId, inputId: accepted.inputId })).input)
+        .toMatchObject({ status: 'consumed', processingStatus: 'failed', nativeEntryId: expect.any(String), resultEntryId: expect.any(String) });
+      expect(need(await app.queryRun(accepted.runId)).status).toBe('failed');
+      expect(await app.submitInput(prompt)).toEqual({ ok: true, data: accepted });
+      expect(await app.submitInput({ ...prompt, clientSequence: 4 })).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
+      expect(requests).toHaveLength(1);
+      expect(need(await app.listJobCandidates({ jobId: task.job.jobId })).items).toEqual([]);
+      return;
+    }
+    expect(end.result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'agent_goal_not_met' } } });
+    const inputs = need(await app.listSessionInputs({ sessionId: session.sessionId })).items;
+    const firstInput = inputs.find(input => input.inputId === accepted.inputId)!;
+    const followInput = inputs.find(input => input.inputId === follow.inputId)!;
+    expect(firstInput).toMatchObject({ status: 'consumed', processingStatus: 'failed', resultEntryId: expect.any(String), error: { code: 'agent_goal_not_met' } });
+    expect(followInput).toMatchObject({ status: 'consumed', processingStatus: 'completed', resultEntryId: expect.any(String), error: null });
+    expect(followInput.content).toEqual(frozenFollow.content);
+    expect(firstInput.resultEntryId).not.toBe(followInput.resultEntryId);
+    expect(need(await app.listJobCandidates({ jobId: task.job.jobId })).items).toHaveLength(1);
+    expect(requests).toHaveLength(3);
+    if (frozenFollow.content.version !== 2) throw new Error('P5 fixture must freeze the exact V2 prompt.');
+    expect(requests[1]!.messages.filter(message => message.role === 'user').at(-1)!.content)
+      .toEqual([{ type: 'text', text: frozenFollow.content.promptText }]);
+  });
   it.each([false, true])('registers Fill only when a trusted bridge is present: %s', async bridgePresent => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-form-manifest-'));
     let names: readonly string[] = [];
@@ -156,7 +408,8 @@ describe('Fill backend through the public Application', () => {
       current = need(await app.readWorkspace());
       const selected = need(await app.selectCandidate({ jobId: task.job.jobId, candidateId,
         expectedCandidateId: current.candidateRef?.id ?? null, expectedRevision: current.revision }));
-      const fillInput: SessionInputRequest = { sessionId: session.sessionId, clientSequence: 1, mode: 'prompt', goalMode: 'fill-form',
+      const nextSequence = need(await app.querySessionInput({ sessionId: session.sessionId })).nextClientSequence!;
+      const fillInput: FillInputRequest = { sessionId: session.sessionId, clientSequence: nextSequence, mode: 'prompt', goalMode: 'fill-form',
         text: 'Apply the selected candidate.', workspace: expectation(selected.workspace), config,
         formTarget: { formInstanceId: 'private-form-target', expectedRevision: 4 }, timeoutMs: outcome === 'late-applied' ? 500 : 5000, stopGraceMs: 500 };
       const filled = await run(app, fillInput, true); fillRunId = filled.accepted.runId;
@@ -184,7 +437,8 @@ describe('Fill backend through the public Application', () => {
       fillToolId = bridgeCalls[0]!.toolCallId;
       expect(bridgeCalls[0]).toMatchObject({ operation: 'apply', runId: fillRunId, candidateId, candidateSequence: 1,
         target: fillInput.formTarget, candidate: { lines: [], notes: [] } });
-      const resultMissing = outcome === 'late-applied' || outcome === 'toolResult-save-failure';
+      // An unconfirmed external commit closes the Run before another model request.
+      const resultMissing = outcome === 'unknown' || outcome === 'late-applied' || outcome === 'toolResult-save-failure';
       expect(requests).toHaveLength(resultMissing ? 3 : 4);
       expect(requests[2]!.tools?.map(tool => tool.function.name)).toEqual(['fill_invoice_form']);
       const result = requests[3]?.messages.find(message => message.role === 'tool' && message.tool_call_id === 'form-call-3');
@@ -193,7 +447,7 @@ describe('Fill backend through the public Application', () => {
       else expect(String(result?.content)).not.toContain('"applied":true');
       expect(JSON.stringify(requests)).not.toContain('private-form-target');
       expect(JSON.stringify(requests)).not.toContain('expectedRevision');
-      expect(need(await app.querySessionInput({ sessionId: session.sessionId, clientSequence: 1 })).input)
+      expect(need(await app.querySessionInput({ sessionId: session.sessionId, clientSequence: nextSequence })).input)
         .toMatchObject({ inputId: filled.accepted.inputId, runId: fillRunId, status: 'consumed',
           processingStatus: outcome === 'applied' ? 'completed' : 'failed', nativeEntryId: expect.any(String) });
       const before = need(await app.queryRun(fillRunId));
@@ -273,7 +527,7 @@ describe('Fill backend through the public Application', () => {
       if (outcome === 'unknown') expect(storedResult.error.code).toBe('operation_result_unknown');
       if (outcome === 'invalid-receipt') expect(storedResult.error.code).toBe('state_conflict');
       expect(storedResult.formApplication.outcome).toBe(outcome === 'not_applied' ? 'not_applied' : 'applied');
-      if (outcome === 'late-applied' || outcome === 'toolResult-save-failure') expect(JSON.parse(call.delivery_json).state).not.toBe('request_observed');
+      if (['unknown', 'late-applied', 'toolResult-save-failure'].includes(outcome)) expect(JSON.parse(call.delivery_json).state).not.toBe('request_observed');
       else expect(JSON.parse(call.delivery_json).state).toBe('request_observed');
       expect(db.query('SELECT status FROM invoice_candidates WHERE id=?').get(candidateId)).toEqual({ status: 'generated' });
       expect(db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 2 });

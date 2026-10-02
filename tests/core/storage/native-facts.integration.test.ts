@@ -50,6 +50,15 @@ function fixture(toolName = 'powershell') {
 }
 
 describe('native ToolCall storage facts', () => {
+  it.each([12, 16, 13])('reads historical and current fixed P3 budgets without accepting arbitrary budgets: %s', modelCalls => {
+    const f = fixture();
+    const config = { ...f.snapshot, agent: { ...f.snapshot.agent, maxModelCalls: modelCalls } };
+    f.store.db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify(config), f.context.runId);
+    if (modelCalls === 13) expect(f.store.runs.get(f.context.runId)).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    else expect(f.store.runs.get(f.context.runId)).toMatchObject({ ok: true, data: { config: { agent: { maxModelCalls: modelCalls } } } });
+    expect(f.store.db.query('SELECT config_json FROM runs WHERE id=?').get(f.context.runId)).toEqual({ config_json: JSON.stringify(config) });
+  });
+
   it('uses the frozen ordinary Run identity and retains the SDK raw result instead of an output/process platform', () => {
     const f = fixture();
     expect(f.store.toolCalls.getNativeWorkingDirectory(f.context)).toEqual({ ok: true, data: f.workingDirectory });

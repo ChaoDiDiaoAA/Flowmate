@@ -34,11 +34,12 @@ export type ModelProfile = {
 };
 
 export type ProductSettings = {
-  version: 2;
+  version: 2 | 3;
   revision: number;
   profile: { displayName: string; theme: 'system' | 'light' | 'dark' };
   models: readonly ModelProfile[];
   defaultModelId: string | null;
+  runtime?: import('./runtime.ts').RuntimeRequestOverrides;
   updatedAt: string;
 };
 
@@ -74,7 +75,9 @@ export type DesktopAgentRunRequest = {
   workspace?: import('./workspace.ts').WorkspaceExpectation;
   goalMode: 'answer' | 'save-candidate';
   workingDirectory?: string;
+  budget?: import('./runtime.ts').RuntimeBudgetOverrides;
   timeoutMs?: number;
+  stopGraceMs?: number;
 };
 
 export type DesktopInvoiceFormRunRequest = {
@@ -82,7 +85,49 @@ export type DesktopInvoiceFormRunRequest = {
   target: import('./invoice.ts').InvoiceFormTarget;
   clientSequence: import('./runtime.ts').DbId;
   modelId: string;
+  budget?: import('./runtime.ts').RuntimeBudgetOverrides;
+  timeoutMs?: number;
+  stopGraceMs?: number;
 };
+export function serializeDesktopInvoiceFormRequest(input: DesktopInvoiceFormRunRequest): string {
+  const workspace = input.workspace;
+  return JSON.stringify({ requestIdentityVersion: 1, clientSequence: input.clientSequence, modelId: input.modelId,
+    target: { formInstanceId: input.target.formInstanceId, expectedRevision: input.target.expectedRevision },
+    workspace: { revision: workspace.revision, sessionId: workspace.sessionId,
+      documentRef: workspace.documentRef === null ? null : { id: workspace.documentRef.id, version: workspace.documentRef.version },
+      jobId: workspace.jobId, candidateRef: workspace.candidateRef === null ? null : { id: workspace.candidateRef.id, sequence: workspace.candidateRef.sequence } },
+    originalBudgetOverrides: { ...(input.budget === undefined ? {} : { budget: {
+      ...(input.budget.maxToolCalls === undefined ? {} : { maxToolCalls: input.budget.maxToolCalls }),
+      ...(input.budget.maxModelCalls === undefined ? {} : { maxModelCalls: input.budget.maxModelCalls }),
+      ...(input.budget.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: input.budget.toolTimeoutMs }) } }),
+      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+      ...(input.stopGraceMs === undefined ? {} : { stopGraceMs: input.stopGraceMs }) } });
+}
+export type DesktopSessionInputRequest =
+  | Omit<import('./session-inputs.ts').PromptInputRequest, 'config'> & { modelId: string }
+  | import('./session-inputs.ts').ActiveInputRequest;
+/** Stable identity for an already validated Desktop prompt, shared with the browser. */
+export function serializeDesktopPromptRequest(input: Extract<DesktopSessionInputRequest, { mode: 'prompt' }>, identityVersion?: 1): string {
+  const workspace = input.workspace;
+  const budget = input.budget === undefined ? undefined : {
+    ...(input.budget.maxToolCalls === undefined ? {} : { maxToolCalls: input.budget.maxToolCalls }),
+    ...(input.budget.maxModelCalls === undefined ? {} : { maxModelCalls: input.budget.maxModelCalls }),
+    ...(input.budget.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: input.budget.toolTimeoutMs }),
+  };
+  return JSON.stringify({ sessionId: input.sessionId, clientSequence: input.clientSequence, mode: input.mode,
+    text: input.text, modelId: input.modelId, goalMode: input.goalMode ?? 'answer',
+    ...(workspace === undefined ? {} : { workspace: { revision: workspace.revision,
+      documentRef: workspace.documentRef === null ? null : { id: workspace.documentRef.id, version: workspace.documentRef.version },
+      jobId: workspace.jobId, candidateRef: workspace.candidateRef === null ? null : { id: workspace.candidateRef.id, sequence: workspace.candidateRef.sequence },
+      sessionId: workspace.sessionId } }),
+    ...(input.workingDirectory === undefined ? {} : { workingDirectory: input.workingDirectory }),
+    ...(identityVersion === 1 ? { requestIdentityVersion: 1, originalBudgetOverrides: {
+      ...(budget === undefined ? {} : { budget }),
+      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+      ...(input.stopGraceMs === undefined ? {} : { stopGraceMs: input.stopGraceMs }),
+    } } : { timeoutMs: input.timeoutMs ?? 60_000, stopGraceMs: input.stopGraceMs ?? 5000,
+      ...(budget === undefined ? {} : { budget }) }) });
+}
 export type DesktopInvoiceFormWorkspace = Omit<import('./workspace.ts').WorkspaceExpectation, 'sessionId'> & {
   sessionId: import('./runtime.ts').DbId | null;
 };
@@ -114,6 +159,10 @@ export type DesktopBridge = {
   listSessionMessages(request: import('./runtime.ts').SessionMessagesRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionMessagesPage>>;
   queryPromptTrace(runId: import('./runtime.ts').DbId, callSequence?: number): Promise<import('./runtime.ts').Result<import('./diagnostics.ts').PromptTraceResult>>;
   startRun(input: DesktopAgentRunRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunAccepted & { requestId: string }>>;
+  submitInput(input: DesktopSessionInputRequest): Promise<import('./runtime.ts').Result<import('./session-inputs.ts').SessionInputAccepted & { requestId: string }>>;
+  listSessionInputs(input: import('./session-inputs.ts').SessionInputsRequest): Promise<import('./runtime.ts').Result<import('./session-inputs.ts').SessionInputsPage>>;
+  setSessionStatus(input: import('./runtime.ts').SetSessionStatusRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
+  branchSession(input: import('./runtime.ts').BranchSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').BranchSessionResult>>;
   registerInvoiceFormTarget(input: { purpose: 'fill' | 'edit'; workspace: DesktopInvoiceFormWorkspace; formRevision: number }): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceFormTarget>>;
   invalidateInvoiceFormTarget(formInstanceId: string): Promise<import('./runtime.ts').Result<void>>;
   setInvoiceFormDirty(formInstanceId: string, dirty: boolean, formRevision: number): Promise<import('./runtime.ts').Result<void>>;

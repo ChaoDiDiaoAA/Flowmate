@@ -93,7 +93,7 @@ export async function closeDesktopFixture(app: ElectronApplication, userData: st
           ]);
         } finally { clearTimeout(probeTimer); }
         closeFailure = new Error(`Desktop fixture normal close: ${JSON.stringify({ desktop,
-          pid: app.process().pid, exitCode: app.process().exitCode, killed: app.process().killed })}`, {
+          pid: child.pid, exitCode: child.exitCode, killed: child.killed })}`, {
           cause: quitFailure ? new AggregateError([quitFailure, error], 'Desktop quit and exit confirmation failed') : error });
       } finally { clearTimeout(timer); }
     }

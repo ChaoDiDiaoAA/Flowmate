@@ -28,6 +28,33 @@ function project(value: NativeSessionHistory, options: Record<string, unknown> =
 }
 
 describe('P4 native messages and projection', () => {
+  it('retains the single-user legacy fallback when the P5 association collection is empty', () => {
+    const manager = SessionManager.inMemory('D:/fixture');
+    manager.appendMessage({ role: 'user', content: 'Legacy question', timestamp: 1 });
+    const entryId = manager.getLeafId()!;
+    const history: NativeSessionHistory = { storageVersion: 1, header: manager.getHeader()!, entries: manager.getEntries().map(entry => ({ ...entry })), leafId: entryId, unusable: false };
+    const projected = api().projectSessionMessages({ history, limit: 50, bindings: [{ entryId, runId: 1 }], sessionInputs: [],
+      runInputs: [{ runId: 1, goalMode: null, input: { version: 1, goal: 'chat', text: 'Legacy question', messageTimestamp: 1 } }] });
+    expect(projected.ok).toBe(true);
+    if (projected.ok) expect(projected.data.items[0]).toMatchObject({ textOrigin: 'product-input', blocks: [{ type: 'text', text: 'Legacy question' }] });
+  });
+  it('projects each P5 user from its own persisted input association even with identical Run and text', () => {
+    const value = history([user, assistant([{ type: 'text', text: 'First response' }]), { ...user, timestamp: 3 }]);
+    const content = { version: 2, text: 'Tax?', promptText: 'Tax?', workspaceContext: null, workspaceInput: null,
+      allowedDocumentIds: [], allowedArtifactIds: [] };
+    const options = { bindings: value.entries.map(entry => ({ entryId: entry.id, runId: 7 })),
+      runInputs: [{ runId: 7, input: { version: 1, goal: '', text: 'Tax?', messageTimestamp: 123 }, goalMode: null }],
+      sessionInputs: [{ inputId: 100, runId: 7, nativeEntryId: value.entries[0]!.id, content },
+        { inputId: 101, runId: 7, nativeEntryId: value.entries[2]!.id, content }] };
+    expect(project(value, options)).toMatchObject({ ok: true, data: { items: [
+      { role: 'user', textOrigin: 'product-input' }, { role: 'assistant' }, { role: 'user', textOrigin: 'product-input' },
+    ] } });
+    expect(project(value, { ...options, sessionInputs: options.sessionInputs.slice(0, 1) }).ok).toBe(false);
+    expect(project(value, { ...options, sessionInputs: options.sessionInputs.map((item, index) => index === 1
+      ? { ...item, content: { ...content, promptText: 'forged' } } : item) }).ok).toBe(false);
+    expect(project(value, { ...options, sessionInputs: options.sessionInputs.map(item => ({ ...item, inputId: 100 })) }).ok).toBe(false);
+  });
+
   it('projects SDK streaming partial calls only once their real identity is formed', () => {
     const partial = assistant([{ type: 'toolCall', id: '', name: '', arguments: {} }], 'pending');
     const context = { entryId: null, runId: 7, liveOrdinal: 1, persistence: 'pending' as const, phase: 'streaming' as const };

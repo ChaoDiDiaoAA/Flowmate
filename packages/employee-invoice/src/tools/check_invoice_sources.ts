@@ -40,7 +40,7 @@ export const checkInvoiceSources = (documents: DocumentService, repository: Docu
   name: 'check_invoice_sources',
   version: '1',
   label: 'Check sources',
-  description: 'Verify candidate sources against the authorized document version, page, block, and quoted text.',
+  description: 'Verify candidate sources against the authorized document version, page, block, and quoted text. Copy documentId/version/artifactId exactly from read tools; never shorten or reconstruct version strings. quote must be a nonempty verbatim substring of the referenced block text, not a normalized value, paraphrase or joined text. reference_mismatch means the source identity differs from the returned documentRef; correct the identity before changing the quote.',
   inputSchema: invoiceToolSchemas.check_invoice_sources.input,
   outputSchema: invoiceToolSchemas.check_invoice_sources.output,
   effect: 'READ',

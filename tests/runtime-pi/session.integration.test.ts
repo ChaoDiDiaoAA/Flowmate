@@ -108,6 +108,276 @@ const config: ProviderConfig = {
 };
 
 describe('PiAgentAdapter', () => {
+  it('rechecks admission at actual native enqueue when a high-level dispatch finishes after agent_end', async () => {
+    const fetchEntered = deferred<void>(); const reply = deferred<Response>(); const dispatchEntered = deferred<void>(); const dispatchRelease = deferred<void>(); const closed = deferred<void>();
+    const app = await fixture(() => { fetchEntered.resolve(); return reply.promise; });
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal;
+    app.adapter.watchSession(id, () => ok(undefined));
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const record = (Reflect.get(app.adapter, 'sessions') as Map<string, { session: AgentSession }>).get(id)!;
+    const followUp = record.session.followUp.bind(record.session);
+    record.session.followUp = async text => { dispatchEntered.resolve(); await dispatchRelease.promise; return followUp(text); };
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined), onInputAdmissionClosed: () => closed.resolve() }, signal, () => {});
+    await fetchEntered.promise;
+    const enqueue = app.adapter.enqueueInput(id, { inputId: 101, runId: 71, sessionId: 21, mode: 'followUp', text: 'late', promptText: 'late' });
+    await dispatchEntered.promise; reply.resolve(response()); await closed.promise; dispatchRelease.resolve();
+    expect(await enqueue).toMatchObject({ ok: false, error: { code: 'input_admission_closed' } });
+    expect((await running).error).toBeNull(); expect(app.requests).toHaveLength(1);
+    expect(record.session.agent.hasQueuedMessages()).toBe(false);
+  });
+  it('keeps completed response batches intact when a later input loses authorization before the next model request', async () => {
+    const entered = deferred<void>(); const reply = deferred<Response>();
+    const app = await fixture(() => { entered.resolve(); return reply.promise; });
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal; const consumed: number[] = []; const completed: number[][] = [];
+    app.adapter.watchSession(id, (_history, context) => { if (context?.inputId) consumed.push(context.inputId); return ok(undefined); });
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: inputId => inputId === 101 && consumed.includes(101) ? fail(appError('tool_access_denied', 'runtime', 'Controlled input revocation.')) : ok(undefined),
+      completeInputResult: ids => { completed.push([...ids]); return ok(undefined); } }, signal, () => {});
+    await entered.promise;
+    expect(await app.adapter.enqueueInput(id, { inputId: 101, runId: 71, sessionId: 21, mode: 'followUp', text: 'later', promptText: 'later' })).toEqual(ok(undefined));
+    reply.resolve(response('first answer'));
+    const result = await running;
+    expect(result.error?.code).toBe('tool_access_denied'); expect(app.requests).toHaveLength(1);
+    expect(consumed).toEqual([100, 101]); expect(completed).toEqual([[100]]);
+  });
+
+  it('applies the P5 Chat model budget to queued inputs and reports the one native item that remains unconsumed', async () => {
+    const entered = deferred<void>(); const reply = deferred<Response>();
+    const app = await fixture(() => { if (app.requests.length === 1) { entered.resolve(); return reply.promise; } return response('bounded answer'); });
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal; const completed: number[][] = [];
+    app.adapter.watchSession(id, () => ok(undefined));
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: ids => { completed.push([...ids]); return ok(undefined); } }, signal, () => {});
+    await entered.promise;
+    for (let inputId = 101; inputId <= 113; inputId++) expect(await app.adapter.enqueueInput(id,
+      { inputId, runId: 71, sessionId: 21, mode: 'followUp', text: 'next', promptText: 'next' })).toEqual(ok(undefined));
+    reply.resolve(response('bounded answer'));
+    const result = await running;
+    expect(result.error?.code).toBe('agent_model_call_budget'); expect(result.agent.modelCallCount).toBe(12);
+    expect(app.requests).toHaveLength(12); expect(completed).toHaveLength(12); expect(completed.flat()).toEqual(Array.from({ length: 12 }, (_value, index) => 100 + index));
+    expect(result.agent.confirmedUnconsumedInputIds).toEqual([113]); expect(result.stopped).toBe(true);
+  });
+
+  it.each(['return', 'throw'] as const)('retains the saved result identity when its synchronous completion callback fails by %s', async kind => {
+    const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal; let resultEntry: string | undefined;
+    app.adapter.watchSession(id, (_history, context) => { if (context?.resultInputIds?.length) resultEntry = context.entryId; return ok(undefined); });
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const result = await prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: (_ids, entry) => {
+        if (resultEntry === undefined) throw new Error('The result was not saved before completion.');
+        expect(entry).toBe(resultEntry);
+        if (kind === 'throw') throw new Error('Controlled completion failure.');
+        return fail(appError('storage_write_failed', 'storage', 'Controlled completion failure.'));
+      } }, signal, () => {});
+    expect(result.error?.code).toBe('storage_write_failed'); expect(result.stopped).toBe(true);
+    const history = app.adapter.exportSession(id); expect(history.ok && history.data.entries.some(entry => entry.id === resultEntry)).toBe(true);
+  });
+
+  it('blocks the native record when leaf restoration cannot verify the committed entry set', async () => {
+    const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const history = app.adapter.exportSession(id); if (!history.ok) throw new Error(history.error.code);
+    expect(app.adapter.restoreSessionLeaf(id, { ...history.data, header: { ...history.data.header, id: 'wrong-native-session' } })).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    expect(app.adapter.inspect(id)).toEqual({ availability: 'unusable' }); expect(app.requests).toHaveLength(0);
+  });
+  it('refuses an unconsumed receipt when the SDK still reports a pending queue after settled cleanup', async () => {
+    const entered = deferred<void>(); const reply = deferred<Response>();
+    const app = await fixture(async () => { entered.resolve(); await reply.promise;
+      throw new DOMException('Controlled transport abort.', 'AbortError'); });
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const controller = new AbortController();
+    app.adapter.watchSession(id, () => ok(undefined));
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, controller.signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const record = (Reflect.get(app.adapter, 'sessions') as Map<string, { session: AgentSession }>).get(id)!;
+    const hasQueuedMessages = record.session.agent.hasQueuedMessages.bind(record.session.agent);
+    const unsubscribe = record.session.subscribe(event => {
+      if (event.type === 'agent_settled') record.session.agent.hasQueuedMessages = () => true;
+    });
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined) }, controller.signal, () => {});
+    await entered.promise;
+    expect(await app.adapter.enqueueInput(id, { inputId: 101, runId: 71, sessionId: 21, mode: 'followUp', text: 'queued', promptText: 'queued' })).toEqual(ok(undefined));
+    controller.abort(); reply.resolve(response());
+    const result = await running;
+    expect(record.session.agent.hasQueuedMessages()).toBe(true);
+    expect(result.agent.confirmedUnconsumedInputIds).toBeUndefined();
+    expect(app.adapter.inspect(id)).toEqual({ availability: 'unusable' });
+    unsubscribe(); record.session.agent.hasQueuedMessages = hasQueuedMessages; record.session.clearQueue();
+  });
+  it('does not bind or complete an empty stopped assistant as a P5 input result', async () => {
+    const app = await fixture(() => response('')); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal; let completed = 0; let bound = 0;
+    app.adapter.watchSession(id, (_history, context) => { if (context?.resultInputIds?.length) bound++; return ok(undefined); });
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const result = await prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: () => { completed++; return ok(undefined); } }, signal, () => {});
+    expect(result.error?.code).toBe('agent_goal_not_met'); expect(bound).toBe(0); expect(completed).toBe(0);
+  });
+  it('resets both native input modes to one-at-a-time when a prepared Agent is reused', async () => {
+    const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal;
+    const first = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!first.ok) throw new Error(first.error.code);
+    const record = (Reflect.get(app.adapter, 'sessions') as Map<string, { session: AgentSession }>).get(id)!;
+    record.session.setSteeringMode('all'); record.session.setFollowUpMode('all');
+    const next = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    expect(next.ok).toBe(true); expect(record.session.steeringMode).toBe('one-at-a-time'); expect(record.session.followUpMode).toBe('one-at-a-time');
+    expect(app.requests).toHaveLength(0);
+  });
+  it('binds identical P5 inputs to real users and separate saved response batches through a tool chain', async () => {
+    const entered = deferred<void>(); const release = deferred<void>();
+    const tool: ToolDefinition<{ value: number }, { value: number }> = {
+      name: 'probe_read', version: '1', description: 'Read the controlled value.', label: 'Read',
+      inputSchema: z.object({ value: z.number() }).strict(), outputSchema: z.object({ value: z.number() }).strict(),
+      effect: 'READ', executionMode: 'parallel', execute: async value => value,
+    };
+    const app = await fixture(() => app.requests.length === 1
+      ? toolCallResponse('input-tool', 'probe_read', { value: 7 }) : response(`result ${app.requests.length}`),
+    'fixture-only-key', undefined, [tool]);
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal;
+    const saved: import('@flowmate/contracts').NativeHistoryAppendContext[] = [];
+    let history = app.adapter.exportSession(id); const completed: Array<{ ids: readonly number[]; entry: string }> = [];
+    app.adapter.watchSession(id, (value, context) => { history = ok(value); if (context) saved.push(context); return ok(undefined); });
+    const binding: AgentToolBinding = { context: { runId: 71, sessionId: 21, scope: { version: 2,
+      allowedTools: ['probe_read'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] } },
+    observeRequest: () => ok(undefined), rejectRequest: () => ok(undefined), recordDelivery: () => ok(undefined),
+    execute: async () => { entered.resolve(); await release.promise; return { result: { status: 'succeeded', data: { value: 7 } }, fatal: false }; } };
+    const options = { activeToolNames: ['probe_read'] };
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, options);
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const observations: AgentObservation[] = [];
+    expect(typeof app.adapter.enqueueInput).toBe('function');
+    const execute = prepared.data.execute({ ...input(71, 21, 'same'), inputId: 100, promptText: 'same', toolBinding: binding,
+      verifyInputUse: () => ok(undefined), completeInputResult: (ids, entry) => {
+        expect(history.ok && history.data.entries.some(value => value.id === entry)).toBe(true);
+        completed.push({ ids: [...ids], entry }); return ok(undefined);
+      } }, signal, event => observations.push(event));
+    await entered.promise;
+    expect(typeof app.adapter.enqueueInput).toBe('function');
+    expect(await app.adapter.enqueueInput(id, { inputId: 102, runId: 71, sessionId: 21, mode: 'followUp', promptText: 'same', text: 'same' })).toEqual(ok(undefined));
+    expect(await app.adapter.enqueueInput(id, { inputId: 101, runId: 71, sessionId: 21, mode: 'steer', promptText: 'same', text: 'same' })).toEqual(ok(undefined));
+    release.resolve();
+    expect((await execute).error).toBeNull();
+    expect(saved.filter(value => value.inputId !== undefined).map(value => value.inputId)).toEqual([100, 101, 102]);
+    expect(saved.filter(value => value.resultInputIds?.length).map(value => value.resultInputIds)).toEqual([[100, 101], [102]]);
+    expect(completed.map(value => value.ids)).toEqual([[100, 101], [102]]);
+    expect(new Set(completed.map(value => value.entry)).size).toBe(2);
+    expect(observations.filter(event => event.type === 'display_message' && event.message.role === 'user'
+      && event.message.persistence === 'saved')).toHaveLength(3);
+    // A reused Agent must not gain another capture wrapper.
+    const reused = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, options);
+    if (!reused.ok) throw new Error(reused.error.code);
+    expect((await reused.data.execute({ ...input(72, 21, 'next'), inputId: 103, promptText: 'next', toolBinding: binding,
+      verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined) }, signal, () => {})).error).toBeNull();
+    expect(saved.filter(value => value.inputId === 103)).toHaveLength(1);
+  });
+
+  it('permits pure Chat P5 follow-up calls while preserving no tools and closes admission before settled', async () => {
+    const entered = deferred<void>(); const reply = deferred<Response>();
+    const app = await fixture(() => { if (app.requests.length === 1) { entered.resolve(); return reply.promise; } return response('follow-up answer'); });
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal;
+    app.adapter.watchSession(id, () => ok(undefined));
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    expect(prepared.data.snapshot.agent).toMatchObject({ policyVersion: 'p5-session-inputs-v1', maxModelCalls: 12, maxContextBytes: 524_288 });
+    let closed = 0; let late: Promise<unknown> | undefined;
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined), onInputAdmissionClosed: () => {
+        closed++; late = app.adapter.enqueueInput(id, { inputId: 102, runId: 71, sessionId: 21, mode: 'steer', text: 'late', promptText: 'late' });
+      } }, signal, () => {});
+    await entered.promise;
+    expect(await app.adapter.enqueueInput(id, { inputId: 101, runId: 71, sessionId: 21, mode: 'followUp', text: 'follow', promptText: 'follow' })).toEqual(ok(undefined));
+    reply.resolve(response('first answer'));
+    const result = await running;
+    expect(result.error).toBeNull(); expect(result.text).toBe('follow-up answer'); expect(result.agent.modelCallCount).toBe(2);
+    expect(result.usage.version).toBe(2); expect(closed).toBe(1);
+    expect(await late).toMatchObject({ ok: false, error: { code: 'input_admission_closed' } });
+    expect(app.requests.every(request => request.body.tools === undefined || request.body.tools.length === 0)).toBe(true);
+  });
+
+  it('keeps a drained P5 input consumed across Stop and confirms only still queued inputs unconsumed', async () => {
+    const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const controller = new AbortController();
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, controller.signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const record = (Reflect.get(app.adapter, 'sessions') as Map<string, { session: AgentSession }>).get(id)!;
+    expect(typeof app.adapter.enqueueInput).toBe('function');
+    const entered = deferred<void>(); const release = deferred<void>();
+    const refresh = record.session.agent.prepareNextTurnWithContext;
+    record.session.agent.prepareNextTurnWithContext = async (turn, signal) => { entered.resolve(); await release.promise; return refresh?.(turn, signal); };
+    const consumed: number[] = [];
+    app.adapter.watchSession(id, (_history, context) => { if (context?.inputId) consumed.push(context.inputId); return ok(undefined); });
+    let queued: Promise<unknown> | undefined;
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined) }, controller.signal, event => {
+      if (event.type === 'agent_event' && event.data.eventName === 'turn_end' && !queued) queued = app.adapter.enqueueInput(id,
+        { inputId: 101, runId: 71, sessionId: 21, mode: 'steer', text: 'drained', promptText: 'drained' });
+    });
+    await entered.promise; await queued;
+    expect(await app.adapter.enqueueInput(id, { inputId: 102, runId: 71, sessionId: 21, mode: 'followUp', text: 'queued', promptText: 'queued' })).toEqual(ok(undefined));
+    controller.abort(); release.resolve();
+    const result = await running;
+    expect(result.stopped).toBe(true); expect(consumed).toEqual([100, 101]);
+    expect(result.agent.confirmedUnconsumedInputIds).toEqual([102]);
+    expect(record.session.agent.hasQueuedMessages()).toBe(false);
+  });
+
+  it.each(['user', 'result'] as const)('does not complete a P5 batch when its %s history write fails', async kind => {
+    const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal; let completed = 0;
+    app.adapter.watchSession(id, (_history, context) => context && (kind === 'user' ? context.inputId !== undefined : context.resultInputIds !== undefined)
+      ? fail(appError('storage_write_failed', 'storage', 'Controlled history failure.')) : ok(undefined));
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const result = await prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: () => { completed++; return ok(undefined); } }, signal, () => {});
+    expect(result.error?.code).toBe('storage_write_failed'); expect(completed).toBe(0);
+    expect(result.agent.confirmedUnconsumedInputIds).toBeUndefined();
+  });
+
+  it('moves and restores a saved assistant leaf with or without prepared credentials without generating messages', async () => {
+    const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId; const signal = new AbortController().signal;
+    app.adapter.watchSession(id, () => ok(undefined));
+    for (const run of [71, 72]) {
+      const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal);
+      if (!prepared.ok) throw new Error(prepared.error.code);
+      expect((await prepared.data.execute(input(run, 21, `question ${run}`), signal, () => {})).error).toBeNull();
+    }
+    const committed = app.adapter.exportSession(id); if (!committed.ok) throw new Error(committed.error.code);
+    const target = committed.data.entries.find(entry => entry.type === 'message' && (entry.message as { role: string }).role === 'assistant')!.id;
+    expect(typeof app.adapter.moveSessionLeaf).toBe('function');
+    const moved = await app.adapter.moveSessionLeaf(id, target); expect(moved).toMatchObject({ ok: true, data: { leafId: target } });
+    expect(app.adapter.restoreSessionLeaf(id, committed.data)).toEqual(ok(undefined));
+    expect(app.adapter.exportSession(id)).toEqual(committed);
+    expect((await app.adapter.releaseSession(id)).closed).toBe(true);
+    expect(app.adapter.restoreSession(id, committed.data)).toEqual(ok(undefined));
+    expect(await app.adapter.moveSessionLeaf(id, target)).toMatchObject({ ok: true, data: { leafId: target } });
+    expect(app.adapter.restoreSessionLeaf(id, committed.data)).toEqual(ok(undefined));
+    expect(app.adapter.exportSession(id)).toEqual(committed); expect(app.requests).toHaveLength(2);
+    expect(await app.adapter.moveSessionLeaf(id, committed.data.entries.find(entry => entry.type === 'message')!.id)).toMatchObject({ ok: false });
+    expect(await app.adapter.moveSessionLeaf(id, target)).toMatchObject({ ok: true });
+    const rebuilt = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal);
+    if (!rebuilt.ok) throw new Error(rebuilt.error.code);
+    expect((await rebuilt.data.execute(input(73, 21, 'question from branch'), signal, () => {})).error).toBeNull();
+    expect(JSON.stringify(app.requests[2]!.body.messages)).toContain('question 71');
+    expect(JSON.stringify(app.requests[2]!.body.messages)).not.toContain('question 72');
+  });
+
   it('exposes only the fill tool in a fill Run and restores ordinary policy without losing native history', async () => {
     const output = { candidateId: 4, candidateSequence: 1, applied: true } as const;
     const definition: ToolDefinition<any, any> = {
