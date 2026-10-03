@@ -49,6 +49,7 @@ import { ensureNativeSession } from '../sessions/service.ts';
 import type { ToolExecutor } from '../tools/executor.ts';
 import type { SessionInputLedger } from '../sessions/input-ledger.ts';
 import type { WorkspaceVerifier } from '../workspace/verification.ts';
+import type { ContextService } from '../context/service.ts';
 
 export interface RuntimeLogger {
   write(event: { at: string; level: 'info' | 'warn' | 'error'; component: string; runId?: number; event: string; code?: string }): void;
@@ -63,6 +64,7 @@ export type RuntimeDependencies = {
   sessions?: SessionRepository;
   sessionInputs?: SessionInputLedger;
   workspaceVerifier?: WorkspaceVerifier;
+  contextService?: Pick<ContextService, 'build'>;
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;

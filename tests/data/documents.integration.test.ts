@@ -85,6 +85,77 @@ function sample() {
   };
 }
 
+describe('P8 readonly Context parsed inspection', () => {
+  async function fixture() {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-context-material-'));
+    const sourceDirectory = join(root, 'source', '000001'); writeSample(sourceDirectory);
+    const f = serviceFor(root), imported = await f.service.importVoxel51({ sourceDirectory });
+    if (!imported.ok) throw new Error(imported.error.code);
+    return { ...f, root, document: imported.data, request: { documentRef: imported.data.documentRef,
+      allowedDocumentIds: [imported.data.documentRef.id], allowedArtifactIds: [imported.data.parsedArtifactId] } };
+  }
+  const facts = (f: Awaited<ReturnType<typeof fixture>>) => ({ documents: f.opened.db.query('SELECT * FROM documents').all(),
+    workspace: f.opened.db.query('SELECT * FROM workspace').all(), events: f.opened.db.query('SELECT * FROM business_events').all() });
+  it('returns real complete managed text without changing availability, workspace or activity', async () => {
+    const f = await fixture(), before = facts(f);
+    const result = f.service.inspectParsedForContext(f.request);
+    expect(result).toMatchObject({ ok: true, data: { document: f.document, parsed: { formatVersion: 2,
+      pages: [{ page: 1, blocks: [{ id: 'b1', text: 'Header text' }, { id: 'b2', kind: 'table' }, { id: 'b3', kind: 'image' }, { id: 'b4' }] }] } } });
+    expect(facts(f)).toEqual(before);
+  });
+  it('requires original allowlists, visible available Document and exact version while retaining Workspace diagnostics', async () => {
+    const f = await fixture();
+    for (const patch of [{ allowedDocumentIds: [] }, { allowedArtifactIds: [] }, { allowedArtifactIds: [f.document.originalArtifactId] }])
+      expect(f.service.inspectParsedForContext({ ...f.request, ...patch })).toMatchObject({ ok: false, error: { code: 'tool_access_denied' } });
+    expect(f.service.inspectParsedForContext({ ...f.request, documentRef: { ...f.document.documentRef, version: 'wrong' } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    f.opened.documents.setAvailability({ documentId: f.document.documentRef.id, status: 'unavailable', reason: 'fixture', at: '2026-10-03T00:00:00.000Z' });
+    const before = facts(f);
+    expect(f.service.inspectParsedForContext(f.request)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+    expect(f.service.inspectForWorkspace(f.document.documentRef)).toMatchObject({ ok: true, data: { kind: 'valid', document: { status: 'unavailable' } } });
+    expect(facts(f)).toEqual(before);
+    f.opened.db.query('UPDATE documents SET status=\'available\',hidden_at=? WHERE id=?').run('2026-10-03T00:00:00.000Z', f.document.documentRef.id);
+    expect(f.service.inspectParsedForContext(f.request)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+  });
+  it.each(['owner', 'version', 'original-version', 'kind', 'original-file', 'sidecar', 'parsed-drift'] as const)('retains all trusted inspection checks for %s damage without any write', async damage => {
+    const f = await fixture();
+    if (damage === 'owner') f.opened.db.query('UPDATE documents SET source_record_id=? WHERE id=?').run('different-owner', f.document.documentRef.id);
+    if (damage === 'version') f.opened.db.query("UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.sourceVersion','wrong') WHERE id=?").run(f.document.parsedArtifactId);
+    if (damage === 'original-version') f.opened.db.query("UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.sourceVersion','wrong') WHERE id=?").run(f.document.originalArtifactId);
+    if (damage === 'kind') f.opened.db.query("UPDATE artifacts SET kind='original' WHERE id=?").run(f.document.parsedArtifactId);
+    if (damage === 'original-file') unlinkSync(join(f.productPaths.artifactsDir, String(f.document.originalArtifactId), 'original.png'));
+    if (damage === 'sidecar') unlinkSync(join(f.productPaths.artifactsDir, String(f.document.parsedArtifactId), 'raw-pages.json'));
+    if (damage === 'parsed-drift') {
+      const file = join(f.productPaths.artifactsDir, String(f.document.parsedArtifactId), 'parsed.json');
+      const before = readFileSync(file, 'utf8'), changed = before.replace('Header text', 'header text');
+      expect(Buffer.byteLength(changed)).toBe(Buffer.byteLength(before));
+      writeFileSync(file, changed);
+    }
+    const before = facts(f);
+    expect(f.service.inspectParsedForContext(f.request)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+    expect(facts(f)).toEqual(before);
+  });
+  it('preserves transient managed file read errors instead of treating them as nonexistent evidence', async () => {
+    const f = await fixture(), before = facts(f);
+    for (const code of ['EACCES', 'EPERM', 'EBUSY', 'EIO']) {
+      const error = appError('input_unavailable', 'input', code, true);
+      const service = createDocumentService({ paths: f.productPaths, allowedSourceRoot: f.root, repository: f.opened.documents,
+        files: { publish: input => f.files.publish(input), read: () => fail(error) }, now: () => '2026-10-03T00:00:00.000Z' });
+      expect(service.inspectParsedForContext(f.request)).toEqual({ ok: false, error });
+    }
+    expect(facts(f)).toEqual(before);
+  });
+  it('can inspect through read-only capabilities with all writer methods forbidden', async () => {
+    const f = await fixture(), before = facts(f);
+    const service = createDocumentService({ paths: f.productPaths, allowedSourceRoot: f.root,
+      repository: { ...f.opened.documents, setAvailability: () => { throw new Error('inspection must not write'); } },
+      files: { read: (artifact, file) => f.files.read(artifact, file), publish: async () => { throw new Error('inspection must not publish'); } },
+      now: () => { throw new Error('inspection must not request a write time'); } });
+    expect(service.inspectParsedForContext(f.request).ok).toBe(true);
+    expect(facts(f)).toEqual(before);
+  });
+});
+
 describe('P3 controlled document input', () => {
   it('imports parser-free formal input and versions changes to formal bytes', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-parser-free-'));
@@ -693,10 +764,24 @@ describe('P7 Workspace material inspection', () => {
       expect(typeof fixture.service.inspectForWorkspace).toBe('function');
       expect(fixture.service.inspectForWorkspace(fixture.document.documentRef))
         .toEqual({ ok: true, data: { kind: 'invalid', reason: 'artifact_missing_or_invalid' } });
+      expect(fixture.service.inspectParsedForContext({ documentRef: fixture.document.documentRef,
+        allowedDocumentIds: [fixture.document.documentRef.id], allowedArtifactIds: [fixture.document.parsedArtifactId] }))
+        .toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
       expect(fixture.opened.documents.get(fixture.document.documentRef.id)).toMatchObject({ ok: true, data: { status: 'available' } });
     }
     const fixture = await legacy([{ page: 1, blocks: [block] }, { page: 2, blocks: [block] }]);
     expect(fixture.service.inspectForWorkspace(fixture.document.documentRef)).toMatchObject({ ok: true,
       data: { kind: 'valid', pages: [{ page: 1, blockIds: ['b1'] }, { page: 2, blockIds: ['b1'] }] } });
+    expect(fixture.service.inspectParsedForContext({ documentRef: fixture.document.documentRef,
+      allowedDocumentIds: [fixture.document.documentRef.id], allowedArtifactIds: [fixture.document.parsedArtifactId] }))
+      .toMatchObject({ ok: true, data: { parsed: { pages: [{ page: 1 }, { page: 2 }] } } });
+  });
+  it('exposes a complete legacy empty page as real parsed material without fabricating blocks', async () => {
+    const fixture = await legacy([{ page: 1, blocks: [] }]);
+    const before = fixture.opened.db.query('SELECT * FROM documents').all();
+    expect(fixture.service.inspectParsedForContext({ documentRef: fixture.document.documentRef,
+      allowedDocumentIds: [fixture.document.documentRef.id], allowedArtifactIds: [fixture.document.parsedArtifactId] }))
+      .toMatchObject({ ok: true, data: { parsed: { formatVersion: 2, pages: [{ page: 1, blocks: [] }] } } });
+    expect(fixture.opened.db.query('SELECT * FROM documents').all()).toEqual(before);
   });
 });

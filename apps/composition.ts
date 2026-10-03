@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
-  RuntimeService, SessionService, openDatabase } from '@flowmate/core';
+  ContextService, RuntimeService, SessionService, openDatabase } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
@@ -51,6 +51,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     allowedSourceRoot: options.invoiceSourceRoot ?? resolve(process.cwd(), 'data', 'invoices', 'agent-input'),
     repository: database.data.documents, files, now });
   const workspaceVerifier = createWorkspaceVerifier({ inspectMaterial: ref => documents.inspectForWorkspace(ref) });
+  const contextService = new ContextService({ store: database.data,
+    materials: { inspectParsed: input => documents.inspectParsedForContext(input) } });
   const invoiceEdits = createInvoiceEditService({ candidates: database.data.candidates, files,
     validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, documents), now });
   const native = createNativeTools({
@@ -77,6 +79,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     sessions: database.data.sessions,
     sessionInputs: database.data.sessionInputs,
     workspaceVerifier,
+    contextService,
     isSessionManaging: sessionId => sessionService?.isManaging(sessionId) ?? false,
     provider,
     agent,

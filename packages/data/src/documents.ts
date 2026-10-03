@@ -8,6 +8,7 @@ import {
   MAX_INVOICE_BLOCKS_PER_PAGE,
   MAX_INVOICE_VERSION_CHARS,
   DocumentRefSchema,
+  ContextMaterialRequestSchema,
 } from '@flowmate/contracts';
 import type {
   DocumentSnapshot,
@@ -17,6 +18,8 @@ import type {
   RunScope,
   DocumentRef,
   WorkspaceMaterialInspection,
+  ContextMaterialPort,
+  ContextParsedMaterial,
 } from '@flowmate/contracts';
 import { mapVoxel51ParsedDocument, parseVoxel51Sample } from './parsed-document.ts';
 import { isSupportedOriginal, readVoxel51Files } from './source/voxel51.ts';
@@ -274,8 +277,35 @@ export class DocumentService {
   }
 
   public inspectForWorkspace(ref: DocumentRef): Result<WorkspaceMaterialInspection> {
+    const inspected = this.inspectMaterial(ref);
+    if (!inspected.ok) return inspected;
+    if (inspected.data.kind === 'invalid') return ok(inspected.data);
+    return ok({ kind: 'valid', document: inspected.data.document,
+      pages: inspected.data.parsed.pages.map(page => ({ page: page.page, blockIds: page.blocks.map(block => block.id) })) });
+  }
+
+  public inspectParsedForContext(input: Parameters<ContextMaterialPort['inspectParsed']>[0]): Result<ContextParsedMaterial> {
+    const parsed = ContextMaterialRequestSchema.safeParse(input);
+    if (!parsed.success) return fail(appError('input_invalid', 'input', 'Context material reference is invalid.'));
+    const request = parsed.data;
+    if (!request.allowedDocumentIds.includes(request.documentRef.id)) return fail(appError('tool_access_denied', 'runtime', 'Context material is outside the Run scope.'));
+    try {
+      const document = this.options.repository.get(request.documentRef.id);
+      if (!document.ok) return document;
+      if (document.data.documentRef.version !== request.documentRef.version) return fail(appError('state_conflict', 'input', 'Context material version changed.'));
+      if (document.data.isHidden || document.data.status !== 'available') return fail(appError('input_unavailable', 'input', 'Context material is unavailable.', true));
+      if (!request.allowedArtifactIds.includes(document.data.parsedArtifactId)) return fail(appError('tool_access_denied', 'runtime', 'Context Artifact is outside the Run scope.'));
+      const inspected = this.inspectMaterial(request.documentRef);
+      if (!inspected.ok) return inspected;
+      if (inspected.data.kind === 'invalid') return fail(appError('artifact_unavailable', 'storage', 'Context managed material could not be verified.'));
+      return ok({ document: inspected.data.document, parsed: inspected.data.parsed });
+    } catch { return fail(appError('storage_read_failed', 'storage', 'Context material inspection could not be completed.', true)); }
+  }
+
+  private inspectMaterial(ref: DocumentRef): Result<{ kind: 'invalid'; reason: string }
+    | { kind: 'valid'; document: DocumentSnapshot; parsed: StoredParsedDocument }> {
     if (!DocumentRefSchema.safeParse(ref).success) return fail(appError('input_invalid', 'input', '材料引用无效。'));
-    const invalid = (reason: string): Result<WorkspaceMaterialInspection> => ok({ kind: 'invalid', reason });
+    const invalid = (reason: string): Result<{ kind: 'invalid'; reason: string }> => ok({ kind: 'invalid', reason });
     try {
       const document = this.options.repository.get(ref.id);
       if (!document.ok) return document.error.code === 'document_not_found' ? invalid('document_missing') : document;
@@ -317,8 +347,7 @@ export class DocumentService {
         seenPages.add(page.page);
         if (new Set(page.blocks.map(block => block.id)).size !== page.blocks.length) return invalid('artifact_missing_or_invalid');
       }
-      return ok({ kind: 'valid', document: document.data,
-        pages: decoded.data.pages.map(page => ({ page: page.page, blockIds: page.blocks.map(block => block.id) })) });
+      return ok({ kind: 'valid', document: document.data, parsed: decoded.data });
     } catch {
       return fail(appError('storage_read_failed', 'storage', '材料核验暂时无法完成。', true));
     }
