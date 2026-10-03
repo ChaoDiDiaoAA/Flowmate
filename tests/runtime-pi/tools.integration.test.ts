@@ -379,6 +379,165 @@ describe('P4 real candidate commit and message persistence failures', () => {
   }, 30_000);
 });
 
+it('F6-04 preserves the actual SDK candidate and Activity when its Tool settlement event INSERT fails', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-p6-sdk-candidate-event-'));
+  const product = join(root, 'product');
+  const paths = { root: product, databaseFile: join(product, 'data', 'app.sqlite'), logsDir: join(product, 'logs'),
+    artifactsDir: join(product, 'artifacts'), outputsDir: join(product, 'outputs'), runtimeDir: join(product, 'runtime') };
+  const sourceRoot = join(root, 'source');
+  const source = join(sourceRoot, '000001');
+  writeFaultInvoice(source);
+  const seeded = openDatabase(paths);
+  if (!seeded.ok) throw new Error(seeded.error.message);
+  // This fault can fire only after the real candidate and its matching business Activity exist.
+  seeded.data.db.exec(`CREATE TRIGGER reject_saved_candidate_terminal_event BEFORE INSERT ON runtime_events
+    WHEN NEW.type IN ('tool_succeeded','tool_failed','tool_cancelled') AND EXISTS (
+      SELECT 1 FROM invoice_candidates candidate JOIN business_events activity ON activity.candidate_id=candidate.id
+      WHERE candidate.tool_call_id=NEW.tool_call_id AND activity.type='candidate_generated' AND activity.result='succeeded')
+    BEGIN SELECT RAISE(ABORT,'candidate Tool settlement event unavailable'); END;`);
+  seeded.data.close();
+  let documentId = 0;
+  const callId = 'p6-save-event-failure';
+  let httpCalls = 0;
+  let executorCalls = 0;
+  let saves = 0;
+  let applies = 0;
+  let deliveries = 0;
+  const deliveryAttempts: Array<{ state: string; result: Result<void> }> = [];
+  let prepares = 0;
+  let invocation: Awaited<ReturnType<AgentToolBinding['execute']>> | undefined;
+  let savedCall: ToolCallSnapshot | undefined;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    await request.json();
+    httpCalls += 1;
+    const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
+      `data: ${JSON.stringify({ id: `p6-candidate-${httpCalls}`, model: 'p6-candidate-model',
+        choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+    return new Response(`${chunk({ role: 'assistant', tool_calls: [{ index: 0, id: callId, type: 'function',
+      function: { name: 'save_invoice_candidate', arguments: JSON.stringify({ documentId, candidate }) } }] })}${chunk({}, 'tool_calls')}data: [DONE]\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  deferCleanup(() => server.stop(true));
+  const opened = await createApplication({ paths, invoiceSourceRoot: sourceRoot,
+    logger: { write: () => undefined, close: async () => undefined },
+    invoiceFormBridge: async () => { applies += 1; throw new Error('Unexpected form application after candidate event failure.'); },
+    toolDefinitions: definitions => definitions.map(definition => definition.name === 'save_invoice_candidate'
+      ? { ...definition, execute: async (...args) => { saves += 1; return definition.execute(...args); } } : definition),
+    agentFactory: tools => {
+      const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p6-candidate-key' });
+      const prepare = adapter.prepare.bind(adapter);
+      adapter.prepare = async (...args) => {
+        prepares += 1;
+        const prepared = await prepare(...args);
+        if (!prepared.ok) return prepared;
+        const execute = prepared.data.execute.bind(prepared.data);
+        return { ...prepared, data: { ...prepared.data, execute: (input, signal, observe) => {
+          const binding = input.toolBinding!;
+          return execute({ ...input, toolBinding: { ...binding,
+            execute: async (...call) => {
+              executorCalls += 1;
+              invocation = await binding.execute(...call);
+              const queried = binding.queryCall?.(call[2].nativeToolCallId);
+              if (!queried?.ok) throw new Error('Missing original ToolCall after settlement rollback.');
+              savedCall = queried.data;
+              return invocation;
+            },
+            recordDelivery: (...call) => {
+              const result = binding.recordDelivery(...call);
+              if (result.ok) deliveries += 1;
+              deliveryAttempts.push({ state: call[1].state, result });
+              return result;
+            },
+          } }, signal, observe);
+        } } };
+      };
+      return adapter;
+    } });
+  if (!opened.ok) throw new Error(opened.error.message);
+  const app = opened.data;
+  deferCleanup(() => app.close());
+  const imported = await app.importInvoiceMaterial(source);
+  if (!imported.ok) throw new Error(imported.error.message);
+  documentId = imported.data.documentRef.id;
+  const session = await app.createSession({ title: 'Candidate event failure' });
+  if (!session.ok) throw new Error(session.error.message);
+  const sessionId = session.data.sessionId;
+  expect(await app.updateWorkspace({ expectedRevision: 0, change: { kind: 'session', sessionId } })).toMatchObject({ ok: true });
+  const selected = await app.updateWorkspace({ expectedRevision: 1, change: { kind: 'document', documentId } });
+  if (!selected.ok) throw new Error(selected.error.message);
+  const task = await app.startTask({ clientSequence: 1, expectedRevision: selected.data.revision,
+    documentRef: imported.data.documentRef, goal: 'Save candidate before settlement failure' });
+  if (!task.ok) throw new Error(task.error.message);
+  const jobId = task.data.job.jobId;
+  const current = task.data.workspace;
+  const workspace = { revision: current.revision, sessionId, documentRef: current.documentRef,
+    jobId: current.jobId, candidateRef: current.candidateRef };
+  const config: ProviderConfig = { version: 1, name: 'P6 candidate fixture', revision: 1,
+    modelRef: { provider: 'p6-candidate-fixture', model: 'p6-candidate-model' },
+    native: { authPath: join(root, 'unused-auth.json'), modelsPath: null },
+    connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
+  const request = { sessionId, text: 'Save the supplied candidate for review.', config, workspace, goalMode: 'save-candidate' as const };
+  let finish!: (event: Extract<AgentRunEvent, { type: 'run_finished' }>) => void;
+  const completion = new Promise<Extract<AgentRunEvent, { type: 'run_finished' }>>(resolve => { finish = resolve; });
+  const accepted = await app.startRun(request, { onEvent: event => { if (event.type === 'run_finished') finish(event); } });
+  if (!accepted.ok) throw new Error(accepted.error.message);
+  const runId = accepted.data.runId;
+  expect((await completion).result).toMatchObject({ ok: true, data: {
+    status: 'failed', stopped: false, error: { code: 'storage_write_failed' } } });
+  expect(invocation).toMatchObject({ fatal: true, result: { status: 'failed', error: { code: 'storage_write_failed' } } });
+  expect(savedCall).toMatchObject({ runId, sessionId, nativeToolCallId: callId, status: 'running',
+    result: null, runtimeObservation: null, endedAt: null, stoppedAt: null, delivery: { state: 'not_attempted' } });
+  expect(savedCall).toBeDefined();
+  const toolCallId = savedCall!.toolCallId;
+  const candidateQuery = { jobId, candidateId: 1 };
+  expect(await app.queryJobCandidate(candidateQuery)).toMatchObject({ ok: true, data: { candidate: {
+    ...candidate, candidateId: 1, jobId, runId, toolCallId, sequence: 1, status: 'generated' } } });
+  const activity = await app.listActivity({ jobId, limit: 20 });
+  if (!activity.ok) throw new Error(activity.error.message);
+  expect(activity.data.items.filter(event => event.type === 'candidate_generated')).toEqual([
+    expect.objectContaining({ runId, jobId, candidateId: 1, operationRef: `tool-call-id:${toolCallId}`, result: 'succeeded' }),
+  ]);
+  expect(await app.queryJob(jobId)).toMatchObject({ ok: true, data: { status: 'failed', reason: 'storage_write_failed',
+    currentCandidateId: null, acceptedCandidateId: null } });
+  expect(await app.queryRun(runId)).toMatchObject({ ok: true, data: { status: 'failed', stoppedAt: null,
+    cleanup: { stopped: false, lateObservationRequired: true }, error: { code: 'storage_write_failed' } } });
+  expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { active: null, blocked: true } });
+  const counters = () => ({ httpCalls, executorCalls, saves, applies, deliveries, prepares });
+  expect(counters()).toEqual({ httpCalls: 1, executorCalls: 1, saves: 1, applies: 0, deliveries: 1, prepares: 1 });
+  expect(deliveryAttempts).toEqual([
+    { state: 'failed', result: { ok: true, data: undefined } },
+    { state: 'message_observed', result: expect.objectContaining({ ok: false, error: expect.objectContaining({ code: 'state_conflict' }) }) },
+  ]);
+  const beforeQueries = counters();
+  const page = await app.queryRuntimeEvents({ runId, sessionId, cursor: { runId, lastPersistedSequence: 0 }, limit: 100 });
+  if (!page.ok) throw new Error(page.error.message);
+  expect(page.data.items.filter(event => event.toolCallId === toolCallId).map(event => event.type))
+    .toEqual(['tool_requested', 'tool_started']);
+  expect(page.data.items.some(event => event.type === 'run_failed')).toBe(true);
+  expect(await app.queryRunToolCall({ runId, sessionId, toolCallId })).toMatchObject({ ok: true, data: {
+    status: 'running', endedAt: null, stoppedAt: null, committedCandidateId: null, deliveryState: 'failed' } });
+  expect(await app.queryRuntimeEvents({ runId, sessionId, cursor: page.data.nextCursor })).toMatchObject({ ok: true, data: { items: [] } });
+  expect(await app.queryJobCandidate(candidateQuery)).toMatchObject({ ok: true, data: { candidate } });
+  expect(await app.startRun(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
+  expect(counters()).toEqual(beforeQueries);
+  expect(await app.close()).toMatchObject({ ok: true, data: { closed: true } });
+  expect(counters()).toEqual(beforeQueries);
+  const db = new Database(paths.databaseFile, { readonly: true });
+  try {
+    expect(db.query('SELECT run_id,tool_call_id,sequence,status FROM invoice_candidates').all())
+      .toEqual([{ run_id: runId, tool_call_id: toolCallId, sequence: 1, status: 'generated' }]);
+    expect(db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 1 });
+    expect(db.query('SELECT status,result_json,runtime_observation_json,ended_at,stopped_at FROM tool_calls WHERE id=?').get(toolCallId))
+      .toEqual({ status: 'running', result_json: null, runtime_observation_json: null, ended_at: null, stopped_at: null });
+    expect(db.query("SELECT COUNT(*) AS count FROM runtime_events WHERE type IN ('tool_succeeded','tool_failed','tool_cancelled')").get())
+      .toEqual({ count: 0 });
+    expect(db.query("SELECT COUNT(*) AS count FROM tool_calls WHERE tool_name='fill_invoice_form'").get()).toEqual({ count: 0 });
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  } finally { db.close(); }
+}, 30_000);
+
 it('persists real material revocation between conversion and fetch while saved history remains readable', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p4-revoke-'));
   const product = join(root, 'product');

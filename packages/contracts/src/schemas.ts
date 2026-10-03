@@ -12,6 +12,7 @@ import type {
 } from './runtime.ts';
 import { WorkspaceContextSchema } from './workspace.ts';
 import { RuntimeRequestOverridesSchema } from './runtime.ts';
+import { RUNTIME_CONFIG } from './runtime-config.ts';
 
 const modelRefSchema = z
   .object({
@@ -47,8 +48,8 @@ const providerConfigSchema = z
       .optional(),
     parameters: z
       .object({
-        maxRetries: z.number().int().min(0).max(1).default(0),
-        maxRetryDelayMs: z.number().int().min(1).max(5000).default(2000),
+        maxRetries: z.number().int().min(RUNTIME_CONFIG.ranges.maxRetries.min).max(RUNTIME_CONFIG.ranges.maxRetries.max).default(RUNTIME_CONFIG.provider.maxRetries),
+        maxRetryDelayMs: z.number().int().min(RUNTIME_CONFIG.ranges.maxRetryDelayMs.min).max(RUNTIME_CONFIG.ranges.maxRetryDelayMs.max).default(RUNTIME_CONFIG.provider.maxRetryDelayMs),
       })
       .strict(),
   })
@@ -59,8 +60,8 @@ const providerRequestSchema = z
     goal: z.string().min(1),
     text: z.string(),
     config: providerConfigSchema,
-    timeoutMs: z.number().int().min(100).max(120_000).default(60_000),
-    stopGraceMs: z.number().int().min(100).max(10_000).default(5000),
+    timeoutMs: z.number().int().min(RUNTIME_CONFIG.ranges.providerTestTimeoutMs.min).max(RUNTIME_CONFIG.ranges.providerTestTimeoutMs.max).default(RUNTIME_CONFIG.request.timeoutMs),
+    stopGraceMs: z.number().int().min(RUNTIME_CONFIG.ranges.stopGraceMs.min).max(RUNTIME_CONFIG.ranges.stopGraceMs.max).default(RUNTIME_CONFIG.request.stopGraceMs),
   })
   .strict();
 

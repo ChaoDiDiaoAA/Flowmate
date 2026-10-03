@@ -10,6 +10,10 @@ import {
   normalizeSessionRunsRequest,
   normalizeSessionMessagesRequest,
   invoiceToolSchemas,
+  RunToolCallsRequestSchema,
+  RunToolCallRequestSchema,
+  RuntimeToolViewSchema,
+  RuntimeToolPageSchema,
   ok,
 } from '@flowmate/contracts';
 import type {
@@ -34,8 +38,11 @@ import type {
   SessionRunsRequest,
   SessionSnapshot,
   NativeToolAvailability,
+  ToolCallSnapshot,
+  RuntimeToolView,
 } from '@flowmate/contracts';
-import type { BusinessEventRepository, DocumentRepository, JobRepository, RunRepository } from './storage/repositories.ts';
+import type { BusinessEventRepository, DocumentRepository, JobRepository, RunRepository, ToolCallRepository } from './storage/repositories.ts';
+import type { EventService } from './events/service.ts';
 import type { SessionService } from './sessions/service.ts';
 import type { WorkspaceService } from './workspace/service.ts';
 import type { JobService } from './jobs/service.ts';
@@ -63,6 +70,8 @@ type ProductApplicationOptions = {
   jobs: JobRepository;
   candidates: CandidateRepository;
   events: BusinessEventRepository;
+  runtimeEvents?: EventService;
+  toolCalls?: Pick<ToolCallRepository, 'list' | 'getById'>;
   invoiceForms?: Pick<InvoiceFormService, 'query'>;
   invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'queryOperation'>;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
@@ -96,6 +105,43 @@ export function makeApplication(
       return normalized.ok ? runtime.callProvider(normalized.data, control) : normalized;
     },
     queryRun: async (runId) => isDbId(runId) ? runs.get(runId) : fail(appError('input_invalid', 'input', 'Run ID 无效。')),
+    queryRuntimeEvents: async input => products?.runtimeEvents?.query(input) ?? ({ ok: false,
+      error: appError('runtime_events_unavailable', 'runtime', 'Runtime 事件服务尚未组装。', true), context: null }),
+    subscribeRuntimeEvents: async (input, listener) => products?.runtimeEvents?.subscribe(input, listener)
+      ?? fail(appError('runtime_events_unavailable', 'runtime', 'Runtime 事件服务尚未组装。', true)),
+    listRunToolCalls: async raw => {
+      if (!products?.toolCalls) return fail(appError('tool_calls_unavailable', 'storage', 'Run 工具查询尚未组装。', true));
+      const parsed = RunToolCallsRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run tool query is invalid.'));
+      const { runId, sessionId, beforeId, limit } = parsed.data;
+      const run = runs.get(runId);
+      if (!run.ok) return run;
+      if ((run.data.kind === 'provider' ? null : run.data.sessionId) !== sessionId)
+        return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.', false, runId));
+      if (run.data.kind === 'provider') return ok({ items: [], nextBeforeId: null });
+      const calls = products.toolCalls.list({ runId, ...(beforeId === undefined ? {} : { beforeId }), limit });
+      if (!calls.ok) return calls;
+      try {
+        if (calls.data.items.some(call => call.runId !== runId || call.sessionId !== sessionId)) throw new Error('ownership');
+        return ok(RuntimeToolPageSchema.parse({ items: calls.data.items.map(toolView), nextBeforeId: calls.data.nextBeforeId }));
+      } catch { return fail(appError('storage_corrupt', 'storage', 'Run tools could not be projected.')); }
+    },
+    queryRunToolCall: async raw => {
+      if (!products?.toolCalls) return fail(appError('tool_calls_unavailable', 'storage', 'Run 工具查询尚未组装。', true));
+      const parsed = RunToolCallRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run tool query is invalid.'));
+      const { runId, sessionId, toolCallId } = parsed.data;
+      const run = runs.get(runId);
+      if (!run.ok) return run;
+      if (run.data.kind !== 'agent' || run.data.sessionId !== sessionId)
+        return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.', false, runId));
+      const call = products.toolCalls.getById(toolCallId);
+      if (!call.ok) return call;
+      if (call.data.runId !== runId || call.data.sessionId !== sessionId)
+        return fail(appError('state_conflict', 'runtime', 'Tool call does not belong to this Run.', false, runId));
+      try { return ok(toolView(call.data)); }
+      catch { return fail(appError('storage_corrupt', 'storage', 'Run tool could not be projected.')); }
+    },
     createSession: async (raw = {}) => {
       const normalized = normalizeCreateSessionRequest(raw);
       return normalized.ok ? sessions?.create(normalized.data) ?? fail(sessionServiceUnavailable()) : normalized;
@@ -313,6 +359,15 @@ export function makeApplication(
     };
     return ok(report);
   }
+}
+
+function toolView(call: ToolCallSnapshot): RuntimeToolView {
+  return RuntimeToolViewSchema.parse({ toolCallId: call.toolCallId, runId: call.runId, sessionId: call.sessionId,
+    toolName: call.toolName, status: call.status, requestedAt: call.requestedAt, startedAt: call.startedAt,
+    endedAt: call.endedAt, stoppedAt: call.stoppedAt, committedCandidateId: call.result?.committedCandidateId ?? null,
+    errorCode: call.result && call.result.status !== 'succeeded' ? call.result.error.code : null,
+    stopped: typeof call.cleanup.stopped === 'boolean' ? call.cleanup.stopped : null,
+    deliveryState: call.delivery.state, formApplicationOutcome: call.formApplication?.outcome ?? null });
 }
 
 function normalizePageRequest(value: unknown, allowedExtra: readonly string[] = []): Result<{ beforeId?: number; limit: number }> {

@@ -16,7 +16,7 @@ import {
   type AgentToolResult,
   type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
-import { appError, fail, ok } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, ok } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
   AgentObservation,
@@ -56,11 +56,12 @@ import { normalizeUsage, modelRuntimeSnapshot, observedFetch, prepareModelRuntim
 import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import { toPiTool } from './tools.ts';
 import { getNativeToolParameters } from './native-tools.ts';
+import { projectSessionEvent } from './events.ts';
 import { formatExecutionPrompt, validateNativeHistory, validateModelMessages, projectSessionMessages, projectMessageView } from './messages.ts';
 
-const maxContextBytes = 512 * 1024;
-const maxOutputBytes = 256 * 1024;
-const maxAssistantContentBytes = 512 * 1024;
+const maxContextBytes = RUNTIME_CONFIG.llmPayload.maxChatContextBytes;
+const maxOutputBytes = RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
+const maxAssistantContentBytes = RUNTIME_CONFIG.llmPayload.maxAssistantContentBytes;
 const encoder = new TextEncoder();
 
 type AgentStream = AgentSession['agent']['streamFunction'];
@@ -675,9 +676,23 @@ export class PiAgentAdapter implements AgentPort {
         this.dependencies.sessionSetup?.(session);
         const beforeToolCall = session.agent.beforeToolCall;
         session.agent.beforeToolCall = async (context, hookSignal) => {
+          const toolCall = context.toolCall;
+          const original = structuredClone(toolCall);
           const request = record.active?.toolRequests.get(context.toolCall.id);
           if (request) request.failureStage = 'sdk_before';
-          const result = await beforeToolCall?.(context, hookSignal);
+          let result;
+          let changed = false;
+          try { result = await beforeToolCall?.(context, hookSignal); }
+          finally {
+            changed = context.toolCall !== toolCall || !isDeepStrictEqual(toolCall, original);
+            if (changed) {
+              // The SDK retains this raw block for execution, result identity, and history.
+              for (const key of Object.keys(toolCall)) Reflect.deleteProperty(toolCall, key);
+              Object.assign(toolCall, original);
+              if (request) request.raw = toolCall.arguments;
+            }
+          }
+          if (changed) result = { block: true, reason: 'The SDK before hook changed the original tool request.' };
           if (request && result?.block) request.sdkBlocked = true;
           return result;
         };
@@ -762,13 +777,14 @@ export class PiAgentAdapter implements AgentPort {
       const taskAgent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts = policy !== 'p2' ? {
         policyVersion: 'p3-invoice-tools-v1', nativeSessionId, systemPrompt: session.systemPrompt,
         thinkingLevel: session.thinkingLevel, resourcePolicy: 'none', historyPolicy: 'memory-only',
-        maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 16,
-        maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false,
+        maxContextBytes: RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes, maxOutputBytes, maxAssistantContentBytes,
+        maxModelCalls: RUNTIME_CONFIG.runBudget.maxModelCalls.workspace,
+        maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs, sessionRetry: false,
       } : {
-        ...(record.sessionInputs ? { policyVersion: 'p5-session-inputs-v1' as const, maxModelCalls: 12 as const }
+        ...(record.sessionInputs ? { policyVersion: 'p5-session-inputs-v1' as const, maxModelCalls: RUNTIME_CONFIG.runBudget.maxModelCalls.chat }
           : { policyVersion: 'p2-invoice-chat-v1' as const, maxModelCalls: 1 as const }), nativeSessionId, systemPrompt: session.systemPrompt,
         thinkingLevel: session.thinkingLevel, resourcePolicy: 'none', historyPolicy: 'memory-only',
-        maxContextBytes: 524_288, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, sessionRetry: false,
+        maxContextBytes, maxOutputBytes, maxAssistantContentBytes, sessionRetry: false,
       };
       const agent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts = options?.runtimeBudget
         ? { ...taskAgent, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : taskAgent;
@@ -817,7 +833,7 @@ export class PiAgentAdapter implements AgentPort {
       }
       // Awareness is a request-local copy; native history and the saved system prompt remain authoritative.
       const requestContext = this.withRuntimeAwareness(active, context, modelCallLimit, remainingMs);
-      const contextLimit = active.p3 ? 8_388_608 : maxContextBytes;
+      const contextLimit = active.p3 ? RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes : maxContextBytes;
       let contextSize: number;
       try {
         contextSize = encoder.encode(JSON.stringify(requestContext)).byteLength;
@@ -1195,7 +1211,7 @@ export class PiAgentAdapter implements AgentPort {
       this.observe(active, 'response_started', { callSequence: active.callSequence, attempt: active.attempts || 1, status: response.status });
     };
     try {
-      const requestTimeoutMs = Math.floor(Math.min(record.snapshot?.limits.timeoutMs ?? 60_000,
+      const requestTimeoutMs = Math.floor(Math.min(record.snapshot?.limits.timeoutMs ?? RUNTIME_CONFIG.request.timeoutMs,
         active.input.remainingRunMs?.() ?? Infinity));
       if (!(requestTimeoutMs > 0)) {
         const error = appError('agent_timeout', 'runtime', 'The Run deadline elapsed before dispatch.');
@@ -1497,22 +1513,8 @@ export class PiAgentAdapter implements AgentPort {
           event.type !== 'message_end' && assistant ? 'streaming' : 'ended');
         if (event.type === 'message_end' && assistant) delete active.assistantOrdinal;
       }
-      const name = event.type;
-      if (name === 'agent_start' || name === 'agent_end' || name === 'agent_settled'
-        || name === 'turn_start' || name === 'turn_end' || name === 'message_start'
-        || name === 'message_update' || name === 'message_end'
-        || name === 'tool_execution_start' || name === 'tool_execution_update' || name === 'tool_execution_end') {
-        const message = 'message' in event ? event.message : undefined;
-        const role = message?.role === 'user' || message?.role === 'assistant' || message?.role === 'toolResult' ? message.role : undefined;
-        this.observe(active, 'agent_event', {
-          eventName: name,
-          ...(role ? { role } : {}),
-          ...(message?.role === 'assistant' && message.stopReason ? { stopReason: message.stopReason } : {}),
-          ...(name.startsWith('turn_') ? { turnOrdinal: active.turnOrdinal } : {}),
-          ...(name === 'message_update' && event.assistantMessageEvent.type === 'text_delta'
-            ? { textBytes: encoder.encode(event.assistantMessageEvent.delta).byteLength } : {}),
-        });
-      }
+      const projected = projectSessionEvent(event, active.turnOrdinal);
+      if (projected) this.observe(active, 'agent_event', projected);
     });
     const unsubscribeAgent = session.agent.subscribe((event, eventSignal) => this.observeAgentEvent(record, active, event, eventSignal));
     const onAbort = () => this.stop(record, active);

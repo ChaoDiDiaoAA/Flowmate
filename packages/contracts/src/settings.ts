@@ -66,6 +66,7 @@ export type DesktopEvent =
   | { type: 'provider_observation'; requestId: string; runId: number; sequence: number; observation: string; at: string; data: Readonly<Record<string, unknown>> }
   | { type: 'provider_finished'; requestId: string; runId: number; result: import('./runtime.ts').Result<import('./runtime.ts').ProviderOutcome> }
   | { type: 'host_state'; state: DesktopState }
+  | import('./events.ts').RuntimeEventsWake
   | import('./runtime.ts').AgentRunEvent;
 
 export type DesktopAgentRunRequest = {
@@ -182,6 +183,11 @@ export type DesktopBridge = {
   cancelRun(runId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: import('./runtime.ts').DbId }>>;
   queryRuntimeState(): Promise<import('./runtime.ts').Result<import('./runtime.ts').RuntimeState>>;
   queryRun(runId: number): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunSnapshot>>;
+  queryRuntimeEvents(input: import('./events.ts').RuntimeEventsQuery): Promise<import('./events.ts').RuntimeEventsReadResult>;
+  subscribeRuntimeEvents(input: import('./events.ts').RuntimeEventsSubscriptionRequest): Promise<import('./runtime.ts').Result<import('./events.ts').RuntimeSubscriptionInfo>>;
+  unsubscribeRuntimeEvents(subscriptionId: string): Promise<import('./runtime.ts').Result<void>>;
+  listRunToolCalls(input: import('./events.ts').RunToolCallsRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./events.ts').RuntimeToolView>>>;
+  queryRunToolCall(input: import('./events.ts').RunToolCallRequest): Promise<import('./runtime.ts').Result<import('./events.ts').RuntimeToolView>>;
   readWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
   updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
   startTask(input: import('./workspace.ts').StartTaskRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').TaskOperation>>;

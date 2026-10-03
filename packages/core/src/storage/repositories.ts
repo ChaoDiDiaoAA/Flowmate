@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { associateInputResult, completeSessionInputs, createSessionInputLedger, finishSessionInputs, markInputConsumed, recoverSessionInputs } from '../sessions/input-ledger.ts';
 import type { InputResultBatch, SessionInputAdmission } from '../sessions/input-ledger.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeBudgetOverridesSchema, RuntimeStrategySnapshotSchema, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
+import type { RuntimeEventStore } from '../events/store.ts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -47,6 +48,7 @@ import type {
   WorkspaceExpectation,
   WorkspaceContext,
   WorkspaceInput,
+  SessionInputContentV2,
   GoalMode,
   SelectCandidateRequest,
   CandidateSelection,
@@ -85,6 +87,9 @@ import { StoredCandidateDraftSchema, SaveInvoiceCandidateRequestSchema, AcceptIn
   RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields,
   invoiceFieldDisplayValue, isLegalInvoiceNormalizedValue } from '@flowmate/contracts';
 import { InvoiceCandidateOperationQuerySchema } from '@flowmate/contracts';
+
+import { MAX_TOOL_NAME_CHARS, MAX_TOOL_VERSION_CHARS, MAX_INVOICE_PAGES,
+  MAX_INVOICE_CHECKS, MAX_INVOICE_ISSUES, MAX_INVOICE_TOOL_PAGE_SIZE } from '@flowmate/contracts';
 
 export type ValidateHumanInvoice = (draft: StoredCandidateDraft, documentRef: { id: DbId; version: string }) =>
   Result<{ checks: CheckResult[]; issues: InvoiceIssue[] }>;
@@ -305,6 +310,7 @@ export interface RunRepository {
   createAgent(input: NewAgentRun): Result<DbId>;
   createWorkspaceAgent(input: NewWorkspaceAgentRun): Result<WorkspaceRunAdmission>;
   freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }): Result<SessionInputAdmission>;
+  verifyInputUse(content: SessionInputContentV2): Result<void>;
   listBySession(request: NormalizedSessionRunsRequest): Result<{ items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null }>;
   start(runId: DbId, config: SafeConfigSnapshot, startedAt: string): Result<void>;
   recordCancel(runId: DbId, requestedAt: string): Result<boolean>;
@@ -389,6 +395,13 @@ function validatedInput(value: unknown): InputRecord {
   return v1 as unknown as InputRecordV1;
 }
 
+// 已保存 runtime-v1 的预算协议范围固定；不随新请求的可配置范围改变。
+const storedRuntimeBudgetSchema = z.object({
+  maxToolCalls: z.number().int().min(0).max(100),
+  maxModelCalls: z.number().int().min(1).max(64),
+  toolTimeoutMs: z.number().int().min(100).max(1_800_000),
+}).strict();
+
 function validatedAgentConfig(value: unknown): Record<string, unknown> {
   const agent = object(value, 'config_agent');
   const commonInvalid = typeof agent.nativeSessionId !== 'string'
@@ -412,7 +425,7 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
     || !['p2-invoice-chat-v1', 'p3-invoice-tools-v1', 'p5-session-inputs-v1'].includes(String(agent.taskPolicyVersion))
     || agent.maxContextBytes !== (agent.taskPolicyVersion === 'p3-invoice-tools-v1' ? 8_388_608 : 524_288)
     || agent.maxOutputBytes !== 262_144 || agent.maxAssistantContentBytes !== 524_288
-    || !RuntimeBudgetOverridesSchema.required().safeParse({ maxToolCalls: agent.maxToolCalls,
+    || !storedRuntimeBudgetSchema.safeParse({ maxToolCalls: agent.maxToolCalls,
       maxModelCalls: agent.maxModelCalls, toolTimeoutMs: agent.toolTimeoutMs }).success);
   if (p2Invalid || p3Invalid || p5Invalid || runtimeInvalid
     || !['p2-invoice-chat-v1', 'p3-invoice-tools-v1', 'p5-session-inputs-v1', 'runtime-v1'].includes(String(agent.policyVersion))) {
@@ -442,7 +455,7 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
     if ((raw.version === 2) !== (agent.policyVersion === 'runtime-v1')) throw new Error('invalid_runtime_config_version');
     if (raw.version === 2 && record.runtimeBudget === undefined) throw new Error('missing_runtime_budget');
     if (record.runtimeBudget !== undefined) {
-      const budget = RuntimeBudgetOverridesSchema.required().parse(record.runtimeBudget);
+      const budget = storedRuntimeBudgetSchema.parse(record.runtimeBudget);
       if (budget.maxToolCalls !== agent.maxToolCalls || budget.maxModelCalls !== agent.maxModelCalls
         || budget.toolTimeoutMs !== agent.toolTimeoutMs) throw new Error('invalid_runtime_config_budget');
     }
@@ -694,7 +707,7 @@ function documentSnapshot(value: unknown): DocumentSnapshot {
     ...(hasSampleId ? ['sampleId'] : []),
   ]);
   if (metadata.version !== 2 || !Number.isSafeInteger(metadata.pageCount) || Number(metadata.pageCount) < 1
-    || Number(metadata.pageCount) > 20
+    || Number(metadata.pageCount) > MAX_INVOICE_PAGES
     || !Array.isArray(metadata.warnings) || !metadata.warnings.every((item) => typeof item === 'string')
     || !Array.isArray(metadata.allowedUsesClaim) || !metadata.allowedUsesClaim.every((item) => typeof item === 'string')
     || typeof metadata.licenseVerification !== 'string'
@@ -802,8 +815,8 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.run_id) || row.run_id < 1
     || !Number.isSafeInteger(row.session_id) || row.session_id < 1 || typeof row.native_tool_call_id !== 'string'
     || row.native_tool_call_id.length < 1 || row.native_tool_call_id.length > 256 || typeof row.tool_name !== 'string'
-    || row.tool_name.length < 1 || row.tool_name.length > 128
-    || (row.tool_version !== null && (typeof row.tool_version !== 'string' || row.tool_version.length < 1 || row.tool_version.length > 32))
+    || row.tool_name.length < 1 || row.tool_name.length > MAX_TOOL_NAME_CHARS
+    || (row.tool_version !== null && (typeof row.tool_version !== 'string' || row.tool_version.length < 1 || row.tool_version.length > MAX_TOOL_VERSION_CHARS))
     || (row.effect !== null && !ToolEffectSchema.safeParse(row.effect).success)
     || !['requested', 'running', 'succeeded', 'failed', 'cancelled'].includes(row.status)
     || typeof row.requested_at !== 'string'
@@ -900,8 +913,8 @@ function candidateSnapshot(value: unknown): { snapshot: CandidateSnapshot; docum
   }
   const candidate = (row.origin === 'human_edit' ? StoredCandidateDraftSchema : CandidateDraftSchema)
     .parse({ fields: fields.values, lines: lines.items, notes: persisted.notes });
-  const checks = z.array(CheckResultSchema).max(1_000).parse(persisted.checks);
-  const issues = z.array(InvoiceIssueSchema).max(1_000).parse(persisted.items);
+  const checks = z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS).parse(persisted.checks);
+  const issues = z.array(InvoiceIssueSchema).max(MAX_INVOICE_ISSUES).parse(persisted.items);
   const sourceMap = new Map<string, CandidateDraft['fields'][keyof CandidateDraft['fields']]['sources'][number]>();
   const fieldsToRead = [...Object.values(candidate.fields), ...candidate.lines.flatMap((line) => Object.values(line))];
   for (const field of fieldsToRead) for (const source of field.sources) {
@@ -1407,7 +1420,27 @@ export function createJobRepository(db: Database): JobRepository {
   };
 }
 
-export function createToolCallRepository(db: Database): ToolCallRepository {
+function appendToolState(db: Database, events: RuntimeEventStore | undefined, toolCallId: DbId,
+  type: 'tool_requested' | 'tool_started' | 'tool_succeeded' | 'tool_failed' | 'tool_cancelled', origin: 'live' | 'recovery' = 'live'): void {
+  if (!events) return;
+  const row = db.query('SELECT run_id,session_id,status,tool_name,requested_at,started_at,ended_at,result_json,cleanup_json FROM tool_calls WHERE id=?')
+    .get(toolCallId) as { run_id: number; session_id: number; status: ToolCallStatus; tool_name: string; requested_at: string;
+      started_at: string | null; ended_at: string | null; result_json: string | null; cleanup_json: string } | null;
+  if (!row) throw new Error('event_tool_missing');
+  const result = row.result_json === null ? null : object(readJson(row.result_json, 'tool_result'), 'tool_result');
+  const cleanup = object(readJson(row.cleanup_json, 'tool_cleanup'), 'tool_cleanup');
+  const error = result?.error === undefined ? null : object(result.error, 'tool_error');
+  events.appendInTransaction({ runId: row.run_id, sessionId: row.session_id, toolCallId, type,
+    occurredAt: (type === 'tool_requested' ? row.requested_at : type === 'tool_started' ? row.started_at : row.ended_at)!,
+    dedupeKey: `tool:${toolCallId}:${type === 'tool_requested' ? 'requested' : type === 'tool_started' ? 'started' : 'terminal'}`,
+    payload: { version: 1, status: row.status, origin, toolName: row.tool_name,
+      stopped: typeof cleanup.stopped === 'boolean' ? cleanup.stopped : null,
+      committedCandidateId: typeof result?.committedCandidateId === 'number' ? result.committedCandidateId : null,
+      errorCode: typeof error?.code === 'string' ? error.code : null } });
+}
+
+export function createToolCallRepository(db: Database, events?: RuntimeEventStore): ToolCallRepository {
+  const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
   const byId = (toolCallId: DbId) => {
     const row = db.query('SELECT * FROM tool_calls WHERE id=?').get(toolCallId);
     if (!row) return fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
@@ -1433,13 +1466,13 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
       try {
         if (!Number.isSafeInteger(input.runId) || input.runId < 1 || !Number.isSafeInteger(input.sessionId) || input.sessionId < 1
           || typeof input.nativeToolCallId !== 'string' || input.nativeToolCallId.length < 1 || input.nativeToolCallId.length > 256
-          || typeof input.toolName !== 'string' || input.toolName.length < 1 || input.toolName.length > 128
-          || input.toolVersion !== null && (typeof input.toolVersion !== 'string' || input.toolVersion.length < 1 || input.toolVersion.length > 32)
+          || typeof input.toolName !== 'string' || input.toolName.length < 1 || input.toolName.length > MAX_TOOL_NAME_CHARS
+          || input.toolVersion !== null && (typeof input.toolVersion !== 'string' || input.toolVersion.length < 1 || input.toolVersion.length > MAX_TOOL_VERSION_CHARS)
           || input.effect !== null && !ToolEffectSchema.safeParse(input.effect).success
           || (input.toolVersion === null) !== (input.effect === null)) return fail(appError('input_invalid', 'input', '原生 ToolCall 身份无效。'));
         const raw = JSON.stringify(input.rawArguments);
         if (raw === undefined || !NATIVE_TOOL_NAMES.includes(input.toolName as (typeof NATIVE_TOOL_NAMES)[number])
-          && Buffer.byteLength(raw, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', 'ToolCall 参数超过记录上限。'));
+          && Buffer.byteLength(raw, 'utf8') > TOOL_CONFIG.payload.maxRawArgumentsBytes) return fail(appError('tool_result_too_large', 'input', 'ToolCall 参数超过记录上限。'));
         const existing = db.query('SELECT * FROM tool_calls WHERE session_id=? AND native_tool_call_id=?')
           .get(input.sessionId, input.nativeToolCallId);
         if (existing) {
@@ -1453,7 +1486,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
         const run = db.query("SELECT session_id,status FROM runs WHERE id=? AND kind='agent'").get(input.runId) as { session_id: number; status: string } | null;
         if (!run || run.session_id !== input.sessionId) return fail(appError('tool_access_denied', 'runtime', 'ToolCall 与可信 Agent Run 不匹配.'));
         if (!['created', 'running'].includes(run.status)) return fail(appError('run_state_invalid', 'runtime', 'Run 已停止接纳新的 ToolCall。'));
-        const id = transaction(db, () => {
+        const id = writeTransaction(() => {
           const inserted = db.query(`INSERT INTO tool_calls(run_id,session_id,native_tool_call_id,tool_name,tool_version,effect,args_json,
             delivery_json,cleanup_json,requested_at) VALUES (?,?,?,?,?,?,?, ?,?,?)`)
             .run(input.runId, input.sessionId, input.nativeToolCallId, input.toolName, input.toolVersion, input.effect,
@@ -1464,6 +1497,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           const counted = db.query("UPDATE runs SET tool_call_count=tool_call_count+1 WHERE id=? AND status IN ('created','running')")
             .run(input.runId).changes;
           if (counted !== 1) throw new Error('tool_call_run_closed');
+          appendToolState(db, events, Number(inserted.lastInsertRowid), 'tool_requested');
           return Number(inserted.lastInsertRowid);
         });
         if (!id.ok) return id;
@@ -1520,7 +1554,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
               SELECT 1 FROM json_each(run.config_json,'$.runtimeStrategy.calibration.groups') strategy
               WHERE json_extract(strategy.value,'$.groupKey')=? AND json_extract(strategy.value,'$.toolName')=tool.tool_name
               AND json_extract(strategy.value,'$.toolVersion')=tool.tool_version))
-          ORDER BY tool.id DESC LIMIT 200`).all(input.cutoff, input.groupKey, input.groupKey);
+          ORDER BY tool.id DESC LIMIT ?`).all(input.cutoff, input.groupKey, input.groupKey, TOOL_CONFIG.statistics.maxAttempts);
         return ok(rows.map(row => toolCallSnapshot(db, row)));
       } catch { return fail(appError('storage_corrupt', 'storage', 'Runtime observations could not be read.')); }
     },
@@ -1528,8 +1562,8 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
     recentObservations(input) {
       try {
         return ok(db.query(`SELECT * FROM tool_calls WHERE runtime_observation_json IS NOT NULL
-          AND json_extract(runtime_observation_json,'$.groupKey')=? AND id<=? ORDER BY id DESC LIMIT 200`)
-          .all(input.groupKey, input.cutoff).map(row => toolCallSnapshot(db, row)));
+          AND json_extract(runtime_observation_json,'$.groupKey')=? AND id<=? ORDER BY id DESC LIMIT ?`)
+          .all(input.groupKey, input.cutoff, TOOL_CONFIG.statistics.maxAttempts).map(row => toolCallSnapshot(db, row)));
       } catch { return fail(appError('storage_corrupt', 'storage', 'Runtime experience could not be read.')); }
     },
 
@@ -1625,7 +1659,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
         if (!before.ok) return before;
         const serialized = JSON.stringify(input.finalArguments);
         if (serialized === undefined || !NATIVE_TOOL_NAMES.includes(before.data.toolName as (typeof NATIVE_TOOL_NAMES)[number])
-          && Buffer.byteLength(serialized, 'utf8') > 65_536) return fail(appError('tool_result_too_large', 'input', 'ToolCall 最终参数超过记录上限.'));
+          && Buffer.byteLength(serialized, 'utf8') > TOOL_CONFIG.payload.maxFinalArgumentsBytes) return fail(appError('tool_result_too_large', 'input', 'ToolCall 最终参数超过记录上限.'));
         const changed = db.query(`UPDATE tool_calls SET args_json=json_set(args_json,'$.final',json(?)) WHERE id=? AND status='requested' AND json_type(args_json,'$.final')='null'`)
           .run(serialized, input.toolCallId).changes;
         if (changed === 1) return byId(input.toolCallId);
@@ -1640,18 +1674,24 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
 
     start(input) {
       try {
-        const changed = db.query("UPDATE tool_calls SET status='running',started_at=? WHERE id=? AND status='requested' AND json_type(args_json,'$.final')!='null'")
-          .run(input.startedAt, input.toolCallId).changes;
-        if (changed === 1) return byId(input.toolCallId);
-        const current = byId(input.toolCallId);
-        return current.ok && current.data.status === 'running' ? current
-          : fail(appError('run_state_invalid', 'runtime', 'ToolCall 未处于可执行状态。'));
+        const started = writeTransaction(() => {
+          const changed = db.query("UPDATE tool_calls SET status='running',started_at=? WHERE id=? AND status='requested' AND json_type(args_json,'$.final')!='null'")
+            .run(input.startedAt, input.toolCallId).changes;
+          if (changed === 1) {
+            appendToolState(db, events, input.toolCallId, 'tool_started');
+            return byId(input.toolCallId);
+          }
+          const current = byId(input.toolCallId);
+          return current.ok && current.data.status === 'running' ? current
+            : fail(appError('run_state_invalid', 'runtime', 'ToolCall 未处于可执行状态。'));
+        });
+        return started.ok ? started.data : started;
       } catch { return fail(databaseError('ToolCall 执行状态保存失败。')); }
     },
 
     finish(input) {
       try {
-        const completed = transaction(db, () => {
+        const completed = writeTransaction(() => {
           if (!['succeeded', 'failed', 'cancelled'].includes(input.result.status)
             || !Array.isArray(input.cleanup.errors) || (input.result.status === 'succeeded' && (!input.cleanup.stopped || input.stoppedAt === null))) {
             return fail(appError('input_invalid', 'storage', 'ToolCall 终态事实无效。'));
@@ -1682,11 +1722,15 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           const formApplication = before.data.formApplication ?? incoming.formApplication;
           const serialized = JSON.stringify({ ...incoming, ...(formApplication === undefined ? {} : { formApplication }) });
           if (!NATIVE_TOOL_NAMES.includes(before.data.toolName as (typeof NATIVE_TOOL_NAMES)[number])
-            && Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
+            && Buffer.byteLength(serialized, 'utf8') > TOOL_CONFIG.payload.maxStoredResultEnvelopeBytes) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
           const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=?,runtime_observation_json=?
             WHERE id=? AND status='running'`).run(input.result.status, serialized, JSON.stringify(cleanup), input.endedAt,
             input.stoppedAt, observation === null ? null : JSON.stringify(observation), input.toolCallId).changes;
-          if (changed === 1) return byId(input.toolCallId);
+          if (changed === 1) {
+            appendToolState(db, events, input.toolCallId, input.result.status === 'succeeded' ? 'tool_succeeded'
+              : input.result.status === 'failed' ? 'tool_failed' : 'tool_cancelled');
+            return byId(input.toolCallId);
+          }
           return fail(appError('state_conflict', 'runtime', 'ToolCall 终态已固定或状态已变化。'));
         });
         return completed.ok ? completed.data : completed;
@@ -1695,7 +1739,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
 
     reject(input) {
       try {
-        const rejected = transaction(db, () => {
+        const rejected = writeTransaction(() => {
           if (!['failed', 'cancelled'].includes(input.result.status) || input.cleanup.version !== 1
             || input.cleanup.stopped !== true || !Array.isArray(input.cleanup.errors)) {
             return fail(appError('input_invalid', 'storage', '未执行调用的终态事实无效。'));
@@ -1720,11 +1764,14 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
           }
           const formApplication = before.data.formApplication ?? incoming.formApplication;
           const serialized = JSON.stringify({ ...incoming, ...(formApplication === undefined ? {} : { formApplication }) });
-          if (Buffer.byteLength(serialized, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
+          if (Buffer.byteLength(serialized, 'utf8') > TOOL_CONFIG.payload.maxStoredResultEnvelopeBytes) return fail(appError('tool_result_too_large', 'storage', 'ToolCall 结果超过记录上限。'));
           const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=NULL,runtime_observation_json=?
             WHERE id=? AND status='requested'`).run(input.result.status, serialized, JSON.stringify(input.cleanup), input.endedAt,
             observation === null ? null : JSON.stringify(observation), input.toolCallId).changes;
-          if (changed === 1) return byId(input.toolCallId);
+          if (changed === 1) {
+            appendToolState(db, events, input.toolCallId, input.result.status === 'failed' ? 'tool_failed' : 'tool_cancelled');
+            return byId(input.toolCallId);
+          }
           return fail(appError('state_conflict', 'runtime', 'ToolCall 已开始或终态已固定。'));
         });
         return rejected.ok ? rejected.data : rejected;
@@ -1753,7 +1800,7 @@ export function createToolCallRepository(db: Database): ToolCallRepository {
       if (!Number.isSafeInteger(input.toolCallId) || input.toolCallId < 1 || !parsed.success) {
         return fail(appError('input_invalid', 'input', '表单应用回执无效。'));
       }
-      const recorded = transaction(db, () => {
+      const recorded = writeTransaction(() => {
         const before = byId(input.toolCallId);
         if (!before.ok) return before;
         try { validateFormApplication(db, before.data, parsed.data); }
@@ -2058,8 +2105,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         }
         const validation = validate(candidate, facts.data.job.documentRef);
         if (!validation.ok) return validation;
-        const checks = z.array(CheckResultSchema).max(1_000).parse(validation.data.checks);
-        const issues = z.array(InvoiceIssueSchema).max(1_000).parse(validation.data.issues);
+        const checks = z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS).parse(validation.data.checks);
+        const issues = z.array(InvoiceIssueSchema).max(MAX_INVOICE_ISSUES).parse(validation.data.issues);
         const fieldsJson = asJson({ version: 1, values: candidate.fields, editRequestHash: hash });
         const linesJson = asJson({ version: 1, items: candidate.lines });
         const issuesJson = asJson({ version: 1, notes: candidate.notes, checks, items: issues });
@@ -2130,8 +2177,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
     save(input) {
       try {
         const draft = CandidateDraftSchema.parse(input.candidate);
-        const checks = z.array(CheckResultSchema).max(1_000).parse(input.checks);
-        const issues = z.array(InvoiceIssueSchema).max(1_000).parse(input.issues);
+        const checks = z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS).parse(input.checks);
+        const issues = z.array(InvoiceIssueSchema).max(MAX_INVOICE_ISSUES).parse(input.issues);
         const finalArgs = JSON.stringify({ documentId: input.documentId, candidate: draft });
         if (Buffer.byteLength(finalArgs, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', '候选参数超过保存上限。'));
         const committed = transaction(db, () => {
@@ -2236,7 +2283,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
 
     listForRun(input) {
       try {
-        if (!Number.isSafeInteger(input.runId) || input.runId < 1 || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 50
+        if (!Number.isSafeInteger(input.runId) || input.runId < 1 || !Number.isSafeInteger(input.limit)
+          || input.limit < 1 || input.limit > MAX_INVOICE_TOOL_PAGE_SIZE
           || input.beforeSequence !== null && (!Number.isSafeInteger(input.beforeSequence) || input.beforeSequence < 1)) {
           return fail(appError('input_invalid', 'input', '候选分页参数无效。'));
         }
@@ -2328,6 +2376,26 @@ const usageKeys: readonly (keyof SdkUsageValues)[] = [
   'costInput', 'costOutput', 'costCacheRead', 'costCacheWrite', 'costTotal',
 ];
 
+function tokenConflicts(current: TokenColumns, incoming: TokenColumns): boolean {
+  return (['inputTokens', 'outputTokens', 'totalTokens', 'cost'] as const)
+    .some(key => current[key] !== null && incoming[key] !== null && current[key] !== incoming[key]);
+}
+function usageConflicts(current: UsageRecord, incoming: UsageRecord): boolean {
+  if ((current.attemptsComplete || incoming.attemptsComplete) && current.attempts !== null && incoming.attempts !== null
+    && current.attempts !== incoming.attempts) return true;
+  if (usageKeys.some(key => current.sdkValues?.[key] != null && incoming.sdkValues?.[key] != null
+    && current.sdkValues[key] !== incoming.sdkValues[key])) return true;
+  if (current.version !== 2 || incoming.version !== 2) return false;
+  return current.calls.some(call => {
+    const next = incoming.calls.find(value => value.callSequence === call.callSequence);
+    return next !== undefined && (usageConflicts(call.usage, next.usage) || tokenConflicts(call.tokens, next.tokens));
+  });
+}
+function usageFacts(usage: UsageRecord): unknown {
+  const { updatedAt: _updatedAt, ...facts } = usage;
+  return usage.version === 2 ? { ...facts, calls: usage.calls.map(call => ({ ...call, usage: usageFacts(call.usage) })) } : facts;
+}
+
 function mergeUsage(current: UsageRecordV1, incoming: UsageRecordV1): UsageRecordV1;
 function mergeUsage(current: UsageRecord, incoming: UsageRecord): UsageRecord;
 function mergeUsage(current: UsageRecord, incoming: UsageRecord): UsageRecord {
@@ -2377,9 +2445,9 @@ function mergeUsage(current: UsageRecord, incoming: UsageRecord): UsageRecord {
     calls: [...calls.values()].sort((a, b) => a.callSequence - b.callSequence) });
 }
 
-function transaction<T>(db: Database, fn: () => T): Result<T> {
+function transaction<T>(db: Database, fn: () => T, events?: RuntimeEventStore): Result<T> {
   try {
-    return ok(db.transaction(fn).immediate());
+    return ok(events ? events.withTransaction(fn) : db.transaction(fn).immediate());
   } catch (error) {
     if (isBusyConstraint(error)) {
       return fail(appError('runtime_busy', 'runtime', '已有 Provider Run 正在执行。'));
@@ -2436,7 +2504,8 @@ function readNativeHistory(db: Database, sessionId: DbId): NativeSessionHistory 
   return { storageVersion: 1, header, entries, leafId: row.leaf_id, unusable: row.unusable === 1 };
 }
 
-function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessionHistory, context?: NativeHistoryAppendContext): void {
+function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessionHistory, context?: NativeHistoryAppendContext,
+  events?: RuntimeEventStore): void {
   const session = db.query('SELECT native_session_id FROM sessions WHERE id=?').get(sessionId) as { native_session_id: string } | null;
   if (!session || history.storageVersion !== 1 || history.header.type !== 'session'
     || history.header.version !== 3 || history.header.id !== session.native_session_id
@@ -2479,10 +2548,10 @@ function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessio
     if (context.inputId !== undefined) {
       if (!Number.isSafeInteger(context.inputId) || context.inputId <= 0 || message?.role !== 'user' || context.resultInputIds !== undefined)
         throw new Error('input_consumption_identity_invalid');
-      markInputConsumed(db, context.inputId, context.runId, entry.id, entry.timestamp);
+      markInputConsumed(db, context.inputId, context.runId, entry.id, entry.timestamp, events);
     } else if (message?.role === 'user'
       && db.query('SELECT id FROM session_inputs WHERE run_id=? LIMIT 1').get(context.runId)) throw new Error('input_consumption_identity_missing');
-    if (context.resultInputIds !== undefined) associateInputResult(db, context.runId, context.resultInputIds, entry.id, entry.timestamp);
+    if (context.resultInputIds !== undefined) associateInputResult(db, context.runId, context.resultInputIds, entry.id, entry.timestamp, events);
   }
   db.query('UPDATE session_native_history SET leaf_id=?,entry_count=?,unusable=? WHERE session_id=?')
     .run(history.leafId, history.entries.length, previous?.unusable || history.unusable ? 1 : 0, sessionId);
@@ -2492,10 +2561,11 @@ function hasTable(db: Database, table: string): boolean {
   return db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== null;
 }
 
-export function createSessionRepository(db: Database): SessionRepository {
+export function createSessionRepository(db: Database, events?: RuntimeEventStore): SessionRepository {
+  const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
   return {
     create(input) {
-      const created = transaction(db, () => {
+      const created = writeTransaction(() => {
         if (input.expectedRevision !== undefined) {
           const workspace = ensureWorkspace(db, input.at) as { revision: number };
           if (workspace.revision !== input.expectedRevision) return null;
@@ -2504,7 +2574,7 @@ export function createSessionRepository(db: Database): SessionRepository {
           .run(input.nativeSessionId, input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }));
         const id = Number(result.lastInsertRowid);
         if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_session_id');
-        if (input.nativeHistory) writeNativeHistory(db, id, input.nativeHistory);
+        if (input.nativeHistory) writeNativeHistory(db, id, input.nativeHistory, undefined, events);
         if (input.expectedRevision !== undefined) {
           const changed = db.query(`UPDATE workspace SET active_session_id=?,revision=revision+1,updated_at=?
             WHERE id=1 AND revision=?`).run(id, input.at, input.expectedRevision).changes;
@@ -2549,7 +2619,7 @@ export function createSessionRepository(db: Database): SessionRepository {
     },
 
     saveHistory(sessionId, history, context) {
-      const saved = transaction(db, () => writeNativeHistory(db, sessionId, history, context));
+      const saved = writeTransaction(() => writeNativeHistory(db, sessionId, history, context, events));
       return saved.ok ? ok(undefined) : fail(appError('storage_write_failed', 'storage', 'Conversation history could not be saved.', true));
     },
 
@@ -2575,7 +2645,7 @@ export function createSessionRepository(db: Database): SessionRepository {
     },
 
     rename(input) {
-      const result = transaction(db, () => {
+      const result = writeTransaction(() => {
         const changed = db.query('UPDATE sessions SET title=?,updated_at=? WHERE id=?')
           .run(input.title, input.at, input.sessionId).changes;
         return changed === 1
@@ -2594,7 +2664,7 @@ export function createSessionRepository(db: Database): SessionRepository {
     },
 
     revokeDocumentUse(input) {
-      const revoked = transaction(db, () => {
+      const revoked = writeTransaction(() => {
         if (!db.query('SELECT id FROM documents WHERE id=?').get(input.documentId)) {
           return { ok: false as const, error: appError('document_not_found', 'input', '正式材料不存在。') };
         }
@@ -2604,7 +2674,7 @@ export function createSessionRepository(db: Database): SessionRepository {
     },
 
     prepareDelete(sessionId, at) {
-      const prepared = transaction(db, () => {
+      const prepared = writeTransaction(() => {
         const row = db.query('SELECT * FROM sessions WHERE id=?').get(sessionId);
         if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
@@ -2619,7 +2689,7 @@ export function createSessionRepository(db: Database): SessionRepository {
     },
 
     setStatus(input) {
-      const changed = transaction(db, () => {
+      const changed = writeTransaction(() => {
         const raw = db.query('SELECT * FROM sessions WHERE id=?').get(input.sessionId) as { hidden_at: string | null } | null;
         if (!raw || raw.hidden_at !== null) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
         const row = readSessionRow(db, raw);
@@ -2635,7 +2705,7 @@ export function createSessionRepository(db: Database): SessionRepository {
     },
 
     delete(sessionId, at) {
-      const deleted = transaction(db, () => {
+      const deleted = writeTransaction(() => {
         const row = db.query('SELECT status,hidden_at,metadata_json FROM sessions WHERE id=?').get(sessionId) as { status: string; hidden_at: string | null; metadata_json: string } | null;
         if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (row.status !== 'archived') {
@@ -2740,10 +2810,25 @@ function freezeWorkspaceInput(db: Database, input: Pick<NewWorkspaceAgentRun, 's
   return ok({ document, job, workspaceContext, workspaceInput });
 }
 
-export function createRunRepository(db: Database): RunRepository {
+function appendRunState(db: Database, events: RuntimeEventStore | undefined, runId: DbId,
+  type: 'run_created' | 'run_started' | 'run_completed' | 'run_failed' | 'run_cancelled', origin: 'live' | 'recovery' = 'live'): void {
+  if (!events) return;
+  const row = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
+  if (!row) throw new Error('event_run_missing');
+  const cleanup = object(readJson(row.cleanup_json, 'cleanup'), 'cleanup');
+  const error = row.error_json === null ? null : object(readJson(row.error_json, 'error'), 'error');
+  events.appendInTransaction({ runId, sessionId: row.session_id, toolCallId: null, type,
+    occurredAt: (type === 'run_created' ? row.created_at : type === 'run_started' ? row.started_at : row.ended_at)!,
+    dedupeKey: type === 'run_created' ? 'run:created' : type === 'run_started' ? 'run:started' : 'run:terminal',
+    payload: { version: 1, status: row.status, origin, stopped: typeof cleanup.stopped === 'boolean' ? cleanup.stopped : null,
+      errorCode: typeof error?.code === 'string' ? error.code : null } });
+}
+
+export function createRunRepository(db: Database, events?: RuntimeEventStore): RunRepository {
+  const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
   return {
     create(input) {
-      const result = transaction(db, () => {
+      const result = writeTransaction(() => {
         const inserted = db
           .query(
             `INSERT INTO runs
@@ -2753,13 +2838,14 @@ export function createRunRepository(db: Database): RunRepository {
           .run(input.goal, asJson(input.input), asJson(input.config), asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const id = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(id)) throw new Error('unsafe_run_id');
+        appendRunState(db, events, id, 'run_created');
         return id;
       });
       return result;
     },
 
     createAgent(input) {
-      const created = transaction(db, () => {
+      const created = writeTransaction(() => {
         const session = db.query('SELECT status,metadata_json,native_session_id FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string; native_session_id: string } | null;
         if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (parseSessionMetadata(session.metadata_json).delete_pending === true) return fail(appError('session_delete_incomplete', 'session', 'Session deletion is incomplete.', true));
@@ -2776,6 +2862,7 @@ export function createRunRepository(db: Database): RunRepository {
             asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const id = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_run_id');
+        appendRunState(db, events, id, 'run_created');
         db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(input.createdAt, input.sessionId);
         return ok(id);
       });
@@ -2783,7 +2870,7 @@ export function createRunRepository(db: Database): RunRepository {
     },
 
     createWorkspaceAgent(input) {
-      const created = transaction(db, () => {
+      const created = writeTransaction(() => {
         const expected = WorkspaceExpectationSchema.safeParse(input.expected);
         const target = input.formTarget === undefined ? null : InvoiceFormTargetSchema.safeParse(input.formTarget);
         const fill = input.goalMode === 'fill-form';
@@ -2821,6 +2908,7 @@ export function createRunRepository(db: Database): RunRepository {
             asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const runId = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(runId) || runId <= 0) throw new Error('unsafe_run_id');
+        appendRunState(db, events, runId, 'run_created');
         if (input.nativeTools && !fill) {
           const workingDirectory = input.nativeTools.workingDirectory ?? join(input.nativeTools.runtimeDir, String(runId), 'work');
           if (!isAbsolute(workingDirectory) || /[\x00-\x1f\x7f]/.test(workingDirectory)) throw new Error('invalid_native_runtime_directory');
@@ -2877,14 +2965,54 @@ export function createRunRepository(db: Database): RunRepository {
       } catch { return fail(appError('storage_read_failed', 'storage', 'Input admission facts cannot be read.', true)); }
     },
 
+    verifyInputUse(content) {
+      try {
+        const frozen = content.workspaceContext;
+        if (frozen === null) return ok(undefined);
+        const documents = createDocumentRepository(db);
+        if (frozen.documentRef !== null) {
+          const document = documents.get(frozen.documentRef.id);
+          if (!document.ok) return document;
+          if (document.data.status !== 'available' || document.data.isHidden)
+            return fail(appError('input_unavailable', 'input', 'Frozen input material is unavailable.', true));
+          if (document.data.documentRef.version !== frozen.documentRef.version
+            || !content.allowedDocumentIds.includes(frozen.documentRef.id)
+            || !content.allowedArtifactIds.includes(document.data.parsedArtifactId))
+            return fail(appError('state_conflict', 'input', 'Frozen input material references changed.'));
+        }
+        for (const id of content.allowedArtifactIds) {
+          const artifact = documents.getArtifact(id);
+          if (!artifact.ok) return artifact;
+        }
+        if (frozen.jobId !== null) {
+          const job = readJob(db, frozen.jobId);
+          const visibility = db.query('SELECT hidden_at FROM jobs WHERE id=?').get(frozen.jobId) as { hidden_at: string | null } | null;
+          if (!job || job.documentRef.id !== frozen.documentRef?.id || job.documentRef.version !== frozen.documentRef.version
+            || visibility?.hidden_at !== null)
+            return fail(appError('state_conflict', 'input', 'Frozen input task references changed.'));
+          if (job.status === 'completed') return fail(appError('job_completed', 'input', 'The input task has already completed.'));
+          if (frozen.candidateRef !== null) {
+            const row = queryCandidateRow(db, frozen.candidateRef.id, frozen.jobId);
+            if (!row || candidateSnapshot(row).snapshot.sequence !== frozen.candidateRef.sequence)
+              return fail(appError('state_conflict', 'input', 'Frozen input candidate references changed.'));
+          }
+        }
+        return ok(undefined);
+      } catch { return fail(appError('storage_read_failed', 'storage', 'Frozen input references cannot be verified.', true)); }
+    },
+
     start(runId, config, startedAt) {
       try {
-        const changed = db
-          .query("UPDATE runs SET status='running', config_json=?, started_at=? WHERE id=? AND status='created'")
-          .run(asJson(config), startedAt, runId).changes;
-        return changed === 1
-          ? ok(undefined)
-          : fail(appError('run_state_invalid', 'runtime', 'Run 不处于可启动状态。', false, runId));
+        const saved = writeTransaction(() => {
+          const changed = db
+            .query("UPDATE runs SET status='running', config_json=?, started_at=? WHERE id=? AND status='created'")
+            .run(asJson(config), startedAt, runId).changes;
+          if (changed === 1) appendRunState(db, events, runId, 'run_started');
+          return changed === 1
+            ? ok(undefined)
+            : fail(appError('run_state_invalid', 'runtime', 'Run 不处于可启动状态。', false, runId));
+        });
+        return saved.ok ? saved.data : saved;
       } catch {
         return fail(databaseError(), runId);
       }
@@ -2892,17 +3020,24 @@ export function createRunRepository(db: Database): RunRepository {
 
     recordCancel(runId, requestedAt) {
       try {
-        const changed = db
-          .query("UPDATE runs SET cancel_requested_at=? WHERE id=? AND status IN ('created','running')")
-          .run(requestedAt, runId).changes;
-        return ok(changed === 1);
+        return writeTransaction(() => {
+          const changed = db
+            .query("UPDATE runs SET cancel_requested_at=? WHERE id=? AND status IN ('created','running') AND cancel_requested_at IS NULL")
+            .run(requestedAt, runId).changes;
+          const row = db.query("SELECT session_id,cancel_requested_at FROM runs WHERE id=? AND status IN ('created','running')")
+            .get(runId) as { session_id: number | null; cancel_requested_at: string | null } | null;
+          if (changed === 1) events?.appendInTransaction({ runId, sessionId: row!.session_id, toolCallId: null,
+            type: 'run_cancel_requested', occurredAt: row!.cancel_requested_at!, dedupeKey: 'run:cancel-requested',
+            payload: { version: 1, requestedAt: row!.cancel_requested_at! } });
+          return row?.cancel_requested_at != null;
+        });
       } catch {
         return fail(databaseError(), runId);
       }
     },
 
     finish(runId, terminal) {
-      const result = transaction(db, () => {
+      const result = writeTransaction(() => {
         const current = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (terminal.nativeHistoryUnusable !== undefined && typeof terminal.nativeHistoryUnusable !== 'boolean'
           || terminal.nativeHistoryUnusable === true && current?.kind === 'provider') throw new Error('invalid_native_history_terminal');
@@ -2948,6 +3083,15 @@ export function createRunRepository(db: Database): RunRepository {
             runId,
             terminal.status,
           ).changes;
+        if (changed === 1) {
+          if (active?.cancel_requested_at === null && terminal.cancelRequestedAt !== undefined) {
+            events?.appendInTransaction({ runId, sessionId: active.session_id, toolCallId: null,
+              type: 'run_cancel_requested', occurredAt: terminal.cancelRequestedAt, dedupeKey: 'run:cancel-requested',
+              payload: { version: 1, requestedAt: terminal.cancelRequestedAt } });
+          }
+          appendRunState(db, events, runId,
+            terminal.status === 'completed' ? 'run_completed' : terminal.status === 'failed' ? 'run_failed' : 'run_cancelled');
+        }
         if (changed === 1 && active?.kind === 'agent' && active.session_id !== null) {
           if (terminal.nativeHistoryUnusable === true) db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(active.session_id);
           db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(terminal.endedAt, active.session_id);
@@ -2966,8 +3110,8 @@ export function createRunRepository(db: Database): RunRepository {
           if (jobChanged !== 1) throw new Error('job_terminal_state_invalid');
         }
         if (changed === 1 && hasTable(db, 'session_inputs')) {
-          for (const batch of terminal.inputResults ?? []) completeSessionInputs(db, runId, batch.inputIds, batch.resultEntryId, terminal.endedAt);
-          finishSessionInputs(db, runId, terminal.status, terminal.error, terminal.endedAt, terminal.confirmedUnconsumedInputIds);
+          for (const batch of terminal.inputResults ?? []) completeSessionInputs(db, runId, batch.inputIds, batch.resultEntryId, terminal.endedAt, events);
+          finishSessionInputs(db, runId, terminal.status, terminal.error, terminal.endedAt, terminal.confirmedUnconsumedInputIds, events);
         }
         return changed === 1;
       });
@@ -3003,20 +3147,24 @@ export function createRunRepository(db: Database): RunRepository {
     },
 
     supplementUsage(runId, usageValue, tokens) {
-      const result = transaction(db, () => {
-        const row = db.query('SELECT usage_json,input_tokens,output_tokens,total_tokens,cost FROM runs WHERE id=? AND status IN (\'completed\',\'failed\',\'cancelled\')').get(runId) as { usage_json: string; input_tokens: number | null; output_tokens: number | null; total_tokens: number | null; cost: string | null } | null;
+      const result = writeTransaction(() => {
+        const row = db.query('SELECT session_id,usage_json,input_tokens,output_tokens,total_tokens,cost,usage_complete FROM runs WHERE id=? AND status IN (\'completed\',\'failed\',\'cancelled\')').get(runId) as {
+          session_id: number | null; usage_json: string; input_tokens: number | null; output_tokens: number | null;
+          total_tokens: number | null; cost: string | null; usage_complete: number } | null;
         if (!row) return false;
         const current = validatedUsage(readJson(row.usage_json, 'usage'));
-        const currentValues = current.sdkValues;
-        const incomingValues = usageValue.sdkValues;
-        const conflicts = usageKeys.some((key) => currentValues?.[key] !== null && currentValues?.[key] !== undefined
-          && incomingValues?.[key] !== null && incomingValues?.[key] !== undefined && currentValues[key] !== incomingValues[key]);
-        const tokenConflicts = (row.input_tokens !== null && tokens.inputTokens !== null && row.input_tokens !== tokens.inputTokens)
-          || (row.output_tokens !== null && tokens.outputTokens !== null && row.output_tokens !== tokens.outputTokens)
-          || (row.total_tokens !== null && tokens.totalTokens !== null && row.total_tokens !== tokens.totalTokens)
-          || (row.cost !== null && tokens.cost !== null && row.cost !== tokens.cost);
-        if (conflicts || tokenConflicts) return false;
+        const currentTokens: TokenColumns = { inputTokens: row.input_tokens, outputTokens: row.output_tokens,
+          totalTokens: row.total_tokens, cost: row.cost, usageComplete: row.usage_complete === 1 };
+        if (usageConflicts(current, usageValue) || tokenConflicts(currentTokens, tokens)) return false;
         const merged = mergeUsage(current, usageValue);
+        const mergedTokens: TokenColumns = { inputTokens: currentTokens.inputTokens ?? tokens.inputTokens,
+          outputTokens: currentTokens.outputTokens ?? tokens.outputTokens, totalTokens: currentTokens.totalTokens ?? tokens.totalTokens,
+          cost: currentTokens.cost ?? tokens.cost, usageComplete: currentTokens.usageComplete || tokens.usageComplete };
+        if (stableJson({ usage: usageFacts(current), tokens: currentTokens })
+          === stableJson({ usage: usageFacts(merged), tokens: mergedTokens })) {
+          // A compatible replay is accepted, as before; it writes no new usage or event.
+          return true;
+        }
         const changed = db
           .query(
             `UPDATE runs SET
@@ -3032,6 +3180,9 @@ export function createRunRepository(db: Database): RunRepository {
             asJson(merged), tokens.inputTokens, tokens.outputTokens, tokens.totalTokens,
             tokens.cost, tokens.usageComplete ? 1 : 0, runId,
           ).changes;
+        if (changed === 1) events?.appendInTransaction({ runId, sessionId: row.session_id, toolCallId: null,
+          type: 'run_usage_updated', occurredAt: merged.updatedAt, payload: { version: 1, tokens: mergedTokens,
+            attempts: merged.attempts, attemptsComplete: merged.attemptsComplete, source: merged.source } });
         return changed === 1;
       });
       return result.ok ? result : { ...result, ...(result.error && runId !== undefined ? { runId } : {}) };
@@ -3041,7 +3192,10 @@ export function createRunRepository(db: Database): RunRepository {
       try {
         const error = asJson({ version: 1, ...appError('runtime_interrupted', 'runtime', '上一次进程退出，Run 未收口。') });
         const cleanup = asJson({ version: 1, stopped: false, stopReason: 'process-exit', errors: [], lateObservationRequired: true });
-        const recovered = transaction(db, () => {
+        const recovered = writeTransaction(() => {
+          const activeRuns = events ? db.query("SELECT id FROM runs WHERE status IN ('created','running') ORDER BY id").all() as { id: number }[] : [];
+          const activeTools = events && hasTable(db, 'tool_calls')
+            ? db.query("SELECT id FROM tool_calls WHERE status IN ('requested','running') ORDER BY id").all() as { id: number }[] : [];
           if (hasTable(db, 'session_native_history')) db.query(`UPDATE session_native_history SET unusable=1
             WHERE session_id IN (SELECT session_id FROM runs WHERE kind='agent' AND status IN ('created','running'))
               OR session_id IN (SELECT session_id FROM tool_calls WHERE status IN ('requested','running'))`).run();
@@ -3063,6 +3217,7 @@ export function createRunRepository(db: Database): RunRepository {
                 WHEN json_extract(cleanup_json,'$.stopped')=1 AND stopped_at IS NOT NULL THEN stopped_at
                 ELSE NULL END
             WHERE status IN ('requested','running')`).run(endedAt);
+          for (const call of activeTools) appendToolState(db, events, call.id, 'tool_failed', 'recovery');
           // A stopped tool with an unreadable required result makes only its own
           // persisted conversation unsafe to resume. Diagnostic delivery failures
           // are still readable records and do not disable unrelated Sessions.
@@ -3085,8 +3240,9 @@ export function createRunRepository(db: Database): RunRepository {
             )`).run(endedAt);
           const changed = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE status IN ('created','running')")
             .run(error, cleanup, endedAt).changes;
+          for (const run of activeRuns) appendRunState(db, events, run.id, 'run_failed', 'recovery');
           if (hasTable(db, 'session_inputs')) recoverSessionInputs(db, endedAt,
-            (runId, inputIds, resultEntryId, completed) => qualifyRecoveredInputResult(db, runId, inputIds, resultEntryId, completed));
+            (runId, inputIds, resultEntryId, completed) => qualifyRecoveredInputResult(db, runId, inputIds, resultEntryId, completed), events);
           return changed;
         });
         return recovered;
@@ -3123,7 +3279,8 @@ function qualifyRecoveredInputResult(db: Database, runId: DbId, inputIds: readon
       const target = InvoiceFormTargetSchema.parse(config.formTarget);
       const context = WorkspaceContextSchema.parse(config.workspaceContext);
       const job = raw.job_id == null ? null : readJob(db, raw.job_id);
-      if (!job || !['waiting', 'completed'].includes(job.status) || context.candidateRef === null) return false;
+      // A later Run can change this Job without invalidating an already completed input's evidence.
+      if (!job || !completed && !['waiting', 'completed'].includes(job.status) || context.candidateRef === null) return false;
       return calls.some(call => {
         const output = FillInvoiceFormOutputSchema.safeParse(call.result?.data);
         const receipt = call.formApplication;

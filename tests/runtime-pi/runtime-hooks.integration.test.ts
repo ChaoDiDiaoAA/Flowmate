@@ -8,7 +8,7 @@ import { createApplication } from '../../apps/composition.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import { deferCleanup, mkdtempSync } from '../support/resources.ts';
 
-for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-normalize', 'duplicate-raw', 'host-cancel', 'after-rewrite', 'after-mutate', 'after-is-error', 'after-oversize', 'after-throw'] as const) {
+for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-id-mutate', 'sdk-name-mutate', 'sdk-raw-mutate', 'sdk-id-mutate-throw', 'sdk-normalize', 'duplicate-raw', 'host-cancel', 'after-rewrite', 'after-mutate', 'after-is-error', 'after-oversize', 'after-throw'] as const) {
   it('persists the real SDK hook ordering and fixed outcome for ' + mode, async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-hooks-'));
     const paths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
@@ -44,6 +44,10 @@ for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-normalize', 'duplic
             before += 1;
             const original = await originalBefore?.(...call);
             if (mode === 'sdk-throw') throw new Error('Controlled SDK before failure.');
+            if (mode === 'sdk-id-mutate' || mode === 'sdk-id-mutate-throw') Reflect.set(call[0].toolCall, 'id', 'changed-call');
+            if (mode === 'sdk-name-mutate') Reflect.set(call[0].toolCall, 'name', 'changed-tool');
+            if (mode === 'sdk-raw-mutate') Reflect.set(call[0].toolCall.arguments, 'scale', 3);
+            if (mode === 'sdk-id-mutate-throw') throw new Error('Controlled SDK before mutation failure.');
             if (mode === 'sdk-normalize' || mode === 'duplicate-raw') {
               if (!call[0].args || typeof call[0].args !== 'object') throw new Error('Expected normalized object arguments.');
               Reflect.set(call[0].args, 'scale', 1);
@@ -128,17 +132,31 @@ for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-normalize', 'duplic
           expect(JSON.parse(row.args_json)).toMatchObject({ raw: args, final: { ...args, scale: 1 } });
           return;
         }
-        const sdkRejected = ['schema', 'sdk-block', 'sdk-throw'].includes(mode);
+        const mutated = mode.startsWith('sdk-') && mode.includes('-mutate');
+        const sdkRejected = ['schema', 'sdk-block', 'sdk-throw'].includes(mode) || mutated;
         const rejected = sdkRejected || mode === 'host-cancel';
         expect(before).toBe(mode === 'schema' ? 0 : 1);
         expect(after).toBe(sdkRejected ? 0 : 1);
         expect(business).toBe(rejected ? 0 : 1);
         expect(observation).toMatchObject({ beforeOutcome: rejected ? 'rejected' : 'allowed',
-          failureStage: mode === 'schema' ? 'sdk_arguments' : mode === 'sdk-block' || mode === 'sdk-throw' ? 'sdk_before' : mode === 'host-cancel' ? 'before' : null });
+          failureStage: mode === 'schema' ? 'sdk_arguments' : sdkRejected ? 'sdk_before' : mode === 'host-cancel' ? 'before' : null });
         if (rejected) expect(observation?.executionDurationMs).toBeNull();
         else expect(observation?.executionDurationMs).toBeGreaterThanOrEqual(0);
         expect(JSON.parse(row.args_json).raw).toEqual(args);
         expect(JSON.parse(row.args_json).final === null).toBe(sdkRejected);
+        if (mutated) {
+          expect(db.query('SELECT native_tool_call_id AS id,tool_name AS name,status FROM tool_calls').all())
+            .toEqual([{ id: 'runtime-hook-call', name: 'calculate_invoice_amounts', status: 'failed' }]);
+          expect(db.query('SELECT tool_call_count AS count FROM runs').get()).toEqual({ count: 1 });
+          expect(terminal.result).toMatchObject({ ok: true, data: { status: 'completed', stopped: true } });
+          expect(requests).toBe(2);
+          const entries = db.query('SELECT entry_json AS entry FROM session_native_entries').all() as { entry: string }[];
+          const messages = entries.map(entry => JSON.parse(entry.entry).message).filter(Boolean);
+          expect(messages.find(message => message.role === 'assistant' && message.stopReason === 'toolUse').content)
+            .toEqual([{ type: 'toolCall', id: 'runtime-hook-call', name: 'calculate_invoice_amounts', arguments: args }]);
+          expect(messages.find(message => message.role === 'toolResult'))
+            .toMatchObject({ toolCallId: 'runtime-hook-call', toolName: 'calculate_invoice_amounts', isError: true });
+        }
         if (mode === 'sdk-block') expect(JSON.parse(row.result_json).error.message).toBe('Controlled SDK block.');
         if (mode === 'sdk-throw') expect(JSON.parse(row.result_json).error.message).toBe('Controlled SDK before failure.');
         if (mode === 'schema') expect(JSON.parse(row.result_json).error.message).toContain('first validation errors');

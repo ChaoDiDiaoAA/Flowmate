@@ -5,6 +5,8 @@ import { appError, fail, ok } from '@flowmate/contracts';
 import type { AppError, ProductPaths, Result } from '@flowmate/contracts';
 import { validateProductPaths } from '@flowmate/shared';
 import { createSessionInputLedger, type SessionInputLedger } from '../sessions/input-ledger.ts';
+import { createRuntimeEventStore, type RuntimeEventStore } from '../events/store.ts';
+import { createEventService, type EventService } from '../events/service.ts';
 import {
   createDocumentRepository,
   createToolCallRepository,
@@ -36,6 +38,8 @@ export type DbHandle = {
   toolCalls: ToolCallRepository;
   businessEvents: BusinessEventRepository;
   candidates: InvoiceEditRepository;
+  runtimeEventStore: RuntimeEventStore;
+  runtimeEvents: EventService;
   /** Required historical stop gaps; diagnostics and Session-local history do not poison this root. */
   recoveryError: AppError | null;
   /** Run identities that predate this database owner's in-memory diagnostics. */
@@ -43,13 +47,13 @@ export type DbHandle = {
   close: () => void;
 };
 
-function migrationSql(version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql'][version - 1];
+function migrationSql(version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13): string {
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
 
-function runMigration(db: Database, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12): void {
+function runMigration(db: Database, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13): void {
   try {
     if (version === 4 || version === 10 || version === 11) {
       for (const statement of migrationSql(version).split(';').map((sql) => sql.trim()).filter(Boolean)) {
@@ -58,7 +62,7 @@ function runMigration(db: Database, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
       if (db.query('PRAGMA foreign_key_check').all().length) throw new Error('migration_foreign_key_violation');
       db.exec('COMMIT');
       if (version === 10) db.exec('PRAGMA foreign_keys=ON');
-    } else if (version === 8 || version === 9 || version === 12) {
+    } else if (version === 8 || version === 9 || version === 12 || version === 13) {
       // Bun/SQLite can suppress a statement error in an ALTER + multi-statement exec.
       // Execute this small migration statement by statement so the outer catch rolls back.
       for (const statement of migrationSql(version).split(';').map((sql) => sql.trim()).filter(Boolean)) db.exec(statement);
@@ -77,10 +81,10 @@ function migrateToLatest(db: Database): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 12) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 13) {
     throw new Error('unsupported_schema_version');
   }
-  for (let version = versions.length + 1; version <= 12; version += 1) runMigration(db, version as 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12);
+  for (let version = versions.length + 1; version <= 13; version += 1) runMigration(db, version as 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13);
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {
@@ -99,13 +103,15 @@ export function openDatabase(paths: ProductPaths): Result<DbHandle> {
     db = new Database(paths.databaseFile, { create: true });
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 1000; PRAGMA journal_mode = DELETE; PRAGMA locking_mode = EXCLUSIVE;');
     migrateToLatest(db);
-    const runs = createRunRepository(db);
-    const sessions = createSessionRepository(db);
-    const sessionInputs = createSessionInputLedger(db);
+    const runtimeEventStore = createRuntimeEventStore(db);
+    const runtimeEvents = createEventService(runtimeEventStore);
+    const runs = createRunRepository(db, runtimeEventStore);
+    const sessions = createSessionRepository(db, runtimeEventStore);
+    const sessionInputs = createSessionInputLedger(db, runtimeEventStore);
     const documents = createDocumentRepository(db);
     const workspace = createWorkspaceRepository(db);
     const jobs = createJobRepository(db);
-    const toolCalls = createToolCallRepository(db);
+    const toolCalls = createToolCallRepository(db, runtimeEventStore);
     const businessEvents = createBusinessEventRepository(db);
     const candidates = createCandidateRepository(db);
     const interrupted = runs.failInterrupted(new Date().toISOString());
@@ -114,7 +120,7 @@ export function openDatabase(paths: ProductPaths): Result<DbHandle> {
     const maxRunIdAtBoot = (db.query('SELECT COALESCE(MAX(id),0) AS id FROM runs').get() as { id: number }).id;
     if (!Number.isSafeInteger(maxRunIdAtBoot) || maxRunIdAtBoot < 0) throw new Error('unsafe_run_id');
     return ok({ db, runs, sessions, sessionInputs, documents, workspace, jobs, toolCalls, businessEvents, candidates, recoveryError,
-      maxRunIdAtBoot, close: () => db?.close() });
+      runtimeEventStore, runtimeEvents, maxRunIdAtBoot, close: () => { runtimeEvents.close(); db?.close(); } });
   } catch (error) {
     try { db?.close(); } catch { /* preserve original error */ }
     if (error instanceof Error && error.message === 'unsupported_schema_version') {

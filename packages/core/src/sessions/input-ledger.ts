@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
+import type { RuntimeEventStore } from '../events/store.ts';
 import { appError, fail, normalizeSessionInputRequest, ok, SessionInputContentV2Schema,
   SessionInputQuerySchema, SessionInputSnapshotSchema, SessionInputsRequestSchema, LegacySessionInputRequestSchema } from '@flowmate/contracts';
 import type { AppError, DbId, NormalizedSessionInputRequest, Result, SessionInputQuery, SessionInputQueryResult,
@@ -22,6 +23,18 @@ function snapshot(row: InputRow): SessionInputSnapshot {
 }
 const writeFailure = () => fail(appError('storage_write_failed', 'storage', 'Session input could not be saved.', true));
 const readFailure = () => fail(appError('storage_read_failed', 'storage', 'Session input could not be read.', true));
+function appendInputState(db: Database, inputId: DbId, events: RuntimeEventStore | undefined,
+  origin: 'live' | 'recovery' = 'live'): void {
+  if (!events) return;
+  const row = db.query('SELECT * FROM session_inputs WHERE id=?').get(inputId) as InputRow | null;
+  if (!row || row.run_id === null) throw new Error('event_input_missing');
+  const input = snapshot(row);
+  events.appendInTransaction({ runId: row.run_id, sessionId: row.session_id, toolCallId: null,
+    type: 'input_state_changed', occurredAt: input.updatedAt,
+    dedupeKey: `input:${inputId}:${input.status}:${input.processingStatus}:${input.nativeEntryId ?? 'none'}:${input.resultEntryId ?? 'none'}`,
+    payload: { version: 1, inputId, origin, status: input.status, processingStatus: input.processingStatus,
+      nativeEntryId: input.nativeEntryId, resultEntryId: input.resultEntryId, errorCode: input.error?.code ?? null } });
+}
 /** Schema 009 hash bytes remain an existing idempotency fact. */
 function requestHash(request: NormalizedSessionInputRequest, legacy: boolean, identityVersion?: 1): string {
   const identity = identityVersion === 1 ? { requestIdentityVersion: 1, request }
@@ -30,8 +43,9 @@ function requestHash(request: NormalizedSessionInputRequest, legacy: boolean, id
   return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
 }
 export type SessionInputLedger = ReturnType<typeof createSessionInputLedger>;
-export function createSessionInputLedger(db: Database) {
+export function createSessionInputLedger(db: Database, events?: RuntimeEventStore) {
   const byId = (inputId: DbId) => db.query('SELECT * FROM session_inputs WHERE id=?').get(inputId) as InputRow | null;
+  const writeTransaction = <T>(fn: () => T): T => events ? events.withTransaction(fn) : db.transaction(fn).immediate();
   function lookup(raw: SessionInputRequest, desktopRequestHash?: string): Result<SessionInputSnapshot | null> {
     const normalized = normalizeSessionInputRequest(raw);
     if (!normalized.ok) return normalized;
@@ -60,14 +74,14 @@ export function createSessionInputLedger(db: Database) {
     allocateSequence<T>(sessionId: DbId, accept: (sequence: number) => Result<T>): Result<T> {
       let rejected: Result<never> | null = null;
       try {
-        return db.transaction(() => {
+        return writeTransaction(() => {
           const max = (db.query('SELECT COALESCE(MAX(client_sequence),0) AS sequence FROM session_inputs WHERE session_id=?')
             .get(sessionId) as { sequence: number }).sequence;
           if (max >= Number.MAX_SAFE_INTEGER) throw new Error('input_sequence_exhausted');
           const result = accept(max + 1);
           if (!result.ok) { rejected = result; throw new Error('input_admission_rejected'); }
           return result;
-        }).immediate();
+        });
       } catch { return rejected ?? writeFailure(); }
     },
     query(raw: SessionInputQuery): Result<SessionInputQueryResult> {
@@ -114,7 +128,7 @@ export function createSessionInputLedger(db: Database) {
       if (!normalized.ok) return normalized;
       let rejected: Result<never> | null = null;
       try {
-        return db.transaction(() => {
+        return writeTransaction(() => {
           const existing = lookup(normalized.data, desktopRequestHash);
           if (!existing.ok) { rejected = existing; throw new Error('input_admission_rejected'); }
           if (existing.data) return ok({ input: existing.data, created: false });
@@ -145,8 +159,9 @@ export function createSessionInputLedger(db: Database) {
             VALUES (?,?,?,?,?,?,?,'queued','pending',NULL,NULL,NULL,NULL,?,?)`)
             .run(request.sessionId, request.clientSequence, request.mode, goalMode, requestHash(request, false, content.requestIdentityVersion),
               admission.runId, JSON.stringify(content), at, at);
+          appendInputState(db, Number(inserted.lastInsertRowid), events);
           return ok({ input: snapshot(byId(Number(inserted.lastInsertRowid))!), created: true });
-        }).immediate();
+        });
       } catch { return rejected ?? writeFailure(); }
     },
     dispatch(inputId: DbId, at: string): Result<void> {
@@ -169,23 +184,27 @@ export function createSessionInputLedger(db: Database) {
       } catch { return fail(appError('input_processing_unconfirmed', 'runtime', 'Saved input result cannot be confirmed.', true, runId)); }
     },
     completeResult(runId: DbId, inputIds: readonly DbId[], resultEntryId: string, at: string): Result<void> {
-      try { db.transaction(() => completeSessionInputs(db, runId, inputIds, resultEntryId, at)).immediate(); return ok(undefined); }
+      try { writeTransaction(() => completeSessionInputs(db, runId, inputIds, resultEntryId, at, events)); return ok(undefined); }
       catch { return writeFailure(); }
     },
     failResult(runId: DbId, inputIds: readonly DbId[], resultEntryId: string, error: AppError, at: string): Result<void> {
       try {
-        db.transaction(() => {
+        writeTransaction(() => {
           verifiedResultMembers(db, runId, inputIds, resultEntryId);
-          for (const id of inputIds) db.query("UPDATE session_inputs SET processing_status='failed',error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")
-            .run(JSON.stringify(error), at, id);
-        }).immediate();
+          for (const id of inputIds) {
+            const changed = db.query("UPDATE session_inputs SET processing_status='failed',error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")
+              .run(JSON.stringify(error), at, id).changes;
+            if (changed === 1) appendInputState(db, id, events);
+          }
+        });
         return ok(undefined);
       } catch { return writeFailure(); }
     },
   };
 }
 /** Called within the transaction saving this exact SDK user entry. */
-export function markInputConsumed(db: Database, inputId: DbId, runId: DbId, entryId: string, at: string): void {
+export function markInputConsumed(db: Database, inputId: DbId, runId: DbId, entryId: string, at: string,
+  events?: RuntimeEventStore): void {
   const row = db.query('SELECT * FROM session_inputs WHERE id=?').get(inputId) as InputRow | null;
   if (!row || row.run_id !== runId) throw new Error('input_consumption_identity_invalid');
   const entry = db.query('SELECT entry_json,run_id FROM session_native_entries WHERE session_id=? AND entry_id=?')
@@ -196,8 +215,9 @@ export function markInputConsumed(db: Database, inputId: DbId, runId: DbId, entr
     || native?.type !== 'message' || native.message?.role !== 'user') throw new Error('input_consumption_identity_invalid');
   if (row.status === 'consumed') { if (row.native_entry_id !== entryId) throw new Error('input_consumption_identity_conflict'); return; }
   if (!['queued', 'delivery_unknown'].includes(row.status) || row.native_entry_id !== null) throw new Error('input_consumption_state_conflict');
-  db.query("UPDATE session_inputs SET status='consumed',native_entry_id=?,updated_at=? WHERE id=? AND status IN ('queued','delivery_unknown')")
-    .run(entryId, at, inputId);
+  const changed = db.query("UPDATE session_inputs SET status='consumed',native_entry_id=?,updated_at=? WHERE id=? AND status IN ('queued','delivery_unknown')")
+    .run(entryId, at, inputId).changes;
+  if (changed === 1) appendInputState(db, inputId, events);
 }
 function resultPath(db: Database, sessionId: DbId, runId: DbId, resultEntryId: string): NativeEntry[] {
   const stored = db.query('SELECT entry_id,entry_json,run_id FROM session_native_entries WHERE session_id=?').all(sessionId) as {
@@ -243,7 +263,8 @@ function verifiedResultMembers(db: Database, runId: DbId, inputIds: readonly DbI
   return members;
 }
 /** Assistant persistence fixes the first result and members, without claiming completion. */
-export function associateInputResult(db: Database, runId: DbId, inputIds: readonly DbId[], resultEntryId: string, at: string): void {
+export function associateInputResult(db: Database, runId: DbId, inputIds: readonly DbId[], resultEntryId: string, at: string,
+  events?: RuntimeEventStore): void {
   if (!inputIds.length || new Set(inputIds).size !== inputIds.length) throw new Error('input_result_batch_invalid');
   for (const id of inputIds) {
     const row = db.query('SELECT * FROM session_inputs WHERE id=?').get(id) as InputRow | null;
@@ -254,35 +275,45 @@ export function associateInputResult(db: Database, runId: DbId, inputIds: readon
   }
   const existing = db.query('SELECT id FROM session_inputs WHERE run_id=? AND result_entry_id=?').all(runId, resultEntryId) as { id: number }[];
   if (existing.length && (existing.length !== inputIds.length || existing.some(row => !inputIds.includes(row.id)))) throw new Error('input_result_batch_frozen');
-  for (const id of inputIds) db.query('UPDATE session_inputs SET result_entry_id=?,updated_at=? WHERE id=? AND result_entry_id IS NULL').run(resultEntryId, at, id);
+  for (const id of inputIds) {
+    const changed = db.query('UPDATE session_inputs SET result_entry_id=?,updated_at=? WHERE id=? AND result_entry_id IS NULL').run(resultEntryId, at, id).changes;
+    if (changed === 1) appendInputState(db, id, events);
+  }
   verifiedResultMembers(db, runId, inputIds, resultEntryId);
 }
 /** Caller verifies authorization, tools and goal for this response batch before this transaction. */
-export function completeSessionInputs(db: Database, runId: DbId, inputIds: readonly DbId[], resultEntryId: string, at: string): void {
+export function completeSessionInputs(db: Database, runId: DbId, inputIds: readonly DbId[], resultEntryId: string, at: string,
+  events?: RuntimeEventStore, origin: 'live' | 'recovery' = 'live'): void {
   verifiedResultMembers(db, runId, inputIds, resultEntryId);
-  for (const id of inputIds) db.query("UPDATE session_inputs SET processing_status='completed',error_json=NULL,updated_at=? WHERE id=? AND processing_status='pending'").run(at, id);
+  for (const id of inputIds) {
+    const changed = db.query("UPDATE session_inputs SET processing_status='completed',error_json=NULL,updated_at=? WHERE id=? AND processing_status='pending'").run(at, id).changes;
+    if (changed === 1) appendInputState(db, id, events, origin);
+  }
 }
 /** Run terminal state only closes pending inputs. Completed members require a per-result write. */
 export function finishSessionInputs(db: Database, runId: DbId, status: 'completed' | 'failed' | 'cancelled', error: AppError | null,
-  at: string, confirmedUnconsumedInputIds: readonly DbId[] = []): void {
+  at: string, confirmedUnconsumedInputIds: readonly DbId[] = [], events?: RuntimeEventStore, origin: 'live' | 'recovery' = 'live'): void {
   const rows = db.query("SELECT * FROM session_inputs WHERE run_id=? AND processing_status='pending'").all(runId) as InputRow[];
   if (status === 'completed' && rows.some(row => row.status === 'consumed'
     || row.dispatched_at !== null && !confirmedUnconsumedInputIds.includes(row.id))) throw new Error('input_processing_unconfirmed');
   for (const row of rows) {
     if (status === 'completed') {
-      db.query("UPDATE session_inputs SET status='cancelled',processing_status='cancelled',error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")
-        .run(JSON.stringify(appError('input_not_consumed', 'session', 'Native execution ended without consuming this input.', false, runId)), at, row.id);
+      const changed = db.query("UPDATE session_inputs SET status='cancelled',processing_status='cancelled',error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")
+        .run(JSON.stringify(appError('input_not_consumed', 'session', 'Native execution ended without consuming this input.', false, runId)), at, row.id).changes;
+      if (changed === 1) appendInputState(db, row.id, events, origin);
       continue;
     }
     const delivery = row.status === 'consumed' ? 'consumed' : row.dispatched_at === null || confirmedUnconsumedInputIds.includes(row.id)
       ? status === 'cancelled' ? 'cancelled' : 'failed' : 'delivery_unknown';
-    db.query("UPDATE session_inputs SET status=?,processing_status=?,error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")
-      .run(delivery, status, error === null ? null : JSON.stringify(error), at, row.id);
+    const changed = db.query("UPDATE session_inputs SET status=?,processing_status=?,error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")
+      .run(delivery, status, error === null ? null : JSON.stringify(error), at, row.id).changes;
+    if (changed === 1) appendInputState(db, row.id, events, origin);
   }
 }
 /** Boot repair neither invents a result nor dispatches another input. */
 export function recoverSessionInputs(db: Database, at: string,
-  qualify: (runId: DbId, inputIds: readonly DbId[], resultEntryId: string, completed?: boolean) => boolean = () => false): void {
+  qualify: (runId: DbId, inputIds: readonly DbId[], resultEntryId: string, completed?: boolean) => boolean = () => false,
+  events?: RuntimeEventStore): void {
   const completed = db.query("SELECT * FROM session_inputs WHERE processing_status='completed' AND json_extract(content_json,'$.version')=2").all() as InputRow[];
   const verified = new Set<string>();
   for (const input of completed) {
@@ -306,13 +337,13 @@ export function recoverSessionInputs(db: Database, at: string,
       for (const resultEntryId of new Set(inputs.filter(input => input.processing_status === 'pending' && input.result_entry_id !== null)
         .map(input => input.result_entry_id!))) {
         const members = inputs.filter(input => input.result_entry_id === resultEntryId).map(input => input.id);
-        if (qualify(row.id, members, resultEntryId)) completeSessionInputs(db, row.id, members, resultEntryId, at);
+        if (qualify(row.id, members, resultEntryId)) completeSessionInputs(db, row.id, members, resultEntryId, at, events, 'recovery');
       }
       if (!db.query("SELECT id FROM session_inputs WHERE run_id=? AND processing_status='pending' LIMIT 1").get(row.id)) continue;
     }
     const error = row.status === 'completed' ? appError('input_processing_unconfirmed', 'runtime', 'A terminal Run has unconfirmed input results.', true, row.id)
       : row.error_json === null ? null : JSON.parse(row.error_json);
-    finishSessionInputs(db, row.id, row.status === 'completed' ? 'failed' : row.status, error, at);
+    finishSessionInputs(db, row.id, row.status === 'completed' ? 'failed' : row.status, error, at, [], events, 'recovery');
     if (row.status === 'completed') db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(row.session_id);
   }
 }

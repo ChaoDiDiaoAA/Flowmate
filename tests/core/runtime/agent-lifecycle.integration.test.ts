@@ -2,7 +2,7 @@ import { mkdtempSync, waitFor } from '../../support/resources.ts';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'bun:test';
-import { appError, ok, ToolExecutionFailure } from '@flowmate/contracts';
+import { appError, fail, ok, ToolExecutionFailure } from '@flowmate/contracts';
 import type {
   AgentInputDispatch,
   P5ChatAgentConfigFacts,
@@ -564,6 +564,91 @@ describe('RuntimeService Agent lifecycle', () => {
 });
 
 describe('P5 public input stopping and admission barriers', () => {
+  it('blocks the Session when the final input audit fails after its saved result completed', async () => {
+    const { db, deps } = fixture();
+    let executions = 0;
+    let auditReads = 0;
+    const agent = makeAgent(deps.fixtureHistory, { execute: async () => { executions++; return nativeOutcome; } });
+    const runtime = new RuntimeService({ ...deps, agent, sessionInputs: { ...db.sessionInputs, forRun(runId) {
+      if (++auditReads === 2) return fail(appError('storage_read_failed', 'storage', 'Final input audit unavailable.', true));
+      return db.sessionInputs.forRun(runId);
+    } } });
+    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
+      (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
+      id => runtime.verifySessionMutation(id));
+    const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
+    const finished = finishSignal();
+    const submitted = await app.submitInput({ ...request, clientSequence: 1, mode: 'prompt' }, finished);
+    if (!submitted.ok) throw new Error(submitted.error.code);
+    expect(await finished.done.promise).toMatchObject({ type: 'run_finished', result: { ok: true, data: {
+      status: 'failed', stopped: true, error: { code: 'storage_read_failed' },
+    } } });
+    expect(auditReads).toBe(2);
+    expect(await app.querySessionInput({ sessionId: 1, inputId: submitted.data.inputId })).toMatchObject({ ok: true, data: { input: {
+      inputId: submitted.data.inputId, runId: submitted.data.runId, status: 'consumed', processingStatus: 'completed',
+      nativeEntryId: `user-${submitted.data.inputId}`, resultEntryId: `assistant-${submitted.data.inputId}`, error: null,
+    } } });
+    expect(db.sessions.get(1)).toMatchObject({ ok: true, data: { nativeUnusable: true } });
+    expect(await app.querySession(1)).toMatchObject({ ok: true, data: { availability: 'unusable' } });
+    expect(await app.submitInput({ ...request, clientSequence: 2, mode: 'prompt' }))
+      .toMatchObject({ ok: false, error: { code: 'agent_session_unusable' } });
+    expect(executions).toBe(1);
+    expect(db.db.query('SELECT id FROM runs WHERE session_id=?').all(1)).toEqual([{ id: submitted.data.runId }]);
+    await app.close();
+  });
+
+  it.each(['failed-result', 'ledger-read-failure'] as const)('blocks unknown delivery when its audit encounters %s', async scenario => {
+    const { db, deps } = fixture();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    let streaming = false;
+    const agent: AgentPort = {
+      ...makeAgent(deps.fixtureHistory),
+      inspect: () => ({ availability: streaming ? 'busy' : 'ready' }),
+      enqueueInput: async () => ok(undefined),
+      async prepare(nativeId) {
+        return ok({ snapshot, async execute(input, _signal, observe) {
+          streaming = true;
+          observe({ type: 'agent_event', at: deps.now(), monotonicMs: performance.now(), data: { eventName: 'agent_start' } });
+          deps.fixtureHistory.saveUser(nativeId, input);
+          entered.resolve(); await release.promise;
+          deps.fixtureHistory.saveResult(nativeId, { ...input, completeInputResult: () => ok(undefined) }, nativeOutcome);
+          if (scenario === 'failed-result') {
+            const failed = db.sessionInputs.failResult(input.runId, [input.inputId!], `assistant-${input.inputId}`,
+              appError('agent_goal_not_met', 'runtime', 'The first input did not meet its goal.', false, input.runId), deps.now());
+            if (!failed.ok) throw new Error(failed.error.code);
+          }
+          streaming = false;
+          return nativeOutcome;
+        } });
+      },
+    };
+    let rejectRead = scenario === 'ledger-read-failure';
+    const runtime = new RuntimeService({ ...deps, agent, sessionInputs: { ...db.sessionInputs, forRun(runId) {
+      if (rejectRead) { rejectRead = false; return fail(appError('storage_read_failed', 'storage', 'Transient input audit failure.', true)); }
+      return db.sessionInputs.forRun(runId);
+    } } });
+    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
+      (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
+      id => runtime.verifySessionMutation(id));
+    const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
+    const finished = finishSignal();
+    const initial = await app.submitInput({ ...request, clientSequence: 1, mode: 'prompt', timeoutMs: 5000 }, finished);
+    if (!initial.ok) throw new Error(initial.error.code);
+    await entered.promise;
+    const queued = await app.submitInput({ sessionId: 1, clientSequence: 2, mode: 'followUp', runId: initial.data.runId, text: 'Unconfirmed input' });
+    if (!queued.ok) throw new Error(queued.error.code);
+    release.resolve();
+    expect(await finished.done.promise).toMatchObject({ type: 'run_finished', result: { ok: true, data: { status: 'failed', stopped: true } } });
+    expect(await app.querySessionInput({ sessionId: 1, inputId: queued.data.inputId })).toMatchObject({ ok: true, data: { input: {
+      status: 'delivery_unknown', processingStatus: 'failed', nativeEntryId: null } } });
+    expect(db.sessions.get(1)).toMatchObject({ ok: true, data: { nativeUnusable: true } });
+    expect(await app.querySession(1)).toMatchObject({ ok: true, data: { availability: 'unusable' } });
+    expect(await app.submitInput({ ...request, clientSequence: 3, mode: 'prompt' }))
+      .toMatchObject({ ok: false, error: { code: 'agent_session_unusable' } });
+    await app.close();
+  });
+
   it.each([true, false])('keeps each input fact across Stop and requires the real tool barrier: tool stopped=%s', async toolStopped => {
     const { db, deps } = fixture();
     const entered = deferred<void>();

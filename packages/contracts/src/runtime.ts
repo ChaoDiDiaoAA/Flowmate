@@ -1,18 +1,19 @@
 import { z } from 'zod';
 import { WorkspaceInputSchema } from './workspace.ts';
+import { RUNTIME_CONFIG } from './runtime-config.ts';
 
 export type DbId = number;
 
 export const RuntimeBudgetOverridesSchema = z.object({
-  maxToolCalls: z.number().int().min(0).max(100).optional(),
-  maxModelCalls: z.number().int().min(1).max(64).optional(),
-  toolTimeoutMs: z.number().int().min(100).max(1_800_000).optional(),
+  maxToolCalls: z.number().int().min(RUNTIME_CONFIG.ranges.maxToolCalls.min).max(RUNTIME_CONFIG.ranges.maxToolCalls.max).optional(),
+  maxModelCalls: z.number().int().min(RUNTIME_CONFIG.ranges.maxModelCalls.min).max(RUNTIME_CONFIG.ranges.maxModelCalls.max).optional(),
+  toolTimeoutMs: z.number().int().min(RUNTIME_CONFIG.ranges.toolTimeoutMs.min).max(RUNTIME_CONFIG.ranges.toolTimeoutMs.max).optional(),
 }).strict();
 export type RuntimeBudgetOverrides = z.infer<typeof RuntimeBudgetOverridesSchema>;
 export const RuntimeRequestOverridesSchema = z.object({
   budget: RuntimeBudgetOverridesSchema.optional(),
-  timeoutMs: z.number().int().min(100).max(1_800_000).optional(),
-  stopGraceMs: z.number().int().min(100).max(10_000).optional(),
+  timeoutMs: z.number().int().min(RUNTIME_CONFIG.ranges.timeoutMs.min).max(RUNTIME_CONFIG.ranges.timeoutMs.max).optional(),
+  stopGraceMs: z.number().int().min(RUNTIME_CONFIG.ranges.stopGraceMs.min).max(RUNTIME_CONFIG.ranges.stopGraceMs.max).optional(),
 }).strict();
 export type RuntimeRequestOverrides = z.infer<typeof RuntimeRequestOverridesSchema>;
 export type ResolvedRuntimeBudget = Required<RuntimeBudgetOverrides>;
@@ -514,6 +515,11 @@ export interface Application {
     control?: ProviderControl,
   ): Promise<Result<ProviderOutcome>>;
   queryRun(runId: DbId): Promise<Result<RunSnapshot>>;
+  queryRuntimeEvents(input: import('./events.ts').RuntimeEventsQuery): Promise<import('./events.ts').RuntimeEventsReadResult>;
+  subscribeRuntimeEvents(input: import('./events.ts').RuntimeEventsSubscriptionRequest,
+    listener: (wake: import('./events.ts').RuntimeEventsAvailable) => void): Promise<Result<import('./events.ts').RuntimeEventSubscription>>;
+  listRunToolCalls(input: import('./events.ts').RunToolCallsRequest): Promise<Result<import('./workspace.ts').Page<import('./events.ts').RuntimeToolView>>>;
+  queryRunToolCall(input: import('./events.ts').RunToolCallRequest): Promise<Result<import('./events.ts').RuntimeToolView>>;
   createSession(request?: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
   queryNativeTools(): Promise<Result<readonly import('./tools.ts').NativeToolAvailability[]>>;
   renameSession(request: RenameSessionRequest): Promise<Result<SessionSnapshot>>;

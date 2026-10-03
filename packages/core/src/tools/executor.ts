@@ -1,6 +1,7 @@
-import { AppErrorSchema, FillInvoiceFormOutputSchema, NativeToolOutputSchema, RuntimeStrategySnapshotSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, ToolExecutionFailure, NATIVE_TOOL_NAMES, INVOICE_REVIEW_TOOL_NAMES, appError, fail, ok } from '@flowmate/contracts';
+import { AppErrorSchema, FillInvoiceFormOutputSchema, NativeToolOutputSchema, RuntimeStrategySnapshotSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, ToolExecutionFailure, NATIVE_TOOL_NAMES, INVOICE_REVIEW_TOOL_NAMES, TOOL_CONFIG, RUNTIME_CONFIG, appError, fail, ok } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import type { AppError, DbId, Result, ToolCallDelivery, ToolDefinition, ToolExecutionContext, ToolResult, ToolCallSnapshot, ToolRuntimeObservation, RuntimeStrategySnapshot, ResolvedRuntimeBudget, RuntimeStrategyPolicy } from '@flowmate/contracts';
+import { MAX_TOOL_NAME_CHARS, MAX_TOOL_VERSION_CHARS } from '@flowmate/contracts';
 import { createToolRecorder } from './recorder.ts';
 type Recorder = ReturnType<typeof createToolRecorder>;
 export type ToolExecution = { call: ToolCallSnapshot; result: ToolResult<unknown>; fatal: boolean };
@@ -20,6 +21,17 @@ function safeError(value: unknown): AppError {
 
 type StrategyInput = { allowedTools: readonly string[]; configuredToolTimeoutMs: number; sdk: { codingAgent: string; ai: string };
   environment: string; sampleSource: ToolRuntimeObservation['sampleSource']; taskType: string; modelKey: string; promptVersion: string };
+
+function isToolExperience(call: ToolCallSnapshot, observation: ToolRuntimeObservation): boolean {
+  if (call.status === 'cancelled' || observation.runDeadlineTruncated) return false;
+  const errors = [call.result && call.result.status !== 'succeeded' ? call.result.error : null, observation.commitError];
+  if (errors.some(error => error !== null && !(error.category === 'tool'
+    || error.category === 'input' && ['tool_invalid_input', 'input_invalid', 'source_invalid', 'tool_result_too_large'].includes(error.code)
+    || error.category === 'runtime' && error.code === 'tool_timeout'))) return false;
+  // Lifecycle failures do not describe tool reliability; an actual invalid output remains a tool diagnostic.
+  return observation.afterStructure === 'invalid' || observation.afterDomain === 'invalid'
+    || !['identity', 'sdk_before', 'commit', 'storage', 'sdk_after', 'delivery', 'history'].includes(observation.failureStage ?? '');
+}
 
 export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Recorder; definitions: readonly ToolDefinition<any, any>[];
   policy?: RuntimeStrategyPolicy }): Result<RuntimeStrategySnapshot> {
@@ -64,16 +76,18 @@ export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Recorde
       && call.runtimeObservation.executionDurationMs !== null && !call.runtimeObservation.runDeadlineTruncated
       && call.runtimeObservation.afterStructure === 'valid' && ['valid', 'not_applicable'].includes(call.runtimeObservation.afterDomain));
     group.eligibleCount = eligible.length;
-    const risky = attempts.slice(0, 20).some(call => !call.cleanup.stopped || call.runtimeObservation?.runDeadlineTruncated
+    const risky = attempts.slice(0, TOOL_CONFIG.statistics.riskWindowAttempts).some(call => !call.cleanup.stopped || call.runtimeObservation?.runDeadlineTruncated
       || ['tool_timeout', 'agent_timeout', 'stop_not_confirmed'].includes(call.runtimeObservation?.diagnosticCode ?? ''));
     if (!statistical) group.fallbackReason = 'ineligible_tool';
     else if (input.policy?.statistics === false) group.fallbackReason = 'disabled';
     else if (risky) group.fallbackReason = 'recent_risk';
-    else if (eligible.length < 20) group.fallbackReason = 'insufficient_samples';
+    else if (eligible.length < TOOL_CONFIG.statistics.minEligibleSamples) group.fallbackReason = 'insufficient_samples';
     else {
       const sorted = eligible.map(call => call.runtimeObservation!.executionDurationMs!).sort((left, right) => left - right);
-      group.p95Ms = sorted[Math.ceil(sorted.length * .95) - 1]!;
-      group.selectedTimeoutMs = Math.min(input.configuredToolTimeoutMs, Math.max(1000, Math.ceil(1.5 * group.p95Ms)));
+      // nearest-rank P95 是 p95Ms 的固定语义，不作为自由百分位配置。
+      group.p95Ms = sorted[Math.ceil(sorted.length * 0.95) - 1]!;
+      group.selectedTimeoutMs = Math.min(input.configuredToolTimeoutMs,
+        Math.max(TOOL_CONFIG.statistics.minTimeoutMs, Math.ceil(TOOL_CONFIG.statistics.timeoutMultiplier * group.p95Ms)));
       group.timeoutSource = 'statistical';
     }
     if (input.policy?.experience === false) continue;
@@ -81,15 +95,16 @@ export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Recorde
     for (const call of known.ok ? known.data : []) {
       const observation = call.runtimeObservation;
       if (!observation || observation.diagnosticCode === null && observation.afterStructure !== 'invalid' && observation.afterDomain !== 'invalid') continue;
+      if (!isToolExperience(call, observation)) continue;
       const item = { toolName: name, failureStage: observation.failureStage, diagnosticCode: observation.diagnosticCode,
         afterStructure: observation.afterStructure, afterDomain: observation.afterDomain, timingComplete: observation.timingComplete,
         missingEvidence: observation.commit === 'unknown' || !call.cleanup.stopped || !observation.timingComplete, count: 1 };
       const prior = experience.items.find(candidate => JSON.stringify({ ...candidate, count: 1 }) === JSON.stringify(item));
       if (prior) prior.count++;
-      else if (experience.items.length < 64) experience.items.push(item);
+      else if (experience.items.length < TOOL_CONFIG.statistics.maxExperienceItems) experience.items.push(item);
     }
   }
-  experience.items = experience.items.slice(0, 64);
+  experience.items = experience.items.slice(0, TOOL_CONFIG.statistics.maxExperienceItems);
   return ok({ version: 'runtime-v1', sampleSource: input.sampleSource,
     calibration: { sourceCutoffToolCallId: cutoff.ok ? cutoff.data : 0, groups }, experience });
 }
@@ -108,9 +123,11 @@ export function createToolExecutor(input: {
 }) {
   const definitions = Object.freeze([...input.definitions]);
   const byName = new Map<string, ToolDefinition<any, any>>();
+  const namePattern = new RegExp(`^[a-z][a-z0-9_]{0,${MAX_TOOL_NAME_CHARS - 1}}$`);
+  const versionPattern = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]{0,${MAX_TOOL_VERSION_CHARS - 1}}$`);
   for (const definition of definitions) {
-    if (!definition || typeof definition.name !== 'string' || !/^[a-z][a-z0-9_]{0,127}$/.test(definition.name)
-      || typeof definition.version !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(definition.version)
+    if (!definition || typeof definition.name !== 'string' || !namePattern.test(definition.name)
+      || typeof definition.version !== 'string' || !versionPattern.test(definition.version)
       || typeof definition.description !== 'string' || !definition.description.trim() || definition.description.length > 4096
       || !ToolEffectSchema.safeParse(definition.effect).success
       || !ToolExecutionModeSchema.safeParse(definition.executionMode).success
@@ -125,9 +142,10 @@ export function createToolExecutor(input: {
   }
   const budgets = new Map<DbId, RunBudget>();
   const active = new Map<string, Promise<ToolExecution>>();
-  const maxCalls = input.maxToolCalls ?? 24;
-  const maxTimeoutMs = input.maxToolTimeoutMs ?? 10_000;
-  const maxResultBytes = input.maxResultBytes ?? 8_388_608;
+  // Run 默认额度集中在 packages/contracts/src/runtime-config.ts；载荷／统计策略见 tool-config.ts。
+  const maxCalls = input.maxToolCalls ?? RUNTIME_CONFIG.runBudget.maxToolCalls;
+  const singleToolTimeoutMs = input.maxToolTimeoutMs ?? RUNTIME_CONFIG.runBudget.toolTimeoutMs;
+  const maxResultBytes = input.maxResultBytes ?? RUNTIME_CONFIG.runBudget.maxToolFeedbackBytes;
   const monotonicNow = input.monotonicNow ?? (() => performance.now());
   const budgetFor = (runId: DbId): RunBudget => {
     let budget = budgets.get(runId);
@@ -252,7 +270,7 @@ export function createToolExecutor(input: {
     const native = NATIVE_TOOL_NAMES.includes(definition.name as (typeof NATIVE_TOOL_NAMES)[number]);
     let argumentsBytes: number;
     try { argumentsBytes = encodedSize(raw); } catch { return fail(appError('tool_invalid_input', 'tool', '工具参数不是可记录的 JSON。')); }
-    if (!native && argumentsBytes > 256 * 1024) return fail(appError('tool_result_too_large', 'tool', '工具参数超过输入上限。'));
+    if (!native && argumentsBytes > TOOL_CONFIG.payload.maxRawArgumentsBytes) return fail(appError('tool_result_too_large', 'tool', '工具参数超过输入上限。'));
     const parsed = definition.inputSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('tool_invalid_input', 'tool', '工具参数不符合输入 Schema。'));
     const fixed = input.recorder.fixArguments(call.toolCallId, parsed.data);
@@ -266,7 +284,7 @@ export function createToolExecutor(input: {
     }
     if (context.signal.aborted || budget.closed || budget.fatal) return fail(appError(context.signal.aborted ? 'agent_cancelled' : 'tool_budget_exceeded', 'runtime',
       context.signal.aborted ? 'Run 已取消，工具未执行。' : 'Run 已停止接纳工具调用。', false, context.runId, context.sessionId, context.nativeToolCallId));
-    const configuredMs = budget.limit?.toolTimeoutMs ?? maxTimeoutMs;
+    const configuredMs = budget.limit?.toolTimeoutMs ?? singleToolTimeoutMs;
     const selected = !native && ['PURE', 'READ'].includes(definition.effect)
       ? budget.strategy?.calibration.groups.find(group => group.toolName === definition.name && group.toolVersion === definition.version) : undefined;
     const selectedMs = Math.min(configuredMs, selected?.selectedTimeoutMs ?? configuredMs);
@@ -318,7 +336,7 @@ export function createToolExecutor(input: {
       if (definition.outputSchema && !output?.success) {
         status = 'failed';
         error = appError('tool_invalid_output', 'tool', '工具返回值不符合输出 Schema。');
-      } else if (!native && encodedSize(data) > 256 * 1024) {
+      } else if (!native && encodedSize(data) > TOOL_CONFIG.payload.maxOutputBytes) {
         status = 'failed';
         error = appError('tool_result_too_large', 'tool', '工具结果超过输出上限。');
       } else if (timedOut || context.signal.aborted) {
@@ -332,7 +350,7 @@ export function createToolExecutor(input: {
       if (thrown instanceof ToolExecutionFailure && thrown.data !== undefined) {
         const checked = definition.outputSchema?.safeParse(thrown.data);
         afterStructure = checked?.success ? 'valid' : 'invalid';
-        if (checked?.success && (native || encodedSize(checked.data) <= 256 * 1024)) {
+        if (checked?.success && (native || encodedSize(checked.data) <= TOOL_CONFIG.payload.maxOutputBytes)) {
           data = checked.data;
         }
       }

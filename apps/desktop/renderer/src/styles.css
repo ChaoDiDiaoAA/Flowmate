@@ -626,3 +626,30 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 .next-run-limits { font-size: 12px; margin-bottom: 10px; }
 .next-run-limits > summary { cursor: pointer; }
 .next-run-limits .runtime-limit-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.activity-page { min-width: 0; }
+.activity-page .panel { margin-bottom: 20px; overflow: hidden; }
+.activity-controls { display: flex; flex-wrap: wrap; gap: 14px; padding: 18px 22px; align-items: end; }
+.activity-controls label { display: flex; flex: 1 1 220px; min-width: 0; flex-direction: column; gap: 8px; font-size: 14px; }
+.activity-controls select { width: 100%; min-height: 42px; max-width: 100%; padding: 10px 12px; border: 1px solid var(--input); border-radius: 8px; background: var(--surface); color: var(--foreground); font: inherit; }
+.activity-facts, .activity-tools, .activity-diagnostics { padding: 18px 22px; }
+.activity-facts dl, .activity-tool-detail { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; margin: 0; }
+.activity-facts dt, .activity-tool-detail dt { font-size: 13px; color: var(--foreground-muted); }
+.activity-facts dd, .activity-tool-detail dd { margin: 6px 0 0; font-size: 15px; overflow-wrap: anywhere; }
+.activity-note { margin: 0; padding: 18px 22px; color: var(--foreground-muted); font-size: 14px; }
+.activity-timeline { list-style: none; padding: 8px 22px 22px; margin: 0; }
+.activity-timeline li { display: flex; align-items: start; gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--border); }
+.activity-timeline li > div { display: flex; min-width: 0; flex-direction: column; align-items: start; gap: 6px; overflow-wrap: anywhere; }
+.activity-timeline strong { font-size: 15px; font-weight: 600; }
+.activity-timeline time, .activity-timeline li > div > span { font-size: 13px; color: var(--foreground-muted); }
+.activity-sequence { min-width: 30px; padding-top: 2px; color: var(--foreground-subtle); font-family: var(--font-numeric-stack); font-size: 13px; }
+.activity-tools > .route-row { display: flex; width: 100%; justify-content: space-between; gap: 12px; text-align: left; min-height: 44px; }
+.activity-tools > .route-row span { font-size: 13px; color: var(--foreground-muted); }
+.activity-tool-detail { padding-top: 16px; }
+.activity-diagnostics { border-top: 1px solid var(--border); font-size: 14px; }
+.activity-diagnostics summary { cursor: pointer; min-height: 40px; align-content: center; }
+.activity-diagnostics p { color: var(--foreground-muted); overflow-wrap: anywhere; }
+@media (max-width: 1079px) {
+  .activity-controls, .activity-facts, .activity-tools, .activity-diagnostics { padding: 16px; }
+  .activity-controls label { flex-basis: 100%; }
+  .activity-timeline { padding-inline: 16px; }
+}

@@ -21,7 +21,7 @@ function request(store: ReturnType<typeof makeSelectedCandidate>) {
 }
 
 describe('human candidate transactions', () => {
-  it('migrates to 12 while preserving model IDs, bytes, pointers and foreign keys', () => {
+  it('migrates to the current schema while preserving model IDs, bytes, pointers and foreign keys', () => {
     const legacy = makeSelectedCandidate(true);
     const paths = { root: legacy.root, databaseFile: join(legacy.root,'data','flowmate.sqlite'), outputsDir: join(legacy.root,'outputs'),
       artifactsDir: join(legacy.root,'artifacts'), logsDir: join(legacy.root,'logs'), runtimeDir: join(legacy.root,'runtime') };
@@ -31,7 +31,7 @@ describe('human candidate transactions', () => {
     expect(legacy.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 9 });
     legacy.close();
     const store = required(openDatabase(paths)); deferCleanup(() => store.close());
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 12 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 13 });
     expect({ candidate: store.db.query(candidateSql).all(), jobs: store.db.query('SELECT * FROM jobs').all(),
       artifacts: store.db.query('SELECT * FROM artifacts').all(), events: store.db.query('SELECT * FROM business_events').all() }).toEqual(before);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);

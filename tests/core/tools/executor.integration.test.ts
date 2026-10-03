@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
 import { appError, ToolExecutionFailure, NativeToolOutputSchema, invoiceToolSchemas } from '@flowmate/contracts';
-import type { ToolDefinition, ToolExecutionContext, ToolEffect } from '@flowmate/contracts';
+import type { AppError, ToolDefinition, ToolExecutionContext, ToolEffect, ToolRuntimeObservation } from '@flowmate/contracts';
 import { deferCleanup } from '../../support/resources.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
@@ -233,6 +233,85 @@ describe('P3 Tool Executor', () => {
     expect(JSON.stringify(summary)).not.toContain('C:/private.pdf');
     expect(store.executor.freezeStrategy({ ...config, modelKey: 'model-B' })).toMatchObject({ ok: true,
       data: { experience: { items: [] } } });
+  });
+  it('excludes environment and control failures from frozen tool experience without changing their facts or counts', () => {
+    const store = makeRuntime(['read_fixture']);
+    const config = { allowedTools: ['read_fixture'], configuredToolTimeoutMs: 10_000,
+      sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, environment: 'fixture', sampleSource: 'test' as const,
+      taskType: 'answer', modelKey: 'model-A', promptVersion: 'prompt-A' };
+    const initial = store.executor.freezeStrategy(config);
+    if (!initial.ok) throw new Error(initial.error.code);
+    const groupKey = initial.data.calibration.groups[0]!.groupKey;
+    const diagnostics: Array<{ id: string; error: AppError; stage: ToolRuntimeObservation['failureStage'];
+      rejected?: boolean; diagnosticCode?: string; afterStructure?: 'invalid'; afterDomain?: 'invalid';
+      commitError?: AppError; truncated?: boolean; cancelled?: boolean }> = [
+      { id: 'sdk-arguments', error: appError('tool_invalid_input', 'tool', 'Correct SDK arguments.'), stage: 'sdk_arguments', rejected: true },
+      { id: 'host-arguments', error: appError('input_invalid', 'input', 'Correct arguments.'), stage: 'before', rejected: true },
+      { id: 'read-reference', error: appError('tool_invalid_input', 'input', 'Read the correct page.'), stage: 'execute' },
+      { id: 'candidate-source', error: appError('source_invalid', 'input', 'Correct the source reference.'), stage: 'execute' },
+      { id: 'execution-1', error: appError('tool_execution_failed', 'tool', 'Execution failed.'), stage: 'execute' },
+      { id: 'execution-2', error: appError('tool_execution_failed', 'tool', 'Another execution failed.'), stage: 'execute' },
+      { id: 'output-structure', error: appError('tool_invalid_output', 'tool', 'Invalid output.'), stage: 'validation', afterStructure: 'invalid' },
+      { id: 'output-receipt', error: appError('tool_invalid_output', 'tool', 'Incompatible receipt.'), stage: 'validation', afterDomain: 'invalid' },
+      { id: 'tool-timeout', error: appError('tool_timeout', 'runtime', 'Tool deadline elapsed.'), stage: 'execute' },
+      { id: 'permission', error: appError('tool_access_denied', 'runtime', 'Permission denied.'), stage: 'before', rejected: true },
+      { id: 'material', error: appError('input_unavailable', 'input', 'Material unavailable.'), stage: 'execute', afterStructure: 'invalid' },
+      { id: 'artifact', error: appError('artifact_unavailable', 'input', 'Artifact unavailable.'), stage: 'execute' },
+      { id: 'storage-result', error: appError('storage_corrupt', 'storage', 'Stored facts unavailable.'), stage: 'execute',
+        diagnosticCode: 'tool_execution_failed', afterDomain: 'invalid' },
+      { id: 'storage-commit', error: appError('tool_invalid_output', 'tool', 'Output could not be verified.'), stage: 'validation',
+        afterDomain: 'invalid', commitError: appError('storage_corrupt', 'storage', 'Commit query failed.') },
+      { id: 'storage-stage', error: appError('tool_execution_failed', 'tool', 'Storage stage failed.'), stage: 'storage' },
+      { id: 'history-stage', error: appError('tool_execution_failed', 'tool', 'History stage failed.'), stage: 'history' },
+      { id: 'delivery-stage', error: appError('tool_execution_failed', 'tool', 'Delivery stage failed.'), stage: 'delivery' },
+      { id: 'sdk-after-stage', error: appError('tool_execution_failed', 'tool', 'SDK feedback failed.'), stage: 'sdk_after' },
+      { id: 'revoked', error: appError('session_scope_revoked', 'session', 'Permission revoked.'), stage: 'before', rejected: true },
+      { id: 'cancelled', error: appError('agent_cancelled', 'runtime', 'Run cancelled.'), stage: 'execute', cancelled: true },
+      { id: 'budget', error: appError('tool_budget_exceeded', 'runtime', 'Call budget exhausted.'), stage: 'before', rejected: true },
+      { id: 'feedback-budget', error: appError('tool_context_limit', 'runtime', 'Feedback budget exhausted.'), stage: 'validation', afterDomain: 'invalid' },
+      { id: 'run-deadline', error: appError('agent_timeout', 'runtime', 'Run deadline elapsed.'), stage: 'before', rejected: true },
+      { id: 'truncated-timeout', error: appError('tool_timeout', 'runtime', 'Run deadline truncated the tool.'), stage: 'execute', truncated: true },
+    ];
+    for (const sample of diagnostics) {
+      const requested = store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: sample.id,
+        toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: { value: 1 }, requestedAt: store.at });
+      if (!requested.ok) throw new Error(requested.error.code);
+      const toolCallId = requested.data.toolCallId;
+      const observation: ToolRuntimeObservation = { version: 1, groupKey, strategyVersion: 'runtime-v1', sampleSource: 'test',
+        beforeOutcome: sample.rejected ? 'rejected' : 'allowed', failureStage: sample.stage,
+        diagnosticCode: sample.diagnosticCode ?? sample.error.code, afterStructure: sample.afterStructure ?? 'not_applicable',
+        afterDomain: sample.afterDomain ?? 'not_applicable', executionDurationMs: sample.rejected ? null : 1,
+        timingComplete: !sample.rejected && !sample.cancelled, effectiveTimeoutMs: sample.rejected ? null : 10_000,
+        timeoutSource: sample.rejected ? null : 'configured', runDeadlineTruncated: sample.truncated ?? false,
+        commit: sample.commitError ? 'unknown' : 'none_confirmed', commitError: sample.commitError ?? null };
+      const facts = { toolCallId, result: { version: 1 as const, status: sample.cancelled ? 'cancelled' as const : 'failed' as const,
+        error: sample.error, committedCandidateId: null }, cleanup: { version: 1 as const, stopped: true, stopReason: 'fixture', errors: [] },
+        endedAt: store.at, runtimeObservation: observation };
+      if (sample.rejected) expect(store.toolCalls.reject(facts).ok).toBe(true);
+      else {
+        expect(store.toolCalls.fixArguments({ toolCallId, finalArguments: { value: 1 } }).ok).toBe(true);
+        expect(store.toolCalls.start({ toolCallId, startedAt: store.at }).ok).toBe(true);
+        expect(store.toolCalls.finish({ ...facts, stoppedAt: store.at }).ok).toBe(true);
+      }
+    }
+    const readFacts = () => store.db.query('SELECT * FROM tool_calls ORDER BY id').all();
+    const persisted = readFacts();
+    expect(store.db.query('SELECT tool_call_count FROM runs WHERE id=1').get()).toEqual({ tool_call_count: 24 });
+    const frozen = store.executor.freezeStrategy(config);
+    if (!frozen.ok) throw new Error(frozen.error.code);
+    expect(frozen.data.experience.items.map(item => [item.failureStage, item.diagnosticCode, item.afterStructure, item.afterDomain, item.count]))
+      .toEqual([
+        ['execute', 'tool_timeout', 'not_applicable', 'not_applicable', 1],
+        ['validation', 'tool_invalid_output', 'not_applicable', 'invalid', 1],
+        ['validation', 'tool_invalid_output', 'invalid', 'not_applicable', 1],
+        ['execute', 'tool_execution_failed', 'not_applicable', 'not_applicable', 2],
+        ['execute', 'source_invalid', 'not_applicable', 'not_applicable', 1],
+        ['execute', 'tool_invalid_input', 'not_applicable', 'not_applicable', 1],
+        ['before', 'input_invalid', 'not_applicable', 'not_applicable', 1],
+        ['sdk_arguments', 'tool_invalid_input', 'not_applicable', 'not_applicable', 1],
+      ]);
+    expect(readFacts()).toEqual(persisted);
+    expect(store.db.query('SELECT tool_call_count FROM runs WHERE id=1').get()).toEqual({ tool_call_count: 24 });
   });
   it('freezes nearest-rank P95 from the last 200 started attempts before selecting eligible samples', () => {
     const store = makeRuntime(['read_fixture', 'write_fixture', 'read']);

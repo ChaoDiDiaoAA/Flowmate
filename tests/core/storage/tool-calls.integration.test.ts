@@ -59,8 +59,85 @@ const observation: ToolRuntimeObservation = { version: 1, groupKey: 'fixture-rea
   effectiveTimeoutMs: 1000, timeoutSource: 'configured', runDeadlineTruncated: false,
   commit: 'none_confirmed', commitError: null };
 
+function utf8Sized<T>(bytes: number, build: (text: string) => T): T {
+  const seed = '票"\n'.repeat(6_000);
+  const remaining = bytes - Buffer.byteLength(JSON.stringify(build(seed)), 'utf8');
+  if (remaining < 0) throw new Error('Boundary fixture is too small for its multibyte seed.');
+  return build(seed + 'x'.repeat(remaining));
+}
+
+describe('ToolCall serialized byte boundaries', () => {
+  it('counts raw UTF-8 JSON bytes before creating a request or charging its Run', () => {
+    const store = makeStore();
+    const raw = utf8Sized(262_144, text => ({ text }));
+    expect(Buffer.byteLength(JSON.stringify(raw), 'utf8')).toBe(262_144);
+    expect(JSON.stringify(raw).length).toBeLessThan(262_144);
+    const request = { runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'raw-boundary',
+      toolName: 'read_fixture', toolVersion: '1', effect: 'READ' as const, rawArguments: raw, requestedAt: store.stamp };
+    expect(store.toolCalls.request({ ...request, rawArguments: { text: raw.text + 'x' } }))
+      .toMatchObject({ ok: false, error: { code: 'tool_result_too_large' } });
+    expect(store.db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 0 });
+    expect(store.db.query('SELECT tool_call_count FROM runs WHERE id=?').get(store.runId)).toEqual({ tool_call_count: 0 });
+    const saved = required(store.toolCalls.request(request));
+    expect(saved.args.raw).toEqual(raw);
+    expect(store.toolCalls.request(request)).toEqual({ ok: true, data: saved });
+    expect(store.toolCalls.request({ ...request, nativeToolCallId: 'raw-too-large', rawArguments: { text: raw.text + 'x' } }))
+      .toMatchObject({ ok: false, error: { code: 'tool_result_too_large' } });
+    expect(store.db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
+    expect(store.db.query('SELECT tool_call_count FROM runs WHERE id=?').get(store.runId)).toEqual({ tool_call_count: 1 });
+  });
+
+  it('fixes final arguments at 64 KiB and leaves rejected arguments unfixed', () => {
+    const store = makeStore();
+    const call = required(store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId,
+      nativeToolCallId: 'final-boundary', toolName: 'read_fixture', toolVersion: '1', effect: 'READ',
+      rawArguments: {}, requestedAt: store.stamp }));
+    const finalArguments = utf8Sized(65_536, text => ({ text }));
+    expect(Buffer.byteLength(JSON.stringify(finalArguments), 'utf8')).toBe(65_536);
+    expect(JSON.stringify(finalArguments).length).toBeLessThan(65_536);
+    expect(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: { text: finalArguments.text + 'x' } }))
+      .toMatchObject({ ok: false, error: { code: 'tool_result_too_large' } });
+    expect(required(store.toolCalls.getById(call.toolCallId))).toMatchObject({ status: 'requested', args: { raw: {}, final: null } });
+    const fixed = required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments }));
+    expect(fixed.args.final).toEqual(finalArguments);
+    expect(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments })).toEqual({ ok: true, data: fixed });
+    expect(store.db.query('SELECT tool_call_count FROM runs WHERE id=?').get(store.runId)).toEqual({ tool_call_count: 1 });
+  });
+
+  it.each(['finish', 'reject'] as const)('counts the complete %s envelope and preserves open facts when one byte over', mode => {
+    const store = makeStore();
+    const call = required(store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId,
+      nativeToolCallId: `envelope-${mode}`, toolName: 'read_fixture', toolVersion: '1', effect: 'READ',
+      rawArguments: {}, requestedAt: store.stamp }));
+    if (mode === 'finish') {
+      required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
+      required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: store.stamp }));
+    }
+    const result = utf8Sized(262_144, text => mode === 'finish'
+      ? { version: 1 as const, status: 'succeeded' as const, data: { text }, committedCandidateId: null }
+      : { version: 1 as const, status: 'failed' as const,
+        error: appError('tool_invalid_input', 'tool', 'Fixture rejection.'), data: { text }, committedCandidateId: null });
+    expect(Buffer.byteLength(JSON.stringify(result), 'utf8')).toBe(262_144);
+    expect(Buffer.byteLength(JSON.stringify(result.data), 'utf8')).toBeLessThan(262_144);
+    const cleanup = { version: 1 as const, stopReason: 'fixture-completed', stopped: true, errors: [] };
+    const facts = { toolCallId: call.toolCallId, cleanup, endedAt: store.stamp,
+      runtimeObservation: mode === 'finish' ? observation : { ...observation, beforeOutcome: 'rejected' as const,
+        afterStructure: 'not_applicable' as const, executionDurationMs: null, timingComplete: false } };
+    const oversized = { ...result, data: { text: result.data.text + 'x' } };
+    const denied = mode === 'finish' ? store.toolCalls.finish({ ...facts, result: oversized, stoppedAt: store.stamp })
+      : store.toolCalls.reject({ ...facts, result: oversized });
+    expect(denied).toMatchObject({ ok: false, error: { code: 'tool_result_too_large' } });
+    expect(required(store.toolCalls.getById(call.toolCallId))).toMatchObject({ status: mode === 'finish' ? 'running' : 'requested',
+      result: null, runtimeObservation: null, endedAt: null, stoppedAt: null });
+    const saved = mode === 'finish' ? store.toolCalls.finish({ ...facts, result, stoppedAt: store.stamp })
+      : store.toolCalls.reject({ ...facts, result });
+    expect(saved).toMatchObject({ ok: true, data: { result, runtimeObservation: facts.runtimeObservation, endedAt: store.stamp } });
+    expect(store.db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
+  });
+});
+
 describe('Runtime fixed observations', () => {
-  it.each(['throws', 'foreign-receipt', 'terminal-write-fails'] as const)('keeps the original candidate commit when execution %s and never repeats its write', async (mode) => {
+  it.each(['throws', 'foreign-receipt', 'terminal-write-fails', 'terminal-event-fails'] as const)('keeps the original candidate commit when execution %s and never repeats its write', async (mode) => {
     const store = makeStore();
     addRunningInvoiceJob(store);
     const candidate = { fields: { invoiceNumber: missingField(), issueDate: missingField(), sellerName: missingField(),
@@ -84,6 +161,8 @@ describe('Runtime fixed observations', () => {
     const context = { runId: 1, sessionId: store.sessionId, nativeToolCallId: 'committed-write', scope, signal: new AbortController().signal };
     if (mode === 'terminal-write-fails') store.db.exec(`CREATE TRIGGER reject_commit_terminal BEFORE UPDATE OF status ON tool_calls
       WHEN NEW.status IN ('succeeded','failed') BEGIN SELECT RAISE(ABORT,'terminal unavailable'); END;`);
+    if (mode === 'terminal-event-fails') store.db.exec(`CREATE TRIGGER reject_commit_event BEFORE INSERT ON runtime_events
+      WHEN NEW.type IN ('tool_succeeded','tool_failed','tool_cancelled') BEGIN SELECT RAISE(ABORT,'terminal event unavailable'); END;`);
     const executed = await executor.execute('save_invoice_candidate', { documentId: 1, candidate }, context);
     expect(executed).toMatchObject({ fatal: true, result: { status: 'failed', error: {
       code: mode === 'throws' ? 'tool_execution_failed' : mode === 'foreign-receipt' ? 'tool_invalid_output' : 'storage_write_failed',
@@ -91,11 +170,18 @@ describe('Runtime fixed observations', () => {
     const original = required(recorder.query({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'committed-write' }));
     expect(required(recorder.queryCandidateCommit({ toolCallId: original.toolCallId, runId: 1, sessionId: store.sessionId })))
       .toMatchObject({ candidateId: 1, jobId: 4, sequence: 1 });
-    expect(original).toMatchObject(mode === 'terminal-write-fails' ? { status: 'running', result: null, runtimeObservation: null }
+    expect(original).toMatchObject(mode === 'terminal-write-fails' || mode === 'terminal-event-fails' ? { status: 'running', result: null, runtimeObservation: null }
       : { status: 'failed', result: { committedCandidateId: 1 }, runtimeObservation: { commit: 'committed' } });
     await executor.execute('save_invoice_candidate', { documentId: 1, candidate }, context);
     expect(executions).toBe(1);
     expect(store.db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 1 });
+    if (mode === 'terminal-event-fails') {
+      expect(store.db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 1 });
+      expect(store.db.query("SELECT COUNT(*) AS count FROM runtime_events WHERE type IN ('tool_succeeded','tool_failed','tool_cancelled')").get()).toEqual({ count: 0 });
+      expect(store.db.query("SELECT COUNT(*) AS count FROM tool_calls WHERE tool_name='fill_invoice_form'").get()).toEqual({ count: 0 });
+      expect(required(recorder.queryCandidateCommit({ toolCallId: original.toolCallId, runId: 1, sessionId: store.sessionId })))
+        .toMatchObject({ candidateId: 1, jobId: 4, sequence: 1 });
+    }
   });
   it('migrates an existing database with NULL observations and rolls back failed version registration', () => {
     for (const registrationFails of [false, true]) {
@@ -108,6 +194,8 @@ describe('Runtime fixed observations', () => {
         'running','fixture','{}','{}','{}','{}',?)`).run(session.sessionId, stamp);
       const call = required(store.toolCalls.request({ runId: 1, sessionId: session.sessionId, nativeToolCallId: 'old-row',
         toolName: 'unknown_tool', toolVersion: null, effect: null, rawArguments: {}, requestedAt: stamp }));
+      store.db.exec('DROP TABLE runtime_events');
+      store.db.exec('DELETE FROM schema_migrations WHERE version=13');
       store.db.exec('DROP INDEX tool_calls_runtime_observation_recent');
       store.db.exec('ALTER TABLE tool_calls DROP COLUMN runtime_observation_json');
       store.db.exec('DELETE FROM schema_migrations WHERE version=12');
@@ -118,7 +206,7 @@ describe('Runtime fixed observations', () => {
       expect(reopened.ok).toBe(!registrationFails);
       const db = reopened.ok ? reopened.data.db : new Database(paths(root).databaseFile);
       deferCleanup(() => reopened.ok ? reopened.data.close() : db.close());
-      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 12 });
+      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 13 });
       const columns = db.query('PRAGMA table_info(tool_calls)').all() as Array<{ name: string }>;
       expect(columns.some(column => column.name === 'runtime_observation_json')).toBe(!registrationFails);
       expect(db.query('SELECT id,native_tool_call_id FROM tool_calls WHERE id=?').get(call.toolCallId))

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import { addDecimal, multiplyDecimal, parseDecimal, roundDecimal, taxAmount, toDecimalString } from '../../packages/shared/src/decimal.ts';
-import { CandidateDraftSchema, invoiceToolSchemas } from '@flowmate/contracts';
-import type { CandidateDraft, SourceRef } from '@flowmate/contracts';
+import { CandidateDraftSchema, invoiceToolSchemas, ok } from '@flowmate/contracts';
+import type { CandidateDraft, CandidateRepository, ParsedBlock, SourceRef } from '@flowmate/contracts';
 import { saveInvoiceCandidate } from '../../packages/employee-invoice/src/tools/save_invoice_candidate.ts';
 import { evaluateCandidate } from '../../packages/employee-invoice/src/validation.ts';
 import { normalizeInvoiceValues } from '../../packages/employee-invoice/src/tools/normalize_invoice_values.ts';
+import { projectInvoiceDocumentPage } from '../../packages/employee-invoice/src/tools/read_invoice_document.ts';
+import { compareInvoiceCandidates } from '../../packages/employee-invoice/src/tools/compare_invoice_candidates.ts';
 
 describe('exact invoice decimal arithmetic', () => {
   it('adds 0.1 and 0.2 exactly without converting the amount to Number', () => {
@@ -25,6 +27,75 @@ describe('exact invoice decimal arithmetic', () => {
     const zero = parseDecimal('-0.000');
     expect(zero === null ? null : toDecimalString(zero)).toBe('0');
     expect(parseDecimal('1e3')).toBeNull();
+  });
+});
+
+describe('invoice pagination serialized boundaries', () => {
+  it('counts the final block cursor and resumes with every complete block exactly once', () => {
+    const block = (id: number, text: string): ParsedBlock => ({ id: `b${id}`, text,
+      kind: 'text', sourceIndex: id - 1, sourceType: 'text', bbox: null });
+    const loaded = {
+      document: { documentRef: { id: 1, version: 'v' }, parsedArtifactId: 2, originalArtifactId: 1,
+        displayName: 'Invoice', isHidden: false, status: 'available' as const, pageCount: 1, warnings: [],
+        unavailableReason: null, createdAt: '2026-10-03T00:00:00Z', updatedAt: '2026-10-03T00:00:00Z' },
+      parsed: { formatVersion: 2 as const, completeness: { status: 'complete' as const, checks: [], warnings: [] },
+        pages: [{ page: 1, blocks: [...Array.from({ length: 9 }, (_, index) => block(index + 1, 'prior')),
+          block(10, 'x'.repeat(65_536)), block(11, 'y'.repeat(62_997)), block(12, 'after')] }] },
+    };
+    let afterBlockId: string | null = 'b9';
+    const seen: string[] = [];
+    for (let page = 0; page < 3; page += 1) {
+      const result = projectInvoiceDocumentPage({ documentId: 1, page: 1, afterBlockId, limit: 2 }, loaded);
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error(result.error.code);
+      expect(invoiceToolSchemas.read_invoice_document.output.safeParse(result.data).success).toBe(true);
+      expect(Buffer.byteLength(JSON.stringify(result.data), 'utf8')).toBeLessThanOrEqual(128 * 1024);
+      seen.push(...result.data.blocks.map(item => item.id));
+      afterBlockId = result.data.nextAfterBlockId;
+      if (result.data.completePage) break;
+      expect(afterBlockId).toBe(result.data.blocks.at(-1)?.id ?? null);
+    }
+    expect(afterBlockId).toBeNull();
+    expect(seen).toEqual(['b10', 'b11', 'b12']);
+  });
+
+  it('counts the final comparison cursor with multibyte values and returns all differences once', async () => {
+    const left = candidateForHeader();
+    const right = candidateForHeader();
+    left.notes = Array(20).fill('中'.repeat(1_022));
+    right.notes = Array(20).fill('文'.repeat(1_022));
+    for (const name of ['buyerName', 'sellerName'] as const) {
+      left.fields[name].raw = '中'.repeat(1_022);
+      right.fields[name].raw = '文'.repeat(1_022);
+    }
+    left.fields.buyerTaxId.raw = 'a';
+    right.fields.buyerTaxId.raw = 'b'.repeat(690);
+    expect(CandidateDraftSchema.safeParse(left).success).toBe(true);
+    expect(CandidateDraftSchema.safeParse(right).success).toBe(true);
+    const unused = (): never => { throw new Error('Unexpected candidate mutation or query'); };
+    const candidates: CandidateRepository = { save: unused, listByJob: unused, readByJob: unused, listForRun: unused,
+      readForRun: ({ candidateId }) => ok({ jobId: 1, candidateId, documentRef: { id: 1, version: 'v' },
+        runId: 1, toolCallId: candidateId, sequence: candidateId, status: 'generated', issueCount: 0,
+        createdAt: '2026-10-03T00:00:00Z', candidate: candidateId === 1 ? left : right, checks: [], issues: [] }) };
+    const tool = compareInvoiceCandidates(candidates);
+    const context = { runId: 1, sessionId: 1, scope: { version: 2 as const, allowedTools: [tool.name],
+      allowedDocumentIds: [1], allowedArtifactIds: [2], allowedResourcePaths: [] } };
+    let afterPath: string | null = null;
+    const seen: string[] = [];
+    for (let page = 0; page < 3; page += 1) {
+      const result = await tool.execute({ leftCandidateId: 1, rightCandidateId: 2, afterPath, limit: 50 },
+        { nativeToolCallId: `compare-${page}`, signal: new AbortController().signal }, context);
+      expect(invoiceToolSchemas.compare_invoice_candidates.output.safeParse(result).success).toBe(true);
+      expect(Buffer.byteLength(JSON.stringify(result), 'utf8')).toBeLessThanOrEqual(128 * 1024);
+      seen.push(...result.differences.map(item => item.path));
+      afterPath = result.nextAfterPath;
+      if (result.complete) break;
+      expect(afterPath).toBe(result.differences.at(-1)?.path ?? null);
+    }
+    expect(afterPath).toBeNull();
+    expect(seen).toHaveLength(23);
+    expect(new Set(seen).size).toBe(23);
+    expect(seen).toContain('/notes/8');
   });
 });
 

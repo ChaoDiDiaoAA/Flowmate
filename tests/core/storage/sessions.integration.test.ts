@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
-import { createRunRepository } from '../../../packages/core/src/storage/repositories.ts';
+import { createRunRepository, createSessionRepository } from '../../../packages/core/src/storage/repositories.ts';
 import { normalizeListSessionsRequest, normalizeSessionRunsRequest } from '../../../packages/contracts/src/schemas.ts';
 import type { InputRecordV2, UsageRecordV2 } from '../../../packages/contracts/src/runtime.ts';
 import type { P3AgentConfigFacts } from '../../../packages/contracts/src/ports.ts';
@@ -85,20 +85,23 @@ const agentConfig = {
 };
 const scope = { version: 1 as const, mode: 'chat-text' as const, toolNames: [] as [], resourcePaths: [] as [] };
 
-function nativeFixture(paths: ProductPaths) {
+function nativeFixture(paths: ProductPaths, historical = false) {
   const opened = openDatabase(paths);
   expect(opened.ok).toBe(true);
   if (!opened.ok) throw new Error(opened.error.code);
   let closed = false;
   const close = () => { if (!closed) { closed = true; opened.data.close(); } };
   deferCleanup(close);
+  // These corruption/repair fixtures represent history written before P6 event recording.
+  const sessions = historical ? createSessionRepository(opened.data.db) : opened.data.sessions;
+  const runs = historical ? createRunRepository(opened.data.db) : opened.data.runs;
   const history: NativeSessionHistory = { storageVersion: 1,
     header: { type: 'session', version: 3, id: 'native-p4-storage', timestamp: '2026-09-30T00:00:00.000Z', cwd: paths.runtimeDir },
     entries: [], leafId: null, unusable: false };
-  const session = opened.data.sessions.create({ nativeSessionId: history.header.id, title: 'P4 storage', at: history.header.timestamp, nativeHistory: history });
+  const session = sessions.create({ nativeSessionId: history.header.id, title: 'P4 storage', at: history.header.timestamp, nativeHistory: history });
   expect(session.ok).toBe(true);
   if (!session.ok) throw new Error(session.error.code);
-  const run = opened.data.runs.createAgent({ goal: runInput.goal, input: runInput,
+  const run = runs.createAgent({ goal: runInput.goal, input: runInput,
     config: { ...agentConfig, agent: { ...agentConfig.agent, nativeSessionId: history.header.id } }, usage, cleanup,
     createdAt: history.header.timestamp, sessionId: session.data.sessionId, scope });
   expect(run.ok).toBe(true);
@@ -108,7 +111,7 @@ function nativeFixture(paths: ProductPaths) {
   const terminal = { status: 'failed' as const, output: null, error: { code: 'agent_failed', category: 'runtime' as const, message: 'fixture', retryable: false },
     usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
     cleanup, endedAt: '2026-09-30T00:01:00.000Z', stoppedAt: null, durationMs: 1000 };
-  return { ...opened.data, close, sessionId: session.data.sessionId, runId: run.data, history, entry, terminal };
+  return { ...opened.data, runs, sessions, close, sessionId: session.data.sessionId, runId: run.data, history, entry, terminal };
 }
 
 function createLegacyV1(paths: ProductPaths, includeActive = false) {
@@ -192,7 +195,7 @@ describe('P5 migration compatibility', () => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true); if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 12 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 13 });
     expect(opened.data.db.query('SELECT * FROM session_inputs').get()).toEqual({ ...before as object, result_entry_id: null });
     const rows = opened.data.db.query('SELECT id,metadata_json,hidden_at,updated_at FROM sessions ORDER BY id').all() as Array<{ id: number; metadata_json: string; hidden_at: string | null; updated_at: string }>;
     expect(JSON.parse(rows[0]!.metadata_json)).toEqual({ version: 1, model_use_blocked: null, tool_profile: 'invoice', delete_pending: true });
@@ -344,11 +347,11 @@ describe('P2 Session and Agent Run storage', () => {
     expect(reopened.data.db.query("SELECT COUNT(*) AS count FROM runs WHERE status IN ('created','running')").get()).toEqual({ count: 0 });
   }));
 
-  it('migrates a real new database through version 12 before exposing repositories', () => withDatabase((paths) => {
+  it('migrates a real new database through version 13 before exposing repositories', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }]);
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     opened.data.close();
   }));
@@ -366,7 +369,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
     try {
-      expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 12 });
+      expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 13 });
       expect(migrated.data.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: entry, run_id: null });
       expect(migrated.data.db.query('SELECT header_json,storage_version,leaf_id,entry_count FROM session_native_history').get())
         .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });
@@ -390,7 +393,7 @@ describe('P2 Session and Agent Run storage', () => {
   }));
 
   it('rejects inconsistent persisted Run ownership rather than displaying or restoring guessed facts', () => withDatabase((paths) => {
-    const store = nativeFixture(paths);
+    const store = nativeFixture(paths, true);
     const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
     expect(store.sessions.saveHistory(store.sessionId, history, { entryId: store.entry.id, runId: store.runId }).ok).toBe(true);
     const other = store.sessions.create({ nativeSessionId: 'native-corrupt-other', title: 'Other', at: store.history.header.timestamp });
@@ -404,7 +407,7 @@ describe('P2 Session and Agent Run storage', () => {
   }));
 
   it('rolls back startup history blocking when interrupted Run repair fails, then blocks on the next successful startup', () => withDatabase((paths) => {
-    const store = nativeFixture(paths);
+    const store = nativeFixture(paths, true);
     expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true }).ok).toBe(true);
     store.db.query('UPDATE session_native_history SET unusable=0').run();
     store.db.query("UPDATE runs SET status='running',ended_at=NULL,error_json=NULL WHERE id=?").run(store.runId);

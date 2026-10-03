@@ -1,4 +1,4 @@
-import { invoiceToolSchemas } from '@flowmate/contracts';
+import { invoiceToolSchemas, MAX_INVOICE_TOOL_PAGE_SIZE } from '@flowmate/contracts';
 import type { DocumentService } from '@flowmate/data';
 import type { DocumentSnapshot, InvoiceToolInput, InvoiceToolOutput, ParsedBlock, Result, ToolDefinition } from '@flowmate/contracts';
 import type { StoredParsedDocument } from '@flowmate/data';
@@ -17,11 +17,12 @@ export function projectInvoiceDocumentPage(input: InvoiceToolInput<'read_invoice
     start = cursor + 1;
   }
   const selected: Array<ParsedBlock & { source: ReturnType<typeof sourceFor> }> = [];
-  for (const block of page.blocks.slice(start, start + Math.min(input.limit, 50))) {
+  for (const block of page.blocks.slice(start, start + Math.min(input.limit, MAX_INVOICE_TOOL_PAGE_SIZE))) {
     const candidate = { ...block, source: sourceFor(loaded.document, page.page, block.id, block.text) };
+    const completePage = start + selected.length + 1 >= page.blocks.length;
     const response = { documentRef: loaded.document.documentRef, parsedArtifactId: loaded.document.parsedArtifactId,
       page: page.page, pageCount: loaded.parsed.pages.length, blocks: [...selected, candidate],
-      nextAfterBlockId: null, completePage: false };
+      nextAfterBlockId: completePage ? null : block.id, completePage };
     if (Buffer.byteLength(JSON.stringify(response), 'utf8') > MAX_RESULT_BYTES) {
       if (selected.length === 0) return fail(appError('tool_result_too_large', 'runtime', 'A complete parsed block exceeds the result size limit.'));
       break;

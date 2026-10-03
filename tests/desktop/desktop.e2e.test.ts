@@ -14,6 +14,475 @@ it.afterEach(cleanupResources);
 const electronPath = resolve(import.meta.dirname, '../../node_modules/electron/dist/electron.exe');
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64');
 
+it('P6 Activity reads persistent processing through Electron without another model request', async () => {
+  it.setTimeout(90_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p6-activity-ui-'));
+  let requestCount = 0;
+  const server = await createHttpProvider(() => { requestCount++; return streamText('P6 controlled saved answer.'); });
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
+  try {
+    app = await electron.launch({ executablePath: electronPath, args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+    const page = await app.firstWindow();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    expect(await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p6-observation', credentialRef: 'p6_observation_key',
+        name: 'Controlled P6', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'p6-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p6-observation' },
+      { modelId: 'p6-observation', apiKey: 'synthetic-p6-controlled-key' });
+    }, `http://127.0.0.1:${server.port}`)).toMatchObject({ ok: true });
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    await page.getByRole('textbox', { name: 'Message to model' }).fill('P6 original body must never appear in a runtime event.');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(page.locator('.chat-transcript')).toContainText('P6 controlled saved answer.', { timeout: 20_000 });
+    await expect.poll(() => requestCount).toBe(1);
+    const identity = await page.evaluate(async () => {
+      const chats = await window.flowmate.listSessions({ limit: 50 }); if (!chats.ok || !chats.data.items[0]) return null;
+      const sessionId = chats.data.items[0].sessionId;
+      const runs = await window.flowmate.listSessionRuns({ sessionId, limit: 50 });
+      return runs.ok && runs.data.items[0] ? { runId: runs.data.items[0].runId, sessionId } : null;
+    });
+    expect(identity).not.toBeNull(); if (!identity) return;
+    expect(await page.locator('.rail .nav-item').count()).toBe(6);
+    await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
+    await expect(page.getByTestId('activity-page')).toBeVisible();
+    await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
+    await page.getByLabel('Processing request', { exact: true }).selectOption(String(identity.runId));
+    await expect(page.getByTestId('processing-details')).toContainText('Processing completed', { timeout: 15_000 });
+    const persisted = await page.evaluate(id => window.flowmate.queryRuntimeEvents({ ...id,
+      cursor: { runId: id.runId, lastPersistedSequence: 0 }, limit: 100 }), identity);
+    expect(persisted).toMatchObject({ ok: true, data: { coverage: 'from-created' } });
+    if (persisted.ok) {
+      expect(persisted.data.items.map(item => item.sequence)).toEqual(persisted.data.items.map((_, index) => index + 1));
+      expect(persisted.data.items.map(item => item.type)).toContain('run_completed');
+      expect(JSON.stringify(persisted)).not.toContain('P6 original body');
+    }
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await page.getByText('Model request diagnostics', { exact: true }).click();
+    await expect(page.getByText('This diagnostic buffer belongs to the current process and is separate from saved activity.', { exact: true })).toBeVisible();
+    expect(requestCount).toBe(1);
+    const screenshots = process.env.FLOWMATE_SCREENSHOT_ROOT ? join(process.env.FLOWMATE_SCREENSHOT_ROOT, 'p6') : join(userData, 'p6-ui');
+    mkdirSync(screenshots, { recursive: true });
+    for (const theme of ['light', 'dark'] as const) {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.locator('.rail').getByRole('button', { name: 'Settings', exact: true }).click();
+      await page.getByLabel('Theme').selectOption(theme);
+      await page.getByRole('button', { name: 'Save appearance', exact: true }).click();
+      await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
+      await expect(page.getByTestId('processing-details')).toContainText('Processing completed');
+      for (const [width, height] of [[1440, 900], [1280, 800], [980, 720]] as const) {
+      await page.setViewportSize({ width, height });
+      await expect(page.locator('.desktop-shell')).toHaveClass(new RegExp(`theme-${theme}`));
+      await page.getByRole('button', { name: 'Refresh activity', exact: true }).focus();
+      await page.screenshot({ path: join(screenshots, `${width}x${height}-${theme}-activity.png`) });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      expect(await page.getByRole('button', { name: 'Refresh activity', exact: true }).evaluate(element => document.activeElement === element)).toBe(true);
+      }
+    }
+    await page.reload();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
+    await page.getByLabel('Processing request', { exact: true }).selectOption(String(identity.runId));
+    await expect(page.getByTestId('processing-details')).toContainText('Processing completed');
+    expect(requestCount).toBe(1);
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await server.stop(true); } }
+});
+
+it('P6 Activity preserves drafts and verified history across a gap, a lost wake and a late page', async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p6-replay-ui-'));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  const app = await electron.launch({ executablePath: electronPath, args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow();
+    await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
+    await app.evaluate(({ ipcMain }) => {
+      const at = '2026-10-03T00:00:00.000Z';
+      const session = (id: number) => ({ sessionId: id, nativeSessionId: `p6-${id}`, title: `Observation ${id}`, status: 'active',
+        createdAt: at, updatedAt: at, availability: 'ready', historyState: 'recoverable', activeRunId: null,
+        modelUseBlocked: false, deletePending: false, hasBusinessHistory: false });
+      const run = (id: number) => ({ kind: 'agent', runId: id, sessionId: id === 101 ? 12 : 13, jobId: null, status: 'completed',
+        input: { version: 1, goal: 'Read saved activity', text: 'Saved question', messageTimestamp: 1 },
+        config: { runtimeBudget: { maxToolCalls: 0, maxModelCalls: 12, toolTimeoutMs: 10_000 } },
+        output: { agent: { modelCallCount: 1 } }, usage: { version: 1, source: 'unknown', reason: null, sdkValues: null,
+          attempts: null, attemptsComplete: false, costSource: null, updatedAt: at },
+        tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+        durationMs: 100, toolCallCount: 0, error: null, cleanup: { stopped: true, lateObservationRequired: false },
+        createdAt: at, startedAt: at, endedAt: at, cancelRequestedAt: receipt.stopping ? at : null, stoppedAt: at,
+        scope: { version: 1, mode: 'chat-text', toolNames: [], resourcePaths: [] } });
+      const context = (id: number, h: number) => ({ runId: id, sessionId: id === 101 ? 12 : 13, highWatermark: h,
+        coverage: h === 0 ? 'none' : id === 201 ? 'partial' : 'from-created', availableRange: h === 0 ? null : { fromSequence: 1, toSequence: h } });
+      const event = (id: number, seq: number) => ({ eventId: id * 10 + seq, runId: id, sessionId: id === 101 ? 12 : 13,
+        toolCallId: null, sequence: seq, sourceConnection: null, sourceSequence: null, occurredAt: at, receivedAt: at,
+        type: id === 201 ? seq === 1 ? 'run_started' : 'run_completed' : seq === 1 ? 'run_created' : 'run_started',
+        payload: { version: 1, status: id === 201 ? seq === 1 ? 'running' : 'completed' : seq === 1 ? 'created' : 'running',
+          origin: 'live', errorCode: null, stopped: id === 201 && seq === 2 ? true : null } });
+      const receipt = { bHigh: 0, failNext: false, reads: 0, activeReads: 0, maxReads: 0, holds: 0, holdRun: null as number | null,
+        release: null as (() => void) | null, removed: [] as string[], commands: 0,
+        failDetails: false, showTools: false, heldTool: null as (() => void) | null, toolRequests: [] as number[],
+        stopping: false, blocked: false, traceAvailability: 'evicted', failTrace: false, cursors: [] as number[], historyReads: 0 };
+      Reflect.set(globalThis, 'p6Replay', receipt);
+      const replace = (channel: string, handler: (...args: any[]) => unknown) => {
+        ipcMain.removeHandler(channel); ipcMain.handle(channel, handler);
+      };
+      replace('flowmate:list-sessions', () => ({ ok: true, data: { items: [session(12), session(13)], next: null } }));
+      replace('flowmate:query-session', (_event, id) => ({ ok: true, data: session(id) }));
+      replace('flowmate:list-session-messages', (_event, input) => {
+        receipt.historyReads++;
+        return { ok: true, data: { session: session(input.sessionId), leafId: null, entryCount: 0, items: [], nextBeforeEntryId: null } };
+      });
+      replace('flowmate:list-session-runs', (_event, input) => ({ ok: true, data: { items: [run(input.sessionId === 12 ? 101 : 201)], nextBeforeRunId: null } }));
+      const unavailable = { ok: false, error: { code: 'storage_read_failed', category: 'storage', retryable: true, message: 'Controlled details failed.' } };
+      const tool = (id: number) => ({ toolCallId: id, runId: 201, sessionId: 13,
+        toolName: id === 10 ? 'read_invoice_document' : 'list_invoice_pages', status: 'succeeded', requestedAt: at,
+        startedAt: at, endedAt: at, stoppedAt: at, committedCandidateId: null, errorCode: null, stopped: true,
+        deliveryState: 'request_observed', formApplicationOutcome: null });
+      replace('flowmate:query-run', (_event, id) => receipt.failDetails ? unavailable : ({ ok: true,
+        data: { ...run(id), status: receipt.stopping ? 'running' : 'completed' } }));
+      replace('flowmate:query-runtime-state', () => ({ ok: true, data: { active: null, blocked: receipt.blocked,
+        error: receipt.blocked ? { code: 'runtime_unusable', category: 'runtime', retryable: false, message: 'Controlled stop is unconfirmed.' } : null } }));
+      replace('flowmate:query-prompt-trace', () => receipt.failTrace ? unavailable : ({ ok: true, data: { availability: receipt.traceAvailability, calls: [], droppedCalls: null } }));
+      replace('flowmate:list-run-tool-calls', () => receipt.failDetails ? unavailable : ({ ok: true,
+        data: { items: receipt.showTools ? [tool(10), tool(20)] : [], nextBeforeId: null } }));
+      replace('flowmate:query-run-tool-call', async (_event, input) => {
+        receipt.toolRequests.push(input.toolCallId);
+        if (input.toolCallId === 10) await new Promise<void>(resolve => { receipt.heldTool = resolve; });
+        return { ok: true, data: tool(input.toolCallId) };
+      });
+      replace('flowmate:subscribe-runtime-events', (_event, input) => ({ ok: true, data: { ...context(input.runId, input.runId === 101 ? 3 : receipt.bHigh), subscriptionId: `observed-${input.runId}` } }));
+      replace('flowmate:unsubscribe-runtime-events', (_event, id) => { receipt.removed.push(id); return { ok: true }; });
+      replace('flowmate:query-runtime-events', async (_event, input) => {
+        receipt.reads++; receipt.activeReads++; receipt.maxReads = Math.max(receipt.maxReads, receipt.activeReads);
+        const h = input.runId === 101 ? 3 : receipt.bHigh;
+        try {
+          if (receipt.holdRun === input.runId) { receipt.holds++; await new Promise<void>(resolve => { receipt.release = resolve; }); }
+          const c = input.cursor.lastPersistedSequence, d = input.availableAfterSequence;
+          if (input.runId === 201) receipt.cursors.push(c);
+          if (receipt.failNext) { return { ok: false, error: { code: 'storage_read_failed', category: 'storage',
+            retryable: true, message: 'Controlled observation read failed.' }, context: context(input.runId, h) }; }
+          if (input.runId === 101 && c === 1 && d === undefined) return { ok: false, error: { code: 'event_gap', category: 'storage',
+            retryable: false, message: 'A persisted event interval is missing.' }, context: { ...context(101, h),
+              gap: { fromSequence: 2, toSequence: 2, continueAfterSequence: 2 } } };
+          const position = d ?? c;
+          const sequences = input.runId === 101 ? [1, 3] : h === 0 ? [] : [1, ...(h === 2 ? [2] : [])];
+          const items = sequences.filter(seq => seq > position).slice(0, 1).map(seq => event(input.runId, seq));
+          const last = items.at(-1)?.sequence ?? position;
+          return { ok: true, data: { ...context(input.runId, h), items,
+            nextCursor: { runId: input.runId, lastPersistedSequence: d === undefined ? last : c },
+            nextAvailableAfterSequence: d === undefined ? null : last, hasMore: last < h } };
+        } finally { receipt.activeReads--; }
+      });
+      for (const channel of ['flowmate:submit-input', 'flowmate:start-run', 'flowmate:call-provider', 'flowmate:cancel-run', 'flowmate:cancel-provider'])
+        replace(channel, () => { receipt.commands++; return { ok: false }; });
+    });
+    await page.addInitScript(() => {
+      const ids = new Set<number>(); Reflect.set(window, 'p6ObservationTimers', ids);
+      const start = window.setInterval.bind(window), stop = window.clearInterval.bind(window);
+      window.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+        const id = start(handler, timeout, ...args); if (timeout === 2000) ids.add(id); return id;
+      }) as typeof window.setInterval;
+      Reflect.set(window, 'clearInterval', (id?: number) => { if (id !== undefined) ids.delete(id); stop(id); });
+    });
+    await page.reload();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.locator('.sidebar-chat[data-session-id="13"]').click();
+    await expect(page.getByRole('complementary', { name: 'Assistant', exact: true }).getByText('Observation 13', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Refresh history', exact: true })).toBeEnabled();
+    await page.getByRole('textbox', { name: 'Message to model' }).fill('Draft retained while reading activity');
+    await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.getByLabel('Conversation', { exact: true }).selectOption('12');
+    await page.getByLabel('Processing request', { exact: true }).selectOption('101');
+    await expect(page.getByRole('button', { name: 'View available activity after the gap', exact: true })).toBeVisible();
+    await expect(page.getByTestId('processing-details')).toContainText('Missing recorded activity: 2 to 2.');
+    await expect(page.getByTestId('processing-details')).toContainText('Available recorded activity: 1 to 3.');
+    await page.getByRole('button', { name: 'View available activity after the gap', exact: true }).click();
+    await expect(page.getByText('Showing an available segment. The continuous position is still 1.', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '3']);
+    // Saved running facts describe the original request; they never start a live request.
+    await expect(page.getByTestId('processing-details').getByText('Processing started', { exact: true })).toHaveCount(1);
+    await expect(page.getByTestId('processing-details').getByText('completed', { exact: true })).toBeVisible();
+    expect(await page.getByRole('button', { name: 'Stop', exact: true }).count()).toBe(0);
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').holdRun = 101; });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Replay').activeReads)).toBe(1);
+    await page.getByLabel('Conversation', { exact: true }).selectOption('13');
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').failDetails = true; });
+    await page.getByLabel('Processing request', { exact: true }).selectOption('201');
+    await app.evaluate(() => { const receipt = Reflect.get(globalThis, 'p6Replay'); receipt.holdRun = null; receipt.release?.(); });
+    await expect(page.getByText('No runtime events were recorded for this request. Saved messages and results remain available.', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveCount(0);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Replay').removed)).toContain('observed-101');
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').failDetails = true; });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect(page.getByText('Processing details could not be confirmed.', { exact: false })).toBeVisible();
+    await expect(page.getByText('Tool activity could not be confirmed.', { exact: false })).toBeVisible();
+    await expect(page.getByText('Tool activity has not yet been verified.', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('processing-details').getByText('Loading', { exact: true })).toBeVisible();
+    await expect(page.getByText('No tools recorded.', { exact: true })).toHaveCount(0);
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').failDetails = false; });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect(page.getByText('Tool activity could not be confirmed.', { exact: false })).toHaveCount(0);
+    await expect(page.getByText('No tools recorded.', { exact: true })).toBeVisible();
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').showTools = true; });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await page.locator('.activity-tools').getByRole('button', { name: /Read invoice document/ }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Replay').toolRequests)).toEqual([10]);
+    await page.locator('.activity-tools').getByRole('button', { name: /List invoice pages/ }).click();
+    await expect(page.locator('.activity-tool-detail')).toContainText('List invoice pages');
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').heldTool?.(); });
+    await page.waitForTimeout(100);
+    await expect(page.locator('.activity-tool-detail')).toContainText('List invoice pages');
+    await expect(page.locator('.activity-tool-detail')).not.toContainText('Read invoice document');
+    // Change the saved-page source without sending any wake or touching the view.
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').bHigh = 1; });
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1'], { timeout: 5_000 });
+    await expect(page.getByText('Partial recorded history', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('processing-details')).toContainText('Available recorded activity: 1 to 1.');
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').bHigh = 2; });
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '2'], { timeout: 5_000 });
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Replay').cursors.at(-1))).toBe(2);
+    const historyBeforeTemporary = await app.evaluate(() => Reflect.get(globalThis, 'p6Replay').historyReads);
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', {
+      type: 'message_upsert', runId: 201, sessionId: 13, nativeSessionId: 'p6-13', sequence: 40,
+      at: '2026-10-03T00:00:00.000Z', message: { entryId: null, runId: 201, liveOrdinal: 1,
+        timestamp: 1790985600000, persistence: 'pending', truncated: false, role: 'assistant',
+        blocks: [{ type: 'text', text: 'Temporary text is not a persisted position.' }], phase: 'streaming',
+        stopReason: 'pending', toolCallId: null, toolName: null, isError: null, textOrigin: 'native-content' } }));
+    // The native Session/Run binding is real in this Renderer fixture: its message receiver
+    // requests saved history to reconcile sequence40, while the independent event C remains2.
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Replay').historyReads)).toBeGreaterThan(historyBeforeTemporary);
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Replay').cursors.at(-1))).toBe(2);
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '2']);
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').failTrace = true; });
+    await page.getByText('Model request diagnostics', { exact: true }).click();
+    await expect(page.getByText('Model request diagnostics are unavailable.', { exact: true })).toBeVisible();
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').failTrace = false; });
+    await page.getByText('Model request diagnostics', { exact: true }).click();
+    await page.getByText('Model request diagnostics', { exact: true }).click();
+    await expect(page.getByText('Model request diagnostics are unavailable.', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('These diagnostics were evicted from the process buffer.', { exact: false })).toBeVisible();
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').traceAvailability = 'process-exited'; });
+    await page.getByText('Model request diagnostics', { exact: true }).click();
+    await page.getByText('Model request diagnostics', { exact: true }).click();
+    await expect(page.getByText('The process that collected these diagnostics has exited.', { exact: false })).toBeVisible();
+    await app.evaluate(({ BrowserWindow }) => {
+      const r = Reflect.get(globalThis, 'p6Replay'); r.stopping = true; r.blocked = true;
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'provider_finished',
+        requestId: 'p6-blocked-observation', runId: 300, result: { ok: false, error: { code: 'runtime_unusable',
+          category: 'runtime', retryable: false, message: 'Controlled stop is unconfirmed.' } } });
+    });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect(page.getByTestId('processing-details').getByText('Stopping', { exact: true })).toBeVisible();
+    await expect(page.getByText('New requests are blocked. Saved processing details remain available to read.', { exact: true })).toBeVisible({ timeout: 5_000 });
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Replay').commands)).toBe(0);
+    await app.evaluate(({ BrowserWindow }) => {
+      const r = Reflect.get(globalThis, 'p6Replay'); r.stopping = false; r.blocked = false;
+      BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'provider_finished',
+        requestId: 'p6-cleared-observation', runId: 300, result: { ok: false, error: { code: 'runtime_unusable',
+          category: 'runtime', retryable: false, message: 'Controlled status refresh.' } } });
+    });
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').failNext = true; });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect(page.getByText('Controlled observation read failed.', { exact: false })).toBeVisible();
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '2']);
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Replay').failNext = false; });
+    // The native 2s poll may already heal this transient error and remove its retry button.
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect(page.getByText('Controlled observation read failed.', { exact: false })).toHaveCount(0);
+    await app.evaluate(() => { const receipt = Reflect.get(globalThis, 'p6Replay'); receipt.holdRun = 201; receipt.maxReads = 0; });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Replay').activeReads)).toBe(1);
+    const held = await app.evaluate(() => Reflect.get(globalThis, 'p6Replay').reads);
+    await page.waitForTimeout(4_200);
+    expect(await app.evaluate(() => ({ reads: Reflect.get(globalThis, 'p6Replay').reads, max: Reflect.get(globalThis, 'p6Replay').maxReads })))
+      .toEqual({ reads: held, max: 1 });
+    await app.evaluate(() => { const receipt = Reflect.get(globalThis, 'p6Replay'); receipt.holdRun = null; receipt.release?.(); });
+    await expect(page.getByRole('textbox', { name: 'Message to model' })).toHaveValue('Draft retained while reading activity');
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Replay').commands)).toBe(0);
+    await page.locator('.rail').getByRole('button', { name: 'Invoices', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => Reflect.get(window, 'p6ObservationTimers').size)).toBe(0);
+    const afterLeaving = await app.evaluate(() => Reflect.get(globalThis, 'p6Replay').reads);
+    await page.waitForTimeout(2_200);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Replay').reads)).toBe(afterLeaving);
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await app.evaluate(() => { const receipt = Reflect.get(globalThis, 'p6Replay'); if (receipt) { receipt.holdRun = null; receipt.release?.(); } }).catch(() => {});
+    await closeDesktopFixture(app, userData, failure); }
+});
+
+it('P6 Renderer checks beyond H and preserves C and D across late opens, expired subscriptions and visibility changes', async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p6-observer-lifecycle-'));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  const app = await electron.launch({ executablePath: electronPath, args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow();
+    await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
+    // These Main boundary responses exercise the real Renderer/preload receiver. SQL and Host
+    // lease behavior are tested separately; no wake or timer can repair the H handoff here.
+    await app.evaluate(({ ipcMain }) => {
+      const at = '2026-10-03T00:00:00.000Z';
+      const receipt = { holdOpen: true, releaseOpen: null as (() => void) | null, bHigh: 1, expireNext: false,
+        opens: [] as Array<{ runId: number; subscriptionId: string; c: number }>, removed: [] as string[],
+        reads: [] as Array<{ runId: number; subscriptionId: string; c: number; d: number | null; through: number | null }>, commands: 0 };
+      Reflect.set(globalThis, 'p6Lifecycle', receipt);
+      const session = (id: number) => ({ sessionId: id, nativeSessionId: `lifecycle-${id}`, title: `Lifecycle ${id}`, status: 'active',
+        createdAt: at, updatedAt: at, availability: 'ready', historyState: 'recoverable', activeRunId: null,
+        modelUseBlocked: false, deletePending: false, hasBusinessHistory: false });
+      const run = (id: number) => ({ kind: 'agent', runId: id, sessionId: id === 101 ? 12 : 13, jobId: null, status: 'completed',
+        input: { version: 1, goal: 'Observe', text: 'Saved lifecycle request', messageTimestamp: 1 },
+        config: { runtimeBudget: { maxToolCalls: 0, maxModelCalls: 12 } }, output: { agent: { modelCallCount: 1 } },
+        usage: { version: 1, source: 'unknown', reason: null, sdkValues: null, attempts: null, attemptsComplete: false, costSource: null, updatedAt: at },
+        tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+        durationMs: 100, toolCallCount: 0, error: null, cleanup: { stopped: true, lateObservationRequired: false },
+        createdAt: at, startedAt: at, endedAt: at, cancelRequestedAt: null, stoppedAt: at,
+        scope: { version: 1, mode: 'chat-text', toolNames: [], resourcePaths: [] } });
+      const context = (id: number, h: number) => ({ runId: id, sessionId: id === 101 ? 12 : 13, highWatermark: h,
+        coverage: 'from-created', availableRange: { fromSequence: 1, toSequence: h } });
+      const event = (id: number, sequence: number) => ({ eventId: id * 10 + sequence, runId: id,
+        sessionId: id === 101 ? 12 : 13, toolCallId: null, sequence, sourceConnection: null, sourceSequence: null,
+        occurredAt: at, receivedAt: at, type: sequence === 1 ? 'run_created' : 'run_completed',
+        payload: { version: 1, status: sequence === 1 ? 'created' : 'completed', origin: 'live', stopped: sequence === 1 ? null : true, errorCode: null } });
+      const replace = (channel: string, handler: (...args: any[]) => unknown) => { ipcMain.removeHandler(channel); ipcMain.handle(channel, handler); };
+      replace('flowmate:list-sessions', () => ({ ok: true, data: { items: [session(12), session(13)], next: null } }));
+      replace('flowmate:query-session', (_event, id) => ({ ok: true, data: session(id) }));
+      replace('flowmate:list-session-messages', (_event, input) => ({ ok: true, data: { session: session(input.sessionId), leafId: null,
+        entryCount: 0, items: [], nextBeforeEntryId: null } }));
+      replace('flowmate:list-session-runs', (_event, input) => ({ ok: true, data: { items: [run(input.sessionId === 12 ? 101 : 201)], nextBeforeRunId: null } }));
+      replace('flowmate:query-run', (_event, id) => ({ ok: true, data: run(id) }));
+      replace('flowmate:query-runtime-state', () => ({ ok: true, data: { active: null, blocked: false, error: null } }));
+      replace('flowmate:list-run-tool-calls', () => ({ ok: true, data: { items: [], nextBeforeId: null } }));
+      replace('flowmate:subscribe-runtime-events', async (_event, input) => {
+        const subscriptionId = `lifecycle-${input.runId}-${receipt.opens.length + 1}`;
+        const h = input.runId === 101 ? 3 : receipt.bHigh;
+        receipt.opens.push({ runId: input.runId, subscriptionId, c: input.cursor.lastPersistedSequence });
+        if (input.runId === 101 && receipt.holdOpen) await new Promise<void>(resolve => { receipt.releaseOpen = resolve; });
+        return { ok: true, data: { ...context(input.runId, h), subscriptionId } };
+      });
+      replace('flowmate:unsubscribe-runtime-events', (_event, id) => { receipt.removed.push(id); return { ok: true }; });
+      replace('flowmate:query-runtime-events', (_event, input) => {
+        const c = input.cursor.lastPersistedSequence, d = input.availableAfterSequence ?? null;
+        receipt.reads.push({ runId: input.runId, subscriptionId: input.subscriptionId, c, d, through: input.throughSequence ?? null });
+        if (receipt.expireNext) {
+          receipt.expireNext = false;
+          return { ok: false, error: { code: 'event_subscription_invalid', category: 'input', retryable: false, message: 'The observation lease expired.' }, context: null };
+        }
+        const h = input.runId === 101 ? 3 : receipt.bHigh;
+        if (input.runId === 101 && c === 1 && d === null) return { ok: false, error: { code: 'event_gap', category: 'storage',
+          retryable: false, message: 'A recorded interval is missing.' }, context: { ...context(101, h), gap: { fromSequence: 2, toSequence: 2, continueAfterSequence: 2 } } };
+        const through = input.throughSequence ?? h, position = d ?? c;
+        const items = (input.runId === 101 ? [1, 3] : [1, 2]).filter(sequence => sequence > position && sequence <= through)
+          .slice(0, 1).map(sequence => event(input.runId, sequence));
+        const last = items.at(-1)?.sequence ?? position;
+        // The next persisted event appears after the last bounded page; its wake is lost.
+        if (input.runId === 201 && input.throughSequence === 1) receipt.bHigh = 2;
+        return { ok: true, data: { ...context(input.runId, h), items, nextCursor: { runId: input.runId, lastPersistedSequence: d === null ? last : c },
+          nextAvailableAfterSequence: d === null ? null : last, hasMore: last < through } };
+      });
+      for (const channel of ['flowmate:start-run', 'flowmate:submit-input', 'flowmate:cancel-run', 'flowmate:call-provider',
+        'flowmate:cancel-provider', 'flowmate:start-task', 'flowmate:start-invoice-form-run'])
+        replace(channel, () => { receipt.commands++; return { ok: false }; });
+    });
+    await page.addInitScript(() => {
+      const start = window.setInterval.bind(window);
+      window.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) =>
+        start(timeout === 2000 ? () => {} : handler, timeout, ...args)) as typeof window.setInterval;
+    });
+    await page.reload();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('textbox', { name: 'Message to model' }).fill('Lifecycle observation preserves this draft');
+    // Playwright normally forces document.hasFocus() to true, which masks native blur.
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+    await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.getByLabel('Conversation', { exact: true }).selectOption('12');
+    await page.getByLabel('Processing request', { exact: true }).selectOption('101');
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.length)).toBe(1);
+    await page.getByLabel('Conversation', { exact: true }).selectOption('13');
+    await page.getByLabel('Processing request', { exact: true }).selectOption('201');
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '2']);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.filter((read: { runId: number }) => read.runId === 201)))
+      .toMatchObject([{ c: 0, through: 1 }, { c: 1, through: null }]);
+    await app.evaluate(() => { const receipt = Reflect.get(globalThis, 'p6Lifecycle'); receipt.holdOpen = false; receipt.releaseOpen?.(); });
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').removed)).toContain('lifecycle-101-1');
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '2']);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.some((read: { runId: number }) => read.runId === 101))).toBe(false);
+    const settledReads = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.length);
+    await page.waitForTimeout(2_200);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.length)).toBe(settledReads);
+
+    await page.getByLabel('Conversation', { exact: true }).selectOption('12');
+    await page.getByLabel('Processing request', { exact: true }).selectOption('101');
+    await page.getByRole('button', { name: 'View available activity after the gap', exact: true }).click();
+    await expect(page.getByText('Showing an available segment. The continuous position is still 1.', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '3']);
+    const beforeExpiry = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.length);
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6Lifecycle').expireNext = true; });
+    await page.getByRole('button', { name: 'Refresh activity', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.length)).toBe(beforeExpiry + 1);
+    const renewedId = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.at(-1).subscriptionId);
+    await expect.poll(() => app.evaluate((_electron, id) => Reflect.get(globalThis, 'p6Lifecycle').reads.filter((read: { subscriptionId: string }) => read.subscriptionId === id), renewedId))
+      .toMatchObject([{ runId: 101, c: 1, d: 3, through: 3 }, { runId: 101, c: 1, d: 3, through: null }]);
+    await expect(page.getByText('Showing an available segment. The continuous position is still 1.', { exact: true })).toBeVisible();
+
+    await app.evaluate(async ({ BrowserWindow }) => {
+      Reflect.set(globalThis, 'p6PrimaryWindow', BrowserWindow.getAllWindows()[0]!);
+      const focusWindow = new BrowserWindow({ width: 200, height: 160, show: false,
+        webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      Reflect.set(globalThis, 'p6FocusWindow', focusWindow);
+      await focusWindow.loadURL('about:blank'); focusWindow.show(); focusWindow.focus();
+    });
+    await expect.poll(() => page.evaluate(() => document.hasFocus())).toBe(false);
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').removed)).toContain(renewedId);
+    await app.evaluate(() => { Reflect.get(globalThis, 'p6FocusWindow').destroy(); Reflect.get(globalThis, 'p6PrimaryWindow').focus(); });
+    await expect.poll(() => page.evaluate(() => document.hasFocus())).toBe(true);
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.length)).toBe(beforeExpiry + 2);
+    const focusedId = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.at(-1).subscriptionId);
+    await expect.poll(() => app.evaluate((_electron, id) => Reflect.get(globalThis, 'p6Lifecycle').reads.some((read: { subscriptionId: string; c: number; d: number }) =>
+      read.subscriptionId === id && read.c === 1 && read.d === 3), focusedId)).toBe(true);
+    await cdp.detach();
+    // CDP keeps document.visibilityState visible even for a hidden native window. Assert
+    // the actual Electron visibility and focus, then the Renderer's release/reopen behavior.
+    await app.evaluate(() => Reflect.get(globalThis, 'p6PrimaryWindow').hide());
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6PrimaryWindow').isVisible())).toBe(false);
+    await expect.poll(() => page.evaluate(() => document.hasFocus())).toBe(false);
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').removed)).toContain(focusedId);
+    const hiddenReads = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.length);
+    await page.waitForTimeout(2_200);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.length)).toBe(hiddenReads);
+    await app.evaluate(() => { const window = Reflect.get(globalThis, 'p6PrimaryWindow'); window.show(); window.focus(); });
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6PrimaryWindow').isVisible())).toBe(true);
+    await expect.poll(() => page.evaluate(() => !document.hidden && document.hasFocus())).toBe(true);
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.length)).toBe(beforeExpiry + 3);
+    const visibleId = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.at(-1).subscriptionId);
+    await expect.poll(() => app.evaluate((_electron, id) => Reflect.get(globalThis, 'p6Lifecycle').reads.some((read: { subscriptionId: string; c: number; d: number }) =>
+      read.subscriptionId === id && read.c === 1 && read.d === 3), visibleId)).toBe(true);
+    await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '3']);
+    await expect(page.getByText('Showing an available segment. The continuous position is still 1.', { exact: true })).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Message to model' })).toHaveValue('Lifecycle observation preserves this draft');
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').commands)).toBe(0);
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally {
+    await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle')?.releaseOpen?.()).catch(() => {});
+    await closeDesktopFixture(app, userData, failure);
+  }
+});
+
 function writeInvoiceSample(directory: string) {
   mkdirSync(directory, { recursive: true });
   const content = JSON.stringify([
@@ -65,11 +534,11 @@ async function captureDesktopViews(page: Page) {
   if (!root) return;
   mkdirSync(root, { recursive: true });
   const nav = page.getByRole('navigation', { name: 'Workspace navigation' });
-  expect(await page.locator('.rail .nav-item').count()).toBe(5);
-  for (const name of ['Invoices', 'Processing History', 'Chats', 'Models', 'Settings']) {
+  expect(await page.locator('.rail .nav-item').count()).toBe(6);
+  for (const name of ['Invoices', 'Processing History', 'Chats', 'Activity', 'Models', 'Settings']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(1);
   }
-  for (const name of ['Connections', 'Activity', 'Workspace', 'Approved Results', 'Prompts', 'Skills', 'Extensions', 'Evaluation']) {
+  for (const name of ['Connections', 'Workspace', 'Approved Results', 'Prompts', 'Skills', 'Extensions', 'Evaluation']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(0);
   }
   for (const theme of ['light', 'dark'] as const) {
@@ -224,7 +693,8 @@ for (const action of ['last-window', 'quit', 'main-exit'] as const) {
 }
 
 for (const unknownCode of ['operation_result_unknown', 'input_delivery_unknown'] as const) {
-it(`desktop manages same-Run inputs, recovers ${unknownCode} and continues from a saved reply`, async () => {
+for (const unknownMode of ['steer', 'followUp'] as const) {
+it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknownCode} and continues from a saved reply`, async () => {
   it.setTimeout(90_000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-p5-'));
   const requests: unknown[] = [];
@@ -312,22 +782,52 @@ it(`desktop manages same-Run inputs, recovers ${unknownCode} and continues from 
         return result;
       });
     }, unknownCode);
-    await composer.fill('P5 steer input');
-    await page.getByRole('button', { name: 'Steer', exact: true }).click();
+    const submittedDraft = `  P5 ${unknownMode} input \n `;
+    const laterDraft = '  Extra draft while receipt unknown  ';
+    await composer.fill(submittedDraft);
+    await page.getByRole('button', { name: unknownMode === 'steer' ? 'Steer' : 'Follow up', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
-    await expect(composer).toHaveValue('P5 steer input');
+    await expect(composer).toHaveValue(submittedDraft);
     await expect(page.getByRole('button', { name: 'Steer', exact: true })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Follow up', exact: true })).toBeDisabled();
-    await composer.fill('P5 steer input\n\nExtra draft while receipt unknown');
+    const originalActiveInput = await page.evaluate(id => window.flowmate.querySessionInput({ sessionId: id, clientSequence: 2 }), sessionId);
+    expect(originalActiveInput).toMatchObject({ ok: true, data: { input: { mode: unknownMode, runId,
+      content: { text: `P5 ${unknownMode} input` } } } });
+    await composer.fill(`${submittedDraft}\n\n${laterDraft}`);
     await page.getByRole('button', { name: 'Check input status', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toHaveCount(0);
-    await expect(composer).toHaveValue('Extra draft while receipt unknown');
-    await composer.fill('P5 follow-up input');
-    await page.getByRole('button', { name: 'Follow up', exact: true }).click();
+    await expect(composer).toHaveValue(laterDraft);
+    expect(await page.evaluate(id => window.flowmate.querySessionInput({ sessionId: id, clientSequence: 2 }), sessionId)).toEqual(originalActiveInput);
+    const recoveredInputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
+    expect(recoveredInputs.ok && recoveredInputs.data.items.length).toBe(2);
+    expect(requests).toHaveLength(1);
+    const acceptedMode = unknownMode === 'steer' ? 'followUp' : 'steer';
+    await electronApp.evaluate(({ ipcMain }, mode) => {
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      const original = handlers.get('flowmate:submit-input'); if (!original) throw new Error('Missing submit-input');
+      const gate = { release: null as (() => void) | null };
+      (globalThis as unknown as { acceptedAppendDraftGate: typeof gate }).acceptedAppendDraftGate = gate;
+      ipcMain.removeHandler('flowmate:submit-input');
+      ipcMain.handle('flowmate:submit-input', async (event, input) => {
+        const result = await original(event, input);
+        if (input.mode === mode) await new Promise<void>(resolveReceipt => { gate.release = resolveReceipt; });
+        return result;
+      });
+    }, acceptedMode);
+    const acceptedDraft = `  P5 ${acceptedMode} input  `;
+    const acceptedLaterDraft = '  New draft while append is accepted  ';
+    await composer.fill(acceptedDraft);
+    await page.getByRole('button', { name: acceptedMode === 'steer' ? 'Steer' : 'Follow up', exact: true }).click();
+    await expect.poll(() => electronApp!.evaluate(() => Boolean((globalThis as unknown as {
+      acceptedAppendDraftGate: { release: (() => void) | null } }).acceptedAppendDraftGate.release))).toBe(true);
+    await composer.fill(unknownCode === 'operation_result_unknown' ? `${acceptedDraft}\n\n${acceptedLaterDraft}` : acceptedLaterDraft);
+    await electronApp.evaluate(() => (globalThis as unknown as { acceptedAppendDraftGate: { release: (() => void) | null } }).acceptedAppendDraftGate.release?.());
+    await expect(page.getByRole('button', { name: acceptedMode === 'steer' ? 'Steer' : 'Follow up', exact: true })).toBeEnabled();
+    await expect(composer).toHaveValue(acceptedLaterDraft);
     await expect.poll(async () => {
       const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
       return inputs.ok ? inputs.data.items.map(input => [input.mode, input.runId]) : [];
-    }).toEqual([['followUp', runId], ['steer', runId], ['prompt', runId]]);
+    }).toEqual([[acceptedMode, runId], [unknownMode, runId], ['prompt', runId]]);
     await expect(page.locator('[data-testid="session-input"]')).toHaveCount(3);
     expect(requests).toHaveLength(1);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats', exact: true }).click();
@@ -431,7 +931,7 @@ it(`desktop manages same-Run inputs, recovers ${unknownCode} and continues from 
     })).toMatchObject({ ok: true });
     expect(await page.evaluate(request => window.flowmate.submitInput(request), originalPrompt)).toMatchObject(originalReceipt);
     expect(requests).toHaveLength(callsAfterStop);
-    expect(await page.locator('.rail .nav-item').count()).toBe(5);
+    expect(await page.locator('.rail .nav-item').count()).toBe(6);
     const closingApp = electronApp;
     electronApp = null;
     await closeDesktopFixture(closingApp, userData);
@@ -440,7 +940,7 @@ it(`desktop manages same-Run inputs, recovers ${unknownCode} and continues from 
       expect(db.query('SELECT count(*) AS count FROM runs WHERE session_id=?').get(sessionId)).toEqual({ count: 3 });
       expect(db.query('SELECT count(*) AS count FROM session_inputs WHERE session_id=?').get(sessionId)).toEqual({ count: 5 });
       expect(db.query('SELECT mode,run_id,status,processing_status,native_entry_id IS NOT NULL AS user_saved,result_entry_id IS NOT NULL AS reply_saved FROM session_inputs WHERE run_id=? ORDER BY id').all(runId))
-        .toEqual(['prompt', 'steer', 'followUp'].map(mode => ({ mode, run_id: runId, status: 'consumed', processing_status: 'completed', user_saved: 1, reply_saved: 1 })));
+        .toEqual(['prompt', unknownMode, acceptedMode].map(mode => ({ mode, run_id: runId, status: 'consumed', processing_status: 'completed', user_saved: 1, reply_saved: 1 })));
     } finally { db.close(); }
   } catch (error) {
     failure = error instanceof Error ? error : new Error(String(error));
@@ -454,6 +954,231 @@ it(`desktop manages same-Run inputs, recovers ${unknownCode} and continues from 
     throw failure;
   }
   finally { try { if (electronApp) await closeDesktopFixture(electronApp, userData, failure); } finally { await server.stop(true); } }
+});
+}
+}
+
+it('desktop discloses the active Run and frozen invoice after the viewed invoice changes', async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-active-context-'));
+  const sourceRoot = await mkdtemp(join(tmpdir(), 'flowmate-desktop-active-context-source-'));
+  const sources = [join(sourceRoot, '000001'), join(sourceRoot, '000002')];
+  for (const [index, source] of sources.entries()) {
+    writeInvoiceSample(source);
+    const metadata = JSON.parse(readFileSync(join(source, 'metadata.json'), 'utf8'));
+    writeFileSync(join(source, 'metadata.json'), JSON.stringify({ ...metadata,
+      sampleId: index === 0 ? '000001' : '000002', sourceRecordId: `active-context-${index + 1}` }));
+  }
+  const requests: unknown[] = [];
+  let release!: () => void;
+  const barrier = new Promise<void>(resolveResponse => { release = resolveResponse; });
+  const server = await createHttpProvider(async request => {
+    requests.push(await request.json()); await barrier; return streamText('Original invoice response.');
+  });
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA'])
+    if (process.env[name]) env[name] = process.env[name];
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  env.FLOWMATE_TEST_INVOICE_SOURCE_ROOT = sourceRoot;
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
+  try {
+    app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+    const page = await app.firstWindow();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    expect(await page.evaluate(async port => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'active-context-model', credentialRef: 'active_context_credential',
+        name: 'Active context model', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'active-context-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'active-context-model' },
+      { modelId: 'active-context-model', apiKey: 'synthetic-active-context-key' });
+    }, server.port)).toMatchObject({ ok: true });
+    await page.reload();
+    for (const source of sources) {
+      await app.evaluate(({ dialog }, selectedDirectory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedDirectory] }); }, source);
+      await page.getByRole('button', { name: /Import invoice/ }).click();
+      await page.getByRole('heading', { name: source.endsWith('000001') ? 'Invoice 000001' : 'Invoice 000002', exact: true }).waitFor();
+    }
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Invoices', exact: true }).click();
+    await page.locator('.invoice-context .processing-open').filter({ hasText: 'Invoice 000001' }).click();
+    await expect(page.locator('.chat-context')).toHaveText('Working with Invoice 000001');
+    const composer = page.getByRole('textbox', { name: 'Message to model' });
+    await composer.fill('Explain the original invoice.');
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect.poll(() => requests.length).toBe(1);
+    const original = await page.evaluate(async () => {
+      const state = await window.flowmate.queryRuntimeState();
+      if (!state.ok || !state.data.active) throw new Error('Missing active Run');
+      const run = await window.flowmate.queryRun(state.data.active.runId); if (!run.ok) throw new Error('Missing frozen Run');
+      return run.data;
+    });
+    expect(original.config).toMatchObject({ workspaceContext: { documentRef: { id: 1 }, sessionId: original.sessionId } });
+    await page.locator('.invoice-context .processing-open').filter({ hasText: 'Invoice 000002' }).click();
+    await page.getByRole('heading', { name: 'Invoice 000002', exact: true }).waitFor();
+    expect(await page.evaluate(() => window.flowmate.readWorkspace())).toMatchObject({ ok: true, data: { documentRef: { id: 2 } } });
+    await expect(page.locator('.chat-context')).toContainText(`Run ${original.runId}`);
+    await expect(page.locator('.chat-context')).toContainText('Invoice 000001');
+    await expect(page.locator('.chat-context')).not.toContainText('Invoice 000002');
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models', exact: true }).click();
+    await page.getByRole('button', { name: '＋ Add', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Invoices', exact: true }).click();
+    await expect(page.locator('.chat-context')).toContainText(`Run ${original.runId}`);
+    await expect(page.locator('.chat-context')).toContainText('Invoice 000001');
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    await expect(page.locator('.chat-context')).not.toContainText(`Run ${original.runId}`);
+    await page.locator(`.sidebar-chat[data-session-id="${original.sessionId}"]`).click();
+    await expect(page.locator('.chat-context')).toContainText(`Run ${original.runId}`);
+    await expect(page.locator('.chat-context')).toContainText('Invoice 000001');
+    await composer.fill('Keep this later draft.');
+    expect(requests).toHaveLength(1);
+    expect(await page.evaluate(id => window.flowmate.queryRun(id), original.runId)).toMatchObject({ ok: true,
+      data: { sessionId: original.sessionId, config: { workspaceContext: { documentRef: { id: 1 } } } } });
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
+    await expect(composer).toHaveValue('Keep this later draft.');
+    expect(await page.evaluate(id => window.flowmate.queryRun(id), original.runId)).toMatchObject({ ok: true, data: { status: 'cancelled' } });
+    expect(requests).toHaveLength(1);
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { release(); try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await server.stop(true); } }
+});
+
+for (const outcome of ['accepted', 'accepted-appended', 'rejected', 'unknown', 'unknown-whitespace', 'unknown-whitespace-appended'] as const) {
+it(`desktop preserves a newer draft during Send preparation and ${outcome} admission`, async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-preparation-draft-'));
+  const requests: unknown[] = [];
+  const server = await createHttpProvider(async request => { requests.push(await request.json()); return streamText('Saved preparation reply.'); });
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA'])
+    if (process.env[name]) env[name] = process.env[name];
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
+  try {
+    app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+    const page = await app.firstWindow();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    expect(await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'preparation-model', credentialRef: 'preparation_draft_credential',
+        name: 'Preparation model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'preparation-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'preparation-model' },
+      { modelId: 'preparation-model', apiKey: 'synthetic-preparation-key' });
+    }, `http://127.0.0.1:${server.port}`)).toMatchObject({ ok: true });
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    const composer = page.getByRole('textbox', { name: 'Message to model' });
+    const originalDraft = outcome.startsWith('unknown-whitespace') ? '  Original preparation input  ' : 'Original preparation input';
+    await composer.fill(originalDraft);
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+    await app.evaluate(({ ipcMain }, result) => {
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      const query = handlers.get('flowmate:query-session-input'), submit = handlers.get('flowmate:submit-input');
+      if (!query || !submit) throw new Error('Missing input handlers');
+      const gate = { held: false, release: null as (() => void) | null, submitted: null as string | null };
+      (globalThis as unknown as { preparationDraftGate: typeof gate }).preparationDraftGate = gate;
+      ipcMain.removeHandler('flowmate:query-session-input');
+      ipcMain.handle('flowmate:query-session-input', async (event, input) => {
+        if (!gate.held && input.clientSequence === undefined) {
+          gate.held = true;
+          await new Promise<void>(resolveQuery => { gate.release = resolveQuery; });
+        }
+        return query(event, input);
+      });
+      ipcMain.removeHandler('flowmate:submit-input');
+      ipcMain.handle('flowmate:submit-input', async (event, input) => {
+        gate.submitted = input.text;
+        if (result === 'rejected') return { ok: false, error: { code: 'input_invalid', category: 'input', message: 'Controlled admission rejection', retryable: false } };
+        const accepted = await submit(event, input);
+        return result.startsWith('unknown') ? { ok: false, error: { code: 'operation_result_unknown', category: 'runtime', message: 'Controlled receipt loss', retryable: true } } : accepted;
+      });
+    }, outcome);
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect.poll(() => app!.evaluate(() => (globalThis as unknown as { preparationDraftGate: { held: boolean } }).preparationDraftGate.held)).toBe(true);
+    const draftDuringPreparation = outcome === 'unknown-whitespace' ? originalDraft
+      : outcome.endsWith('-appended') ? `${originalDraft}\n\nNew draft typed while preparing` : 'New draft typed while preparing';
+    if (outcome !== 'unknown-whitespace') await composer.fill(draftDuringPreparation);
+    await app.evaluate(() => (globalThis as unknown as { preparationDraftGate: { release: (() => void) | null } }).preparationDraftGate.release?.());
+    await expect.poll(() => app!.evaluate(() => (globalThis as unknown as { preparationDraftGate: { submitted: string | null } }).preparationDraftGate.submitted))
+      .toBe('Original preparation input');
+    if (outcome.startsWith('unknown')) {
+      await page.getByRole('button', { name: 'Check input status', exact: true }).waitFor();
+      await expect(composer).toHaveValue(draftDuringPreparation);
+      await page.getByRole('button', { name: 'Check input status', exact: true }).click();
+      await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toHaveCount(0);
+    } else await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+    await expect(composer).toHaveValue(outcome === 'unknown-whitespace' ? '' : 'New draft typed while preparing');
+    await expect.poll(() => requests.length).toBe(outcome === 'rejected' ? 0 : 1);
+    if (outcome.startsWith('unknown')) {
+      if (outcome === 'unknown-whitespace') await composer.fill('Next unsent preparation draft');
+      await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+      const inputs = await page.evaluate(async () => {
+        const sessions = await window.flowmate.listSessions(); if (!sessions.ok || !sessions.data.items[0]) throw new Error('Missing preparation Session');
+        return window.flowmate.listSessionInputs({ sessionId: sessions.data.items[0].sessionId });
+      });
+      expect(inputs).toMatchObject({ ok: true, data: { items: [{ content: { text: 'Original preparation input' }, mode: 'prompt' }] } });
+      if (inputs.ok) expect(inputs.data.items).toHaveLength(1);
+      expect(requests).toHaveLength(1);
+    }
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally {
+    if (app) await app.evaluate(() => (globalThis as unknown as { preparationDraftGate?: { release: (() => void) | null } }).preparationDraftGate?.release?.()).catch(() => undefined);
+    try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await server.stop(true); }
+  }
+});
+}
+
+for (const limit of ['model', 'tool'] as const) {
+it(`desktop shows the actual frozen ${limit} allowance after budget exhaustion`, async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-frozen-budget-'));
+  const calls: unknown[] = [];
+  const server = await createHttpProvider(async request => {
+    calls.push(await request.json());
+    return streamToolCall('read', `frozen-budget-${calls.length}`, { path: 'missing-budget-file' });
+  });
+  const env: Record<string, string> = {};
+  for (const name of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA'])
+    if (process.env[name]) env[name] = process.env[name];
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined;
+  try {
+    app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+    const page = await app.firstWindow();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    expect(await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'frozen-budget-model', credentialRef: 'frozen_budget_credential',
+        name: 'Frozen budget model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'frozen-budget-model', api: 'openai-completions',
+        contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'frozen-budget-model' },
+      { modelId: 'frozen-budget-model', apiKey: 'synthetic-frozen-budget-key' });
+    }, `http://127.0.0.1:${server.port}`)).toMatchObject({ ok: true });
+    await page.reload();
+    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    await page.getByText('Next Run limits', { exact: true }).click();
+    await page.getByLabel('Next Run model requests', { exact: true }).fill(limit === 'model' ? '1' : '4');
+    await page.getByLabel('Next Run tool calls', { exact: true }).fill(limit === 'tool' ? '1' : '3');
+    await page.getByRole('textbox', { name: 'Message to model' }).fill(`Exhaust the frozen ${limit} allowance`);
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled({ timeout: 15_000 });
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    const cause = limit === 'model' ? 'request' : 'tool';
+    await page.getByRole('log').getByText(`The assistant reached the ${cause} limit before finishing. Check Processing History for any saved result.`, { exact: true })
+      .waitFor({ timeout: 15_000 });
+    const current = await page.evaluate(async () => {
+      const sessions = await window.flowmate.listSessions(); if (!sessions.ok || !sessions.data.items[0]) throw new Error('Missing budget Session');
+      return window.flowmate.listSessionRuns({ sessionId: sessions.data.items[0].sessionId });
+    });
+    expect(current).toMatchObject({ ok: true, data: { items: [{ status: 'failed', error: { code: limit === 'model' ? 'agent_model_call_budget' : 'tool_budget_exceeded' },
+      config: { runtimeBudget: { maxModelCalls: limit === 'model' ? 1 : 4, maxToolCalls: limit === 'tool' ? 1 : 3 } } }] } });
+    await expect(page.getByRole('log')).toContainText(limit === 'model' ? '1 model request · 3 tool calls' : '4 model requests · 1 tool call');
+    await expect(page.locator('.chat-composer')).not.toContainText('Runtime is');
+    await expect(page.getByText('This chat cannot continue safely. Start a new chat.', { exact: true })).toHaveCount(0);
+    expect(calls).toHaveLength(limit === 'model' ? 1 : 2);
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await server.stop(true); } }
 });
 }
 
@@ -1153,6 +1878,28 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
     expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
     expect(await composer.inputValue()).toBe('Preserve this unsent draft.');
     expect(await page.getByTestId('runtime-feedback').textContent()).toContain('blocked');
+
+    runtimeCheckpoint = 'a newer manual Runtime read wins over the active observation timer';
+    await app.evaluate(() => {
+      const gate = Reflect.get(globalThis, 'runtimeUiGate');
+      gate.state = { active: { runId: 7, sessionId: null, kind: 'provider' }, blocked: false, error: null };
+      gate.holdNext = true; gate.heldQuery = null; gate.release = null;
+    });
+    // Wait for the real 2s active-Run observation timer, without issuing a manual read.
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'runtimeUiGate').heldQuery), { timeout: 5_000 }).not.toBeNull();
+    await app.evaluate(() => { Reflect.get(globalThis, 'runtimeUiGate').state = {
+      active: { runId: 8, sessionId: null, kind: 'provider' }, blocked: false, error: null }; });
+    await page.getByRole('button', { name: 'Check runtime status', exact: true }).click();
+    await expect(page.getByTestId('runtime-feedback')).toContainText('still occupied by Run 8');
+    await app.evaluate(async () => {
+      const gate = Reflect.get(globalThis, 'runtimeUiGate'); const query = gate.heldQuery;
+      gate.release?.();
+      for (let attempt = 0; !gate.settledQueries.includes(query) && attempt < 100; attempt++)
+        await new Promise(resolveWait => setTimeout(resolveWait, 10));
+      if (!gate.settledQueries.includes(query)) throw new Error('Held observation timer did not settle');
+    });
+    await page.waitForTimeout(100);
+    await expect(page.getByTestId('runtime-feedback')).toContainText('still occupied by Run 8');
 
     runtimeCheckpoint = 'explicit next-query failure';
     await app.evaluate(() => {
@@ -1949,6 +2696,15 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     await page.getByText(/Invoice removed from All invoices/).waitFor({ state: 'visible', timeout: 10_000 });
     expect(await invoiceRow.count()).toBe(0);
     expect(await page.getByRole('option', { name: 'Invoice 000001' }).count()).toBe(0);
+    const hiddenWorkspace = await page.evaluate(() => window.flowmate.readWorkspace());
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Activity' }).click();
+    await page.getByLabel('Invoice or processing record').selectOption('processing:1');
+    await page.getByRole('button', { name: 'View invoice', exact: true }).first().click();
+    await expect(page.getByText('You are viewing a read-only record;', { exact: false })).toBeVisible();
+    await expect(page.locator('.invoice-sheet img')).toBeVisible();
+    expect(await page.getByRole('button', { name: 'Process this invoice', exact: true }).count()).toBe(0);
+    expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(hiddenWorkspace);
+    expect(requests).toHaveLength(5);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Processing History' }).click();
     await page.getByRole('button', { name: 'Invoice 000001' }).click();
     await page.getByText('Read only', { exact: true }).waitFor({ state: 'visible', timeout: 10_000 });

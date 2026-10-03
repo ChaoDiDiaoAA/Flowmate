@@ -28,11 +28,11 @@ describe('selected candidate Workspace admission', () => {
   it('allows a caller transaction to roll back nested repository writes as one unit', () => {
     const store = required(openDatabase(makePaths(mkdtempSync(join(tmpdir(), 'flowmate-repository-transaction-')))));
     deferCleanup(() => store.close());
-    const operation = store.db.transaction(() => {
+    const operation = () => store.runtimeEventStore.withTransaction(() => {
       required(store.sessions.create({ nativeSessionId: 'nested-session', title: 'Nested', at: '2026-10-01T00:00:00.000Z' }));
       throw new Error('outer-write-failed');
     });
-    expect(() => operation.immediate()).toThrow('outer-write-failed');
+    expect(operation).toThrow('outer-write-failed');
     expect(store.db.query('SELECT COUNT(*) AS count FROM sessions').get()).toEqual({ count: 0 });
   });
 
@@ -218,7 +218,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -281,7 +281,7 @@ describe('P3 invoice storage migration', () => {
     expect(after.query('PRAGMA foreign_key_check').all()).toEqual([]);
     after.close();
   });
-  it('migrates schema 2 through 12 without changing existing Provider, Agent, or Session facts', () => {
+  it('migrates schema 2 through the current schema without changing existing Provider, Agent, or Session facts', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-migration-'));
     const paths = makePaths(root);
     createVersion2Database(paths);
@@ -295,7 +295,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -303,7 +303,7 @@ describe('P3 invoice storage migration', () => {
     expect(db.query('SELECT job_id FROM runs ORDER BY id').all()).toEqual([{ job_id: null }, { job_id: null }]);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
-      .toHaveLength(13);
+      .toHaveLength(14);
     expect(db.query('PRAGMA table_info(runs)').all()).toHaveLength(25);
     expect(db.query('SELECT metadata_json FROM sessions WHERE id=7').get()).toEqual({
       metadata_json: '{"version":1,"model_use_blocked":null}',

@@ -102,12 +102,15 @@ export type RuntimeAgentConfigFacts = Omit<AgentConfigFacts, 'policyVersion' | '
 };
 export type RunAgentConfigFacts = AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts;
 
+// runtime-v1 已保存策略的固定读取边界，不跟随新 Run 的可调默认变化。
 const observationFields = ToolRuntimeObservationSchema.innerType().shape;
 const calibrationGroupSchema = z.object({
-  toolName: z.string().regex(/^[a-z][a-z0-9_]{0,127}$/), toolVersion: z.string().min(1).max(32),
+  toolName: z.string().regex(/^[a-z][a-z0-9_]{0,127}$/),
+  toolVersion: z.string().min(1).max(32),
   groupKey: observationFields.groupKey, attemptCount: z.number().int().min(0).max(200),
   eligibleCount: z.number().int().min(0).max(200), p95Ms: z.number().finite().nonnegative().nullable(),
-  selectedTimeoutMs: z.number().finite().min(100).max(1_800_000), timeoutSource: z.enum(['configured', 'statistical']),
+  selectedTimeoutMs: z.number().finite().min(100).max(1_800_000),
+  timeoutSource: z.enum(['configured', 'statistical']),
   fallbackReason: z.string().min(1).max(128).nullable(),
 }).strict().refine(group => group.eligibleCount <= group.attemptCount
   && (group.timeoutSource !== 'statistical' || group.eligibleCount >= 20 && group.p95Ms !== null), 'Invalid calibration evidence.');

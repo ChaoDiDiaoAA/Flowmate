@@ -57,6 +57,58 @@ async function run(app: Application, request: AgentRunRequest | FillInputRequest
 }
 
 describe('Fill backend through the public Application', () => {
+  it('blocks a queued input when its frozen document becomes unavailable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-p5-unavailable-input-'));
+    const paths = productPaths(join(root, 'product'));
+    const sourceRoot = join(root, 'source'); const source = join(sourceRoot, '000001'); writeInvoice(source);
+    let entered!: () => void; const firstRequest = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; });
+    const requests: unknown[] = [];
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      requests.push(await request.json());
+      if (requests.length === 1) { entered(); await barrier; }
+      const chunk = (delta: unknown, reason: string | null) => `data: ${JSON.stringify({ id: `unavailable-${requests.length}`,
+        model: 'unavailable-model', choices: [{ index: 0, delta, finish_reason: reason }] })}\n\n`;
+      return new Response(`${chunk({ role: 'assistant', content: 'Controlled answer.' }, null)}${chunk({}, 'stop')}data: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    deferCleanup(() => server.stop(true));
+    const config: ProviderConfig = { version: 1, name: 'Controlled unavailable input', revision: 1,
+      modelRef: { provider: 'unavailable-fixture', model: 'unavailable-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
+      connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
+      parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+    const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-unavailable-key' }) }));
+    deferCleanup(async () => { await app.close(); });
+    deferCleanup(() => release());
+    const document = need(await app.importInvoiceMaterial(source));
+    const current = need(await app.readWorkspace());
+    const session = need(await app.createSession({ title: 'Frozen material', expectedRevision: current.revision }));
+    const workspace = need(await app.updateWorkspace({ expectedRevision: need(await app.readWorkspace()).revision,
+      change: { kind: 'document', documentId: document.documentRef.id } }));
+    let finished!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+    const terminal = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finished = resolve; });
+    const accepted = need(await app.submitInput({ sessionId: session.sessionId, clientSequence: 1, mode: 'prompt',
+      text: 'Read this invoice.', workspace: expectation(workspace), config, timeoutMs: 5000, stopGraceMs: 500 },
+    { onEvent(event) { if (event.type === 'run_finished') finished(event); } }));
+    await firstRequest;
+    const queued = need(await app.submitInput({ sessionId: session.sessionId, clientSequence: 2, mode: 'followUp', runId: accepted.runId,
+      text: 'Continue reading the same invoice.', workspace: expectation(workspace) }));
+    const frozen = need(await app.querySessionInput({ sessionId: session.sessionId, inputId: queued.inputId })).input;
+    writeFileSync(join(paths.artifactsDir, String(document.originalArtifactId), 'original.png'), 'corrupt-original');
+    expect(await app.readDocumentOriginal(document.documentRef.id, 1)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+    expect(need(await app.queryDocument(document.documentRef.id)).status).toBe('unavailable');
+    release();
+    expect((await terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'input_unavailable' } } });
+    expect(requests).toHaveLength(1);
+    const saved = need(await app.querySessionInput({ sessionId: session.sessionId, inputId: queued.inputId })).input!;
+    expect(saved.content).toEqual(frozen!.content);
+    expect(saved.processingStatus).toBe('failed');
+    expect(saved.nativeEntryId).toBeNull();
+    expect(need(await app.querySession(session.sessionId)).availability).toBe('unusable');
+  });
+
   it.each(['schema', 'ambiguity', 'source'] as const)('delivers actionable %s failure feedback before a corrected candidate is saved', async scenario => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-candidate-feedback-'));
     const paths = productPaths(join(root, 'product'));
@@ -332,8 +384,9 @@ describe('Fill backend through the public Application', () => {
     } finally { need(await app.close()); }
   });
 
-  it.each(['applied', 'not_applied', 'unknown', 'not-called', 'late-applied', 'invalid-receipt', 'workspace-changed', 'toolResult-save-failure'] as const)
+  it.each(['applied', 'applied-then-failed', 'applied-then-cancelled', 'not_applied', 'unknown', 'not-called', 'late-applied', 'invalid-receipt', 'workspace-changed', 'toolResult-save-failure'] as const)
     ('uses real SDK, Executor and SQLite for %s; query never applies again', async outcome => {
+    const formApplied = outcome === 'applied' || outcome === 'applied-then-failed' || outcome === 'applied-then-cancelled';
     const root = mkdtempSync(join(tmpdir(), 'flowmate-form-chain-'));
     const paths = productPaths(join(root, 'product'));
     const sourceRoot = join(root, 'source'); const source = join(sourceRoot, '000001'); writeInvoice(source);
@@ -343,9 +396,20 @@ describe('Fill backend through the public Application', () => {
     let lateReceipt!: (receipt: InvoiceFormApplicationReceipt) => void;
     let lateAppliedAt = '';
     let app!: Application;
+    let observeLaterRequest!: () => void;
+    const laterRequest = new Promise<void>(resolve => { observeLaterRequest = resolve; });
+    let releaseLaterResponse!: () => void;
+    const laterResponse = new Promise<void>(resolve => { releaseLaterResponse = resolve; });
     const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
       requests.push(await request.json());
       const ordinal = requests.length;
+      if (ordinal === 5 && outcome === 'applied-then-failed') {
+        return Response.json({ error: { type: 'invalid_request_error', message: 'Controlled later request failure.' } }, { status: 400 });
+      }
+      if (ordinal === 5 && outcome === 'applied-then-cancelled') {
+        observeLaterRequest();
+        await laterResponse;
+      }
       if (ordinal === 3 && outcome === 'workspace-changed') {
         const current = need(await app.readWorkspace());
         need(await app.updateWorkspace({ expectedRevision: current.revision, change: { kind: 'document', documentId: null } }));
@@ -363,7 +427,7 @@ describe('Fill backend through the public Application', () => {
       modelRef: { provider: 'form-fixture', model: 'form-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
-    app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
+    const open = () => createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
       invoiceFormBridge: async request => {
         bridgeCalls.push(structuredClone(request));
         const base = unknownReceipt(request);
@@ -374,7 +438,7 @@ describe('Fill backend through the public Application', () => {
         if (request.operation === 'apply' && outcome === 'invalid-receipt') return { ...base, outcome: 'applied',
           candidateId: request.candidateId + 1, appliedRevision: request.target.expectedRevision + 1, appliedAt: base.observedAt };
         if (request.operation === 'query' && outcome === 'late-applied') return base;
-        if (request.operation === 'query' || outcome === 'applied' || outcome === 'toolResult-save-failure') return { ...base, outcome: 'applied',
+        if (request.operation === 'query' || formApplied || outcome === 'toolResult-save-failure') return { ...base, outcome: 'applied',
           appliedRevision: request.target.expectedRevision + 1, appliedAt: base.observedAt };
         return outcome === 'not_applied' ? { ...base, outcome: 'not_applied', reason: 'fixture-target-unavailable' } : base;
       },
@@ -391,7 +455,8 @@ describe('Fill backend through the public Application', () => {
           });
         }
         return adapter;
-      } }));
+      } });
+    app = need(await open());
     let fillRunId = 0; let fillToolId = 0;
     try {
       const doc = need(await app.importInvoiceMaterial(source)); documentId = doc.documentRef.id;
@@ -413,11 +478,11 @@ describe('Fill backend through the public Application', () => {
         text: 'Apply the selected candidate.', workspace: expectation(selected.workspace), config,
         formTarget: { formInstanceId: 'private-form-target', expectedRevision: 4 }, timeoutMs: outcome === 'late-applied' ? 500 : 5000, stopGraceMs: 500 };
       const filled = await run(app, fillInput, true); fillRunId = filled.accepted.runId;
-      expect(filled.finished.result).toMatchObject({ ok: true, data: { status: outcome === 'applied' ? 'completed' : 'failed' } });
+      expect(filled.finished.result).toMatchObject({ ok: true, data: { status: formApplied ? 'completed' : 'failed' } });
       const completedRun = need(await app.queryRun(fillRunId));
       expect(completedRun.output?.agent).toMatchObject({ candidateIds: [] });
-      expect(need(await app.queryJob(task.job.jobId))).toMatchObject({ status: outcome === 'applied' ? 'waiting' : 'failed',
-        ...(outcome === 'applied' ? { reason: 'review_form' } : {}), currentCandidateId: candidateId, acceptedCandidateId: null });
+      expect(need(await app.queryJob(task.job.jobId))).toMatchObject({ status: formApplied ? 'waiting' : 'failed',
+        ...(formApplied ? { reason: 'review_form' } : {}), currentCandidateId: candidateId, acceptedCandidateId: null });
       if (outcome === 'workspace-changed') {
         expect(bridgeCalls).toHaveLength(0);
         expect(requests).toHaveLength(4);
@@ -443,13 +508,13 @@ describe('Fill backend through the public Application', () => {
       expect(requests[2]!.tools?.map(tool => tool.function.name)).toEqual(['fill_invoice_form']);
       const result = requests[3]?.messages.find(message => message.role === 'tool' && message.tool_call_id === 'form-call-3');
       if (!resultMissing) expect(result).toBeDefined();
-      if (outcome === 'applied') expect(JSON.parse(String(result?.content))).toEqual({ candidateId, candidateSequence: 1, applied: true });
+      if (formApplied) expect(JSON.parse(String(result?.content))).toEqual({ candidateId, candidateSequence: 1, applied: true });
       else expect(String(result?.content)).not.toContain('"applied":true');
       expect(JSON.stringify(requests)).not.toContain('private-form-target');
       expect(JSON.stringify(requests)).not.toContain('expectedRevision');
       expect(need(await app.querySessionInput({ sessionId: session.sessionId, clientSequence: nextSequence })).input)
         .toMatchObject({ inputId: filled.accepted.inputId, runId: fillRunId, status: 'consumed',
-          processingStatus: outcome === 'applied' ? 'completed' : 'failed', nativeEntryId: expect.any(String) });
+          processingStatus: formApplied ? 'completed' : 'failed', nativeEntryId: expect.any(String) });
       const before = need(await app.queryRun(fillRunId));
       let receipt = need(await app.queryInvoiceFormApplication({ runId: fillRunId, toolCallId: fillToolId }));
       if (outcome === 'late-applied') {
@@ -471,6 +536,60 @@ describe('Fill backend through the public Application', () => {
       expect(await app.submitInput(fillInput)).toEqual({ ok: true, data: filled.accepted });
       expect(requests).toHaveLength(resultMissing ? 3 : 4);
       expect(bridgeCalls.filter(call => call.operation === 'apply')).toHaveLength(1);
+      if (outcome === 'applied-then-failed' || outcome === 'applied-then-cancelled') {
+        const originalInput = need(await app.querySessionInput({ sessionId: session.sessionId, clientSequence: nextSequence })).input;
+        expect(originalInput).toMatchObject({ processingStatus: 'completed', resultEntryId: expect.any(String) });
+        const savedFacts = () => {
+          const db = new Database(paths.databaseFile, { readonly: true });
+          try {
+            return { call: db.query('SELECT * FROM tool_calls WHERE id=?').get(fillToolId),
+              entries: db.query('SELECT entry_id,entry_json FROM session_native_entries WHERE run_id=? ORDER BY sequence').all(fillRunId) };
+          } finally { db.close(); }
+        };
+        need(await app.close());
+        const originalFacts = savedFacts();
+        app = need(await open());
+        const laterSession = need(await app.createSession({ title: 'Another conversation for the same Job',
+          expectedRevision: need(await app.readWorkspace()).revision }));
+        let finishLater!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+        const laterFinished = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finishLater = resolve; });
+        const later = need(await app.startRun({ sessionId: laterSession.sessionId,
+          goalMode: 'answer', text: 'A later independent request.',
+          workspace: expectation(need(await app.readWorkspace())), config, timeoutMs: 5000, stopGraceMs: 500 },
+        { onEvent(event) { if (event.type === 'run_finished') finishLater(event); } }));
+        if (outcome === 'applied-then-cancelled') {
+          await laterRequest;
+          need(await app.cancelRun(later.runId));
+          releaseLaterResponse();
+        }
+        const laterStatus = outcome === 'applied-then-failed' ? 'failed' : 'cancelled';
+        expect((await laterFinished).result).toMatchObject({ ok: true, data: { status: laterStatus } });
+        expect(need(await app.queryRun(later.runId))).toMatchObject({ jobId: task.job.jobId, cleanup: { stopped: true } });
+        expect(need(await app.queryJob(task.job.jobId)).status).toBe(laterStatus);
+        expect(need(await app.querySession(session.sessionId)).availability).toBe('ready');
+        expect(need(await app.querySession(laterSession.sessionId)).availability).toBe('unusable');
+        need(await app.close());
+        expect(savedFacts()).toEqual(originalFacts);
+        app = need(await open());
+        expect(need(await app.querySession(session.sessionId))).toMatchObject({ availability: 'ready', historyState: 'recoverable' });
+        expect(need(await app.querySession(laterSession.sessionId)).availability).toBe('unusable');
+        expect(need(await app.querySessionInput({ sessionId: session.sessionId, clientSequence: nextSequence })).input).toEqual(originalInput);
+        expect(need(await app.queryRun(fillRunId))).toEqual(before);
+        expect(need(await app.queryInvoiceFormApplication({ runId: fillRunId, toolCallId: fillToolId }))).toEqual(receipt);
+        expect(await app.submitInput(fillInput)).toEqual({ ok: true, data: filled.accepted });
+        expect(requests).toHaveLength(5);
+        expect(bridgeCalls.filter(call => call.operation === 'apply')).toHaveLength(1);
+        need(await app.updateWorkspace({ expectedRevision: need(await app.readWorkspace()).revision,
+          change: { kind: 'session', sessionId: session.sessionId } }));
+        const continued = await run(app, { sessionId: session.sessionId, goalMode: 'answer', text: 'Continue after reopening.',
+          workspace: expectation(need(await app.readWorkspace())), config, timeoutMs: 5000, stopGraceMs: 500 });
+        expect(continued.finished.result).toMatchObject({ ok: true, data: { status: 'completed' } });
+        expect(requests).toHaveLength(6);
+        need(await app.close());
+        expect(savedFacts()).toEqual(originalFacts);
+        expect(bridgeCalls.filter(call => call.operation === 'apply')).toHaveLength(1);
+        return;
+      }
       if (outcome === 'applied') {
         const workspace = need(await app.readWorkspace());
         const unchangedDraft = InvoiceFormDraftSchema.parse({ fields: Object.fromEntries(Object.keys(candidate.fields).map(name => [name, ''])),

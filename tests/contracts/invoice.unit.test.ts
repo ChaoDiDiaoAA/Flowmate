@@ -56,6 +56,71 @@ const outputExamples = {
 } as const;
 
 describe('P3 invoice tool contracts', () => {
+  it('requires an explicit pagination limit and rejects requests outside the existing range', () => {
+    const requests = [
+      [invoiceToolSchemas.read_invoice_document.input, { documentId: 1, page: 1, afterBlockId: null }],
+      [invoiceToolSchemas.search_invoice_document.input, { documentId: 1, page: null, query: 'Invoice', afterBlockId: null }],
+      [invoiceToolSchemas.list_invoice_tables.input, { documentId: 1, page: null, afterBlockId: null }],
+      [invoiceToolSchemas.list_invoice_candidates.input, { beforeSequence: null }],
+      [invoiceToolSchemas.compare_invoice_candidates.input, { leftCandidateId: 4, rightCandidateId: 5, afterPath: null }],
+    ] as const;
+    for (const [schema, request] of requests) {
+      expect(schema.safeParse(request).success).toBe(false);
+      for (const limit of [1, 50]) expect(schema.safeParse({ ...request, limit }).success).toBe(true);
+      for (const limit of [0, 51]) expect(schema.safeParse({ ...request, limit }).success).toBe(false);
+    }
+  });
+
+  it('accepts complete candidate fields and lines at their existing boundaries', () => {
+    const present = { ...field, raw: 'x'.repeat(1024), normalized: 'x'.repeat(1024), state: 'present' };
+    expect(CandidateDraftSchema.safeParse({ ...candidate,
+      fields: { ...candidate.fields, invoiceNumber: present } }).success).toBe(true);
+    expect(CandidateDraftSchema.safeParse({ ...candidate,
+      fields: { ...candidate.fields, invoiceNumber: { ...present, raw: 'x'.repeat(1025) } } }).success).toBe(false);
+    expect(CandidateDraftSchema.safeParse({ ...candidate,
+      fields: { ...candidate.fields, invoiceNumber: { ...present, normalized: 'x'.repeat(1025) } } }).success).toBe(false);
+    const line = { description: field, quantity: field, unit: field, unitPrice: field,
+      netAmount: field, taxRate: field, taxAmount: field, totalAmount: field };
+    expect(CandidateDraftSchema.safeParse({ ...candidate, lines: Array.from({ length: 200 }, () => line) }).success).toBe(true);
+    expect(CandidateDraftSchema.safeParse({ ...candidate, lines: Array.from({ length: 201 }, () => line) }).success).toBe(false);
+  });
+
+  it('keeps amount input precision, sum capacity and requested rounding scale bounded', () => {
+    const schema = invoiceToolSchemas.calculate_invoice_amounts.input;
+    expect(schema.safeParse({ operation: 'sum', values: ['999999999999999999.123456'], scale: null }).success).toBe(true);
+    for (const value of ['9999999999999999999', '1.1234567']) {
+      expect(schema.safeParse({ operation: 'sum', values: [value], scale: null }).success).toBe(false);
+    }
+    for (const scale of [0, 6]) expect(schema.safeParse({ operation: 'sum', values: ['1'], scale }).success).toBe(true);
+    for (const scale of [-1, 7]) expect(schema.safeParse({ operation: 'sum', values: ['1'], scale }).success).toBe(false);
+    expect(schema.safeParse({ operation: 'sum', values: Array(200).fill('1'), scale: null }).success).toBe(true);
+    expect(schema.safeParse({ operation: 'sum', values: Array(201).fill('1'), scale: null }).success).toBe(false);
+  });
+
+  it('limits one source-check batch without imposing that limit on the entire candidate', () => {
+    expect(invoiceToolSchemas.check_invoice_sources.input.safeParse({ documentId: 1,
+      sources: Array.from({ length: 50 }, () => source) }).success).toBe(true);
+    expect(invoiceToolSchemas.check_invoice_sources.input.safeParse({ documentId: 1,
+      sources: Array.from({ length: 51 }, () => source) }).success).toBe(false);
+    const sources = Array.from({ length: 8 }, (_, index) => ({ ...source, blockId: `b${index + 1}` }));
+    const fields = Object.fromEntries(Object.entries(candidate.fields).map(([name, value], index) => [name,
+      index < 7 ? { ...value, raw: 'Invoice', normalized: 'Invoice', state: 'present', sources } : value]));
+    expect(CandidateDraftSchema.safeParse({ ...candidate, fields }).success).toBe(true);
+    expect(CandidateDraftSchema.safeParse({ ...candidate,
+      fields: { ...candidate.fields, invoiceNumber: { ...field, sources: [...sources, source] } } }).success).toBe(false);
+  });
+
+  it('distinguishes serialized comparison values from candidate raw field lengths', () => {
+    const raw = 'x'.repeat(1024);
+    expect(CandidateDraftSchema.safeParse({ ...candidate,
+      fields: { ...candidate.fields, invoiceNumber: { ...field, raw } } }).success).toBe(true);
+    const difference = { path: '/fields/invoiceNumber/raw', kind: 'changed', left: null };
+    expect(invoiceToolSchemas.compare_invoice_candidates.output.safeParse({ ...outputExamples.compare_invoice_candidates,
+      differences: [{ ...difference, right: JSON.stringify('x'.repeat(1022)) }] }).success).toBe(true);
+    expect(invoiceToolSchemas.compare_invoice_candidates.output.safeParse({ ...outputExamples.compare_invoice_candidates,
+      differences: [{ ...difference, right: JSON.stringify(raw) }] }).success).toBe(false);
+  });
+
   it('keeps form targets and application evidence out of the model tool input and output', () => {
     const target = { formInstanceId: 'form-1', expectedRevision: 0 };
     const base = { runId: 2, toolCallId: 9, formInstanceId: 'form-1', candidateId: 4, candidateSequence: 1,

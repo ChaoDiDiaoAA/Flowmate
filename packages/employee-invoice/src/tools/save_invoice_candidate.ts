@@ -22,7 +22,8 @@ export const saveInvoiceCandidate = (documents: DocumentService, documentReposit
     if (!validation.saveable) {
       const sourceFailure = validation.violations.some((item) => item.code.startsWith('source_') || item.code === 'present_source_missing');
       const diagnostics = validation.violations.slice(0, 6).map(item => ({ code: item.code,
-        fieldPaths: item.fieldPaths.slice(0, 6).map(path => path.slice(0, 96)) }));
+        fieldPaths: item.fieldPaths.slice(0, 6)
+          .map(path => path.slice(0, 96)) }));
       throw appError(sourceFailure ? 'source_invalid' : 'tool_invalid_input', sourceFailure ? 'input' : 'tool',
         `${sourceFailure ? 'Candidate sources failed validation' : 'Candidate structure or normalized values are invalid'}; no candidate was saved. First validation errors: ${JSON.stringify(diagnostics)}. Expected documentRef: ${JSON.stringify(validation.documentRef)}. Copy the full source version from read tools without rewriting it.`, false,
         context.runId, context.sessionId, call.nativeToolCallId);

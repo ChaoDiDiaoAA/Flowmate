@@ -4,6 +4,9 @@ import {
   fail,
   ok,
   ParsedBlockSchema,
+  MAX_INVOICE_PAGES,
+  MAX_INVOICE_BLOCKS_PER_PAGE,
+  MAX_INVOICE_VERSION_CHARS,
 } from '@flowmate/contracts';
 import type {
   DocumentSnapshot,
@@ -12,7 +15,7 @@ import type {
   Result,
   RunScope,
 } from '@flowmate/contracts';
-import { parseVoxel51Sample } from './parsed-document.ts';
+import { mapVoxel51ParsedDocument, parseVoxel51Sample } from './parsed-document.ts';
 import { isSupportedOriginal, readVoxel51Files } from './source/voxel51.ts';
 
 const MAX_WORKSPACE_ORIGINAL_BYTES = 10 * 1024 * 1024;
@@ -73,7 +76,7 @@ function decodeParsed(value: unknown): StoredParsedDocument {
   const parsed = value as Record<string, unknown>;
   if ((parsed.formatVersion !== 1 && parsed.formatVersion !== 2)
     || (parsed.formatVersion === 2 && 'parser' in parsed)
-    || !Array.isArray(parsed.pages) || parsed.pages.length < 1 || parsed.pages.length > 20
+    || !Array.isArray(parsed.pages) || parsed.pages.length < 1 || parsed.pages.length > MAX_INVOICE_PAGES
     || !parsed.completeness || typeof parsed.completeness !== 'object' || Array.isArray(parsed.completeness)) throw new Error('invalid_parsed_document');
   const completeness = parsed.completeness as Record<string, unknown>;
   if (completeness.status !== 'complete' || !Array.isArray(completeness.checks) || !completeness.checks.every((item) => typeof item === 'string')
@@ -81,8 +84,8 @@ function decodeParsed(value: unknown): StoredParsedDocument {
   const pages = parsed.pages.map((value) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_parsed_page');
     const page = value as Record<string, unknown>;
-    if (!Number.isSafeInteger(page.page) || Number(page.page) < 1 || Number(page.page) > 20 || !Array.isArray(page.blocks)
-      || page.blocks.length > 2_000) throw new Error('invalid_parsed_page');
+    if (!Number.isSafeInteger(page.page) || Number(page.page) < 1 || Number(page.page) > MAX_INVOICE_PAGES || !Array.isArray(page.blocks)
+      || page.blocks.length > MAX_INVOICE_BLOCKS_PER_PAGE) throw new Error('invalid_parsed_page');
     return { page: Number(page.page), blocks: page.blocks.map((block) => ParsedBlockSchema.parse(block)) };
   });
   return { formatVersion: 2, pages,
@@ -135,7 +138,7 @@ export class DocumentService {
     const parsed = parseVoxel51Sample(source.data);
     if (!parsed.ok) return parsed;
     const version = documentVersion(parsed.data.datasetRevision, [originalBytes, contentBytes, pagesBytes, metadataBytes]);
-    if (version.length > 512) return fail(appError('source_invalid', 'input', '来源版本超过支持范围。'));
+    if (version.length > MAX_INVOICE_VERSION_CHARS) return fail(appError('source_invalid', 'input', '来源版本超过支持范围。'));
     const existing = this.options.repository.findBySource({ sourceKey: parsed.data.sourceKey,
       sourceRecordId: parsed.data.sourceRecordId, version });
     if (!existing.ok) return existing;
@@ -218,20 +221,21 @@ export class DocumentService {
     if (!parsed.ok) return parsed;
     const originalName = original.data.relativePath.slice(original.data.relativePath.lastIndexOf('/') + 1);
     const originalBytes = this.options.files.read(original.data, originalName);
-    if (!originalBytes.ok) return this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt');
+    if (!originalBytes.ok) return originalBytes.error.code === 'artifact_unavailable'
+      ? this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt') : originalBytes;
     const extension = originalName.endsWith('.jpg') ? '.jpg' : originalName.endsWith('.png') ? '.png' : '';
     if (!extension || !isSupportedOriginal(originalBytes.data, originalName)) return this.unavailableDocument(documentId, 'original_artifact_invalid');
-    const parsedBytes = this.options.files.read(parsed.data, 'parsed.json');
-    if (!parsedBytes.ok) return this.unavailableDocument(documentId, 'parsed_artifact_missing_or_corrupt');
+    const decoded = this.readStoredParsed(document.data, parsed.data);
+    if (!decoded.ok) return decoded;
     try {
-      const decoded = decodeParsed(parseJson(parsedBytes.data));
-      if (decoded.pages.length !== document.data.pageCount) {
+      if (decoded.data.pages.length !== document.data.pageCount) {
         return this.unavailableDocument(documentId, 'parsed_document_mismatch');
       }
       for (const file of parsed.data.metadata.files) {
         if (file.relativePath === 'parsed.json') continue;
         const sidecar = this.options.files.read(parsed.data, file.relativePath);
-        if (!sidecar.ok) return this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt');
+        if (!sidecar.ok) return sidecar.error.code === 'artifact_unavailable'
+          ? this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt') : sidecar;
       }
       return this.options.repository.setAvailability({ documentId, status: 'available', reason: null, at: this.options.now() });
     } catch {
@@ -251,15 +255,8 @@ export class DocumentService {
     if (document.data.status !== 'available' || document.data.isHidden) return fail(appError('input_unavailable', 'input', '材料当前不可读取。', true, context.runId, context.sessionId));
     const artifact = this.options.repository.getArtifact(document.data.parsedArtifactId);
     if (!artifact.ok) return artifact;
-    const bytes = this.options.files.read(artifact.data, 'parsed.json');
-    if (!bytes.ok) return bytes.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(documentId, 'parsed_artifact_missing_or_corrupt', context)
-      : bytes;
-    try {
-      return ok({ document: document.data, parsed: decodeParsed(parseJson(bytes.data)) });
-    } catch {
-      return this.unavailableDocument(documentId, 'parsed_document_invalid', context);
-    }
+    const parsed = this.readStoredParsed(document.data, artifact.data, context);
+    return parsed.ok ? ok({ document: document.data, parsed: parsed.data }) : parsed;
   }
 
   public readParsedForWorkspace(documentId: number): Result<{ document: DocumentSnapshot; parsed: StoredParsedDocument }> {
@@ -269,11 +266,37 @@ export class DocumentService {
     if (document.data.status !== 'available') return fail(appError('input_unavailable', 'input', '材料当前不可读取。', true));
     const artifact = this.options.repository.getArtifact(document.data.parsedArtifactId);
     if (!artifact.ok) return artifact;
-    const bytes = this.options.files.read(artifact.data, 'parsed.json');
+    const parsed = this.readStoredParsed(document.data, artifact.data);
+    return parsed.ok ? ok({ document: document.data, parsed: parsed.data }) : parsed;
+  }
+
+  private readStoredParsed(document: DocumentSnapshot, artifact: StoredArtifact,
+    context?: ProductToolContext): Result<StoredParsedDocument> {
+    const documentId = document.documentRef.id;
+    const bytes = this.options.files.read(artifact, 'parsed.json');
     if (!bytes.ok) return bytes.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(documentId, 'parsed_artifact_missing_or_corrupt') : bytes;
-    try { return ok({ document: document.data, parsed: decodeParsed(parseJson(bytes.data)) }); }
-    catch { return this.unavailableDocument(documentId, 'parsed_document_invalid'); }
+      ? this.unavailableDocument(documentId, 'parsed_artifact_missing_or_corrupt', context) : bytes;
+    let decoded: StoredParsedDocument;
+    try { decoded = decodeParsed(parseJson(bytes.data)); }
+    catch { return this.unavailableDocument(documentId, 'parsed_document_invalid', context); }
+    if (!/:parsed-v3:[a-f0-9]{64}$/.test(document.documentRef.version)) return ok(decoded);
+
+    const content = this.options.files.read(artifact, 'raw-content.json');
+    if (!content.ok) return content.error.code === 'artifact_unavailable'
+      ? this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt', context) : content;
+    const pages = this.options.files.read(artifact, 'raw-pages.json');
+    if (!pages.ok) return pages.error.code === 'artifact_unavailable'
+      ? this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt', context) : pages;
+    try {
+      const mapped = mapVoxel51ParsedDocument({ content: parseJson(content.data), pages: parseJson(pages.data) });
+      if (!mapped.ok || decoded.pages.length !== document.pageCount
+        || JSON.stringify(decoded.pages) !== JSON.stringify(mapped.data.pages)) {
+        return this.unavailableDocument(documentId, 'parsed_document_mismatch', context);
+      }
+    } catch {
+      return this.unavailableDocument(documentId, 'parsed_sidecar_invalid', context);
+    }
+    return ok(decoded);
   }
 
   private unavailableDocument(documentId: number, reason: string, context?: ProductToolContext): Result<never> {

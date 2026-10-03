@@ -23,6 +23,7 @@ import {
   WorkspaceContextSchema,
   WorkingDirectorySchema,
   RuntimeRequestOverridesSchema,
+  RUNTIME_CONFIG,
   serializeDesktopInvoiceFormRequest,
   invoiceToolSchemas,
   InvoiceFormApplicationReceiptSchema,
@@ -32,6 +33,17 @@ import {
   SetSessionStatusRequestSchema,
   BranchSessionRequestSchema,
   InvoiceCandidateOperationQuerySchema,
+  RuntimeEventsQuerySchema,
+  RuntimeEventsSubscriptionRequestSchema,
+  RuntimeSubscriptionIdSchema,
+  RuntimeEventsWakeSchema,
+  RunToolCallsRequestSchema,
+  RunToolCallRequestSchema,
+  RuntimeEventsReadResultSchema,
+  RuntimeSubscriptionResultSchema,
+  RuntimeSubscriptionReleaseResultSchema,
+  RuntimeToolPageResultSchema,
+  RuntimeToolResultSchema,
   ok,
 } from '@flowmate/contracts';
 import type {
@@ -59,6 +71,9 @@ import type {
   DesktopInvoiceFormInspection,
   InvoiceCandidateOperationQuery,
   InvoiceCandidateOperationResult,
+  RuntimeEventsReadResult,
+  RuntimeSubscriptionInfo,
+  RuntimeEventsWake,
 } from '@flowmate/contracts';
 import { defaultProductSettings, validateProductSettings } from '../../../packages/core/src/configuration/settings.ts';
 import { createCredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
@@ -80,6 +95,11 @@ const channels = {
   callProvider: 'flowmate:call-provider',
   cancelProvider: 'flowmate:cancel-provider',
   queryRun: 'flowmate:query-run',
+  queryRuntimeEvents: 'flowmate:query-runtime-events',
+  subscribeRuntimeEvents: 'flowmate:subscribe-runtime-events',
+  unsubscribeRuntimeEvents: 'flowmate:unsubscribe-runtime-events',
+  listRunToolCalls: 'flowmate:list-run-tool-calls',
+  queryRunToolCall: 'flowmate:query-run-tool-call',
   createSession: 'flowmate:create-session',
   queryNativeTools: 'flowmate:query-native-tools',
   chooseWorkingDirectory: 'flowmate:choose-working-directory',
@@ -140,7 +160,9 @@ const providerTestSchema = (value: unknown): value is ProviderTestRequest => val
   && new TextEncoder().encode(`${(value as ProviderTestRequest).goal}\n\n${(value as ProviderTestRequest).text}`).byteLength <= 65_536
   && typeof (value as ProviderTestRequest).modelId === 'string'
   && /^[a-zA-Z0-9._-]{1,64}$/.test((value as ProviderTestRequest).modelId)
-  && ((value as ProviderTestRequest).timeoutMs === undefined || (Number.isInteger((value as ProviderTestRequest).timeoutMs) && (value as ProviderTestRequest).timeoutMs! >= 100 && (value as ProviderTestRequest).timeoutMs! <= 120_000));
+  && ((value as ProviderTestRequest).timeoutMs === undefined || (Number.isInteger((value as ProviderTestRequest).timeoutMs)
+    && (value as ProviderTestRequest).timeoutMs! >= RUNTIME_CONFIG.ranges.providerTestTimeoutMs.min
+    && (value as ProviderTestRequest).timeoutMs! <= RUNTIME_CONFIG.ranges.providerTestTimeoutMs.max));
 
 let mainWindow: BrowserWindow | null = null;
 let allowWindowClose = false;
@@ -156,6 +178,15 @@ let appVersion = '0.1.0';
 let stateBroadcastSequence = 0;
 const host = new HostClient();
 const subscriptions = new Map<number, () => void>();
+type RuntimeOwner = { token: string; contents: Electron.WebContents; frame: Electron.WebFrameMain;
+  url: string; generation: number; epoch: number };
+type RuntimeBinding = { id: string; owner: RuntimeOwner; runId: number; sessionId: number | null;
+  open: boolean; pendingWake: number | null; cleanup(): void };
+const runtimeOwners = new Map<number, RuntimeOwner>();
+const runtimeGenerations = new Map<number, number>();
+const runtimeBindings = new Map<string, RuntimeBinding>();
+const runtimeReleased = new Map<string, string>();
+const runtimeQueries = new Set<string>();
 const credentialStores = new Map<string, CredentialStore>();
 const piCredentialPrefix = 'pi-credential-v1:';
 type DesktopFormBinding = InvoiceFormTargetBinding & { currentRevision: number; mutationPending?: boolean; unknownOperationRef?: string; clientSequence?: number; requestId?: string; modelId?: string };
@@ -241,6 +272,7 @@ async function bootstrap(): Promise<void> {
     }
   } catch { /* No legacy settings to clean up. */ }
   host.subscribe((event) => {
+    if (event.type === 'runtime_events_available') { receiveRuntimeWake(event); return; }
     if (event.type === 'host_state' && event.state.host === 'error') {
       hostError = true;
       hostErrorCode = 'host_exited';
@@ -262,6 +294,7 @@ async function bootstrap(): Promise<void> {
   });
   host.setCredentialHandler(handleHostCredentialRequest);
   host.setInvoiceFormHandler(handleInvoiceFormRequest);
+  host.setConnectionChangeHandler(releaseAllRuntimeOwners);
   const started = await host.start(userDataRoot, appVersion, appRoot, invoiceSourceRoot);
   if (started.ok && started.data.ready && retiredCredentialRef) {
     const removed = await credentialStore(retiredCredentialRef).remove();
@@ -285,6 +318,7 @@ function closeHostAndQuit(): Promise<void> {
 async function closeDesktop(): Promise<void> {
   desktopClosing = true;
   await startup;
+  releaseAllRuntimeOwners();
   const closed = await host.close();
   await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_closed', requestId: devShutdownRequestId,
     closed: closed.ok && closed.data.closed, stopped: closed.ok && closed.data.stopped });
@@ -319,16 +353,23 @@ function createMainWindow(): void {
     },
   });
   mainWindow = window;
+  const contentsId = window.webContents.id;
   window.removeMenu();
   window.once('ready-to-show', () => window.show());
-  window.on('closed', () => { mainWindow = null; });
+  window.on('closed', () => { releaseRuntimeOwner(contentsId); runtimeGenerations.delete(contentsId); mainWindow = null; });
+  window.webContents.once('destroyed', () => { releaseRuntimeOwner(contentsId); });
   window.on('close', (event) => {
     if (allowWindowClose) return;
     event.preventDefault();
     void confirmInvoiceFormClose().then(confirmed => { if (confirmed) void closeHostAndQuit(); });
   });
   window.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => {
-    if (isMainFrame && invoiceFormBinding) invoiceFormBinding.valid = false;
+    if (isMainFrame) {
+      if (invoiceFormBinding) invoiceFormBinding.valid = false;
+      runtimeGenerations.set(window.webContents.id, (runtimeGenerations.get(window.webContents.id) ?? 0) + 1);
+      releaseRuntimeOwner(window.webContents.id);
+      subscriptions.delete(window.webContents.id);
+    }
   });
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
   if (rendererUrl) void window.loadURL(rendererUrl);
@@ -358,10 +399,12 @@ function registerIpc(): void {
   ipcRegistered = true;
   const handle = (channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>) => {
     ipcMain.handle(channel, async (event, ...args) => {
-      if (!isTrustedSender(event)) return fail(appError('ipc_forbidden', 'input', '请求来源不受信任。'));
-      if (desktopClosing) return fail(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
+      const failure = (error: import('@flowmate/contracts').AppError) => channel === channels.queryRuntimeEvents
+        ? { ok: false, error, context: null } : fail(error);
+      if (!isTrustedSender(event)) return failure(appError('ipc_forbidden', 'input', '请求来源不受信任。'));
+      if (desktopClosing) return failure(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
       try { return await handler(event, ...args); }
-      catch { return fail(appError('desktop_operation_failed', 'runtime', '桌面操作失败。', true)); }
+      catch { return failure(appError('desktop_operation_failed', 'runtime', '桌面操作失败。', true)); }
     });
   };
 
@@ -406,6 +449,21 @@ function registerIpc(): void {
   handle(channels.callProvider, async (_event, inputRaw) => callProvider(inputRaw));
   handle(channels.cancelProvider, async (_event, requestIdRaw) => cancelProvider(requestIdRaw));
   handle(channels.queryRun, async (_event, runIdRaw) => queryRun(runIdRaw));
+  handle(channels.queryRuntimeEvents, queryRuntimeEvents);
+  handle(channels.subscribeRuntimeEvents, subscribeRuntimeEvents);
+  handle(channels.unsubscribeRuntimeEvents, unsubscribeRuntimeEvents);
+  handle(channels.listRunToolCalls, async (_event, raw) => {
+    const input = RunToolCallsRequestSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Run tool list request is invalid.'));
+    try { return RuntimeToolPageResultSchema.parse(await host.request({ type: 'list_run_tool_calls', input: input.data })); }
+    catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool list could not be confirmed.', true)); }
+  });
+  handle(channels.queryRunToolCall, async (_event, raw) => {
+    const input = RunToolCallRequestSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Run tool request is invalid.'));
+    try { return RuntimeToolResultSchema.parse(await host.request({ type: 'query_run_tool_call', input: input.data })); }
+    catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool could not be confirmed.', true)); }
+  });
   handle(channels.createSession, async (_event, inputRaw) => createSession(inputRaw));
   handle(channels.queryNativeTools, async () => productHostRequest({ type: 'query_native_tools' }, 'Native tool availability could not be loaded.'));
   handle(channels.chooseWorkingDirectory, async () => {
@@ -507,12 +565,154 @@ function registerIpc(): void {
   handle(channels.subscribe, async (event) => {
     const id = event.sender.id;
     subscriptions.set(id, () => undefined);
+    for (const binding of runtimeBindings.values()) if (binding.owner.contents.id === id) flushRuntimeWake(binding);
     return { ok: true };
   });
   handle(channels.unsubscribe, async (event) => {
     subscriptions.delete(event.sender.id);
+    releaseRuntimeOwner(event.sender.id);
     return { ok: true };
   });
+}
+
+function runtimeOwnerIsCurrent(owner: RuntimeOwner): boolean {
+  return !owner.contents.isDestroyed() && owner.epoch === host.connectionEpoch
+    && owner.generation === (runtimeGenerations.get(owner.contents.id) ?? 0)
+    && owner.contents.mainFrame === owner.frame && owner.frame.url === owner.url && isAllowedPage(owner.url)
+    && runtimeOwners.get(owner.contents.id) === owner;
+}
+
+function runtimeOwner(event: Electron.IpcMainInvokeEvent): RuntimeOwner {
+  const existing = runtimeOwners.get(event.sender.id);
+  if (existing && runtimeOwnerIsCurrent(existing)) return existing;
+  releaseRuntimeOwner(event.sender.id);
+  const owner: RuntimeOwner = { token: randomUUID(), contents: event.sender, frame: event.senderFrame!,
+    url: event.senderFrame!.url, generation: runtimeGenerations.get(event.sender.id) ?? 0, epoch: host.connectionEpoch };
+  runtimeOwners.set(event.sender.id, owner);
+  return owner;
+}
+
+function rememberRuntimeRelease(id: string, token: string): void {
+  runtimeReleased.set(id, token);
+  if (runtimeReleased.size > 4096) runtimeReleased.delete(runtimeReleased.keys().next().value!);
+}
+
+function releaseRuntimeBinding(binding: RuntimeBinding, cleanup = true): void {
+  if (runtimeBindings.get(binding.id) !== binding) return;
+  runtimeBindings.delete(binding.id);
+  binding.pendingWake = null;
+  rememberRuntimeRelease(binding.id, binding.owner.token);
+  if (cleanup) binding.cleanup();
+}
+
+function releaseRuntimeOwner(contentsId: number): void {
+  const owner = runtimeOwners.get(contentsId);
+  if (!owner) return;
+  for (const binding of runtimeBindings.values()) if (binding.owner === owner) releaseRuntimeBinding(binding);
+  runtimeQueries.delete(owner.token);
+  runtimeOwners.delete(contentsId);
+}
+
+function releaseAllRuntimeOwners(): void {
+  for (const id of runtimeOwners.keys()) releaseRuntimeOwner(id);
+}
+
+function flushRuntimeWake(binding: RuntimeBinding): void {
+  if (binding.pendingWake === null || !binding.open || !subscriptions.has(binding.owner.contents.id)) return;
+  if (!runtimeOwnerIsCurrent(binding.owner)) { releaseRuntimeBinding(binding); return; }
+  const event: RuntimeEventsWake = { type: 'runtime_events_available', subscriptionId: binding.id,
+    runId: binding.runId, sequence: binding.pendingWake };
+  binding.pendingWake = null;
+  try { binding.owner.contents.send('flowmate:event', event); }
+  catch { releaseRuntimeBinding(binding); }
+}
+
+function receiveRuntimeWake(raw: unknown): void {
+  const parsed = RuntimeEventsWakeSchema.safeParse(raw);
+  if (!parsed.success) return;
+  const wake = parsed.data, binding = runtimeBindings.get(wake.subscriptionId);
+  if (!binding || wake.runId !== binding.runId) return;
+  if (!runtimeOwnerIsCurrent(binding.owner)) { releaseRuntimeBinding(binding); return; }
+  binding.pendingWake = Math.max(binding.pendingWake ?? 0, wake.sequence);
+  flushRuntimeWake(binding);
+}
+
+async function subscribeRuntimeEvents(event: Electron.IpcMainInvokeEvent, raw: unknown): Promise<Result<RuntimeSubscriptionInfo>> {
+  const input = RuntimeEventsSubscriptionRequestSchema.safeParse(raw);
+  if (!input.success) return fail(appError('input_invalid', 'input', 'Runtime observation request is invalid.'));
+  const owner = runtimeOwner(event);
+  const owned = [...runtimeBindings.values()].filter(binding => binding.owner === owner);
+  if (runtimeBindings.size >= 64 || owned.length >= 8)
+    return fail(appError('event_subscription_limit', 'runtime', 'Runtime observation capacity is full.', false));
+  if (owned.some(binding => binding.runId === input.data.runId && !binding.open))
+    return fail(appError('event_subscription_invalid', 'input', 'An observation is already opening for this Run.', false));
+  // Reserve the ID and its original connection before sending open; early wakes and late cleanup use this identity.
+  const id = randomUUID();
+  const binding: RuntimeBinding = { id, owner, runId: input.data.runId, sessionId: input.data.sessionId, open: false,
+    pendingWake: null, cleanup: host.captureRuntimeSubscriptionCleanup(owner.token, id) };
+  runtimeBindings.set(id, binding);
+  try {
+    const result = RuntimeSubscriptionResultSchema.parse(await host.request({ type: 'subscribe_runtime_events',
+      ownerToken: owner.token, subscriptionId: id, input: input.data }));
+    if (!result.ok) { releaseRuntimeBinding(binding); return result; }
+    if (runtimeBindings.get(id) !== binding || !runtimeOwnerIsCurrent(owner)) {
+      binding.cleanup();
+      return fail(appError('event_subscription_invalid', 'input', 'The observation page or connection changed.', false));
+    }
+    binding.open = true;
+    flushRuntimeWake(binding);
+    if (runtimeBindings.get(id) !== binding)
+      return fail(appError('event_subscription_invalid', 'input', 'The observation could not be delivered.', false));
+    return result;
+  } catch {
+    releaseRuntimeBinding(binding);
+    return fail(appError('host_protocol_invalid', 'runtime', 'Runtime observation could not be confirmed.', true));
+  }
+}
+
+async function queryRuntimeEvents(event: Electron.IpcMainInvokeEvent, raw: unknown): Promise<RuntimeEventsReadResult> {
+  const failure = (code: string, category: import('@flowmate/contracts').AppError['category'], message: string, retryable = false): RuntimeEventsReadResult =>
+    ({ ok: false, error: appError(code, category, message, retryable), context: null });
+  const input = RuntimeEventsQuerySchema.safeParse(raw);
+  if (!input.success) return failure('input_invalid', 'input', 'Runtime event query is invalid.');
+  const owner = runtimeOwner(event);
+  if (input.data.subscriptionId !== undefined) {
+    const binding = runtimeBindings.get(input.data.subscriptionId);
+    if (!binding || binding.owner !== owner || !binding.open || binding.runId !== input.data.runId || binding.sessionId !== input.data.sessionId)
+      return failure('event_subscription_invalid', 'input', 'Runtime observation is not owned by this page.');
+  }
+  if (runtimeQueries.has(owner.token)) return failure('event_query_busy', 'runtime', 'An event query is already in flight.', true);
+  runtimeQueries.add(owner.token);
+  try {
+    const result = RuntimeEventsReadResultSchema.parse(await host.request({ type: 'query_runtime_events', ownerToken: owner.token, input: input.data }));
+    if (!runtimeOwnerIsCurrent(owner)) return failure('event_subscription_invalid', 'input', 'The observation page or connection changed.');
+    if (!result.ok && result.error.code === 'event_subscription_invalid' && input.data.subscriptionId !== undefined) {
+      const binding = runtimeBindings.get(input.data.subscriptionId);
+      if (binding?.owner === owner) releaseRuntimeBinding(binding);
+    }
+    return result;
+  } catch { return failure('host_protocol_invalid', 'runtime', 'Runtime event page could not be confirmed.', true); }
+  finally { runtimeQueries.delete(owner.token); }
+}
+
+async function unsubscribeRuntimeEvents(event: Electron.IpcMainInvokeEvent, raw: unknown): Promise<Result<void>> {
+  const parsed = RuntimeSubscriptionIdSchema.safeParse(raw);
+  if (!parsed.success) return fail(appError('input_invalid', 'input', 'Runtime observation ID is invalid.'));
+  const id = parsed.data, owner = runtimeOwner(event), binding = runtimeBindings.get(id);
+  const previousOwner = binding?.owner.token ?? runtimeReleased.get(id);
+  if (previousOwner !== undefined && previousOwner !== owner.token)
+    return fail(appError('event_subscription_invalid', 'input', 'Runtime observation is owned by another page.', false));
+  if (!binding && previousOwner === owner.token) return ok(undefined);
+  if (binding) releaseRuntimeBinding(binding, false);
+  try {
+    const result = RuntimeSubscriptionReleaseResultSchema.parse(await host.request({ type: 'unsubscribe_runtime_events', ownerToken: owner.token, subscriptionId: id }));
+    if (result.ok) rememberRuntimeRelease(id, owner.token);
+    else binding?.cleanup();
+    return result;
+  } catch {
+    binding?.cleanup();
+    return fail(appError('host_protocol_invalid', 'runtime', 'Runtime observation release could not be confirmed.', true));
+  }
 }
 
 async function readDesktopState(): Promise<Result<DesktopState>> {

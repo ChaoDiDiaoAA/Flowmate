@@ -1,25 +1,42 @@
 import { z } from 'zod';
 
+// 发票契约的固定业务边界；Schema 与跨层读写共同使用，不是 Run 配置。
+export const MAX_INVOICE_PAGES = 20;
+export const MAX_INVOICE_BLOCKS_PER_PAGE = 2_000;
+export const MAX_INVOICE_VERSION_CHARS = 512;
+export const MAX_INVOICE_FIELD_CHARS = 1_024;
+export const MAX_INVOICE_LINES = 200;
+export const MAX_INVOICE_NOTES = 20;
+export const MAX_INVOICE_NOTE_CHARS = 1_024;
+export const MAX_INVOICE_CHECKS = 1_000;
+export const MAX_INVOICE_ISSUES = 1_000;
+export const MAX_INVOICE_TOOL_PAGE_SIZE = 50;
+export const MAX_INVOICE_QUOTE_CHARS = 1_024;
+export const MAX_INVOICE_SEARCH_EXCERPT_CHARS = 512;
+export const MAX_INVOICE_TABLE_PREVIEW_CHARS = 256;
+// JSON 序列化后的差异值边界，与候选原字段字符上限分别计量。
+export const MAX_INVOICE_DIFF_VALUE_CHARS = 1_024;
+
 const idSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const pageSchema = z.number().int().min(1).max(20);
+const pageSchema = z.number().int().min(1).max(MAX_INVOICE_PAGES);
 const pageOrNullSchema = pageSchema.nullable();
-const limitSchema = z.number().int().min(1).max(50);
+const limitSchema = z.number().int().min(1).max(MAX_INVOICE_TOOL_PAGE_SIZE);
 const blockIdSchema = z.string().regex(/^b[1-9]\d{0,3}$/);
 const decimalTextSchema = z.string().regex(/^-?(0|[1-9][0-9]{0,17})(\.[0-9]{1,6})?$/);
 
 export const DocumentRefSchema = z.object({
   id: idSchema,
-  version: z.string().min(1).max(512),
+  version: z.string().min(1).max(MAX_INVOICE_VERSION_CHARS),
 }).strict();
 export type DocumentRef = z.infer<typeof DocumentRefSchema>;
 
 export const SourceRefSchema = z.object({
   documentId: idSchema,
-  version: z.string().min(1).max(512),
+  version: z.string().min(1).max(MAX_INVOICE_VERSION_CHARS),
   artifactId: idSchema,
   page: pageSchema,
   blockId: blockIdSchema.nullable(),
-  quote: z.string().min(1).max(1024).nullable(),
+  quote: z.string().min(1).max(MAX_INVOICE_QUOTE_CHARS).nullable(),
 }).strict();
 export type SourceRef = z.infer<typeof SourceRefSchema>;
 
@@ -27,7 +44,7 @@ export const ParsedBlockSchema = z.object({
   id: blockIdSchema,
   kind: z.enum(['text', 'table', 'image']),
   text: z.string().max(65_536),
-  sourceIndex: z.number().int().min(0).max(1_999),
+  sourceIndex: z.number().int().min(0).max(MAX_INVOICE_BLOCKS_PER_PAGE - 1),
   sourceType: z.string().min(1).max(128),
   bbox: z.tuple([
     z.number().finite(), z.number().finite(), z.number().finite(), z.number().finite(),
@@ -39,10 +56,10 @@ export const ValueStateSchema = z.enum(['present', 'missing', 'ambiguous', 'unre
 export type ValueState = z.infer<typeof ValueStateSchema>;
 
 export const InvoiceFieldSchema = z.object({
-  raw: z.string().max(1024).nullable(),
-  normalized: z.string().max(1024).nullable(),
+  raw: z.string().max(MAX_INVOICE_FIELD_CHARS).nullable(),
+  normalized: z.string().max(MAX_INVOICE_FIELD_CHARS).nullable(),
   state: ValueStateSchema,
-  alternatives: z.array(z.string().max(1024)).max(5),
+  alternatives: z.array(z.string().max(MAX_INVOICE_FIELD_CHARS)).max(5),
   sources: z.array(SourceRefSchema).max(8),
 }).strict();
 export type InvoiceField = z.infer<typeof InvoiceFieldSchema>;
@@ -71,8 +88,8 @@ export const CandidateDraftSchema = z.object({
     taxAmount: InvoiceFieldSchema,
     totalAmount: InvoiceFieldSchema,
   }).strict(),
-  lines: z.array(invoiceLineSchema).max(200),
-  notes: z.array(z.string().max(1024)).max(20),
+  lines: z.array(invoiceLineSchema).max(MAX_INVOICE_LINES),
+  notes: z.array(z.string().max(MAX_INVOICE_NOTE_CHARS)).max(MAX_INVOICE_NOTES),
 }).strict();
 export type CandidateDraft = z.infer<typeof CandidateDraftSchema>;
 // Model write inputs stay strict; provenance is accepted only by stored read projections.
@@ -103,7 +120,7 @@ export const StoredCandidateDraftSchema = CandidateDraftSchema.extend({
     taxRate: StoredInvoiceFieldSchema,
     taxAmount: StoredInvoiceFieldSchema,
     totalAmount: StoredInvoiceFieldSchema,
-  }).strict()).max(200),
+  }).strict()).max(MAX_INVOICE_LINES),
 }).strict();
 export type StoredCandidateDraft = z.infer<typeof StoredCandidateDraftSchema>;
 
@@ -112,14 +129,15 @@ export const invoiceHeaderFields = ['invoiceNumber', 'issueDate', 'sellerName', 
   'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount'] as const;
 export const invoiceLineFields = ['description', 'quantity', 'unit', 'unitPrice', 'netAmount', 'taxRate',
   'taxAmount', 'totalAmount'] as const;
-const formHeaderShape = Object.fromEntries(invoiceHeaderFields.map(name => [name, z.string().max(1024)])) as {
+const formHeaderShape = Object.fromEntries(invoiceHeaderFields.map(name => [name, z.string().max(MAX_INVOICE_FIELD_CHARS)])) as {
   [Name in typeof invoiceHeaderFields[number]]: z.ZodString;
 };
-const formLineShape = Object.fromEntries(invoiceLineFields.map(name => [name, z.string().max(1024)])) as {
+const formLineShape = Object.fromEntries(invoiceLineFields.map(name => [name, z.string().max(MAX_INVOICE_FIELD_CHARS)])) as {
   [Name in typeof invoiceLineFields[number]]: z.ZodString;
 };
 export const InvoiceFormDraftSchema = z.object({ fields: z.object(formHeaderShape).strict(),
-  lines: z.array(z.object(formLineShape).strict()).max(200), notes: z.array(z.string().max(1024)).max(20) }).strict();
+  lines: z.array(z.object(formLineShape).strict()).max(MAX_INVOICE_LINES),
+  notes: z.array(z.string().max(MAX_INVOICE_NOTE_CHARS)).max(MAX_INVOICE_NOTES) }).strict();
 export type InvoiceFormDraft = z.infer<typeof InvoiceFormDraftSchema>;
 
 export function isLegalInvoiceNormalizedValue(name: string, value: string): boolean {
@@ -169,18 +187,18 @@ export const InvoiceCandidateOperationQuerySchema = z.discriminatedUnion('kind',
 ]);
 export type InvoiceCandidateOperationQuery = z.infer<typeof InvoiceCandidateOperationQuerySchema>;
 export type InvoiceCandidateOperationResult = SaveInvoiceCandidateResponse | InvoiceCandidateDecisionResponse | InvoiceExportReference | null;
-const maxCandidateFieldPaths = 10 + 8 * 200;
+const maxCandidateFieldPaths = invoiceHeaderFields.length + invoiceLineFields.length * MAX_INVOICE_LINES;
 
 export const CheckResultSchema = z.object({
   rule: z.string().min(1).max(128),
   version: z.literal('1'),
   status: z.enum(['passed', 'failed', 'not_evaluable', 'not_applicable']),
   fieldPaths: z.array(z.string().max(256)).max(maxCandidateFieldPaths),
-  actual: z.string().max(1024).nullable(),
-  expected: z.string().max(1024).nullable(),
-  difference: z.string().max(1024).nullable(),
-  tolerance: z.string().max(1024).nullable(),
-  reason: z.string().max(1024).nullable(),
+  actual: z.string().max(1_024).nullable(),
+  expected: z.string().max(1_024).nullable(),
+  difference: z.string().max(1_024).nullable(),
+  tolerance: z.string().max(1_024).nullable(),
+  reason: z.string().max(1_024).nullable(),
 }).strict();
 export type CheckResult = z.infer<typeof CheckResultSchema>;
 
@@ -189,7 +207,7 @@ export const InvoiceIssueSchema = z.object({
   severity: z.enum(['warning', 'error']),
   origin: z.enum(['rule', 'model']),
   fieldPaths: z.array(z.string().max(256)).max(maxCandidateFieldPaths),
-  message: z.string().min(1).max(1024),
+  message: z.string().min(1).max(1_024),
   rule: z.string().max(128).nullable(),
 }).strict();
 export type InvoiceIssue = z.infer<typeof InvoiceIssueSchema>;
@@ -199,7 +217,7 @@ export const CandidateReceiptSchema = z.object({
   jobId: idSchema,
   sequence: idSchema,
   issueCount: z.number().int().min(0).max(20_000),
-  checks: z.array(CheckResultSchema).max(1_000),
+  checks: z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS),
 }).strict();
 export type CandidateReceipt = z.infer<typeof CandidateReceiptSchema>;
 
@@ -251,20 +269,20 @@ const pageRequestInput = {
 const pageIndexSchema = z.object({
   documentRef: DocumentRefSchema,
   parsedArtifactId: idSchema,
-  pageCount: z.number().int().min(1).max(20),
+  pageCount: z.number().int().min(1).max(MAX_INVOICE_PAGES),
   pages: z.array(z.object({
     page: pageSchema,
-    blockCount: z.number().int().min(0).max(2_000),
-    tableCount: z.number().int().min(0).max(2_000),
-  }).strict()).max(20),
+    blockCount: z.number().int().min(0).max(MAX_INVOICE_BLOCKS_PER_PAGE),
+    tableCount: z.number().int().min(0).max(MAX_INVOICE_BLOCKS_PER_PAGE),
+  }).strict()).max(MAX_INVOICE_PAGES),
 }).strict();
 
 const documentPageSchema = z.object({
   documentRef: DocumentRefSchema,
   parsedArtifactId: idSchema,
   page: pageSchema,
-  pageCount: z.number().int().min(1).max(20),
-  blocks: z.array(ParsedBlockSchema.extend({ source: SourceRefSchema }).strict()).max(50),
+  pageCount: z.number().int().min(1).max(MAX_INVOICE_PAGES),
+  blocks: z.array(ParsedBlockSchema.extend({ source: SourceRefSchema }).strict()).max(MAX_INVOICE_TOOL_PAGE_SIZE),
   nextAfterBlockId: blockIdSchema.nullable(),
   completePage: z.boolean(),
 }).strict();
@@ -277,9 +295,9 @@ const searchPageSchema = z.object({
     page: pageSchema,
     blockId: blockIdSchema,
     kind: z.enum(['text', 'table', 'image']),
-    excerpt: z.string().min(1).max(512),
+    excerpt: z.string().min(1).max(MAX_INVOICE_SEARCH_EXCERPT_CHARS),
     source: SourceRefSchema,
-  }).strict()).max(50),
+  }).strict()).max(MAX_INVOICE_TOOL_PAGE_SIZE),
   nextAfterBlockId: blockIdSchema.nullable(),
   complete: z.boolean(),
 }).strict();
@@ -292,9 +310,9 @@ const tableIndexSchema = z.object({
     blockId: blockIdSchema,
     sourceType: z.string().min(1).max(128),
     textLength: z.number().int().min(0).max(65_536),
-    preview: z.string().max(256),
+    preview: z.string().max(MAX_INVOICE_TABLE_PREVIEW_CHARS),
     source: SourceRefSchema,
-  }).strict()).max(50),
+  }).strict()).max(MAX_INVOICE_TOOL_PAGE_SIZE),
   nextAfterBlockId: blockIdSchema.nullable(),
   complete: z.boolean(),
 }).strict();
@@ -320,7 +338,7 @@ const normalizedValuesSchema = z.object({
   items: z.array(z.object({
     index: z.number().int().min(0).max(49),
     kind: z.enum(['decimal', 'date', 'currency']),
-    raw: z.string().min(1).max(1024),
+    raw: z.string().min(1).max(1_024),
     status: z.enum(['normalized', 'ambiguous', 'unsupported']),
     value: z.string().max(128).nullable(),
     alternatives: z.array(z.string().max(128)).max(2),
@@ -349,8 +367,8 @@ const candidateValidationSchema = z.object({
     code: z.string().min(1).max(128),
     fieldPaths: z.array(z.string().max(256)).max(maxCandidateFieldPaths),
   }).strict()).max(1_000),
-  checks: z.array(CheckResultSchema).max(1_000),
-  issues: z.array(InvoiceIssueSchema).max(1_000),
+  checks: z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS),
+  issues: z.array(InvoiceIssueSchema).max(MAX_INVOICE_ISSUES),
 }).strict();
 
 const candidateSummarySchema = z.object({
@@ -371,7 +389,7 @@ function validCandidateOrigin(candidate: z.infer<typeof candidateSummarySchema>)
 
 const candidateIndexSchema = z.object({
   jobId: idSchema,
-  candidates: z.array(candidateSummarySchema.refine(validCandidateOrigin, 'Invalid candidate provenance.')).max(50),
+  candidates: z.array(candidateSummarySchema.refine(validCandidateOrigin, 'Invalid candidate provenance.')).max(MAX_INVOICE_TOOL_PAGE_SIZE),
   nextBeforeSequence: idSchema.nullable(),
 }).strict();
 
@@ -381,8 +399,8 @@ const candidateDetailSchema = z.object({
   documentRef: DocumentRefSchema,
   toolCallId: idSchema.nullable(),
   candidate: StoredCandidateDraftSchema,
-  checks: z.array(CheckResultSchema).max(1_000),
-  issues: z.array(InvoiceIssueSchema).max(1_000),
+  checks: z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS),
+  issues: z.array(InvoiceIssueSchema).max(MAX_INVOICE_ISSUES),
 }).strict().refine((candidate) => validCandidateOrigin(candidate)
   && (candidate.origin === 'human_edit'
     ? candidate.toolCallId === null
@@ -396,9 +414,9 @@ const candidateDiffPageSchema = z.object({
   differences: z.array(z.object({
     path: z.string().min(1).max(512),
     kind: z.enum(['added', 'removed', 'changed']),
-    left: z.string().max(1024).nullable(),
-    right: z.string().max(1024).nullable(),
-  }).strict()).max(50),
+    left: z.string().max(MAX_INVOICE_DIFF_VALUE_CHARS).nullable(),
+    right: z.string().max(MAX_INVOICE_DIFF_VALUE_CHARS).nullable(),
+  }).strict()).max(MAX_INVOICE_TOOL_PAGE_SIZE),
   nextAfterPath: z.string().min(1).max(512).nullable(),
   complete: z.boolean(),
 }).strict();
@@ -459,7 +477,7 @@ export const invoiceToolSchemas = {
   normalize_invoice_values: {
     input: z.object({
       items: z.array(z.object({
-        kind: z.enum(['decimal', 'date', 'currency']), raw: z.string().min(1).max(1024),
+        kind: z.enum(['decimal', 'date', 'currency']), raw: z.string().min(1).max(1_024),
       }).strict()).min(1).max(50),
     }).strict(),
     output: normalizedValuesSchema,

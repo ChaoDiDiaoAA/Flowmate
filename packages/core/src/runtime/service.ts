@@ -1,4 +1,4 @@
-import { appError, fail, ok, RuntimeRequestOverridesSchema, normalizeSessionInputRequest, formatExecutionPrompt, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
+import { appError, fail, ok, RuntimeRequestOverridesSchema, normalizeSessionInputRequest, formatExecutionPrompt, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES, RUNTIME_CONFIG } from '@flowmate/contracts';
 import { join } from 'node:path';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import type {
@@ -137,9 +137,9 @@ const agentPolicy: Omit<AgentConfigFacts, 'nativeSessionId'> = {
   thinkingLevel: 'off',
   resourcePolicy: 'none',
   historyPolicy: 'memory-only',
-  maxContextBytes: 524_288,
-  maxOutputBytes: 262_144,
-  maxAssistantContentBytes: 524_288,
+  maxContextBytes: RUNTIME_CONFIG.llmPayload.maxChatContextBytes,
+  maxOutputBytes: RUNTIME_CONFIG.llmPayload.maxOutputTextBytes,
+  maxAssistantContentBytes: RUNTIME_CONFIG.llmPayload.maxAssistantContentBytes,
   maxModelCalls: 1,
   sessionRetry: false,
 };
@@ -148,8 +148,8 @@ const p3AgentPolicy: Omit<P3AgentConfigFacts, 'nativeSessionId'> = {
   policyVersion: 'p3-invoice-tools-v1',
   systemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT,
   thinkingLevel: 'off', resourcePolicy: 'none', historyPolicy: 'memory-only',
-  maxContextBytes: 8_388_608, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288,
-  maxModelCalls: 16, maxToolCalls: 24, toolTimeoutMs: 10_000, sessionRetry: false,
+  maxContextBytes: RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes, maxOutputBytes: RUNTIME_CONFIG.llmPayload.maxOutputTextBytes, maxAssistantContentBytes: RUNTIME_CONFIG.llmPayload.maxAssistantContentBytes,
+  maxModelCalls: RUNTIME_CONFIG.runBudget.maxModelCalls.workspace, maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs, sessionRetry: false,
 };
 
 function initialAgentSnapshot(request: FrozenAgentRunRequest, nativeSessionId: string): SafeConfigSnapshot & { agent: RuntimeAgentConfigFacts } {
@@ -354,7 +354,7 @@ export class RuntimeService {
       return fail(appError('session_history_invalid', 'session', 'Input Session is unavailable.', false, active.runId));
     if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', 'Input material access was revoked.', false, active.runId));
     if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'Saved history is unusable.', false, active.runId));
-    return ok(undefined);
+    return this.dependencies.runs.verifyInputUse(stored.data.content);
   }
 
   private qualifyInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Result<boolean> {
@@ -447,9 +447,11 @@ export class RuntimeService {
       return fail(appError('input_invalid', 'input', 'A text-only Run cannot receive tool permission.'));
     const request: FrozenAgentRunRequest = { ...rawRequest,
       goalMode: rawRequest.goalMode ?? 'answer',
-      timeoutMs: rawRequest.timeoutMs ?? defaults.data.timeoutMs ?? (rawRequest.goalMode === 'save-candidate' ? 120_000 : 60_000),
-      stopGraceMs: rawRequest.stopGraceMs ?? defaults.data.stopGraceMs ?? 5000,
-      budget: Object.freeze({ maxToolCalls: 24, maxModelCalls: rawRequest.workspace ? 16 : 12, toolTimeoutMs: 10_000,
+      timeoutMs: rawRequest.timeoutMs ?? defaults.data.timeoutMs ?? (rawRequest.goalMode === 'save-candidate' ? RUNTIME_CONFIG.request.saveCandidateTimeoutMs : RUNTIME_CONFIG.request.timeoutMs),
+      stopGraceMs: rawRequest.stopGraceMs ?? defaults.data.stopGraceMs ?? RUNTIME_CONFIG.request.stopGraceMs,
+      budget: Object.freeze({ maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, maxModelCalls: rawRequest.workspace
+          ? RUNTIME_CONFIG.runBudget.maxModelCalls.workspace : RUNTIME_CONFIG.runBudget.maxModelCalls.chat,
+        toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs,
         ...defaults.data.budget, ...rawRequest.budget, ...(!rawRequest.workspace ? { maxToolCalls: 0 } : {}) }) };
     const { agent, sessions } = this.dependencies;
     if (!agent || !sessions) return fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'));
@@ -982,12 +984,13 @@ export class RuntimeService {
     let unresolvedDispatched: number[] = [];
     if (context.inputId !== undefined) {
       const inputs = this.dependencies.sessionInputs!.forRun(active.runId);
-      if (!inputs.ok) finalError ??= { ...inputs.error, runId: active.runId };
-      else if (inputs.data.some(input => input.processingStatus === 'failed')) {
-        finalError ??= inputs.data.find(input => input.processingStatus === 'failed')!.error
-          ?? appError('input_processing_unconfirmed', 'runtime', 'An input failed processing.', true, active.runId);
+      if (!inputs.ok) {
+        finalError ??= { ...inputs.error, runId: active.runId };
+        inputUnconfirmed = true;
       }
-      else if (!inputs.data.length || inputs.data.some(input => input.status !== 'consumed')) {
+      else {
+        if (inputs.data.some(input => input.processingStatus === 'failed')) finalError ??= inputs.data.find(input => input.processingStatus === 'failed')!.error
+          ?? appError('input_processing_unconfirmed', 'runtime', 'An input failed processing.', true, active.runId);
         unresolvedDispatched = inputs.data.filter(input => input.status !== 'consumed' && input.dispatchedAt !== null).map(input => input.inputId);
       }
     }
@@ -1045,7 +1048,10 @@ export class RuntimeService {
     const inputResults: import('../sessions/input-ledger.ts').InputResultBatch[] = [];
     if (!finalError && context.inputId !== undefined) {
       const inputs = this.dependencies.sessionInputs!.forRun(active.runId);
-      if (!inputs.ok) finalError = inputs.error;
+      if (!inputs.ok) {
+        finalError = { ...inputs.error, runId: active.runId };
+        inputUnconfirmed = true;
+      }
       else {
         const pending = inputs.data.filter(input => input.processingStatus === 'pending' && input.status === 'consumed');
         for (const input of pending) if (input.resultEntryId === null) {

@@ -1,7 +1,8 @@
-import { invoiceToolSchemas } from '@flowmate/contracts';
+import { invoiceToolSchemas, MAX_INVOICE_DIFF_VALUE_CHARS } from '@flowmate/contracts';
 import type { CandidateRepository, InvoiceToolOutput, InvoiceToolInput, ToolDefinition } from '@flowmate/contracts';
 import { appError } from '@flowmate/contracts';
 import { unwrap } from './definition.ts';
+import { MAX_RESULT_BYTES } from './source.ts';
 
 function compareCodePoints(left: string, right: string): number {
   const a = Array.from(left, (value) => value.codePointAt(0)!);
@@ -31,7 +32,8 @@ function compareDrafts(left: unknown, right: unknown): InvoiceToolOutput<'compar
     const leftValue = leftLeaves.get(path);
     const rightValue = rightLeaves.get(path);
     if (leftValue === rightValue) continue;
-    if (leftValue !== undefined && leftValue.length > 1024 || rightValue !== undefined && rightValue.length > 1024) {
+    if (leftValue !== undefined && leftValue.length > MAX_INVOICE_DIFF_VALUE_CHARS
+      || rightValue !== undefined && rightValue.length > MAX_INVOICE_DIFF_VALUE_CHARS) {
       throw new RangeError('candidate_diff_value_too_large');
     }
     differences.push({ path, kind: leftValue === undefined ? 'added' : rightValue === undefined ? 'removed' : 'changed',
@@ -60,9 +62,10 @@ export const compareInvoiceCandidates = (candidates: CandidateRepository) => ({
     if (input.afterPath !== null && cursorIndex < 0) throw appError('tool_invalid_input', 'tool', 'The difference cursor does not belong to this comparison.');
     const selected: typeof differences = [];
     for (const difference of differences.slice(cursorIndex + 1, cursorIndex + 1 + input.limit)) {
+      const complete = cursorIndex + 2 + selected.length >= differences.length;
       const response = { jobId: left.jobId, leftCandidateId: input.leftCandidateId, rightCandidateId: input.rightCandidateId,
-        differences: [...selected, difference], nextAfterPath: null, complete: false };
-      if (Buffer.byteLength(JSON.stringify(response), 'utf8') > 128 * 1024) {
+        differences: [...selected, difference], nextAfterPath: complete ? null : difference.path, complete };
+      if (Buffer.byteLength(JSON.stringify(response), 'utf8') > MAX_RESULT_BYTES) {
         if (selected.length === 0) throw appError('tool_result_too_large', 'runtime', 'Candidate differences exceed the result size limit.');
         break;
       }

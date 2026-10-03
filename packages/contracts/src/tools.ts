@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import type { AppError, DbId } from './runtime.ts';
 
+// 工具身份的固定契约长度，供装配、记录与 Schema 共用。
+export const MAX_TOOL_NAME_CHARS = 128;
+export const MAX_TOOL_VERSION_CHARS = 32;
+
 export const ToolEffectSchema = z.enum(['PURE', 'READ', 'LOCAL_WRITE']);
 export type ToolEffect = z.infer<typeof ToolEffectSchema>;
 
@@ -8,17 +12,17 @@ export const ToolExecutionModeSchema = z.enum(['sequential', 'parallel']);
 export type ToolExecutionMode = z.infer<typeof ToolExecutionModeSchema>;
 
 export const ToolIdentitySchema = z.object({
-  name: z.string().min(1).max(128),
-  version: z.string().min(1).max(32),
+  name: z.string().min(1).max(MAX_TOOL_NAME_CHARS),
+  version: z.string().min(1).max(MAX_TOOL_VERSION_CHARS),
   effect: ToolEffectSchema,
   executionMode: ToolExecutionModeSchema,
 }).strict();
 
 const scopeShape = {
-  allowedTools: z.array(z.string().min(1).max(128)).max(64),
+  allowedTools: z.array(z.string().min(1).max(MAX_TOOL_NAME_CHARS)).max(64),
   allowedDocumentIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(64),
   allowedArtifactIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(128),
-  allowedResourcePaths: z.array(z.string().min(1).max(4096)).max(64),
+  allowedResourcePaths: z.array(z.string().min(1).max(4_096)).max(64),
 };
 export const RunScopeSchema = z.object({ version: z.literal(2), ...scopeShape }).strict();
 

@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type ReactNode } from 'react';
-import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema } from '../../../../packages/contracts/src/invoice.ts';
+import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema,
+  MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS } from '../../../../packages/contracts/src/invoice.ts';
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
-import { RuntimeRequestOverridesSchema } from '../../../../packages/contracts/src/runtime.ts';
+import { RuntimeBudgetOverridesSchema, RuntimeRequestOverridesSchema } from '../../../../packages/contracts/src/runtime.ts';
+import { RUNTIME_CONFIG } from '../../../../packages/contracts/src/runtime-config.ts';
 import type { RuntimeRequestOverrides } from '@flowmate/contracts';
 import { WorkspaceContextSchema } from '../../../../packages/contracts/src/workspace.ts';
 import type { DesktopInvoiceFormRunRequest, DesktopSessionInputRequest, InvoiceCandidateOperationQuery, InvoiceFormApplicationReceipt, InvoiceFormDraft, SaveInvoiceCandidateResponse, SessionInputSnapshot } from '@flowmate/contracts';
@@ -9,20 +11,28 @@ import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoi
   invoiceHeaderFields, invoiceLineFields, queryInvoiceFormApplication, type InvoiceFormState } from './invoice-form.ts';
 import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, NativeToolAvailability, ProductSettings, RunSnapshot, RuntimeState, SessionCursor, SessionMessageView, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
 import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type MessageViewState } from './message-state.ts';
+import { ActivityPage } from './activity.tsx';
+import { createEventView, bindEventSubscription, applyEventWake, applyEventRead, eventReadRequest,
+  selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
+import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'tasks' | 'chats' | 'models' | 'settings';
+type Page = 'workspace' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings';
 const pageLabels: Record<Page, string> = {
   workspace: 'Invoices', tasks: 'Processing History', chats: 'Chats',
-  models: 'Models', settings: 'Settings',
+  activity: 'Activity', models: 'Models', settings: 'Settings',
 };
+type EventObservation = { view: EventViewState; wanted: boolean; opening: boolean; through?: number;
+  pendingWake: RuntimeEventsWake | null; snapshot: RunSnapshot | null; tools: readonly RuntimeToolView[];
+  nextToolId: number | null; toolsExpanded: boolean; toolsLoading: boolean;
+  snapshotError: boolean; toolsError: boolean; toolsVerified: boolean };
 type Notice = { tone: 'good' | 'bad' | 'info'; message: string } | null;
 type ProfileDraft = { displayName: string; theme: 'system' | 'light' | 'dark' };
 const runtimeLimitFields = [
-  { key: 'maxModelCalls', label: 'model requests', min: 1, max: 64 },
-  { key: 'maxToolCalls', label: 'tool calls', min: 0, max: 100 },
-  { key: 'toolTimeoutMs', label: 'tool timeout (ms)', min: 100, max: 1_800_000 },
-  { key: 'timeoutMs', label: 'Run timeout (ms)', min: 100, max: 1_800_000 },
-  { key: 'stopGraceMs', label: 'stop wait (ms)', min: 100, max: 10_000 },
+  { key: 'maxModelCalls', label: 'model requests', ...RUNTIME_CONFIG.ranges.maxModelCalls },
+  { key: 'maxToolCalls', label: 'tool calls', ...RUNTIME_CONFIG.ranges.maxToolCalls },
+  { key: 'toolTimeoutMs', label: 'tool timeout (ms)', ...RUNTIME_CONFIG.ranges.toolTimeoutMs },
+  { key: 'timeoutMs', label: 'Run timeout (ms)', ...RUNTIME_CONFIG.ranges.timeoutMs },
+  { key: 'stopGraceMs', label: 'stop wait (ms)', ...RUNTIME_CONFIG.ranges.stopGraceMs },
 ] as const;
 type RuntimeLimitDraft = Record<(typeof runtimeLimitFields)[number]['key'], string>;
 function runtimeLimitsDraft(value: RuntimeRequestOverrides): RuntimeLimitDraft {
@@ -54,7 +64,7 @@ type ChatTurn = {
   clientSequence?: number;
   inputId?: number;
 };
-type RunFeedback = { runId: number; status: 'completed' | 'failed' | 'cancelled'; error: string | null };
+type RunFeedback = { runId: number; status: 'completed' | 'failed' | 'cancelled'; error: string | null; limits?: string };
 
 function emptyMessageState(sessionId: number): MessageViewState {
   return { sessionId, byEntryId: new Map(), liveByRun: new Map(), lastSequenceByMessage: new Map(),
@@ -154,6 +164,9 @@ export function App() {
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null);
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]);
   const [historicalDocuments, setHistoricalDocuments] = useState<Record<number, DocumentSnapshot>>({});
+  const [historicalInvoice, setHistoricalInvoice] = useState<DocumentSnapshot | null>(null);
+  const [historicalInvoiceView, setHistoricalInvoiceView] = useState<'original' | 'parsed' | 'candidate'>('original');
+  const [historicalJobs, setHistoricalJobs] = useState<Record<number, JobSnapshot>>({});
   const [jobs, setJobs] = useState<JobSnapshot[]>([]);
   const [historyJobId, setHistoryJobId] = useState<number | null>(null);
   const [hidingDocumentId, setHidingDocumentId] = useState<number | null>(null);
@@ -192,6 +205,29 @@ export function App() {
   const [cancelPending, setCancelPending] = useState(false);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
+  const [activityTarget, setActivityTarget] = useState<{ runId: number; sessionId: number | null } | null>(null);
+  const [activityView, setActivityView] = useState<EventViewState | null>(null);
+  const [activitySnapshot, setActivitySnapshot] = useState<RunSnapshot | null>(null);
+  const [activityTools, setActivityTools] = useState<readonly RuntimeToolView[]>([]);
+  const [activityToolCursor, setActivityToolCursor] = useState<number | null>(null);
+  const [activityToolsLoading, setActivityToolsLoading] = useState(false);
+  const [activitySnapshotError, setActivitySnapshotError] = useState(false);
+  const [activityToolsError, setActivityToolsError] = useState(false);
+  const [activityToolsVerified, setActivityToolsVerified] = useState(false);
+  const activityTargetRef = useRef<typeof activityTarget>(null);
+  const activityVisibleRef = useRef(false);
+  const activityFocusedRef = useRef(!document.hidden && document.hasFocus());
+  const eventObservations = useRef(new Map<number, EventObservation>());
+  const eventReadQueue = useRef<string[]>([]);
+  const eventReadBusy = useRef(false);
+  const runtimeReadsInFlight = useRef(0);
+  const eventReadTimer = useRef<number | null>(null);
+  const eventViewGeneration = useRef(0);
+  const eventCoordinatorAlive = useRef(true);
+  const observedActiveRef = useRef<RuntimeState['active']>(null);
+  const taskDetailsGeneration = useRef(0);
+  const documentReadGeneration = useRef(0);
+  const historyJobIdRef = useRef<number | null>(null);
   useEffect(() => {
     let active = true;
     void window.flowmate.listModelCatalog().then((result) => {
@@ -217,7 +253,7 @@ export function App() {
   const messageStates = useRef(new Map<number, MessageViewState>());
   const messageCursors = useRef(new Map<number, string | null>());
   const inputPages = useRef(new Map<number, { items: SessionInputSnapshot[]; cursor: number | null }>());
-  const unknownInputs = useRef(new Map<number, DesktopSessionInputRequest>());
+  const unknownInputs = useRef(new Map<number, DesktopSessionInputRequest & { submittedDraft?: string }>());
   const inputSubmittingRef = useRef(false);
   const historyPositions = useRef(new Map<number, { leafId: string | null; entryCount: number }>());
   const nativeSessionIds = useRef(new Map<number, string>());
@@ -247,6 +283,221 @@ export function App() {
   const formLastCall = useRef<{ runId: number; toolCallId: number } | null>(null);
   const formLeaveResolve = useRef<((leave: boolean) => void) | null>(null);
   const candidateQuerySequence = useRef(0);
+
+  function publishEventObservation(observation: EventObservation) {
+    if (!eventCoordinatorAlive.current || activityTargetRef.current?.runId !== observation.view.runId) return;
+    setActivityView(observation.view); setActivitySnapshot(observation.snapshot); setActivityTools(observation.tools);
+    setActivityToolCursor(observation.nextToolId); setActivityToolsLoading(observation.toolsLoading);
+    setActivitySnapshotError(observation.snapshotError); setActivityToolsError(observation.toolsError);
+    setActivityToolsVerified(observation.toolsVerified);
+  }
+  function queueEventRead(observation: EventObservation) {
+    const id = observation.view.subscriptionId;
+    if (!id || !observation.wanted || !hostReadyRef.current || !eventCoordinatorAlive.current) return;
+    eventReadQueue.current = enqueueEventRead(eventReadQueue.current, id);
+    void drainEventReads();
+  }
+  async function drainEventReads() {
+    if (eventReadBusy.current) return;
+    eventReadBusy.current = true;
+    try {
+      await drainEventReadQueue(() => eventReadQueue.current.shift(),
+        () => eventCoordinatorAlive.current && hostReadyRef.current, async id => {
+        const observation = [...eventObservations.current.values()].find(item => item.view.subscriptionId === id && item.wanted);
+        if (!observation) return;
+        const generation = observation.view.generation;
+        const request = eventReadRequest(observation.view, observation.through);
+        try {
+          const [result, snapshot, tools] = await Promise.all([
+            window.flowmate.queryRuntimeEvents(request), window.flowmate.queryRun(request.runId),
+            window.flowmate.listRunToolCalls({ runId: request.runId, sessionId: request.sessionId, limit: 50 }),
+          ]);
+          if (!observation.wanted || generation !== observation.view.generation || observation.view.subscriptionId !== id) return;
+          observation.view = applyEventRead(observation.view, result, request, generation);
+          observation.snapshotError = !snapshot.ok || snapshot.data.runId !== request.runId || snapshot.data.sessionId !== request.sessionId;
+          if (snapshot.ok && !observation.snapshotError) observation.snapshot = snapshot.data;
+          observation.toolsError = !tools.ok;
+          if (tools.ok) {
+            observation.toolsVerified = true;
+            const byId = new Map(observation.tools.map(tool => [tool.toolCallId, tool]));
+            for (const tool of tools.data.items) byId.set(tool.toolCallId, tool);
+            observation.tools = [...byId.values()].sort((a, b) => b.toolCallId - a.toolCallId);
+            if (!observation.toolsExpanded) observation.nextToolId = tools.data.nextBeforeId;
+          }
+          publishEventObservation(observation);
+          if (!result.ok && result.error.code === 'event_subscription_invalid') {
+            observation.view = { ...observation.view, subscriptionId: null };
+            observation.through = undefined;
+            void openEventObservation(observation);
+          } else if (result.ok && !observation.view.error) {
+            const completedHandoff = observation.through !== undefined && !result.data.hasMore;
+            if (completedHandoff) observation.through = undefined;
+            if (completedHandoff || observation.view.needsRefresh) {
+              // One page per FIFO round. A hot request goes behind other waiting observations.
+              eventReadQueue.current = enqueueEventRead(eventReadQueue.current, id);
+            }
+          }
+        } catch {
+          if (generation !== observation.view.generation) return;
+          observation.view = { ...observation.view, error: { code: 'storage_read_failed', category: 'storage',
+            message: 'Recorded activity could not be read. Refresh to try again.', retryable: true }, needsRefresh: false };
+          observation.snapshotError = true; observation.toolsError = true;
+          publishEventObservation(observation);
+        }
+      });
+    } finally { eventReadBusy.current = false; }
+  }
+  async function openEventObservation(observation: EventObservation) {
+    if (observation.opening || observation.view.subscriptionId || !observation.wanted || !hostReadyRef.current) return;
+    observation.opening = true;
+    const generation = ++eventViewGeneration.current;
+    observation.view = { ...observation.view, generation };
+    try {
+      const opened = await window.flowmate.subscribeRuntimeEvents({ runId: observation.view.runId,
+        sessionId: observation.view.sessionId, cursor: observation.view.cursor });
+      if (!observation.wanted || generation !== observation.view.generation || !eventCoordinatorAlive.current) {
+        if (opened.ok) await window.flowmate.unsubscribeRuntimeEvents(opened.data.subscriptionId).catch(() => {});
+        return;
+      }
+      if (!opened.ok) { observation.view = { ...observation.view, error: opened.error, needsRefresh: false }; publishEventObservation(observation); return; }
+      observation.view = bindEventSubscription(observation.view, opened.data, generation);
+      observation.through = opened.data.highWatermark;
+      if (observation.pendingWake) observation.view = applyEventWake(observation.view, observation.pendingWake, generation);
+      observation.pendingWake = null;
+      publishEventObservation(observation); queueEventRead(observation);
+    } catch {
+      if (generation === observation.view.generation) {
+        observation.view = { ...observation.view, error: { code: 'storage_read_failed', category: 'storage',
+          retryable: true, message: 'Recorded activity is unavailable. Refresh to try again.' }, needsRefresh: false };
+        publishEventObservation(observation);
+      }
+    } finally {
+      if (generation === observation.view.generation) observation.opening = false;
+    }
+  }
+  function releaseEventObservation(observation: EventObservation) {
+    const id = observation.view.subscriptionId;
+    observation.wanted = false; observation.opening = false;
+    observation.view = { ...observation.view, generation: ++eventViewGeneration.current, subscriptionId: null };
+    observation.pendingWake = null; observation.through = undefined;
+    if (id) { eventReadQueue.current = eventReadQueue.current.filter(item => item !== id);
+      void window.flowmate.unsubscribeRuntimeEvents(id).catch(() => {}); }
+  }
+  function reconcileEventObservations() {
+    const wanted = new Map<number, number | null>();
+    if (hostReadyRef.current && eventCoordinatorAlive.current) {
+      if (observedActiveRef.current) wanted.set(observedActiveRef.current.runId, observedActiveRef.current.sessionId);
+      if (activityVisibleRef.current && activityFocusedRef.current && activityTargetRef.current)
+        wanted.set(activityTargetRef.current.runId, activityTargetRef.current.sessionId);
+    }
+    for (const observation of eventObservations.current.values()) if (!wanted.has(observation.view.runId) && observation.wanted) releaseEventObservation(observation);
+    for (const [id, sessionId] of wanted) {
+      let observation = eventObservations.current.get(id);
+      if (!observation || observation.view.sessionId !== sessionId) {
+        observation = { view: createEventView(id, sessionId, ++eventViewGeneration.current), wanted: true,
+          opening: false, pendingWake: null, snapshot: null, tools: [], nextToolId: null, toolsExpanded: false, toolsLoading: false,
+          snapshotError: false, toolsError: false, toolsVerified: false };
+        eventObservations.current.set(id, observation);
+      }
+      observation.wanted = true;
+      publishEventObservation(observation);
+      if (observation.view.subscriptionId) queueEventRead(observation); else void openEventObservation(observation);
+    }
+    if (wanted.size && eventReadTimer.current === null) eventReadTimer.current = window.setInterval(pollEventObservations, 2000);
+    else if (!wanted.size && eventReadTimer.current !== null) { window.clearInterval(eventReadTimer.current); eventReadTimer.current = null; }
+  }
+  function observeActivity(runId: number, sessionId: number | null) {
+    const target = { runId, sessionId };
+    taskDetailsGeneration.current++;
+    activityTargetRef.current = target; setActivityTarget(target);
+    setActivityView(null); setActivitySnapshot(null); setActivityTools([]);
+    setActivityToolCursor(null); setActivityToolsLoading(false);
+    setActivitySnapshotError(false); setActivityToolsError(false); setActivityToolsVerified(false);
+    reconcileEventObservations();
+  }
+  function clearActivityObservation() {
+    taskDetailsGeneration.current++;
+    activityTargetRef.current = null; setActivityTarget(null);
+    setActivityView(null); setActivitySnapshot(null); setActivityTools([]);
+    setActivityToolCursor(null); setActivityToolsLoading(false);
+    setActivitySnapshotError(false); setActivityToolsError(false); setActivityToolsVerified(false);
+    reconcileEventObservations();
+  }
+  function refreshObservedActivity() {
+    for (const observation of eventObservations.current.values()) if (observation.wanted) {
+      observation.through = undefined;
+    }
+    reconcileEventObservations();
+  }
+  async function loadEarlierActivityTools() {
+    const observation = activityTargetRef.current ? eventObservations.current.get(activityTargetRef.current.runId) : undefined;
+    if (!observation || observation.toolsLoading || observation.nextToolId === null) return;
+    const generation = observation.view.generation;
+    observation.toolsLoading = true; publishEventObservation(observation);
+    try {
+      const result = await window.flowmate.listRunToolCalls({ runId: observation.view.runId, sessionId: observation.view.sessionId,
+        beforeId: observation.nextToolId, limit: 50 });
+      if (generation !== observation.view.generation) return;
+      if (result.ok) {
+        const byId = new Map(observation.tools.map(tool => [tool.toolCallId, tool]));
+        for (const tool of result.data.items) byId.set(tool.toolCallId, tool);
+        observation.tools = [...byId.values()].sort((a, b) => b.toolCallId - a.toolCallId);
+        observation.nextToolId = result.data.nextBeforeId; observation.toolsExpanded = true;
+      } else setNotice({ tone: 'bad', message: 'More tool activity could not be loaded. Your recorded position is retained.' });
+    } catch {
+      if (generation === observation.view.generation) setNotice({ tone: 'bad', message: 'More tool activity is unavailable. Try again.' });
+    } finally {
+      observation.toolsLoading = false; if (generation === observation.view.generation) publishEventObservation(observation);
+    }
+  }
+  function chooseActivitySegment(after: number | null) {
+    const observation = activityTargetRef.current ? eventObservations.current.get(activityTargetRef.current.runId) : undefined;
+    if (!observation) return;
+    if (after === null && observation.view.error?.code === 'event_cursor_invalid') {
+      const { runId, sessionId } = observation.view;
+      releaseEventObservation(observation);
+      observation.view = createEventView(runId, sessionId, ++eventViewGeneration.current);
+      observation.wanted = true; publishEventObservation(observation); void openEventObservation(observation); return;
+    }
+    observation.view = after === null ? retryEventPrefix(observation.view) : selectEventSegment(observation.view, after);
+    observation.through = undefined; publishEventObservation(observation); queueEventRead(observation);
+  }
+  useEffect(() => {
+    activityVisibleRef.current = page === 'activity';
+    if (runtimeState !== null) observedActiveRef.current = runtimeState.active;
+    reconcileEventObservations();
+  }, [page, activityTarget, runtimeState, state?.ready]);
+  function pollEventObservations() {
+      if (!hostReadyRef.current) return;
+      for (const observation of eventObservations.current.values()) if (observation.wanted) {
+        if (observation.view.subscriptionId) queueEventRead(observation); else void openEventObservation(observation);
+      }
+      if (observedActiveRef.current && runtimeReadsInFlight.current === 0) {
+        runtimeReadsInFlight.current++;
+        const generation = hostStateSequence.current;
+        const sequence = ++runtimeQuerySequence.current;
+        void window.flowmate.queryRuntimeState().then(result => {
+          if (generation !== hostStateSequence.current || sequence !== runtimeQuerySequence.current || !eventCoordinatorAlive.current) return;
+          if (result.ok) { setRuntimeState(result.data); setRuntimeReadFailed(false); }
+          else setRuntimeReadFailed(true);
+        }).catch(() => { if (generation === hostStateSequence.current && sequence === runtimeQuerySequence.current && eventCoordinatorAlive.current) setRuntimeReadFailed(true); })
+          .finally(() => { runtimeReadsInFlight.current--; });
+      }
+  }
+  useEffect(() => {
+    eventCoordinatorAlive.current = true;
+    const focus = () => { activityFocusedRef.current = !document.hidden && document.hasFocus();
+      reconcileEventObservations(); };
+    document.addEventListener('visibilitychange', focus);
+    window.addEventListener('focus', focus); window.addEventListener('blur', focus);
+    return () => {
+      eventCoordinatorAlive.current = false;
+      if (eventReadTimer.current !== null) { window.clearInterval(eventReadTimer.current); eventReadTimer.current = null; }
+      document.removeEventListener('visibilitychange', focus); window.removeEventListener('focus', focus); window.removeEventListener('blur', focus);
+      for (const observation of eventObservations.current.values()) releaseEventObservation(observation);
+      eventReadQueue.current = [];
+    };
+  }, []);
 
   function receiveDesktopState(next: DesktopState): boolean {
     if (next.ready && next.settings.revision < settingsRevision.current) return false;
@@ -520,6 +771,7 @@ export function App() {
     setRuntimeState(null);
     setRuntimeReadFailed(false);
     if (!hostReadyRef.current) return null;
+    runtimeReadsInFlight.current++;
     try {
       const result = await window.flowmate.queryRuntimeState();
       if (sequence !== runtimeQuerySequence.current || !hostReadyRef.current) return null;
@@ -529,7 +781,7 @@ export function App() {
     } catch {
       if (sequence === runtimeQuerySequence.current && hostReadyRef.current) setRuntimeReadFailed(true);
       return null;
-    }
+    } finally { runtimeReadsInFlight.current--; }
   }
 
   function draftKey(sessionId: number | null): string { return sessionId === null ? 'new' : String(sessionId); }
@@ -541,11 +793,17 @@ export function App() {
   }
 
   async function navigate(next: Page) {
-    if (next !== page && !await confirmFormLeave()) return;
+    if (next !== page && !await confirmFormLeave()) return false;
+    taskDetailsGeneration.current++;
+    documentReadGeneration.current++;
     setPage(next);
     setNavOpen(false);
     const selectedJobId = historyJobId ?? workspace?.jobId;
     if (next === 'tasks' && selectedJobId) void loadTaskDetails(selectedJobId);
+    return true;
+  }
+  function selectHistoryJob(jobId: number | null) {
+    historyJobIdRef.current = jobId; taskDetailsGeneration.current++; setHistoryJobId(jobId);
   }
 
   async function openChat(sessionId: number) {
@@ -635,11 +893,14 @@ export function App() {
     await Promise.all([loadWorkspace(), loadProductLists()]);
   }
 
-  async function loadDocumentMaterial(documentId: number) {
-    const page = await window.flowmate.readDocumentPage({ documentId, page: 1, afterBlockId: null, limit: 50 });
+  async function loadDocumentMaterial(documentId: number, generation = ++documentReadGeneration.current) {
+    const [page, original] = await Promise.all([
+      window.flowmate.readDocumentPage({ documentId, page: 1, afterBlockId: null, limit: 50 }),
+      window.flowmate.readDocumentOriginal(documentId, 1),
+    ]);
+    if (generation !== documentReadGeneration.current) return;
     if (page.ok) setParsedPage(page.data);
     else { setParsedPage(null); setNotice({ tone: 'bad', message: errorMessage(page) }); }
-    const original = await window.flowmate.readDocumentOriginal(documentId, 1);
     if (original.ok) setOriginalImage(original.data);
     else setOriginalImage(null);
   }
@@ -655,16 +916,27 @@ export function App() {
   }
 
   async function selectWorkspaceDocument(documentId: number | null) {
-    const snapshot = await changeWorkspace({ kind: 'document', documentId });
-    if (!snapshot) return;
-    setHistoryJobId(null);
-    if (documentId === null) return;
+    const generation = ++documentReadGeneration.current;
     let doc = documents.find((item) => item.documentRef.id === documentId);
-    if (!doc) {
+    if (documentId !== null && !doc) {
       const queried = await window.flowmate.queryDocument(documentId);
-      if (queried.ok) doc = queried.data;
+      if (generation !== documentReadGeneration.current) return;
+      if (!queried.ok) { setNotice({ tone: 'bad', message: errorMessage(queried) }); return; }
+      doc = queried.data;
     }
-    if (doc) await loadDocumentMaterial(documentId);
+    if (doc?.isHidden) {
+      if (!await confirmFormLeave() || generation !== documentReadGeneration.current) return;
+      setHistoricalInvoice(doc); setHistoricalInvoiceView('original');
+      setParsedPage(null); setOriginalImage(null);
+      await loadDocumentMaterial(doc.documentRef.id, generation);
+      return;
+    }
+    const snapshot = await changeWorkspace({ kind: 'document', documentId });
+    if (!snapshot || generation !== documentReadGeneration.current) return;
+    setHistoricalInvoice(null);
+    selectHistoryJob(null);
+    if (documentId === null) return;
+    if (doc) await loadDocumentMaterial(documentId, generation);
   }
 
   async function startTask() {
@@ -689,7 +961,7 @@ export function App() {
       return;
     }
     acceptWorkspace(result.data.workspace);
-    setHistoryJobId(result.data.job.jobId);
+    selectHistoryJob(result.data.job.jobId);
     setGoalMode('save-candidate');
     updateChatInput('Generate and save a result for this invoice using its parsed data and source references. Keep missing or ambiguous details explicit.');
     setChatCollapsed(false);
@@ -699,10 +971,16 @@ export function App() {
   }
 
   async function loadTaskDetails(jobId: number) {
+    const generation = taskDetailsGeneration.current;
+    const documentId = workspaceRef.current?.documentRef?.id ?? null;
+    const selectedJob = historyJobIdRef.current ?? workspaceRef.current?.jobId;
+    if (selectedJob !== jobId) return;
     const [candidatesResult, activityResult] = await Promise.all([
       window.flowmate.listJobCandidates({ jobId, limit: 50 }),
       window.flowmate.listActivity({ jobId, limit: 50 }),
     ]);
+    if (generation !== taskDetailsGeneration.current || documentId !== (workspaceRef.current?.documentRef?.id ?? null)
+      || jobId !== (historyJobIdRef.current ?? workspaceRef.current?.jobId)) return;
     if (candidatesResult.ok) setCandidateSummaries(candidatesResult.data.items);
     else setNotice({ tone: 'bad', message: errorMessage(candidatesResult) });
     if (activityResult.ok) setActivity(activityResult.data.items);
@@ -737,16 +1015,22 @@ export function App() {
 
   async function openJob(jobId: number) {
     if (!await confirmFormLeave()) return;
-    const job = jobs.find((item) => item.jobId === jobId);
+    const generation = taskDetailsGeneration.current;
+    const visibleJob = jobs.find((item) => item.jobId === jobId);
+    const queriedJob = visibleJob ? null : await window.flowmate.queryJob(jobId);
+    if (generation !== taskDetailsGeneration.current) return;
+    const job = visibleJob ?? (queriedJob?.ok ? queriedJob.data : null);
     if (!job) return;
     const document = await window.flowmate.queryDocument(job.documentRef.id);
+    if (generation !== taskDetailsGeneration.current) return;
     if (!document.ok) { setNotice({ tone: 'bad', message: errorMessage(document) }); return; }
     setHistoricalDocuments((current) => ({ ...current, [document.data.documentRef.id]: document.data }));
-    if (!document.data.isHidden) {
+    if (!visibleJob) setHistoricalJobs(current => ({ ...current, [jobId]: job }));
+    if (visibleJob && !document.data.isHidden) {
       const snapshot = await changeWorkspace({ kind: 'job', jobId });
-      if (!snapshot) return;
+      if (!snapshot || generation !== taskDetailsGeneration.current) return;
     }
-    setHistoryJobId(jobId);
+    selectHistoryJob(jobId);
     setCandidateDetail(null);
     await loadTaskDetails(jobId);
   }
@@ -757,7 +1041,7 @@ export function App() {
     const result = await window.flowmate.hideJob(jobId);
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     if (workspaceRef.current?.jobId === jobId || historyJobId === jobId) {
-      setHistoryJobId(null);
+      selectHistoryJob(null);
       setCandidateSummaries([]);
       setCandidateDetail(null);
       setActivity([]);
@@ -854,7 +1138,8 @@ export function App() {
     }
     unknownInputs.current.delete(sessionId);
     const draft = chatDrafts.current.get(draftKey(sessionId)) ?? '';
-    const remainingDraft = draft === original!.text ? '' : draft.startsWith(`${original!.text}\n\n`) ? draft.slice(original!.text.length + 2) : draft;
+    const submittedDraft = original!.submittedDraft ?? original!.text;
+    const remainingDraft = draft === submittedDraft ? '' : draft.startsWith(`${submittedDraft}\n\n`) ? draft.slice(submittedDraft.length + 2) : draft;
     chatDrafts.current.set(draftKey(sessionId), remainingDraft);
     if (selectedSessionIdRef.current === sessionId) updateChatInput(remainingDraft);
     if (selectedSessionIdRef.current === sessionId) setUnknownInput(null);
@@ -923,8 +1208,16 @@ export function App() {
         setChatTurns(runsResult.data.items.slice().reverse().map(turnFromRun));
       }
       setRunFeedbacks(runsResult.data.items.filter((item) => item.status === 'cancelled' || item.status === 'failed')
-        .map((item) => ({ runId: item.runId, status: item.status as 'failed' | 'cancelled',
-          error: item.error ? errorMessage({ error: item.error }) : null })));
+        .map((item) => {
+          const budget = RuntimeBudgetOverridesSchema.passthrough().safeParse(item.config.runtimeBudget ?? item.config.agent);
+          const limits = budget.success ? [
+            budget.data.maxModelCalls === undefined ? null : `${budget.data.maxModelCalls} model request${budget.data.maxModelCalls === 1 ? '' : 's'}`,
+            budget.data.maxToolCalls === undefined ? null : `${budget.data.maxToolCalls} tool call${budget.data.maxToolCalls === 1 ? '' : 's'}`,
+          ].filter(Boolean).join(' · ') : '';
+          return { runId: item.runId, status: item.status as 'failed' | 'cancelled',
+            error: item.error ? errorMessage({ error: item.error }) : null,
+            ...(limits ? { limits: `Run ${item.runId} limits: ${limits}` } : {}) };
+        }));
     } catch {
       failed = true;
       if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId) {
@@ -1145,12 +1438,24 @@ export function App() {
     void refresh();
     const unsubscribe = window.flowmate.subscribe((event) => {
       if (!alive) return;
+      if (event.type === 'runtime_events_available') {
+        const observation = eventObservations.current.get(event.runId);
+        if (!observation?.wanted) return;
+        if (observation.opening && !observation.view.subscriptionId) {
+          if (!observation.pendingWake || event.sequence >= observation.pendingWake.sequence) observation.pendingWake = event;
+        } else {
+          observation.view = applyEventWake(observation.view, event, observation.view.generation);
+          if (observation.view.needsRefresh) queueEventRead(observation);
+        }
+        return;
+      }
       if (event.type === 'host_state') {
         if (!receiveDesktopState(event.state)) return;
         hostStateSequence.current += 1;
         runtimeQuerySequence.current += 1;
         setRuntimeState(null);
         setRuntimeReadFailed(false);
+        if (!event.state.ready) for (const observation of eventObservations.current.values()) releaseEventObservation(observation);
         if (!event.state.ready && invoiceFormRef.current) publishInvoiceForm(invalidateInvoiceForm(invoiceFormRef.current));
         if (event.state.ready) void refreshRuntimeState();
         return;
@@ -1337,6 +1642,29 @@ export function App() {
     && !cancelPending && !agentStopRequested.current && !inputSubmitting && !unknownInput && !sessionMutating && !historyError
     && selectedForSend?.status === 'active' && !selectedForSend.deletePending && !selectedForSend.modelUseBlocked
     && selectedForSend.historyState === 'recoverable' && !(invoiceForm?.runId === activeAgentRunId));
+  const targetRun = run?.runId === activeAgentRunId && run.sessionId === activeAgentSessionId ? run : null;
+  const targetWorkspace = targetRun ? WorkspaceContextSchema.safeParse(targetRun.config.workspaceContext) : null;
+  const targetDocument = targetWorkspace?.success ? targetWorkspace.data.documentRef : null;
+  const activeInputTarget = activeAgentRunId !== null && activeAgentSessionId === selectedSessionId ? {
+    runId: activeAgentRunId,
+    material: !targetRun ? 'Checking original material…' : targetRun.config.workspaceContext === undefined
+      || targetWorkspace?.success && targetDocument === null ? 'General conversation'
+      : targetDocument ? documents.find(item => item.documentRef.id === targetDocument.id
+        && item.documentRef.version === targetDocument.version)?.displayName ?? `Invoice ${targetDocument.id}`
+        : 'Original material could not be verified.',
+  } : null;
+  useEffect(() => {
+    if (activeAgentRunId === null || activeAgentSessionId !== selectedSessionId
+      || run?.runId === activeAgentRunId && run.sessionId === activeAgentSessionId) return;
+    const targetRunId = activeAgentRunId;
+    const targetSessionId = activeAgentSessionId;
+    let current = true;
+    void window.flowmate.queryRun(targetRunId).then(result => {
+      if (current && result.ok && result.data.runId === targetRunId && result.data.sessionId === targetSessionId
+        && activeAgentRunIdRef.current === targetRunId && selectedSessionIdRef.current === targetSessionId) setRun(result.data);
+    }).catch(() => {});
+    return () => { current = false; };
+  }, [activeAgentRunId, activeAgentSessionId, selectedSessionId, run?.runId, run?.sessionId]);
   useLayoutEffect(() => {
     if (!focusComposerWhenReady.current || !inputEnabled) return;
     focusComposerWhenReady.current = false;
@@ -1370,7 +1698,7 @@ export function App() {
     setSelectedModelId(id);
     setDraft(item);
     setApiKey('');
-    setRun(null);
+    setRun(current => current?.runId === activeAgentRunIdRef.current ? current : null);
     setNotice(null);
   }
 
@@ -1489,7 +1817,9 @@ export function App() {
   }
 
   async function sendChatMessage(override?: { sessionId: number; prompt: string }) {
-    const prompt = override?.prompt ?? chatInputRef.current.trim();
+    const submittedDraft = override?.prompt ?? chatInputRef.current;
+    const prompt = submittedDraft.trim();
+    let sessionId = override?.sessionId ?? selectedSessionIdRef.current;
     const directory = workingDirectory;
     const model = persistedModel;
     if ((!canChat && !override) || !modelReady || busy || !selectedModelId || !model || !prompt || inputSubmittingRef.current) return;
@@ -1506,7 +1836,6 @@ export function App() {
       return;
     }
     setNotice({ tone: 'info', message: 'Preparing your request…' });
-    let sessionId = override?.sessionId ?? selectedSessionIdRef.current;
     if (sessionId === null) {
       const created = await createNewSession(true);
       if (!created) { setBusy(false); return; }
@@ -1529,8 +1858,14 @@ export function App() {
     activeAgentRunIdRef.current = null;
     agentStopRequested.current = false;
     setActiveRunModel({ id: model.id, name: model.name, model: model.model });
-    chatDrafts.current.set(draftKey(sessionId), '');
-    if (selectedSessionIdRef.current === sessionId) updateChatInput('');
+    const currentDraft = chatDrafts.current.get(draftKey(sessionId)) ?? '';
+    const remainingDraft = currentDraft === submittedDraft ? '' : currentDraft.startsWith(`${submittedDraft}\n\n`)
+      ? currentDraft.slice(submittedDraft.length + 2) : currentDraft;
+    const clearedDraft = remainingDraft !== currentDraft;
+    if (clearedDraft) {
+      chatDrafts.current.set(draftKey(sessionId), remainingDraft);
+      if (selectedSessionIdRef.current === sessionId) updateChatInput(remainingDraft);
+    }
     if (selectedSessionIdRef.current === sessionId) setChatTurns((turns) => [...turns, newTurn]);
     setBusy(true);
     setCancelPending(false);
@@ -1556,15 +1891,17 @@ export function App() {
     if (accepted.ok) setNextRuntimeDraft(runtimeLimitsDraft({}));
     if (!accepted.ok) {
       if (accepted.error.code === 'operation_result_unknown' || accepted.error.code === 'input_delivery_unknown') {
-        unknownInputs.current.set(sessionId, request);
+        unknownInputs.current.set(sessionId, { ...request, submittedDraft });
         if (selectedSessionIdRef.current === sessionId) setUnknownInput({ sessionId, clientSequence });
       }
       void refreshRuntimeState();
       setChatTurns((turns) => turns.filter((turn) => turn.id !== turnId));
-      const restoredDraft = chatDrafts.current.get(draftKey(sessionId));
-      const nextDraft = restoredDraft ? `${prompt}\n\n${restoredDraft}` : prompt;
-      chatDrafts.current.set(draftKey(sessionId), nextDraft);
-      if (selectedSessionIdRef.current === sessionId) updateChatInput(nextDraft);
+      if (clearedDraft) {
+        const restoredDraft = chatDrafts.current.get(draftKey(sessionId));
+        const nextDraft = restoredDraft === submittedDraft ? restoredDraft : restoredDraft ? `${submittedDraft}\n\n${restoredDraft}` : submittedDraft;
+        chatDrafts.current.set(draftKey(sessionId), nextDraft);
+        if (selectedSessionIdRef.current === sessionId) updateChatInput(nextDraft);
+      }
       if (accepted.error.code === 'state_conflict') await loadWorkspace();
       setNotice({ tone: 'bad', message: accepted.error.code === 'state_conflict'
         ? 'Invoice context changed. Review it and press Send again; your message is preserved.' : errorMessage(accepted) });
@@ -1618,7 +1955,8 @@ export function App() {
   async function appendChatInput(mode: 'steer' | 'followUp') {
     const sessionId = selectedSessionIdRef.current;
     const runId = activeAgentRunIdRef.current;
-    const prompt = chatInputRef.current.trim();
+    const submittedDraft = chatInputRef.current;
+    const prompt = submittedDraft.trim();
     if (!canAppend || !sessionId || !runId || !prompt || inputSubmittingRef.current) return;
     inputSubmittingRef.current = true; setInputSubmitting(true);
     try {
@@ -1632,6 +1970,7 @@ export function App() {
       if (!sequence.ok || sequence.data.nextClientSequence === null || !originalRun.ok || originalRun.data.kind !== 'agent') {
         setNotice({ tone: 'bad', message: 'The active Run or next input could not be confirmed. Your draft is preserved.' }); return;
       }
+      if (originalRun.data.runId === runId && originalRun.data.sessionId === sessionId) setRun(originalRun.data);
       const clientSequence = sequence.data.nextClientSequence;
       const current = workspaceRef.current;
       const hasWorkspace = originalRun.data.config.workspaceContext !== undefined;
@@ -1645,15 +1984,16 @@ export function App() {
       const accepted = await window.flowmate.submitInput(request);
       if (!accepted.ok) {
         if (accepted.error.code === 'operation_result_unknown' || accepted.error.code === 'input_delivery_unknown') {
-          unknownInputs.current.set(sessionId, request);
+          unknownInputs.current.set(sessionId, { ...request, submittedDraft });
           if (selectedSessionIdRef.current === sessionId) setUnknownInput({ sessionId, clientSequence });
         }
         setNotice({ tone: 'bad', message: errorMessage(accepted) }); return;
       }
-      if (chatDrafts.current.get(draftKey(sessionId)) === prompt || chatInputRef.current.trim() === prompt && selectedSessionIdRef.current === sessionId) {
-        chatDrafts.current.set(draftKey(sessionId), '');
-        if (selectedSessionIdRef.current === sessionId) updateChatInput('');
-      }
+      const currentDraft = chatDrafts.current.get(draftKey(sessionId)) ?? '';
+      const remainingDraft = currentDraft === submittedDraft ? '' : currentDraft.startsWith(`${submittedDraft}\n\n`)
+        ? currentDraft.slice(submittedDraft.length + 2) : currentDraft;
+      chatDrafts.current.set(draftKey(sessionId), remainingDraft);
+      if (selectedSessionIdRef.current === sessionId) updateChatInput(remainingDraft);
       await loadSessionInputs(sessionId);
     } finally { inputSubmittingRef.current = false; setInputSubmitting(false); }
   }
@@ -1821,6 +2161,7 @@ export function App() {
             ['workspace', 'Invoices', '▧'],
             ['tasks', 'Processing History', '☷'],
             ['chats', 'Chats', '◌'],
+            ['activity', 'Activity', '≋'],
           ] as const).map(([target, label, glyph]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
             aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
@@ -1880,6 +2221,8 @@ export function App() {
           <WorkspacePage
             workspace={workspace}
             documents={documents}
+            historicalDocument={historicalInvoice}
+            historicalView={historicalInvoiceView}
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
             onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)}
@@ -1907,7 +2250,7 @@ export function App() {
             onStartTask={() => void startTask()}
             onOpenCandidate={(jobId, candidateId) => void openCandidate(jobId, candidateId)}
             onTaskGoalChange={setTaskGoal}
-            onChangeView={(view) => void changeWorkspace({ kind: 'view', view })}
+            onChangeView={(view) => { if (historicalInvoice) setHistoricalInvoiceView(view); else void changeWorkspace({ kind: 'view', view }); }}
             onRefresh={() => void loadProductOverview()}
             onRevokeModelAccess={() => void revokeModelAccess()}
             revokingAccess={revokingAccess}
@@ -1917,6 +2260,7 @@ export function App() {
             workspace={workspace}
             documents={documents}
             historicalDocuments={historicalDocuments}
+            historicalJobs={historicalJobs}
             jobs={jobs}
             selectedJobId={historyJobId ?? workspace?.jobId ?? null}
             candidates={candidateSummaries}
@@ -1939,6 +2283,16 @@ export function App() {
             ready={Boolean(state?.ready && !sessionLoading && !sessionMutating)}
             mutating={sessionMutating} notice={notice} onSelect={openChat}
             onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onLoadMore={() => void loadMoreSessions()} />
+        ) : page === 'activity' ? (
+          <ActivityPage sessions={sessions} selectedSessionId={selectedSessionId} jobs={jobs} documents={documents}
+            currentRun={run} runtime={runtimeState} view={activityView} snapshot={activitySnapshot} tools={activityTools}
+            snapshotError={activitySnapshotError} toolsError={activityToolsError} toolsVerified={activityToolsVerified}
+            nextToolId={activityToolCursor} toolsLoading={activityToolsLoading} onLoadMoreTools={() => void loadEarlierActivityTools()}
+            onClearObservation={clearActivityObservation}
+            onObserve={observeActivity} onRefresh={refreshObservedActivity} onSegment={after => chooseActivitySegment(after)}
+            onRetryPrefix={() => chooseActivitySegment(null)}
+            onOpenInvoice={id => { void navigate('workspace').then(moved => { if (moved) void selectWorkspaceDocument(id); }); }}
+            onOpenProcessing={id => { void navigate('tasks').then(moved => { if (moved) void openJob(id); }); }} />
         ) : (
           <section className="page-content">
             <div className="page-heading">
@@ -2100,6 +2454,7 @@ export function App() {
         activeAgentRunId={activeAgentRunId}
         activeAgentSessionId={activeAgentSessionId}
         activeRunModel={activeRunModel}
+        activeInputTarget={activeInputTarget}
         selectedModelId={selectedModelId}
         modelName={persistedModel?.name ?? null}
         modelId={persistedModel?.model ?? null}
@@ -2216,6 +2571,8 @@ function ChatsPage({ sessions, selectedSessionId, activeSessionId, managementBlo
 function WorkspacePage(props: {
   workspace: WorkspaceSnapshot | null;
   documents: readonly DocumentSnapshot[];
+  historicalDocument: DocumentSnapshot | null;
+  historicalView: 'original' | 'parsed' | 'candidate';
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
   formControls: ReactNode;
@@ -2237,11 +2594,13 @@ function WorkspacePage(props: {
   revokingAccess: boolean;
 }) {
   const { workspace, documents, candidates, candidateDetail, taskGoal, parsedPage, originalImage, notice, revokingAccess } = props;
-  const selectedDocument = documents.find((item) => item.documentRef.id === workspace?.documentRef?.id) ?? null;
+  const selectedDocument = props.historicalDocument ?? documents.find((item) => item.documentRef.id === workspace?.documentRef?.id) ?? null;
+  const historical = props.historicalDocument !== null;
+  const view = historical ? props.historicalView : workspace?.activeView;
   return <section className="page-content invoice-page">
     <div className="page-heading">
       <div><h1>Invoices</h1><p>Review the original, parsed details and saved results in one place.</p></div>
-      <div className="invoice-heading-actions"><select className="context-select" aria-label="Choose invoice" value={selectedDocument?.documentRef.id ?? ''} onChange={(event) => props.onSelectDocument(Number(event.target.value))}><option value="" disabled>Choose invoice</option>{documents.map((item) => <option key={item.documentRef.id} value={item.documentRef.id}>{item.displayName}</option>)}</select>{selectedDocument && <button className="text-button danger-text invoice-heading-delete" disabled={props.hidingDocumentId !== null} onClick={() => props.onHideDocument(selectedDocument.documentRef.id)}>Delete</button>}<button className="secondary-button" onClick={props.onImport}>＋ Import invoice</button></div>
+      <div className="invoice-heading-actions"><select className="context-select" aria-label="Choose invoice" value={historical ? '' : selectedDocument?.documentRef.id ?? ''} onChange={(event) => props.onSelectDocument(Number(event.target.value))}><option value="" disabled>Choose invoice</option>{documents.map((item) => <option key={item.documentRef.id} value={item.documentRef.id}>{item.displayName}</option>)}</select>{selectedDocument && !historical && <button className="text-button danger-text invoice-heading-delete" disabled={props.hidingDocumentId !== null} onClick={() => props.onHideDocument(selectedDocument.documentRef.id)}>Delete</button>}<button className="secondary-button" onClick={props.onImport}>＋ Import invoice</button></div>
     </div>
     {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
     <section className="invoice-context">
@@ -2254,25 +2613,27 @@ function WorkspacePage(props: {
         </div>)}</div>}
     </section>
 
-    {workspace?.documentRef && <section className="panel config-panel invoice-sheet">
+    {(historical || workspace?.documentRef) && <section className="panel config-panel invoice-sheet">
+      {historical && <p className="notice info" role="status">This invoice was removed from the daily list. You are viewing a read-only record; it is not the Assistant context.</p>}
       <div className="panel-head"><div><h2>{selectedDocument?.displayName ?? 'Invoice'}</h2><p className="invoice-subtitle">{selectedDocument?.pageCount ?? 1} {selectedDocument?.pageCount === 1 ? 'page' : 'pages'} · Imported {selectedDocument ? new Date(selectedDocument.createdAt).toLocaleDateString() : 'recently'}</p></div>
-        <details className="invoice-access"><summary>Material access</summary><button className="danger-action" disabled={revokingAccess} onClick={props.onRevokeModelAccess}>{revokingAccess ? 'Revoking…' : 'Revoke model access'}</button></details>
+        {!historical && <details className="invoice-access"><summary>Material access</summary><button className="danger-action" disabled={revokingAccess} onClick={props.onRevokeModelAccess}>{revokingAccess ? 'Revoking…' : 'Revoke model access'}</button></details>}
       </div>
       <div className="button-row invoice-tabs" role="tablist" aria-label="Invoice view">
-        <button className={workspace.activeView === 'original' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('original')}>Original</button>
-        <button className={workspace.activeView === 'parsed' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('parsed')}>Parsed</button>
-        <button className={workspace.activeView === 'candidate' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('candidate')}>Results</button>
+        <button className={view === 'original' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('original')}>Original</button>
+        <button className={view === 'parsed' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('parsed')}>Parsed</button>
+        <button className={view === 'candidate' ? 'secondary-button' : 'text-button'} onClick={() => props.onChangeView('candidate')}>Results</button>
       </div>
-      {workspace.activeView === 'original' && (originalImage
+      {view === 'original' && (originalImage
         ? <figure><img style={{ maxWidth: '100%', maxHeight: '60vh', objectFit: 'contain' }} src={`data:${originalImage.mimeType};base64,${originalImage.base64}`} alt={`Original invoice document page 1`} /><figcaption>Original page shown for user review.</figcaption></figure>
         : <p className="config-note">Original page is unavailable. The selected document may be missing its source asset.</p>)}
-      {workspace.activeView === 'parsed' && (parsedPage
+      {view === 'parsed' && (parsedPage
         ? <div className="model-list parsed-list">{parsedPage.blocks.map((block) => <article className="route-row" key={block.id}>
           <span className="route-icon">{block.kind === 'table' ? '▤' : block.kind === 'image' ? '▧' : '¶'}</span>
           <span className="route-name"><strong>{block.kind === 'table' ? 'Table' : block.kind === 'image' ? 'Image note' : 'Text'} · Page {block.source.page}</strong><small>{block.text || '(no extracted text)'}</small></span>
         </article>)}</div>
         : <p className="config-note">Parsed page could not be loaded.</p>)}
-      {workspace.activeView === 'candidate' && <div className="invoice-results">{candidates.length === 0
+      {view === 'candidate' && historical && <p className="config-note">Saved results and sources remain available in Processing History.</p>}
+      {view === 'candidate' && !historical && workspace && <div className="invoice-results">{candidates.length === 0
         ? <div className="empty-route"><strong>No results yet</strong><span>Choose Process this invoice, then send the request in Assistant.</span></div>
         : <div className="model-list">{candidates.map((item) => <button className="route-row" key={item.candidateId} onClick={() => workspace.jobId && props.onOpenCandidate(workspace.jobId, item.candidateId)}><span className="route-icon">✓</span><span className="route-name"><strong>Result {item.sequence}</strong><small>{item.issueCount ? `${item.issueCount} issues to review` : 'No issues found'} · {new Date(item.createdAt).toLocaleDateString()}</small></span></button>)}</div>}
         {candidateDetail && <><CandidateDetails detail={candidateDetail} />
@@ -2281,11 +2642,11 @@ function WorkspacePage(props: {
           </>}{props.formControls}</div>}
     </section>}
 
-    <section className="panel invoice-process">
+    {!historical && <section className="panel invoice-process">
       <div className="panel-head"><div><h2>Process this invoice</h2><p className="invoice-subtitle">Prepare a result from the parsed content. The model starts only when you press Send.</p></div></div>
       <details><summary>Additional requirements</summary><label className="field full"><span>What else should the assistant consider?</span><textarea value={taskGoal} onChange={(event) => props.onTaskGoalChange(event.target.value)} maxLength={3500} rows={3} placeholder="Optional instructions for this invoice" /></label></details>
       <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace?.documentRef} onClick={props.onStartTask}>Process this invoice</button></div>
-    </section>
+    </section>}
     <footer className="page-footer"><span>The original is for your review. Assistant uses registered parsed content and source references.</span></footer>
   </section>;
 }
@@ -2294,6 +2655,7 @@ function TasksPage(props: {
   workspace: WorkspaceSnapshot | null;
   documents: readonly DocumentSnapshot[];
   historicalDocuments: Readonly<Record<number, DocumentSnapshot>>;
+  historicalJobs: Readonly<Record<number, JobSnapshot>>;
   jobs: readonly JobSnapshot[];
   selectedJobId: number | null;
   candidates: readonly CandidateSummary[];
@@ -2306,7 +2668,8 @@ function TasksPage(props: {
   onSelectCandidate(jobId: number, candidateId: number): void;
 }) {
   const { workspace, jobs, candidates, candidateDetail, activity } = props;
-  const job = jobs.find((item) => item.jobId === props.selectedJobId) ?? null;
+  const job = jobs.find((item) => item.jobId === props.selectedJobId)
+    ?? (props.selectedJobId === null ? null : props.historicalJobs[props.selectedJobId]) ?? null;
   const documentInfo = (documentId: number) => props.documents.find((item) => item.documentRef.id === documentId) ?? props.historicalDocuments[documentId];
   const documentName = (documentId: number) => documentInfo(documentId)?.displayName ?? 'Invoice';
   return <section className="page-content">
@@ -2361,20 +2724,20 @@ function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, op
     {!state.valid && <p role="alert">This form target is no longer valid. Your local draft is retained.</p>}
     {state.warnings.length > 0 && <ul>{state.warnings.map(warning => <li key={warning.path}>{warning.path}: {warning.reason.replaceAll('_', ' ')}</li>)}</ul>}
     <div className="profile-fields">{invoiceHeaderFields.map(name => <label className="field" key={name}><span>{invoiceFieldLabels[name]}</span>
-      <input aria-label={invoiceFieldLabels[name]} value={state.draft.fields[name]} maxLength={1024} disabled={disabled}
+      <input aria-label={invoiceFieldLabels[name]} value={state.draft.fields[name]} maxLength={MAX_INVOICE_FIELD_CHARS} disabled={disabled}
         onChange={event => onChange({ ...state.draft, fields: { ...state.draft.fields, [name]: event.target.value } })} /></label>)}</div>
     <h3>Line items</h3>{state.draft.lines.map((line, index) => <fieldset key={index} disabled={disabled}><legend>Line {index + 1}</legend>
       <div className="profile-fields">{invoiceLineFields.map(name => <label className="field" key={name}><span>{invoiceFieldLabels[name]}</span>
-        <input aria-label={`Line ${index + 1} ${invoiceFieldLabels[name]}`} value={line[name]} maxLength={1024}
+        <input aria-label={`Line ${index + 1} ${invoiceFieldLabels[name]}`} value={line[name]} maxLength={MAX_INVOICE_FIELD_CHARS}
           onChange={event => onChange({ ...state.draft, lines: state.draft.lines.map((value, position) => position === index ? { ...value, [name]: event.target.value } : value) })} /></label>)}</div>
       <button className="text-button" onClick={() => onChange({ ...state.draft, lines: state.draft.lines.filter((_, position) => position !== index) })}>Remove line {index + 1}</button>
     </fieldset>)}
-    <button className="text-button" disabled={disabled || state.draft.lines.length >= 200} onClick={() => onChange({ ...state.draft,
+    <button className="text-button" disabled={disabled || state.draft.lines.length >= MAX_INVOICE_LINES} onClick={() => onChange({ ...state.draft,
       lines: [...state.draft.lines, Object.fromEntries(invoiceLineFields.map(name => [name, ''])) as InvoiceFormDraft['lines'][number]] })}>Add line</button>
     <h3>Notes</h3>{state.draft.notes.map((note, index) => <label className="field" key={index}><span>Note {index + 1}</span>
-      <input value={note} maxLength={1024} disabled={disabled} onChange={event => onChange({ ...state.draft, notes: state.draft.notes.map((value, position) => position === index ? event.target.value : value) })} />
+      <input value={note} maxLength={MAX_INVOICE_NOTE_CHARS} disabled={disabled} onChange={event => onChange({ ...state.draft, notes: state.draft.notes.map((value, position) => position === index ? event.target.value : value) })} />
       <button className="text-button" disabled={disabled} onClick={() => onChange({ ...state.draft, notes: state.draft.notes.filter((_, position) => position !== index) })}>Remove note {index + 1}</button></label>)}
-    <button className="text-button" disabled={disabled || state.draft.notes.length >= 20} onClick={() => onChange({ ...state.draft, notes: [...state.draft.notes, ''] })}>Add note</button>
+    <button className="text-button" disabled={disabled || state.draft.notes.length >= MAX_INVOICE_NOTES} onClick={() => onChange({ ...state.draft, notes: [...state.draft.notes, ''] })}>Add note</button>
     <div className="button-row"><button className="secondary-button" onClick={onQuery} disabled={!canQuery}>Check Fill status</button>
       <button className="secondary-button" onClick={onSave} disabled={disabled || operationUnknown}>Save result</button>
       <button className="secondary-button" onClick={onAccept} disabled={disabled || state.dirty || operationUnknown}>Accept result</button>
@@ -2452,6 +2815,7 @@ function AgentChatPanel({
   activeAgentRunId,
   activeAgentSessionId,
   activeRunModel,
+  activeInputTarget,
   selectedModelId,
   modelName,
   modelId,
@@ -2497,6 +2861,7 @@ function AgentChatPanel({
   activeAgentRunId: number | null;
   activeAgentSessionId: number | null;
   activeRunModel: { id: string; name: string; model: string } | null;
+  activeInputTarget: { runId: number; material: string } | null;
   selectedModelId: string | null;
   modelName: string | null;
   modelId: string | null;
@@ -2568,8 +2933,11 @@ function AgentChatPanel({
       </article>)}
       {busy && activeAgentSessionId === selectedSessionId && !messages.some((message) => message.phase === 'streaming')
         && <div className="chat-pending"><span className="loader-ring" />Responding…</div>}
-      {runFeedbacks.map((item) => <p className={item.status === 'failed' ? 'chat-error' : 'chat-save-feedback'} key={item.runId}>
-        {item.status === 'cancelled' ? 'Request cancelled.' : item.error ?? 'The request failed.'}</p>)}
+      {runFeedbacks.map((item) => <div key={item.runId}>
+        <p className={item.status === 'failed' ? 'chat-error' : 'chat-save-feedback'}>
+          {item.status === 'cancelled' ? 'Request cancelled.' : item.error ?? 'The request failed.'}</p>
+        {item.limits && <p className="chat-save-feedback">{item.limits}</p>}
+      </div>)}
     </div>
     {sessionInputs.length > 0 && <details className="chat-input-queue" open><summary>Inputs · {sessionInputs.length}</summary>
       <ul>{sessionInputs.slice().reverse().map(item => <li key={item.inputId} data-testid="session-input" data-input-id={item.inputId}>
@@ -2584,7 +2952,8 @@ function AgentChatPanel({
     {unknownInput && <div className="chat-save-feedback" role="status">The original input receipt is unknown. Your draft is preserved.
       <button className="text-button" type="button" onClick={onCheckInputStatus}>Check input status</button></div>}
     <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend(); }}>
-      <div className="chat-context">{contextName ? `Working with ${contextName}` : 'General conversation'}</div>
+      <div className="chat-context">{activeInputTarget ? `Run ${activeInputTarget.runId} · ${activeInputTarget.material}`
+        : contextName ? `Working with ${contextName}` : 'General conversation'}</div>
       {sessionHint && <p className="chat-config-hint">{sessionHint}</p>}
       {(selectedSession?.historyState === 'legacy-read-only' || selectedSession?.historyState === 'invalid') && input.trim() && <button className="secondary-button" type="button" onClick={onNewChatAndSend}>New chat and send</button>}
       {canGenerate && <button className={`generate-toggle ${goalMode === 'save-candidate' ? 'selected' : ''}`} type="button" aria-pressed={goalMode === 'save-candidate'} onClick={() => onGoalModeChange(goalMode === 'save-candidate' ? 'answer' : 'save-candidate')}>Generate result {goalMode === 'save-candidate' ? 'for next message' : ''}</button>}

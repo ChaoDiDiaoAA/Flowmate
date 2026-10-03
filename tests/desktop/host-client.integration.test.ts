@@ -1,4 +1,5 @@
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
@@ -8,9 +9,10 @@ import { Database } from 'bun:sqlite';
 import { createServer } from 'node:http';
 import { openDatabase } from '@flowmate/core';
 import { resolveProductPaths } from '@flowmate/shared';
-import { SessionMessageViewSchema } from '@flowmate/contracts';
+import { RuntimeToolPageSchema, RuntimeToolViewSchema, SessionMessageViewSchema } from '@flowmate/contracts';
 import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, SessionMessagesPage, SessionMessageView, Result,
-  DocumentSnapshot, WorkspaceSnapshot, TaskOperation, CandidateSelection, RunAccepted } from '@flowmate/contracts';
+  DocumentSnapshot, WorkspaceSnapshot, TaskOperation, CandidateSelection, RunAccepted, Page, RuntimeToolView } from '@flowmate/contracts';
+import type { RuntimeEventsReadResult, RuntimeEventsWake, RuntimeSubscriptionInfo } from '@flowmate/contracts';
 import { mkdtemp } from '../support/resources.ts';
 import { HostClient, safeChildEnvironment } from '../../apps/desktop/main/host-client.ts';
 
@@ -273,11 +275,50 @@ it('preserves unconfirmed cleanup after a Host crash and recovers its interrupte
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Fixture server has no port');
   const client = new HostClient();
-  client.setCredentialHandler(async () => ({ ok: true, credential: { type: 'api_key', key: 'synthetic-host-crash-key' } }));
+  let releasePreparation!: () => void;
+  const preparation = new Promise<void>(resolvePreparation => { releasePreparation = resolvePreparation; });
+  let credentialReads = 0;
+  client.setCredentialHandler(async () => {
+    if (++credentialReads > 1) await preparation;
+    return { ok: true, credential: { type: 'api_key', key: 'synthetic-host-crash-key' } };
+  });
+  const oldSubscriptionId = randomUUID(), newSubscriptionId = randomUUID();
+  const receivedWakes: RuntimeEventsWake[] = [];
+  client.subscribe(event => { if (event.type === 'runtime_events_available') receivedWakes.push(event); });
+  const lateRequestId = 'before-crash-held-page';
+  let heldWake: Buffer | undefined, heldPage: Buffer | undefined;
+  let releaseOldPipe: (() => void) | undefined;
   let child: ChildProcessWithoutNullStreams | null = null;
   try {
     expect(await client.start(userDataRoot, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true, data: { ready: true } });
     child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    const oldChild = child, oldEpoch = client.connectionEpoch, oldPid = child.pid;
+    const oldEmit = oldChild.stdout.emit;
+    const heldEnd: Array<{ event: string | symbol; values: unknown[] }> = [];
+    let buffered = Buffer.alloc(0);
+    let wakeCaptured!: () => void, pageCaptured!: () => void;
+    const wakePacket = new Promise<void>(resolveCaptured => { wakeCaptured = resolveCaptured; });
+    const pagePacket = new Promise<void>(resolveCaptured => { pageCaptured = resolveCaptured; });
+    // Preserve real old-Host packets and EOF so its readline callback remains installed across replacement.
+    oldChild.stdout.emit = function(event: string | symbol, ...values: unknown[]): boolean {
+      if (event === 'end' || event === 'close') { heldEnd.push({ event, values }); return true; }
+      if (event !== 'data' || !Buffer.isBuffer(values[0])) return Reflect.apply(oldEmit, this, [event, ...values]);
+      buffered = Buffer.concat([buffered, values[0]]);
+      const forward: Buffer[] = [];
+      for (let newline = buffered.indexOf(10); newline >= 0; newline = buffered.indexOf(10)) {
+        const line = Buffer.from(buffered.subarray(0, newline + 1)); buffered = buffered.subarray(newline + 1);
+        const output = JSON.parse(line.toString('utf8'));
+        if (output.type === 'event' && output.event?.type === 'runtime_events_available'
+          && output.event.subscriptionId === oldSubscriptionId) { heldWake = line; wakeCaptured(); continue; }
+        if (output.type === 'response' && output.requestId === lateRequestId) { heldPage = line; pageCaptured(); continue; }
+        forward.push(line);
+      }
+      return forward.length ? Reflect.apply(oldEmit, this, ['data', Buffer.concat(forward), ...values.slice(1)]) : true;
+    };
+    releaseOldPipe = () => {
+      oldChild.stdout.emit = oldEmit;
+      for (const held of heldEnd.splice(0)) Reflect.apply(oldEmit, oldChild.stdout, [held.event, ...held.values]);
+    };
     expect(await client.request({ type: 'save_settings', settings: {
       version: 2, revision: 0, profile: { displayName: 'Crash test', theme: 'system' },
       models: [{ id: 'crash-model', credentialRef: 'credential_reference_crash', name: 'Crash model', kind: 'custom', providerId: null,
@@ -287,8 +328,26 @@ it('preserves unconfirmed cleanup after a Host crash and recovers its interrupte
     const accepted = await client.request({ type: 'call_provider', input: { modelId: 'crash-model', goal: 'Test crash recovery', text: 'Hold this request.' } }) as Result<{ runId: number }>;
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
-    await Promise.race([requestStarted, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Provider request did not start')), 5_000))]);
+    const eventInput = { runId: accepted.data.runId, sessionId: null, cursor: { runId: accepted.data.runId, lastPersistedSequence: 0 }, limit: 100 };
+    const subscriptionInput = { runId: eventInput.runId, sessionId: null, cursor: eventInput.cursor };
+    expect(await client.request({ type: 'subscribe_runtime_events', ownerToken: 'before-crash', subscriptionId: oldSubscriptionId,
+      input: subscriptionInput })).toMatchObject({ ok: true, data: { subscriptionId: oldSubscriptionId, highWatermark: 1 } });
+    const oldCleanup = client.captureRuntimeSubscriptionCleanup('before-crash', oldSubscriptionId);
+    releasePreparation();
+    await Promise.race([Promise.all([requestStarted, wakePacket]), new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Provider or persisted wake did not start')), 5_000))]);
     expect(await client.request({ type: 'query_run', runId: accepted.data.runId })).toMatchObject({ ok: true, data: { status: 'running' } });
+    expect(JSON.parse(heldWake!.toString('utf8')).event).toEqual({ type: 'runtime_events_available', subscriptionId: oldSubscriptionId,
+      runId: accepted.data.runId, sequence: 2 });
+    expect(receivedWakes).toEqual([]);
+    const liveEvents = await client.request({ type: 'query_runtime_events', ownerToken: 'before-crash',
+      input: { ...eventInput, subscriptionId: oldSubscriptionId } }) as RuntimeEventsReadResult;
+    expect(liveEvents).toMatchObject({ ok: true, data: { coverage: 'from-created' } });
+    if (!liveEvents.ok) throw new Error(liveEvents.error.code);
+    expect(liveEvents.data.items.map(event => event.type)).toEqual(['run_created', 'run_started']);
+    const latePage = client.request({ type: 'query_runtime_events', requestId: lateRequestId, ownerToken: 'before-crash',
+      input: { ...eventInput, subscriptionId: oldSubscriptionId } }).then(() => 'resolved', error => (error as Error).message);
+    await pagePacket;
+    expect(JSON.parse(heldPage!.toString('utf8')).value).toEqual(liveEvents);
     const exited = once(child, 'exit');
     child.kill(); // Deliberate crash; this is not the normal shutdown/abort test.
     await exited;
@@ -297,21 +356,96 @@ it('preserves unconfirmed cleanup after a Host crash and recovers its interrupte
     const paths = resolveProductPaths(userDataRoot);
     expect(paths.ok).toBe(true);
     if (!paths.ok) return;
-    const recovered = openDatabase(paths.data);
-    expect(recovered.ok).toBe(true);
-    if (!recovered.ok) return;
+    // Inspect the committed prefix without openDatabase: recovery must happen in the restarted real Host.
+    const stoppedDatabase = new Database(paths.data.databaseFile);
+    let legacyFacts: Record<string, string | number | null>;
     try {
-      expect(recovered.data.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: {
-        status: 'failed', error: { code: 'runtime_interrupted' }, cleanup: { stopped: false, lateObservationRequired: true },
-      } });
-      expect(requests).toBe(1);
-    } finally { recovered.data.close(); }
+      const original = stoppedDatabase.query('SELECT * FROM runs WHERE id=?').get(accepted.data.runId) as Record<string, string | number | null>;
+      expect(original.status).toBe('running');
+      expect(stoppedDatabase.query('SELECT sequence,type FROM runtime_events WHERE run_id=? ORDER BY sequence').all(accepted.data.runId))
+        .toEqual([{ sequence: 1, type: 'run_created' }, { sequence: 2, type: 'run_started' }]);
+      expect(stoppedDatabase.query('SELECT (SELECT count(*) FROM tool_calls) AS tools, (SELECT count(*) FROM session_inputs) AS inputs').get())
+        .toEqual({ tools: 0, inputs: 0 });
+      legacyFacts = original;
+    } finally { stoppedDatabase.close(); }
+    // Production controller-lock stale remains15s. Wait naturally after confirmed PID exit; do not alter its mtime or delete it.
+    await new Promise(resolveStaleLock => setTimeout(resolveStaleLock, 16_000));
+    expect(await latePage).toBe('host_request_timeout');
+    expect(await client.start(userDataRoot, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true, data: { ready: true } });
+    child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    expect(child.pid).not.toBe(oldPid);
+    expect(client.connectionEpoch).toBeGreaterThan(oldEpoch);
+    const newCommands: Array<{ type: string; subscriptionId?: string }> = [];
+    const newWrite = child.stdin.write;
+    child.stdin.write = function(...values: unknown[]): boolean {
+      newCommands.push(JSON.parse(String(values[0])));
+      return Reflect.apply(newWrite, this, values);
+    };
+    oldCleanup(); // The confirmed dead child cannot send its ID to the replacement connection.
+    expect(newCommands).toEqual([]);
+    const reopened = await client.request({ type: 'subscribe_runtime_events', ownerToken: 'after-crash', subscriptionId: newSubscriptionId,
+      input: { ...subscriptionInput, cursor: liveEvents.data.nextCursor } }) as Result<RuntimeSubscriptionInfo>;
+    expect(reopened).toMatchObject({ ok: true, data: { subscriptionId: newSubscriptionId, highWatermark: 3 } });
+    const resumedPage = client.request({ type: 'query_runtime_events', requestId: lateRequestId, ownerToken: 'after-crash',
+      input: { ...eventInput, cursor: liveEvents.data.nextCursor, subscriptionId: newSubscriptionId } }) as Promise<RuntimeEventsReadResult>;
+    expect(heldEnd.some(held => held.event === 'end')).toBe(true);
+    expect(oldChild.stdout.listenerCount('data')).toBeGreaterThan(0);
+    Reflect.apply(oldEmit, oldChild.stdout, ['data', Buffer.concat([heldWake!, heldPage!])]);
+    expect(receivedWakes).toEqual([]);
+    expect(await resumedPage).toMatchObject({ ok: true, data: { highWatermark: 3, nextCursor: { lastPersistedSequence: 3 },
+      items: [{ sequence: 3, type: 'run_failed', payload: { origin: 'recovery' } }] } });
+    releaseOldPipe(); releaseOldPipe = undefined;
+    for (const ownerToken of ['before-crash', 'after-crash']) expect(await client.request({ type: 'query_runtime_events', ownerToken,
+      input: { ...eventInput, subscriptionId: oldSubscriptionId } })).toMatchObject({ ok: false, error: { code: 'event_subscription_invalid' }, context: null });
+    expect(await client.request({ type: 'query_runtime_events', ownerToken: 'after-crash',
+      input: { ...eventInput, cursor: liveEvents.data.nextCursor, subscriptionId: newSubscriptionId } })).toMatchObject({ ok: true });
+    expect(newCommands.filter(command => command.type === 'unsubscribe_runtime_events' && command.subscriptionId === oldSubscriptionId)).toEqual([]);
+    const recoveredEvents = await client.request({ type: 'query_runtime_events', ownerToken: 'after-crash', input: eventInput }) as import('@flowmate/contracts').RuntimeEventsReadResult;
+    expect(recoveredEvents).toMatchObject({ ok: true, data: { coverage: 'from-created', highWatermark: 3 } });
+    if (!recoveredEvents.ok) throw new Error(recoveredEvents.error.code);
+    expect(recoveredEvents.data.items.slice(0, 2)).toEqual([...liveEvents.data.items]);
+    expect(recoveredEvents.data.items.map(event => event.sequence)).toEqual([1, 2, 3]);
+    expect(recoveredEvents.data.items.map(event => event.type)).toEqual(['run_created', 'run_started', 'run_failed']);
+    expect(recoveredEvents.data.items[2]?.payload).toMatchObject({ origin: 'recovery', status: 'failed', stopped: false, errorCode: 'runtime_interrupted' });
+    expect(await client.request({ type: 'query_run', runId: accepted.data.runId })).toMatchObject({ ok: true, data: {
+      status: 'failed', output: null, stoppedAt: null, error: { code: 'runtime_interrupted' }, cleanup: { stopped: false, lateObservationRequired: true } } });
+    expect(await client.request({ type: 'query_runtime_state' })).toMatchObject({ ok: true, data: { blocked: true } });
+    expect(await client.request({ type: 'query_runtime_events', ownerToken: 'after-crash', input: eventInput })).toEqual(recoveredEvents);
+    expect(requests).toBe(1);
+    expect(await client.request({ type: 'unsubscribe_runtime_events', ownerToken: 'after-crash', subscriptionId: newSubscriptionId })).toMatchObject({ ok: true });
+    expect(await client.close()).toMatchObject({ ok: true, data: { closed: true } });
+    const unchangedExecution = new Database(paths.data.databaseFile, { readonly: true });
+    try { expect(unchangedExecution.query('SELECT (SELECT count(*) FROM tool_calls) AS tools, (SELECT count(*) FROM session_inputs) AS inputs').get())
+      .toEqual({ tools: 0, inputs: 0 }); } finally { unchangedExecution.close(); }
+    // The one-active-Run constraint remains in force: seed a separate pre-P6 row only after recovery closed the original.
+    const legacyDatabase = new Database(paths.data.databaseFile);
+    let legacyRunId: number;
+    try {
+      const columns = Object.keys(legacyFacts).filter(column => column !== 'id');
+      const inserted = legacyDatabase.query(`INSERT INTO runs(${columns.join(',')}) VALUES(${columns.map(() => '?').join(',')})`)
+        .run(...columns.map(column => legacyFacts[column]!));
+      legacyRunId = Number(inserted.lastInsertRowid);
+      expect(legacyDatabase.query('SELECT COUNT(*) AS count FROM runtime_events WHERE run_id=?').get(legacyRunId)).toEqual({ count: 0 });
+    } finally { legacyDatabase.close(); }
+    expect(await client.start(userDataRoot, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true, data: { ready: true } });
+    child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    const legacyEvents = await client.request({ type: 'query_runtime_events', ownerToken: 'legacy-after-crash', input: {
+      runId: legacyRunId, sessionId: null, cursor: { runId: legacyRunId, lastPersistedSequence: 0 }, limit: 100 } }) as import('@flowmate/contracts').RuntimeEventsReadResult;
+    expect(legacyEvents).toMatchObject({ ok: true, data: { coverage: 'partial', highWatermark: 1,
+      items: [{ sequence: 1, type: 'run_failed', payload: { origin: 'recovery', stopped: false } }] } });
+    if (!legacyEvents.ok) throw new Error(legacyEvents.error.code);
+    expect(legacyEvents.data.items).toHaveLength(1);
+    expect(await client.request({ type: 'query_run', runId: legacyRunId })).toMatchObject({ ok: true,
+      data: { output: null, stoppedAt: null, cleanup: { stopped: false } } });
+    expect(requests).toBe(1);
+    expect(await client.close()).toMatchObject({ ok: true, data: { closed: true } });
   } finally {
+    releasePreparation(); releaseOldPipe?.();
     if (child && child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; }
     server.closeAllConnections();
     server.close();
   }
-}, 20_000);
+}, 45_000);
 
 it('passes Pi provider ambient auth to Host without Judge or platform credentials', () => {
   const previous = { deepseek: process.env.DEEPSEEK_API_KEY, judge: process.env.FLOWMATE_JUDGE_API_KEY,
@@ -751,6 +885,24 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     const savedDb = new Database(databaseFile, { readonly: true });
     const savedRows = savedDb.query('SELECT session_id,sequence,entry_id,entry_json,run_id FROM session_native_entries ORDER BY session_id,sequence').all();
     const savedHeads = savedDb.query('SELECT * FROM session_native_history ORDER BY session_id').all();
+    const readToolFacts = (toolDb: Database) => ({
+      counts: toolDb.query(`SELECT (SELECT COUNT(*) FROM tool_calls) AS tools,
+        (SELECT COUNT(*) FROM session_inputs) AS inputs,
+        (SELECT COUNT(*) FROM runtime_events) AS events`).get(),
+      tools: toolDb.query('SELECT * FROM tool_calls ORDER BY id').all(),
+      inputs: toolDb.query('SELECT * FROM session_inputs ORDER BY id').all(),
+      runs: toolDb.query('SELECT * FROM runs ORDER BY id').all(),
+      events: toolDb.query('SELECT * FROM runtime_events ORDER BY run_id,sequence').all(),
+    });
+    const beforeToolsRead = { facts: readToolFacts(savedDb), requests: requests.length, credentials: credentials.length,
+      finished: finished.length, upserts: upserts.length };
+    expect(beforeToolsRead.facts.counts).toMatchObject({ tools: 1, inputs: 3 });
+    const storedTool = savedDb.query('SELECT id,run_id,session_id,args_json,result_json FROM tool_calls').get() as {
+      id: number; run_id: number; session_id: number; args_json: string; result_json: string;
+    };
+    expect(storedTool).toMatchObject({ run_id: first.data.runId, session_id: sessionId });
+    expect(JSON.parse(storedTool.args_json)).toMatchObject({ raw: args, final: args });
+    expect(storedTool.result_json).toContain('13.00');
     expect(savedDb.query('SELECT native_tool_call_id,status,delivery_json FROM tool_calls').all()).toEqual([{ native_tool_call_id: callId, status: 'succeeded',
       delivery_json: expect.stringContaining('"state":"request_observed"') }]);
     expect(savedDb.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
@@ -760,6 +912,49 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     savedDb.close();
     const restarted = newClient();
     expect((await restarted.start(userDataRoot, '0.1.0', repoRoot)).ok).toBe(true);
+    // Public Activity queries read the actual SDK Tool from the restarted Host SQL store.
+    const toolsPage = await restarted.request({ type: 'list_run_tool_calls',
+      input: { runId: first.data.runId, sessionId, limit: 100 } }) as Result<Page<RuntimeToolView>>;
+    expect(toolsPage.ok).toBe(true);
+    if (!toolsPage.ok) throw new Error('The actual Agent Tool list must be readable.');
+    expect(RuntimeToolPageSchema.safeParse(toolsPage.data).success).toBe(true);
+    expect(toolsPage.data.nextBeforeId).toBeNull();
+    expect(toolsPage.data.items).toHaveLength(1);
+    const actualTool = toolsPage.data.items[0]!;
+    expect(actualTool).toMatchObject({ toolCallId: storedTool.id, runId: first.data.runId, sessionId,
+      toolName: 'calculate_invoice_amounts', status: 'succeeded', committedCandidateId: null,
+      errorCode: null, stopped: true, deliveryState: 'request_observed', formApplicationOutcome: null });
+    expect(actualTool.requestedAt).toBeString();
+    expect(actualTool.startedAt).toBeString();
+    expect(actualTool.endedAt).toBeString();
+    expect(Object.keys(actualTool).sort()).toEqual(['toolCallId', 'runId', 'sessionId', 'toolName', 'status',
+      'requestedAt', 'startedAt', 'endedAt', 'stoppedAt', 'committedCandidateId', 'errorCode', 'stopped',
+      'deliveryState', 'formApplicationOutcome'].sort());
+    expect(RuntimeToolViewSchema.safeParse(actualTool).success).toBe(true);
+    expect(JSON.stringify(actualTool)).not.toContain('netAmount');
+    expect(JSON.stringify(actualTool)).not.toContain('taxRate');
+    expect(JSON.stringify(actualTool)).not.toContain('rounded');
+    expect(JSON.stringify(actualTool)).not.toContain(reply);
+    const oneTool = await restarted.request({ type: 'query_run_tool_call',
+      input: { runId: first.data.runId, sessionId, toolCallId: storedTool.id } }) as Result<RuntimeToolView>;
+    expect(oneTool).toEqual({ ok: true, data: actualTool });
+    expect(await restarted.request({ type: 'list_run_tool_calls',
+      input: { runId: first.data.runId, sessionId, beforeId: storedTool.id, limit: 1 } }))
+      .toEqual({ ok: true, data: { items: [], nextBeforeId: null } });
+    expect(await restarted.request({ type: 'list_run_tool_calls',
+      input: { runId: first.data.runId, sessionId: other.data.sessionId, limit: 50 } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await restarted.request({ type: 'query_run_tool_call',
+      input: { runId: first.data.runId, sessionId: other.data.sessionId, toolCallId: storedTool.id } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await restarted.request({ type: 'query_run_tool_call',
+      input: { runId: second.data.runId, sessionId, toolCallId: storedTool.id } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await restarted.request({ type: 'query_run_tool_call',
+      input: { runId: isolated.data.runId, sessionId: other.data.sessionId, toolCallId: storedTool.id } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(await restarted.request({ type: 'list_run_tool_calls', input: { runId: second.data.runId, sessionId, limit: 50 } }))
+      .toEqual({ ok: true, data: { items: [], nextBeforeId: null } });
     const beforeRead = { requests: requests.length, credentials: credentials.length, events: upserts.length };
     const recovered = await restarted.request({ type: 'list_session_messages', input: { sessionId, limit: 100 } }) as Result<SessionMessagesPage>;
     expect(recovered.ok).toBe(true);
@@ -777,6 +972,8 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     expect(await restarted.close()).toMatchObject({ ok: true, data: { closed: true } });
     const unchanged = new Database(databaseFile, { readonly: true });
     try {
+      expect({ facts: readToolFacts(unchanged), requests: requests.length, credentials: credentials.length,
+        finished: finished.length, upserts: upserts.length }).toEqual(beforeToolsRead);
       expect(unchanged.query('SELECT session_id,sequence,entry_id,entry_json,run_id FROM session_native_entries ORDER BY session_id,sequence').all()).toEqual(savedRows);
       expect(unchanged.query('SELECT * FROM session_native_history ORDER BY session_id').all()).toEqual(savedHeads);
       expect(unchanged.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });

@@ -1,4 +1,4 @@
-import { invoiceToolSchemas } from '@flowmate/contracts';
+import { invoiceToolSchemas, MAX_INVOICE_SEARCH_EXCERPT_CHARS } from '@flowmate/contracts';
 import type { InvoiceToolInput, InvoiceToolOutput, ToolDefinition } from '@flowmate/contracts';
 import type { DocumentService } from '@flowmate/data';
 import { appError } from '@flowmate/contracts';
@@ -27,7 +27,7 @@ export const searchInvoiceDocument = (documents: DocumentService) => ({
     const matches = flattened.slice(cursorIndex + 1).flatMap(({ page, block }) => {
       const index = block.text.indexOf(input.query);
       if (index < 0) return [];
-      const excerpt = block.text.slice(index, index + 512);
+      const excerpt = block.text.slice(index, index + MAX_INVOICE_SEARCH_EXCERPT_CHARS);
       return [{ page, blockId: block.id, kind: block.kind, excerpt, source: sourceFor(loaded.document, page, block.id, excerpt) }];
     });
     const items = matches.slice(0, input.limit);

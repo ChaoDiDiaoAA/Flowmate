@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { parseHostCommand } from '../../apps/host/protocol.ts';
+import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeEventsReadResultSchema,
+  RuntimeEventsWakeSchema, RuntimeSubscriptionResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
+  RunToolCallsRequestSchema, RunToolCallRequestSchema } from '@flowmate/contracts';
 
 describe('versioned desktop Host protocol', () => {
   it('shares new Run budget bounds across chat, ordinary Run, and Fill while active inputs cannot override them', () => {
@@ -183,5 +186,58 @@ describe('versioned desktop Host protocol', () => {
     expect(parseHostCommand({ ...start, expectedSettingsRevision: 0 })).toBeNull();
     expect(parseHostCommand({ ...start, type: 'cancel_run', runId: 5 })).toBeNull();
     expect(parseHostCommand({ version: 1, requestId: 'stop-1', type: 'cancel_run', runId: 5, apiKey: 'secret' })).toBeNull();
+  });
+});
+
+describe('P6 strict DTOs at the desktop protocol boundary', () => {
+  const empty = { runId: 21, sessionId: null, highWatermark: 0, availableRange: null, coverage: 'none' };
+  const subscriptionId = '72e9078d-d110-4a4f-a875-7893f0e7aa75';
+  it('keeps wire subscription requests separate from queries and trusted ownership', () => {
+    const input = { runId: 21, sessionId: null, cursor: { runId: 21, lastPersistedSequence: 0 } };
+    expect(RuntimeEventsQuerySchema.parse(JSON.parse(JSON.stringify(input)))).toEqual({ ...input, limit: 50 });
+    expect(RuntimeEventsSubscriptionRequestSchema.safeParse(input).success).toBe(true);
+    for (const fields of [{ subscriptionId }, { owner: 'renderer' }, { connectionEpoch: 2 }, { availableAfterSequence: 1 }]) {
+      expect(RuntimeEventsSubscriptionRequestSchema.safeParse({ ...input, ...fields }).success).toBe(false);
+    }
+    expect(RuntimeEventsQuerySchema.safeParse({ ...input, subscriptionId }).success).toBe(true);
+    expect(RunToolCallsRequestSchema.safeParse({ runId: 21, sessionId: null }).success).toBe(true);
+    expect(RunToolCallRequestSchema.safeParse({ runId: 21, sessionId: null, toolCallId: 8 }).success).toBe(false);
+  });
+  it('retains independent null failure context through JSON transport and rejects functions or forged notifications', () => {
+    const failed = { ok: false, error: { code: 'storage_read_failed', category: 'storage', retryable: true, message: 'Unavailable.' }, context: null } as const;
+    expect(RuntimeEventsReadResultSchema.parse(JSON.parse(JSON.stringify(failed)))).toEqual(failed);
+    expect(RuntimeEventsReadResultSchema.safeParse({ ok: false, error: failed.error }).success).toBe(false);
+    expect(RuntimeEventsReadResultSchema.safeParse({ ...failed, error: { ...failed.error, context: empty } }).success).toBe(false);
+    const info = { ok: true, data: { ...empty, subscriptionId } };
+    expect(RuntimeSubscriptionResultSchema.safeParse(info).success).toBe(true);
+    expect(RuntimeSubscriptionResultSchema.safeParse({ ...info, data: { ...info.data, unsubscribe() {} } }).success).toBe(false);
+    const wake = { type: 'runtime_events_available', subscriptionId, runId: 21, sequence: 1 };
+    expect(RuntimeEventsWakeSchema.safeParse(wake).success).toBe(true);
+    expect(RuntimeEventsWakeSchema.safeParse({ ...wake, owner: 'renderer' }).success).toBe(false);
+    expect(RuntimeEventsWakeSchema.safeParse({ ...wake, event: { prompt: 'private' } }).success).toBe(false);
+  });
+  it('keeps readonly tool results strict and ordinary failure envelopes compatible', () => {
+    expect(RuntimeToolPageResultSchema.safeParse({ ok: true, data: { items: [], nextBeforeId: null } }).success).toBe(true);
+    const failed = { ok: false, error: { code: 'tool_call_not_found', category: 'storage', retryable: false, message: 'Missing.' }, runId: 21 };
+    expect(RuntimeToolResultSchema.safeParse(failed).success).toBe(true);
+    expect(RuntimeToolResultSchema.safeParse({ ...failed, args: {} }).success).toBe(false);
+    expect(RuntimeToolPageResultSchema.safeParse({ ok: true, data: { items: [], nextBeforeId: null, context: empty } }).success).toBe(false);
+  });
+  it('parses five P6 commands with private Main ownership while public input cannot forge that identity', () => {
+    const ownerToken = 'trusted-frame-page-connection';
+    const input = { runId: 21, sessionId: null, cursor: { runId: 21, lastPersistedSequence: 0 } };
+    const commands = [
+      { type: 'query_runtime_events', ownerToken, input },
+      { type: 'subscribe_runtime_events', ownerToken, subscriptionId, input },
+      { type: 'unsubscribe_runtime_events', ownerToken, subscriptionId },
+      { type: 'list_run_tool_calls', input: { runId: 21, sessionId: null } },
+      { type: 'query_run_tool_call', input: { runId: 21, sessionId: 12, toolCallId: 8 } },
+    ];
+    for (const command of commands) expect(parseHostCommand({ version: 1, requestId: 'p6-wire', ...command })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'p6-wire', type: 'subscribe_runtime_events', subscriptionId, input })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'p6-wire', type: 'subscribe_runtime_events', subscriptionId, ownerToken,
+      input: { ...input, ownerToken: 'forged' } })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'p6-wire', type: 'query_runtime_events', ownerToken,
+      input: { ...input, cursor: { runId: 21, lastPersistedSequence: -1 } } })).not.toBeNull();
   });
 });

@@ -5,7 +5,7 @@ import {
   type Model,
 } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { appError, fail, ok } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, ok } from '@flowmate/contracts';
 import type {
   ProviderConfig,
   Result,
@@ -30,7 +30,7 @@ type FetchFacts = {
   complete: boolean;
 };
 
-const maxOutputBytes = 256 * 1024;
+const maxOutputBytes = RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
 
 function normalizeText(message: AssistantMessage): string {
   return message.content

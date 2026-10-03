@@ -1,4 +1,4 @@
-import { invoiceToolSchemas } from '@flowmate/contracts';
+import { invoiceToolSchemas, MAX_INVOICE_TABLE_PREVIEW_CHARS } from '@flowmate/contracts';
 import type { InvoiceToolInput, InvoiceToolOutput, ToolDefinition } from '@flowmate/contracts';
 import type { DocumentService } from '@flowmate/data';
 import { appError } from '@flowmate/contracts';
@@ -26,7 +26,7 @@ export const listInvoiceTables = (documents: DocumentService) => ({
     const tables = blocks.slice(cursorIndex + 1).filter(({ block }) => block.kind === 'table');
     const items = tables.slice(0, input.limit).map(({ page, block }) => ({
       page, blockId: block.id, sourceType: block.sourceType, textLength: block.text.length,
-      preview: block.text.slice(0, 256), source: sourceFor(loaded.document, page, block.id, block.text),
+      preview: block.text.slice(0, MAX_INVOICE_TABLE_PREVIEW_CHARS), source: sourceFor(loaded.document, page, block.id, block.text),
     }));
     const response = { documentRef: loaded.document.documentRef, parsedArtifactId: loaded.document.parsedArtifactId,
       tables: items, nextAfterBlockId: tables.length > items.length ? items.at(-1)?.blockId ?? null : null,

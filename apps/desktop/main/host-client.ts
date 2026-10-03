@@ -3,12 +3,13 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import { InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, appError, fail, ok } from '@flowmate/contracts';
+import { InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, RuntimeEventsWakeSchema, appError, fail, ok } from '@flowmate/contracts';
 import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, Result } from '@flowmate/contracts';
 import type { HostCommand, HostCredentialRequest, HostEvent, HostOutput } from '../../host/protocol.ts';
+import { isRuntimeHostCommand, parseHostCommand, parseRuntimeHostResult } from '../../host/protocol.ts';
 
 type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
-type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
+type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; command: HostCommand };
 type HostCommandInput = HostCommand extends infer Command
   ? Command extends HostCommand ? Omit<Command, 'version' | 'requestId'> & { requestId?: string } : never
   : never;
@@ -26,9 +27,19 @@ export class HostClient {
   private credentialHandler: ((request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>) | null = null;
   private epoch = 0;
   private invoiceFormHandler: ((request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>) | null = null;
+  private connectionChangeHandler: (() => void) | null = null;
 
   public get state(): HostState | null { return this.currentState; }
   public get connectionEpoch(): number { return this.epoch; }
+  public setConnectionChangeHandler(handler: () => void): void { this.connectionChangeHandler = handler; }
+  public captureRuntimeSubscriptionCleanup(ownerToken: string, subscriptionId: string): () => void {
+    const child = this.child;
+    return () => {
+      if (!child || child.killed || child.exitCode !== null || child.signalCode !== null || child.stdin.destroyed || !child.stdin.writable) return;
+      try { child.stdin.write(`${JSON.stringify({ version: 1, type: 'unsubscribe_runtime_events', requestId: randomUUID(), ownerToken, subscriptionId })}\n`); }
+      catch { /* original Host may have exited; never send this ID to a replacement */ }
+    };
+  }
   public setInvoiceFormHandler(handler: (request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>): void {
     this.invoiceFormHandler = handler;
   }
@@ -44,6 +55,8 @@ export class HostClient {
 
   public async start(userDataRoot: string, appVersion: string, cwd: string,
     invoiceSourceRoot = join(cwd, 'data', 'invoices', 'agent-input')): Promise<Result<HostState>> {
+    this.connectionChangeHandler?.();
+    if (this.child) this.failAll('host_replaced', 'Bun Host 连接已更换。');
     const executable = process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun';
     const env = safeChildEnvironment();
     env.FLOWMATE_DESKTOP_VERSION = appVersion;
@@ -60,7 +73,7 @@ export class HostClient {
     this.processExited = false;
     this.closedReport = null;
     this.exited = new Promise<number | null>((resolveExit) => { this.resolveExit = resolveExit; });
-    child.stdin.on('error', () => this.failAll('host_write_failed', 'Bun Host 输入通道已关闭。'));
+    child.stdin.on('error', () => { if (this.child === child) this.failAll('host_write_failed', 'Bun Host 输入通道已关闭。'); });
     child.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trimEnd();
       if (text) process.stderr.write(`[Flowmate Host] ${text}\n`);
@@ -74,12 +87,14 @@ export class HostClient {
       resolveStartup(result);
     };
     child.on('error', () => {
+      if (this.child !== child) return;
       this.failAll('host_spawn_failed', 'Bun Host 无法启动.');
       settleStartup(fail(appError('host_spawn_failed', 'runtime', 'Bun Host 无法启动。', true)));
     });
     child.on('exit', (code) => {
       if (this.child !== child) return;
       this.processExited = true;
+      this.connectionChangeHandler?.();
       this.resolveExit?.(code);
       this.resolveExit = null;
       if (!startupSettled) settleStartup(fail(appError('host_exited', 'runtime', 'Bun Host 在就绪前退出。', true)));
@@ -105,13 +120,15 @@ export class HostClient {
     const child = this.child;
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
-    const message = { ...command, version: 1, requestId } as HostCommand;
+    const rawMessage = { ...command, version: 1, requestId };
+    const message = isRuntimeHostCommand(command.type) ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
+    if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         reject(new Error('host_request_timeout'));
       }, timeoutMs);
-      this.pending.set(requestId, { resolve, reject, timer });
+      this.pending.set(requestId, { resolve, reject, timer, command: message });
       try {
         child.stdin.write(`${JSON.stringify(message)}\n`, 'utf8', (error) => {
           if (!error) return;
@@ -163,7 +180,7 @@ export class HostClient {
         process.stderr.write('[Flowmate Host] Ignored invalid protocol output.\n');
         return;
       }
-      if (output.version !== 1 || typeof output.type !== 'string') return;
+      if (!output || typeof output !== 'object' || output.version !== 1 || typeof output.type !== 'string') return;
       if (output.type === 'ready') { onReady(output); return; }
       if (output.type === 'invoice_form_request') {
         const request = InvoiceFormBridgeRequestSchema.safeParse(output.request);
@@ -198,8 +215,20 @@ export class HostClient {
         if (!pending) return;
         clearTimeout(pending.timer);
         this.pending.delete(output.requestId);
-        pending.resolve(output.value);
+        if (isRuntimeHostCommand(pending.command.type)) {
+          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
+          const value = validEnvelope ? parseRuntimeHostResult(pending.command.type, output.value) : null;
+          if (value === null || !matchesRuntimeResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(value);
+        } else pending.resolve(output.value);
       } else if (output.type === 'event') {
+        if (!output.event || typeof output.event !== 'object') return;
+        if (output.event.type === 'runtime_events_available') {
+          if (!Object.keys(output).every(key => ['version', 'type', 'event'].includes(key))) return;
+          const wake = RuntimeEventsWakeSchema.safeParse(output.event);
+          if (!wake.success) return;
+          this.emit(wake.data); return;
+        }
         if (output.event.type === 'host_state') this.currentState = output.event.state as HostState;
         this.emit(output.event);
       }
@@ -226,6 +255,44 @@ export class HostClient {
     this.pending.clear();
     if (code === 'host_spawn_failed') process.stderr.write(`[Flowmate Host] ${message}\n`);
   }
+}
+
+function matchesRuntimeResponse(command: HostCommand, value: unknown): boolean {
+  if (!isRuntimeHostCommand(command.type)) return true;
+  const result = value as { ok: boolean; data?: unknown; error?: { code: string }; context?: import('@flowmate/contracts').RuntimeEventReadContext | null };
+  if (!result.ok) return result.context == null || command.type !== 'query_runtime_events'
+    || result.context.runId === command.input.runId
+      && (result.context.sessionId === command.input.sessionId || result.error?.code === 'event_cursor_invalid');
+  if (command.type === 'query_runtime_events') {
+    const page = result.data as import('@flowmate/contracts').RuntimeEventsPage;
+    const input = command.input, c = input.cursor.lastPersistedSequence, d = input.availableAfterSequence;
+    const through = input.throughSequence ?? page.highWatermark, last = page.items.at(-1)?.sequence ?? d ?? c;
+    if (page.runId !== input.runId || page.sessionId !== input.sessionId || input.cursor.runId !== input.runId || c < 0
+      || through < c || through > page.highWatermark || page.hasMore !== (last < through)
+      || page.items.length > input.limit || page.items.some(event => event.sequence > through)) return false;
+    if (d !== undefined) return d >= c && d <= through && page.nextCursor.lastPersistedSequence === c
+      && page.nextAvailableAfterSequence === (page.items.at(-1)?.sequence ?? d)
+      && (page.items.length === 0 || page.items[0].sequence === d + 1);
+    return page.nextAvailableAfterSequence === null && page.nextCursor.lastPersistedSequence === (page.items.at(-1)?.sequence ?? c)
+      && (page.items.length === 0 || page.items[0].sequence === c + 1);
+  }
+  if (command.type === 'subscribe_runtime_events') {
+    const info = result.data as import('@flowmate/contracts').RuntimeSubscriptionInfo;
+    return info.subscriptionId === command.subscriptionId && info.runId === command.input.runId && info.sessionId === command.input.sessionId
+      && command.input.cursor.runId === command.input.runId && command.input.cursor.lastPersistedSequence >= 0
+      && command.input.cursor.lastPersistedSequence <= info.highWatermark;
+  }
+  if (command.type === 'list_run_tool_calls') {
+    const page = result.data as import('@flowmate/contracts').Page<import('@flowmate/contracts').RuntimeToolView>;
+    return page.items.length <= command.input.limit && (command.input.sessionId !== null || page.items.length === 0)
+      && page.items.every(tool => tool.runId === command.input.runId && tool.sessionId === command.input.sessionId
+        && (command.input.beforeId === undefined || tool.toolCallId < command.input.beforeId));
+  }
+  if (command.type === 'query_run_tool_call') {
+    const tool = result.data as import('@flowmate/contracts').RuntimeToolView;
+    return tool.runId === command.input.runId && tool.sessionId === command.input.sessionId && tool.toolCallId === command.input.toolCallId;
+  }
+  return true;
 }
 
 export function safeChildEnvironment(): NodeJS.ProcessEnv {

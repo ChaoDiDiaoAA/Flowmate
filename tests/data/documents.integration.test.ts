@@ -2,7 +2,7 @@ import { copyFileSync, cpSync, mkdirSync, readFileSync, readdirSync, renameSync,
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'bun:test';
-import { ok } from '@flowmate/contracts';
+import { appError, fail, ok } from '@flowmate/contracts';
 import { createDocumentService } from '../../packages/data/src/documents.ts';
 import { readInvoiceEvidence } from '../../packages/employee-invoice/src/tools/read_invoice_evidence.ts';
 import { checkInvoiceSourcesResult } from '../../packages/employee-invoice/src/tools/check_invoice_sources.ts';
@@ -150,6 +150,119 @@ describe('P3 controlled document input', () => {
       data: { documentRef: { id: documentId }, isHidden: false } });
     expect(opened.documents.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ documentRef: { id: documentId } }] } });
   });
+  for (const access of ['run', 'workspace', 'restore', 'sources'] as const) {
+    it(`rejects equal-length managed text drift through ${access} and restores only matching stored content`, async () => {
+      const root = mkdtempSync(join(tmpdir(), 'flowmate-parsed-consistency-'));
+      const sourceDirectory = join(root, 'source', '000001');
+      writeSample(sourceDirectory);
+      const { opened, service, productPaths } = serviceFor(root);
+      const imported = await service.importVoxel51({ sourceDirectory });
+      expect(imported.ok).toBe(true);
+      if (!imported.ok) return;
+      const document = imported.data;
+      const documentId = document.documentRef.id;
+      const context = { runId: 1, sessionId: 1, scope: { version: 2 as const,
+        allowedTools: ['read_invoice_document', 'check_invoice_sources'], allowedDocumentIds: [documentId],
+        allowedArtifactIds: [document.parsedArtifactId], allowedResourcePaths: [] } };
+      const managedPath = join(productPaths.artifactsDir, String(document.parsedArtifactId), 'parsed.json');
+      const saved = readFileSync(managedPath);
+      const changed = Buffer.from(saved.toString('utf8').replace('Header text', 'Header edit'));
+      expect(changed.byteLength).toBe(saved.byteLength);
+      expect(changed.equals(saved)).toBe(false);
+      writeFileSync(managedPath, changed);
+      const changedSource = { documentId, version: document.documentRef.version,
+        artifactId: document.parsedArtifactId, page: 1, blockId: 'b1', quote: 'Header edit' };
+      if (access === 'restore') {
+        expect(opened.documents.setAvailability({ documentId, status: 'unavailable', reason: 'fixture',
+          at: '2026-09-28T00:01:00.000Z' }).ok).toBe(true);
+      }
+      const result = access === 'run' ? service.readParsedForRun(documentId, context)
+        : access === 'workspace' ? service.readParsedForWorkspace(documentId)
+        : access === 'restore' ? service.restoreDocument(documentId)
+        : checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents);
+      expect(result).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+      expect(opened.documents.get(documentId)).toMatchObject({ ok: true,
+        data: { documentRef: document.documentRef, status: 'unavailable' } });
+      expect(checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents))
+        .toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+      expect(service.restoreDocument(documentId)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+
+      writeFileSync(managedPath, saved);
+      for (const name of ['original.png', 'content.json', 'pages.json', 'metadata.json']) unlinkSync(join(sourceDirectory, name));
+      expect(service.restoreDocument(documentId)).toMatchObject({ ok: true,
+        data: { documentRef: document.documentRef, status: 'available' } });
+      const restoredRead = service.readParsedForWorkspace(documentId);
+      expect(restoredRead.ok).toBe(true);
+      if (restoredRead.ok) expect(restoredRead.data.parsed.pages[0]?.blocks[0])
+        .toMatchObject({ id: 'b1', text: 'Header text' });
+      expect(checkInvoiceSourcesResult({ documentId, sources: [{ ...changedSource, quote: 'Header text' }] }, context, service, opened.documents))
+        .toMatchObject({ ok: true, data: { results: [{ status: 'valid', code: 'parsed_quote_matched' }] } });
+    });
+  }
+
+  for (const [fileName, attempt] of [['original.png', 1], ['raw-content.json', 2], ['source.json', 1]] as const) {
+    it(`preserves availability on a transient restore read of ${fileName} at attempt ${attempt}`, async () => {
+      const root = mkdtempSync(join(tmpdir(), 'flowmate-restore-transient-'));
+      const sourceDirectory = join(root, 'source', '000001');
+      writeSample(sourceDirectory);
+      const { opened, files, service } = serviceFor(root);
+      const imported = await service.importVoxel51({ sourceDirectory });
+      expect(imported.ok).toBe(true);
+      if (!imported.ok) return;
+      const read = files.read.bind(files);
+      let matchedReads = 0;
+      const temporaryFailure = fail(appError('input_unavailable', 'input', 'Temporarily unreadable.', true));
+      files.read = (artifact, name) => name === fileName && ++matchedReads === attempt
+        ? temporaryFailure : read(artifact, name);
+      const restored = service.restoreDocument(imported.data.documentRef.id);
+      expect(matchedReads).toBe(attempt);
+      expect(restored).toEqual(temporaryFailure);
+      expect(opened.documents.get(imported.data.documentRef.id)).toMatchObject({ ok: true,
+        data: { status: 'available', unavailableReason: null } });
+      files.read = read;
+      expect(service.restoreDocument(imported.data.documentRef.id)).toMatchObject({ ok: true,
+        data: { status: 'available', unavailableReason: null } });
+    });
+  }
+
+  it('reads and restores legacy managed parsed files without requiring new raw sidecars', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-legacy-parsed-'));
+    const { opened, files, service } = serviceFor(root);
+    const at = '2026-09-28T00:00:00.000Z';
+    const parsedBytes = Buffer.from(JSON.stringify({ formatVersion: 1, parser: { key: 'legacy-parser' },
+      pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text', text: 'Legacy text',
+        sourceIndex: 0, sourceType: 'text', bbox: null }] }],
+      completeness: { status: 'complete', checks: ['legacy'], warnings: [] } }));
+    const published = await files.publish({ sourceKey: 'voxel51', sourceRecordId: 'legacy-1', sourceVersion: 'legacy-v1', at,
+      original: { kind: 'original', primaryName: 'original.png',
+        files: [{ name: 'original.png', bytes: onePixelPng, mimeType: 'image/png' }] },
+      parsed: { kind: 'parsed', primaryName: 'parsed.json',
+        files: [{ name: 'parsed.json', bytes: parsedBytes, mimeType: 'application/json' }] } });
+    expect(published.ok).toBe(true);
+    if (!published.ok) return;
+    const registered = opened.documents.register({ documentId: published.data.documentId,
+      sourceKey: 'voxel51', sourceRecordId: 'legacy-1', version: 'legacy-v1',
+      originalArtifact: { ...published.data.original, kind: 'original' },
+      parsedArtifact: { ...published.data.parsed, kind: 'parsed' }, status: 'available',
+      metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['local review'],
+        licenseVerification: 'not_verified', unavailableReason: null }, createdAt: at, updatedAt: at });
+    expect(registered.ok).toBe(true);
+    if (!registered.ok) return;
+    const document = registered.data;
+    const context = { runId: 1, sessionId: 1, scope: { version: 2 as const,
+      allowedTools: ['read_invoice_document'], allowedDocumentIds: [document.documentRef.id],
+      allowedArtifactIds: [document.parsedArtifactId], allowedResourcePaths: [] } };
+    expect(service.readParsedForRun(document.documentRef.id, context)).toMatchObject({ ok: true,
+      data: { parsed: { pages: [{ blocks: [{ id: 'b1', text: 'Legacy text' }] }] } } });
+    const workspaceRead = service.readParsedForWorkspace(document.documentRef.id);
+    expect(workspaceRead.ok).toBe(true);
+    if (workspaceRead.ok) expect(workspaceRead.data.parsed).not.toHaveProperty('parser');
+    expect(opened.documents.setAvailability({ documentId: document.documentRef.id, status: 'unavailable',
+      reason: 'fixture', at }).ok).toBe(true);
+    expect(service.restoreDocument(document.documentRef.id)).toMatchObject({ ok: true,
+      data: { documentRef: document.documentRef, status: 'available' } });
+  });
+
   it('maps existing parsed content to stable one-based pages and source-index block IDs', () => {
     const result = parseVoxel51Sample(sample());
     expect(result.ok).toBe(true);

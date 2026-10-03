@@ -1,4 +1,4 @@
-import { appError, fail, ok, ParsedBlockSchema } from '@flowmate/contracts';
+import { appError, fail, ok, ParsedBlockSchema, MAX_INVOICE_BLOCKS_PER_PAGE } from '@flowmate/contracts';
 import type { ParsedBlock, Result } from '@flowmate/contracts';
 
 export const VOXEL51_SOURCE_KEY = 'voxel51-hq-invoice-ocr';
@@ -77,24 +77,42 @@ function blockText(block: Record<string, unknown>): { kind: ParsedBlock['kind'];
 
 export function parseVoxel51Sample(input: Voxel51SampleInput): Result<Voxel51Sample> {
   const metadata = record(input.metadata);
-  const content = input.content;
   const sourceRecordId = metadata?.sourceRecordId;
   const sampleId = metadata?.sampleId;
   const datasetRevision = metadata?.datasetRevision;
   const allowedUsesClaim = stringList(metadata?.allowedUsesClaim, 32);
   const licenseVerification = metadata?.licenseVerification;
   const files = metadata?.files;
-  const pageDirectory = Array.isArray(input.pages) && input.pages.length === 1 ? input.pages[0] : null;
-  const rawPageText = pageText(pageDirectory);
   const invalid = !metadata || typeof sampleId !== 'string' || !/^\d{6}$/.test(sampleId)
     || typeof sourceRecordId !== 'string' || sourceRecordId.length < 1 || sourceRecordId.length > 512
     || typeof datasetRevision !== 'string' || datasetRevision.length < 1 || datasetRevision.length > 256
     || !allowedUsesClaim || typeof licenseVerification !== 'string' || licenseVerification.length > 1024
     || !Array.isArray(files) || files.length < 3 || files.length > 64
     || typeof metadata.qualityStatus !== 'string' || /partial|blocked|incomplete|failed/i.test(metadata.qualityStatus)
-    || !['original.jpg', 'original.png'].includes(input.originalFileName)
-    || !Array.isArray(content) || content.length < 1 || content.length > 2_000 || rawPageText === null;
+    || !['original.jpg', 'original.png'].includes(input.originalFileName);
   if (invalid) return fail(appError('source_invalid', 'input', '来源材料结构不完整或不受支持。'));
+
+  const parsed = mapVoxel51ParsedDocument({ content: input.content, pages: input.pages });
+  if (!parsed.ok) return parsed;
+  return ok({
+    sourceKey: VOXEL51_SOURCE_KEY,
+    sampleId: sampleId as string,
+    sourceRecordId: sourceRecordId as string,
+    datasetRevision: datasetRevision as string,
+    originalFileName: input.originalFileName as Voxel51Sample['originalFileName'],
+    allowedUsesClaim,
+    licenseVerification,
+    parsed: parsed.data,
+  });
+}
+
+export function mapVoxel51ParsedDocument(input: { content: unknown; pages: unknown }): Result<ParsedVoxel51Document> {
+  const content = input.content;
+  const pageDirectory = Array.isArray(input.pages) && input.pages.length === 1 ? input.pages[0] : null;
+  const rawPageText = pageText(pageDirectory);
+  if (!Array.isArray(content) || content.length < 1 || content.length > MAX_INVOICE_BLOCKS_PER_PAGE || rawPageText === null) {
+    return fail(appError('source_invalid', 'input', '来源材料结构不完整或不受支持。'));
+  }
 
   const page = record(pageDirectory)!;
   if (Number(page.blockCount) !== content.length) return fail(appError('source_invalid', 'input', '来源页目录与解析块数量不一致。'));
@@ -123,17 +141,8 @@ export function parseVoxel51Sample(input: Voxel51SampleInput): Result<Voxel51Sam
     return fail(appError('source_invalid', 'input', '来源解析页为空。'));
   }
   return ok({
-    sourceKey: VOXEL51_SOURCE_KEY,
-    sampleId: sampleId as string,
-    sourceRecordId: sourceRecordId as string,
-    datasetRevision: datasetRevision as string,
-    originalFileName: input.originalFileName as Voxel51Sample['originalFileName'],
-    allowedUsesClaim,
-    licenseVerification,
-    parsed: {
-      formatVersion: 2,
-      pages: [{ page: 1, blocks }],
-      completeness: { status: 'complete', checks: ['page-sequence', 'block-count', 'supported-blocks'], warnings: [] },
-    },
+    formatVersion: 2,
+    pages: [{ page: 1, blocks }],
+    completeness: { status: 'complete', checks: ['page-sequence', 'block-count', 'supported-blocks'], warnings: [] },
   });
 }

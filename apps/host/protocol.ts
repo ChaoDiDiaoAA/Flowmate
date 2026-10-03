@@ -4,10 +4,14 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   SessionInputsRequestSchema, SetSessionStatusRequestSchema, BranchSessionRequestSchema,
   SessionMessagesRequestSchema, WorkingDirectorySchema, WorkspaceExpectationSchema, SaveInvoiceCandidateRequestSchema,
   AcceptInvoiceCandidateRequestSchema, RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema,
-  InvoiceCandidateOperationQuerySchema, RuntimeRequestOverridesSchema } from '@flowmate/contracts';
+  InvoiceCandidateOperationQuerySchema, RuntimeRequestOverridesSchema, RUNTIME_CONFIG,
+  RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeSubscriptionIdSchema,
+  RunToolCallsRequestSchema, RunToolCallRequestSchema, RuntimeEventsReadResultSchema, RuntimeSubscriptionResultSchema,
+  RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema } from '@flowmate/contracts';
 import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
+const ownerToken = z.string().min(1).max(256);
 const modelId = z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/);
 const dbId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const pageLimit = z.number().int().min(1).max(100);
@@ -46,6 +50,12 @@ const workspaceChange = z.discriminatedUnion('kind', [
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_runtime_events'), ownerToken, input: RuntimeEventsQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('subscribe_runtime_events'), ownerToken,
+    subscriptionId: RuntimeSubscriptionIdSchema, input: RuntimeEventsSubscriptionRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('unsubscribe_runtime_events'), ownerToken, subscriptionId: RuntimeSubscriptionIdSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_run_tool_calls'), input: RunToolCallsRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_run_tool_call'), input: RunToolCallRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('submit_session_input'), input: DesktopSessionInputRequestSchema,
     expectedSettingsRevision: dbId.optional(), expectedCredentialRef: credentialRef.optional() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_session_inputs'), input: SessionInputsRequestSchema }).strict(),
@@ -79,7 +89,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     version: z.literal(1), requestId, type: z.literal('call_provider'),
     input: z.object({
       goal: z.string().min(1).max(4096), text: z.string().max(65_536), modelId,
-      timeoutMs: z.number().int().min(100).max(120_000).optional(),
+      timeoutMs: z.number().int().min(RUNTIME_CONFIG.ranges.providerTestTimeoutMs.min).max(RUNTIME_CONFIG.ranges.providerTestTimeoutMs.max).optional(),
     }).strict(),
   }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_provider'), targetRequestId: requestId }).strict(),
@@ -187,12 +197,29 @@ export type HostEvent = {
     | { type: 'host_state'; state: Partial<Omit<DesktopState, 'modelCredentials'>> & Pick<DesktopState, 'version' | 'ready' | 'host' | 'appVersion' | 'userDataPath'> }
     | { type: 'model_auth_notice'; requestId: string; notice: ModelAuthNotice }
     | { type: 'model_auth_prompt'; requestId: string; promptId: string; prompt: ModelAuthPrompt }
-    | { type: 'agent_run_event'; requestId: string; value: AgentRunEvent };
+    | { type: 'agent_run_event'; requestId: string; value: AgentRunEvent }
+    | import('@flowmate/contracts').RuntimeEventsWake;
 };
 
 export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest | HostInvoiceFormRequest;
 
 export function parseHostCommand(value: unknown): HostCommand | null {
   const parsed = hostCommandSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+const runtimeResultSchemas = {
+  query_runtime_events: RuntimeEventsReadResultSchema,
+  subscribe_runtime_events: RuntimeSubscriptionResultSchema,
+  unsubscribe_runtime_events: RuntimeSubscriptionReleaseResultSchema,
+  list_run_tool_calls: RuntimeToolPageResultSchema,
+  query_run_tool_call: RuntimeToolResultSchema,
+};
+export function isRuntimeHostCommand(type: string): type is keyof typeof runtimeResultSchemas {
+  return Object.hasOwn(runtimeResultSchemas, type);
+}
+export function parseRuntimeHostResult(type: string, value: unknown): unknown | null {
+  if (!isRuntimeHostCommand(type)) return null;
+  const parsed = runtimeResultSchemas[type].safeParse(value);
   return parsed.success ? parsed.data : null;
 }

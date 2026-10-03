@@ -1,24 +1,34 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
-import { appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest,
+  RuntimeEventsAvailableSchema } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings } from '@flowmate/core';
 import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
-import { parseHostCommand } from './protocol.ts';
+import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand } from './protocol.ts';
 import type { HostCommand, HostOutput } from './protocol.ts';
 
 for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) {
   console[method] = (...values: unknown[]) => process.stderr.write(`${values.map((value) => String(value)).join(' ')}\n`);
 }
 
-function send(value: HostOutput): void {
-  try { process.stdout.write(`${JSON.stringify(value)}\n`); } catch { /* parent may already have exited */ }
+// Bun's native stdout can block inside write on Windows and reports no queue length.
+// This fd=1 stream tracks real bytes waiting for pipe drain for every protocol line.
+const stdout = createWriteStream('', { fd: 1, autoClose: false });
+stdout.on('error', () => { /* parent may already have exited; runHost also releases observers */ });
+function send(value: HostOutput): Promise<void> {
+  if (value.type === 'event' && value.event.type === 'runtime_events_available' && stdout.writableLength >= 262144) return Promise.resolve();
+  return new Promise(resolveWritten => {
+    try { stdout.write(`${JSON.stringify(value)}\n`, () => resolveWritten()); }
+    catch { resolveWritten(); }
+  });
 }
 
 function startupRoot(): string | null {
@@ -150,6 +160,44 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     return;
   }
   application = created.data;
+  type RuntimeRegistration = {
+    ownerToken: string; identity: string; input: import('@flowmate/contracts').RuntimeEventsSubscriptionRequest;
+    closed: boolean; local?: import('@flowmate/contracts').RuntimeEventSubscription;
+    timer?: ReturnType<typeof setTimeout>; pendingWake: number | null; wakeQueued: boolean;
+    opened: Promise<Result<import('@flowmate/contracts').RuntimeSubscriptionInfo>>;
+  };
+  const runtimeRegistrations = new Map<string, RuntimeRegistration>();
+  const releasedRuntimeRegistrations = new Map<string, string>();
+  const runtimeQueries = new Set<string>();
+  let runtimeObservationsClosing = false;
+  const rememberRelease = (id: string, owner: string) => {
+    releasedRuntimeRegistrations.set(id, owner);
+    if (releasedRuntimeRegistrations.size > 4096) releasedRuntimeRegistrations.delete(releasedRuntimeRegistrations.keys().next().value!);
+  };
+  const releaseRuntimeRegistration = (id: string) => {
+    const entry = runtimeRegistrations.get(id);
+    if (!entry) return;
+    entry.closed = true; clearTimeout(entry.timer); entry.pendingWake = null;
+    runtimeRegistrations.delete(id); rememberRelease(id, entry.ownerToken);
+    try { entry.local?.unsubscribe(); } catch { /* observer disposal never changes execution */ }
+  };
+  const renewRuntimeRegistration = (id: string, entry: RuntimeRegistration) => {
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => releaseRuntimeRegistration(id), 90_000);
+    entry.timer.unref();
+  };
+  const closeRuntimeObservations = () => {
+    runtimeObservationsClosing = true;
+    for (const id of runtimeRegistrations.keys()) releaseRuntimeRegistration(id);
+    releasedRuntimeRegistrations.clear();
+  };
+  stdout.once('error', closeRuntimeObservations);
+  const runtimeReply = (command: HostCommand, value: unknown) => {
+    const checked = parseRuntimeHostResult(command.type, value);
+    const error = appError('host_protocol_invalid', 'runtime', 'Runtime observation response is invalid.', true);
+    send({ version: 1, type: 'response', requestId: command.requestId,
+      value: checked ?? (command.type === 'query_runtime_events' ? { ok: false, error, context: null } : fail(error)) });
+  };
   const catalog = await createPiModelCatalog();
   const requireDesktopPiKey = async (profile: ModelProfile): Promise<Result<void>> => {
     const revision = currentSettings.revision;
@@ -190,6 +238,77 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
   };
 
   const dispatch = async (command: HostCommand): Promise<void> => {
+    if (command.type === 'subscribe_runtime_events') {
+      const { subscriptionId: id, ownerToken: owner, input } = command;
+      const identity = JSON.stringify(input), existing = runtimeRegistrations.get(id);
+      if (existing) {
+        runtimeReply(command, existing.ownerToken !== owner
+          ? fail(appError('event_subscription_invalid', 'input', 'Observation belongs to another owner.'))
+          : existing.identity !== identity ? fail(appError('state_conflict', 'runtime', 'Observation parameters conflict.'))
+            : await existing.opened);
+        return;
+      }
+      if (runtimeObservationsClosing || releasedRuntimeRegistrations.has(id)) {
+        runtimeReply(command, fail(appError('event_subscription_invalid', 'input', 'Observation has been released.'))); return;
+      }
+      if (runtimeRegistrations.size >= 64 || [...runtimeRegistrations.values()].filter(entry => entry.ownerToken === owner).length >= 8) {
+        runtimeReply(command, fail(appError('event_subscription_limit', 'runtime', 'Observation capacity reached.'))); return;
+      }
+      if ([...runtimeRegistrations.values()].some(entry => entry.ownerToken === owner && entry.input.runId === input.runId && !entry.local)) {
+        runtimeReply(command, fail(appError('event_subscription_invalid', 'input', 'An observation for this Run is opening.'))); return;
+      }
+      const entry: RuntimeRegistration = { ownerToken: owner, identity, input, closed: false, pendingWake: null,
+        wakeQueued: false, opened: Promise.resolve(fail(appError('event_subscription_invalid', 'input', 'Observation is opening.'))) };
+      runtimeRegistrations.set(id, entry); renewRuntimeRegistration(id, entry);
+      entry.opened = Promise.resolve().then(() => application.subscribeRuntimeEvents(input, wake => {
+        if (entry.closed || !RuntimeEventsAvailableSchema.safeParse(wake).success || wake.runId !== input.runId) return;
+        entry.pendingWake = Math.max(entry.pendingWake ?? 0, wake.sequence);
+        if (entry.wakeQueued) return;
+        entry.wakeQueued = true;
+        queueMicrotask(() => {
+          entry.wakeQueued = false;
+          const sequence = entry.pendingWake; entry.pendingWake = null;
+          if (!entry.closed && sequence !== null) send({ version: 1, type: 'event',
+            event: { type: 'runtime_events_available', subscriptionId: id, runId: input.runId, sequence } });
+        });
+      })).then(result => {
+        if (!result.ok) { releaseRuntimeRegistration(id); return result; }
+        if (entry.closed) { result.data.unsubscribe(); return fail(appError('event_subscription_invalid', 'input', 'Observation was released while opening.')); }
+        entry.local = result.data;
+        const { unsubscribe: _unsubscribe, ...context } = result.data;
+        return ok({ ...context, subscriptionId: id });
+      }).catch(() => { releaseRuntimeRegistration(id); return fail(appError('storage_read_failed', 'storage', 'Observation could not open.', true)); });
+      runtimeReply(command, await entry.opened); return;
+    }
+    if (command.type === 'unsubscribe_runtime_events') {
+      const existing = runtimeRegistrations.get(command.subscriptionId);
+      const knownOwner = existing?.ownerToken ?? releasedRuntimeRegistrations.get(command.subscriptionId);
+      if (knownOwner !== undefined && knownOwner !== command.ownerToken) {
+        runtimeReply(command, fail(appError('event_subscription_invalid', 'input', 'Observation belongs to another owner.'))); return;
+      }
+      releaseRuntimeRegistration(command.subscriptionId);
+      rememberRelease(command.subscriptionId, command.ownerToken);
+      runtimeReply(command, ok(undefined)); return;
+    }
+    if (command.type === 'query_runtime_events') {
+      const { subscriptionId: id, ...input } = command.input;
+      if (id !== undefined) {
+        const entry = runtimeRegistrations.get(id);
+        if (!entry || entry.ownerToken !== command.ownerToken || entry.input.runId !== input.runId || entry.input.sessionId !== input.sessionId) {
+          runtimeReply(command, { ok: false, error: appError('event_subscription_invalid', 'input', 'Observation identity is invalid.'), context: null }); return;
+        }
+        renewRuntimeRegistration(id, entry);
+      }
+      if (runtimeQueries.has(command.ownerToken)) {
+        runtimeReply(command, { ok: false, error: appError('event_query_busy', 'runtime', 'An event query is already in flight.', true), context: null }); return;
+      }
+      runtimeQueries.add(command.ownerToken);
+      try { runtimeReply(command, await application.queryRuntimeEvents(input)); }
+      finally { runtimeQueries.delete(command.ownerToken); }
+      return;
+    }
+    if (command.type === 'list_run_tool_calls') { runtimeReply(command, await application.listRunToolCalls(command.input)); return; }
+    if (command.type === 'query_run_tool_call') { runtimeReply(command, await application.queryRunToolCall(command.input)); return; }
     if (command.type === 'invoice_form_response') {
       const pending = pendingForms.get(command.requestId);
       if (!pending) return;
@@ -496,10 +615,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       return;
     }
     if (command.type === 'close') {
+      closeRuntimeObservations();
       const report = await application.close();
-      send({ version: 1, type: 'response', requestId: command.requestId, value: report });
+      await send({ version: 1, type: 'response', requestId: command.requestId, value: report });
       if (report.ok && report.data.closed) {
-        send({ version: 1, type: 'event', event: { type: 'host_state', state: { ...state(), ready: false, host: 'closing' } } });
+        await send({ version: 1, type: 'event', event: { type: 'host_state', state: { ...state(), ready: false, host: 'closing' } } });
         setTimeout(() => process.exit(0), 30);
       }
       return;
@@ -574,7 +694,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
         native: { authPath: authFile, modelsPath: null },
         ...(profile.kind === 'custom' ? { connection: { baseUrl: profile.baseUrl, api: profile.api,
           contextWindow: profile.contextWindow!, maxTokens: profile.maxTokens!, reasoning: profile.reasoning } } : {}),
-        parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
+        parameters: { ...RUNTIME_CONFIG.provider },
       };
       const normalized = command.type === 'start_run' ? normalizeAgentRunRequest({
         sessionId: command.input.sessionId,
@@ -649,8 +769,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
         ...(profile.kind === 'custom' ? { connection: { baseUrl: profile.baseUrl, api: profile.api,
           contextWindow: profile.contextWindow!, maxTokens: profile.maxTokens!, reasoning: profile.reasoning } } : {}),
         parameters: {
-          maxRetries: 0,
-          maxRetryDelayMs: 2000,
+          ...RUNTIME_CONFIG.provider,
         },
       };
       const normalized = normalizeProviderRequest({
@@ -699,10 +818,14 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     const command = parseHostCommand(raw);
     if (!command) return;
     void dispatch(command).catch(() => {
-      send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('host_command_failed', 'runtime', 'Host 命令处理失败。', true)) });
+      const error = appError('host_command_failed', 'runtime', 'Host 命令处理失败。', true);
+      if (isRuntimeHostCommand(command.type)) runtimeReply(command, command.type === 'query_runtime_events'
+        ? { ok: false, error, context: null } : fail(error));
+      else send({ version: 1, type: 'response', requestId: command.requestId, value: fail(error) });
     });
   });
   input.on('close', () => {
+    closeRuntimeObservations();
     let retry: ReturnType<typeof setInterval> | undefined;
     const closeEventually = async () => {
       const report = await application.close();
