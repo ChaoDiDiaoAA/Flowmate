@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { Database } from 'bun:sqlite';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { appError, fail, InvoiceFormDraftSchema } from '@flowmate/contracts';
+import { appError, fail, InvoiceFormDraftSchema, CandidateDraftSchema, ContextSnapshotJsonSchema, ContextObservationsSchema, invoiceLineFields, formatExecutionPrompt } from '@flowmate/contracts';
 import type { AgentRunEvent, AgentRunRequest, Application, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest,
   ProviderConfig, Result, FillInputRequest, WorkspaceSnapshot } from '@flowmate/contracts';
 import { createApplication } from '../../../apps/composition.ts';
@@ -57,6 +57,89 @@ async function run(app: Application, request: AgentRunRequest | FillInputRequest
 }
 
 describe('Fill backend through the public Application', () => {
+  it('T10 F8-06 sends a complete real 64-line large candidate Fill prompt to HTTP and the trusted form bridge', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-t10-large-fill-'));
+    const paths = productPaths(join(root, 'product'));
+    const sourceRoot = join(root, 'source'), source = join(sourceRoot, '000001'); writeInvoice(source);
+    const values = Array.from({ length: 64 }, (_, index) => `T10-line-${index}:` + '😀'.repeat(256));
+    const modelCandidate = CandidateDraftSchema.parse(candidate);
+    const requests: Array<{ messages: Array<{ role: string; content?: unknown }>; tools?: Array<{ function: { name: string } }> }> = [];
+    const bridgeCalls: InvoiceFormBridgeRequest[] = []; let documentId = 0, candidateId = 0;
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      requests.push(await request.json()); const ordinal = requests.length;
+      const tool = ordinal === 1 ? { name: 'save_invoice_candidate', input: { documentId, candidate: modelCandidate } }
+        : ordinal === 3 ? { name: 'fill_invoice_form', input: { candidateId } } : null;
+      const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `t10-fill-${ordinal}`, type: 'function',
+        function: { name: tool.name, arguments: JSON.stringify(tool.input) } }] } : { role: 'assistant', content: 'Controlled completed Fill.' };
+      const chunk = (value: unknown, reason: string | null) => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: value, finish_reason: reason }] }) + '\n\n';
+      return new Response(chunk(delta, null) + chunk({}, tool ? 'tool_calls' : 'stop') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    deferCleanup(() => server.stop(true));
+    const config: ProviderConfig = { version: 1, name: 'T10 large Fill', revision: 1, modelRef: { provider: 't10-fill', model: 'fixture' },
+      native: { authPath: join(root, 'unused.json'), modelsPath: null }, connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`,
+        api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+    const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
+      invoiceFormBridge: async request => { bridgeCalls.push(structuredClone(request)); const base = unknownReceipt(request);
+        return { ...base, outcome: 'applied', appliedRevision: request.target.expectedRevision + 1, appliedAt: base.observedAt }; },
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-large-fill-key' }) }));
+    deferCleanup(() => app.close());
+    const doc = need(await app.importInvoiceMaterial(source)); documentId = doc.documentRef.id;
+    const session = need(await app.createSession({ title: 'Large Fill', expectedRevision: need(await app.readWorkspace()).revision }));
+    const current = need(await app.updateWorkspace({ expectedRevision: need(await app.readWorkspace()).revision, change: { kind: 'document', documentId } }));
+    const task = need(await app.startTask({ clientSequence: 1, expectedRevision: current.revision, documentRef: doc.documentRef, goal: 'Review complete large candidate' }));
+    const generated = await run(app, { sessionId: session.sessionId, goalMode: 'save-candidate', text: 'Save every line.', workspace: expectation(task.workspace), config, timeoutMs: 5000, stopGraceMs: 500 });
+    expect(generated.finished.result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    const saved = need(await app.listJobCandidates({ jobId: task.job.jobId })).items[0]!; candidateId = saved.candidateId;
+    expect(saved.context).toMatchObject({ snapshotId: expect.any(Number), requestSequence: 1 });
+    const selected = need(await app.selectCandidate({ jobId: task.job.jobId, candidateId, expectedCandidateId: null, expectedRevision: need(await app.readWorkspace()).revision }));
+    const formDraft = InvoiceFormDraftSchema.parse({ fields: Object.fromEntries(Object.keys(candidate.fields).map(name => [name, ''])),
+      lines: values.map(description => ({ ...Object.fromEntries(invoiceLineFields.map(name => [name, ''])), description })), notes: [] });
+    const human = need(await app.saveInvoiceCandidate({ operationRef: 't10-large-human-edit', jobId: task.job.jobId,
+      expectedCandidateId: candidateId, expectedRevision: selected.workspace.revision, basedOnCandidateId: candidateId, draft: formDraft }));
+    const large = { fields: human.candidate.fields, lines: human.candidate.lines, notes: human.candidate.notes };
+    expect(human.candidate).toMatchObject({ origin: 'human_edit', basedOnCandidateId: candidateId, runId: null, toolCallId: null, context: null });
+    candidateId = human.candidate.candidateId;
+    expect(Buffer.byteLength(JSON.stringify(large))).toBeGreaterThan(65536);
+    expect(Buffer.byteLength(JSON.stringify(large))).toBeLessThan(262144);
+    const filled = await run(app, { sessionId: session.sessionId, clientSequence: 2, mode: 'prompt', goalMode: 'fill-form', text: 'Apply every complete line.',
+      workspace: expectation(human.workspace), config, formTarget: { formInstanceId: 'private-t10-form', expectedRevision: 4 }, timeoutMs: 5000, stopGraceMs: 500 }, true);
+    expect(filled.finished.result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    const input = need(await app.querySessionInput({ sessionId: session.sessionId, inputId: filled.accepted.inputId })).input!;
+    const content = input.content;
+    if (content.version !== 2 || input.mode !== 'prompt' || !content.workspaceInput) throw new Error('Real frozen V2 Fill required.');
+    const wire = requests[2]!;
+    expect(wire.messages.filter(message => message.role === 'user').at(-1)?.content).toEqual([{ type: 'text', text: content.promptText }]);
+    expect(Buffer.byteLength(content.promptText)).toBeGreaterThan(65536);
+    expect(content.promptText.startsWith(formatExecutionPrompt({ text: content.text, business: true, goalMode: 'fill-form',
+      workspaceInput: content.workspaceInput, ...(content.workspaceContext ? { workspaceContext: content.workspaceContext } : {}) }))).toBe(true);
+    for (const value of values) expect(content.promptText).toContain(value);
+    expect(wire.tools?.map(tool => tool.function.name)).toEqual(['fill_invoice_form']);
+    expect(JSON.stringify(wire)).not.toContain('private-t10-form');
+    const apply = bridgeCalls[0]!; expect(bridgeCalls).toHaveLength(1);
+    expect(apply.operation).toBe('apply');
+    if (apply.operation !== 'apply') throw new Error('Real apply bridge required.');
+    expect(apply.target).toEqual({ formInstanceId: 'private-t10-form', expectedRevision: 4 });
+    expect(apply.candidate.lines).toEqual(large.lines);
+    const detail = need(await app.queryContextSnapshot({ sessionId: session.sessionId, runId: filled.accepted.runId, snapshotId: input.contextSnapshotId! }));
+    expect(detail.snapshot.json.modelProjection.candidate).toMatchObject({ id: candidateId, sequence: human.candidate.sequence, origin: 'human_edit', values: [] });
+    expect(detail.snapshot.json.modelProjection.fragments).toEqual([]);
+    expect(requests).toHaveLength(4); expect(need(await app.close()).closed).toBe(true);
+    const db = new Database(paths.databaseFile, { readonly: true });
+    try {
+      const snapshot = db.query<{ snapshot_json: string }, [number]>('SELECT snapshot_json FROM context_snapshots WHERE id=?').get(input.contextSnapshotId!)!;
+      const savedSnapshot = ContextSnapshotJsonSchema.parse(JSON.parse(snapshot.snapshot_json));
+      expect(savedSnapshot.modelProjection).toEqual(detail.snapshot.json.modelProjection);
+      expect(savedSnapshot).toMatchObject({ goalMode: 'fill-form', workingDirectory: null, workspaceContext: { candidateRef: { id: candidateId, sequence: human.candidate.sequence } } });
+      expect(Buffer.byteLength(snapshot.snapshot_json)).toBeLessThanOrEqual(262144);
+      const row = db.query<{ context_observations_json: string }, [number]>('SELECT context_observations_json FROM runs WHERE id=?').get(filled.accepted.runId)!;
+      const journal = ContextObservationsSchema.parse(JSON.parse(row.context_observations_json));
+      expect(journal.requests).toHaveLength(2);
+      expect(journal.requests[0]).toMatchObject({ binding: { inputId: input.inputId, snapshotId: input.contextSnapshotId },
+        sdkPayload: { inclusion: 'confirmed' }, attempts: [expect.objectContaining({ wireInclusion: 'confirmed', responseStatus: 200 })] });
+      expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    } finally { db.close(); }
+  });
   it('blocks a queued input when its frozen document becomes unavailable', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-p5-unavailable-input-'));
     const paths = productPaths(join(root, 'product'));

@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { CandidateDraftSchema, ContextObservationsSchema, invoiceFieldDisplayValue, invoiceHeaderFields, invoiceLineFields } from '@flowmate/contracts';
-import type { AgentRunEvent, Application, InvoiceFormBridgeRequest, ProviderConfig, Result, SessionInputRequest,
+import type { AgentRunEvent, Application, CandidateSnapshot, InvoiceFormBridgeRequest, ProviderConfig, Result, SessionInputRequest,
   WorkspaceSnapshot, InvoiceFormDraft } from '@flowmate/contracts';
 import { createApplication } from '../../apps/composition.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
@@ -51,7 +51,8 @@ async function begin(app: Application, input: SessionInputRequest) {
   return { accepted, terminal };
 }
 async function fixture(onRequest: (ordinal: number, app: Application) => Promise<Response> | Response,
-  bridgeCalls: InvoiceFormBridgeRequest[] = [], failDelivery = false) {
+  bridgeCalls: InvoiceFormBridgeRequest[] = [], failDelivery = false,
+  afterCandidateCommit?: (app: Application, jobId: number) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p7-sdk-'));
   const product = join(root, 'product');
   const paths = { root: product, databaseFile: join(product, 'data', 'app.sqlite'), logsDir: join(product, 'logs'),
@@ -59,6 +60,7 @@ async function fixture(onRequest: (ordinal: number, app: Application) => Promise
   const sourceRoot = join(root, 'source'); const source = join(sourceRoot, '000001'); writeSource(source);
   let app!: Application;
   let documentId = 0;
+  let jobId = 0;
   const payloads: Payload[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     payloads.push(await request.json());
@@ -80,6 +82,14 @@ async function fixture(onRequest: (ordinal: number, app: Application) => Promise
     }, agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p7-key', sessionSetup(session) {
         if (failDelivery) session.agent.afterToolCall = async () => { throw new Error('Controlled candidate delivery failure.'); };
+        if (afterCandidateCommit) {
+          const original = session.agent.afterToolCall;
+          session.agent.afterToolCall = async (...call) => {
+            const result = await original?.(...call);
+            if (call[0].toolCall.name === 'save_invoice_candidate') await afterCandidateCommit(app, jobId);
+            return result;
+          };
+        }
       } }) }));
   deferCleanup(() => app.close());
   const document = need(await app.importInvoiceMaterial(source)); documentId = document.documentRef.id;
@@ -88,19 +98,71 @@ async function fixture(onRequest: (ordinal: number, app: Application) => Promise
     change: { kind: 'document', documentId } }));
   const task = need(await app.startTask({ clientSequence: 1, expectedRevision: selectedDocument.revision,
     documentRef: document.documentRef, goal: 'Review selected invoice' }));
+  jobId = task.job.jobId;
   const saved = await begin(app, { sessionId: session.sessionId, clientSequence: 1, mode: 'prompt', text: 'Save candidate.',
     goalMode: 'save-candidate', workspace: expected(task.workspace), config, timeoutMs: 5000, stopGraceMs: 500 });
-  expect((await saved.terminal).result).toMatchObject({ ok: true, data: { status: failDelivery ? 'failed' : 'completed' } });
+  expect((await saved.terminal).result).toMatchObject({ ok: true, data: { status: afterCandidateCommit ? 'cancelled' : failDelivery ? 'failed' : 'completed' } });
   const candidateId = need(await app.listJobCandidates({ jobId: task.job.jobId })).items[0]!.candidateId;
-  const selected = need(await app.selectCandidate({ jobId: task.job.jobId, candidateId, expectedCandidateId: null,
+  const selected = afterCandidateCommit ? { workspace: task.workspace } : need(await app.selectCandidate({ jobId: task.job.jobId, candidateId, expectedCandidateId: null,
     expectedRevision: need(await app.readWorkspace()).revision }));
   const tax = { formatVersion: 1 as const, kind: 'field' as const, target: 'candidate' as const,
     targetId: candidateId, targetVersion: 1, fieldPath: 'fields.taxAmount' };
-  const workspace = need(await app.updateWorkspace({ expectedRevision: selected.workspace.revision, change: { kind: 'selection', selection: tax } }));
+  const workspace = afterCandidateCommit ? selected.workspace : need(await app.updateWorkspace({ expectedRevision: selected.workspace.revision, change: { kind: 'selection', selection: tax } }));
   return { app, paths, payloads, config, session, document, candidateId, workspace, tax, bridgeCalls };
 }
 
 describe('P7 frozen positioning through real Pi and loopback HTTP', () => {
+  it('T10 F8-18 retains a real committed candidate after public revocation before late SDK delivery', async () => {
+    const entered = barrier(), release = barrier();
+    deferCleanup(() => release.release());
+    const observed: { app?: Application; candidate?: CandidateSnapshot } = {};
+    const pending = fixture(() => reply(), [], false, async (app, jobId) => {
+      const candidateId = need(await app.listJobCandidates({ jobId })).items[0]!.candidateId;
+      const original = need(await app.queryJobCandidate({ jobId, candidateId })).candidate;
+      if (original.runId === null || original.context === null) throw new Error('Actual P8 model candidate required');
+      const tool = need(await app.listRunToolCalls({ sessionId: need(await app.queryRun(original.runId)).sessionId!, runId: original.runId })).items[0]!;
+      expect(tool).toMatchObject({ status: 'succeeded', committedCandidateId: candidateId, context: original.context });
+      expect(original.context).toMatchObject({ snapshotId: expect.any(Number), requestSequence: 1 });
+      observed.app = app; observed.candidate = original; entered.release();
+      await release.ready;
+    });
+    try {
+      await entered.ready;
+      const app = observed.app!, original = observed.candidate!;
+      const run = need(await app.queryRun(original.runId!));
+      expect(run.status).toBe('running');
+      const workspace = need(await app.readWorkspace());
+      expect(await app.revokeDocumentUse(workspace.documentRef!.id)).toEqual({ ok: true,
+        data: { affectedSessionIds: [run.sessionId!], stopRequested: true } });
+      expect(need(await app.queryJobCandidate({ jobId: original.jobId, candidateId: original.candidateId })).candidate).toEqual(original);
+      release.release(); const f = await pending;
+      expect(f.payloads).toHaveLength(1);
+      expect(need(await app.querySession(f.session.sessionId)).modelUseBlocked).toBe(true);
+      const finished = need(await app.queryRun(original.runId!));
+      expect(finished.status).toBe('cancelled');
+      expect(need(await app.queryJobCandidate({ jobId: original.jobId, candidateId: original.candidateId })).candidate).toEqual(original);
+      const tool = need(await app.listRunToolCalls({ runId: original.runId!, sessionId: f.session.sessionId })).items[0]!;
+      expect(tool).toMatchObject({ status: 'succeeded', committedCandidateId: original.candidateId, context: original.context });
+      expect(tool.deliveryState).toBe('message_observed');
+      expect(await app.close()).toMatchObject({ ok: true, data: { stopped: true, closed: true } });
+      const db = new Database(f.paths.databaseFile, { readonly: true });
+      try {
+        const saved = db.query<{ context_snapshot_id: number; request_sequence: number; fields_json: string; lines_json: string }, [number]>
+          ('SELECT context_snapshot_id,request_sequence,fields_json,lines_json FROM invoice_candidates WHERE id=?').get(original.candidateId)!;
+        expect({ snapshotId: saved.context_snapshot_id, requestSequence: saved.request_sequence }).toEqual(original.context!);
+        expect(JSON.parse(saved.fields_json).values).toEqual(original.fields); expect(JSON.parse(saved.lines_json).items).toEqual(original.lines);
+        expect(db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 1 });
+        expect(db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 1 });
+        expect(db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 1 });
+        expect(JSON.parse(db.query<{ delivery_json: string }, [number]>
+          ('SELECT delivery_json FROM tool_calls WHERE id=?').get(tool.toolCallId)!.delivery_json))
+          .toMatchObject({ state: 'message_observed', includedInCallSequence: null, requestDispatchedAt: null });
+        expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally { db.close(); }
+      expect(f.payloads).toHaveLength(1); expect(need(await app.close()).closed).toBe(true);
+    } finally { release.release(); }
+  });
+
   it.each(['accept', 'reject'] as const)('P8 preserves committed model and human provenance after delivery failure and %s', async decision => {
     const f = await fixture(() => reply(), [], true);
     const original = need(await f.app.queryJobCandidate({ jobId: f.workspace.jobId!, candidateId: f.candidateId })).candidate;

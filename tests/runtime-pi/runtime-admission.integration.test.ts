@@ -4,10 +4,11 @@ import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { appError, fail, ok } from '@flowmate/contracts';
-import type { AgentRunEvent, ProviderConfig, Result, WorkspaceSnapshot } from '@flowmate/contracts';
-import { createFileStore, createToolExecutor, createToolRecorder, JobService, makeApplication, openDatabase,
+import { appError, fail, ok, CandidateDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
+import type { AgentRunEvent, Application, CandidateRepository, ProviderConfig, Result, WorkspaceSnapshot } from '@flowmate/contracts';
+import { ContextService, createFileStore, createToolExecutor, createToolRecorder, JobService, makeApplication, openDatabase,
   RuntimeService, SessionService, WorkspaceService } from '@flowmate/core';
+import type { DbHandle } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools } from '@flowmate/employee-invoice';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
@@ -16,9 +17,11 @@ import { createTestWorkspaceVerifier } from '../support/workspace.ts';
 
 function need<T>(value: Result<T>): T { if (!value.ok) throw new Error(value.error.code); return value.data; }
 function barrier() { let release!: () => void; const ready = new Promise<void>(resolve => { release = resolve; }); return { ready, release }; }
-function response(text: string, tool = false) {
-  const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: 'original-runtime-call', type: 'function',
-    function: { name: 'calculate_invoice_amounts', arguments: JSON.stringify({ operation: 'sum', values: ['1', '2'], scale: 2 }) } }] }
+function response(text: string, tool: boolean | { name: string; args: unknown; id: string } = false) {
+  const call = typeof tool === 'object' ? tool : { name: 'calculate_invoice_amounts',
+    args: { operation: 'sum', values: ['1', '2'], scale: 2 }, id: 'original-runtime-call' };
+  const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: call.id, type: 'function',
+    function: { name: call.name, arguments: JSON.stringify(call.args) } }] }
     : { role: 'assistant', content: text };
   const chunk = (value: unknown, finish: string | null) => 'data: ' + JSON.stringify({ id: 'runtime-admission',
     choices: [{ index: 0, delta: value, finish_reason: finish }] }) + '\n\n';
@@ -27,7 +30,9 @@ function response(text: string, tool = false) {
 }
 type Payload = { messages: Array<{ role: string; content: unknown; tool_call_id?: string }> };
 function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<Response>, setup?: (session: AgentSession) => void,
-  options: { maxResultBytes?: number } = {}) {
+  options: { maxResultBytes?: number; p8?: boolean;
+    candidateSave?: (save: CandidateRepository['save'], input: Parameters<CandidateRepository['save']>[0],
+      store: DbHandle, app: Application) => ReturnType<CandidateRepository['save']> } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-admission-'));
   const paths = { root, databaseFile: join(root, 'data/app.sqlite'), runtimeDir: join(root, 'runtime'),
     logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs') };
@@ -57,7 +62,11 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
   const documents = createDocumentService({ paths, repository: store.documents, files, allowedSourceRoot: root, now });
   const verify = createTestWorkspaceVerifier(store, root);
   let business = 0, clockOffset = 0;
-  const definitions = createInvoiceTools({ documents, documentRepository: store.documents, candidates: store.candidates, now })
+  let app!: Application;
+  const originalSave = store.candidates.save.bind(store.candidates);
+  const candidates: CandidateRepository = { ...store.candidates, save: input => options.candidateSave
+    ? options.candidateSave(originalSave, input, store, app) : originalSave(input) };
+  const definitions = createInvoiceTools({ documents, documentRepository: store.documents, candidates, now })
     .map(tool => ({ ...tool, execute: (...args: Parameters<typeof tool.execute>) => { business++; return tool.execute(...args); } }));
   const tools = createToolExecutor({ definitions, recorder: createToolRecorder(store.toolCalls, now), now,
     isSessionModelUseBlocked: id => store.sessions.isModelUseBlocked(id), monotonicNow: () => performance.now() + clockOffset,
@@ -70,13 +79,15 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
   const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir, tools: definitions,
     credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-runtime-key', sessionSetup: setup });
   const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, tools, agent, workspaceVerifier: verify,
+    ...(options.p8 ? { contextService: new ContextService({ store, materials: {
+      inspectParsed: input => documents.inspectParsedForContext(input) } }), contextRepository: store.context } : {}),
     provider: { async prepare() { throw new Error('No direct Provider request is authorized.'); },
       async close() { return { stopped: true, closed: true, errors: [] }; } }, log: { write() {}, async close() {} },
     now, monotonicNow: () => performance.now() + clockOffset });
   const sessions = new SessionService(store.sessions, agent, () => runtime.state(), now, store.runs, store.sessionInputs,
     (request, input, control) => runtime.start(request, control, input), request => runtime.appendInput(request),
     id => runtime.verifySessionMutation(id));
-  const app = makeApplication(runtime, store.runs, async () => { store.close(); return { stopped: true, closed: true, errors: [] }; },
+  app = makeApplication(runtime, store.runs, async () => { store.close(); return { stopped: true, closed: true, errors: [] }; },
     sessions, undefined, new WorkspaceService(store.workspace, now, verify), new JobService(store.jobs, now));
   deferCleanup(() => app.close());
   const config: ProviderConfig = { version: 1, name: 'Controlled runtime admission', revision: 1,
@@ -104,6 +115,59 @@ function completion() {
 }
 
 describe('Runtime final admission after the real SDK before hook awaits', () => {
+  it('T10 F8-18 rejects original synchronous candidate save after public revocation inside its real handler', async () => {
+    const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
+    const candidate = CandidateDraftSchema.parse({ fields: Object.fromEntries(invoiceHeaderFields.map(name => [name, missing])), lines: [], notes: [] });
+    const observed: { calls: number; revoke?: ReturnType<Application['revokeDocumentUse']>;
+      result?: ReturnType<CandidateRepository['save']>; snapshot?: unknown; input?: unknown; journal?: unknown } = { calls: 0 };
+    const f = fixture((_body, ordinal) => ordinal === 1 ? response('', {
+      name: 'save_invoice_candidate', args: { documentId: 1, candidate }, id: 't10-revoked-candidate' }) : response('Unexpected later request'),
+    undefined, { p8: true, candidateSave(save, input, store, app) {
+      observed.calls++;
+      const tool = store.db.query<{ context_snapshot_id: number; request_sequence: number; status: string }, [number, string]>
+        ('SELECT context_snapshot_id,request_sequence,status FROM tool_calls WHERE run_id=? AND native_tool_call_id=?')
+        .get(input.runId, input.nativeToolCallId)!;
+      expect(tool).toMatchObject({ context_snapshot_id: expect.any(Number), request_sequence: 1, status: 'running' });
+      observed.snapshot = store.db.query('SELECT * FROM context_snapshots WHERE run_id=?').get(input.runId);
+      expect(observed.snapshot).toMatchObject({ id: tool.context_snapshot_id, run_id: input.runId, session_id: input.sessionId });
+      observed.input = store.db.query('SELECT id,content_json,context_snapshot_id FROM session_inputs WHERE run_id=?').get(input.runId);
+      observed.journal = store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(input.runId);
+      observed.revoke = app.revokeDocumentUse(input.documentId);
+      expect(need(store.sessions.isModelUseBlocked(input.sessionId))).toBe(true);
+      // No await: the unchanged synchronous repository must itself enter the revoked transaction.
+      const result = save(input); observed.result = result;
+      expect(result).toMatchObject({ ok: false, error: { code: 'session_scope_revoked', category: 'session', retryable: false } });
+      expect(store.db.query('SELECT * FROM context_snapshots WHERE id=?').get(tool.context_snapshot_id)).toEqual(observed.snapshot);
+      expect(store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(input.runId)).toEqual(observed.journal);
+      return result;
+    } });
+    const selected = await select(f.app);
+    const task = need(await f.app.startTask({ clientSequence: 1, expectedRevision: selected.workspace.revision,
+      documentRef: { id: 1, version: 'v1' }, goal: 'Save a candidate at the actual commit gate' }));
+    const terminal = completion();
+    const accepted = need(await f.app.submitInput({ sessionId: selected.session.sessionId, clientSequence: 1, mode: 'prompt',
+      text: 'Save the selected invoice candidate', goalMode: 'save-candidate', workspace: expected(task.workspace),
+      config: f.config, timeoutMs: 5000, stopGraceMs: 500 }, terminal));
+    const ended = await terminal.ready;
+    expect(observed.calls).toBe(1); expect(observed.result?.ok).toBe(false);
+    expect(observed.revoke).toBeDefined();
+    expect(await observed.revoke!).toEqual({ ok: true, data: { affectedSessionIds: [selected.session.sessionId], stopRequested: true } });
+    expect(ended.result).toMatchObject({ ok: true, data: { status: 'cancelled' } });
+    expect(need(f.store.sessions.get(selected.session.sessionId)).modelUseBlocked).toBe(true);
+    expect(f.payloads).toHaveLength(1); expect(f.business()).toBe(1);
+    expect(f.store.db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 0 });
+    expect(f.store.db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 0 });
+    expect(f.store.db.query('SELECT id,content_json,context_snapshot_id FROM session_inputs WHERE run_id=?').get(accepted.runId)).toEqual(observed.input);
+    expect(f.store.db.query('SELECT * FROM context_snapshots WHERE run_id=?').get(accepted.runId)).toEqual(observed.snapshot);
+    const journal = JSON.parse(f.store.db.query<{ context_observations_json: string }, [number]>
+      ('SELECT context_observations_json FROM runs WHERE id=?').get(accepted.runId)!.context_observations_json);
+    expect(journal.requests[0].binding).toMatchObject({ runId: accepted.runId, sessionId: selected.session.sessionId,
+      inputId: accepted.inputId, snapshotId: need(f.store.sessionInputs.get(accepted.inputId))!.contextSnapshotId });
+    expect(journal.requests[0].sdkPayload.inclusion).toBe('confirmed'); expect(journal.requests[0].attempts).toHaveLength(1);
+    expect(f.store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(await f.app.close()).toMatchObject({ ok: true, data: { stopped: true, closed: true } });
+  });
+
   it('charges the actual SDK blocked feedback against the shared Run context limit', async () => {
     let after = 0;
     const reason = 'Controlled SDK refusal: ' + 'x'.repeat(2048);

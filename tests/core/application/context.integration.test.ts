@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { createContextRepository, createFileStore, openDatabase } from '@flowmate/core';
-import { createDocumentService } from '@flowmate/data';
-import { appError, ContextSnapshotJsonSchema, formatExecutionPrompt, InvoiceFormDraftSchema, invoiceHeaderFields, invoiceFieldDisplayValue } from '@flowmate/contracts';
+import { createDocumentService, DocumentService } from '@flowmate/data';
+import { appError, CandidateDraftSchema, ContextSnapshotJsonSchema, formatExecutionPrompt, InvoiceFormDraftSchema, invoiceHeaderFields, invoiceFieldDisplayValue } from '@flowmate/contracts';
 import { validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import type { ContextBuildRequest, Result, WorkspaceSelection } from '@flowmate/contracts';
 import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
@@ -10,10 +10,179 @@ import { Database } from 'bun:sqlite';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { createApplication } from '../../../apps/composition.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import type { AgentRunEvent } from '@flowmate/contracts';
+
+function writeContextMaterial(directory: string, sampleId: string, text: string) {
+  mkdirSync(directory, { recursive: true });
+  const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64');
+  const content = JSON.stringify([{ type: 'text', text, bbox: [0, 0, 1, 1], page_idx: 0 }]);
+  const pages = JSON.stringify([{ pageNumber: 1, text, blockCount: 1 }]);
+  writeFileSync(join(directory, 'original.png'), original); writeFileSync(join(directory, 'content.json'), content);
+  writeFileSync(join(directory, 'pages.json'), pages);
+  writeFileSync(join(directory, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId,
+    datasetId: 'voxel51-hq-invoice-ocr', sourceRecordId: `t10-material-${sampleId}`, datasetRevision: 't10-fixture', qualityStatus: 'complete',
+    allowedUsesClaim: ['local test'], licenseVerification: 'not_verified', files: [{ path: 'original.png', bytes: original.length },
+      { path: 'content.json', bytes: Buffer.byteLength(content) }, { path: 'pages.json', bytes: Buffer.byteLength(pages) }] }));
+}
+function contextReply(tool?: { documentId: number; candidate: unknown }) {
+  const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: 't10-material-candidate', type: 'function',
+    function: { name: 'save_invoice_candidate', arguments: JSON.stringify(tool) } }] } : { role: 'assistant', content: 'Controlled material answer' };
+  const chunk = (value: unknown, reason: string | null) => 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: value, finish_reason: reason }] }) + '\n\n';
+  return new Response(chunk(delta, null) + chunk({}, tool ? 'tool_calls' : 'stop') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+}
+async function materialApplicationFixture(text = 'FIRST税 total 113.00 LAST税', oldVersion = false) {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-t10-material-'));
+  const paths = { root: join(root, 'product'), databaseFile: join(root, 'product/data/app.sqlite'), artifactsDir: join(root, 'product/artifacts'),
+    logsDir: join(root, 'product/logs'), outputsDir: join(root, 'product/outputs'), runtimeDir: join(root, 'product/runtime') };
+  const sourceRoot = join(root, 'source'), source = join(sourceRoot, '000001'), foreignSource = join(sourceRoot, '000002');
+  writeContextMaterial(source, '000001', oldVersion ? 'An actual earlier source version' : text);
+  writeContextMaterial(foreignSource, '000002', 'T10 FOREIGN MATERIAL MUST NOT BE SELECTED');
+  let http = 0, documentId = 0; let draft: unknown;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    await request.json(); http++; return http === 1 ? contextReply({ documentId, candidate: draft }) : contextReply();
+  } });
+  deferCleanup(() => server.stop(true));
+  const config: import('@flowmate/contracts').ProviderConfig = { version: 1, name: 'T10 materials', revision: 1,
+    modelRef: { provider: 't10-material', model: 'fixture' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
+    connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+  const open = async () => {
+    const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-t10-material-key' }) }));
+    deferCleanup(() => app.close()); return app;
+  };
+  const app = await open();
+  const firstVersion = need(await app.importInvoiceMaterial(source));
+  if (oldVersion) writeContextMaterial(source, '000001', text);
+  const document = oldVersion ? need(await app.importInvoiceMaterial(source)) : firstVersion;
+  const foreign = need(await app.importInvoiceMaterial(foreignSource)); documentId = document.documentRef.id;
+  const page = need(await app.readDocumentPage({ documentId, page: 1, afterBlockId: null, limit: 50 }));
+  const sourceRef = { documentId, version: document.documentRef.version, artifactId: document.parsedArtifactId,
+    page: 1, blockId: page.blocks[0]!.id, quote: 'FIRST税' };
+  const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
+  draft = CandidateDraftSchema.parse({ fields: { ...Object.fromEntries(invoiceHeaderFields.map(name => [name, missing])),
+    totalAmount: { raw: '113.00', normalized: '113.00', state: 'present', alternatives: [],
+      sources: [sourceRef, { ...sourceRef, quote: 'LAST税' }, sourceRef] } }, lines: [], notes: [] });
+  const session = need(await app.createSession({ title: 'T10 materials', expectedRevision: need(await app.readWorkspace()).revision }));
+  const selected = need(await app.updateWorkspace({ expectedRevision: need(await app.readWorkspace()).revision, change: { kind: 'document', documentId } }));
+  const task = need(await app.startTask({ clientSequence: 1, expectedRevision: selected.revision, documentRef: document.documentRef, goal: 'Inspect actual material' }));
+  const runInput = async (app: import('@flowmate/contracts').Application, clientSequence: number, goalMode: 'answer' | 'save-candidate') => {
+    const workspace = need(await app.readWorkspace()); let finish!: (event: Extract<AgentRunEvent, { type: 'run_finished' }>) => void;
+    const terminal = new Promise<Extract<AgentRunEvent, { type: 'run_finished' }>>(resolve => { finish = resolve; });
+    const result = await app.submitInput({ sessionId: session.sessionId, clientSequence, mode: 'prompt', goalMode, text: 'Explain the selected amount',
+      workspace: { revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
+        candidateRef: workspace.candidateRef, sessionId: session.sessionId }, config, timeoutMs: 5000, stopGraceMs: 500 },
+    { onEvent(event) { if (event.type === 'run_finished') finish(event); } });
+    return { result, terminal };
+  };
+  const generated = await runInput(app, 1, 'save-candidate'); need(generated.result);
+  expect((await generated.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const saved = need(await app.listJobCandidates({ jobId: task.job.jobId })).items[0]!;
+  expect(saved.context).toMatchObject({ snapshotId: expect.any(Number), requestSequence: 1 });
+  need(await app.selectCandidate({ jobId: task.job.jobId, candidateId: saved.candidateId, expectedCandidateId: null,
+    expectedRevision: need(await app.readWorkspace()).revision }));
+  need(await app.updateWorkspace({ expectedRevision: need(await app.readWorkspace()).revision, change: { kind: 'selection', selection: {
+    formatVersion: 1, kind: 'field', target: 'candidate', targetId: saved.candidateId, targetVersion: saved.sequence, fieldPath: 'fields.totalAmount' } } }));
+  expect(http).toBe(2); expect(need(await app.close()).closed).toBe(true);
+  return { paths, open, runInput, document, foreign, firstVersion, candidate: saved, sourceRef, http: () => http };
+}
+function materialRows(db: Database) {
+  return Object.fromEntries(['documents', 'artifacts', 'runs', 'session_inputs', 'context_snapshots', 'tool_calls', 'invoice_candidates',
+    'business_events', 'runtime_events', 'workspace'].map(table => [table, db.query(`SELECT * FROM ${table} ORDER BY id`).all()]));
+}
+
+describe('T10 real managed material evidence', () => {
+  it('T10 F8-02 selects real Unicode quote windows and audits only the frozen document inspection tuple', async () => {
+    const text = '😀'.repeat(400) + 'FIRST税' + '"\\\n\u0000' + '😀'.repeat(1500) + 'LAST税' + '😀'.repeat(400) + 'FIRST税';
+    const f = await materialApplicationFixture(text);
+    expect(f.foreign.documentRef.id).not.toBe(f.document.documentRef.id);
+    expect(f.foreign.documentRef.version).not.toBe(f.document.documentRef.version);
+    expect(f.foreign.parsedArtifactId).not.toBe(f.document.parsedArtifactId);
+    const baseline = new Database(f.paths.databaseFile, { readonly: true });
+    const before = materialRows(baseline); baseline.close();
+    const app = await f.open();
+    const attempted: Array<{ id: number; version: string }> = [];
+    const inspections: Array<{ documentId: number; version: string; parsedArtifactId: number }> = [];
+    const inspect = DocumentService.prototype.inspectParsedForContext;
+    DocumentService.prototype.inspectParsedForContext = function (this: DocumentService, input) {
+      attempted.push(structuredClone(input.documentRef));
+      const result = inspect.call(this, input);
+      if (result.ok) inspections.push({ documentId: input.documentRef.id, version: input.documentRef.version,
+        parsedArtifactId: result.data.document.parsedArtifactId });
+      return result;
+    };
+    try {
+      const run = await f.runInput(app, 2, 'answer'); const accepted = need(run.result);
+      expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+      expect(attempted).toEqual([f.document.documentRef]);
+      expect(inspections).toEqual([{ documentId: f.document.documentRef.id, version: f.document.documentRef.version,
+        parsedArtifactId: f.document.parsedArtifactId }]);
+      const input = need(await app.querySessionInput({ sessionId: accepted.sessionId, inputId: accepted.inputId })).input!;
+      const detail = need(await app.queryContextSnapshot({ sessionId: accepted.sessionId, runId: accepted.runId, snapshotId: input.contextSnapshotId! }));
+      const projection = detail.snapshot.json.modelProjection, fragment = projection.fragments[0]!;
+      expect(fragment).toMatchObject({ documentRef: f.document.documentRef, artifactId: f.document.parsedArtifactId, page: 1,
+        blockId: f.sourceRef.blockId, reasons: ['candidate-source'], originalBytes: Buffer.byteLength(text), truncated: true });
+      expect(fragment.sources).toEqual([f.sourceRef, { ...f.sourceRef, quote: 'LAST税' }]);
+      expect(fragment.windows.some(window => window.start <= text.indexOf('FIRST税') && window.end >= text.indexOf('FIRST税') + 'FIRST税'.length)).toBe(true);
+      for (const quote of ['FIRST税', 'LAST税']) expect(fragment.windows.some(window => window.text.includes(quote))).toBe(true);
+      for (const [index, window] of fragment.windows.entries()) {
+        expect(window.text).toBe(text.slice(window.start, window.end));
+        expect(/^[\uDC00-\uDFFF]/.test(window.text)).toBe(false); expect(/[\uD800-\uDBFF]$/.test(window.text)).toBe(false);
+        if (index) expect(window.start).toBeGreaterThanOrEqual(fragment.windows[index - 1]!.end);
+      }
+      expect(fragment.includedBytes).toBe(fragment.windows.reduce((sum, window) => sum + Buffer.byteLength(window.text), 0));
+      expect(fragment.includedBytes).toBeLessThanOrEqual(4096);
+      expect(Buffer.byteLength(JSON.stringify(projection))).toBeLessThanOrEqual(65536);
+      expect(JSON.stringify(detail.snapshot)).not.toContain('T10 FOREIGN');
+      expect(need(await app.close()).closed).toBe(true);
+      const db = new Database(f.paths.databaseFile, { readonly: true });
+      try {
+        const snapshot = db.query<{ snapshot_json: string }, [number]>('SELECT snapshot_json FROM context_snapshots WHERE id=?').get(input.contextSnapshotId!)!;
+        expect(Buffer.byteLength(snapshot.snapshot_json)).toBeLessThanOrEqual(262144);
+        const saved = ContextSnapshotJsonSchema.parse(JSON.parse(snapshot.snapshot_json));
+        expect(saved.modelProjection).toEqual(projection); expect(snapshot.snapshot_json).not.toContain('T10 FOREIGN');
+        const after = materialRows(db); expect(after.documents).toEqual(before.documents); expect(after.artifacts).toEqual(before.artifacts);
+        expect(after.invoice_candidates).toEqual(before.invoice_candidates); expect(after.workspace).toEqual(before.workspace);
+        expect(after.business_events).toEqual(before.business_events); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally { db.close(); }
+    } finally { DocumentService.prototype.inspectParsedForContext = inspect; }
+    expect(f.http()).toBe(3);
+  });
+
+  it.each(['cross-document', 'old-version', 'wrong-artifact', 'forged-quote'] as const)
+    ('T10 F8-03 refuses historical source corruption through actual Application: %s', async cause => {
+      const f = await materialApplicationFixture(undefined, cause === 'old-version');
+      const db = new Database(f.paths.databaseFile);
+      let before: ReturnType<typeof materialRows>;
+      try {
+        const row = db.query<{ fields_json: string }, [number]>('SELECT fields_json FROM invoice_candidates WHERE id=?').get(f.candidate.candidateId)!;
+        const fields = JSON.parse(row.fields_json);
+        const altered = cause === 'cross-document' ? { ...f.sourceRef, documentId: f.foreign.documentRef.id,
+          version: f.foreign.documentRef.version, artifactId: f.foreign.parsedArtifactId }
+          : cause === 'old-version' ? { ...f.sourceRef, version: f.firstVersion.documentRef.version }
+          : cause === 'wrong-artifact' ? { ...f.sourceRef, artifactId: f.document.originalArtifactId }
+          : { ...f.sourceRef, quote: 'T10 forged quotation absent from actual block' };
+        if (cause === 'old-version') expect(f.firstVersion.documentRef.version).not.toBe(f.document.documentRef.version);
+        fields.values.totalAmount.sources = [altered];
+        // Controlled corrupt historical input: preserve all production guards and the actual model candidate pair.
+        expect(db.query('UPDATE invoice_candidates SET fields_json=? WHERE id=?').run(JSON.stringify(fields), f.candidate.candidateId).changes).toBe(1);
+        before = materialRows(db); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally { db.close(); }
+      const app = await f.open(); const httpBefore = f.http();
+      const run = await f.runInput(app, 2, 'answer');
+      expect(run.result).toMatchObject({ ok: false, error: { code: 'source_invalid', category: 'input', retryable: false } });
+      expect(f.http()).toBe(httpBefore); expect(httpBefore).toBe(2);
+      expect(need(await app.close()).closed).toBe(true);
+      const after = new Database(f.paths.databaseFile, { readonly: true });
+      try { expect(materialRows(after)).toEqual(before!); expect(after.query('PRAGMA foreign_key_check').all()).toEqual([]); }
+      finally { after.close(); }
+    });
+});
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 function fixture(selection: WorkspaceSelection | null = null, fill = false, human = false, workingDirectory?: string) {

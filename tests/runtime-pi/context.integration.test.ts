@@ -158,6 +158,106 @@ async function begin(app: Application, input: SessionInputRequest) {
   const accepted = need(await app.submitInput(input, { onEvent(event) { if (event.type === 'run_finished') finish(event); } }));
   return { accepted, terminal };
 }
+it('T10 F8-12 reopens a real Application and SQLite without query replay, then seeds exact branch identities for new input', async () => {
+  let builds = 0;
+  const build = ContextService.prototype.build;
+  ContextService.prototype.build = function (this: ContextService, ...args) { builds++; return build.apply(this, args); };
+  deferCleanup(() => { ContextService.prototype.build = build; });
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-t10-reopen-'));
+  const paths = { root, databaseFile: join(root, 'data/app.sqlite'), logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'),
+    outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
+  const payloads: unknown[] = [];
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) { payloads.push(await request.json()); return reply(); } });
+  deferCleanup(() => server.stop(true));
+  const config: ProviderConfig = { version: 1, name: 'T10 restart', revision: 1, modelRef: { provider: 't10-restart', model: 'fixture' },
+    native: { authPath: join(root, 'unused.json'), modelsPath: null }, connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`,
+      api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+  const open = async () => {
+    let adapter!: PiAgentAdapter;
+    const calls = { restore: 0, leaf: 0, watch: 0, prepare: 0, enqueue: 0, inspect: 0 };
+    const restored: Array<Parameters<PiAgentAdapter['restoreSessionLeaf']>> = [];
+    const app = need(await createApplication({ paths, logger: { write() {}, async close() {} }, agentFactory: tools => {
+      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-reopen-key' });
+      const restore = adapter.restoreSession.bind(adapter); adapter.restoreSession = (...args) => { calls.restore++; restored.push(structuredClone(args)); return restore(...args); };
+      const leaf = adapter.restoreSessionLeaf.bind(adapter); adapter.restoreSessionLeaf = (...args) => { calls.leaf++; restored.push(structuredClone(args)); return leaf(...args); };
+      const watch = adapter.watchSession.bind(adapter); adapter.watchSession = (...args) => { calls.watch++; return watch(...args); };
+      const prepare = adapter.prepare.bind(adapter); adapter.prepare = (...args) => { calls.prepare++; return prepare(...args); };
+      const enqueue = adapter.enqueueInput.bind(adapter); adapter.enqueueInput = (...args) => { calls.enqueue++; return enqueue(...args); };
+      const inspect = adapter.inspect.bind(adapter); adapter.inspect = (...args) => { calls.inspect++; return inspect(...args); };
+      return adapter;
+    } }));
+    deferCleanup(() => app.close()); return { app, adapter, calls, restored };
+  };
+  const firstApp = await open();
+  const session = need(await firstApp.app.createSession({ title: 'Actual restart', expectedRevision: need(await firstApp.app.readWorkspace()).revision }));
+  const prompt = (clientSequence: number): SessionInputRequest => ({ sessionId: session.sessionId, clientSequence, mode: 'prompt', text: 'same text', config, timeoutMs: 5000, stopGraceMs: 500 });
+  const first = await begin(firstApp.app, prompt(1)); expect((await first.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const second = await begin(firstApp.app, prompt(2)); expect((await second.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const history = need(firstApp.adapter.exportSession(session.nativeSessionId));
+  const target = history.entries.find(entry => entry.type === 'message' && typeof entry.message === 'object' && entry.message !== null
+    && 'role' in entry.message && entry.message.role === 'assistant')!.id;
+  need(await firstApp.app.branchSession({ sessionId: session.sessionId, expectedLeafId: history.leafId, expectedEntryCount: history.entries.length, targetEntryId: target }));
+  const branch = JSON.parse(JSON.stringify(need(firstApp.adapter.exportSession(session.nativeSessionId))));
+  const oldInputs = [first, second].map(async run => need(await firstApp.app.querySessionInput({ sessionId: session.sessionId, inputId: run.accepted.inputId })).input!);
+  const inputs = await Promise.all(oldInputs);
+  expect(inputs[0]!.nativeEntryId).not.toBe(inputs[1]!.nativeEntryId);
+  expect(need(await firstApp.app.close()).closed).toBe(true);
+  const persisted = () => {
+    const db = new Database(paths.databaseFile, { readonly: true });
+    try { return { sessions: db.query('SELECT * FROM sessions ORDER BY id').all(), runs: db.query('SELECT * FROM runs WHERE id IN (?,?) ORDER BY id').all(first.accepted.runId, second.accepted.runId),
+      inputs: db.query('SELECT * FROM session_inputs WHERE id IN (?,?) ORDER BY id').all(first.accepted.inputId, second.accepted.inputId),
+      snapshots: db.query('SELECT * FROM context_snapshots WHERE run_id IN (?,?) ORDER BY id').all(first.accepted.runId, second.accepted.runId),
+      fk: db.query('PRAGMA foreign_key_check').all() }; } finally { db.close(); }
+  };
+  const before = persisted(); expect(before.fk).toEqual([]); expect(payloads).toHaveLength(2);
+  const reopened = await open(); expect(reopened.adapter).not.toBe(firstApp.adapter);
+  const buildBaseline = builds;
+  need(await reopened.app.querySession(session.sessionId));
+  expect(reopened.calls).toEqual({ restore: 0, leaf: 0, watch: 0, prepare: 0, enqueue: 0, inspect: 1 });
+  const queryBaseline = { ...reopened.calls };
+  for (const [index, run] of [first, second].entries()) {
+    need(await reopened.app.queryRun(run.accepted.runId));
+    expect(need(await reopened.app.querySessionInput({ sessionId: session.sessionId, inputId: run.accepted.inputId })).input).toEqual(inputs[index]);
+    const owner = { sessionId: session.sessionId, runId: run.accepted.runId };
+    expect(need(await reopened.app.listContextSnapshots(owner)).items).toHaveLength(1);
+    expect(need(await reopened.app.listContextRequests(owner)).items).toHaveLength(1);
+    const snapshotId = inputs[index]!.contextSnapshotId;
+    if (snapshotId === null) throw new Error('Real P8 snapshot required.');
+    expect(need(await reopened.app.queryContextSnapshot({ ...owner, snapshotId })).snapshot.id).toBe(snapshotId);
+  }
+  expect(reopened.calls).toEqual(queryBaseline);
+  expect(builds).toBe(buildBaseline);
+  expect(payloads).toHaveLength(2); expect(need(await reopened.app.close()).closed).toBe(true);
+  expect(persisted()).toEqual(before);
+  const active = await open();
+  // Recheck the same newly opened instance immediately before admitting its new input.
+  need(await active.app.listContextSnapshots({ sessionId: session.sessionId, runId: first.accepted.runId }));
+  need(await active.app.listContextRequests({ sessionId: session.sessionId, runId: first.accepted.runId }));
+  need(await active.app.queryContextSnapshot({ sessionId: session.sessionId, runId: first.accepted.runId, snapshotId: inputs[0]!.contextSnapshotId! }));
+  expect(active.calls).toEqual({ restore: 0, leaf: 0, watch: 0, prepare: 0, enqueue: 0, inspect: 0 });
+  expect(builds).toBe(buildBaseline); expect(payloads).toHaveLength(2);
+  const third = await begin(active.app, prompt(3)); expect((await third.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const thirdInput = need(await active.app.querySessionInput({ sessionId: session.sessionId, inputId: third.accepted.inputId })).input!;
+  expect(active.calls).toMatchObject({ restore: 1, leaf: 0, watch: 1, prepare: 1 });
+  expect(active.restored[0]![0]).toBe(session.nativeSessionId);
+  expect(JSON.parse(JSON.stringify(active.restored[0]![1]))).toEqual(branch);
+  expect(active.restored[0]![2]).toEqual([first, second].map((run, index) => {
+    const nativeEntryId = inputs[index]!.nativeEntryId;
+    if (nativeEntryId === null) throw new Error('Persisted user entry required.');
+    return { originRunId: run.accepted.runId, inputId: run.accepted.inputId, nativeEntryId, snapshotId: inputs[index]!.contextSnapshotId };
+  }));
+  expect(thirdInput.nativeEntryId).not.toBe(inputs[0]!.nativeEntryId); expect(thirdInput.nativeEntryId).not.toBe(inputs[1]!.nativeEntryId);
+  expect(thirdInput.contextSnapshotId).not.toBe(inputs[0]!.contextSnapshotId); expect(payloads).toHaveLength(3);
+  expect(builds).toBe(buildBaseline + 1);
+  const requests = need(await active.app.listContextRequests({ sessionId: session.sessionId, runId: third.accepted.runId })).items;
+  expect(requests[0]).toMatchObject({ binding: { inputId: third.accepted.inputId, snapshotId: thirdInput.contextSnapshotId, requestSequence: 1,
+    includedBindings: [{ originRunId: first.accepted.runId, inputId: first.accepted.inputId, nativeEntryId: inputs[0]!.nativeEntryId, snapshotId: inputs[0]!.contextSnapshotId },
+      { originRunId: third.accepted.runId, inputId: third.accepted.inputId, nativeEntryId: thirdInput.nativeEntryId, snapshotId: thirdInput.contextSnapshotId }] },
+    sdkPayload: { inclusion: 'confirmed' }, attempts: [expect.objectContaining({ wireInclusion: 'confirmed', responseStatus: 200 })] });
+  expect(need(await active.app.close()).closed).toBe(true);
+  const after = persisted(); expect(after.runs).toEqual(before.runs); expect(after.inputs).toEqual(before.inputs);
+  expect(after.snapshots).toEqual(before.snapshots); expect(after.fk).toEqual([]);
+});
 async function fixture(onRequest: (ordinal: number) => Promise<Response> | Response = () => reply(), beforeTool?: () => Promise<void>,
   toolFault?: 'error-terminal' | 'error-result' | 'aborted-result' | 'tool-result' | 'binding-lost') {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p8-context-sdk-'));
