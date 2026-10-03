@@ -85,7 +85,7 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
   }, { ownedRoot: userData, commandType, tracePath: join(userData, 'form-transport-identities.json') });
 }
 
-for (const outcome of ['accept-export', 'save-on-close', 'discard-on-close', 'reject-reselect', 'unknown-close-save', 'unknown-ui-save-close', 'unknown-fill-input', 'concurrent-fill-input'] as const)
+for (const outcome of ['accept-export', 'save-on-close', 'discard-on-close', 'reject-reselect', 'unknown-close-save', 'unknown-ui-save-close', 'unknown-fill-input', 'concurrent-fill-input', 'selection-while-fill'] as const)
 it(`real Fill and manual form public chain: ${outcome}`, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-form-desktop-'));
   const sourceRoot = await mkdtemp(join(tmpdir(), 'flowmate-form-source-'));
@@ -115,7 +115,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     const body = await request.json() as Body; requests.push(body);
     const fill = body.tools?.some(tool => tool.function.name === 'fill_invoice_form');
     if (fill) {
-      if ((outcome === 'unknown-fill-input' || outcome === 'concurrent-fill-input') && !fillRequestHeld && !body.messages.some(message => message.tool_call_id === 'form-apply')) {
+      if ((outcome === 'unknown-fill-input' || outcome === 'concurrent-fill-input' || outcome === 'selection-while-fill') && !fillRequestHeld && !body.messages.some(message => message.tool_call_id === 'form-apply')) {
         fillRequestHeld = true; await heldFill;
       }
       return body.messages.some(message => message.tool_call_id === 'form-apply') ? stream('Form draft ready for review.')
@@ -163,6 +163,63 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     await page.getByRole('button', { name: 'Results', exact: true }).click();
     await page.getByRole('button', { name: /Result 1/ }).click();
     await page.getByRole('button', { name: 'Select result', exact: true }).click();
+    if (outcome === 'selection-while-fill') {
+      checkpoint = 'P7 Fill keeps its original revision while selection and view preserve the local form';
+      await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
+      await page.getByRole('button', { name: 'Select Invoice number', exact: true }).click();
+      await expect(page.getByRole('button', { name: 'Select Invoice number', exact: true })).toHaveAttribute('aria-pressed', 'true');
+      await page.getByRole('button', { name: 'Fill form', exact: true }).click();
+      await expect.poll(() => fillRequestHeld).toBe(true);
+      const beforeChangedSelection = requests.length;
+      await page.getByRole('button', { name: 'Select Tax amount', exact: true }).click();
+      await expect(page.getByRole('button', { name: 'Select Tax amount', exact: true })).toHaveAttribute('aria-pressed', 'true');
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('');
+      releaseHeldFill?.();
+      await waitFor(() => page.evaluate(async () => { const state = await window.flowmate.queryRuntimeState(); return state.ok && state.data.active === null && !state.data.blocked; }));
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('');
+      const fillRequests = requests.filter(body => body.tools?.some(tool => tool.function.name === 'fill_invoice_form'));
+      expect(fillRequests).toHaveLength(2);
+      expect(JSON.stringify(fillRequests[1]!.messages.find(message => message.tool_call_id === 'form-apply'))).toContain('no longer matches');
+      await page.getByLabel('Invoice number', { exact: true }).fill('P7-MANUAL-VERSION');
+      await page.getByRole('button', { name: 'Select Seller name', exact: true }).click();
+      await page.getByRole('tab', { name: 'Original', exact: true }).click();
+      await page.getByRole('tab', { name: 'Results', exact: true }).click();
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('P7-MANUAL-VERSION');
+      await expect(page.getByRole('dialog', { name: 'Unsaved invoice changes', exact: true })).toHaveCount(0);
+      await page.getByRole('button', { name: 'Save result', exact: true }).click();
+      await expect(page.getByTestId('workspace-summary')).toContainText('Result 2');
+      await expect(page.getByTestId('workspace-summary')).toContainText('No selection');
+      const saved = await page.evaluate(async () => {
+        const workspace = await window.flowmate.readWorkspace(); if (!workspace.ok || !workspace.data.jobId || !workspace.data.candidateRef) throw new Error('Saved version missing');
+        const detail = await window.flowmate.queryJobCandidate({ jobId: workspace.data.jobId, candidateId: workspace.data.candidateRef.id });
+        return { workspace: workspace.data, detail };
+      });
+      expect(saved.workspace.selection).toBeNull(); expect(saved.workspace.candidateRef?.sequence).toBe(2);
+      expect(saved.detail).toMatchObject({ ok: true, data: { candidate: { fields: { invoiceNumber: { raw: 'P7-MANUAL-VERSION' } } } } });
+      await page.getByLabel('Invoice number', { exact: true }).fill('P7-PRESERVED-DRAFT');
+      const rejected = await page.evaluate(async () => {
+        const read = async () => { const value = await window.flowmate.readWorkspace(); if (!value.ok) throw new Error('Workspace unavailable'); return value.data; };
+        const dirty = { fields: { invoiceNumber: 'P7-PRESERVED-DRAFT', issueDate: '', sellerName: '', sellerTaxId: '', buyerName: '', buyerTaxId: '', currency: '', netAmount: '', taxAmount: '', totalAmount: '' }, lines: [], notes: [] };
+        const attempt = async () => {
+          const current = await read();
+          const base = { operationRef: crypto.randomUUID(), jobId: 1, candidateId: 2, expectedCandidateId: 2, expectedRevision: current.revision };
+          return [await window.flowmate.saveInvoiceCandidate({ operationRef: base.operationRef, jobId: base.jobId, expectedRevision: base.expectedRevision, expectedCandidateId: 2, basedOnCandidateId: 2, draft: dirty }),
+            await window.flowmate.acceptInvoiceCandidate({ ...base, operationRef: crypto.randomUUID(), dirty: false }),
+            await window.flowmate.rejectInvoiceCandidate({ ...base, operationRef: crypto.randomUUID(), reason: 'Untrusted changed scene' })];
+        };
+        let current = await read();
+        const changed = await window.flowmate.selectCandidate({ jobId: 1, candidateId: 1, expectedCandidateId: current.candidateRef?.id ?? null, expectedRevision: current.revision }); if (!changed.ok) throw new Error('Candidate switch failed');
+        const candidate = await attempt();
+        current = await read(); const restored = await window.flowmate.selectCandidate({ jobId: 1, candidateId: 2, expectedCandidateId: current.candidateRef?.id ?? null, expectedRevision: current.revision }); if (!restored.ok) throw new Error('Candidate restore failed');
+        const session = await window.flowmate.createSession(); if (!session.ok) throw new Error('Session create failed');
+        current = await read(); const selected = await window.flowmate.updateWorkspace({ expectedRevision: current.revision, change: { kind: 'session', sessionId: session.data.sessionId } }); if (!selected.ok) throw new Error('Session switch failed');
+        return { candidate, session: await attempt() };
+      });
+      for (const results of [rejected.candidate, rejected.session]) for (const result of results) expect(result).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('P7-PRESERVED-DRAFT');
+      expect(requests.length).toBe(beforeChangedSelection + 1);
+      return;
+    }
     if (outcome === 'concurrent-fill-input') {
       checkpoint = 'three same-target calls all await Desktop state before one fixes its identity';
       await app.evaluate(({ ipcMain }, ownedRoot) => {
@@ -205,7 +262,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
           const input = raw as import('@flowmate/contracts').DesktopInvoiceFormRunRequest;
           gate.input = input; gate.armed = true;
           gate.results = await Promise.all([original(event, input), original(event, { ...input, clientSequence: input.clientSequence + 1 }), original(event, input)]);
-          gate.restore(); ipcMain.removeHandler('flowmate:start-invoice-form-run'); ipcMain.handle('flowmate:start-invoice-form-run', original);
+          gate.armed = false; ipcMain.removeHandler('flowmate:start-invoice-form-run'); ipcMain.handle('flowmate:start-invoice-form-run', original);
           return gate.results[0];
         });
         (globalThis as typeof globalThis & { concurrentFillGate?: typeof gate }).concurrentFillGate = gate;
@@ -223,11 +280,43 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       expect(concurrent.results[1]).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
       if (concurrent.results[2]?.ok) expect(concurrent.results[2]).toEqual(concurrent.results[0]);
       else expect(concurrent.results[2]).toMatchObject({ ok: false, error: { code: 'operation_result_unknown' } });
-      expect(await page.evaluate(input => window.flowmate.startInvoiceFormRun(input), concurrent.input)).toEqual(concurrent.results[0]);
+      // Admission may finish before the original Run reaches HTTP. Establish the
+      // Provider barrier before sampling a no-replay baseline; its response stays held.
+      await expect.poll(() => fillRequestHeld).toBe(true);
+      expect(requests.filter(body => body.tools?.some(tool => tool.function.name === 'fill_invoice_form'))).toHaveLength(1);
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('');
+      const accepted = concurrent.results[0]; if (!accepted?.ok) throw new Error('Original Fill was not accepted');
+      const jobId = concurrent.input.workspace.jobId;
+      if (jobId === null) throw new Error('Original Fill Job missing');
+      const readFillIdentities = () => page.evaluate(async ({ sessionId, runId, jobId }) => {
+        const [runs, inputs, run, messages, job, candidates, workspace] = await Promise.all([window.flowmate.listSessionRuns({ sessionId }),
+          window.flowmate.listSessionInputs({ sessionId }), window.flowmate.queryRun(runId), window.flowmate.listSessionMessages({ sessionId }),
+          window.flowmate.queryJob(jobId), window.flowmate.listJobCandidates({ jobId }), window.flowmate.readWorkspace()]);
+        if (!runs.ok || !inputs.ok || !run.ok || !messages.ok || !job.ok || !candidates.ok || !workspace.ok) throw new Error('Original Fill authority unavailable');
+        return { runIds: runs.data.items.map(item => item.runId), inputs: inputs.data.items.map(item => ({ inputId: item.inputId,
+          runId: item.runId, clientSequence: item.clientSequence, goalMode: item.goalMode, nativeEntryId: item.nativeEntryId })),
+          run: { runId: run.data.runId, status: run.data.status, config: run.data.config },
+          nativeUsers: messages.data.items.filter(item => item.role === 'user').map(item => ({ entryId: item.entryId, runId: item.runId })),
+          candidateIds: candidates.data.items.map(item => ({ candidateId: item.candidateId, sequence: item.sequence })),
+          currentCandidateId: job.data.currentCandidateId, workspaceCandidate: workspace.data.candidateRef };
+      }, { sessionId: concurrent.input.workspace.sessionId, runId: accepted.data.runId, jobId });
+      const beforeReplays = await readFillIdentities();
+      expect(beforeReplays.runIds).toEqual([accepted.data.runId, prepared.data.runId]);
+      expect(beforeReplays.inputs).toHaveLength(2);
+      expect(beforeReplays.inputs[0]).toMatchObject({ inputId: accepted.data.inputId, runId: accepted.data.runId,
+        clientSequence: concurrent.input.clientSequence, goalMode: 'fill-form', nativeEntryId: expect.any(String) });
+      expect(beforeReplays.run).toMatchObject({ runId: accepted.data.runId, status: 'running' });
+      expect(beforeReplays.nativeUsers).toHaveLength(2);
+      expect(beforeReplays.candidateIds).toEqual([{ candidateId: 1, sequence: 1 }]);
+      expect(beforeReplays.currentCandidateId).toBe(1); expect(beforeReplays.workspaceCandidate).toEqual({ id: 1, sequence: 1 });
       const beforeChangedReplay = requests.length;
+      expect(await page.evaluate(input => window.flowmate.startInvoiceFormRun(input), concurrent.input)).toEqual(concurrent.results[0]);
       expect(await page.evaluate(input => window.flowmate.startInvoiceFormRun({ ...input, budget: { maxModelCalls: 63 } }), concurrent.input))
         .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
       expect(requests).toHaveLength(beforeChangedReplay);
+      expect(await readFillIdentities()).toEqual(beforeReplays);
+      expect(await app.evaluate(() => (globalThis as typeof globalThis & { concurrentFillGate: { fills: unknown[] } }).concurrentFillGate.fills.length)).toBe(1);
+      await app.evaluate(() => (globalThis as typeof globalThis & { concurrentFillGate: { restore(): void } }).concurrentFillGate.restore());
       releaseHeldFill?.();
       await page.waitForFunction(() => (document.querySelector('[aria-label="Invoice number"]') as HTMLInputElement)?.value === 'INV-FORM-1');
       await waitFor(() => page.evaluate(async () => { const state = await window.flowmate.queryRuntimeState(); return state.ok && state.data.active === null; }));
@@ -236,6 +325,23 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
         .toMatchObject({ ok: true, data: { items: [{ runId: (concurrent.results[0] as { ok: true; data: { runId: number } }).data.runId }, { runId: prepared.data.runId }] } });
       expect(await page.evaluate(sessionId => window.flowmate.listSessionInputs({ sessionId }), concurrent.input.workspace.sessionId))
         .toMatchObject({ ok: true, data: { items: [{ clientSequence: concurrent.input.clientSequence }, { clientSequence: 1 }] } });
+      const completed = await readFillIdentities();
+      expect(completed.runIds).toEqual(beforeReplays.runIds); expect(completed.inputs).toEqual(beforeReplays.inputs);
+      expect(completed.nativeUsers).toEqual(beforeReplays.nativeUsers); expect(completed.run.status).toBe('completed');
+      expect(completed.candidateIds).toEqual(beforeReplays.candidateIds); expect(completed.currentCandidateId).toBe(beforeReplays.currentCandidateId);
+      expect(completed.workspaceCandidate).toEqual(beforeReplays.workspaceCandidate);
+      const application = await page.evaluate(async ({ runId, sessionId }) => {
+        const tools = await window.flowmate.listRunToolCalls({ runId, sessionId });
+        if (!tools.ok || tools.data.items.length !== 1) throw new Error('Expected the single original Fill tool call');
+        return { tools: tools.data.items, receipt: await window.flowmate.queryInvoiceFormApplication({ runId, toolCallId: tools.data.items[0]!.toolCallId }) };
+      }, { runId: accepted.data.runId, sessionId: concurrent.input.workspace.sessionId });
+      expect(application.tools).toMatchObject([{ toolName: 'fill_invoice_form', status: 'succeeded', formApplicationOutcome: 'applied' }]);
+      expect(application.receipt).toMatchObject({ ok: true, data: { outcome: 'applied', runId: accepted.data.runId,
+        formInstanceId: concurrent.input.target.formInstanceId, appliedRevision: concurrent.input.target.expectedRevision + 1 } });
+      console.info('Concurrent Fill barrier facts', { requestsBeforeReplay: beforeChangedReplay, requestsAfterCompletion: requests.length,
+        runIds: completed.runIds, inputIds: completed.inputs.map(item => item.inputId), nativeUserCount: completed.nativeUsers.length,
+        toolCalls: application.tools.length, outcome: application.receipt.ok ? application.receipt.data.outcome : 'unknown',
+        candidateIds: completed.candidateIds, currentCandidateId: completed.currentCandidateId, workspaceCandidate: completed.workspaceCandidate });
       return;
     }
     if (outcome === 'unknown-fill-input') {
@@ -419,6 +525,13 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     expect(await page.getByLabel('Invoice number', { exact: true }).inputValue()).toBe('MANUAL-FORM-2');
     if (outcome === 'save-on-close' || outcome === 'discard-on-close') {
       checkpoint = outcome;
+      if (outcome === 'save-on-close') {
+        await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
+        await page.getByRole('button', { name: 'Select Tax amount', exact: true }).click();
+        await page.getByRole('tab', { name: 'Original', exact: true }).click();
+        await page.getByRole('tab', { name: 'Results', exact: true }).click();
+        await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('MANUAL-FORM-2');
+      }
       await app.evaluate(({ dialog }, selected) => { dialog.showMessageBox = async () => ({ response: selected, checkboxChecked: false }); }, outcome === 'save-on-close' ? 2 : 1);
       await closeDesktopFixture(app, userData); app = null;
       const db = new Database(join(userData, 'data', 'app.sqlite'), { readonly: true });

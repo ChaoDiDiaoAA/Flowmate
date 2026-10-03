@@ -15,6 +15,8 @@ import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts
 import { createToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
 import { finishSessionInputs } from '../../../packages/core/src/sessions/input-ledger.ts';
+import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
+import { createTestWorkspaceVerifier } from '../../support/workspace.ts';
 
 const at = '2026-10-01T00:00:00.000Z';
 const workspace: WorkspaceContext = { formatVersion: 1, revision: 3, sessionId: 1,
@@ -47,15 +49,19 @@ function need<T>(result: Result<T>): T {
   if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
   return result.data;
 }
-function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'flowmate-input-ledger-'));
-  const paths = { root, databaseFile: join(root, 'data', 'test.sqlite'), logsDir: join(root, 'logs'),
+function fixture(withMaterial = false) {
+  const selected = withMaterial ? makeSelectedCandidate() : null;
+  const root = selected?.root ?? mkdtempSync(join(tmpdir(), 'flowmate-input-ledger-'));
+  const paths = { root, databaseFile: join(root, 'data', selected ? 'flowmate.sqlite' : 'test.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
-  const store = need(openDatabase(paths));
+  const store = selected ?? need(openDatabase(paths));
   deferCleanup(() => store.close());
-  need(store.sessions.create({ nativeSessionId: 'native-fill-input', title: 'Fill input', at,
-    nativeHistory: { storageVersion: 1, header: { type: 'session', id: 'native-fill-input', version: 3,
-      timestamp: at, cwd: root }, entries: [], leafId: null, unusable: false } }));
+  const history = { storageVersion: 1 as const, header: { type: 'session' as const, id: 'native-fill-input', version: 3,
+    timestamp: at, cwd: root }, entries: [], leafId: null, unusable: false };
+  if (selected) {
+    store.db.query("UPDATE sessions SET native_session_id='native-fill-input' WHERE id=1").run();
+    need(store.sessions.saveHistory(1, history));
+  } else need(store.sessions.create({ nativeSessionId: 'native-fill-input', title: 'Fill input', at, nativeHistory: history }));
   const ledger = Reflect.get(store, 'sessionInputs') as import('../../../packages/core/src/sessions/input-ledger.ts').SessionInputLedger;
   expect(ledger).toBeDefined();
   let creates = 0;
@@ -81,7 +87,7 @@ function fixture() {
     effect: 'LOCAL_WRITE', executionMode: 'sequential', inputSchema: FillInvoiceFormInputSchema,
     outputSchema: FillInvoiceFormOutputSchema, async execute() { throw new Error('Unexpected tool execution.'); } }],
     recorder: createToolRecorder(store.toolCalls, () => at), now: () => at });
-  return { store, ledger, paths, createRun, tools, creates: () => creates };
+  return { store, ledger, paths, createRun, tools, verify: createTestWorkspaceVerifier(store, root), creates: () => creates };
 }
 
 describe('idle Fill prompt input ledger', () => {
@@ -334,7 +340,7 @@ describe('idle Fill prompt input ledger', () => {
   });
 
   it('keeps the admitted form target when a prepared SDK snapshot contains another target', async () => {
-    const { store, ledger, paths, createRun, tools } = fixture();
+    const { store, ledger, paths, createRun, tools, verify } = fixture(true);
     const agent = new PiAgentAdapter({ cwd: paths.root, agentDir: paths.runtimeDir });
     const snapshot = { ...safeConfig, agent: { ...safeConfig.agent, maxModelCalls: 16 as const }, api: 'openai-completions', resolvedModel: request.config.modelRef,
       formTarget: { formInstanceId: 'prepared-other-form', expectedRevision: 99 } };
@@ -345,7 +351,7 @@ describe('idle Fill prompt input ledger', () => {
     let startedTarget: unknown;
     let finish!: () => void;
     const finished = new Promise<void>(resolve => { finish = resolve; });
-    const runtime = new RuntimeService({ runs: { ...store.runs, createWorkspaceAgent: createRun,
+    const runtime = new RuntimeService({ workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun,
       start(_runId, startedConfig) {
         startedTarget = (startedConfig as Record<string, unknown>).formTarget;
         return fail(appError('state_conflict', 'storage', 'Fixture stops at the preparation boundary.'));
@@ -368,7 +374,7 @@ describe('idle Fill prompt input ledger', () => {
   });
 
   it('requires actual applied and delivered tool facts rather than a final model claim', async () => {
-    const { store, ledger, paths, createRun, tools } = fixture();
+    const { store, ledger, paths, createRun, tools, verify } = fixture(true);
     const agent = new PiAgentAdapter({ cwd: paths.root, agentDir: paths.runtimeDir });
     agent.prepare = async () => ok({ snapshot: { ...safeConfig, agent: { ...safeConfig.agent, maxModelCalls: 16 } }, async execute(input) {
       const previous = need(store.sessions.loadHistory(input.sessionId))!;
@@ -383,7 +389,7 @@ describe('idle Fill prompt input ledger', () => {
     } } satisfies PreparedAgent);
     let finish!: () => void;
     const finished = new Promise<void>(resolve => { finish = resolve; });
-    const runtime = new RuntimeService({ runs: { ...store.runs, createWorkspaceAgent: createRun },
+    const runtime = new RuntimeService({ workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun },
       sessions: store.sessions, sessionInputs: ledger, agent, tools,
       provider: { async prepare() { throw new Error('No provider call is authorized by this lifecycle test.'); },
         async close() { return { stopped: true, closed: true, errors: [] }; } },
@@ -400,9 +406,9 @@ describe('idle Fill prompt input ledger', () => {
   });
 
   it('rejects a new Fill input before creating a Run when no trusted form tool is assembled', async () => {
-    const { store, ledger, paths, createRun, creates } = fixture();
+    const { store, ledger, paths, createRun, creates, verify } = fixture(true);
     const agent = new PiAgentAdapter({ cwd: paths.root, agentDir: paths.runtimeDir });
-    const runtime = new RuntimeService({ runs: { ...store.runs, createWorkspaceAgent: createRun },
+    const runtime = new RuntimeService({ workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun },
       sessions: store.sessions, sessionInputs: ledger, agent,
       provider: { async prepare() { throw new Error('Unexpected model request.'); },
         async close() { return { stopped: true, closed: true, errors: [] }; } },

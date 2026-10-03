@@ -1,4 +1,4 @@
-import { appError, fail, ok, RuntimeRequestOverridesSchema, normalizeSessionInputRequest, formatExecutionPrompt, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES, RUNTIME_CONFIG } from '@flowmate/contracts';
+import { appError, fail, ok, RuntimeRequestOverridesSchema, normalizeSessionInputRequest, formatExecutionPrompt, WorkspaceContextSchema, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES, RUNTIME_CONFIG } from '@flowmate/contracts';
 import { join } from 'node:path';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import type {
@@ -48,6 +48,7 @@ import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, T
 import { ensureNativeSession } from '../sessions/service.ts';
 import type { ToolExecutor } from '../tools/executor.ts';
 import type { SessionInputLedger } from '../sessions/input-ledger.ts';
+import type { WorkspaceVerifier } from '../workspace/verification.ts';
 
 export interface RuntimeLogger {
   write(event: { at: string; level: 'info' | 'warn' | 'error'; component: string; runId?: number; event: string; code?: string }): void;
@@ -61,6 +62,7 @@ export type RuntimeDependencies = {
   agent?: AgentPort;
   sessions?: SessionRepository;
   sessionInputs?: SessionInputLedger;
+  workspaceVerifier?: WorkspaceVerifier;
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
@@ -324,7 +326,7 @@ export class RuntimeService {
     } catch { return fail(appError('agent_session_unavailable', 'session', 'Native state cannot be confirmed.', true)); }
     const at = this.dependencies.now();
     const admitted = ledger.admit(request, () => runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
-      text: request.text, expected: request.workspace, at }), at);
+      text: request.text, expected: request.workspace, at }, this.dependencies.workspaceVerifier), at);
     if (!admitted.ok) return admitted;
     const input = admitted.data.input;
     if (!admitted.data.created) return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
@@ -354,7 +356,31 @@ export class RuntimeService {
       return fail(appError('session_history_invalid', 'session', 'Input Session is unavailable.', false, active.runId));
     if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', 'Input material access was revoked.', false, active.runId));
     if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'Saved history is unusable.', false, active.runId));
-    return this.dependencies.runs.verifyInputUse(stored.data.content);
+    const content = stored.data.content;
+    const corrupt = () => fail(appError('storage_corrupt', 'storage', 'Saved input does not match its fixed Run scope.', false, active.runId));
+    if (run.data.kind !== 'agent') return corrupt();
+    if (run.data.scope.version === 1) {
+      if (content.workspaceContext !== null || content.workspaceInput !== null
+        || content.allowedDocumentIds.length !== 0 || content.allowedArtifactIds.length !== 0) return corrupt();
+    } else if (run.data.scope.version === 2) {
+      const frozen = content.workspaceContext;
+      const initial = WorkspaceContextSchema.safeParse(run.data.config.workspaceContext);
+      const sameIds = (left: readonly number[], right: readonly number[]) => left.length === right.length
+        && left.every(id => right.includes(id));
+      if (!frozen || !content.workspaceInput || !initial.success || run.data.input.version !== 2
+        || frozen.sessionId !== run.data.sessionId || frozen.sessionId !== initial.data.sessionId
+        || frozen.jobId !== run.data.jobId || frozen.jobId !== initial.data.jobId
+        || JSON.stringify(frozen.documentRef) !== JSON.stringify(initial.data.documentRef)
+        || JSON.stringify(frozen.candidateRef) !== JSON.stringify(initial.data.candidateRef)
+        || JSON.stringify(content.workspaceInput) !== JSON.stringify(run.data.input.workspaceInput)
+        || JSON.stringify(frozen.documentRef) !== JSON.stringify(content.workspaceInput.documentRef)
+        || frozen.jobId !== (content.workspaceInput.job?.id ?? null)
+        || frozen.candidateRef?.id !== content.workspaceInput.candidate?.id
+        || frozen.candidateRef?.sequence !== content.workspaceInput.candidate?.sequence
+        || !sameIds(content.allowedDocumentIds, run.data.scope.allowedDocumentIds)
+        || !sameIds(content.allowedArtifactIds, run.data.scope.allowedArtifactIds)) return corrupt();
+    } else return corrupt();
+    return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier);
   }
 
   private qualifyInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Result<boolean> {
@@ -439,6 +465,8 @@ export class RuntimeService {
     } else if (rawRequest.goalMode === 'fill-form') {
       return fail(appError('input_invalid', 'input', 'Fill requires the dedicated input admission.'));
     }
+    if (rawRequest.workspace && !this.dependencies.workspaceVerifier)
+      return fail(appError('workspace_unavailable', 'storage', 'Workspace verification is unavailable.', true));
     const settings = this.dependencies.runtimeDefaults?.() ?? ok({});
     if (!settings.ok) return settings;
     const defaults = RuntimeRequestOverridesSchema.safeParse(settings.data);
@@ -506,6 +534,8 @@ export class RuntimeService {
       if (submission.mode !== 'prompt') return fail(appError('input_invalid', 'input', 'Initial input must be a prompt.'));
       let runId: number;
       if (request.workspace) {
+        const verify = this.dependencies.workspaceVerifier;
+        if (!verify) return fail(appError('workspace_unavailable', 'storage', 'Workspace verification is unavailable.', true));
         const created = this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
           expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
           messageTimestamp: input.messageTimestamp, goal: INVOICE_CHAT_GOAL,
@@ -514,7 +544,7 @@ export class RuntimeService {
           ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
           ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
             runtimeDir: this.dependencies.nativeTools.runtimeDir, allowedTools: nativeNames,
-            ...(workingDirectory ? { workingDirectory } : {}) } } : {}) });
+            ...(workingDirectory ? { workingDirectory } : {}) } } : {}) }, verify);
         if (!created.ok) return created;
         admission = created.data;
         scope = created.data.scope;
@@ -535,7 +565,8 @@ export class RuntimeService {
         allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : [],
         ...(control.desktopRequestHash === undefined ? {} : { desktopRequestHash: control.desktopRequestHash }),
         promptText: formatExecutionPrompt({ text: request.text, business: admission !== null,
-          ...(admission ? { workspaceInput: admission.workspaceInput, goalMode: request.goalMode ?? 'answer' } : {}),
+          ...(admission ? { workspaceInput: admission.workspaceInput, workspaceContext: admission.workspaceContext,
+            goalMode: request.goalMode ?? 'answer' } : {}),
           ...(workingDirectory ? { workingDirectory } : {}) }) };
       return ok({ runId, content });
     }, createdAt, control.desktopRequestHash);
@@ -890,7 +921,8 @@ export class RuntimeService {
         if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', '会话历史不可继续使用。', false, active.runId, request.sessionId));
         return ok(undefined);
       },
-      ...(context.admission ? { workspaceInput: context.admission.workspaceInput, goalMode: request.goalMode ?? 'answer' as const } : {}),
+      ...(context.admission ? { workspaceInput: context.admission.workspaceInput, workspaceContext: context.admission.workspaceContext,
+        goalMode: request.goalMode ?? 'answer' as const } : {}),
       ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}),
       ...(productContext && this.dependencies.tools ? { toolBinding: {
         context: productContext,

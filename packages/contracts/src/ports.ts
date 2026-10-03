@@ -17,7 +17,7 @@ import type {
   ResolvedRuntimeBudget,
 } from './runtime.ts';
 import type { ProductToolContext, ToolCallContext, ToolResult } from './tools.ts';
-import type { CandidateJobDetail, CandidateJobPage, GoalMode, WorkspaceInput } from './workspace.ts';
+import type { CandidateJobDetail, CandidateJobPage, GoalMode, WorkspaceContext, WorkspaceInput } from './workspace.ts';
 import type { ToolCallDelivery } from './activity.ts';
 import type { CandidateSnapshot } from './activity.ts';
 import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput } from './invoice.ts';
@@ -155,6 +155,7 @@ export type AgentExecutionInput = NativeInput & {
   runId: DbId;
   sessionId: DbId;
   workspaceInput?: WorkspaceInput;
+  workspaceContext?: WorkspaceContext;
   goalMode?: GoalMode;
   workingDirectory?: string;
   runtimeBudget?: ResolvedRuntimeBudget;

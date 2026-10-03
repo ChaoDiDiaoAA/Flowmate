@@ -1,3 +1,4 @@
+import { createTestWorkspaceVerifier } from '../../support/workspace.ts';
 import { describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -72,7 +73,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
       return {};
     } })),
     recorder: createToolRecorder(db.toolCalls, now), now });
-  const runtime = new RuntimeService({ runs: db.runs, sessions: db.sessions, sessionInputs: db.sessionInputs, agent, tools,
+  const runtime = new RuntimeService({ workspaceVerifier: createTestWorkspaceVerifier(db, root), runs: db.runs, sessions: db.sessions, sessionInputs: db.sessionInputs, agent, tools,
     provider: { prepare: async () => ({ ok: false, error: appError('unused', 'provider', 'Unused.') }),
       close: async () => ({ stopped: true, closed: true, errors: [] }) },
     log: { write() {}, close: async () => {} }, now, monotonicNow: () => performance.now(),
@@ -84,7 +85,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
     db.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
   const app = makeApplication(runtime, db.runs, async () => {
     db.close(); return { stopped: true, closed: true, errors: [] };
-  }, sessions, undefined, createWorkspaceService(db.workspace, now));
+  }, sessions, undefined, createWorkspaceService(db.workspace, now, createTestWorkspaceVerifier(db, root)));
   return { app, store: db, db: db.db, executions, preparations, workingDirectory, runtimeDir };
 }
 

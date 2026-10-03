@@ -6,7 +6,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, RuntimeEventsWakeSchema, appError, fail, ok } from '@flowmate/contracts';
 import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, Result } from '@flowmate/contracts';
 import type { HostCommand, HostCredentialRequest, HostEvent, HostOutput } from '../../host/protocol.ts';
-import { isRuntimeHostCommand, parseHostCommand, parseRuntimeHostResult } from '../../host/protocol.ts';
+import { isRuntimeHostCommand, isWorkspaceHostCommand, parseHostCommand, parseRuntimeHostResult, parseWorkspaceHostResult } from '../../host/protocol.ts';
 
 type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
 type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; command: HostCommand };
@@ -121,7 +121,7 @@ export class HostClient {
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
     const rawMessage = { ...command, version: 1, requestId };
-    const message = isRuntimeHostCommand(command.type) ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
+    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
     if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -219,6 +219,11 @@ export class HostClient {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
           const value = validEnvelope ? parseRuntimeHostResult(pending.command.type, output.value) : null;
           if (value === null || !matchesRuntimeResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(value);
+        } else if (isWorkspaceHostCommand(pending.command.type)) {
+          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
+          const value = validEnvelope ? parseWorkspaceHostResult(pending.command.type, output.value) : null;
+          if (value === null) pending.reject(new Error('host_protocol_invalid'));
           else pending.resolve(value);
         } else pending.resolve(output.value);
       } else if (output.type === 'event') {

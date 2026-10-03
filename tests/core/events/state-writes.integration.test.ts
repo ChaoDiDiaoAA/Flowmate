@@ -1,3 +1,4 @@
+import { createTestWorkspaceVerifier } from '../../support/workspace.ts';
 import { describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -74,7 +75,7 @@ function agentFixture(workspace = false, legacy = false) {
     if (workspace) {
       const admission = f.runs.createWorkspaceAgent({ goal: input.goal, text: input.text, messageTimestamp: 1,
         config: agentConfig, usage, cleanup, createdAt: stamp, sessionId: session.sessionId, goalMode: 'answer',
-        expected: { revision: 1, documentRef: null, jobId: null, candidateRef: null, sessionId: session.sessionId } });
+        expected: { revision: 1, documentRef: null, jobId: null, candidateRef: null, sessionId: session.sessionId } }, createTestWorkspaceVerifier(f, f.paths.root));
       if (!admission.ok) return admission;
       return ok({ runId: admission.data.runId, content: { version: 2 as const, text: input.text,
         workspaceContext: admission.data.workspaceContext, workspaceInput: admission.data.workspaceInput,

@@ -190,6 +190,7 @@ export type DesktopBridge = {
   queryRunToolCall(input: import('./events.ts').RunToolCallRequest): Promise<import('./runtime.ts').Result<import('./events.ts').RuntimeToolView>>;
   readWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
   updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
+  restoreWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceRestoreResult>>;
   startTask(input: import('./workspace.ts').StartTaskRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').TaskOperation>>;
   queryTaskOperation(clientSequence: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').TaskOperation | null>>;
   selectCandidate(input: import('./workspace.ts').SelectCandidateRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').CandidateSelection>>;
@@ -204,6 +205,7 @@ export type DesktopBridge = {
   listActivity(request: import('./activity.ts').ActivityPageRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./activity.ts').BusinessEventSnapshot>>>;
   chooseAndImportInvoice(): Promise<import('./runtime.ts').Result<import('./workspace.ts').DocumentSnapshot | null>>;
   readDocumentPage(input: import('./invoice.ts').InvoiceToolInput<'read_invoice_document'>): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceToolOutput<'read_invoice_document'>>>;
+  listDocumentPages(input: import('./invoice.ts').InvoiceToolInput<'list_invoice_pages'>): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceToolOutput<'list_invoice_pages'>>>;
   readDocumentOriginal(documentId: number, page: number): Promise<import('./runtime.ts').Result<import('./workspace.ts').DocumentOriginalImage>>;
   revokeDocumentUse(documentId: number): Promise<import('./runtime.ts').Result<{ affectedSessionIds: number[]; stopRequested: boolean }>>;
   subscribe(listener: (event: DesktopEvent) => void): () => void;

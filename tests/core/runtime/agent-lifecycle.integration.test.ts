@@ -27,6 +27,7 @@ import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
 import { openTestDatabase } from '../../support/database.ts';
 import type { ProviderPort } from '@flowmate/contracts';
 import { createAgentHistoryFixture } from '../application/agent-history-fixture.ts';
+import { createTestWorkspaceVerifier } from '../../support/workspace.ts';
 
 const config: ProviderConfig = {
   version: 1,
@@ -108,7 +109,7 @@ function fixture() {
     now: () => '2026-09-24T00:00:00.000Z',
     monotonicNow: () => performance.now(),
   };
-  return { db: opened.data, deps };
+  return { db: opened.data, deps, root };
 }
 
 function makeAgent(history: ReturnType<typeof createAgentHistoryFixture>, options: {
@@ -142,6 +143,82 @@ function makeAgent(history: ReturnType<typeof createAgentHistoryFixture>, option
 }
 
 describe('RuntimeService Agent lifecycle', () => {
+  it('rejects a new Workspace Run with missing verification before storing or preparing it', async () => {
+    const { db, deps } = fixture();
+    let preparations = 0;
+    const agent = makeAgent(deps.fixtureHistory, { prepare: async () => { preparations++; return ok({ snapshot, execute: async () => nativeOutcome }); } });
+    const runtime = new RuntimeService({ ...deps, agent });
+    expect(await runtime.start({ ...request, workspace: { revision: 0, sessionId: 1, documentRef: null, jobId: null, candidateRef: null } }))
+      .toMatchObject({ ok: false, error: { code: 'workspace_unavailable' } });
+    expect(preparations).toBe(0);
+    expect(db.db.query('SELECT count(*) AS count FROM runs').get()).toEqual({ count: 0 });
+    expect(db.db.query('SELECT count(*) AS count FROM session_inputs').get()).toEqual({ count: 0 });
+    await runtime.close(); db.close();
+  });
+
+  it.each([false, true])('keeps pure Chat input use available and requires verification for consistent empty Workspace (verifier=%s)', async hasVerifier => {
+    for (const scopeVersion of [1, 2] as const) {
+      const { db, deps, root } = fixture();
+      let checked: Result<void> | undefined;
+      const agent = makeAgent(deps.fixtureHistory, { execute: async input => {
+        if (scopeVersion === 2) {
+          const run = db.runs.get(input.runId), saved = db.sessionInputs.get(input.inputId!);
+          if (!run.ok || !saved.ok || !saved.data) throw new Error('Saved admission is required.');
+          const workspaceContext = { formatVersion: 1, revision: 0, sessionId: 1, documentRef: null,
+            jobId: null, candidateRef: null, activeView: 'candidate', selection: null };
+          const workspaceInput = { documentRef: null, job: null, candidate: null };
+          db.db.query('UPDATE runs SET scope_json=?,input_json=?,config_json=? WHERE id=?').run(JSON.stringify({ version: 2,
+            allowedTools: [], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] }),
+          JSON.stringify({ ...run.data.input, version: 2, workspaceInput }), JSON.stringify({ ...run.data.config, workspaceContext }), input.runId);
+          db.db.query('UPDATE session_inputs SET content_json=? WHERE id=?').run(JSON.stringify({ ...saved.data.content,
+            workspaceContext, workspaceInput }), input.inputId!);
+        }
+        checked = input.verifyInputUse!(input.inputId!);
+        return { ...nativeOutcome, error: checked.ok ? null : checked.error, stopReason: checked.ok ? 'stop' : 'error' };
+      } });
+      const runtime = new RuntimeService({ ...deps, agent,
+        ...(hasVerifier ? { workspaceVerifier: createTestWorkspaceVerifier(db, root) } : {}) });
+      const finished = finishSignal();
+      expect((await runtime.start(request, finished)).ok).toBe(true);
+      await finished.done.promise;
+      expect(checked).toMatchObject(scopeVersion === 1 || hasVerifier ? { ok: true }
+        : { ok: false, error: { code: 'workspace_unavailable' } });
+      await runtime.close(); db.close();
+    }
+  });
+
+  it.each([false, true])('rejects contradictory authoritative Scope and saved input before native delivery (verifier=%s)', async hasVerifier => {
+    for (const contradiction of ['chat-with-context', 'workspace-without-context'] as const) {
+      const { db, deps, root } = fixture();
+      let delivered = 0;
+      let checked: Result<void> | undefined;
+      const agent = { ...makeAgent(deps.fixtureHistory), prepare: async () => ok({ snapshot,
+        execute: async (input: AgentExecutionInput) => {
+          const saved = db.sessionInputs.get(input.inputId!);
+          if (!saved.ok || !saved.data) throw new Error('Expected a saved input.');
+          if (contradiction === 'chat-with-context') {
+            db.db.query('UPDATE session_inputs SET content_json=? WHERE id=?').run(JSON.stringify({ ...saved.data.content,
+              workspaceContext: { formatVersion: 1, revision: 0, sessionId: 1, documentRef: null, jobId: null,
+                candidateRef: null, activeView: 'candidate', selection: null },
+              workspaceInput: { documentRef: null, job: null, candidate: null } }), input.inputId!);
+          } else {
+            db.db.query('UPDATE runs SET scope_json=? WHERE id=?').run(JSON.stringify({ version: 2,
+              allowedTools: [], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] }), input.runId);
+          }
+          checked = input.verifyInputUse!(input.inputId!);
+          if (checked.ok) delivered++;
+          return { ...nativeOutcome, error: checked.ok ? null : checked.error, stopReason: checked.ok ? 'stop' : 'error' };
+        } }) } satisfies AgentPort;
+      const runtime = new RuntimeService({ ...deps, agent,
+        ...(hasVerifier ? { workspaceVerifier: createTestWorkspaceVerifier(db, root) } : {}) });
+      const finished = finishSignal();
+      expect((await runtime.start(request, finished)).ok).toBe(true);
+      await finished.done.promise;
+      expect(checked).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+      expect(delivered).toBe(0);
+      await runtime.close(); db.close();
+    }
+  });
   it('keeps admitted Run limits when prepared Agent facts report different limits', async () => {
     const { db, deps } = fixture();
     let remainingMs = 0;
@@ -695,20 +772,22 @@ describe('P5 public input stopping and admission barriers', () => {
     };
     const nativeHeader = db.db.query<{ cwd: string }, []>("SELECT json_extract(header_json,'$.cwd') AS cwd FROM session_native_history WHERE session_id=1").get();
     if (!nativeHeader) throw new Error('The native Session header must exist.');
-    const runtime = new RuntimeService({ ...deps, agent, tools, nativeTools: {
+    const verify = createTestWorkspaceVerifier(db, nativeHeader.cwd);
+    const runtime = new RuntimeService({ ...deps, agent, tools, workspaceVerifier: verify, nativeTools: {
       runtimeDir: nativeHeader.cwd,
       availability: [{ name: 'powershell', available: true, reason: null }] } });
     const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
       id => runtime.verifySessionMutation(id));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
-    const current = db.workspace.update({ expectedRevision: 0, change: { kind: 'session', sessionId: 1 }, at: deps.now() });
+    const current = db.workspace.update({ expectedRevision: 0, change: { kind: 'session', sessionId: 1 }, at: deps.now() }, verify);
     if (!current.ok) throw new Error(current.error.code);
     const workspace = { revision: current.data.revision, sessionId: 1, documentRef: null, jobId: null, candidateRef: null };
     const finished = finishSignal();
     const initial = await app.submitInput({ ...request, clientSequence: 1, mode: 'prompt', workspace, timeoutMs: 5000, stopGraceMs: 1000 }, finished);
     if (!initial.ok) throw new Error(initial.error.code);
     await entered.promise;
+    expect(executionInput.workspaceContext).toEqual({ ...workspace, formatVersion: 1, activeView: current.data.activeView, selection: null });
     const receipts: SessionInputAccepted[] = [];
     for (const clientSequence of [2, 3, 4]) {
       const receipt = await app.submitInput({ sessionId: 1, clientSequence, mode: 'followUp', runId: initial.data.runId,

@@ -653,3 +653,26 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
   .activity-controls label { flex-basis: 100%; }
   .activity-timeline { padding-inline: 16px; }
 }
+.workspace-summary { padding: 20px; }
+.workspace-summary dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 0 0 12px; }
+.workspace-summary dl div { min-width: 0; }
+.workspace-summary dt { color: var(--foreground-muted); font-size: 12px; margin-bottom: 5px; }
+.workspace-summary dd { margin: 0; overflow-wrap: anywhere; }
+.workspace-material { min-width: 0; }
+.workspace-original { margin: 16px 0; }
+.workspace-original img { max-width: 100%; max-height: 60vh; object-fit: contain; }
+.workspace-original figcaption { color: var(--foreground-muted); margin-top: 8px; }
+.workspace-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.workspace-field, .workspace-block { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; min-width: 0; }
+.workspace-field > div:first-child, .workspace-block > div { min-width: 0; flex: 1; }
+.workspace-field p, .workspace-block p { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.workspace-field small { color: var(--foreground-muted); }
+.workspace-field.selected, .workspace-block.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+.workspace-sources { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; }
+.workspace-sources button { white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.workspace-line { padding: 14px 0; border-top: 1px solid var(--border); }
+.workspace-line h4 { margin: 0; }
+.workspace-blocks { display: grid; gap: 10px; margin: 16px 0; }
+@media (max-width: 1079px) {
+  .workspace-summary dl, .workspace-fields { grid-template-columns: minmax(0, 1fr); }
+}

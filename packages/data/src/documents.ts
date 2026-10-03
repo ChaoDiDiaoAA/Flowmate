@@ -7,6 +7,7 @@ import {
   MAX_INVOICE_PAGES,
   MAX_INVOICE_BLOCKS_PER_PAGE,
   MAX_INVOICE_VERSION_CHARS,
+  DocumentRefSchema,
 } from '@flowmate/contracts';
 import type {
   DocumentSnapshot,
@@ -14,6 +15,8 @@ import type {
   ProductToolContext,
   Result,
   RunScope,
+  DocumentRef,
+  WorkspaceMaterialInspection,
 } from '@flowmate/contracts';
 import { mapVoxel51ParsedDocument, parseVoxel51Sample } from './parsed-document.ts';
 import { isSupportedOriginal, readVoxel51Files } from './source/voxel51.ts';
@@ -270,31 +273,85 @@ export class DocumentService {
     return parsed.ok ? ok({ document: document.data, parsed: parsed.data }) : parsed;
   }
 
+  public inspectForWorkspace(ref: DocumentRef): Result<WorkspaceMaterialInspection> {
+    if (!DocumentRefSchema.safeParse(ref).success) return fail(appError('input_invalid', 'input', '材料引用无效。'));
+    const invalid = (reason: string): Result<WorkspaceMaterialInspection> => ok({ kind: 'invalid', reason });
+    try {
+      const document = this.options.repository.get(ref.id);
+      if (!document.ok) return document.error.code === 'document_not_found' ? invalid('document_missing') : document;
+      if (document.data.documentRef.version !== ref.version) return invalid('document_version_mismatch');
+      if (document.data.isHidden) return invalid('document_hidden');
+      const original = this.options.repository.getArtifact(document.data.originalArtifactId);
+      const parsed = this.options.repository.getArtifact(document.data.parsedArtifactId);
+      if (!original.ok) return original.error.code === 'artifact_not_found' ? invalid('artifact_missing_or_invalid') : original;
+      if (!parsed.ok) return parsed.error.code === 'artifact_not_found' ? invalid('artifact_missing_or_invalid') : parsed;
+      if (original.data.kind !== 'original' || parsed.data.kind !== 'parsed'
+        || original.data.artifactId === parsed.data.artifactId
+        || original.data.metadata.sourceVersion !== ref.version || parsed.data.metadata.sourceVersion !== ref.version
+        || original.data.metadata.sourceKey !== parsed.data.metadata.sourceKey
+        || original.data.metadata.sourceRecordId !== parsed.data.metadata.sourceRecordId) return invalid('artifact_missing_or_invalid');
+      const owner = this.options.repository.findBySource({ sourceKey: original.data.metadata.sourceKey,
+        sourceRecordId: original.data.metadata.sourceRecordId, version: original.data.metadata.sourceVersion });
+      if (!owner.ok) return owner;
+      if (owner.data?.documentRef.id !== ref.id || owner.data.documentRef.version !== ref.version)
+        return invalid('artifact_missing_or_invalid');
+      const originalName = original.data.relativePath.slice(original.data.relativePath.lastIndexOf('/') + 1);
+      const originalBytes = this.options.files.read(original.data, originalName);
+      if (!originalBytes.ok) return originalBytes.error.code === 'artifact_unavailable' ? invalid('artifact_missing_or_invalid') : originalBytes;
+      if ((originalName !== 'original.png' && originalName !== 'original.jpg')
+        || original.data.mimeType !== (originalName.endsWith('.png') ? 'image/png' : 'image/jpeg')
+        || !isSupportedOriginal(originalBytes.data, originalName)) return invalid('artifact_missing_or_invalid');
+      // Check every registered file, including sidecars, without altering availability.
+      for (const artifact of [original.data, parsed.data]) {
+        for (const file of artifact.metadata.files) {
+          const bytes = this.options.files.read(artifact, file.relativePath);
+          if (!bytes.ok) return bytes.error.code === 'artifact_unavailable' ? invalid('artifact_missing_or_invalid') : bytes;
+        }
+      }
+      const decoded = this.inspectStoredParsed(document.data, parsed.data);
+      if (!decoded.ok) return decoded.error.code === 'artifact_unavailable' ? invalid('artifact_missing_or_invalid') : decoded;
+      if (decoded.data.pages.length !== document.data.pageCount) return invalid('artifact_missing_or_invalid');
+      const seenPages = new Set<number>();
+      for (const page of decoded.data.pages) {
+        if (seenPages.has(page.page)) return invalid('artifact_missing_or_invalid');
+        seenPages.add(page.page);
+        if (new Set(page.blocks.map(block => block.id)).size !== page.blocks.length) return invalid('artifact_missing_or_invalid');
+      }
+      return ok({ kind: 'valid', document: document.data,
+        pages: decoded.data.pages.map(page => ({ page: page.page, blockIds: page.blocks.map(block => block.id) })) });
+    } catch {
+      return fail(appError('storage_read_failed', 'storage', '材料核验暂时无法完成。', true));
+    }
+  }
+
   private readStoredParsed(document: DocumentSnapshot, artifact: StoredArtifact,
     context?: ProductToolContext): Result<StoredParsedDocument> {
-    const documentId = document.documentRef.id;
+    const inspected = this.inspectStoredParsed(document, artifact);
+    return !inspected.ok && inspected.error.code === 'artifact_unavailable'
+      ? this.unavailableDocument(document.documentRef.id, inspected.error.message, context) : inspected;
+  }
+
+  private inspectStoredParsed(document: DocumentSnapshot, artifact: StoredArtifact): Result<StoredParsedDocument> {
+    const invalid = (reason: string) => fail<StoredParsedDocument>(appError('artifact_unavailable', 'storage', reason));
     const bytes = this.options.files.read(artifact, 'parsed.json');
-    if (!bytes.ok) return bytes.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(documentId, 'parsed_artifact_missing_or_corrupt', context) : bytes;
+    if (!bytes.ok) return bytes.error.code === 'artifact_unavailable' ? invalid('parsed_artifact_missing_or_corrupt') : bytes;
     let decoded: StoredParsedDocument;
     try { decoded = decodeParsed(parseJson(bytes.data)); }
-    catch { return this.unavailableDocument(documentId, 'parsed_document_invalid', context); }
+    catch { return invalid('parsed_document_invalid'); }
     if (!/:parsed-v3:[a-f0-9]{64}$/.test(document.documentRef.version)) return ok(decoded);
 
     const content = this.options.files.read(artifact, 'raw-content.json');
-    if (!content.ok) return content.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt', context) : content;
+    if (!content.ok) return content.error.code === 'artifact_unavailable' ? invalid('parsed_sidecar_missing_or_corrupt') : content;
     const pages = this.options.files.read(artifact, 'raw-pages.json');
-    if (!pages.ok) return pages.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt', context) : pages;
+    if (!pages.ok) return pages.error.code === 'artifact_unavailable' ? invalid('parsed_sidecar_missing_or_corrupt') : pages;
     try {
       const mapped = mapVoxel51ParsedDocument({ content: parseJson(content.data), pages: parseJson(pages.data) });
       if (!mapped.ok || decoded.pages.length !== document.pageCount
         || JSON.stringify(decoded.pages) !== JSON.stringify(mapped.data.pages)) {
-        return this.unavailableDocument(documentId, 'parsed_document_mismatch', context);
+        return invalid('parsed_document_mismatch');
       }
     } catch {
-      return this.unavailableDocument(documentId, 'parsed_sidecar_invalid', context);
+      return invalid('parsed_sidecar_invalid');
     }
     return ok(decoded);
   }

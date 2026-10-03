@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Message } from '@earendil-works/pi-ai';
 import { SessionManager, type AgentSession, type FileEntry } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok, InputRecordV2Schema, invoiceToolSchemas, INVOICE_TOOL_NAMES,
-  SessionMessageViewSchema, FillInvoiceFormOutputSchema, SessionInputContentSchema, formatExecutionPrompt } from '@flowmate/contracts';
+  SessionMessageViewSchema, FillInvoiceFormOutputSchema, SessionInputContentSchema, formatExecutionPrompt, WorkspaceContextSchema } from '@flowmate/contracts';
 import type { DbId, MessageDisplayBlock, MessageRunInput, NativeMessageProjectionInput,
   NativeSessionHistory, Result, SessionMessageView, SessionMessagesPage, MessageSessionInput } from '@flowmate/contracts';
 export { formatExecutionPrompt } from '@flowmate/contracts';
@@ -56,6 +56,7 @@ const historySchema = z.object({ storageVersion: z.literal(1),
   entries: z.array(entrySchema), leafId: id.nullable(), unusable: z.boolean() }).strict();
 const runInputSchema = z.object({ runId: dbId, goalMode: z.enum(['answer', 'save-candidate', 'fill-form']).nullable(),
   workingDirectory: z.string().min(1).max(4096).optional(),
+  workspaceContext: WorkspaceContextSchema.optional(),
   input: z.union([z.object({ version: z.literal(1), goal: z.string(), text: z.string(), messageTimestamp: finite }).strict(),
     InputRecordV2Schema]) }).strict();
 
@@ -221,7 +222,8 @@ export function projectMessageView(message: unknown, context: MessageViewContext
         const expected = formatExecutionPrompt({ text: run.data.input.text, business: run.data.goalMode !== null,
           ...(run.data.workingDirectory ? { workingDirectory: run.data.workingDirectory } : {}),
           ...(run.data.goalMode === null ? {} : { goalMode: run.data.goalMode }),
-          ...(run.data.input.version === 2 ? { workspaceInput: run.data.input.workspaceInput } : {}) });
+          ...(run.data.input.version === 2 ? { workspaceInput: run.data.input.workspaceInput } : {}),
+          ...(run.data.workspaceContext ? { workspaceContext: run.data.workspaceContext } : {}) });
         if (expected !== visible) return invalid();
         visible = run.data.input.text; origin = 'product-input';
       }

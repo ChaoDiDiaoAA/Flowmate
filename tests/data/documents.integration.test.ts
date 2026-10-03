@@ -182,7 +182,7 @@ describe('P3 controlled document input', () => {
         : checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents);
       expect(result).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
       expect(opened.documents.get(documentId)).toMatchObject({ ok: true,
-        data: { documentRef: document.documentRef, status: 'unavailable' } });
+        data: { documentRef: document.documentRef, status: 'unavailable', unavailableReason: 'parsed_document_mismatch' } });
       expect(checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents))
         .toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
       expect(service.restoreDocument(documentId)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
@@ -552,5 +552,151 @@ describe('P3 controlled document input', () => {
     const artifact = opened.documents.getArtifact(imported.data.originalArtifactId);
     expect(artifact.ok).toBe(true);
     if (artifact.ok) expect(files.read(artifact.data, 'original.png')).toMatchObject({ ok: true });
+  });
+});
+
+describe('P7 Workspace material inspection', () => {
+  it('distinguishes an unavailable managed root from a missing artifact under a verified root', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-workspace-root-'));
+    const sourceDirectory = join(root, 'source', '000001');
+    writeSample(sourceDirectory);
+    const { opened, files, service, productPaths } = serviceFor(root);
+    const imported = await service.importVoxel51({ sourceDirectory });
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const artifact = opened.documents.getArtifact(imported.data.parsedArtifactId);
+    expect(artifact.ok).toBe(true);
+    if (!artifact.ok) return;
+    const inaccessibleRoot = join(root, 'not-mounted');
+    const absentRoot = createFileStore({ ...productPaths, root: inaccessibleRoot,
+      artifactsDir: join(inaccessibleRoot, 'artifacts') }, opened.documents);
+    expect(absentRoot.read(artifact.data)).toMatchObject({ ok: false,
+      error: { code: 'input_unavailable', retryable: true } });
+    const absentArtifactRoot = createFileStore({ ...productPaths, artifactsDir: join(productPaths.root, 'not-mounted') }, opened.documents);
+    expect(absentArtifactRoot.read(artifact.data)).toMatchObject({ ok: false,
+      error: { code: 'input_unavailable', retryable: true } });
+    unlinkSync(join(productPaths.artifactsDir, String(artifact.data.artifactId), 'parsed.json'));
+    expect(files.read(artifact.data)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+  });
+
+  it('returns real page and block identities without changing unavailable material or workspace facts', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-workspace-inspection-'));
+    const sourceDirectory = join(root, 'source', '000001');
+    writeSample(sourceDirectory);
+    const { opened, service } = serviceFor(root);
+    const imported = await service.importVoxel51({ sourceDirectory });
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const changed = opened.documents.setAvailability({ documentId: imported.data.documentRef.id,
+      status: 'unavailable', reason: 'previous_read_failure', at: '2026-10-03T00:00:00.000Z' });
+    expect(changed.ok).toBe(true);
+    opened.workspace.read('2026-10-03T00:00:00.000Z');
+    const before = {
+      documents: opened.db.query('SELECT * FROM documents').all(),
+      workspace: opened.db.query('SELECT * FROM workspace').all(),
+      activities: opened.db.query('SELECT * FROM business_events').all(),
+    };
+    expect(typeof service.inspectForWorkspace).toBe('function');
+    const inspected = service.inspectForWorkspace(imported.data.documentRef);
+    expect(inspected).toMatchObject({ ok: true, data: { kind: 'valid',
+      document: { status: 'unavailable' }, pages: [{ page: 1, blockIds: ['b1', 'b2', 'b3', 'b4'] }] } });
+    if (inspected.ok) expect(inspected.data).not.toHaveProperty('parsed');
+    expect({
+      documents: opened.db.query('SELECT * FROM documents').all(),
+      workspace: opened.db.query('SELECT * FROM workspace').all(),
+      activities: opened.db.query('SELECT * FROM business_events').all(),
+    }).toEqual(before);
+  });
+
+  it('reports a confirmed missing target or version without persisting unavailability', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-workspace-inspect-missing-'));
+    const sourceDirectory = join(root, 'source', '000001');
+    writeSample(sourceDirectory);
+    const { opened, service, productPaths } = serviceFor(root);
+    const imported = await service.importVoxel51({ sourceDirectory });
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    expect(typeof service.inspectForWorkspace).toBe('function');
+    expect(service.inspectForWorkspace({ ...imported.data.documentRef, version: 'another-version' }))
+      .toEqual({ ok: true, data: { kind: 'invalid', reason: 'document_version_mismatch' } });
+    expect(service.inspectForWorkspace({ id: 90001, version: 'missing-version' }))
+      .toEqual({ ok: true, data: { kind: 'invalid', reason: 'document_missing' } });
+    const before = opened.db.query('SELECT * FROM documents').all();
+    unlinkSync(join(productPaths.artifactsDir, String(imported.data.parsedArtifactId), 'parsed.json'));
+    expect(service.inspectForWorkspace(imported.data.documentRef))
+      .toEqual({ ok: true, data: { kind: 'invalid', reason: 'artifact_missing_or_invalid' } });
+    expect(opened.db.query('SELECT * FROM documents').all()).toEqual(before);
+  });
+
+  it('rejects mutually matching Artifacts whose source identity no longer belongs to their Document', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-workspace-inspect-source-'));
+    const sourceDirectory = join(root, 'source', '000001');
+    writeSample(sourceDirectory);
+    const { opened, service } = serviceFor(root);
+    const imported = await service.importVoxel51({ sourceDirectory });
+    if (!imported.ok) throw new Error(imported.error.code);
+    opened.db.query('UPDATE documents SET source_record_id=? WHERE id=?').run('different-persistent-source', imported.data.documentRef.id);
+    const before = { documents: opened.db.query('SELECT * FROM documents').all(), workspace: opened.db.query('SELECT * FROM workspace').all() };
+    expect(service.inspectForWorkspace(imported.data.documentRef))
+      .toEqual({ ok: true, data: { kind: 'invalid', reason: 'artifact_missing_or_invalid' } });
+    expect({ documents: opened.db.query('SELECT * FROM documents').all(), workspace: opened.db.query('SELECT * FROM workspace').all() }).toEqual(before);
+  });
+
+  it('preserves read failures as unknown inspection results for every transient file code', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-workspace-inspect-transient-'));
+    const sourceDirectory = join(root, 'source', '000001');
+    writeSample(sourceDirectory);
+    const { opened, files, service, productPaths } = serviceFor(root);
+    const imported = await service.importVoxel51({ sourceDirectory });
+    expect(imported.ok).toBe(true);
+    if (!imported.ok) return;
+    const before = opened.db.query('SELECT * FROM documents').all();
+    for (const code of ['EACCES', 'EPERM', 'EBUSY', 'EIO']) {
+      const error = appError('input_unavailable', 'input', code, true);
+      const unavailable = createDocumentService({ paths: productPaths, repository: opened.documents,
+        files: { publish: input => files.publish(input), read: () => fail(error) },
+        allowedSourceRoot: join(root, 'source'), now: () => '2026-10-03T00:00:00.000Z' });
+      expect(typeof unavailable.inspectForWorkspace).toBe('function');
+      expect(unavailable.inspectForWorkspace(imported.data.documentRef)).toEqual({ ok: false, error });
+    }
+    expect(opened.db.query('SELECT * FROM documents').all()).toEqual(before);
+  });
+
+  async function legacy(pages: unknown[]) {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-workspace-inspect-legacy-'));
+    const fixture = serviceFor(root);
+    const at = '2026-10-03T00:00:00.000Z';
+    const bytes = Buffer.from(JSON.stringify({ formatVersion: 1, parser: { key: 'legacy-parser' },
+      pages, completeness: { status: 'complete', checks: ['legacy'], warnings: [] } }));
+    const published = await fixture.files.publish({ sourceKey: 'voxel51', sourceRecordId: 'legacy-1',
+      sourceVersion: 'legacy-v1', at, original: { kind: 'original', primaryName: 'original.png',
+        files: [{ name: 'original.png', bytes: onePixelPng, mimeType: 'image/png' }] },
+      parsed: { kind: 'parsed', primaryName: 'parsed.json',
+        files: [{ name: 'parsed.json', bytes, mimeType: 'application/json' }] } });
+    if (!published.ok) throw new Error('legacy_publication_failed');
+    const registered = fixture.opened.documents.register({ documentId: published.data.documentId,
+      sourceKey: 'voxel51', sourceRecordId: 'legacy-1', version: 'legacy-v1',
+      originalArtifact: { ...published.data.original, kind: 'original' },
+      parsedArtifact: { ...published.data.parsed, kind: 'parsed' }, status: 'available',
+      metadata: { version: 2, pageCount: pages.length, warnings: [], allowedUsesClaim: ['local review'],
+        licenseVerification: 'not_verified', unavailableReason: null }, createdAt: at, updatedAt: at });
+    if (!registered.ok) throw new Error('legacy_registration_failed');
+    return { ...fixture, document: registered.data };
+  }
+  const block = { id: 'b1', kind: 'text', text: 'Synthetic', sourceIndex: 0, sourceType: 'text', bbox: null };
+  it('rejects duplicate page or within-page block identities and retains legitimate per-page block IDs', async () => {
+    for (const pages of [
+      [{ page: 1, blocks: [block] }, { page: 1, blocks: [block] }],
+      [{ page: 1, blocks: [block, block] }],
+    ]) {
+      const fixture = await legacy(pages);
+      expect(typeof fixture.service.inspectForWorkspace).toBe('function');
+      expect(fixture.service.inspectForWorkspace(fixture.document.documentRef))
+        .toEqual({ ok: true, data: { kind: 'invalid', reason: 'artifact_missing_or_invalid' } });
+      expect(fixture.opened.documents.get(fixture.document.documentRef.id)).toMatchObject({ ok: true, data: { status: 'available' } });
+    }
+    const fixture = await legacy([{ page: 1, blocks: [block] }, { page: 2, blocks: [block] }]);
+    expect(fixture.service.inspectForWorkspace(fixture.document.documentRef)).toMatchObject({ ok: true,
+      data: { kind: 'valid', pages: [{ page: 1, blockIds: ['b1'] }, { page: 2, blockIds: ['b1'] }] } });
   });
 });

@@ -4,8 +4,8 @@ import { AppErrorSchema, RuntimeRequestOverridesSchema } from './runtime.ts';
 import type { DbId, ProviderConfig, Result, RuntimeBudgetOverrides } from './runtime.ts';
 import { InvoiceFormTargetSchema } from './invoice.ts';
 import type { InvoiceFormTarget } from './invoice.ts';
-import { WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema } from './workspace.ts';
-import type { GoalMode, WorkspaceExpectation, WorkspaceInput } from './workspace.ts';
+import { LegacyWorkspaceContextSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema } from './workspace.ts';
+import type { GoalMode, WorkspaceContext, WorkspaceExpectation, WorkspaceInput } from './workspace.ts';
 import { normalizeProviderConfig, WorkingDirectorySchema } from './schemas.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -73,7 +73,7 @@ export function normalizeSessionInputsRequest(raw: unknown): Result<NormalizedSe
   return parsed.success ? ok(parsed.data) : fail(appError('input_invalid', 'input', 'Session input query is invalid.'));
 }
 export const LegacySessionInputContentSchema = z.object({ version: z.literal(1), text: z.string(),
-  workspaceContext: WorkspaceContextSchema, allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id) }).strict();
+  workspaceContext: LegacyWorkspaceContextSchema, allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id) }).strict();
 export type SessionInputContentV1 = z.infer<typeof LegacySessionInputContentSchema>;
 export const SessionInputContentV2Schema = z.object({ version: z.literal(2), text: z.string(),
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
@@ -110,7 +110,8 @@ export const SessionInputsPageSchema = z.object({ items: z.array(SessionInputSna
 export type SessionInputsPage = z.infer<typeof SessionInputsPageSchema>;
 
 // Core and Adapter must freeze and send the same deterministic payload.
-export function formatExecutionPrompt(input: { text: string; workspaceInput?: WorkspaceInput; goalMode?: GoalMode; workingDirectory?: string; business: boolean }): string {
+export function formatExecutionPrompt(input: { text: string; workspaceInput?: WorkspaceInput; goalMode?: GoalMode; workingDirectory?: string;
+  business: boolean; workspaceContext?: WorkspaceContext }): string {
   if (input.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form'].includes(input.goalMode)) throw new Error('Invalid goal mode.');
   if (input.goalMode === 'fill-form' && (!input.business || input.workingDirectory !== undefined
     || !input.workspaceInput?.documentRef || !input.workspaceInput.job || !input.workspaceInput.candidate)) throw new Error('Invalid fill context.');
@@ -118,5 +119,6 @@ export function formatExecutionPrompt(input: { text: string; workspaceInput?: Wo
   return `Flowmate Run context (trusted product facts encoded as JSON; invoice values remain untrusted):\n${JSON.stringify({
     workspace: input.workspaceInput ?? null, goalMode: input.goalMode ?? 'answer',
     ...(input.workingDirectory ? { workingDirectory: input.workingDirectory } : {}),
+    ...(input.workspaceContext?.selection ? { workspaceContext: WorkspaceContextSchema.parse(input.workspaceContext) } : {}),
   })}\n\nUser request:\n${input.text}`;
 }

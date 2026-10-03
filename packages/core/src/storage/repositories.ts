@@ -5,6 +5,8 @@ import { z } from 'zod';
 import { associateInputResult, completeSessionInputs, createSessionInputLedger, finishSessionInputs, markInputConsumed, recoverSessionInputs } from '../sessions/input-ledger.ts';
 import type { InputResultBatch, SessionInputAdmission } from '../sessions/input-ledger.ts';
 import type { RuntimeEventStore } from '../events/store.ts';
+import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/verification.ts';
+import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
 import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
@@ -33,6 +35,8 @@ import type {
   UsageRecordV2,
   DocumentSnapshot,
   WorkspaceSnapshot,
+  WorkspaceSelection,
+  WorkspaceRestoreResult,
   WorkspaceChange,
   JobSnapshot,
   CandidateSnapshot,
@@ -82,7 +86,7 @@ import type {
   MessageSessionInput,
 } from '@flowmate/contracts';
 import type { RunAgentConfigFacts, RuntimeAgentConfigFacts, AgentFacts, RunScope, LegacyRunScope } from '@flowmate/contracts';
-import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_REVIEW_TOOL_NAMES, NATIVE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, InvoiceFormTargetSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, FillInvoiceFormInputSchema } from '@flowmate/contracts';
+import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_REVIEW_TOOL_NAMES, NATIVE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, WorkspaceSelectionSchema, InvoiceFormTargetSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, FillInvoiceFormInputSchema } from '@flowmate/contracts';
 import { StoredCandidateDraftSchema, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandidateRequestSchema,
   RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields,
   invoiceFieldDisplayValue, isLegalInvoiceNormalizedValue } from '@flowmate/contracts';
@@ -214,8 +218,9 @@ export interface DocumentRepository {
 export type WorkspaceUpdate = { expectedRevision: number; change: WorkspaceChange; at: string };
 export type SelectCandidateRecord = SelectCandidateRequest & { at: string };
 export interface WorkspaceRepository {
-  read(at: string): Result<WorkspaceSnapshot>;
-  update(input: WorkspaceUpdate): Result<WorkspaceSnapshot>;
+  read(at: string, verify?: WorkspaceVerifier): Result<WorkspaceSnapshot>;
+  update(input: WorkspaceUpdate, verify: WorkspaceVerifier): Result<WorkspaceSnapshot>;
+  restore(input: { expectedRevision: number; at: string }, verify: WorkspaceVerifier): Result<WorkspaceRestoreResult>;
   selectCandidate(input: SelectCandidateRecord): Result<CandidateSelection>;
 }
 
@@ -308,9 +313,9 @@ export type TerminalWrite = {
 export interface RunRepository {
   create(input: NewProviderRun): Result<DbId>;
   createAgent(input: NewAgentRun): Result<DbId>;
-  createWorkspaceAgent(input: NewWorkspaceAgentRun): Result<WorkspaceRunAdmission>;
-  freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }): Result<SessionInputAdmission>;
-  verifyInputUse(content: SessionInputContentV2): Result<void>;
+  createWorkspaceAgent(input: NewWorkspaceAgentRun, verify: WorkspaceVerifier): Result<WorkspaceRunAdmission>;
+  freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }, verify: WorkspaceVerifier | undefined): Result<SessionInputAdmission>;
+  verifyInputUse(content: SessionInputContentV2, verify: WorkspaceVerifier | undefined): Result<void>;
   listBySession(request: NormalizedSessionRunsRequest): Result<{ items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null }>;
   start(runId: DbId, config: SafeConfigSnapshot, startedAt: string): Result<void>;
   recordCancel(runId: DbId, requestedAt: string): Result<boolean>;
@@ -1067,6 +1072,7 @@ export function createDocumentRepository(db: Database): DocumentRepository {
         if (active.some((run) => runUsesDocument(run, documentId))) {
           return fail(appError('document_busy', 'runtime', 'Wait for the active response or stop it before removing this invoice.', true));
         }
+        if (!activeWorkspaceCanAdvance(db, 'active_document_id', documentId)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         const affectedSessionIds = blockSessionsUsingDocument(db, documentId, at);
         db.query('UPDATE documents SET hidden_at=?,updated_at=? WHERE id=?').run(at, at, documentId);
         db.query(`UPDATE workspace SET active_document_id=NULL,active_job_id=NULL,active_view='original',
@@ -1109,30 +1115,40 @@ function readJob(db: Database, jobId: DbId): JobSnapshot | null {
   };
 }
 
+type WorkspaceRow = { active_document_id: number | null; active_job_id: number | null; active_session_id: number | null;
+  active_view: string; selection_json: string | null; revision: number; updated_at: string };
+
 function workspaceSnapshot(db: Database, row: unknown, at: string): WorkspaceSnapshot {
-  const record = row as {
-    active_document_id: number | null; active_job_id: number | null; active_session_id: number | null;
-    active_view: string; revision: number; updated_at: string;
-  } | null;
+  const record = row as WorkspaceRow | null;
   if (!record || !Number.isSafeInteger(record.revision) || record.revision < 0
-    || !['original', 'parsed', 'candidate'].includes(record.active_view) || typeof record.updated_at !== 'string') {
+    || !['original', 'parsed', 'candidate'].includes(record.active_view) || typeof record.updated_at !== 'string'
+    || record.active_job_id !== null && record.active_document_id === null
+    || [record.active_document_id, record.active_job_id, record.active_session_id].some(id => id !== null && (!Number.isSafeInteger(id) || id < 1))) {
     throw new Error('invalid_workspace_row');
   }
   const invalidReferences: string[] = [];
+  const selection = record.selection_json === null ? null : WorkspaceSelectionSchema.parse(readJson(record.selection_json, 'workspace_selection'));
   let documentRef: WorkspaceSnapshot['documentRef'] = null;
   if (record.active_document_id !== null) {
-    const document = db.query('SELECT id,version FROM documents WHERE id=?').get(record.active_document_id) as { id: number; version: string } | null;
-    if (document) documentRef = DocumentRefSchema.parse(document);
+    const document = db.query('SELECT id,version,status,hidden_at FROM documents WHERE id=?').get(record.active_document_id) as { id: number; version: string; status: string; hidden_at: string | null } | null;
+    if (document) {
+      documentRef = DocumentRefSchema.parse({ id: document.id, version: document.version });
+      if (document.hidden_at !== null) invalidReferences.push('document_hidden');
+      if (document.status !== 'available') invalidReferences.push('document_unavailable');
+    }
     else invalidReferences.push('document_missing');
   }
-  let jobId: DbId | null = record.active_job_id;
+  let jobId: DbId | null = record.active_document_id !== null && documentRef === null ? null : record.active_job_id;
   let candidateRef: WorkspaceSnapshot['candidateRef'] = null;
-  if (record.active_job_id !== null) {
-    const job = db.query('SELECT id,document_id,current_candidate_id FROM jobs WHERE id=?').get(record.active_job_id) as {
-      id: number; document_id: number; current_candidate_id: number | null;
+  if (record.active_job_id !== null && documentRef !== null) {
+    const job = db.query('SELECT id,document_id,current_candidate_id,hidden_at FROM jobs WHERE id=?').get(record.active_job_id) as {
+      id: number; document_id: number; current_candidate_id: number | null; hidden_at: string | null;
     } | null;
     if (!job) {
       invalidReferences.push('job_missing');
+      jobId = null;
+    } else if (job.hidden_at !== null) {
+      invalidReferences.push('job_hidden');
       jobId = null;
     } else if (job.document_id !== record.active_document_id) {
       invalidReferences.push('job_document_mismatch');
@@ -1142,13 +1158,14 @@ function workspaceSnapshot(db: Database, row: unknown, at: string): WorkspaceSna
         id: number; sequence: number; job_id: number;
       } | null;
       if (candidate && candidate.job_id === job.id) candidateRef = { id: candidate.id, sequence: candidate.sequence };
-      else invalidReferences.push('candidate_mismatch');
+      else throw new Error('candidate_authority_mismatch');
     }
   }
   let sessionId: DbId | null = record.active_session_id;
   if (record.active_session_id !== null) {
-    const session = db.query("SELECT id,status FROM sessions WHERE id=?").get(record.active_session_id) as { id: number; status: string } | null;
-    if (!session || session.status !== 'active') {
+    const session = db.query('SELECT * FROM sessions WHERE id=?').get(record.active_session_id);
+    const facts = session ? readSessionRow(db, session) : null;
+    if (!facts || facts.status !== 'active' || (session as { hidden_at: string | null }).hidden_at !== null || facts.deletePending) {
       invalidReferences.push('session_unavailable');
       sessionId = null;
     }
@@ -1163,8 +1180,36 @@ function workspaceSnapshot(db: Database, row: unknown, at: string): WorkspaceSna
   if (!Number.isSafeInteger(nextTaskSequence)) throw new Error('task_sequence_exhausted');
   return {
     documentRef, jobId, sessionId, candidateRef, activeView: record.active_view as WorkspaceSnapshot['activeView'],
-    selection: null, revision: record.revision, updatedAt: record.updated_at || at, invalidReferences, nextTaskSequence,
+    selection, revision: record.revision, updatedAt: record.updated_at || at, invalidReferences, nextTaskSequence,
   };
+}
+
+function workspaceCandidate(db: Database, workspace: Pick<WorkspaceSnapshot, 'candidateRef' | 'jobId'>): WorkspaceInput['candidate'] {
+  if (!workspace.candidateRef) return null;
+  const row = queryCandidateRow(db, workspace.candidateRef.id, workspace.jobId ?? undefined);
+  if (!row) throw new Error('candidate_authority_missing');
+  const candidate = candidateSnapshot(row).snapshot;
+  if (candidate.jobId !== workspace.jobId || candidate.sequence !== workspace.candidateRef.sequence) throw new Error('candidate_authority_mismatch');
+  return { id: candidate.candidateId, sequence: candidate.sequence, fields: candidate.fields, lines: candidate.lines, issues: candidate.issues };
+}
+
+function verifyWorkspaceSnapshot(db: Database, workspace: WorkspaceSnapshot, verify: WorkspaceVerifier): Result<WorkspaceVerification> {
+  const candidate = workspaceCandidate(db, workspace);
+  const verified = verify({ documentRef: workspace.documentRef, jobId: workspace.jobId,
+    candidateRef: workspace.candidateRef, candidate, selection: workspace.selection });
+  return verified.ok ? ok({ ...verified.data,
+    invalidReferences: [...new Set([...workspace.invalidReferences, ...verified.data.invalidReferences])] }) : verified;
+}
+
+function revisionCanAdvance(revision: number): boolean { return Number.isSafeInteger(revision + 1); }
+function activeWorkspaceCanAdvance(db: Database, field: 'active_document_id' | 'active_job_id' | 'active_session_id', id: DbId): boolean {
+  const row = db.query(`SELECT revision FROM workspace WHERE id=1 AND ${field}=?`).get(id) as { revision: number } | null;
+  return !row || revisionCanAdvance(row.revision);
+}
+function corruptWorkspace<T>(): Result<T> { return fail(appError('storage_corrupt', 'storage', 'Workspace 持久事实损坏。')); }
+function workspaceReadFailure<T>(error: unknown): Result<T> {
+  return error instanceof Error && (error.name === 'SQLiteError' || /closed database|database is closed|no such table/i.test(error.message))
+    ? fail(appError('storage_read_failed', 'storage', 'Workspace 事实暂时无法读取。', true)) : corruptWorkspace<T>();
 }
 
 function ensureWorkspace(db: Database, at: string): unknown {
@@ -1175,22 +1220,30 @@ function ensureWorkspace(db: Database, at: string): unknown {
 
 export function createWorkspaceRepository(db: Database): WorkspaceRepository {
   return {
-    read(at) {
-      const result = transaction(db, () => workspaceSnapshot(db, ensureWorkspace(db, at), at));
-      return result.ok ? result : fail(appError('storage_corrupt', 'storage', 'Workspace 事实无法读取。'));
+    read(at, verify) {
+      try { return db.transaction(() => {
+        const workspace = workspaceSnapshot(db, ensureWorkspace(db, at), at);
+        // Even an unverified revision read must reject malformed candidate authority.
+        workspaceCandidate(db, workspace);
+        if (!verify) return ok(workspace);
+        const verified = verifyWorkspaceSnapshot(db, workspace, verify);
+        return verified.ok ? ok({ ...workspace, invalidReferences: verified.data.invalidReferences }) : verified;
+      }).immediate(); } catch (error) { return workspaceReadFailure<WorkspaceSnapshot>(error); }
     },
 
-    update(input) {
+    update(input, verify) {
+      if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
       const changed = transaction(db, () => {
-        const row = ensureWorkspace(db, input.at) as {
-          active_document_id: number | null; active_job_id: number | null; active_session_id: number | null;
-          active_view: string; revision: number;
-        };
+        const row = ensureWorkspace(db, input.at) as WorkspaceRow;
         if (row.revision !== input.expectedRevision) return fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true));
+        let current: WorkspaceSnapshot;
+        try { current = workspaceSnapshot(db, row, input.at); workspaceCandidate(db, current); }
+        catch (error) { return workspaceReadFailure<WorkspaceSnapshot>(error); }
         let documentId = row.active_document_id;
         let jobId = row.active_job_id;
         let sessionId = row.active_session_id;
         let activeView = row.active_view as WorkspaceSnapshot['activeView'];
+        let selection = current.selection;
         const change = input.change;
         if (change.kind === 'document') {
           if (change.documentId !== null && !db.query('SELECT id FROM documents WHERE id=? AND hidden_at IS NULL').get(change.documentId)) {
@@ -1199,44 +1252,122 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
           if (documentId !== change.documentId) {
             documentId = change.documentId;
             jobId = null;
+            selection = null;
             activeView = 'original';
           }
         } else if (change.kind === 'job') {
           const job = readJob(db, change.jobId);
-          if (!job) return fail(appError('job_not_found', 'input', 'Job 不存在。'));
+          const visible = db.query('SELECT hidden_at FROM jobs WHERE id=?').get(change.jobId) as { hidden_at: string | null } | null;
+          if (!job || visible?.hidden_at !== null) return fail(appError('job_not_found', 'input', 'Job 不存在。'));
           if (!db.query('SELECT id FROM documents WHERE id=? AND hidden_at IS NULL').get(job.documentRef.id)) {
             return fail(appError('input_unavailable', 'input', 'This invoice is available only in Processing History.'));
           }
           if (jobId !== change.jobId || documentId !== job.documentRef.id) {
+            if (documentId !== job.documentRef.id || selection?.target === 'candidate') selection = null;
             jobId = change.jobId;
             documentId = job.documentRef.id;
             activeView = 'original';
           }
         } else if (change.kind === 'session') {
           if (change.sessionId !== null) {
-            const session = db.query("SELECT status FROM sessions WHERE id=?").get(change.sessionId) as { status: string } | null;
-            if (!session || session.status !== 'active') return fail(appError('session_not_found', 'input', '可用 Session 不存在。'));
+            const session = db.query('SELECT * FROM sessions WHERE id=? AND hidden_at IS NULL').get(change.sessionId);
+            const facts = session ? readSessionRow(db, session) : null;
+            if (!facts || facts.status !== 'active' || facts.deletePending) return fail(appError('session_not_found', 'input', '可用 Session 不存在。'));
           }
           sessionId = change.sessionId;
-        } else {
+        } else if (change.kind === 'view') {
           activeView = change.view;
+        } else {
+          const parsed = change.selection === null ? null : WorkspaceSelectionSchema.safeParse(change.selection);
+          if (parsed !== null && !parsed.success) return fail(appError('selection_invalid', 'input', '选择定位无效。'));
+          selection = parsed?.data ?? null;
         }
+        const proposedRow = { ...row, active_document_id: documentId, active_job_id: jobId, active_session_id: sessionId,
+          active_view: activeView, selection_json: selection === null ? null : asJson(selection) };
+        const proposed = workspaceSnapshot(db, proposedRow, input.at);
+        const verified = verifyWorkspaceSnapshot(db, proposed, verify);
+        if (!verified.ok) return verified;
+        const valid = requireValidWorkspace(verified.data);
+        if (!valid.ok) return valid;
         if (documentId === row.active_document_id && jobId === row.active_job_id
-          && sessionId === row.active_session_id && activeView === row.active_view) {
-          return ok(workspaceSnapshot(db, row, input.at));
+          && sessionId === row.active_session_id && activeView === row.active_view && sameWorkspaceSelection(selection, current.selection)) {
+          return ok(proposed);
         }
+        if (!revisionCanAdvance(row.revision)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         const updated = db.query(`UPDATE workspace SET active_document_id=?,active_job_id=?,active_session_id=?,
-          active_view=?,selection_json=NULL,revision=revision+1,updated_at=? WHERE id=1 AND revision=?`)
-          .run(documentId, jobId, sessionId, activeView, input.at, input.expectedRevision).changes;
+          active_view=?,selection_json=?,revision=revision+1,updated_at=? WHERE id=1 AND revision=?`)
+          .run(documentId, jobId, sessionId, activeView, proposedRow.selection_json, input.at, input.expectedRevision).changes;
         if (updated !== 1) return fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true));
-        return ok(workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), input.at));
+        const saved = workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), input.at);
+        const final = verifyWorkspaceSnapshot(db, saved, verify);
+        if (!final.ok) throw new Error('workspace_projection_failed');
+        const admitted = requireValidWorkspace(final.data);
+        if (!admitted.ok) throw new Error('workspace_projection_failed');
+        return ok({ ...saved, invalidReferences: final.data.invalidReferences });
       });
       return changed.ok ? changed.data : changed;
     },
 
+    restore(input, verify) {
+      if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
+      const restored = transaction(db, () => {
+        const row = ensureWorkspace(db, input.at) as WorkspaceRow;
+        if (row.revision !== input.expectedRevision) return fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true));
+        let current: WorkspaceSnapshot, verified: Result<WorkspaceVerification>;
+        try { current = workspaceSnapshot(db, row, input.at); verified = verifyWorkspaceSnapshot(db, current, verify); }
+        catch (error) { return workspaceReadFailure<WorkspaceRestoreResult>(error); }
+        if (!verified.ok) return verified;
+        const invalid = new Set(verified.data.invalidReferences);
+        const definiteDocument = ['document_missing', 'document_hidden', 'document_version_mismatch', 'artifact_missing_or_invalid'].some(reason => invalid.has(reason));
+        const definiteJob = ['job_missing', 'job_hidden', 'job_document_mismatch'].some(reason => invalid.has(reason));
+        const supported = new Set(['document_unavailable', 'session_unavailable', 'document_missing', 'document_hidden', 'document_version_mismatch',
+          'artifact_missing_or_invalid', 'job_missing', 'job_hidden', 'job_document_mismatch', 'selection_target_mismatch',
+          'selection_version_mismatch', 'selection_location_missing', 'selection_unsupported']);
+        if ([...invalid].some(reason => !supported.has(reason))) return fail(appError('storage_corrupt', 'storage', 'Workspace 引用无法安全恢复。'));
+        let documentId = row.active_document_id, jobId = row.active_job_id, sessionId = row.active_session_id;
+        let selection = current.selection, activeView = row.active_view;
+        const clearedReferences: string[] = [];
+        if (definiteDocument) {
+          documentId = null; jobId = null; selection = null; activeView = 'original';
+          clearedReferences.push(...[...invalid].filter(reason => ['document_missing', 'document_hidden', 'document_version_mismatch', 'artifact_missing_or_invalid'].includes(reason)));
+        } else {
+          if (definiteJob) {
+            jobId = null;
+            if (selection?.target === 'candidate') selection = null;
+            clearedReferences.push(...[...invalid].filter(reason => reason.startsWith('job_')));
+          }
+          if ([...invalid].some(reason => reason.startsWith('selection_'))) {
+            selection = null;
+            clearedReferences.push(...[...invalid].filter(reason => reason.startsWith('selection_')));
+          }
+        }
+        if (invalid.has('session_unavailable')) { sessionId = null; clearedReferences.push('session_unavailable'); }
+        const changed = documentId !== row.active_document_id || jobId !== row.active_job_id || sessionId !== row.active_session_id
+          || activeView !== row.active_view || !sameWorkspaceSelection(selection, current.selection);
+        if (changed && !revisionCanAdvance(row.revision)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
+        const material = verified.data.material;
+        if (!definiteDocument && material?.kind === 'valid' && material.document.status === 'unavailable') {
+          const repaired = createDocumentRepository(db).setAvailability({ documentId: material.document.documentRef.id,
+            status: 'available', reason: null, at: input.at });
+          if (!repaired.ok) throw new Error('workspace_material_repair_failed');
+        }
+        if (changed) {
+          const count = db.query(`UPDATE workspace SET active_document_id=?,active_job_id=?,active_session_id=?,active_view=?,
+            selection_json=?,revision=revision+1,updated_at=? WHERE id=1 AND revision=?`)
+            .run(documentId, jobId, sessionId, activeView, selection === null ? null : asJson(selection), input.at, input.expectedRevision).changes;
+          if (count !== 1) throw new Error('workspace_restore_cas_failed');
+        }
+        const workspace = workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), input.at);
+        const final = verifyWorkspaceSnapshot(db, workspace, verify);
+        if (!final.ok || final.data.invalidReferences.length) throw new Error('workspace_restore_projection_failed');
+        return ok({ workspace: { ...workspace, invalidReferences: final.data.invalidReferences }, clearedReferences });
+      });
+      return restored.ok ? restored.data : restored;
+    },
+
     selectCandidate(input) {
       const selected = transaction(db, () => {
-        const workspace = ensureWorkspace(db, input.at) as { active_job_id: number | null; revision: number };
+        const workspace = ensureWorkspace(db, input.at) as WorkspaceRow;
         const operationRef = `job:${input.jobId}:select:${input.expectedRevision}:from:${input.expectedCandidateId ?? 'none'}:to:${input.candidateId}`;
         const previous = db.query("SELECT job_id,candidate_id FROM business_events WHERE type='candidate_selected' AND operation_ref=? AND result='succeeded'")
           .get(operationRef) as { job_id: number | null; candidate_id: number | null } | null;
@@ -1267,7 +1398,7 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
         if (job.status === 'completed') return fail(appError('job_completed', 'input', '已完成 Job 不能更换候选。'));
         if (job.status === 'running') return fail(appError('state_conflict', 'runtime', 'Job 仍在运行，暂时不能选择候选。', true));
         if (!executionReleased(db, input.jobId)) return fail(appError('state_conflict', 'runtime', 'Job 仍有未停止或未收尾的执行。', true));
-        if (!Number.isSafeInteger(workspace.revision + 1)) {
+        if (workspace.active_job_id === input.jobId && !revisionCanAdvance(workspace.revision)) {
           return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         }
         const changedJob = db.query('UPDATE jobs SET current_candidate_id=?,updated_at=? WHERE id=? AND current_candidate_id IS ?')
@@ -1276,7 +1407,7 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
         if (workspace.active_job_id === input.jobId) {
           const changedWorkspace = db.query(`UPDATE workspace SET selection_json=NULL,revision=revision+1,updated_at=?
             WHERE id=1 AND revision=?`).run(input.at, input.expectedRevision).changes;
-          if (changedWorkspace !== 1) return fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true));
+          if (changedWorkspace !== 1) throw new Error('workspace_selection_cas_failed');
         }
         db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,candidate_id,result,safe_summary)
           VALUES ('candidate_selected',?,'user',?,?,?,?,'succeeded','Candidate selected')`)
@@ -1352,6 +1483,7 @@ export function createJobRepository(db: Database): JobRepository {
         if (row.hidden_at !== null) return ok(job);
         const active = db.query("SELECT 1 FROM runs WHERE job_id=? AND status IN ('created','running') LIMIT 1").get(jobId);
         if (active) return fail(appError('run_state_invalid', 'runtime', 'Wait for the active response before deleting this processing record.'));
+        if (!activeWorkspaceCanAdvance(db, 'active_job_id', jobId)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         db.query('UPDATE jobs SET hidden_at=? WHERE id=?').run(at, jobId);
         db.query("UPDATE workspace SET active_job_id=NULL,selection_json=NULL,active_view='original',revision=revision+1,updated_at=? WHERE id=1 AND active_job_id=?")
           .run(at, jobId);
@@ -1401,6 +1533,7 @@ export function createJobRepository(db: Database): JobRepository {
         const document = db.query('SELECT version,status,hidden_at FROM documents WHERE id=?').get(input.documentRef.id) as { version: string; status: string; hidden_at: string | null } | null;
         if (!document || document.version !== input.documentRef.version) return fail(appError('document_not_found', 'input', 'Document 版本不存在。'));
         if (document.status !== 'available' || document.hidden_at !== null) return fail(appError('input_unavailable', 'input', 'Invoice is no longer available for processing.', true));
+        if (!revisionCanAdvance(workspace.revision)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         const inputJson = { version: 1, clientSequence: input.clientSequence, expectedRevision: input.expectedRevision,
           documentRef: input.documentRef, goal: input.goal };
         const inserted = db.query(`INSERT INTO jobs(document_id,goal,input_json,status,created_at,updated_at)
@@ -1409,7 +1542,7 @@ export function createJobRepository(db: Database): JobRepository {
         if (!Number.isSafeInteger(jobId) || jobId <= 0) throw new Error('unsafe_job_id');
         const updated = db.query(`UPDATE workspace SET active_job_id=?,active_view='original',selection_json=NULL,
           revision=revision+1,updated_at=? WHERE id=1 AND revision=?`).run(jobId, input.at, input.expectedRevision).changes;
-        if (updated !== 1) return fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true));
+        if (updated !== 1) throw new Error('workspace_task_cas_failed');
         db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,result,safe_summary)
           VALUES ('task_started',?,'user',?,?,?,'succeeded','Task started')`)
           .run(input.at, operationRef(input.clientSequence), input.documentRef.id, jobId);
@@ -2568,7 +2701,7 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       const created = writeTransaction(() => {
         if (input.expectedRevision !== undefined) {
           const workspace = ensureWorkspace(db, input.at) as { revision: number };
-          if (workspace.revision !== input.expectedRevision) return null;
+          if (workspace.revision !== input.expectedRevision || !revisionCanAdvance(workspace.revision)) return null;
         }
         const result = db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at,metadata_json) VALUES (?,?,?,?,?)')
           .run(input.nativeSessionId, input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }));
@@ -2698,7 +2831,11 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
           return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
         if (row.status === input.status) return ok(row);
         if (row.status !== input.expectedStatus) return fail(appError('state_conflict', 'session', 'Session status has changed.', true));
+        if (input.status === 'archived' && !activeWorkspaceCanAdvance(db, 'active_session_id', input.sessionId))
+          return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         db.query('UPDATE sessions SET status=?,updated_at=? WHERE id=?').run(input.status, input.at, input.sessionId);
+        if (input.status === 'archived') db.query('UPDATE workspace SET active_session_id=NULL,revision=revision+1,updated_at=? WHERE id=1 AND active_session_id=?')
+          .run(input.at, input.sessionId);
         return ok(readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(input.sessionId)));
       });
       return changed.ok ? changed.data : changed;
@@ -2720,6 +2857,7 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
           db.query('UPDATE sessions SET metadata_json=? WHERE id=?').run(asJson(completedMetadata), sessionId);
           return ok('hidden' as const);
         }
+        if (!activeWorkspaceCanAdvance(db, 'active_session_id', sessionId)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         db.query('UPDATE workspace SET active_session_id=NULL,revision=revision+1,updated_at=? WHERE id=1 AND active_session_id=?')
           .run(at, sessionId);
         if (hasBusinessHistory(db, sessionId)) {
@@ -2739,12 +2877,15 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
   };
 }
 
-function freezeWorkspaceInput(db: Database, input: Pick<NewWorkspaceAgentRun, 'sessionId' | 'expected' | 'goalMode' | 'createdAt'>) {
+function freezeWorkspaceInput(db: Database, input: Pick<NewWorkspaceAgentRun, 'sessionId' | 'expected' | 'goalMode' | 'createdAt'>, verify: WorkspaceVerifier | undefined) {
+  if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
   const expected = WorkspaceExpectationSchema.safeParse(input.expected);
   if (!expected.success) return fail(appError('input_invalid', 'input', 'Workspace expectation is invalid.'));
   const fill = input.goalMode === 'fill-form';
         const rawWorkspace = ensureWorkspace(db, input.createdAt);
-        const workspace = workspaceSnapshot(db, rawWorkspace, input.createdAt);
+        let workspace: WorkspaceSnapshot;
+        try { workspace = workspaceSnapshot(db, rawWorkspace, input.createdAt); workspaceCandidate(db, workspace); }
+        catch (error) { return workspaceReadFailure<never>(error); }
         const actualExpectation: WorkspaceExpectation = {
           revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
           candidateRef: workspace.candidateRef, sessionId: workspace.sessionId ?? 0,
@@ -2753,7 +2894,7 @@ function freezeWorkspaceInput(db: Database, input: Pick<NewWorkspaceAgentRun, 's
           && actualExpectation.documentRef?.version === expected.data.documentRef?.version;
         const sameCandidate = actualExpectation.candidateRef?.id === expected.data.candidateRef?.id
           && actualExpectation.candidateRef?.sequence === expected.data.candidateRef?.sequence;
-        if (workspace.invalidReferences.length || actualExpectation.revision !== expected.data.revision
+        if (actualExpectation.revision !== expected.data.revision
           || actualExpectation.jobId !== expected.data.jobId || actualExpectation.sessionId !== expected.data.sessionId
           || !sameDocument || !sameCandidate) {
           return fail(appError('state_conflict', 'input', 'Workspace 或其引用已变化，请重新确认。', true));
@@ -2795,16 +2936,20 @@ function freezeWorkspaceInput(db: Database, input: Pick<NewWorkspaceAgentRun, 's
           };
         }
         if (fill && candidate === null) return fail(appError('state_conflict', 'input', '填表需要已选候选。'));
+        const verified = verifyWorkspaceSnapshot(db, workspace, verify);
+        if (!verified.ok) return verified;
+        const valid = requireValidWorkspace(verified.data);
+        if (!valid.ok) return valid;
         const workspaceContext = WorkspaceContextSchema.parse({
           formatVersion: 1, revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
-          candidateRef: workspace.candidateRef, sessionId: input.sessionId, activeView: workspace.activeView, selection: null,
+          candidateRef: workspace.candidateRef, sessionId: input.sessionId, activeView: workspace.activeView, selection: workspace.selection,
         });
         const workspaceInput = WorkspaceInputSchema.parse({
           documentRef: workspace.documentRef,
           job: job ? { id: job.jobId, goal: job.goal } : null,
           candidate,
         });
-        if (Buffer.byteLength(JSON.stringify(workspaceInput), 'utf8') > 512 * 1024) {
+        if (Buffer.byteLength(JSON.stringify({ workspaceContext, workspaceInput }), 'utf8') > 512 * 1024) {
           return fail(appError('input_too_large', 'input', '冻结 Workspace 输入超过 512 KiB。'));
         }
   return ok({ document, job, workspaceContext, workspaceInput });
@@ -2869,7 +3014,8 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
       return created.ok ? created.data : created;
     },
 
-    createWorkspaceAgent(input) {
+    createWorkspaceAgent(input, verify) {
+      if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
       const created = writeTransaction(() => {
         const expected = WorkspaceExpectationSchema.safeParse(input.expected);
         const target = input.formTarget === undefined ? null : InvoiceFormTargetSchema.safeParse(input.formTarget);
@@ -2880,12 +3026,12 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           || !fill && 'formTarget' in input.config) {
           return fail(appError('input_invalid', 'input', 'P3 Workspace Run 参数无效。'));
         }
-        const session = db.query('SELECT status,metadata_json FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string } | null;
+        const session = db.query('SELECT status,metadata_json FROM sessions WHERE id=? AND hidden_at IS NULL').get(input.sessionId) as { status: string; metadata_json: string } | null;
         if (!session || session.status !== 'active') return fail(appError('session_archived', 'session', 'Session 不可用于新 Run。'));
         if (parseSessionMetadata(session.metadata_json).delete_pending === true) return fail(appError('session_delete_incomplete', 'session', 'Session deletion is incomplete.', true));
         if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
         if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
-        const frozen = freezeWorkspaceInput(db, input);
+        const frozen = freezeWorkspaceInput(db, input, verify);
         if (!frozen.ok) return frozen;
         const { document, job, workspaceContext, workspaceInput } = frozen.data;
         const allowedTools = fill ? ['fill_invoice_form'] : !document ? [INVOICE_REVIEW_TOOL_NAMES[6]!, INVOICE_REVIEW_TOOL_NAMES[7]!]
@@ -2924,7 +3070,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
       return created.ok ? created.data : created;
     },
 
-    freezeInput(input) {
+    freezeInput(input, verify) {
       try {
         const raw = db.query('SELECT * FROM runs WHERE id=?').get(input.runId) as RunRow | null;
         if (!raw || raw.kind !== 'agent' || raw.session_id !== input.sessionId || !['created', 'running'].includes(raw.status)
@@ -2941,10 +3087,14 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const goalMode = config.goalMode ?? 'answer';
         if (goalMode === 'fill-form') return fail(appError('input_invalid', 'input', 'Fill does not accept active input.'));
         if (scope.version === 1) {
+          const savedInput = validatedInput(readJson(raw.input_json, 'input'));
           if (input.expected !== undefined) return fail(appError('state_conflict', 'input', 'This Chat Run has no Workspace.'));
+          if (config.workspaceContext != null || savedInput.version === 2 && savedInput.workspaceInput !== null)
+            return fail(appError('storage_corrupt', 'storage', 'Chat Run contains persisted Workspace references.'));
           return ok({ runId: input.runId, content: { version: 2, text: input.text, workspaceContext: null,
             workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [], promptText: input.text } });
         }
+        if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
         if (scope.version !== 2 || input.expected === undefined || !config.workspaceContext)
           return fail(appError('state_conflict', 'input', 'This Run requires its compatible current Workspace.'));
         const original = WorkspaceContextSchema.parse(config.workspaceContext);
@@ -2953,22 +3103,31 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           || expected.jobId !== original.jobId || expected.candidateRef?.id !== original.candidateRef?.id
           || expected.candidateRef?.sequence !== original.candidateRef?.sequence)
           return fail(appError('state_conflict', 'input', 'Input Workspace differs from the Run admission.'));
-        const frozen = freezeWorkspaceInput(db, { sessionId: input.sessionId, expected, goalMode: goalMode as GoalMode, createdAt: input.at });
+        const frozen = freezeWorkspaceInput(db, { sessionId: input.sessionId, expected, goalMode: goalMode as GoalMode, createdAt: input.at }, verify);
         if (!frozen.ok) return frozen;
         const { document, workspaceContext, workspaceInput } = frozen.data;
         if (document && (!scope.allowedDocumentIds.includes(document.id) || !scope.allowedArtifactIds.includes(document.parsed_artifact_id)))
           return fail(appError('state_conflict', 'input', 'Input would expand the Run scope.'));
         return ok({ runId: input.runId, content: { version: 2, text: input.text, workspaceContext, workspaceInput,
           allowedDocumentIds: [...scope.allowedDocumentIds], allowedArtifactIds: [...scope.allowedArtifactIds],
-          promptText: formatExecutionPrompt({ text: input.text, workspaceInput, goalMode: goalMode as GoalMode, business: true,
+          promptText: formatExecutionPrompt({ text: input.text, workspaceInput, workspaceContext, goalMode: goalMode as GoalMode, business: true,
             ...(typeof config.workingDirectory === 'string' ? { workingDirectory: config.workingDirectory } : {}) }) } });
       } catch { return fail(appError('storage_read_failed', 'storage', 'Input admission facts cannot be read.', true)); }
     },
 
-    verifyInputUse(content) {
+    verifyInputUse(content, verify) {
       try {
         const frozen = content.workspaceContext;
-        if (frozen === null) return ok(undefined);
+        if (frozen === null) return content.workspaceInput === null && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
+          ? ok(undefined) : fail(appError('storage_corrupt', 'storage', 'Chat input contains Workspace references.'));
+        const business = WorkspaceInputSchema.safeParse(content.workspaceInput);
+        if (!business.success || business.data.documentRef?.id !== frozen.documentRef?.id || business.data.documentRef?.version !== frozen.documentRef?.version
+          || business.data.job?.id !== (frozen.jobId ?? undefined) || business.data.candidate?.id !== frozen.candidateRef?.id
+          || business.data.candidate?.sequence !== frozen.candidateRef?.sequence
+          || content.allowedDocumentIds.length !== (frozen.documentRef ? 1 : 0)
+          || content.allowedArtifactIds.length !== (frozen.documentRef ? 1 : 0))
+          return fail(appError('storage_corrupt', 'storage', 'Frozen Workspace projection is inconsistent.'));
+        if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
         const documents = createDocumentRepository(db);
         if (frozen.documentRef !== null) {
           const document = documents.get(frozen.documentRef.id);
@@ -2984,6 +3143,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           const artifact = documents.getArtifact(id);
           if (!artifact.ok) return artifact;
         }
+        let candidate: WorkspaceInput['candidate'] = null;
         if (frozen.jobId !== null) {
           const job = readJob(db, frozen.jobId);
           const visibility = db.query('SELECT hidden_at FROM jobs WHERE id=?').get(frozen.jobId) as { hidden_at: string | null } | null;
@@ -2995,10 +3155,14 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
             const row = queryCandidateRow(db, frozen.candidateRef.id, frozen.jobId);
             if (!row || candidateSnapshot(row).snapshot.sequence !== frozen.candidateRef.sequence)
               return fail(appError('state_conflict', 'input', 'Frozen input candidate references changed.'));
+            candidate = workspaceCandidate(db, frozen);
           }
         }
-        return ok(undefined);
-      } catch { return fail(appError('storage_read_failed', 'storage', 'Frozen input references cannot be verified.', true)); }
+        if (frozen.candidateRef !== null && frozen.jobId === null) return fail(appError('storage_corrupt', 'storage', 'Frozen candidate has no task.'));
+        const verified = verify({ documentRef: frozen.documentRef, jobId: frozen.jobId, candidateRef: frozen.candidateRef,
+          candidate, selection: frozen.selection });
+        return verified.ok ? requireValidWorkspace(verified.data) : verified;
+      } catch (error) { return workspaceReadFailure<void>(error); }
     },
 
     start(runId, config, startedAt) {

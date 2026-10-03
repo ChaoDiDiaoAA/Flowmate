@@ -6,6 +6,7 @@ import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import type { CandidateDraft, InvoiceIssue, P3AgentConfigFacts, Result, SafeConfigSnapshot, UsageRecord, WorkspaceSnapshot } from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
+import { createTestWorkspaceVerifier, prepareTestWorkspaceVerifier } from '../../support/workspace.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 
 function makePaths(root: string) {
@@ -49,12 +50,13 @@ describe('selected candidate Workspace admission', () => {
         mimeType: 'application/json', metadata: artifactMetadata, createdAt: stamp },
       status: 'available', metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'],
         licenseVerification: 'not_verified', unavailableReason: null }, createdAt: stamp, updatedAt: stamp }));
+    const verify = prepareTestWorkspaceVerifier(store);
     const session = required(store.sessions.create({ nativeSessionId: 'native-candidate-admission', title: 'Selected candidate', at: stamp }));
     let workspace = required(store.workspace.read(stamp));
     workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
-      change: { kind: 'session', sessionId: session.sessionId }, at: stamp }));
+      change: { kind: 'session', sessionId: session.sessionId }, at: stamp }, verify));
     workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
-      change: { kind: 'document', documentId: 1 }, at: stamp }));
+      change: { kind: 'document', documentId: 1 }, at: stamp }, verify));
     const task = required(store.jobs.create({ clientSequence: 1, expectedRevision: workspace.revision,
       documentRef: { id: 1, version: 'v1' }, goal: 'Review invoice totals', at: stamp }));
     workspace = task.workspace;
@@ -73,7 +75,7 @@ describe('selected candidate Workspace admission', () => {
       jobId: snapshot.jobId, candidateRef: snapshot.candidateRef, sessionId: session.sessionId });
     const first = required(store.runs.createWorkspaceAgent({ sessionId: session.sessionId, expected: expectation(workspace),
       goalMode: 'save-candidate', text: 'Save a review candidate.', messageTimestamp: 1, goal: task.job.goal, config,
-      usage, cleanup, createdAt: stamp }));
+      usage, cleanup, createdAt: stamp }, verify));
     const frozenConfig = { ...config, goalMode: 'save-candidate' as const, workspaceContext: first.workspaceContext };
     required(store.runs.start(first.runId, frozenConfig, stamp));
     const missing = () => ({ raw: null, normalized: null, state: 'missing' as const, alternatives: [], sources: [] });
@@ -100,21 +102,21 @@ describe('selected candidate Workspace admission', () => {
       cleanup: { ...cleanup, stopped: true, stopReason: 'native-stop' }, endedAt: stamp, stoppedAt: stamp, durationMs: 0 }));
     expect(store.runs.createWorkspaceAgent({ sessionId: session.sessionId, expected: expectation(workspace), goalMode: 'fill-form',
       formTarget: { formInstanceId: 'not-selected', expectedRevision: 0 }, text: 'Fill.', messageTimestamp: 2,
-      goal: task.job.goal, config, usage, cleanup, createdAt: stamp }))
+      goal: task.job.goal, config, usage, cleanup, createdAt: stamp }, verify))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     const selected = required(store.workspace.selectCandidate({ jobId: task.job.jobId, candidateId: saved.receipt.candidateId,
       expectedCandidateId: null, expectedRevision: workspace.revision, at: stamp }));
     const nextRequest = { sessionId: session.sessionId, expected: expectation(selected.workspace),
       goalMode: 'answer' as const, text: 'Explain the selected total.', messageTimestamp: 2, goal: task.job.goal, config, usage, cleanup, createdAt: stamp };
     const target = { formInstanceId: 'form-admission', expectedRevision: 0 };
-    expect(store.runs.createWorkspaceAgent({ ...nextRequest, formTarget: target }))
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, formTarget: target }, verify))
       .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
-    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form' }))
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form' }, verify))
       .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
-    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: { ...target, expectedRevision: -1 } }))
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: { ...target, expectedRevision: -1 } }, verify))
       .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
     const next = store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: target,
-      nativeTools: { runtimeDir: join(tmpdir(), 'form-admission-runtime'), allowedTools: ['bash', 'read'] } });
+      nativeTools: { runtimeDir: join(tmpdir(), 'form-admission-runtime'), allowedTools: ['bash', 'read'] } }, verify);
 
     expect(next).toMatchObject({ ok: true, data: { jobId: task.job.jobId,
       workspaceContext: { candidateRef: { id: saved.receipt.candidateId, sequence: saved.receipt.sequence } },
@@ -129,7 +131,7 @@ describe('selected candidate Workspace admission', () => {
     expect(next.data.workspaceContext).not.toHaveProperty('formTarget');
     expect(next.data.workspaceInput).not.toHaveProperty('formTarget');
     store.db.query("UPDATE invoice_candidates SET status='rejected' WHERE id=?").run(saved.receipt.candidateId);
-    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: target }))
+    expect(store.runs.createWorkspaceAgent({ ...nextRequest, goalMode: 'fill-form', formTarget: target }, verify))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     store.db.query("UPDATE invoice_candidates SET status='generated' WHERE id=?").run(saved.receipt.candidateId);
     expect(required(store.runs.get(next.data.runId)).input).toMatchObject({
@@ -218,7 +220,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -295,7 +297,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -363,11 +365,12 @@ describe('P3 invoice storage migration', () => {
     expect(opened.data.db.query('SELECT COUNT(*) AS count FROM documents').get()).toEqual({ count: 1 });
     expect(opened.data.db.query('SELECT COUNT(*) AS count FROM business_events').get()).toEqual({ count: 1 });
 
+    const verify = prepareTestWorkspaceVerifier(opened.data);
     const initialWorkspace = opened.data.workspace.read('2026-09-28T00:01:00.000Z');
     expect(initialWorkspace).toMatchObject({ ok: true, data: { revision: 0, nextTaskSequence: 1, selection: null } });
     if (!initialWorkspace.ok) return;
     const selectedDocument = opened.data.workspace.update({ expectedRevision: 0, at: '2026-09-28T00:01:01.000Z',
-      change: { kind: 'document', documentId: 1 } });
+      change: { kind: 'document', documentId: 1 } }, verify);
     expect(selectedDocument).toMatchObject({ ok: true, data: { revision: 1, documentRef: { id: 1, version: 'source-v1' } } });
     const startTask = { clientSequence: 1, expectedRevision: 1, documentRef: { id: 1, version: 'source-v1' },
       goal: 'Review this invoice', at: '2026-09-28T00:01:02.000Z' };
@@ -383,7 +386,7 @@ describe('P3 invoice storage migration', () => {
     expect(opened.data.jobs.create({ ...startTask, clientSequence: 2, expectedRevision: 1 })).toMatchObject({
       ok: false, error: { code: 'state_conflict' },
     });
-    expect(opened.data.workspace.update({ expectedRevision: 2, at: '2026-09-28T00:01:04.000Z', change: { kind: 'job', jobId: 1 } }))
+    expect(opened.data.workspace.update({ expectedRevision: 2, at: '2026-09-28T00:01:04.000Z', change: { kind: 'job', jobId: 1 } }, verify))
       .toMatchObject({ ok: true, data: { revision: 2, jobId: 1 } });
     expect(opened.data.db.query('SELECT COUNT(*) AS count FROM jobs').get()).toEqual({ count: 1 });
     const persistedInput = opened.data.db.query('SELECT input_json FROM jobs WHERE id=1').get() as { input_json: string };
@@ -394,7 +397,7 @@ describe('P3 invoice storage migration', () => {
     expect(selectedSession.ok).toBe(true);
     if (!selectedSession.ok) return;
     const sessionWorkspace = opened.data.workspace.update({ expectedRevision: 2, at: '2026-09-28T00:01:06.000Z',
-      change: { kind: 'session', sessionId: selectedSession.data.sessionId } });
+      change: { kind: 'session', sessionId: selectedSession.data.sessionId } }, verify);
     expect(sessionWorkspace).toMatchObject({ ok: true, data: { revision: 3, jobId: 1 } });
     opened.data.db.exec(`
       UPDATE jobs SET status='waiting',status_reason='review_candidate' WHERE id=1;
@@ -416,10 +419,13 @@ describe('P3 invoice storage migration', () => {
         VALUES (300,1,100,200,1,'model','generated','{"version":1,"values":{}}','{"version":1,"items":[]}',
           '{"version":1,"notes":[],"checks":[],"items":[]}','2026-09-28T00:01:08.000Z');
     `);
+    opened.data.db.query('UPDATE invoice_candidates SET fields_json=? WHERE id=300').run(JSON.stringify({ version: 1, values: Object.fromEntries(
+      ['invoiceNumber', 'issueDate', 'sellerName', 'sellerTaxId', 'buyerName', 'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount']
+        .map(field => [field, { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] }])) }));
     const selectionRequest = { jobId: 1, candidateId: 300, expectedCandidateId: null, expectedRevision: 3 };
     expect(opened.data.workspace.selectCandidate({ ...selectionRequest, at: '2026-09-28T00:01:09.000Z' }))
       .toMatchObject({ ok: true, data: { jobId: 1, candidateId: 300, workspace: { revision: 4, jobId: 1, candidateRef: { id: 300, sequence: 1 } } } });
-    expect(opened.data.workspace.update({ expectedRevision: 4, at: '2026-09-28T00:01:10.000Z', change: { kind: 'view', view: 'parsed' } }))
+    expect(opened.data.workspace.update({ expectedRevision: 4, at: '2026-09-28T00:01:10.000Z', change: { kind: 'view', view: 'parsed' } }, verify))
       .toMatchObject({ ok: true, data: { revision: 5, activeView: 'parsed', candidateRef: { id: 300 } } });
     expect(opened.data.workspace.selectCandidate({ ...selectionRequest, at: '2026-09-28T00:01:11.000Z' }))
       .toMatchObject({ ok: true, data: { workspace: { revision: 5, activeView: 'parsed', candidateRef: { id: 300 } } } });
@@ -463,7 +469,7 @@ describe('P3 invoice storage migration', () => {
     expect(opened.data.workspace.read('2026-09-28T00:01:18.000Z'))
       .toMatchObject({ ok: true, data: { documentRef: null, jobId: null, revision: 7 } });
     expect(opened.data.workspace.update({ expectedRevision: 7, at: '2026-09-28T00:01:18.000Z',
-      change: { kind: 'document', documentId: 1 } })).toMatchObject({ ok: false, error: { code: 'document_not_found' } });
+      change: { kind: 'document', documentId: 1 } }, verify)).toMatchObject({ ok: false, error: { code: 'document_not_found' } });
     expect(opened.data.jobs.create({ clientSequence: 2, expectedRevision: 7, documentRef: { id: 1, version: 'source-v1' },
       goal: 'Try again', at: '2026-09-28T00:01:19.000Z' })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(opened.data.jobs.get(1)).toMatchObject({ ok: true, data: { jobId: 1 } });

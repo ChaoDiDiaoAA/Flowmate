@@ -77,6 +77,7 @@ type ProductApplicationOptions = {
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
   hideDocument?: (documentId: DbId) => Result<{ documentId: DbId; affectedChatCount: number }>;
   readDocumentPage: (input: import('@flowmate/contracts').InvoiceToolInput<'read_invoice_document'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'read_invoice_document'>>;
+  listDocumentPages: (input: import('@flowmate/contracts').InvoiceToolInput<'list_invoice_pages'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'list_invoice_pages'>>;
   readDocumentOriginal: (documentId: DbId, page: number) => Result<import('@flowmate/contracts').DocumentOriginalImage>;
 };
 
@@ -222,6 +223,7 @@ export function makeApplication(
     queryInvoiceCandidateOperation: async request => products?.invoiceEdits?.queryOperation(request)
       ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice operation lookup is unavailable.')),
     readWorkspace: async () => workspace?.read() ?? fail(appError('workspace_unavailable', 'storage', 'Workspace 服务尚未组装。', true)),
+    restoreWorkspace: async () => workspace?.restore() ?? fail(appError('workspace_unavailable', 'storage', 'Workspace 服务尚未组装。', true)),
     updateWorkspace: async (raw) => workspace?.update(raw) ?? fail(appError('workspace_unavailable', 'storage', 'Workspace 服务尚未组装。', true)),
     startTask: async (raw) => jobs?.create(raw) ?? fail(appError('job_service_unavailable', 'storage', 'Job 服务尚未组装。', true)),
     queryTaskOperation: async (clientSequence) => jobs?.queryOperation(clientSequence)
@@ -294,6 +296,11 @@ export function makeApplication(
       }
       return products?.importInvoiceMaterial(sourceDirectory)
         ?? fail(appError('document_service_unavailable', 'storage', 'Document 导入尚未组装。', true));
+    },
+    listDocumentPages: async raw => {
+      const input = invoiceToolSchemas.list_invoice_pages.input.safeParse(raw);
+      return !input.success ? fail(appError('input_invalid', 'input', 'Parsed page query is invalid.'))
+        : products?.listDocumentPages(input.data) ?? fail(appError('document_service_unavailable', 'storage', 'Parsed page listing is unavailable.', true));
     },
     readDocumentPage: async (raw) => {
       const input = invoiceToolSchemas.read_invoice_document.input.safeParse(raw);

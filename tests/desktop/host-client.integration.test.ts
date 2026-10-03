@@ -16,6 +16,98 @@ import type { RuntimeEventsReadResult, RuntimeEventsWake, RuntimeSubscriptionInf
 import { mkdtemp } from '../support/resources.ts';
 import { HostClient, safeChildEnvironment } from '../../apps/desktop/main/host-client.ts';
 
+const emptyWorkspace: WorkspaceSnapshot = { revision: 0, documentRef: null, jobId: null, candidateRef: null,
+  sessionId: null, activeView: 'original', selection: null, updatedAt: '2026-10-03T00:00:00.000Z',
+  invalidReferences: [], nextTaskSequence: 1 };
+
+async function workspaceProtocolFixture(revision = 0) {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-p7-host-protocol-'));
+  mkdirSync(join(root, 'apps', 'host'), { recursive: true });
+  writeFileSync(join(root, 'apps', 'host', 'main.ts'), `
+    import { createInterface } from 'node:readline';
+    import { createWriteStream } from 'node:fs';
+    const stdout = createWriteStream('', { fd: 1, autoClose: false });
+    const workspace = ${JSON.stringify({ ...emptyWorkspace, revision })}; let held;
+    const response = (requestId, value, extra = {}) => stdout.write(JSON.stringify({version:1,type:'response',requestId,value,...extra})+'\\n');
+    stdout.write(JSON.stringify({version:1,type:'ready',state:{version:1,ready:true,host:'ready',userDataPath:'synthetic'}})+'\\n');
+    const input = createInterface({input:process.stdin});
+    input.on('line', line => {
+      const command = JSON.parse(line);
+      if (command.type === 'get_state') { if (held) response(held,{ok:true,data:workspace}); response(command.requestId,{released:!!held}); return; }
+      if (command.requestId === 'held-workspace') { held=command.requestId; return; }
+      const value = command.type==='restore_workspace' ? {ok:true,data:{workspace,clearedReferences:[]}} : {ok:true,data:workspace};
+      switch(command.requestId) {
+        case 'wrong-restore-shape': response(command.requestId,{ok:true,data:workspace}); break;
+        case 'wrong-selection': response(command.requestId,{ok:true,data:{...workspace,selection:{kind:'unknown'}}}); break;
+        case 'extra-payload': response(command.requestId,{...value,extra:true}); break;
+        case 'extra-envelope': response(command.requestId,value,{extra:true}); break;
+        case 'wrong-identity': response('unrelated-request',value); break;
+        default: response(command.requestId,value);
+      }
+    });
+    input.on('close',()=>process.exit(0));
+  `);
+  return root;
+}
+
+async function finishProtocolChild(child: ChildProcessWithoutNullStreams) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, 'exit'); child.stdin.end(); await exited;
+}
+
+it('P7 HostClient validates Workspace envelopes and restore shape on a real child pipe', async () => {
+  const root = await workspaceProtocolFixture();
+  const client = new HostClient();
+  expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: true });
+  const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  try {
+    expect(await client.request({ type: 'read_workspace' })).toEqual({ ok: true, data: emptyWorkspace });
+    expect(await client.request({ type: 'restore_workspace' })).toEqual({ ok: true, data: { workspace: emptyWorkspace, clearedReferences: [] } });
+    for (const requestId of ['wrong-restore-shape', 'extra-payload', 'extra-envelope']) {
+      const outcome = await client.request({ type: 'restore_workspace', requestId }, 500)
+        .then(() => 'resolved', error => error instanceof Error ? error.message : String(error));
+      expect({ requestId, outcome }).toEqual({ requestId, outcome: 'host_protocol_invalid' });
+    }
+    const selectionOutcome = await client.request({ type: 'read_workspace', requestId: 'wrong-selection' }, 500)
+      .then(() => 'resolved', error => error instanceof Error ? error.message : String(error));
+    expect(selectionOutcome).toBe('host_protocol_invalid');
+    const identityOutcome = await client.request({ type: 'read_workspace', requestId: 'wrong-identity' }, 100)
+      .then(() => 'resolved', error => error instanceof Error ? error.message : String(error));
+    expect(identityOutcome).toBe('host_request_timeout');
+    expect(await client.request({ type: 'read_workspace' })).toEqual({ ok: true, data: emptyWorkspace });
+  } finally { await finishProtocolChild(child); }
+}, 5_000);
+
+it('P7 old Host replies cannot resolve the same request identity on a replacement connection', async () => {
+  const firstRoot = await workspaceProtocolFixture(99), secondRoot = await workspaceProtocolFixture();
+  const client = new HostClient();
+  expect(await client.start(firstRoot, '0.1.0', firstRoot)).toMatchObject({ ok: true });
+  const oldChild = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  let newChild: ChildProcessWithoutNullStreams | null = null;
+  try {
+    const oldEpoch = client.connectionEpoch;
+    const oldRequest = client.request({ type: 'read_workspace', requestId: 'held-workspace' }).then(() => 'resolved', error => String(error));
+    // A real child acknowledgement proves its held read is installed before replacement.
+    expect(await client.request({ type: 'get_state' })).toEqual({ released: true });
+    // Reinstall another held request; the first response has been consumed above.
+    const originalPending = client.request({ type: 'read_workspace', requestId: 'held-workspace' }).then(() => 'resolved', error => String(error));
+    expect(await oldRequest).toBe('resolved');
+    expect(await client.start(secondRoot, '0.1.0', secondRoot)).toMatchObject({ ok: true });
+    expect(await originalPending).toContain('host_replaced');
+    expect(client.connectionEpoch).toBeGreaterThan(oldEpoch);
+    newChild = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    let settled = false;
+    const current = client.request({ type: 'read_workspace', requestId: 'held-workspace' }).then(value => { settled = true; return value; });
+    const observed = once(oldChild.stdout, 'data');
+    oldChild.stdin.write(`${JSON.stringify({ version: 1, type: 'get_state', requestId: 'release-old' })}\n`);
+    await observed;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(await client.request({ type: 'get_state' })).toEqual({ released: true });
+    expect(await current).toEqual({ ok: true, data: emptyWorkspace });
+  } finally { await finishProtocolChild(oldChild); if (newChild) await finishProtocolChild(newChild); }
+}, 5_000);
+
 it('returns the original P5 Desktop prompt after credentials or settings change without redelivery', async () => {
   const root = await mkdtemp(join(tmpdir(), 'flowmate-host-p5-dedup-'));
   let requests = 0, credentialReads = 0, credentialAvailable = true;

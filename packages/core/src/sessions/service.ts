@@ -1,5 +1,5 @@
 import { appError, fail, normalizeSessionInputRequest, ok, SessionMessagesPageSchema, normalizeAgentRunRequest,
-  SetSessionStatusRequestSchema, BranchSessionRequestSchema } from '@flowmate/contracts';
+  SetSessionStatusRequestSchema, BranchSessionRequestSchema, WorkspaceContextSchema } from '@flowmate/contracts';
 import type {
   AgentPort,
   CreateSessionRequest,
@@ -256,7 +256,11 @@ export class SessionService {
       if (run.data.input.version === 2 && goalMode === null) {
         return fail(appError('session_history_invalid', 'session', 'Saved message Run context is incomplete.'));
       }
+      const context = config.workspaceContext === undefined ? undefined : WorkspaceContextSchema.safeParse(config.workspaceContext);
+      if (context && !context.success)
+        return fail(appError('session_history_invalid', 'session', 'Saved message Workspace context is invalid.'));
       runInputs.push({ runId, input: run.data.input, goalMode,
+        ...(context?.success ? { workspaceContext: context.data } : {}),
         ...(typeof config.workingDirectory === 'string' ? { workingDirectory: config.workingDirectory } : {}) });
     }
     const projected = this.agent.projectSessionMessages({ history: stored.data.history, bindings: stored.data.bindings,

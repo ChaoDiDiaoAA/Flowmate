@@ -18,7 +18,7 @@ import {
   AppErrorSchema,
   StartTaskRequestSchema,
   SelectCandidateRequestSchema,
-  WorkspaceChangeSchema,
+  WorkspaceUpdateRequestSchema,
   WorkspaceExpectationSchema,
   WorkspaceContextSchema,
   WorkingDirectorySchema,
@@ -131,6 +131,7 @@ const channels = {
   cancelRun: 'flowmate:cancel-run',
   queryRuntimeState: 'flowmate:query-runtime-state',
   readWorkspace: 'flowmate:read-workspace',
+  restoreWorkspace: 'flowmate:restore-workspace',
   updateWorkspace: 'flowmate:update-workspace',
   startTask: 'flowmate:start-task',
   queryTaskOperation: 'flowmate:query-task-operation',
@@ -146,6 +147,7 @@ const channels = {
   listActivity: 'flowmate:list-activity',
   chooseAndImportInvoice: 'flowmate:choose-and-import-invoice',
   readDocumentPage: 'flowmate:read-document-page',
+  listDocumentPages: 'flowmate:list-document-pages',
   readDocumentOriginal: 'flowmate:read-document-original',
   revokeDocumentUse: 'flowmate:revoke-document-use',
   subscribe: 'flowmate:subscribe',
@@ -545,6 +547,9 @@ function registerIpc(): void {
   handle(channels.cancelRun, async (_event, runIdRaw) => cancelRun(runIdRaw));
   handle(channels.queryRuntimeState, async () => queryRuntimeState());
   handle(channels.readWorkspace, async () => productHostRequest({ type: 'read_workspace' }, 'Workspace 暂不可用。'));
+  handle(channels.restoreWorkspace, async (_event, ...args) => args.length
+    ? fail(appError('input_invalid', 'input', 'Workspace recovery takes no parameters.'))
+    : productHostRequest({ type: 'restore_workspace' }, 'Workspace recovery could not be confirmed.', 10_000, 'operation_result_unknown'));
   handle(channels.updateWorkspace, async (_event, raw) => updateWorkspace(raw));
   handle(channels.startTask, async (_event, raw) => startTask(raw));
   handle(channels.queryTaskOperation, async (_event, raw) => queryTaskOperation(raw));
@@ -559,6 +564,11 @@ function registerIpc(): void {
   handle(channels.queryJobCandidate, async (_event, raw) => queryJobCandidate(raw));
   handle(channels.listActivity, async (_event, raw) => listActivity(raw));
   handle(channels.chooseAndImportInvoice, async () => chooseAndImportInvoice());
+  handle(channels.listDocumentPages, async (_event, raw) => {
+    const input = invoiceToolSchemas.list_invoice_pages.input.safeParse(raw);
+    return input.success ? productHostRequest({ type: 'list_document_pages', input: input.data }, 'Parsed page listing could not be loaded.')
+      : fail(appError('input_invalid', 'input', 'Parsed page query is invalid.'));
+  });
   handle(channels.readDocumentPage, async (_event, raw) => readDocumentPage(raw));
   handle(channels.readDocumentOriginal, async (_event, documentId, page) => readDocumentOriginal(documentId, page));
   handle(channels.revokeDocumentUse, async (_event, raw) => revokeDocumentUse(raw));
@@ -846,14 +856,9 @@ async function queryRun(value: unknown): Promise<Result<RunSnapshot>> {
 }
 
 async function updateWorkspace(raw: unknown) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fail(appError('input_invalid', 'input', 'Workspace 更新参数无效。'));
-  const value = raw as Record<string, unknown>;
-  const change = WorkspaceChangeSchema.safeParse(value.change);
-  if (!Number.isSafeInteger(value.expectedRevision) || Number(value.expectedRevision) < 0 || !change.success
-    || Object.keys(value).some((key) => !['expectedRevision', 'change'].includes(key))) {
-    return fail(appError('input_invalid', 'input', 'Workspace 更新参数无效。'));
-  }
-  return productHostRequest({ type: 'update_workspace', input: { expectedRevision: Number(value.expectedRevision), change: change.data } }, 'Workspace 更新未能提交。');
+  const input = WorkspaceUpdateRequestSchema.safeParse(raw);
+  if (!input.success) return fail(appError('input_invalid', 'input', 'Workspace 更新参数无效。'));
+  return productHostRequest({ type: 'update_workspace', input: input.data }, 'Workspace update could not be confirmed.', 10_000, 'operation_result_unknown');
 }
 
 async function startTask(raw: unknown) {
@@ -990,8 +995,14 @@ function validId(value: unknown): value is number { return Number.isSafeInteger(
 
 async function productHostRequest<T = unknown>(command: Parameters<HostClient['request']>[0], message: string,
   timeoutMs = 10_000, transportErrorCode = hostErrorCode): Promise<Result<T>> {
-  try { return await host.request(command, timeoutMs) as Result<T>; }
-  catch { return fail(appError(transportErrorCode, 'runtime', message, true)); }
+  const epoch = host.connectionEpoch;
+  try {
+    const result = await host.request(command, timeoutMs) as Result<T>;
+    return epoch === host.connectionEpoch ? result : fail(appError(transportErrorCode, 'runtime', message, true));
+  } catch (error) {
+    return fail(appError(error instanceof Error && error.message === 'host_protocol_invalid' ? 'host_protocol_invalid' : transportErrorCode,
+      'runtime', message, true));
+  }
 }
 
 async function createSession(raw: unknown): Promise<Result<SessionSnapshot>> {
@@ -1216,7 +1227,11 @@ async function broadcastState(): Promise<void> {
 }
 
 function sameFormWorkspace(expected: DesktopInvoiceFormWorkspace, actual: DesktopInvoiceFormWorkspace): boolean {
-  return expected.revision === actual.revision && expected.sessionId === actual.sessionId && expected.jobId === actual.jobId
+  return expected.revision === actual.revision && sameFormWorkspaceBasis(expected, actual);
+}
+
+function sameFormWorkspaceBasis(expected: DesktopInvoiceFormWorkspace, actual: DesktopInvoiceFormWorkspace): boolean {
+  return expected.sessionId === actual.sessionId && expected.jobId === actual.jobId
     && expected.documentRef?.id === actual.documentRef?.id && expected.documentRef?.version === actual.documentRef?.version
     && expected.candidateRef?.id === actual.candidateRef?.id && expected.candidateRef?.sequence === actual.candidateRef?.sequence;
 }
@@ -1386,9 +1401,12 @@ async function submitInvoiceCandidateOperation(raw: unknown, owner: InvoiceFormO
   try {
   const form = inspected ?? await inspectCurrentInvoiceForm(binding);
   if (!form) return fail(appError('operation_result_unknown', 'input', 'Current form could not be inspected. Your local draft is retained.'));
+  const current = await productHostRequest<WorkspaceSnapshot>({ type: 'read_workspace' }, 'Workspace is unavailable.');
+  if (!current.ok) return current;
   if (binding !== invoiceFormBinding || !checkedInvoiceFormInspection(binding, form, owner)
     || input.request.jobId !== form.basis.jobId || input.request.expectedCandidateId !== form.basis.candidateId
-    || input.request.expectedRevision !== binding.workspace.revision)
+    || current.data.invalidReferences.length || !sameFormWorkspaceBasis(binding.workspace, current.data)
+    || input.request.expectedRevision !== current.data.revision)
     return fail(appError('state_conflict', 'input', 'Current form or selected result changed.'));
   if (input.kind === 'save') {
     if (input.request.basedOnCandidateId !== form.basis.candidateId || JSON.stringify(input.request.draft) !== JSON.stringify(form.draft))
@@ -1423,9 +1441,11 @@ async function confirmInvoiceFormClose(): Promise<boolean> {
   try {
     const form = await inspectCurrentInvoiceForm(binding);
     if (!form) return false;
+    const current = await productHostRequest<WorkspaceSnapshot>({ type: 'read_workspace' }, 'Workspace is unavailable.');
+    if (!current.ok) return false;
     const operation: InvoiceCandidateOperationQuery = { kind: 'save', request: { operationRef: randomUUID(), jobId: form.basis.jobId,
       basedOnCandidateId: form.basis.candidateId, expectedCandidateId: form.basis.candidateId,
-      expectedRevision: binding.workspace.revision, draft: form.draft } };
+      expectedRevision: current.data.revision, draft: form.draft } };
     const result = await submitInvoiceCandidateOperation(operation, binding, form);
     if (!result.ok) {
       if (result.error.code === 'operation_result_unknown') unknownOperation = operation;

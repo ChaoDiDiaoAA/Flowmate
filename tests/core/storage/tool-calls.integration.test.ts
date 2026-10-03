@@ -1,6 +1,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { prepareTestWorkspaceVerifier } from '../../support/workspace.ts';
 import { describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { appError, CandidateDraftSchema, CandidateReceiptSchema, ToolExecutionFailure } from '@flowmate/contracts';
@@ -195,7 +196,7 @@ describe('Runtime fixed observations', () => {
       const call = required(store.toolCalls.request({ runId: 1, sessionId: session.sessionId, nativeToolCallId: 'old-row',
         toolName: 'unknown_tool', toolVersion: null, effect: null, rawArguments: {}, requestedAt: stamp }));
       store.db.exec('DROP TABLE runtime_events');
-      store.db.exec('DELETE FROM schema_migrations WHERE version=13');
+      store.db.exec('DELETE FROM schema_migrations WHERE version>=13');
       store.db.exec('DROP INDEX tool_calls_runtime_observation_recent');
       store.db.exec('ALTER TABLE tool_calls DROP COLUMN runtime_observation_json');
       store.db.exec('DELETE FROM schema_migrations WHERE version=12');
@@ -206,7 +207,7 @@ describe('Runtime fixed observations', () => {
       expect(reopened.ok).toBe(!registrationFails);
       const db = reopened.ok ? reopened.data.db : new Database(paths(root).databaseFile);
       deferCleanup(() => reopened.ok ? reopened.data.close() : db.close());
-      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 13 });
+      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 14 });
       const columns = db.query('PRAGMA table_info(tool_calls)').all() as Array<{ name: string }>;
       expect(columns.some(column => column.name === 'runtime_observation_json')).toBe(!registrationFails);
       expect(db.query('SELECT id,native_tool_call_id FROM tool_calls WHERE id=?').get(call.toolCallId))
@@ -332,12 +333,13 @@ function makeFormStore(started = true) {
       mimeType: 'application/json', metadata, createdAt: stamp },
     status: 'available', metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'],
       licenseVerification: 'not_verified', unavailableReason: null }, createdAt: stamp, updatedAt: stamp }));
+  const verify = prepareTestWorkspaceVerifier(store);
   const session = required(store.sessions.create({ nativeSessionId: 'native-form-storage', title: 'Form storage', at: stamp }));
   let workspace = required(store.workspace.read(stamp));
   workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
-    change: { kind: 'session', sessionId: session.sessionId }, at: stamp }));
+    change: { kind: 'session', sessionId: session.sessionId }, at: stamp }, verify));
   workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
-    change: { kind: 'document', documentId: 1 }, at: stamp }));
+    change: { kind: 'document', documentId: 1 }, at: stamp }, verify));
   const task = required(store.jobs.create({ clientSequence: 1, expectedRevision: workspace.revision,
     documentRef: { id: 1, version: 'v1' }, goal: 'Review form fixture', at: stamp }));
   workspace = task.workspace;
@@ -355,7 +357,7 @@ function makeFormStore(started = true) {
   const first = required(store.runs.createWorkspaceAgent({ sessionId: session.sessionId,
     expected: { revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
       candidateRef: workspace.candidateRef, sessionId: session.sessionId }, goalMode: 'save-candidate',
-    text: 'Save fixture candidate.', messageTimestamp: 1, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }));
+    text: 'Save fixture candidate.', messageTimestamp: 1, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }, verify));
   const firstConfig = { ...config, goalMode: 'save-candidate' as const, workspaceContext: first.workspaceContext };
   required(store.runs.start(first.runId, firstConfig, stamp));
   const candidate = { fields: { invoiceNumber: missingField(), issueDate: missingField(), sellerName: missingField(),
@@ -383,7 +385,7 @@ function makeFormStore(started = true) {
   const form = required(store.runs.createWorkspaceAgent({ sessionId: session.sessionId,
     expected: { revision: selected.revision, documentRef: selected.documentRef, jobId: selected.jobId,
     candidateRef: selected.candidateRef, sessionId: session.sessionId }, goalMode: 'fill-form', formTarget: target,
-    text: 'Store a trusted form receipt.', messageTimestamp: 2, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }));
+    text: 'Store a trusted form receipt.', messageTimestamp: 2, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }, verify));
   const frozenConfig = { ...config, goalMode: 'fill-form' as const, workspaceContext: form.workspaceContext, formTarget: target };
   required(store.runs.start(form.runId, frozenConfig, stamp));
   const call = required(store.toolCalls.request({ runId: form.runId, sessionId: session.sessionId, nativeToolCallId: 'fill-storage-1',
@@ -393,7 +395,7 @@ function makeFormStore(started = true) {
   const unknown: InvoiceFormApplicationReceipt = { runId: form.runId, toolCallId: call.toolCallId, formInstanceId: target.formInstanceId,
     candidateId: saved.receipt.candidateId, candidateSequence: saved.receipt.sequence, observedAt: stamp, outcome: 'unknown' };
   const applied: InvoiceFormApplicationReceipt = { ...unknown, outcome: 'applied', appliedRevision: target.expectedRevision + 1, appliedAt: stamp };
-  return { ...store, root, stamp, runId: form.runId, sessionId: session.sessionId, jobId: task.job.jobId, toolCallId: call.toolCallId, unknown, applied,
+  return { ...store, root, verify, stamp, runId: form.runId, sessionId: session.sessionId, jobId: task.job.jobId, toolCallId: call.toolCallId, unknown, applied,
     recorder: createToolRecorder(store.toolCalls, () => stamp) };
 }
 
@@ -408,7 +410,7 @@ describe('ToolCall form application facts', () => {
     expect(first).toMatchObject(expected);
     expect(first.candidate.fields.invoiceNumber.state).toBe('missing');
     const workspace = required(store.workspace.read(store.stamp));
-    required(store.workspace.update({ expectedRevision: workspace.revision, change: { kind: 'document', documentId: null }, at: store.stamp }));
+    required(store.workspace.update({ expectedRevision: workspace.revision, change: { kind: 'document', documentId: null }, at: store.stamp }, store.verify));
     store.db.query("UPDATE invoice_candidates SET status='accepted',accepted_at=? WHERE id=?")
       .run(store.stamp, store.applied.candidateId);
     expect(store.toolCalls.readFormApplicationRequest(store.toolCallId)).toEqual({ ok: true, data: first });

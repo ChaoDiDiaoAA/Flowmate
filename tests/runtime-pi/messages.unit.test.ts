@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { SessionManager, type AgentSession } from '@earendil-works/pi-coding-agent';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { NativeSessionHistory } from '@flowmate/contracts';
+import { formatExecutionPrompt } from '@flowmate/contracts';
 
 type AgentMessage = AgentSession['messages'][number];
 
@@ -28,6 +29,23 @@ function project(value: NativeSessionHistory, options: Record<string, unknown> =
 }
 
 describe('P4 native messages and projection', () => {
+  it('projects the legacy Run fallback using its frozen nonempty Workspace context', () => {
+    const workspaceInput = { documentRef: { id: 2, version: 'v1' }, job: null, candidate: null };
+    const workspaceContext = { formatVersion: 1 as const, revision: 4, sessionId: 3,
+      documentRef: workspaceInput.documentRef, jobId: null, candidateRef: null, activeView: 'parsed' as const,
+      selection: { formatVersion: 1 as const, kind: 'source' as const, target: 'document' as const,
+        targetId: 2, targetVersion: 'v1', artifactId: 4, page: 1, block: 'b1' } };
+    const prompt = formatExecutionPrompt({ text: 'Tax?', business: true, workspaceInput, workspaceContext });
+    const value = history([{ ...user, content: prompt }]);
+    const projected = project(value, { bindings: [{ entryId: value.entries[0]!.id, runId: 7 }],
+      runInputs: [{ runId: 7, goalMode: 'answer', workspaceContext,
+        input: { version: 2, goal: 'Invoice', text: 'Tax?', messageTimestamp: 1, workspaceInput } }] });
+    expect(projected).toMatchObject({ ok: true, data: { items: [{ role: 'user', textOrigin: 'product-input',
+      blocks: [{ type: 'text', text: 'Tax?' }] }] } });
+    expect(project(value, { bindings: [{ entryId: value.entries[0]!.id, runId: 7 }],
+      runInputs: [{ runId: 7, goalMode: 'answer',
+        input: { version: 2, goal: 'Invoice', text: 'Tax?', messageTimestamp: 1, workspaceInput } }] }).ok).toBe(false);
+  });
   it('retains the single-user legacy fallback when the P5 association collection is empty', () => {
     const manager = SessionManager.inMemory('D:/fixture');
     manager.appendMessage({ role: 'user', content: 'Legacy question', timestamp: 1 });

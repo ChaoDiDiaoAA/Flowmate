@@ -7,6 +7,8 @@ import { deferCleanup, mkdtempSync } from './resources.ts';
 import { openDatabase } from '../../packages/core/src/storage/database.ts';
 import { createCandidateRepository, createDocumentRepository, createJobRepository, createRunRepository,
   createSessionRepository, createToolCallRepository, createWorkspaceRepository } from '../../packages/core/src/storage/repositories.ts';
+import { createTestWorkspaceVerifier } from './workspace.ts';
+import { createSessionInputLedger } from '../../packages/core/src/sessions/input-ledger.ts';
 
 function paths(root: string) {
   return { root, databaseFile: join(root, 'data', 'flowmate.sqlite'), logsDir: join(root, 'logs'),
@@ -33,7 +35,7 @@ function legacyStore(input: ReturnType<typeof paths>) {
   }
   let closed = false;
   return { db, candidates: createCandidateRepository(db), documents: createDocumentRepository(db), jobs: createJobRepository(db),
-    runs: createRunRepository(db), sessions: createSessionRepository(db), toolCalls: createToolCallRepository(db),
+    runs: createRunRepository(db), sessions: createSessionRepository(db), sessionInputs: createSessionInputLedger(db), toolCalls: createToolCallRepository(db),
     workspace: createWorkspaceRepository(db), close: () => { if (!closed) { db.close(); closed = true; } } };
 }
 export function makeSelectedCandidate(schema9 = false, withSource = false) {
@@ -41,27 +43,31 @@ export function makeSelectedCandidate(schema9 = false, withSource = false) {
   const store = schema9 ? legacyStore(paths(root)) : required(openDatabase(paths(root)));
   deferCleanup(() => store.close());
   const stamp = '2026-10-01T00:00:00.000Z';
+  const originalBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=', 'base64');
   const metadata = { version: 1 as const, sourceKey: 'synthetic', sourceRecordId: 'form-invoice', sourceVersion: 'v1',
-    files: [{ relativePath: 'fixture.json', bytes: 1, mimeType: 'application/json' }] };
+    files: [{ relativePath: 'original.png', bytes: originalBytes.byteLength, mimeType: 'image/png' }] };
   const parsedBytes = Buffer.from(JSON.stringify({ formatVersion: 2, pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text',
     text: 'Total 113.00', sourceIndex: 0, sourceType: 'synthetic', bbox: null }] }],
     completeness: { status: 'complete', checks: [], warnings: [] } }));
   mkdirSync(join(root,'artifacts','2'), { recursive: true });
+  mkdirSync(join(root,'artifacts','1'), { recursive: true });
+  writeFileSync(join(root,'artifacts','1','original.png'), originalBytes);
   writeFileSync(join(root,'artifacts','2','parsed.json'), parsedBytes);
   required(store.documents.register({ documentId: 1, sourceKey: 'synthetic', sourceRecordId: 'form-invoice', version: 'v1',
-    originalArtifact: { artifactId: 1, kind: 'original', relativePath: 'artifacts/1/original.pdf', bytes: 1,
-      mimeType: 'application/pdf', metadata, createdAt: stamp },
+    originalArtifact: { artifactId: 1, kind: 'original', relativePath: 'artifacts/1/original.png', bytes: originalBytes.byteLength,
+      mimeType: 'image/png', metadata, createdAt: stamp },
     parsedArtifact: { artifactId: 2, kind: 'parsed', relativePath: 'artifacts/2/parsed.json', bytes: parsedBytes.byteLength,
       mimeType: 'application/json', metadata: { ...metadata, files: [{ relativePath: 'parsed.json', bytes: parsedBytes.byteLength,
         mimeType: 'application/json' }] }, createdAt: stamp },
     status: 'available', metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'],
       licenseVerification: 'not_verified', unavailableReason: null }, createdAt: stamp, updatedAt: stamp }));
+  const verify = createTestWorkspaceVerifier(store, root);
   const session = required(store.sessions.create({ nativeSessionId: 'native-form-storage', title: 'Form storage', at: stamp }));
   let workspace = required(store.workspace.read(stamp));
   workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
-    change: { kind: 'session', sessionId: session.sessionId }, at: stamp }));
+    change: { kind: 'session', sessionId: session.sessionId }, at: stamp }, verify));
   workspace = required(store.workspace.update({ expectedRevision: workspace.revision,
-    change: { kind: 'document', documentId: 1 }, at: stamp }));
+    change: { kind: 'document', documentId: 1 }, at: stamp }, verify));
   const task = required(store.jobs.create({ clientSequence: 1, expectedRevision: workspace.revision,
     documentRef: { id: 1, version: 'v1' }, goal: 'Review form fixture', at: stamp }));
   workspace = task.workspace;
@@ -79,7 +85,7 @@ export function makeSelectedCandidate(schema9 = false, withSource = false) {
   const first = required(store.runs.createWorkspaceAgent({ sessionId: session.sessionId,
     expected: { revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
       candidateRef: workspace.candidateRef, sessionId: session.sessionId }, goalMode: 'save-candidate',
-    text: 'Save fixture candidate.', messageTimestamp: 1, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }));
+    text: 'Save fixture candidate.', messageTimestamp: 1, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }, verify));
   const firstConfig = { ...config, goalMode: 'save-candidate' as const, workspaceContext: first.workspaceContext };
   required(store.runs.start(first.runId, firstConfig, stamp));
   const candidate = { fields: { invoiceNumber: missingField(), issueDate: missingField(), sellerName: missingField(),
@@ -110,5 +116,5 @@ export function makeSelectedCandidate(schema9 = false, withSource = false) {
     cleanup: { ...cleanup, stopped: true, stopReason: 'native-stop' }, endedAt: stamp, stoppedAt: stamp, durationMs: 0 }));
   const selected = required(store.workspace.selectCandidate({ jobId: task.job.jobId, candidateId: saved.receipt.candidateId,
     expectedCandidateId: null, expectedRevision: workspace.revision, at: stamp })).workspace;
-  return { ...store, root, stamp, session, jobId: task.job.jobId, candidateId: saved.receipt.candidateId, runId: first.runId, toolCallId: saveCall.toolCallId, selectedWorkspace: selected };
+  return { ...store, root, verify, stamp, config, usage, cleanup, session, jobId: task.job.jobId, candidateId: saved.receipt.candidateId, runId: first.runId, toolCallId: saveCall.toolCallId, selectedWorkspace: selected };
 }

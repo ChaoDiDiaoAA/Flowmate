@@ -150,10 +150,13 @@ export class FileStore {
   }
 
   public read(artifact: StoredArtifact, fileName?: string): Result<Uint8Array> {
+    let rootsVerified = false;
     try {
       const root = realpathSync(this.root);
       const managedArtifactRoot = realpathSync(this.artifactRoot);
       if (!within(root, managedArtifactRoot)) throw new Error('path_outside_root');
+      if (!lstatSync(root).isDirectory() || !lstatSync(managedArtifactRoot).isDirectory()) throw new Error('managed_root_unavailable');
+      rootsVerified = true;
       const artifactDirectory = resolve(this.root, dirname(artifact.relativePath));
       const expectedDirectory = resolve(this.artifactRoot, String(artifact.artifactId));
       if (!within(root, artifactDirectory) || artifactDirectory !== expectedDirectory) throw new Error('path_outside_root');
@@ -171,7 +174,7 @@ export class FileStore {
       return ok(bytes);
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-      if (code === 'ENOENT' || error instanceof Error && ['path_outside_root', 'artifact_file_not_registered', 'artifact_size_mismatch'].includes(error.message)) {
+      if (code === 'ENOENT' && rootsVerified || error instanceof Error && ['path_outside_root', 'artifact_file_not_registered', 'artifact_size_mismatch'].includes(error.message)) {
         return fail(appError('artifact_unavailable', 'storage', '受管文件缺失或格式损坏。'));
       }
       return fail(appError('input_unavailable', 'input', '受管材料当前不可读取。', true));

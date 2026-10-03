@@ -1,5 +1,5 @@
 import { resolve } from 'node:path';
-import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, makeApplication,
+import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
   RuntimeService, SessionService, openDatabase } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
@@ -50,6 +50,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const documents = createDocumentService({ paths: options.paths,
     allowedSourceRoot: options.invoiceSourceRoot ?? resolve(process.cwd(), 'data', 'invoices', 'agent-input'),
     repository: database.data.documents, files, now });
+  const workspaceVerifier = createWorkspaceVerifier({ inspectMaterial: ref => documents.inspectForWorkspace(ref) });
   const invoiceEdits = createInvoiceEditService({ candidates: database.data.candidates, files,
     validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, documents), now });
   const native = createNativeTools({
@@ -75,6 +76,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     recoveryError: database.data.recoveryError,
     sessions: database.data.sessions,
     sessionInputs: database.data.sessionInputs,
+    workspaceVerifier,
     isSessionManaging: sessionId => sessionService?.isManaging(sessionId) ?? false,
     provider,
     agent,
@@ -90,7 +92,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs,
     database.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission),
     request => runtime.appendInput(request), sessionId => runtime.verifySessionMutation(sessionId));
-  const workspaceService = createWorkspaceService(database.data.workspace, now);
+  const workspaceService = createWorkspaceService(database.data.workspace, now, workspaceVerifier);
   const jobService = createJobService(database.data.jobs, now);
   return ok(makeApplication(runtime, database.data.runs, async () => {
     const errors = [];
@@ -118,6 +120,13 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     invoiceEdits,
     importInvoiceMaterial: (sourceDirectory) => documents.importVoxel51({ sourceDirectory }),
     hideDocument: (documentId) => database.data.documents.hide(documentId, now()),
+    listDocumentPages: (input) => {
+      const loaded = documents.readParsedForWorkspace(input.documentId);
+      return loaded.ok ? ok({ documentRef: loaded.data.document.documentRef,
+        parsedArtifactId: loaded.data.document.parsedArtifactId, pageCount: loaded.data.parsed.pages.length,
+        pages: loaded.data.parsed.pages.map(page => ({ page: page.page, blockCount: page.blocks.length,
+          tableCount: page.blocks.filter(block => block.kind === 'table').length })) }) : loaded;
+    },
     readDocumentPage: (input) => {
       const loaded = documents.readParsedForWorkspace(input.documentId);
       return loaded.ok ? projectInvoiceDocumentPage(input, loaded.data) : loaded;

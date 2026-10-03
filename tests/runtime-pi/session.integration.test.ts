@@ -108,6 +108,41 @@ const config: ProviderConfig = {
 };
 
 describe('PiAgentAdapter', () => {
+  it.each([false, true])('keeps a legacy fallback locator in native conversion and applies the complete Workspace payload limit (oversized=%s)', async oversized => {
+    const app = await fixture();
+    const created = app.adapter.createSession();
+    if (!created.ok) throw new Error(created.error.code);
+    const signal = new AbortController().signal;
+    const prepared = await app.adapter.prepare(created.data.nativeSessionId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal,
+      { activeToolNames: [], goalMode: 'answer' });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    const denied = () => fail(appError('tool_access_denied', 'runtime', 'The conversion fixture authorizes no tools.'));
+    const binding: AgentToolBinding = { context: { runId: 501, sessionId: 501, scope: { version: 2, allowedTools: [],
+      allowedDocumentIds: [2], allowedArtifactIds: [4], allowedResourcePaths: [] } },
+      observeRequest: denied, rejectRequest: denied, recordDelivery: denied,
+      execute: async () => { throw new Error('No tool may run.'); } };
+    const workspaceContext = { formatVersion: 1 as const, revision: 8, sessionId: 501, documentRef: { id: 2, version: 'v1' },
+      jobId: null, candidateRef: null, activeView: 'parsed' as const,
+      selection: { formatVersion: 1 as const, kind: 'source' as const, target: 'document' as const,
+        targetId: 2, targetVersion: 'v1', artifactId: 4, page: 1, block: 'b1' } };
+    const text = oversized ? 'x'.repeat(8_388_608) : 'Check the selected parsed block.';
+    const events: AgentObservation[] = [];
+    const outcome = await prepared.data.execute({ ...input(501, 501, text), toolBinding: binding,
+      workspaceInput: { documentRef: workspaceContext.documentRef, job: null, candidate: null }, workspaceContext,
+      goalMode: 'answer' }, signal, event => events.push(event));
+    if (oversized) {
+      expect(outcome.error?.code).toBe('agent_context_limit');
+      expect(outcome.agent.modelCallCount).toBe(0);
+      expect(app.requests).toHaveLength(0);
+    } else {
+      expect(outcome.error).toBeNull();
+      expect(JSON.stringify(app.requests[0]!.body.messages)).toContain('\\"workspaceContext\\"');
+      expect(JSON.stringify(app.requests[0]!.body.messages)).toContain('\\"block\\":\\"b1\\"');
+      expect(events.filter(event => event.type === 'display_message').find(event => event.message.role === 'user'))
+        .toMatchObject({ message: { textOrigin: 'product-input', blocks: [{ type: 'text', text }] } });
+    }
+    expect(outcome.stopped).toBe(true);
+  });
   it('rechecks admission at actual native enqueue when a high-level dispatch finishes after agent_end', async () => {
     const fetchEntered = deferred<void>(); const reply = deferred<Response>(); const dispatchEntered = deferred<void>(); const dispatchRelease = deferred<void>(); const closed = deferred<void>();
     const app = await fixture(() => { fetchEntered.resolve(); return reply.promise; });

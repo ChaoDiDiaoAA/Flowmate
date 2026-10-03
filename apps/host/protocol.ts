@@ -7,7 +7,8 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   InvoiceCandidateOperationQuerySchema, RuntimeRequestOverridesSchema, RUNTIME_CONFIG,
   RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeSubscriptionIdSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema, RuntimeEventsReadResultSchema, RuntimeSubscriptionResultSchema,
-  RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema } from '@flowmate/contracts';
+  RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
+  WorkspaceUpdateRequestSchema, WorkspaceSnapshotSchema, WorkspaceRestoreResultSchema, AppErrorSchema, invoiceToolSchemas } from '@flowmate/contracts';
 import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
@@ -41,12 +42,6 @@ export const InvoiceFormRunInputSchema = z.object({ modelId, clientSequence: dbI
 }).strict().refine(value => value.workspace.documentRef !== null && value.workspace.jobId !== null
   && value.workspace.candidateRef !== null, 'Fill requires a selected candidate.');
 const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).strict();
-const workspaceChange = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('document'), documentId: dbId.nullable() }).strict(),
-  z.object({ kind: z.literal('job'), jobId: dbId }).strict(),
-  z.object({ kind: z.literal('session'), sessionId: dbId.nullable() }).strict(),
-  z.object({ kind: z.literal('view'), view: z.enum(['original', 'parsed', 'candidate']) }).strict(),
-]);
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
@@ -95,9 +90,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_provider'), targetRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_run'), runId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('read_workspace') }).strict(),
-  z.object({ version: z.literal(1), requestId, type: z.literal('update_workspace'), input: z.object({
-    expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), change: workspaceChange,
-  }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('restore_workspace') }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('update_workspace'), input: WorkspaceUpdateRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('start_task'), input: z.object({
     clientSequence: dbId, expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), documentRef, goal: z.string().max(4096),
   }).strict() }).strict(),
@@ -119,9 +113,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     pageInput.extend({ jobId: dbId }), pageInput.extend({ documentId: dbId }),
   ]) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('import_invoice_material'), sourceDirectory: z.string().min(1).max(4096) }).strict(),
-  z.object({ version: z.literal(1), requestId, type: z.literal('read_document_page'), input: z.object({
-    documentId: dbId, page: z.number().int().min(1).max(20), afterBlockId: z.string().min(1).max(128).nullable(), limit: z.number().int().min(1).max(100),
-  }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('read_document_page'), input: invoiceToolSchemas.read_invoice_document.input }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_document_pages'), input: invoiceToolSchemas.list_invoice_pages.input }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('read_document_original'), documentId: dbId, page: z.literal(1) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('revoke_document_use'), documentId: dbId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('create_session'), input: z.object({ title: sessionTitle.optional() }).strict() }).strict(),
@@ -221,5 +214,21 @@ export function isRuntimeHostCommand(type: string): type is keyof typeof runtime
 export function parseRuntimeHostResult(type: string, value: unknown): unknown | null {
   if (!isRuntimeHostCommand(type)) return null;
   const parsed = runtimeResultSchemas[type].safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+const workspaceResultSchemas = {
+  read_workspace: WorkspaceSnapshotSchema,
+  update_workspace: WorkspaceSnapshotSchema,
+  restore_workspace: WorkspaceRestoreResultSchema,
+  list_document_pages: invoiceToolSchemas.list_invoice_pages.output,
+};
+export function isWorkspaceHostCommand(type: string): type is keyof typeof workspaceResultSchemas {
+  return Object.hasOwn(workspaceResultSchemas, type);
+}
+export function parseWorkspaceHostResult(type: string, value: unknown): unknown | null {
+  if (!isWorkspaceHostCommand(type)) return null;
+  const parsed = z.union([z.object({ ok: z.literal(true), data: workspaceResultSchemas[type] }).strict(),
+    z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(value);
   return parsed.success ? parsed.data : null;
 }

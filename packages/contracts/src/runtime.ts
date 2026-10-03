@@ -319,6 +319,7 @@ export type NativeHistoryDisplayRecord = { history: NativeSessionHistory | null;
 export type MessageRunInput = {
   runId: DbId; input: Readonly<InputRecord>; goalMode: import('./workspace.ts').GoalMode | null;
   workingDirectory?: string;
+  workspaceContext?: import('./workspace.ts').WorkspaceContext;
 };
 export type NativeMessageProjectionInput = {
   history: NativeSessionHistory; bindings: NativeEntryRunBinding[]; runInputs: MessageRunInput[];
@@ -543,6 +544,7 @@ export interface Application {
   queryInvoiceCandidateOperation(request: import('./invoice.ts').InvoiceCandidateOperationQuery): Promise<Result<import('./invoice.ts').InvoiceCandidateOperationResult>>;
   readWorkspace(): Promise<Result<import('./workspace.ts').WorkspaceSnapshot>>;
   updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<Result<import('./workspace.ts').WorkspaceSnapshot>>;
+  restoreWorkspace(): Promise<Result<import('./workspace.ts').WorkspaceRestoreResult>>;
   startTask(input: import('./workspace.ts').StartTaskRequest): Promise<Result<import('./workspace.ts').TaskOperation>>;
   queryTaskOperation(clientSequence: DbId): Promise<Result<import('./workspace.ts').TaskOperation | null>>;
   selectCandidate(input: import('./workspace.ts').SelectCandidateRequest): Promise<Result<import('./workspace.ts').CandidateSelection>>;
@@ -557,6 +559,7 @@ export interface Application {
   listActivity(request: import('./activity.ts').ActivityPageRequest): Promise<Result<import('./workspace.ts').Page<import('./activity.ts').BusinessEventSnapshot>>>;
   importInvoiceMaterial(sourceDirectory: string): Promise<Result<import('./workspace.ts').DocumentSnapshot>>;
   readDocumentPage(input: import('./invoice.ts').InvoiceToolInput<'read_invoice_document'>): Promise<Result<import('./invoice.ts').InvoiceToolOutput<'read_invoice_document'>>>;
+  listDocumentPages(input: import('./invoice.ts').InvoiceToolInput<'list_invoice_pages'>): Promise<Result<import('./invoice.ts').InvoiceToolOutput<'list_invoice_pages'>>>;
   readDocumentOriginal(documentId: DbId, page: number): Promise<Result<import('./workspace.ts').DocumentOriginalImage>>;
   revokeDocumentUse(documentId: DbId): Promise<Result<{ affectedSessionIds: DbId[]; stopRequested: boolean }>>;
   cancelRun(runId: DbId): Promise<Result<{ accepted: boolean; runId: DbId }>>;

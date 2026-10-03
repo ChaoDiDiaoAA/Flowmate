@@ -1,8 +1,42 @@
 import { describe, expect, it } from 'bun:test';
-import { parseHostCommand } from '../../apps/host/protocol.ts';
+import { parseHostCommand, parseWorkspaceHostResult } from '../../apps/host/protocol.ts';
 import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeEventsReadResultSchema,
   RuntimeEventsWakeSchema, RuntimeSubscriptionResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema } from '@flowmate/contracts';
+
+describe('P7 Workspace protocol', () => {
+  it('accepts only the parameterless restore command and registered selections', () => {
+    const envelope = { version: 1, requestId: 'p7-restore', type: 'restore_workspace' } as const;
+    expect(parseHostCommand(envelope)).toEqual(envelope);
+    expect(parseHostCommand({ ...envelope, path: 'outside' })).toBeNull();
+    const input = { expectedRevision: 3, change: { kind: 'selection', selection: {
+      formatVersion: 1, kind: 'field', target: 'candidate', targetId: 4, targetVersion: 2, fieldPath: 'fields.taxAmount',
+    } } };
+    expect(parseHostCommand({ version: 1, requestId: 'p7-select', type: 'update_workspace', input })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'p7-select', type: 'update_workspace', input: { ...input, extra: true } })).toBeNull();
+  });
+  it('uses the actual parsed-page maximum and cursor schema', () => {
+    const command = { version: 1, requestId: 'p7-page', type: 'read_document_page',
+      input: { documentId: 1, page: 2, afterBlockId: 'b50', limit: 50 } };
+    expect(parseHostCommand(command)).not.toBeNull();
+    expect(parseHostCommand({ ...command, input: { ...command.input, limit: 51 } })).toBeNull();
+    expect(parseHostCommand({ ...command, input: { ...command.input, afterBlockId: 'anything' } })).toBeNull();
+  });
+  it('rejects malformed read, update and restore response payloads', () => {
+    const workspace = { documentRef: null, jobId: null, sessionId: null, candidateRef: null,
+      activeView: 'original', selection: null, revision: 0, updatedAt: '2026-10-03T00:00:00.000Z',
+      invalidReferences: [], nextTaskSequence: 1 };
+    for (const type of ['read_workspace', 'update_workspace']) {
+      expect(parseWorkspaceHostResult(type, { ok: true, data: workspace })).toEqual({ ok: true, data: workspace });
+      expect(parseWorkspaceHostResult(type, { ok: true, data: { ...workspace, revision: -1 } })).toBeNull();
+      expect(parseWorkspaceHostResult(type, { ok: true, data: { ...workspace, selection: { kind: 'unknown' } } })).toBeNull();
+      expect(parseWorkspaceHostResult(type, { ok: true, data: workspace, extra: true })).toBeNull();
+    }
+    expect(parseWorkspaceHostResult('restore_workspace', { ok: true, data: { workspace, clearedReferences: ['selection_location_missing'] } }))
+      .toEqual({ ok: true, data: { workspace, clearedReferences: ['selection_location_missing'] } });
+    expect(parseWorkspaceHostResult('restore_workspace', { ok: true, data: workspace })).toBeNull();
+  });
+});
 
 describe('versioned desktop Host protocol', () => {
   it('shares new Run budget bounds across chat, ordinary Run, and Fill while active inputs cannot override them', () => {

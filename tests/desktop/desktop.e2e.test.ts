@@ -48,7 +48,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
       return runs.ok && runs.data.items[0] ? { runId: runs.data.items[0].runId, sessionId } : null;
     });
     expect(identity).not.toBeNull(); if (!identity) return;
-    expect(await page.locator('.rail .nav-item').count()).toBe(6);
+    expect(await page.locator('.rail .nav-item').count()).toBe(7);
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
     await expect(page.getByTestId('activity-page')).toBeVisible();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
@@ -534,7 +534,7 @@ async function captureDesktopViews(page: Page) {
   if (!root) return;
   mkdirSync(root, { recursive: true });
   const nav = page.getByRole('navigation', { name: 'Workspace navigation' });
-  expect(await page.locator('.rail .nav-item').count()).toBe(6);
+  expect(await page.locator('.rail .nav-item').count()).toBe(7);
   for (const name of ['Invoices', 'Processing History', 'Chats', 'Activity', 'Models', 'Settings']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(1);
   }
@@ -849,7 +849,11 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     await expect(page.locator('.chat-config-hint')).toHaveText('This chat is archived. Unarchive it in Chats to continue.');
     await composer.fill('P5 preserved archived draft');
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+    const archivedWorkspace = await page.evaluate(() => window.flowmate.readWorkspace());
+    expect(archivedWorkspace).toMatchObject({ ok: true, data: { sessionId: null } });
     await row.getByRole('button', { name: 'Unarchive', exact: true }).click();
+    await expect(row.getByRole('button', { name: 'Archive', exact: true })).toBeVisible();
+    expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(archivedWorkspace);
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
     expect(await composer.inputValue()).toBe('P5 preserved archived draft');
     const reply = page.locator('[data-testid="chat-turn"][data-message-role="assistant"]').first();
@@ -864,7 +868,9 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
       ipcMain.removeHandler('flowmate:submit-input'); let lost = false;
       ipcMain.handle('flowmate:submit-input', async (event, ...args) => {
         const result = await original(event, ...args);
-        if (!lost) { lost = true; return { ok: false, error: { code, category: 'runtime', message: 'Controlled receipt loss', retryable: true } }; }
+        if (!lost) { lost = true; (globalThis as typeof globalThis & { p5PromptLostReceiptResult?: unknown }).p5PromptLostReceiptResult = result;
+          if ((result as { ok?: boolean }).ok !== true) return result;
+          return { ok: false, error: { code, category: 'runtime', message: 'Controlled receipt loss', retryable: true } }; }
         return result;
       });
     }, unknownCode);
@@ -872,6 +878,8 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     await composer.fill('P5 unknown receipt input');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
+    const actualPromptReceipt = await electronApp.evaluate(() => (globalThis as typeof globalThis & { p5PromptLostReceiptResult?: unknown }).p5PromptLostReceiptResult);
+    expect(actualPromptReceipt, JSON.stringify({ actualPromptReceipt, workspace: await page.evaluate(() => window.flowmate.readWorkspace()) })).toMatchObject({ ok: true });
     await expect(composer).toHaveValue('P5 unknown receipt input');
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
     await expect(page.getByLabel('Next Run model requests', { exact: true })).toHaveValue('31');
@@ -931,7 +939,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     })).toMatchObject({ ok: true });
     expect(await page.evaluate(request => window.flowmate.submitInput(request), originalPrompt)).toMatchObject(originalReceipt);
     expect(requests).toHaveLength(callsAfterStop);
-    expect(await page.locator('.rail .nav-item').count()).toBe(6);
+    expect(await page.locator('.rail .nav-item').count()).toBe(7);
     const closingApp = electronApp;
     electronApp = null;
     await closeDesktopFixture(closingApp, userData);
@@ -1002,7 +1010,7 @@ it('desktop discloses the active Run and frozen invoice after the viewed invoice
     await page.getByRole('button', { name: 'New chat', exact: true }).click();
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Invoices', exact: true }).click();
     await page.locator('.invoice-context .processing-open').filter({ hasText: 'Invoice 000001' }).click();
-    await expect(page.locator('.chat-context')).toHaveText('Working with Invoice 000001');
+    await expect(page.locator('.chat-context')).toContainText('Working with Invoice 000001');
     const composer = page.getByRole('textbox', { name: 'Message to model' });
     await composer.fill('Explain the original invoice.');
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
@@ -1018,18 +1026,18 @@ it('desktop discloses the active Run and frozen invoice after the viewed invoice
     await page.locator('.invoice-context .processing-open').filter({ hasText: 'Invoice 000002' }).click();
     await page.getByRole('heading', { name: 'Invoice 000002', exact: true }).waitFor();
     expect(await page.evaluate(() => window.flowmate.readWorkspace())).toMatchObject({ ok: true, data: { documentRef: { id: 2 } } });
-    await expect(page.locator('.chat-context')).toContainText(`Run ${original.runId}`);
+    await expect(page.locator('.chat-context')).toContainText('Responding to Invoice 000001');
     await expect(page.locator('.chat-context')).toContainText('Invoice 000001');
     await expect(page.locator('.chat-context')).not.toContainText('Invoice 000002');
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models', exact: true }).click();
     await page.getByRole('button', { name: '＋ Add', exact: true }).click();
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Invoices', exact: true }).click();
-    await expect(page.locator('.chat-context')).toContainText(`Run ${original.runId}`);
+    await expect(page.locator('.chat-context')).toContainText('Responding to Invoice 000001');
     await expect(page.locator('.chat-context')).toContainText('Invoice 000001');
     await page.getByRole('button', { name: 'New chat', exact: true }).click();
-    await expect(page.locator('.chat-context')).not.toContainText(`Run ${original.runId}`);
+    await expect(page.locator('.chat-context')).not.toContainText('Responding to Invoice 000001');
     await page.locator(`.sidebar-chat[data-session-id="${original.sessionId}"]`).click();
-    await expect(page.locator('.chat-context')).toContainText(`Run ${original.runId}`);
+    await expect(page.locator('.chat-context')).toContainText('Responding to Invoice 000001');
     await expect(page.locator('.chat-context')).toContainText('Invoice 000001');
     await composer.fill('Keep this later draft.');
     expect(requests).toHaveLength(1);
@@ -1630,8 +1638,65 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     expect(JSON.stringify(requestBodies.at(-1))).toContain('Invoice total is 1060 CNY.');
     expect(JSON.stringify(requestBodies.at(-1))).toContain('What was the total?');
 
+    const requestsBeforeNewChatEntry = requestBodies.length;
+    await electronApp.evaluate(({ ipcMain }) => {
+      const gate = { createCalls: 0, submitCalls: 0, blockRestore: false,
+        releaseUpdate: null as (() => void) | null, releaseRestore: null as (() => void) | null };
+      let enterUpdate: (() => void) | null = null, enterRestore: (() => void) | null = null;
+      const updateEntered = new Promise<void>(done => { enterUpdate = done; });
+      const restoreEntered = new Promise<void>(done => { enterRestore = done; });
+      const updateWaiting = new Promise<void>(done => { gate.releaseUpdate = done; });
+      const restoreWaiting = new Promise<void>(done => { gate.releaseRestore = done; });
+      (globalThis as typeof globalThis & { newChatEntryGate?: typeof gate & { updateEntered: Promise<void>; restoreEntered: Promise<void> } }).newChatEntryGate = Object.assign(gate, { updateEntered, restoreEntered });
+      const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
+      let holdUpdate = true;
+      for (const channel of ['flowmate:create-session', 'flowmate:submit-input', 'flowmate:update-workspace', 'flowmate:restore-workspace']) {
+        const original = handlers.get(channel); if (!original) throw new Error(`Missing IPC: ${channel}`);
+        ipcMain.removeHandler(channel);
+        ipcMain.handle(channel, async (event, ...args) => {
+          if (channel === 'flowmate:create-session') gate.createCalls++;
+          if (channel === 'flowmate:submit-input') gate.submitCalls++;
+          if (channel === 'flowmate:update-workspace' && holdUpdate) {
+            holdUpdate = false; enterUpdate?.(); await updateWaiting;
+          }
+          if (channel === 'flowmate:restore-workspace' && gate.blockRestore) {
+            gate.blockRestore = false; enterRestore?.(); await restoreWaiting;
+            return { ok: false, error: { code: 'workspace_recovery_blocked', category: 'storage', message: 'Synthetic unavailable material root', retryable: true } };
+          }
+          return original(event, ...args);
+        });
+      }
+    });
     await page.locator(`.sidebar-chat[data-session-id="${legacyId}"]`).click();
     await page.getByText('Read only · older conversation').waitFor({ state: 'visible', timeout: 10_000 });
+    await restartedComposer.fill('Continue the older chat.');
+    const newChatSendButton = page.getByRole('button', { name: 'New chat and send', exact: true });
+    await electronApp.evaluate(() => (globalThis as typeof globalThis & { newChatEntryGate: { updateEntered: Promise<void> } }).newChatEntryGate.updateEntered);
+    await expect(newChatSendButton).toBeDisabled();
+    await newChatSendButton.evaluate(button => (button as HTMLButtonElement).click());
+    await expect(restartedComposer).toHaveValue('Continue the older chat.');
+    expect(await electronApp.evaluate(() => { const gate = (globalThis as typeof globalThis & { newChatEntryGate: { createCalls: number; submitCalls: number } }).newChatEntryGate;
+      return { createCalls: gate.createCalls, submitCalls: gate.submitCalls }; })).toEqual({ createCalls: 0, submitCalls: 0 });
+    expect(requestBodies).toHaveLength(requestsBeforeNewChatEntry);
+    await electronApp.evaluate(() => (globalThis as typeof globalThis & { newChatEntryGate: { releaseUpdate: (() => void) | null } }).newChatEntryGate.releaseUpdate?.());
+    await expect(newChatSendButton).toBeEnabled();
+    expect(await page.evaluate(() => window.flowmate.readWorkspace())).toMatchObject({ ok: true, data: { sessionId: legacyId } });
+    await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
+    await electronApp.evaluate(() => { (globalThis as typeof globalThis & { newChatEntryGate: { blockRestore: boolean } }).newChatEntryGate.blockRestore = true; });
+    await page.getByRole('button', { name: 'Refresh workspace', exact: true }).click();
+    await electronApp.evaluate(() => (globalThis as typeof globalThis & { newChatEntryGate: { restoreEntered: Promise<void> } }).newChatEntryGate.restoreEntered);
+    await expect(newChatSendButton).toBeDisabled();
+    await expect(restartedComposer).toHaveValue('Continue the older chat.');
+    await electronApp.evaluate(() => (globalThis as typeof globalThis & { newChatEntryGate: { releaseRestore: (() => void) | null } }).newChatEntryGate.releaseRestore?.());
+    await expect(page.getByText('Workspace recovery is blocked. Check access to the saved invoice material, then refresh.', { exact: true })).toBeVisible();
+    await expect(newChatSendButton).toBeDisabled();
+    await newChatSendButton.evaluate(button => (button as HTMLButtonElement).click());
+    await expect(restartedComposer).toHaveValue('Continue the older chat.');
+    expect(await electronApp.evaluate(() => { const gate = (globalThis as typeof globalThis & { newChatEntryGate: { createCalls: number; submitCalls: number } }).newChatEntryGate;
+      return { createCalls: gate.createCalls, submitCalls: gate.submitCalls }; })).toEqual({ createCalls: 0, submitCalls: 0 });
+    expect(requestBodies).toHaveLength(requestsBeforeNewChatEntry);
+    await page.getByRole('button', { name: 'Refresh workspace', exact: true }).click();
+    await expect(newChatSendButton).toBeEnabled();
     await page.locator(`.sidebar-chat[data-session-id="${legacyId}"]`).locator('..').getByRole('button', { name: /Rename chat/ }).click();
     await page.getByRole('textbox', { name: 'Chat title' }).fill('Renamed older chat');
     await page.locator('.sidebar-chat-edit').getByRole('button', { name: 'Save' }).click();
@@ -1641,7 +1706,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await electronApp.evaluate(({ ipcMain }) => {
       const gate = { releaseCreate: null as (() => void) | null, releaseStart: null as (() => void) | null,
         enterStart: null as (() => void) | null, enterWorkspace: null as (() => void) | null,
-        releaseWorkspace: null as (() => void) | null, applyWorkspace: null as (() => void) | null, sessionId: 0 };
+        releaseWorkspace: null as (() => void) | null, applyWorkspace: null as (() => void) | null, sessionId: 0, submittedWorkspace: undefined as unknown };
       const creating = new Promise<void>((done) => { gate.releaseCreate = done; });
       const starting = new Promise<void>((done) => { gate.releaseStart = done; });
       const startEntered = new Promise<void>((done) => { gate.enterStart = done; });
@@ -1660,6 +1725,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
           else if (channel === 'flowmate:submit-input') {
             const current = (globalThis as unknown as { newChatSendGate: typeof gate }).newChatSendGate;
             current.sessionId = (args[0] as { sessionId: number }).sessionId;
+            current.submittedWorkspace = (args[0] as { workspace?: unknown }).workspace ?? null;
             current.enterStart?.();
             await starting;
           } else if (firstWorkspace) {
@@ -1693,9 +1759,19 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     expect(currentSessionId).not.toBe(legacyId);
     expect(currentSessionId).not.toBe(firstSessionId);
     expect(Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'))).toBe(firstSessionId);
+    expect(await page.evaluate(() => window.flowmate.readWorkspace())).toMatchObject({ ok: true, data: { sessionId: firstSessionId } });
+    expect(await electronApp.evaluate(() => (globalThis as typeof globalThis & { newChatSendGate: { submittedWorkspace: unknown } }).newChatSendGate.submittedWorkspace)).toBeNull();
     expect(await page.locator('.chat-input-intent').filter({ hasText: 'Continue the older chat.' }).count()).toBe(0);
     await electronApp.evaluate(() => (globalThis as unknown as { newChatSendGate: { releaseStart: (() => void) | null } }).newChatSendGate.releaseStart?.());
     await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'detached', timeout: 20_000 });
+    const detached = await page.evaluate(async id => {
+      const inputs = await window.flowmate.listSessionInputs({ sessionId: id }); if (!inputs.ok || !inputs.data.items[0]?.runId) throw new Error('Detached input missing');
+      return { inputs, run: await window.flowmate.queryRun(inputs.data.items[0].runId) };
+    }, currentSessionId);
+    expect(detached.inputs).toMatchObject({ ok: true, data: { items: [{ content: {
+      workspaceContext: null, workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [] } }] } });
+    expect(detached.run).toMatchObject({ ok: true, data: { scope: { version: 1, mode: 'chat-text', toolNames: [], resourcePaths: [] } } });
+    expect(await page.evaluate(() => window.flowmate.readWorkspace())).toMatchObject({ ok: true, data: { sessionId: firstSessionId } });
     expect(JSON.stringify(requestBodies.at(-1))).toContain('Continue the older chat.');
     expect(JSON.stringify(requestBodies.at(-1))).not.toContain('Invoice total is 1060 CNY.');
     await page.locator(`.sidebar-chat[data-session-id="${currentSessionId}"]`).click();
@@ -2242,8 +2318,18 @@ it('reconciles Renderer messages from the public history IPC without replaying a
         phase: 'ended', stopReason: null, toolCallId: null, toolName: null, isError: null, textOrigin: 'product-input' };
       replace('flowmate:get-state', { ...data, ready: true, host: 'ready' });
       replace('flowmate:list-model-catalog', []);
-      replace('flowmate:read-workspace', { revision: 0, documentRef: null, jobId: null, candidateRef: null,
-        sessionId: 12, activeView: 'original' });
+      const workspace = { revision: 0, documentRef: null, jobId: null, candidateRef: null, sessionId: 12 as number | null,
+        activeView: 'original', selection: null, invalidReferences: [], nextTaskSequence: 1, updatedAt: '2026-09-30T00:00:00.000Z' };
+      replace('flowmate:read-workspace', workspace);
+      replace('flowmate:restore-workspace', { workspace, clearedReferences: [] });
+      ipcMain.removeHandler('flowmate:update-workspace');
+      ipcMain.handle('flowmate:update-workspace', async (_event, input) => {
+        if (input.expectedRevision !== workspace.revision || input.change.kind !== 'session'
+          || ![null, 12, 13].includes(input.change.sessionId)) return { ok: false,
+          error: { code: 'state_conflict', category: 'input', message: 'Controlled Workspace changed.', retryable: true } };
+        if (workspace.sessionId !== input.change.sessionId) { workspace.sessionId = input.change.sessionId; workspace.revision += 1; }
+        return { ok: true, data: workspace };
+      });
       replace('flowmate:list-sessions', { items: [session, otherSession], next: null });
       ipcMain.removeHandler('flowmate:query-session');
       ipcMain.handle('flowmate:query-session', async (_event, id) => ({ ok: true, data: id === 13 ? otherSession : session }));

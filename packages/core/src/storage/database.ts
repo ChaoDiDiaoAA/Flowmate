@@ -47,15 +47,16 @@ export type DbHandle = {
   close: () => void;
 };
 
-function migrationSql(version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql'][version - 1];
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14;
+function migrationSql(version: SchemaVersion): string {
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
 
-function runMigration(db: Database, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13): void {
+function runMigration(db: Database, version: SchemaVersion): void {
   try {
-    if (version === 4 || version === 10 || version === 11) {
+    if (version === 4 || version === 10 || version === 11 || version === 14) {
       for (const statement of migrationSql(version).split(';').map((sql) => sql.trim()).filter(Boolean)) {
         db.exec(statement);
       }
@@ -81,10 +82,10 @@ function migrateToLatest(db: Database): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 13) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 14) {
     throw new Error('unsupported_schema_version');
   }
-  for (let version = versions.length + 1; version <= 13; version += 1) runMigration(db, version as 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13);
+  for (let version = versions.length + 1; version <= 14; version += 1) runMigration(db, version as SchemaVersion);
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { AgentRunEvent, ProviderConfig, Result, WorkspaceSnapshot } from '@flowmate/contracts';
@@ -11,6 +12,7 @@ import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools } from '@flowmate/employee-invoice';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import { deferCleanup, mkdtempSync } from '../support/resources.ts';
+import { createTestWorkspaceVerifier } from '../support/workspace.ts';
 
 function need<T>(value: Result<T>): T { if (!value.ok) throw new Error(value.error.code); return value.data; }
 function barrier() { let release!: () => void; const ready = new Promise<void>(resolve => { release = resolve; }); return { ready, release }; }
@@ -32,18 +34,28 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
   const store = need(openDatabase(paths));
   const now = () => new Date().toISOString();
   for (const id of [1, 2]) {
+    const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64');
+    const parsed = Buffer.from(JSON.stringify({ formatVersion: 2, pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text',
+      text: `Synthetic invoice ${id}`, sourceIndex: 0, sourceType: 'synthetic', bbox: null }] }],
+      completeness: { status: 'complete', checks: [], warnings: [] } }));
+    for (const [artifactId, filename, bytes] of [[2 * id - 1, 'original.png', original], [2 * id, 'parsed.json', parsed]] as const) {
+      mkdirSync(join(paths.artifactsDir, String(artifactId)), { recursive: true });
+      writeFileSync(join(paths.artifactsDir, String(artifactId), filename), bytes);
+    }
     const metadata = { version: 1 as const, sourceKey: 'synthetic', sourceRecordId: `runtime-invoice-${id}`, sourceVersion: 'v1',
-      files: [{ relativePath: 'fixture.json', bytes: 1, mimeType: 'application/json' }] };
+      files: [{ relativePath: 'original.png', bytes: original.byteLength, mimeType: 'image/png' }] };
     need(store.documents.register({ documentId: id, sourceKey: 'synthetic', sourceRecordId: metadata.sourceRecordId, version: 'v1',
-      originalArtifact: { artifactId: 2 * id - 1, kind: 'original', relativePath: `artifacts/${id}/original.png`, bytes: 1,
+      originalArtifact: { artifactId: 2 * id - 1, kind: 'original', relativePath: `artifacts/${2 * id - 1}/original.png`, bytes: original.byteLength,
         mimeType: 'image/png', metadata, createdAt: now() },
-      parsedArtifact: { artifactId: 2 * id, kind: 'parsed', relativePath: `artifacts/${id}/parsed.json`, bytes: 1,
-        mimeType: 'application/json', metadata, createdAt: now() }, status: 'available',
+      parsedArtifact: { artifactId: 2 * id, kind: 'parsed', relativePath: `artifacts/${2 * id}/parsed.json`, bytes: parsed.byteLength,
+        mimeType: 'application/json', metadata: { ...metadata, files: [{ relativePath: 'parsed.json', bytes: parsed.byteLength,
+          mimeType: 'application/json' }] }, createdAt: now() }, status: 'available',
       metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'],
         licenseVerification: 'not_verified', unavailableReason: null }, createdAt: now(), updatedAt: now() }));
   }
   const files = createFileStore(paths, store.documents);
   const documents = createDocumentService({ paths, repository: store.documents, files, allowedSourceRoot: root, now });
+  const verify = createTestWorkspaceVerifier(store, root);
   let business = 0, clockOffset = 0;
   const definitions = createInvoiceTools({ documents, documentRepository: store.documents, candidates: store.candidates, now })
     .map(tool => ({ ...tool, execute: (...args: Parameters<typeof tool.execute>) => { business++; return tool.execute(...args); } }));
@@ -57,7 +69,7 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
   deferCleanup(() => server.stop(true));
   const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir, tools: definitions,
     credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-runtime-key', sessionSetup: setup });
-  const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, tools, agent,
+  const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, tools, agent, workspaceVerifier: verify,
     provider: { async prepare() { throw new Error('No direct Provider request is authorized.'); },
       async close() { return { stopped: true, closed: true, errors: [] }; } }, log: { write() {}, async close() {} },
     now, monotonicNow: () => performance.now() + clockOffset });
@@ -65,7 +77,7 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
     (request, input, control) => runtime.start(request, control, input), request => runtime.appendInput(request),
     id => runtime.verifySessionMutation(id));
   const app = makeApplication(runtime, store.runs, async () => { store.close(); return { stopped: true, closed: true, errors: [] }; },
-    sessions, undefined, new WorkspaceService(store.workspace, now), new JobService(store.jobs, now));
+    sessions, undefined, new WorkspaceService(store.workspace, now, verify), new JobService(store.jobs, now));
   deferCleanup(() => app.close());
   const config: ProviderConfig = { version: 1, name: 'Controlled runtime admission', revision: 1,
     modelRef: { provider: 'runtime-admission-fixture', model: 'runtime-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },

@@ -4,7 +4,7 @@ import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidat
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
 import { RuntimeBudgetOverridesSchema, RuntimeRequestOverridesSchema } from '../../../../packages/contracts/src/runtime.ts';
 import { RUNTIME_CONFIG } from '../../../../packages/contracts/src/runtime-config.ts';
-import type { RuntimeRequestOverrides } from '@flowmate/contracts';
+import type { RuntimeRequestOverrides, Result, SourceRef, WorkspaceSelection, WorkspaceView } from '@flowmate/contracts';
 import { WorkspaceContextSchema } from '../../../../packages/contracts/src/workspace.ts';
 import type { DesktopInvoiceFormRunRequest, DesktopSessionInputRequest, InvoiceCandidateOperationQuery, InvoiceFormApplicationReceipt, InvoiceFormDraft, SaveInvoiceCandidateResponse, SessionInputSnapshot } from '@flowmate/contracts';
 import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoiceFormState, editInvoiceForm, invalidateInvoiceForm,
@@ -12,13 +12,16 @@ import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoi
 import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, NativeToolAvailability, ProductSettings, RunSnapshot, RuntimeState, SessionCursor, SessionMessageView, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
 import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type MessageViewState } from './message-state.ts';
 import { ActivityPage } from './activity.tsx';
+import { WorkspacePage } from './workspace.tsx';
+import { createWorkspaceState, beginWorkspaceRequest, acceptWorkspaceSnapshot, failWorkspaceRequest,
+  resetWorkspaceHost, sameWorkspaceBasis, sameWorkspaceSelection, selectionLabel, workspaceReady, type WorkspaceState } from './workspace-state.ts';
 import { createEventView, bindEventSubscription, applyEventWake, applyEventRead, eventReadRequest,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings';
+type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings';
 const pageLabels: Record<Page, string> = {
-  workspace: 'Invoices', tasks: 'Processing History', chats: 'Chats',
+  workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats',
   activity: 'Activity', models: 'Models', settings: 'Settings',
 };
 type EventObservation = { view: EventViewState; wanted: boolean; opening: boolean; through?: number;
@@ -112,6 +115,7 @@ function errorMessage(value: unknown): string {
     if (error?.code === 'tool_budget_exceeded') return 'The assistant reached the tool limit before finishing. Check Processing History for any saved result.';
     if (error?.code === 'session_scope_revoked') return 'Model access to this invoice was revoked. Start a new chat.';
     if (error?.code === 'state_conflict') return 'The invoice context changed. Review it and send again.';
+    if (error?.code === 'workspace_recovery_blocked') return 'Workspace recovery is blocked. Check access to the saved invoice material, then refresh.';
     if (error && typeof error.message === 'string' && !/[\u3400-\u9fff]/u.test(error.message)) return error.message;
     if (error?.category === 'provider') return 'The model request failed. Check the connection and model settings.';
     if (error?.category === 'storage') return 'Your changes could not be saved. Please try again.';
@@ -162,6 +166,11 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null);
+  const [workspaceState, setWorkspaceState] = useState(createWorkspaceState);
+  const [workspacePending, setWorkspacePending] = useState(0);
+  const [workspaceCandidate, setWorkspaceCandidate] = useState<CandidateJobDetail | null>(null);
+  const [workspaceCandidateLoading, setWorkspaceCandidateLoading] = useState(false);
+  const [workspaceCandidateError, setWorkspaceCandidateError] = useState<string | null>(null);
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]);
   const [historicalDocuments, setHistoricalDocuments] = useState<Record<number, DocumentSnapshot>>({});
   const [historicalInvoice, setHistoricalInvoice] = useState<DocumentSnapshot | null>(null);
@@ -184,6 +193,10 @@ export function App() {
   const [activity, setActivity] = useState<BusinessEventSnapshot[]>([]);
   const [parsedPage, setParsedPage] = useState<InvoiceToolOutput<'read_invoice_document'> | null>(null);
   const [originalImage, setOriginalImage] = useState<DocumentOriginalImage | null>(null);
+  const [materialLoading, setMaterialLoading] = useState(false);
+  const [materialError, setMaterialError] = useState<string | null>(null);
+  const [parsedIndex, setParsedIndex] = useState<InvoiceToolOutput<'list_invoice_pages'> | null>(null);
+  const [localWorkspaceView, setLocalWorkspaceView] = useState<WorkspaceView | null>(null);
   const [taskGoal, setTaskGoal] = useState('');
   const [goalMode, setGoalMode] = useState<'answer' | 'save-candidate'>('answer');
   const [runtimeDefaultsDraft, setRuntimeDefaultsDraft] = useState(() => runtimeLimitsDraft({}));
@@ -263,6 +276,14 @@ export function App() {
   const agentStopRequested = useRef(false);
   const selectedSessionIdRef = useRef<number | null>(null);
   const workspaceRef = useRef<WorkspaceSnapshot | null>(null);
+  const workspaceStateRef = useRef(createWorkspaceState());
+  const workspacePendingRef = useRef(0);
+  const workspaceToken = useRef(0);
+  const workspaceHostEpoch = useRef(0);
+  const workspaceCandidateGeneration = useRef(0);
+  const materialReadLease = useRef<{ generation: number; epoch: number; token: number } | null>(null);
+  const candidateReadLease = useRef<{ generation: number; epoch: number; token: number } | null>(null);
+  const workspaceDetailsToReload = useRef({ material: false, candidate: false });
   const workspaceChanges = useRef<Promise<void>>(Promise.resolve());
   const sessionCursorRef = useRef<SessionCursor | null>(null);
   const sessionLoadSequence = useRef(0);
@@ -501,6 +522,14 @@ export function App() {
 
   function receiveDesktopState(next: DesktopState): boolean {
     if (next.ready && next.settings.revision < settingsRevision.current) return false;
+    if (hostReadyRef.current !== next.ready) {
+      workspaceHostEpoch.current++;
+      publishWorkspaceState(resetWorkspaceHost(workspaceStateRef.current, workspaceHostEpoch.current));
+      documentReadGeneration.current++;
+      candidateQuerySequence.current++;
+      workspaceCandidateGeneration.current++;
+      setMaterialLoading(false); setWorkspaceCandidateLoading(false);
+    }
     settingsRevision.current = Math.max(settingsRevision.current, next.settings.revision);
     hostReadyRef.current = next.ready;
     setState(current => current && next.settings.revision < current.settings.revision
@@ -607,6 +636,7 @@ export function App() {
   }
 
   async function prepareInvoiceForm(purpose: 'fill' | 'edit', detail = candidateDetail): Promise<InvoiceFormState | null> {
+    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return null;
     const current = workspaceRef.current;
     if (!current?.documentRef || !current.jobId || !current.candidateRef || !detail
       || detail.candidate.candidateId !== current.candidateRef.id || detail.candidate.sequence !== current.candidateRef.sequence
@@ -635,7 +665,7 @@ export function App() {
   }
 
   async function fillInvoiceForm() {
-    if (!persistedModel || !modelReady || busy) return;
+    if (!persistedModel || !modelReady || busy || !workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
     const limits = parseRuntimeLimits(nextRuntimeDraft);
     if (!limits.success) { setFormFeedback('Run limits must be within the displayed ranges.'); return; }
     setFormPreparing(true);
@@ -793,13 +823,26 @@ export function App() {
   }
 
   async function navigate(next: Page) {
-    if (next !== page && !await confirmFormLeave()) return false;
+    const sharesInvoiceForm = (page === 'workspace' || page === 'workspace-detail') && (next === 'workspace' || next === 'workspace-detail');
+    if (next !== page && !sharesInvoiceForm && !await confirmFormLeave()) return false;
+    cancelWorkspaceDetailReads();
     taskDetailsGeneration.current++;
     documentReadGeneration.current++;
+    candidateQuerySequence.current++;
+    workspaceCandidateGeneration.current++;
     setPage(next);
     setNavOpen(false);
     const selectedJobId = historyJobId ?? workspace?.jobId;
     if (next === 'tasks' && selectedJobId) void loadTaskDetails(selectedJobId);
+    if (next === 'workspace-detail' && workspaceRef.current?.documentRef) {
+      const current = workspaceRef.current.documentRef;
+      if (!parsedPage || parsedPage.documentRef.id !== current.id || parsedPage.documentRef.version !== current.version
+        || !originalImage || originalImage.documentRef.id !== current.id || originalImage.documentRef.version !== current.version
+        || !parsedIndex || parsedIndex.documentRef.id !== current.id || parsedIndex.documentRef.version !== current.version || materialLoading) {
+        void loadDocumentMaterial(current.id);
+      }
+      void loadWorkspaceCandidate();
+    }
     return true;
   }
   function selectHistoryJob(jobId: number | null) {
@@ -821,13 +864,31 @@ export function App() {
     for (const session of result.data.items) nativeSessionIds.current.set(session.sessionId, session.nativeSessionId);
     setSessionCursor(result.data.next);
     setSessions((current) => append ? [...current, ...result.data.items] : result.data.items);
-    if (allowInitialSessionSelection.current && selectedSessionIdRef.current === null
-      && !chatDrafts.current.get('new') && result.data.items[0]) {
-      selectSession(result.data.items[0].sessionId);
+  }
+
+  function publishWorkspaceState(next: WorkspaceState) {
+    if (next.hostEpoch !== workspaceStateRef.current.hostEpoch || next.requestToken !== workspaceStateRef.current.requestToken) cancelWorkspaceDetailReads();
+    workspaceStateRef.current = next;
+    setWorkspaceState(next);
+  }
+
+  function cancelWorkspaceDetailReads() {
+    if (materialReadLease.current) {
+      materialReadLease.current = null; workspaceDetailsToReload.current.material = true;
+      documentReadGeneration.current++; setMaterialLoading(false);
+    }
+    if (candidateReadLease.current) {
+      candidateReadLease.current = null; workspaceDetailsToReload.current.candidate = true;
+      workspaceCandidateGeneration.current++; setWorkspaceCandidateLoading(false);
     }
   }
 
-  function acceptWorkspace(snapshot: WorkspaceSnapshot) {
+  function acceptWorkspace(snapshot: WorkspaceSnapshot, epoch = workspaceHostEpoch.current,
+    token = workspaceStateRef.current.requestToken): boolean {
+    const before = workspaceStateRef.current;
+    const next = acceptWorkspaceSnapshot(before, epoch, token, snapshot);
+    if (next === before) return false;
+    publishWorkspaceState(next);
     const previous = workspaceRef.current;
     const form = invoiceFormRef.current;
     if (form && (previous?.sessionId !== snapshot.sessionId || previous?.jobId !== snapshot.jobId
@@ -839,23 +900,44 @@ export function App() {
     if (previous?.documentRef?.id !== snapshot.documentRef?.id || previous?.documentRef?.version !== snapshot.documentRef?.version) {
       setParsedPage(null);
       setOriginalImage(null);
+      setParsedIndex(null);
+      setLocalWorkspaceView(null);
+    }
+    if (!sameWorkspaceBasis(previous, snapshot)) {
+      workspaceCandidateGeneration.current++;
+      candidateQuerySequence.current++;
+      setWorkspaceCandidate(null);
+      setWorkspaceCandidateError(null);
     }
     workspaceRef.current = snapshot;
     setWorkspace(snapshot);
+    return true;
   }
 
   async function loadWorkspace() {
-    const result = await window.flowmate.readWorkspace();
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return null; }
-    acceptWorkspace(result.data);
-    return result.data;
+    if (workspacePendingRef.current) return null;
+    const epoch = workspaceHostEpoch.current, token = ++workspaceToken.current;
+    publishWorkspaceState(beginWorkspaceRequest(workspaceStateRef.current, token, 'loading'));
+    try {
+      const result = await window.flowmate.readWorkspace();
+      if (!result.ok) {
+        publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token, errorMessage(result), 'error'));
+        return null;
+      }
+      return acceptWorkspace(result.data, epoch, token) ? result.data : null;
+    } catch {
+      publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token, 'Workspace could not be read. Refresh to try again.', 'error'));
+      return null;
+    }
   }
 
   async function loadProductLists() {
+    const epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
     const [documentsResult, jobsResult] = await Promise.all([
       window.flowmate.listDocuments({ limit: 50 }),
       window.flowmate.listJobs({ limit: 50 }),
     ]);
+    if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return;
     if (documentsResult.ok) setDocuments(documentsResult.data.items);
     else setNotice({ tone: 'bad', message: errorMessage(documentsResult) });
     if (jobsResult.ok) setJobs(jobsResult.data.items);
@@ -865,44 +947,234 @@ export function App() {
       const missingIds = [...new Set(jobsResult.data.items.map((item) => item.documentRef.id))]
         .filter((id) => !visibleIds.has(id));
       const fetched = await Promise.all(missingIds.map((id) => window.flowmate.queryDocument(id)));
+      if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return;
       setHistoricalDocuments((current) => ({ ...current, ...Object.fromEntries(fetched.filter((item) => item.ok)
         .map((item) => [item.data.documentRef.id, item.data])) }));
     }
   }
 
   async function changeWorkspace(change: WorkspaceChange) {
-    if (!await confirmFormLeave()) return null;
+    if (change.kind !== 'selection' && change.kind !== 'view' && !await confirmFormLeave()) return null;
+    const result = await mutateWorkspace(async current => {
+      const updated = await window.flowmate.updateWorkspace({ expectedRevision: current.revision, change });
+      return updated.ok ? { ok: true as const, data: { workspace: updated.data } } : updated;
+    }, change);
+    return result?.workspace ?? null;
+  }
+
+  async function mutateWorkspace<T extends { workspace: WorkspaceSnapshot }>(operation: (current: WorkspaceSnapshot) => Promise<Result<T>>,
+    change: WorkspaceChange | null = null): Promise<T | null> {
+    const queuedEpoch = workspaceHostEpoch.current;
+    workspacePendingRef.current++;
+    setWorkspacePending(workspacePendingRef.current);
     const update = workspaceChanges.current.then(async () => {
-      let current = workspaceRef.current;
-      if (!current) current = await loadWorkspace();
-      if (!current) return null;
-      const result = await window.flowmate.updateWorkspace({ expectedRevision: current.revision, change });
-      if (!result.ok) {
-        setNotice({ tone: 'bad', message: errorMessage(result) });
-        if (result.error.code === 'state_conflict') await loadWorkspace();
+      if (queuedEpoch !== workspaceHostEpoch.current || !hostReadyRef.current) return null;
+      const epoch = queuedEpoch, token = ++workspaceToken.current;
+      publishWorkspaceState(beginWorkspaceRequest(workspaceStateRef.current, token, 'saving', change));
+      try {
+        let current = workspaceRef.current;
+        if (!current) {
+          const read = await window.flowmate.readWorkspace();
+          if (!read.ok || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
+          current = read.data;
+        }
+        const result = await operation(current);
+        if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
+        if (!result.ok) {
+          const status = result.error.code === 'state_conflict' ? 'conflict'
+            : result.error.code === 'operation_result_unknown' ? 'unknown' : 'error';
+          publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token, errorMessage(result), status));
+          setNotice({ tone: 'bad', message: errorMessage(result) });
+          if (status === 'conflict' || status === 'unknown') {
+            const read = await window.flowmate.readWorkspace();
+            if (read.ok) acceptWorkspace(read.data, epoch, token);
+          }
+          return null;
+        }
+        return acceptWorkspace(result.data.workspace, epoch, token) ? result.data : null;
+      } catch {
+        publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token,
+          'The workspace write receipt is unknown. Refresh to read the saved selection.', 'unknown'));
+        // A lost write receipt is recovered by reading facts, never by repeating the write.
+        try { const read = await window.flowmate.readWorkspace(); if (read.ok) acceptWorkspace(read.data, epoch, token); } catch { /* keep unknown */ }
         return null;
       }
-      acceptWorkspace(result.data);
-      return result.data;
+    }).finally(() => {
+      workspacePendingRef.current--;
+      setWorkspacePending(workspacePendingRef.current);
     });
     workspaceChanges.current = update.then(() => undefined, () => undefined);
     return update;
   }
 
   async function loadProductOverview() {
-    await Promise.all([loadWorkspace(), loadProductLists()]);
+    await loadWorkspace();
+    await loadProductLists();
+  }
+
+  function materialReadError(result: Result<unknown>) {
+    return !result.ok && result.error.code === 'host_protocol_invalid'
+      ? 'The invoice material changed. Refresh the workspace.' : errorMessage(result);
   }
 
   async function loadDocumentMaterial(documentId: number, generation = ++documentReadGeneration.current) {
-    const [page, original] = await Promise.all([
-      window.flowmate.readDocumentPage({ documentId, page: 1, afterBlockId: null, limit: 50 }),
+    const epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken, basis = workspaceRef.current;
+    const lease = { generation, epoch, token }; materialReadLease.current = lease;
+    workspaceDetailsToReload.current.material = false;
+    setMaterialLoading(true); setMaterialError(null);
+    try {
+    const [document, index, original] = await Promise.all([
+      window.flowmate.queryDocument(documentId),
+      window.flowmate.listDocumentPages({ documentId }),
       window.flowmate.readDocumentOriginal(documentId, 1),
     ]);
-    if (generation !== documentReadGeneration.current) return;
-    if (page.ok) setParsedPage(page.data);
-    else { setParsedPage(null); setNotice({ tone: 'bad', message: errorMessage(page) }); }
+    if (generation !== documentReadGeneration.current || epoch !== workspaceHostEpoch.current
+      || token !== workspaceStateRef.current.requestToken || !sameWorkspaceBasis(basis, workspaceRef.current)) return;
+    if (!document.ok) { setMaterialError(materialReadError(document)); return; }
+    const expected = document.data;
+    const sameDocument = (reference: DocumentSnapshot['documentRef']) => reference.id === expected.documentRef.id && reference.version === expected.documentRef.version;
+    if (expected.documentRef.id !== documentId || basis?.documentRef?.id === documentId && !sameDocument(basis.documentRef)
+      || index.ok && (!sameDocument(index.data.documentRef) || index.data.parsedArtifactId !== expected.parsedArtifactId)
+      || original.ok && !sameDocument(original.data.documentRef)) {
+      setMaterialError('The invoice material changed. Refresh the workspace.'); return;
+    }
+    if (!index.ok) { setMaterialError(materialReadError(index)); return; }
+    if (!original.ok && original.error.code === 'host_protocol_invalid') { setMaterialError(materialReadError(original)); return; }
+    const wantedPage = basis?.selection?.kind === 'source' ? basis.selection.page : undefined;
+    const pageNumber = wantedPage && index.data.pages.some(page => page.page === wantedPage)
+      ? wantedPage : index.data.pages[0]?.page;
+    if (pageNumber === undefined) { setParsedIndex(index.data); setParsedPage(null); if (original.ok) setOriginalImage(original.data); return; }
+    const page = await window.flowmate.readDocumentPage({ documentId, page: pageNumber, afterBlockId: null, limit: 50 });
+    if (generation !== documentReadGeneration.current || epoch !== workspaceHostEpoch.current
+      || token !== workspaceStateRef.current.requestToken || !sameWorkspaceBasis(basis, workspaceRef.current)) return;
+    setMaterialLoading(false);
+    if (!page.ok) { setMaterialError(materialReadError(page)); return; }
+    if (!sameDocument(page.data.documentRef) || page.data.parsedArtifactId !== expected.parsedArtifactId || page.data.page !== pageNumber) {
+      setMaterialError('The invoice material changed. Refresh the workspace.'); return;
+    }
+    setParsedIndex(index.data); setParsedPage(page.data);
     if (original.ok) setOriginalImage(original.data);
-    else setOriginalImage(null);
+    else { setOriginalImage(null); setMaterialError(materialReadError(original)); }
+    } catch {
+      if (materialReadLease.current === lease) setMaterialError('Invoice material could not be loaded. Refresh to try again.');
+    } finally {
+      if (materialReadLease.current === lease) { materialReadLease.current = null; setMaterialLoading(false); }
+    }
+  }
+
+  async function readParsedPage(pageNumber: number, more = false) {
+    const basis = workspaceRef.current;
+    if (!basis?.documentRef) return;
+    const previous = parsedPage;
+    const expected = workspaceDocument;
+    const sameDocument = (reference: DocumentSnapshot['documentRef']) => reference.id === basis.documentRef!.id && reference.version === basis.documentRef!.version;
+    if (!expected || !sameDocument(expected.documentRef) || more && (!previous || !sameDocument(previous.documentRef)
+      || previous.parsedArtifactId !== expected.parsedArtifactId || previous.page !== pageNumber || !previous.nextAfterBlockId)) {
+      setMaterialError('The invoice material changed. Refresh the workspace.'); return;
+    }
+    const generation = ++documentReadGeneration.current, epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
+    const lease = { generation, epoch, token }; materialReadLease.current = lease;
+    workspaceDetailsToReload.current.material = false;
+    setMaterialLoading(true); setMaterialError(null);
+    try {
+      const result = await window.flowmate.readDocumentPage({ documentId: basis.documentRef.id, page: pageNumber,
+        afterBlockId: more ? previous?.nextAfterBlockId ?? null : null, limit: 50 });
+      if (generation !== documentReadGeneration.current || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken
+        || !sameWorkspaceBasis(basis, workspaceRef.current)) return;
+      setMaterialLoading(false);
+      if (!result.ok) { setMaterialError(materialReadError(result)); return; }
+      if (!sameDocument(result.data.documentRef) || result.data.parsedArtifactId !== expected.parsedArtifactId || result.data.page !== pageNumber
+        || more && previous && result.data.blocks.some(block => previous.blocks.some(prior => prior.id === block.id))) {
+        setMaterialError('The invoice material changed. Refresh the workspace.'); return;
+      }
+      setParsedPage(more && previous
+        ? { ...result.data, blocks: [...previous.blocks, ...result.data.blocks] } : result.data);
+    } catch {
+      if (generation === documentReadGeneration.current && epoch === workspaceHostEpoch.current && token === workspaceStateRef.current.requestToken) {
+        setMaterialLoading(false); setMaterialError('The parsed page could not be loaded. Retry the page or refresh the workspace.');
+      }
+    } finally {
+      if (materialReadLease.current === lease) { materialReadLease.current = null; setMaterialLoading(false); }
+    }
+  }
+
+  async function loadWorkspaceCandidate() {
+    const basis = workspaceRef.current;
+    const generation = ++workspaceCandidateGeneration.current, epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
+    const lease = { generation, epoch, token }; candidateReadLease.current = lease;
+    workspaceDetailsToReload.current.candidate = false;
+    if (!basis?.jobId || !basis.candidateRef) { candidateReadLease.current = null; setWorkspaceCandidate(null); setWorkspaceCandidateLoading(false); return; }
+    setWorkspaceCandidateLoading(true); setWorkspaceCandidateError(null);
+    try {
+      const result = await window.flowmate.queryJobCandidate({ jobId: basis.jobId, candidateId: basis.candidateRef.id });
+      if (generation !== workspaceCandidateGeneration.current || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken
+        || !sameWorkspaceBasis(basis, workspaceRef.current)) return;
+      setWorkspaceCandidateLoading(false);
+      if (result.ok && result.data.documentRef.id === basis.documentRef?.id && result.data.documentRef.version === basis.documentRef.version
+        && result.data.candidate.jobId === basis.jobId && result.data.candidate.candidateId === basis.candidateRef.id && result.data.candidate.sequence === basis.candidateRef.sequence) {
+        setWorkspaceCandidate(result.data);
+        setCandidateDetail(result.data);
+      } else {
+        setWorkspaceCandidate(current => current && basis.documentRef && current.documentRef.id === basis.documentRef.id && current.documentRef.version === basis.documentRef.version
+          && current.candidate.jobId === basis.jobId && current.candidate.candidateId === basis.candidateRef!.id && current.candidate.sequence === basis.candidateRef!.sequence ? current : null);
+        setWorkspaceCandidateError(result.ok ? 'The saved result changed. Refresh the workspace.' : errorMessage(result));
+      }
+    } catch {
+      if (generation === workspaceCandidateGeneration.current && epoch === workspaceHostEpoch.current && token === workspaceStateRef.current.requestToken) {
+        setWorkspaceCandidateLoading(false); setWorkspaceCandidateError('The saved result could not be loaded. Refresh to try again.');
+      }
+    } finally {
+      if (candidateReadLease.current === lease) { candidateReadLease.current = null; setWorkspaceCandidateLoading(false); }
+    }
+  }
+
+  async function restoreWorkspace() {
+    if (workspacePendingRef.current) return;
+    const epoch = workspaceHostEpoch.current, token = ++workspaceToken.current;
+    publishWorkspaceState(beginWorkspaceRequest(workspaceStateRef.current, token, 'loading'));
+    try {
+      const result = await window.flowmate.restoreWorkspace();
+      if (!result.ok) {
+        const blocked = result.error.code === 'workspace_recovery_blocked' || result.error.code === 'input_unavailable';
+        publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token,
+          blocked ? 'Workspace recovery is blocked. Check access to the saved invoice material, then refresh.' : errorMessage(result),
+          blocked ? 'blocked' : result.error.code === 'operation_result_unknown' ? 'unknown' : 'error'));
+        return;
+      }
+      if (!acceptWorkspace(result.data.workspace, epoch, token)) return;
+      const snapshot = result.data.workspace;
+      // Restore the saved chat before lists can render; null is an intentional saved choice.
+      selectSession(snapshot.sessionId);
+      selectHistoryJob(snapshot.jobId);
+      await Promise.all([loadSessionList(), loadProductLists()]);
+      if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return;
+      if (snapshot.documentRef) {
+        const document = await window.flowmate.queryDocument(snapshot.documentRef.id);
+        if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return;
+        if (document.ok) setHistoricalDocuments(current => ({ ...current, [document.data.documentRef.id]: document.data }));
+        await loadDocumentMaterial(snapshot.documentRef.id);
+      }
+      if (snapshot.jobId) {
+        const job = await window.flowmate.queryJob(snapshot.jobId);
+        if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return;
+        if (job.ok) setHistoricalJobs(current => ({ ...current, [job.data.jobId]: job.data }));
+        await loadTaskDetails(snapshot.jobId);
+      }
+      await loadWorkspaceCandidate();
+    } catch {
+      publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token,
+        'Workspace recovery could not be confirmed. Refresh to try again.', 'error'));
+    }
+  }
+
+  async function selectWorkspaceSource(source: SourceRef) {
+    const snapshot = await changeWorkspace({ kind: 'selection', selection: { formatVersion: 1, kind: 'source', target: 'document',
+      targetId: source.documentId, targetVersion: source.version, artifactId: source.artifactId, page: source.page,
+      ...(source.blockId ? { block: source.blockId } : {}) } });
+    if (!snapshot) return;
+    // Local navigation reveals the chosen evidence without adding a second persistent view write.
+    setLocalWorkspaceView('parsed');
+    await readParsedPage(source.page);
   }
 
   async function importInvoice() {
@@ -940,6 +1212,7 @@ export function App() {
   }
 
   async function startTask() {
+    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
     if (!await confirmFormLeave()) return;
     let current = workspaceRef.current;
     if (!current?.documentRef) return;
@@ -949,37 +1222,34 @@ export function App() {
       current = workspaceRef.current;
     }
     if (!current?.documentRef || !current.sessionId) return;
-    const result = await window.flowmate.startTask({
+    const result = await mutateWorkspace(current => window.flowmate.startTask({
       clientSequence: current.nextTaskSequence,
       expectedRevision: current.revision,
-      documentRef: current.documentRef,
+      documentRef: current.documentRef!,
       goal: `Prepare an invoice candidate from this document.${taskGoal.trim() ? ` Additional requirements: ${taskGoal.trim()}` : ''}`,
-    });
-    if (!result.ok) {
-      if (result.error.code === 'state_conflict') await loadWorkspace();
-      setNotice({ tone: 'bad', message: errorMessage(result) });
-      return;
-    }
-    acceptWorkspace(result.data.workspace);
-    selectHistoryJob(result.data.job.jobId);
+    }));
+    if (!result) return;
+    selectHistoryJob(result.job.jobId);
     setGoalMode('save-candidate');
     updateChatInput('Generate and save a result for this invoice using its parsed data and source references. Keep missing or ambiguous details explicit.');
     setChatCollapsed(false);
     setNotice({ tone: 'good', message: 'Ready to process. Review the request in Assistant, then press Send.' });
     await loadProductLists();
-    await loadTaskDetails(result.data.job.jobId);
+    await loadTaskDetails(result.job.jobId);
   }
 
   async function loadTaskDetails(jobId: number) {
     const generation = taskDetailsGeneration.current;
-    const documentId = workspaceRef.current?.documentRef?.id ?? null;
+    const basis = workspaceRef.current, epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
+    const documentId = basis?.documentRef?.id ?? null;
     const selectedJob = historyJobIdRef.current ?? workspaceRef.current?.jobId;
     if (selectedJob !== jobId) return;
     const [candidatesResult, activityResult] = await Promise.all([
       window.flowmate.listJobCandidates({ jobId, limit: 50 }),
       window.flowmate.listActivity({ jobId, limit: 50 }),
     ]);
-    if (generation !== taskDetailsGeneration.current || documentId !== (workspaceRef.current?.documentRef?.id ?? null)
+    if (generation !== taskDetailsGeneration.current || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken
+      || !sameWorkspaceBasis(basis, workspaceRef.current) || documentId !== (workspaceRef.current?.documentRef?.id ?? null)
       || jobId !== (historyJobIdRef.current ?? workspaceRef.current?.jobId)) return;
     if (candidatesResult.ok) setCandidateSummaries(candidatesResult.data.items);
     else setNotice({ tone: 'bad', message: errorMessage(candidatesResult) });
@@ -990,27 +1260,27 @@ export function App() {
   async function openCandidate(jobId: number, candidateId: number) {
     if (candidateDetail?.candidate.candidateId !== candidateId && !await confirmFormLeave()) return;
     const sequence = ++candidateQuerySequence.current;
+    const basis = workspaceRef.current, epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
     const result = await window.flowmate.queryJobCandidate({ jobId, candidateId });
-    if (sequence !== candidateQuerySequence.current) return;
+    if (sequence !== candidateQuerySequence.current || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken
+      || !sameWorkspaceBasis(basis, workspaceRef.current)) return;
     if (result.ok) setCandidateDetail(result.data);
     else setNotice({ tone: 'bad', message: errorMessage(result) });
   }
 
   async function selectCandidate(jobId: number, candidateId: number) {
     if (!await confirmFormLeave()) return;
-    const current = workspaceRef.current;
-    if (!current) return;
-    const result = await window.flowmate.selectCandidate({
+    const result = await mutateWorkspace(current => window.flowmate.selectCandidate({
       jobId,
       candidateId,
       expectedCandidateId: jobs.find((job) => job.jobId === jobId)?.currentCandidateId ?? null,
       expectedRevision: current.revision,
-    });
-    if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-    acceptWorkspace(result.data.workspace);
+    }));
+    if (!result) return;
     setNotice({ tone: 'good', message: 'Selected result updated.' });
     await loadProductLists();
     await loadTaskDetails(jobId);
+    await loadWorkspaceCandidate();
   }
 
   async function openJob(jobId: number) {
@@ -1255,8 +1525,8 @@ export function App() {
     setHistoryError(null);
     setRunFeedbacks([]);
     setNotice(null);
+    if (workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
     if (sessionId !== null) {
-      if (workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
       void loadSession(sessionId);
     }
   }
@@ -1570,13 +1840,17 @@ export function App() {
   useEffect(() => {
     if (state?.ready) {
       void loadNativeTools();
-      void loadWorkspace().then((snapshot) => {
-        if (!snapshot) return;
-        void loadSessionList();
-        void loadProductLists();
-      });
+      void restoreWorkspace();
     }
   }, [state?.ready]);
+
+  useEffect(() => {
+    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current
+      || page !== 'workspace' && page !== 'workspace-detail') return;
+    const reload = workspaceDetailsToReload.current;
+    if (reload.material && workspaceRef.current?.documentRef) void loadDocumentMaterial(workspaceRef.current.documentRef.id);
+    if (reload.candidate) void loadWorkspaceCandidate();
+  }, [workspaceState.requestToken, workspaceState.status, workspacePending, page]);
 
   useEffect(() => {
     const transcript = chatTranscriptRef.current;
@@ -1631,14 +1905,16 @@ export function App() {
   const runtimeStatus = <div data-testid="runtime-feedback"><p role="status">{runtimeFeedback}</p>
     <button className="text-button" onClick={() => void refreshRuntimeState()} disabled={!state?.ready || busy}>Check runtime status</button></div>;
   const canTest = Boolean(modelReady && runtimeReady && !busy && !saving);
+  const dependentReady = workspaceReady(workspaceState) && workspacePending === 0;
+  const canNewChatAndSend = Boolean(dependentReady && modelReady && runtimeReady && !busy && !sessionLoading && !sessionMutating && !inputSubmitting);
   const inputEnabled = true;
   const selectedForSend = selectedSession ?? sessions.find((item) => item.sessionId === selectedSessionId) ?? null;
-  const canChat = Boolean(modelReady && runtimeReady && !busy && !sessionLoading && !sessionMutating && !historyLoading && !historyError
+  const canChat = Boolean(dependentReady && modelReady && runtimeReady && !busy && !sessionLoading && !sessionMutating && !historyLoading && !historyError
     && !inputSubmitting && !unknownInput
     && (selectedSessionId === null || selectedForSend?.availability === 'ready' && !selectedForSend.modelUseBlocked
       && !selectedForSend.deletePending && selectedForSend.status === 'active' && selectedForSend.historyState === 'recoverable')
     && (goalMode !== 'save-candidate' || (workspace?.documentRef && workspace.jobId)));
-  const canAppend = Boolean(state?.ready && busy && activeAgentRunId !== null && activeAgentSessionId === selectedSessionId
+  const canAppend = Boolean(dependentReady && state?.ready && busy && activeAgentRunId !== null && activeAgentSessionId === selectedSessionId
     && !cancelPending && !agentStopRequested.current && !inputSubmitting && !unknownInput && !sessionMutating && !historyError
     && selectedForSend?.status === 'active' && !selectedForSend.deletePending && !selectedForSend.modelUseBlocked
     && selectedForSend.historyState === 'recoverable' && !(invoiceForm?.runId === activeAgentRunId));
@@ -1650,8 +1926,9 @@ export function App() {
     material: !targetRun ? 'Checking original material…' : targetRun.config.workspaceContext === undefined
       || targetWorkspace?.success && targetDocument === null ? 'General conversation'
       : targetDocument ? documents.find(item => item.documentRef.id === targetDocument.id
-        && item.documentRef.version === targetDocument.version)?.displayName ?? `Invoice ${targetDocument.id}`
+        && item.documentRef.version === targetDocument.version)?.displayName ?? 'Original invoice'
         : 'Original material could not be verified.',
+    selection: targetWorkspace?.success ? selectionLabel(targetWorkspace.data.selection) : null,
   } : null;
   useEffect(() => {
     if (activeAgentRunId === null || activeAgentSessionId !== selectedSessionId
@@ -1816,7 +2093,9 @@ export function App() {
     await loadRun(accepted.data.runId);
   }
 
-  async function sendChatMessage(override?: { sessionId: number; prompt: string }) {
+  async function sendChatMessage(override?: { sessionId: number; prompt: string; scene: WorkspaceSnapshot; hostEpoch: number; detached: boolean }) {
+    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
+    const sendEpoch = override?.hostEpoch ?? workspaceHostEpoch.current;
     const submittedDraft = override?.prompt ?? chatInputRef.current;
     const prompt = submittedDraft.trim();
     let sessionId = override?.sessionId ?? selectedSessionIdRef.current;
@@ -1825,6 +2104,9 @@ export function App() {
     if ((!canChat && !override) || !modelReady || busy || !selectedModelId || !model || !prompt || inputSubmittingRef.current) return;
     const limits = parseRuntimeLimits(nextRuntimeDraft);
     if (!limits.success) { setNotice({ tone: 'bad', message: 'Run limits must be within the displayed ranges.' }); return; }
+    if (override?.detached && (goalMode !== 'answer' || directory || (limits.data.budget?.maxToolCalls ?? 0) > 0)) {
+      setNotice({ tone: 'bad', message: 'Open the new chat and review its context and Run limits before sending. Your draft is preserved.' }); return;
+    }
     inputSubmittingRef.current = true;
     setInputSubmitting(true);
     try {
@@ -1835,6 +2117,9 @@ export function App() {
       setNotice({ tone: 'bad', message: runtimeMessage(actualRuntime, !actualRuntime, hostReadyRef.current) });
       return;
     }
+    if (sendEpoch !== workspaceHostEpoch.current || !workspaceReady(workspaceStateRef.current)) {
+      setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
+    }
     setNotice({ tone: 'info', message: 'Preparing your request…' });
     if (sessionId === null) {
       const created = await createNewSession(true);
@@ -1842,7 +2127,14 @@ export function App() {
       sessionId = created.sessionId;
     }
     let current = workspaceRef.current ?? await loadWorkspace();
-    if (current && current.sessionId !== sessionId) current = await changeWorkspace({ kind: 'session', sessionId });
+    if (sendEpoch !== workspaceHostEpoch.current || !workspaceReady(workspaceStateRef.current)) {
+      setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
+    }
+    if (override && (override.hostEpoch !== workspaceHostEpoch.current || !current || current.revision !== override.scene.revision
+      || !sameWorkspaceBasis(current, override.scene))) {
+      setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
+    }
+    if (!override?.detached && current && current.sessionId !== sessionId) current = await changeWorkspace({ kind: 'session', sessionId });
     if (!current) { setBusy(false); return; }
     const sequence = await window.flowmate.querySessionInput({ sessionId });
     if (!sequence.ok || sequence.data.nextClientSequence === null) {
@@ -1851,6 +2143,10 @@ export function App() {
       return;
     }
     const clientSequence = sequence.data.nextClientSequence;
+    if (sendEpoch !== workspaceHostEpoch.current || !workspaceReady(workspaceStateRef.current) || workspacePendingRef.current
+      || workspaceRef.current?.revision !== current.revision || !sameWorkspaceBasis(workspaceRef.current, current)) {
+      setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
+    }
     const turnId = newId();
     const newTurn: ChatTurn = { id: turnId, sessionId, runId: null, clientSequence, prompt, response: null, error: null, status: 'sending' };
     activeChatTurnId.current = turnId;
@@ -1877,13 +2173,13 @@ export function App() {
       mode: 'prompt',
       text: prompt,
       modelId: model.id,
-      workspace: {
+      ...(!override?.detached ? { workspace: {
         revision: current.revision,
         documentRef: current.documentRef,
         jobId: current.jobId,
         candidateRef: current.candidateRef,
         sessionId,
-      },
+      } } : {}),
       goalMode,
       ...(directory ? { workingDirectory: directory } : {}),
     };
@@ -1953,6 +2249,7 @@ export function App() {
   }
 
   async function appendChatInput(mode: 'steer' | 'followUp') {
+    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
     const sessionId = selectedSessionIdRef.current;
     const runId = activeAgentRunIdRef.current;
     const submittedDraft = chatInputRef.current;
@@ -1973,6 +2270,7 @@ export function App() {
       if (originalRun.data.runId === runId && originalRun.data.sessionId === sessionId) setRun(originalRun.data);
       const clientSequence = sequence.data.nextClientSequence;
       const current = workspaceRef.current;
+      if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
       const hasWorkspace = originalRun.data.config.workspaceContext !== undefined;
       if (hasWorkspace && (!current || current.sessionId !== sessionId)) {
         setNotice({ tone: 'bad', message: 'Select this Run’s invoice context before adding an input. Your draft is preserved.' }); return;
@@ -2006,6 +2304,7 @@ export function App() {
       const result = await window.flowmate.setSessionStatus({ sessionId, expectedStatus: session.status, status });
       if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
       setSessions(items => items.map(item => item.sessionId === sessionId ? result.data : item));
+      await loadWorkspace();
       if (selectedSessionIdRef.current === sessionId) {
         sessionLoadSequence.current += 1;
         setSelectedSession(result.data);
@@ -2042,9 +2341,24 @@ export function App() {
   async function newChatAndSend() {
     const prompt = chatInputRef.current.trim();
     if (!prompt || !runtimeReady || busy) return;
+    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
+    const epoch = workspaceHostEpoch.current;
+    const initial = workspaceRef.current;
     const created = await createNewSession(true);
     if (!created) return;
-    await sendChatMessage({ sessionId: created.sessionId, prompt });
+    // A create may have queued its own selection and the user's later selection.
+    // Wait for those facts, without repeating either write or replacing the later choice.
+    while (workspacePendingRef.current && epoch === workspaceHostEpoch.current) await workspaceChanges.current;
+    const scene = workspaceRef.current;
+    if (epoch !== workspaceHostEpoch.current || !workspaceReady(workspaceStateRef.current) || !scene) return;
+    const detached = selectedSessionIdRef.current !== created.sessionId || scene.sessionId !== created.sessionId;
+    const sameBusiness = initial?.documentRef?.id === scene.documentRef?.id && initial?.documentRef?.version === scene.documentRef?.version
+      && initial?.jobId === scene.jobId && initial?.candidateRef?.id === scene.candidateRef?.id && initial?.candidateRef?.sequence === scene.candidateRef?.sequence;
+    if (!sameBusiness || initial?.activeView !== scene.activeView || !sameWorkspaceSelection(initial?.selection ?? null, scene.selection)
+      || detached && (scene.documentRef || scene.jobId || scene.candidateRef || scene.selection || workingDirectory)) {
+      setNotice({ tone: 'info', message: 'The invoice context changed. Open the new chat and review its draft before sending.' }); return;
+    }
+    await sendChatMessage({ sessionId: created.sessionId, prompt, scene, hostEpoch: epoch, detached });
   }
 
   function applyAgentFinish(event: Extract<AgentRunEvent, { type: 'run_finished' }>, turnId: string) {
@@ -2124,6 +2438,31 @@ export function App() {
     setNotice({ tone: 'good', message: 'Model profile removed.' });
   }
 
+  const workspaceDocument = documents.find(item => item.documentRef.id === workspace?.documentRef?.id
+    && item.documentRef.version === workspace.documentRef.version)
+    ?? (workspace?.documentRef && historicalDocuments[workspace.documentRef.id]?.documentRef.version === workspace.documentRef.version
+      ? historicalDocuments[workspace.documentRef.id]! : null);
+  const workspaceParsed = parsedPage && parsedPage.documentRef.id === workspace?.documentRef?.id
+    && parsedPage.documentRef.version === workspace.documentRef.version && parsedPage.parsedArtifactId === workspaceDocument?.parsedArtifactId ? parsedPage : null;
+  const workspaceOriginal = originalImage && originalImage.documentRef.id === workspace?.documentRef?.id
+    && originalImage.documentRef.version === workspace.documentRef.version ? originalImage : null;
+  const workspaceIndex = parsedIndex && parsedIndex.documentRef.id === workspace?.documentRef?.id
+    && parsedIndex.documentRef.version === workspace.documentRef.version && parsedIndex.parsedArtifactId === workspaceDocument?.parsedArtifactId ? parsedIndex : null;
+
+  const invoiceFormControls = invoiceForm || candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId ? <>
+              {candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId && candidateDetail.candidate.status !== 'accepted' && <div className="button-row"><button className="secondary-button" disabled={!dependentReady || !runtimeReady || !modelReady || busy || formPreparing || formSubmitting || formOutcomeUnknown || humanOperationUnknown || invoiceForm?.dirty || !workspace?.sessionId || candidateDetail.candidate.status !== 'generated'}
+                onClick={() => void fillInvoiceForm()}>Fill form</button>
+                <button className="secondary-button" disabled={!dependentReady || !runtimeReady || busy || formPreparing || formSubmitting}
+                  onClick={() => void beginEditInvoiceForm()}>Edit result</button></div>}
+              {invoiceForm && <InvoiceFormEditor state={invoiceForm} feedback={formFeedback} disabled={!dependentReady || !invoiceForm.valid || busy || formPreparing || formSubmitting}
+                onChange={changeInvoiceFormDraft} onDiscard={() => void discardForm()} onQuery={() => void checkFillStatus()}
+                canQuery={invoiceForm.runId !== null || pendingFill.current !== null} canDiscard={!busy && !formPreparing && !formSubmitting}
+                operationUnknown={humanOperationUnknown} onSave={() => void saveInvoiceResult()} onAccept={() => void decideInvoiceResult('accept')} onReject={() => void decideInvoiceResult('reject')} />}
+              {candidateDetail?.candidate.status === 'accepted' && <div className="button-row">{(['json', 'csv', 'markdown'] as const).map(format =>
+                <button key={format} className="secondary-button" disabled={formSubmitting || humanOperationUnknown} onClick={() => void exportInvoiceResult(format)}>Export {format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>)}</div>}
+              <button className="text-button" disabled={formSubmitting} onClick={() => void checkHumanOperation()}>Check original operation</button>
+            </> : null;
+
   return (
     <div className={`desktop-shell theme-${profileDraft.theme} ${chatCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''}`}>
       {rejectPrompt && <div role="dialog" aria-modal="true" aria-label="Reject invoice result"
@@ -2159,6 +2498,7 @@ export function App() {
           <span className="rail-caption">WORK</span>
           {([
             ['workspace', 'Invoices', '▧'],
+            ['workspace-detail', 'Workspace', '▦'],
             ['tasks', 'Processing History', '☷'],
             ['chats', 'Chats', '◌'],
             ['activity', 'Activity', '≋'],
@@ -2218,7 +2558,7 @@ export function App() {
         </header>
 
         {page === 'workspace' ? (
-          <WorkspacePage
+          <InvoicesPage
             workspace={workspace}
             documents={documents}
             historicalDocument={historicalInvoice}
@@ -2226,19 +2566,8 @@ export function App() {
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
             onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)}
-            formControls={invoiceForm || candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId ? <>
-              {candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId && candidateDetail.candidate.status !== 'accepted' && <div className="button-row"><button className="secondary-button" disabled={!runtimeReady || !modelReady || busy || formPreparing || formSubmitting || formOutcomeUnknown || humanOperationUnknown || invoiceForm?.dirty || !workspace?.sessionId || candidateDetail.candidate.status !== 'generated'}
-                onClick={() => void fillInvoiceForm()}>Fill form</button>
-                <button className="secondary-button" disabled={!runtimeReady || busy || formPreparing || formSubmitting}
-                  onClick={() => void beginEditInvoiceForm()}>Edit result</button></div>}
-              {invoiceForm && <InvoiceFormEditor state={invoiceForm} feedback={formFeedback} disabled={!invoiceForm.valid || busy || formPreparing || formSubmitting}
-                onChange={changeInvoiceFormDraft} onDiscard={() => void discardForm()} onQuery={() => void checkFillStatus()}
-                canQuery={invoiceForm.runId !== null || pendingFill.current !== null} canDiscard={!busy && !formPreparing && !formSubmitting}
-                operationUnknown={humanOperationUnknown} onSave={() => void saveInvoiceResult()} onAccept={() => void decideInvoiceResult('accept')} onReject={() => void decideInvoiceResult('reject')} />}
-              {candidateDetail?.candidate.status === 'accepted' && <div className="button-row">{(['json', 'csv', 'markdown'] as const).map(format =>
-                <button key={format} className="secondary-button" disabled={formSubmitting || humanOperationUnknown} onClick={() => void exportInvoiceResult(format)}>Export {format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>)}</div>}
-              <button className="text-button" disabled={formSubmitting} onClick={() => void checkHumanOperation()}>Check original operation</button>
-            </> : null}
+            formControls={invoiceFormControls}
+            dependentReady={dependentReady}
             taskGoal={taskGoal}
             parsedPage={parsedPage}
             originalImage={originalImage}
@@ -2255,6 +2584,23 @@ export function App() {
             onRevokeModelAccess={() => void revokeModelAccess()}
             revokingAccess={revokingAccess}
           />
+        ) : page === 'workspace-detail' ? (
+          <WorkspacePage workspace={workspace} state={workspaceState}
+            document={workspaceDocument}
+            job={jobs.find(item => item.jobId === workspace?.jobId) ?? (workspace?.jobId ? historicalJobs[workspace.jobId] ?? null : null)}
+            chatName={selectedSession?.title ?? sessions.find(item => item.sessionId === workspace?.sessionId)?.title ?? null}
+            candidate={workspaceCandidate ?? candidateDetail} candidateLoading={workspaceCandidateLoading} candidateError={workspaceCandidateError}
+            parsedPage={workspaceParsed} original={workspaceOriginal} materialLoading={materialLoading} materialError={materialError}
+            pages={workspaceIndex?.pages.map(page => page.page) ?? []}
+            originalPageSelectable={!!workspaceIndex?.pages.some(page => page.page === 1)} view={localWorkspaceView ?? workspace?.activeView ?? 'original'}
+            dependentReady={dependentReady} formControls={invoiceFormControls}
+            onRefresh={() => void restoreWorkspace()}
+            onView={view => { setLocalWorkspaceView(null); void changeWorkspace({ kind: 'view', view }); }}
+            onPage={number => void readParsedPage(number)}
+            onMoreBlocks={() => parsedPage && void readParsedPage(parsedPage.page, true)}
+            onSelection={selection => void changeWorkspace({ kind: 'selection', selection })}
+            onSource={source => void selectWorkspaceSource(source)}
+            onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)} />
         ) : page === 'tasks' ? (
           <TasksPage
             workspace={workspace}
@@ -2415,6 +2761,7 @@ export function App() {
         selectedSessionId={selectedSessionId}
         selectedSession={selectedSession}
         hasOlderRuns={selectedSession?.historyState === 'legacy-read-only' ? runCursor !== null : messageCursor !== null}
+        canNewChatAndSend={canNewChatAndSend}
         onNewChatAndSend={() => void newChatAndSend()}
         onLoadOlderRuns={() => void loadOlderRuns()}
         turns={chatTurns}
@@ -2458,7 +2805,9 @@ export function App() {
         selectedModelId={selectedModelId}
         modelName={persistedModel?.name ?? null}
         modelId={persistedModel?.model ?? null}
-        contextName={documents.find((item) => item.documentRef.id === workspace?.documentRef?.id)?.displayName ?? null}
+        contextName={workspace?.documentRef ? [documents.find(item => item.documentRef.id === workspace.documentRef!.id)?.displayName ?? 'Selected invoice',
+          workspace.jobId ? 'Processing task selected' : null, workspace.candidateRef ? `Result ${workspace.candidateRef.sequence}` : null,
+          selectionLabel(workspace.selection)].filter(Boolean).join(' · ') : null}
         goalMode={goalMode}
         canGenerate={Boolean(workspace?.documentRef && workspace.jobId)}
         onGoalModeChange={setGoalMode}
@@ -2568,7 +2917,7 @@ function ChatsPage({ sessions, selectedSessionId, activeSessionId, managementBlo
   </section>;
 }
 
-function WorkspacePage(props: {
+function InvoicesPage(props: {
   workspace: WorkspaceSnapshot | null;
   documents: readonly DocumentSnapshot[];
   historicalDocument: DocumentSnapshot | null;
@@ -2576,6 +2925,7 @@ function WorkspacePage(props: {
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
   formControls: ReactNode;
+  dependentReady: boolean;
   onSelectCandidate(jobId: number, candidateId: number): void;
   taskGoal: string;
   parsedPage: InvoiceToolOutput<'read_invoice_document'> | null;
@@ -2645,7 +2995,7 @@ function WorkspacePage(props: {
     {!historical && <section className="panel invoice-process">
       <div className="panel-head"><div><h2>Process this invoice</h2><p className="invoice-subtitle">Prepare a result from the parsed content. The model starts only when you press Send.</p></div></div>
       <details><summary>Additional requirements</summary><label className="field full"><span>What else should the assistant consider?</span><textarea value={taskGoal} onChange={(event) => props.onTaskGoalChange(event.target.value)} maxLength={3500} rows={3} placeholder="Optional instructions for this invoice" /></label></details>
-      <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!workspace?.documentRef} onClick={props.onStartTask}>Process this invoice</button></div>
+      <div className="config-actions"><span className="action-spacer" /><button className="primary-button" disabled={!props.dependentReady || !workspace?.documentRef} onClick={props.onStartTask}>Process this invoice</button></div>
     </section>}
     <footer className="page-footer"><span>The original is for your review. Assistant uses registered parsed content and source references.</span></footer>
   </section>;
@@ -2784,6 +3134,7 @@ function AgentChatPanel({
   selectedSessionId,
   selectedSession,
   hasOlderRuns,
+  canNewChatAndSend,
   onNewChatAndSend,
   onLoadOlderRuns,
   turns,
@@ -2830,6 +3181,7 @@ function AgentChatPanel({
   selectedSessionId: number | null;
   selectedSession: SessionSnapshot | null;
   hasOlderRuns: boolean;
+  canNewChatAndSend: boolean;
   onNewChatAndSend(): void;
   onLoadOlderRuns(): void;
   turns: readonly ChatTurn[];
@@ -2861,7 +3213,7 @@ function AgentChatPanel({
   activeAgentRunId: number | null;
   activeAgentSessionId: number | null;
   activeRunModel: { id: string; name: string; model: string } | null;
-  activeInputTarget: { runId: number; material: string } | null;
+  activeInputTarget: { runId: number; material: string; selection: string | null } | null;
   selectedModelId: string | null;
   modelName: string | null;
   modelId: string | null;
@@ -2952,10 +3304,10 @@ function AgentChatPanel({
     {unknownInput && <div className="chat-save-feedback" role="status">The original input receipt is unknown. Your draft is preserved.
       <button className="text-button" type="button" onClick={onCheckInputStatus}>Check input status</button></div>}
     <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend(); }}>
-      <div className="chat-context">{activeInputTarget ? `Run ${activeInputTarget.runId} · ${activeInputTarget.material}`
+      <div className="chat-context">{activeInputTarget ? `Responding to ${activeInputTarget.material}${activeInputTarget.selection && activeInputTarget.selection !== 'No selection' ? ` · ${activeInputTarget.selection}` : ''}`
         : contextName ? `Working with ${contextName}` : 'General conversation'}</div>
       {sessionHint && <p className="chat-config-hint">{sessionHint}</p>}
-      {(selectedSession?.historyState === 'legacy-read-only' || selectedSession?.historyState === 'invalid') && input.trim() && <button className="secondary-button" type="button" onClick={onNewChatAndSend}>New chat and send</button>}
+      {(selectedSession?.historyState === 'legacy-read-only' || selectedSession?.historyState === 'invalid') && input.trim() && <button className="secondary-button" type="button" disabled={!canNewChatAndSend} onClick={onNewChatAndSend}>New chat and send</button>}
       {canGenerate && <button className={`generate-toggle ${goalMode === 'save-candidate' ? 'selected' : ''}`} type="button" aria-pressed={goalMode === 'save-candidate'} onClick={() => onGoalModeChange(goalMode === 'save-candidate' ? 'answer' : 'save-candidate')}>Generate result {goalMode === 'save-candidate' ? 'for next message' : ''}</button>}
       {runtimeLimits}
       <label className="sr-only" htmlFor="agent-chat-input">Message to model</label>

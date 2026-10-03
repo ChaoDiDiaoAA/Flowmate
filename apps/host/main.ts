@@ -480,6 +480,10 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.readWorkspace() });
       return;
     }
+    if (command.type === 'restore_workspace') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.restoreWorkspace() });
+      return;
+    }
     if (command.type === 'update_workspace') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.updateWorkspace(command.input) });
       return;
@@ -536,6 +540,10 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     if (command.type === 'import_invoice_material') {
       send({ version: 1, type: 'response', requestId: command.requestId,
         value: await application.importInvoiceMaterial(command.sourceDirectory) });
+      return;
+    }
+    if (command.type === 'list_document_pages') {
+      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.listDocumentPages(command.input) });
       return;
     }
     if (command.type === 'read_document_page') {

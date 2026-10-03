@@ -9,6 +9,7 @@ export * from './storage/repositories.ts';
 export * from './runtime/service.ts';
 export * from './sessions/service.ts';
 export * from './workspace/service.ts';
+export * from './workspace/verification.ts';
 export * from './jobs/service.ts';
 export * from './invoice-edit/service.ts';
 export * from './tools/recorder.ts';

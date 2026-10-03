@@ -439,6 +439,7 @@ export class PiAgentAdapter implements AgentPort {
         ...(active.input.workspaceInput ? { version: 2 as const, workspaceInput: active.input.workspaceInput } : { version: 1 as const }),
         goal: active.input.goal, text: active.input.text, messageTimestamp: active.input.messageTimestamp },
         goalMode: active.input.toolBinding ? active.goalMode : null,
+        ...(active.input.workspaceContext ? { workspaceContext: active.input.workspaceContext } : {}),
         ...(active.input.workingDirectory ? { workingDirectory: active.input.workingDirectory } : {}) } }) });
     if (view.ok) {
       try { active.observe({ type: 'display_message', message: structuredClone(view.data), ...now() }); } catch { /* display loss is repaired by querying native history */ }

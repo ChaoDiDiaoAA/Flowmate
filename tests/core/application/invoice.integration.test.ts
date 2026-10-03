@@ -1,3 +1,4 @@
+import { createTestWorkspaceVerifier, prepareTestWorkspaceVerifier } from '../../support/workspace.ts';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Database } from 'bun:sqlite';
@@ -84,7 +85,7 @@ describe('P3 Workspace and Run admission', () => {
     const opened = openTestDatabase(paths(mkdtempSync(join(tmpdir(), 'flowmate-app-invoice-'))));
     if (!opened.ok) throw new Error(opened.error.message);
     seedDocument(opened.data);
-    const workspace = new WorkspaceService(opened.data.workspace, now);
+    const workspace = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
     const jobs = new JobService(opened.data.jobs, now);
     const stubRuntime: RuntimeServicePort = {
       callProvider: async () => ({ ok: false, error: appError('unused', 'provider', 'unused', false) }),
@@ -98,6 +99,7 @@ describe('P3 Workspace and Run admission', () => {
     const productApplication = { documents: opened.data.documents, jobs: opened.data.jobs, candidates: opened.data.candidates,
       events: opened.data.businessEvents, importInvoiceMaterial: async () => opened.data.documents.get(1),
       readDocumentPage: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
+      listDocumentPages: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
       readDocumentOriginal: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }) };
     const app = makeApplication(stubRuntime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }),
       sessionService, undefined, workspace, jobs, productApplication);
@@ -153,7 +155,7 @@ describe('P3 Workspace and Run admission', () => {
         entries: [], leafId: null, unusable: false } });
     expect(native.ok).toBe(true);
     if (!native.ok) return;
-    const workspace = new WorkspaceService(opened.data.workspace, now);
+    const workspace = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
     await workspace.update({ expectedRevision: 0, change: { kind: 'document', documentId: 1 } });
     await workspace.update({ expectedRevision: 1, change: { kind: 'session', sessionId: native.data.sessionId } });
     const current = workspace.read();
@@ -164,7 +166,7 @@ describe('P3 Workspace and Run admission', () => {
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executes += 1; });
     agent.watchSession!('native-fixture', (history, context) => opened.data.sessions.saveHistory(native.data.sessionId, history, context));
     const tools = createToolExecutor({ definitions: [], recorder: createToolRecorder(opened.data.toolCalls, now), now });
-    const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools,
+    const runtime = new RuntimeService({ workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const stale = { revision: current.data.revision - 1, documentRef: current.data.documentRef, jobId: current.data.jobId,
       candidateRef: current.data.candidateRef, sessionId: native.data.sessionId };
@@ -210,10 +212,10 @@ describe('P3 Workspace and Run admission', () => {
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executions += 1; executionStarted(); });
     const toolExecutor = createToolExecutor({ definitions: [],
       recorder: createToolRecorder(opened.data.toolCalls, now), isSessionModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId), now });
-    const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools: toolExecutor,
+    const runtime = new RuntimeService({ workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools: toolExecutor,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs);
-    const workspaceService = new WorkspaceService(opened.data.workspace, now);
+    const workspaceService = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
     const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService,
       undefined, workspaceService);
     const session = await app.createSession({ expectedRevision: 0 });
@@ -265,14 +267,15 @@ function admission(kind: 'none' | 'document' | 'job', goalMode: 'answer' | 'save
   const opened = openTestDatabase(paths(mkdtempSync(join(tmpdir(), 'flowmate-scope-admission-'))));
   if (!opened.ok) throw new Error(opened.error.message);
   if (kind !== 'none') seedDocument(opened.data);
+  const verify = prepareTestWorkspaceVerifier(opened.data);
   const session = opened.data.sessions.create({ nativeSessionId: 'native-scope', title: 'Scope', at: now() });
   if (!session.ok) throw new Error(session.error.message);
   let workspace = opened.data.workspace.read(now());
   if (!workspace.ok) throw new Error(workspace.error.message);
-  workspace = opened.data.workspace.update({ expectedRevision: workspace.data.revision, change: { kind: 'session', sessionId: session.data.sessionId }, at: now() });
+  workspace = opened.data.workspace.update({ expectedRevision: workspace.data.revision, change: { kind: 'session', sessionId: session.data.sessionId }, at: now() }, verify);
   if (!workspace.ok) throw new Error(workspace.error.message);
   if (kind !== 'none') {
-    workspace = opened.data.workspace.update({ expectedRevision: workspace.data.revision, change: { kind: 'document', documentId: 1 }, at: now() });
+    workspace = opened.data.workspace.update({ expectedRevision: workspace.data.revision, change: { kind: 'document', documentId: 1 }, at: now() }, verify);
     if (!workspace.ok) throw new Error(workspace.error.message);
   }
   if (kind === 'job') {
@@ -296,7 +299,7 @@ function admission(kind: 'none' | 'document' | 'job', goalMode: 'answer' | 'save
     messageTimestamp: 1, goal: INVOICE_CHAT_GOAL, config: p3Config,
     usage: { version: 1, source: 'unknown', reason: 'request-not-finished', sdkValues: null, attempts: null,
       attemptsComplete: false, costSource: null, updatedAt: now() },
-    cleanup: { version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false }, createdAt: now() });
+    cleanup: { version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false }, createdAt: now() }, verify);
   if (!created.ok) throw new Error(created.error.message);
   return created.data;
 }
