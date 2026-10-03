@@ -207,7 +207,7 @@ export const ContextTransportEvidenceSchema = z.object({ attempt: id.max(2), pre
 export type ContextTransportEvidence = z.infer<typeof ContextTransportEvidenceSchema>;
 export const ContextApiSchema = z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/);
 export const ContextRequestEvidenceSchema = z.object({ binding: RequestContextBindingSchema, api: ContextApiSchema, boundAt: time,
-  sdkPayload: ContextSdkPayloadEvidenceSchema, transport: z.enum(['observed-fetch', 'not-observable']),
+  sdkPayload: ContextSdkPayloadEvidenceSchema.nullable(), transport: z.enum(['observed-fetch', 'not-observable']),
   attempts: z.array(ContextTransportEvidenceSchema).max(2).readonly(),
 }).strict().superRefine((value, context) => {
   if (value.transport === 'not-observable' && value.attempts.length !== 0) report(context, 'Unobserved transport cannot invent fetch attempts.');

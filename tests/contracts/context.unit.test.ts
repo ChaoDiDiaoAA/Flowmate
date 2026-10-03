@@ -191,6 +191,21 @@ describe('P8 Context strict contracts', () => {
       expect(schema('ContextSafeErrorCodeSchema').safeParse(code).success).toBe(false);
   });
 
+  it('keeps initial bound requests free of invented SDK payload observations', () => {
+    const unobserved = { ...request, sdkPayload: null, attempts: [] };
+    expect(schema('ContextRequestEvidenceSchema').safeParse(unobserved).success).toBe(true);
+    expect(schema('ContextObservationsSchema').safeParse({ version: 1, requests: [unobserved] }).success).toBe(true);
+    expect(schema('ContextRequestsResultSchema').safeParse({ ok: true, data: {
+      sessionId: 5, runId: 31, collection: 'collected', items: [unobserved], nextBeforeRequestSequence: null,
+    } }).success).toBe(true);
+    const { sdkPayload: _omitted, ...missing } = request;
+    expect(schema('ContextRequestEvidenceSchema').safeParse(missing).success).toBe(false);
+    expect(schema('ContextRequestEvidenceSchema').safeParse({ ...request,
+      sdkPayload: { observedAt: null, inclusion: 'confirmed', reason: null } }).success).toBe(false);
+    expect(schema('ContextRequestEvidenceSchema').safeParse({ ...request,
+      sdkPayload: { observedAt: at, inclusion: 'unavailable', reason: 'payload_codec_unavailable' } }).success).toBe(true);
+  });
+
   it('separates prepared entered response and transport failure facts', () => {
     const validator = schema('ContextTransportEvidenceSchema');
     expect(validator.safeParse(attempt).success).toBe(true);
