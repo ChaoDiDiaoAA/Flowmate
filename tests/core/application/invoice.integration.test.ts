@@ -39,10 +39,12 @@ function seedDocument(db: { db: Database }) {
 
 function preparedP2Agent(onPrepare: () => void, onExecute: () => void): AgentPort {
   const history = createAgentHistoryFixture(process.cwd(), now);
+  history.create('native-fixture');
   return {
     createSession: () => ok({ nativeSessionId: 'native-fixture' }),
     exportSession: history.exportSession,
     watchSession: history.watchSession,
+    restoreSessionLeaf: history.restoreSessionLeaf,
     inspect: () => ({ availability: 'ready' }),
     async prepare(nativeSessionId, receivedConfig, limits, _signal, options): Promise<ReturnType<typeof ok<PreparedAgent>>> {
       onPrepare();

@@ -1,5 +1,6 @@
 import { appError, fail, normalizeSessionInputRequest, ok, SessionMessagesPageSchema, normalizeAgentRunRequest,
   SetSessionStatusRequestSchema, BranchSessionRequestSchema, WorkspaceContextSchema } from '@flowmate/contracts';
+import { isDeepStrictEqual } from 'node:util';
 import type {
   AgentPort,
   CreateSessionRequest,
@@ -157,7 +158,19 @@ export class SessionService {
         }
         confirmed = latest.data;
       }
-      const reverted = this.agent.restoreSessionLeaf(row.data.nativeSessionId, confirmed);
+      const bundle = this.repository.loadHistoryForContext(request.sessionId);
+      let matchesPersistedHistory = false;
+      if (bundle.ok) {
+        try {
+          matchesPersistedHistory = isDeepStrictEqual(JSON.parse(JSON.stringify(bundle.data.history)), JSON.parse(JSON.stringify(confirmed)));
+        } catch { /* Unserializable history cannot confirm the persisted branch. */ }
+      }
+      if (!bundle.ok || !matchesPersistedHistory) {
+        retainBlocked = true;
+        try { await this.agent.releaseSession(row.data.nativeSessionId); } catch { /* preserve the closed management gate */ }
+        return bundle.ok ? fail(appError('context_binding_unknown', 'runtime', 'Committed branch sources could not be confirmed.')) : bundle;
+      }
+      const reverted = this.agent.restoreSessionLeaf(row.data.nativeSessionId, confirmed, bundle.data.bindings);
       if (!reverted.ok) {
         retainBlocked = true;
         this.repository.saveHistory(request.sessionId, { ...confirmed, unusable: true });
@@ -196,9 +209,7 @@ export class SessionService {
   public get(sessionId: DbId) {
     const row = this.repository.get(sessionId);
     if (!row.ok) return row;
-    const restored = ensureNativeSession(this.repository, this.agent, row.data);
-    return ok(this.project(!restored.ok && restored.error.code === 'session_history_invalid'
-      ? { ...row.data, historyState: 'invalid' } : row.data));
+    return ok(this.project(row.data));
   }
 
   public rename(request: RenameSessionRequest): Result<SessionSnapshot> {
@@ -308,19 +319,25 @@ export class SessionService {
 
 export function ensureNativeSession(repository: SessionRepository, agent: AgentPort, row: SessionRow): Result<void> {
   if (row.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'This conversation cannot continue after an interrupted request.'));
+  let availability: ReturnType<AgentPort['inspect']>['availability'];
   try {
-    if (agent.inspect(row.nativeSessionId).availability !== 'missing') return ok(undefined);
+    availability = agent.inspect(row.nativeSessionId).availability;
   } catch { return fail(appError('agent_session_unavailable', 'session', 'Conversation state is unavailable.')); }
-  if (row.historyState !== 'recoverable' || !agent.restoreSession || !agent.watchSession) {
+  if (availability === 'busy' || availability === 'unusable') return ok(undefined);
+  if (availability === 'missing' && (row.historyState !== 'recoverable' || !agent.restoreSession || !agent.watchSession)) {
     return fail(appError(row.historyState === 'invalid' ? 'session_history_invalid' : 'session_history_unavailable',
       'session', 'This conversation cannot be restored. Start a new chat.'));
   }
-  const history = repository.loadHistory(row.sessionId);
-  if (!history.ok) return history;
-  if (!history.data) return fail(appError('session_history_unavailable', 'session', 'This conversation has no saved native history.'));
-  const restored = agent.restoreSession(row.nativeSessionId, history.data);
+  const bundle = repository.loadHistoryForContext(row.sessionId);
+  if (!bundle.ok) return bundle;
+  if (!bundle.data.history) return availability === 'ready' ? ok(undefined)
+    : fail(appError('session_history_unavailable', 'session', 'This conversation has no saved native history.'));
+  if (availability === 'ready') return agent.restoreSessionLeaf
+    ? agent.restoreSessionLeaf(row.nativeSessionId, bundle.data.history, bundle.data.bindings)
+    : fail(appError('context_binding_unknown', 'runtime', 'Saved conversation sources cannot be reconnected.'));
+  const restored = agent.restoreSession!(row.nativeSessionId, bundle.data.history, bundle.data.bindings);
   if (!restored.ok) return restored;
-  return agent.watchSession(row.nativeSessionId, (snapshot, context) => repository.saveHistory(row.sessionId, snapshot, context));
+  return agent.watchSession!(row.nativeSessionId, (snapshot, context) => repository.saveHistory(row.sessionId, snapshot, context));
 }
 
 function deleteInProgress<T>(): Result<T> {

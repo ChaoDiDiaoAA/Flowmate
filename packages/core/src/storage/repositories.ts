@@ -1,14 +1,16 @@
-import type { Database } from 'bun:sqlite';
+import { SQLiteError, type Database } from 'bun:sqlite';
 import { join, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { associateInputResult, completeSessionInputs, createSessionInputLedger, finishSessionInputs, markInputConsumed, recoverSessionInputs } from '../sessions/input-ledger.ts';
-import type { InputResultBatch, SessionInputAdmission } from '../sessions/input-ledger.ts';
+import type { InputResultBatch, FrozenSessionInputAdmission } from '../sessions/input-ledger.ts';
 import type { RuntimeEventStore } from '../events/store.ts';
 import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/verification.ts';
 import { contextReferenceFromColumns, readRunContextOwner, readContextSnapshotOwner, readToolContext } from '../context/repository.ts';
+import { formatContextPrompt } from '../context/service.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, NativeInputContextBindingSchema, SessionInputContentSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -26,6 +28,7 @@ import type {
   SessionStatus,
   SessionHistoryState,
   NativeSessionHistory,
+  NativeContextBindingSeed,
   NativeHistoryAppendContext,
   NativeHistoryDisplayRecord,
   SafeConfigSnapshot,
@@ -291,6 +294,7 @@ export interface SessionRepository {
   setStatus(input: SetSessionStatusRequest & { at: string }): Result<SessionRow>;
   delete(sessionId: DbId, at: string): Result<'hidden' | 'permanent'>;
   loadHistory(sessionId: DbId): Result<NativeSessionHistory | null>;
+  loadHistoryForContext(sessionId: DbId): Result<Readonly<{ history: NativeSessionHistory | null; bindings: readonly NativeContextBindingSeed[] }>>;
   readHistoryForDisplay(sessionId: DbId): Result<NativeHistoryDisplayRecord & { sessionInputs: MessageSessionInput[] }>;
   saveHistory(sessionId: DbId, history: NativeSessionHistory, context?: NativeHistoryAppendContext): Result<void>;
 }
@@ -315,8 +319,9 @@ export interface RunRepository {
   create(input: NewProviderRun): Result<DbId>;
   createAgent(input: NewAgentRun): Result<DbId>;
   createWorkspaceAgent(input: NewWorkspaceAgentRun, verify: WorkspaceVerifier): Result<WorkspaceRunAdmission>;
-  freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }, verify: WorkspaceVerifier | undefined): Result<SessionInputAdmission>;
-  verifyInputUse(content: SessionInputContentV2, verify: WorkspaceVerifier | undefined): Result<void>;
+  freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }, verify: WorkspaceVerifier | undefined): Result<FrozenSessionInputAdmission>;
+  verifyInputUse(content: SessionInputContentV2, verify: WorkspaceVerifier | undefined,
+    binding?: { runId: DbId; sessionId: DbId; contextSnapshotId: DbId | null }): Result<void>;
   listBySession(request: NormalizedSessionRunsRequest): Result<{ items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null }>;
   start(runId: DbId, config: SafeConfigSnapshot, startedAt: string): Result<void>;
   recordCancel(runId: DbId, requestedAt: string): Result<boolean>;
@@ -2658,6 +2663,63 @@ function readNativeHistory(db: Database, sessionId: DbId): NativeSessionHistory 
   return { storageVersion: 1, header, entries, leafId: row.leaf_id, unusable: row.unusable === 1 };
 }
 
+const nativeUserMessage = z.object({ role: z.literal('user'), timestamp: z.number().finite(), content: z.union([z.string(),
+  z.array(z.union([z.object({ type: z.literal('text'), text: z.string() }).passthrough(),
+    z.object({ type: z.literal('image'), data: z.string(), mimeType: z.string().min(1) }).passthrough()]))]) }).passthrough();
+/** This manifest preserves persisted identity; the adapter selects its lawful SDK history path. */
+function readNativeContextBindings(db: Database, sessionId: DbId, history: NativeSessionHistory | null): readonly NativeContextBindingSeed[] {
+  const positiveId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+  const nativeRows = db.query('SELECT entry_id,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence')
+    .all(sessionId) as { entry_id: string; run_id: number | null }[];
+  const origins = new Map(nativeRows.map(row => [row.entry_id, row.run_id]));
+  const inputSchema = z.object({ id: positiveId, session_id: positiveId, run_id: positiveId,
+    native_entry_id: z.string(), context_snapshot_id: positiveId.nullable(), status: z.literal('consumed'), content_json: z.string() });
+  const inputs = new Map<string, z.infer<typeof inputSchema>[]>();
+  for (const raw of db.query('SELECT id,session_id,run_id,native_entry_id,context_snapshot_id,status,content_json FROM session_inputs WHERE session_id=? AND native_entry_id IS NOT NULL').all(sessionId)) {
+    const input = inputSchema.parse(raw), group = inputs.get(input.native_entry_id) ?? [];
+    group.push(input); inputs.set(input.native_entry_id, group);
+  }
+  const ownerSchema = z.object({ id: positiveId, kind: z.literal('agent'), session_id: positiveId, job_id: positiveId.nullable(),
+    config_json: z.string(), current_context_snapshot_id: positiveId.nullable(), context_observations_json: z.string().nullable() });
+  const owners = new Map<number, { row: z.infer<typeof ownerSchema>; context: ReturnType<typeof readRunContextOwner> }>();
+  const owner = (runId: number) => {
+    const cached = owners.get(runId); if (cached) return cached;
+    const row = ownerSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(runId));
+    if (row.session_id !== sessionId) throw new Error('context_seed_run_session');
+    const value = { row, context: readRunContextOwner(db, row) }; owners.set(runId, value); return value;
+  };
+  const bindings: NativeContextBindingSeed[] = [];
+  for (const entry of history?.entries ?? []) {
+    const matching = inputs.get(entry.id) ?? [];
+    inputs.delete(entry.id);
+    const role = entry.type === 'message' ? z.object({ role: z.enum(['user', 'assistant', 'toolResult']) }).passthrough().parse(entry.message).role : null;
+    if (role !== 'user') { if (matching.length) throw new Error('context_seed_not_user'); continue; }
+    nativeUserMessage.parse(entry.message);
+    const originRunId = origins.get(entry.id);
+    if (originRunId === undefined || matching.length > 1) throw new Error('context_seed_ambiguous');
+    const original = originRunId === null ? null : owner(originRunId);
+    if (!matching.length) {
+      if (original !== null && original.context.observations !== null) throw new Error('context_seed_p8_input_missing');
+      bindings.push(NativeInputContextBindingSchema.parse({ originRunId, inputId: null, nativeEntryId: entry.id, snapshotId: null }));
+      continue;
+    }
+    const input = matching[0]!;
+    if (input.session_id !== sessionId || input.run_id !== originRunId || original === null) throw new Error('context_seed_input_owner');
+    const content = SessionInputContentSchema.parse(JSON.parse(input.content_json));
+    if ((input.context_snapshot_id === null) !== (original.context.observations === null)) throw new Error('context_seed_snapshot_missing');
+    if (input.context_snapshot_id !== null) {
+      if (content.version !== 2) throw new Error('context_seed_p8_content');
+      const snapshot = readContextSnapshotOwner(db, input.context_snapshot_id, original.row);
+      if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
+        || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
+        || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds)) throw new Error('context_seed_snapshot_content');
+    }
+    bindings.push(NativeInputContextBindingSchema.parse({ originRunId, inputId: input.id, nativeEntryId: entry.id, snapshotId: input.context_snapshot_id }));
+  }
+  if (inputs.size) throw new Error('context_seed_entry_missing');
+  return Object.freeze(bindings);
+}
+
 function writeNativeHistory(db: Database, sessionId: DbId, history: NativeSessionHistory, context?: NativeHistoryAppendContext,
   events?: RuntimeEventStore): void {
   const session = db.query('SELECT native_session_id FROM sessions WHERE id=?').get(sessionId) as { native_session_id: string } | null;
@@ -2755,6 +2817,19 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
     loadHistory(sessionId) {
       try { return ok(readNativeHistory(db, sessionId)); }
       catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
+    },
+
+    loadHistoryForContext(sessionId) {
+      try {
+        return db.transaction(() => {
+          if (!db.query('SELECT id FROM sessions WHERE id=?').get(sessionId)) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
+          const history = readNativeHistory(db, sessionId);
+          return ok(Object.freeze({ history, bindings: readNativeContextBindings(db, sessionId, history) }));
+        }).deferred();
+      } catch (error) {
+        return fail(error instanceof SQLiteError ? appError('storage_read_failed', 'storage', 'Context history could not be read.', true)
+          : appError('context_binding_unknown', 'runtime', 'Persisted input origins cannot be confirmed.'));
+      }
     },
 
     readHistoryForDisplay(sessionId) {
@@ -3024,10 +3099,12 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         if (scope.version === 3 || config.goalMode === 'local-task') return fail(appError('input_invalid', 'input', 'Legacy native Run formats are read only.'));
         if (parseSessionModelUse(session.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
         if (readNativeHistory(db, input.sessionId)?.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation history is unusable.'));
+        const p8 = config.contextPolicyVersion === 'p8-context-v1';
         const inserted = db.query(`INSERT INTO runs
-          (kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
-          VALUES ('agent',?,?,'created',?,?,?,?,?,?)`)
+          (kind,session_id,scope_json,status,goal,input_json,config_json${p8 ? ',context_observations_json' : ''},cleanup_json,usage_json,created_at)
+          VALUES ('agent',?,?,'created',?,?,?${p8 ? ',?' : ''},?,?,?)`)
           .run(input.sessionId, asJson(input.scope), input.goal, asJson(input.input), asJson(input.config),
+            ...(p8 ? [asJson({ version: 1, requests: [] })] : []),
             asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const id = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_run_id');
@@ -3072,9 +3149,11 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           ...input.config, goalMode: input.goalMode, workspaceContext,
           ...(fill && target?.success ? { formTarget: target.data } : {}),
         };
-        const inserted = db.query(`INSERT INTO runs(kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
-          VALUES ('agent',?,?,?,?,?,?,?,?,?,?)`)
+        const p8 = config.contextPolicyVersion === 'p8-context-v1';
+        const inserted = db.query(`INSERT INTO runs(kind,session_id,job_id,scope_json,status,goal,input_json,config_json${p8 ? ',context_observations_json' : ''},cleanup_json,usage_json,created_at)
+          VALUES ('agent',?,?,?,?,?,?,?${p8 ? ',?' : ''},?,?,?)`)
           .run(input.sessionId, job?.jobId ?? null, asJson(scope), 'created', input.goal, asJson(inputRecord), asJson(config),
+            ...(p8 ? [asJson({ version: 1, requests: [] })] : []),
             asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const runId = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(runId) || runId <= 0) throw new Error('unsafe_run_id');
@@ -3139,8 +3218,25 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
       } catch { return fail(appError('storage_read_failed', 'storage', 'Input admission facts cannot be read.', true)); }
     },
 
-    verifyInputUse(content, verify) {
+    verifyInputUse(content, verify, binding) {
       try {
+        if (binding) {
+          const raw = db.query('SELECT * FROM runs WHERE id=?').get(binding.runId) as RunRow | null;
+          if (!raw || raw.kind !== 'agent' || raw.session_id !== binding.sessionId) return corruptWorkspace();
+          const original = readRunContextOwner(db, raw);
+          if ((binding.contextSnapshotId === null) !== (original.observations === null)) return corruptWorkspace();
+          if (binding.contextSnapshotId !== null) {
+            const snapshot = readContextSnapshotOwner(db, binding.contextSnapshotId, raw);
+            const expectedPrompt = snapshot.json.goalMode === 'fill-form'
+              ? `${formatExecutionPrompt({ text: content.text, goalMode: 'fill-form', business: true,
+                workspaceInput: content.workspaceInput!, workspaceContext: content.workspaceContext! })}\n\nFlowmate Context reference:\n${JSON.stringify({ snapshotId: snapshot.id,
+                policyVersion: snapshot.json.policyVersion, projectionMode: 'fill-reference', gaps: snapshot.json.modelProjection.gaps })}`
+              : formatContextPrompt(snapshot);
+            if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
+              || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
+              || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds) || content.promptText !== expectedPrompt) return corruptWorkspace();
+          }
+        }
         const frozen = content.workspaceContext;
         if (frozen === null) return content.workspaceInput === null && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
           ? ok(undefined) : fail(appError('storage_corrupt', 'storage', 'Chat input contains Workspace references.'));

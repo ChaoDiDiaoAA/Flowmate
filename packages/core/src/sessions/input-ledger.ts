@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import type { RuntimeEventStore } from '../events/store.ts';
-import { readInputContext } from '../context/repository.ts';
+import { readInputContext, readContextSnapshotOwner } from '../context/repository.ts';
 import { appError, fail, normalizeSessionInputRequest, ok, SessionInputContentV2Schema,
   SessionInputQuerySchema, SessionInputSnapshotSchema, SessionInputsRequestSchema, LegacySessionInputRequestSchema } from '@flowmate/contracts';
 import type { AppError, DbId, NormalizedSessionInputRequest, Result, SessionInputQuery, SessionInputQueryResult,
@@ -13,7 +13,11 @@ type InputRow = { id: number; session_id: number; client_sequence: number; mode:
   error_json: string | null; created_at: string; updated_at: string };
 type NativeEntry = { id: string; parentId: string | null; type: string;
   message?: { role?: string; content?: Array<{ type?: string; text?: string }>; stopReason?: string; toolCallId?: string } };
-export type SessionInputAdmission = { runId: DbId; content: SessionInputContentV2 };
+export type FrozenSessionInputAdmission = { runId: DbId; content: SessionInputContentV2 };
+export type SessionInputAdmission = FrozenSessionInputAdmission & (
+  | { contextPolicyVersion: 'p8-context-v1'; contextSnapshotId: DbId }
+  | { contextPolicyVersion?: never; contextSnapshotId?: never }
+);
 export type InputResultBatch = { inputIds: readonly DbId[]; resultEntryId: string };
 function snapshot(db: Database, row: InputRow): SessionInputSnapshot {
   return SessionInputSnapshotSchema.parse({ inputId: row.id, sessionId: row.session_id, clientSequence: row.client_sequence,
@@ -136,13 +140,23 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
           const accepted = admitInput();
           if (!accepted.ok) { rejected = accepted; throw new Error('input_admission_rejected'); }
           const admission = accepted.data;
-          const run = db.query('SELECT session_id,kind,status,config_json,cancel_requested_at FROM runs WHERE id=?')
-            .get(admission.runId) as { session_id: number; kind: string; status: string; config_json: string; cancel_requested_at: string | null } | null;
+          const run = db.query('SELECT id,session_id,job_id,kind,status,config_json,cancel_requested_at FROM runs WHERE id=?')
+            .get(admission.runId) as { id: number; session_id: number; job_id: number | null; kind: string; status: string; config_json: string; cancel_requested_at: string | null } | null;
           const request = normalized.data;
           if (run?.kind !== 'agent' || run.session_id !== request.sessionId || run.cancel_requested_at !== null
             || (request.mode === 'prompt' ? run.status !== 'created' : !['created', 'running'].includes(run.status) || request.runId !== admission.runId))
             throw new Error('input_run_identity_invalid');
           const content = SessionInputContentV2Schema.parse(admission.content);
+          const enabled = JSON.parse(run.config_json).contextPolicyVersion === 'p8-context-v1';
+          if (enabled !== (admission.contextPolicyVersion === 'p8-context-v1')) throw new Error('input_context_policy_invalid');
+          const contextSnapshotId = admission.contextSnapshotId ?? null;
+          if (enabled) {
+            if (!Number.isSafeInteger(contextSnapshotId) || contextSnapshotId === null || contextSnapshotId <= 0) throw new Error('input_context_snapshot_missing');
+            const saved = readContextSnapshotOwner(db, contextSnapshotId, run);
+            if (saved.json.text !== content.text || JSON.stringify(saved.json.workspaceContext) !== JSON.stringify(content.workspaceContext)
+              || JSON.stringify(saved.json.allowedDocumentIds) !== JSON.stringify(content.allowedDocumentIds)
+              || JSON.stringify(saved.json.allowedArtifactIds) !== JSON.stringify(content.allowedArtifactIds)) throw new Error('input_context_snapshot_invalid');
+          }
           if (content.requestIdentityVersion === 1) {
             if (request.mode !== 'prompt') throw new Error('input_active_budget_invalid');
             const overrides = { ...(request.budget === undefined ? {} : { budget: request.budget }),
@@ -156,10 +170,10 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
           const goalMode = request.mode === 'prompt' ? request.goalMode : JSON.parse(run.config_json).goalMode ?? 'answer';
           if (request.mode !== 'prompt' && goalMode === 'fill-form') throw new Error('input_fill_append_invalid');
           const inserted = db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
-            content_json,status,processing_status,native_entry_id,result_entry_id,dispatched_at,error_json,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,'queued','pending',NULL,NULL,NULL,NULL,?,?)`)
+            context_snapshot_id,content_json,status,processing_status,native_entry_id,result_entry_id,dispatched_at,error_json,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,'queued','pending',NULL,NULL,NULL,NULL,?,?)`)
             .run(request.sessionId, request.clientSequence, request.mode, goalMode, requestHash(request, false, content.requestIdentityVersion),
-              admission.runId, JSON.stringify(content), at, at);
+              admission.runId, contextSnapshotId, JSON.stringify(content), at, at);
           appendInputState(db, Number(inserted.lastInsertRowid), events);
           return ok({ input: snapshot(db, byId(Number(inserted.lastInsertRowid))!), created: true });
         });

@@ -254,7 +254,7 @@ export interface AgentPort {
   projectSessionMessages?(input: NativeMessageProjectionInput): Result<Pick<SessionMessagesPage, 'items' | 'nextBeforeEntryId'>>;
   enqueueInput?(nativeSessionId: string, input: AgentInputDispatch): Promise<Result<void>>;
   moveSessionLeaf?(nativeSessionId: string, targetEntryId: string): Promise<Result<import('./runtime.ts').NativeSessionHistory>>;
-  restoreSessionLeaf?(nativeSessionId: string, committed: import('./runtime.ts').NativeSessionHistory): Result<void>;
+  restoreSessionLeaf?(nativeSessionId: string, committed: import('./runtime.ts').NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void>;
   inspect(nativeSessionId: string): {
     availability: AgentPortAvailability;
   };

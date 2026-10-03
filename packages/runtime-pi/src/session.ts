@@ -29,6 +29,7 @@ import type {
   CloseReport,
   NativeObservation,
   NativeSessionHistory,
+  NativeContextBindingSeed,
   PromptTraceBuffer,
   PromptTraceEntry,
   PromptTraceEvent,
@@ -474,7 +475,7 @@ export class PiAgentAdapter implements AgentPort {
     finally { record.preparing = false; }
   }
 
-  public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory): Result<void> {
+  public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory, _bindings?: readonly NativeContextBindingSeed[]): Result<void> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
     if (record.preparing || record.running || record.session && !record.session.isIdle)
@@ -482,12 +483,14 @@ export class PiAgentAdapter implements AgentPort {
     try {
       const current = this.exportSession(nativeSessionId);
       if (!validateNativeHistory(committed).ok || !current.ok || committed.unusable
-        || !isDeepStrictEqual(current.data.header, committed.header) || !isDeepStrictEqual(current.data.entries, committed.entries))
+        || !isDeepStrictEqual(JSON.parse(JSON.stringify(current.data.header)), JSON.parse(JSON.stringify(committed.header)))
+        || !isDeepStrictEqual(JSON.parse(JSON.stringify(current.data.entries)), JSON.parse(JSON.stringify(committed.entries))))
         throw new Error('branch_restore_mismatch');
       if (committed.leafId === null) record.manager.resetLeaf(); else record.manager.branch(committed.leafId);
       if (record.session) record.session.agent.state.messages = record.manager.buildSessionContext().messages;
       const restored = this.exportSession(nativeSessionId);
-      if (!restored.ok || !isDeepStrictEqual(restored.data, committed)) throw new Error('branch_restore_unconfirmed');
+      if (!restored.ok || !isDeepStrictEqual(JSON.parse(JSON.stringify(restored.data)), JSON.parse(JSON.stringify(committed))))
+        throw new Error('branch_restore_unconfirmed');
       record.lastSavedHistory = structuredClone(committed);
       return ok(undefined);
     } catch {

@@ -124,6 +124,7 @@ function makeAgent(history: ReturnType<typeof createAgentHistoryFixture>, option
   }));
   return {
     createSession: () => ok({ nativeSessionId: 'native-2' }),
+    restoreSessionLeaf: history.restoreSessionLeaf,
     inspect: (nativeSessionId) => options.inspection ?? ({
       availability: nativeSessionId === 'native-1' ? 'ready' : 'missing',
     }),
