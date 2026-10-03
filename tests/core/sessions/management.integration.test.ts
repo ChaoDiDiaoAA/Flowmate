@@ -65,6 +65,7 @@ describe('T04 explicit restore and persisted Session queries', () => {
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' as const, contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
     const runtime = new RuntimeService({ runs: app.store.runs, sessions: app.store.sessions, sessionInputs: app.store.sessionInputs,
+      contextRepository: app.store.context,
       agent: app.agent, contextService: new ContextService({ store: app.store,
         materials: { inspectParsed() { throw new Error('Pure chat cannot inspect material.'); } } }),
       provider: { async prepare() { throw new Error('No direct Provider calls.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },

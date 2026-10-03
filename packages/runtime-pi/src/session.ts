@@ -16,7 +16,7 @@ import {
   type AgentToolResult,
   type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
-import { RUNTIME_CONFIG, appError, fail, ok } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
   AgentObservation,
@@ -30,6 +30,9 @@ import type {
   NativeObservation,
   NativeSessionHistory,
   NativeContextBindingSeed,
+  NativeInputContextBinding,
+  NativeToolResultContextBinding,
+  RequestContextBinding,
   PromptTraceBuffer,
   PromptTraceEntry,
   PromptTraceEvent,
@@ -77,7 +80,7 @@ type ModelCallUsage = { callSequence: number; usage: UsageRecordV1; tokens: Toke
 type ToolRequestState = { name: string; raw: unknown; invoked: boolean; terminal: boolean; messageObserved: boolean; messageObservedAt: string | null; requestObservedAtSequence: number | null;
   failureStage?: 'sdk_arguments' | 'sdk_before' | 'unknown'; sdkBlocked?: boolean;
   feedback?: AgentToolResult<unknown>; feedbackIsError?: boolean };
-type InputDispatchState = { inputId: number; text: string; promptText: string; started: boolean; message?: object };
+type InputDispatchState = { inputId: number; text: string; promptText: string; contextSnapshotId?: number; started: boolean; message?: object };
 
 type ActiveExecution = {
   input: AgentExecutionInput;
@@ -142,6 +145,9 @@ type SessionRecord = {
   persistenceWatched?: boolean;
   lastSavedHistory?: NativeSessionHistory;
   liveBindings: Map<string, NativeEntryLiveBinding>;
+  contextEntries: Map<string, NativeInputContextBinding>;
+  contextMessages: WeakMap<object, NativeInputContextBinding>;
+  contextSeeded: boolean;
   historyFailure?: ReturnType<typeof appError>;
   active?: ActiveExecution;
 };
@@ -323,7 +329,8 @@ export class PiAgentAdapter implements AgentPort {
     const cwd = this.dependencies.cwd ?? process.cwd();
     const manager = SessionManager.inMemory(cwd);
     const nativeSessionId = manager.getSessionId();
-    this.sessions.set(nativeSessionId, { manager, preparing: false, running: false, unusable: false, liveBindings: new Map() });
+    this.sessions.set(nativeSessionId, { manager, preparing: false, running: false, unusable: false, liveBindings: new Map(),
+      contextEntries: new Map(), contextMessages: new WeakMap(), contextSeeded: false });
     return ok({ nativeSessionId });
   }
 
@@ -342,7 +349,7 @@ export class PiAgentAdapter implements AgentPort {
     } catch { return fail(appError('session_history_invalid', 'session', 'Native conversation cannot be safely serialized.')); }
   }
 
-  public restoreSession(nativeSessionId: string, history: NativeSessionHistory): Result<void> {
+  public restoreSession(nativeSessionId: string, history: NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
     if (this.closed || this.sessions.has(nativeSessionId)) return fail(appError('session_history_invalid', 'session', 'Conversation cannot be restored in this state.'));
     const cwd = this.dependencies.cwd ?? process.cwd();
     const valid = validateNativeHistory(history);
@@ -356,10 +363,53 @@ export class PiAgentAdapter implements AgentPort {
       else if (manager.getLeafId() !== history.leafId) manager.branch(history.leafId);
       if (manager.getSessionId() !== nativeSessionId || manager.getEntries().length !== history.entries.length) throw new Error('native_history_mismatch');
       manager.buildSessionContext();
-      this.sessions.set(nativeSessionId, { manager, preparing: false, running: false, unusable: false,
-        lastSavedHistory: structuredClone(history), liveBindings: new Map() });
+      const record: SessionRecord = { manager, preparing: false, running: false, unusable: false,
+        lastSavedHistory: structuredClone(history), liveBindings: new Map(), contextEntries: new Map(),
+        contextMessages: new WeakMap(), contextSeeded: false };
+      const seeded = this.reseedContext(record, bindings);
+      if (!seeded.ok) return seeded;
+      this.sessions.set(nativeSessionId, record);
       return ok(undefined);
     } catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history could not be restored.')); }
+  }
+
+  private reseedContext(record: SessionRecord, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
+    const entries = bindings === undefined ? new Map(record.contextEntries) : new Map<string, NativeInputContextBinding>();
+    if (bindings !== undefined) {
+      const inputs = new Map<number, string>();
+      for (const value of bindings) {
+        const parsed = NativeInputContextBindingSchema.safeParse(value);
+        if (!parsed.success) return fail(appError('context_binding_unknown', 'runtime', 'Saved input provenance is unavailable.'));
+        const source = parsed.data; const native = record.manager.getEntry(source.nativeEntryId);
+        if (!native || native.type !== 'message' || native.message.role !== 'user')
+          return fail(appError('context_binding_unknown', 'runtime', 'Saved input entry is unavailable.'));
+        const previous = entries.get(source.nativeEntryId) ?? record.contextEntries.get(source.nativeEntryId);
+        if (previous && !isDeepStrictEqual(previous, source))
+          return fail(appError('context_binding_conflict', 'runtime', 'Saved input provenance conflicts with its entry.'));
+        if (source.inputId !== null) {
+          const previousEntry = inputs.get(source.inputId);
+          if (previousEntry !== undefined && previousEntry !== source.nativeEntryId)
+            return fail(appError('context_binding_conflict', 'runtime', 'Saved Input belongs to distinct entries.'));
+          inputs.set(source.inputId, source.nativeEntryId);
+        }
+        entries.set(source.nativeEntryId, Object.freeze(structuredClone(source)));
+      }
+    }
+    const messages = new WeakMap<object, NativeInputContextBinding>();
+    for (const entry of record.manager.buildContextEntries()) {
+      if (entry.type !== 'message' || entry.message.role !== 'user') continue;
+      const source = entries.get(entry.id);
+      if (source) messages.set(entry.message, source);
+    }
+    if (bindings !== undefined || record.contextSeeded) {
+      for (const message of record.manager.buildSessionContext().messages) {
+        if (message.role === 'user' && !messages.has(message))
+          return fail(appError('context_binding_unknown', 'runtime', 'Current input provenance is unavailable.'));
+      }
+    }
+    record.contextEntries = entries; record.contextMessages = messages;
+    record.contextSeeded ||= bindings !== undefined;
+    return ok(undefined);
   }
 
   public watchSession(nativeSessionId: string, save: (history: NativeSessionHistory, context?: NativeHistoryAppendContext) => Result<void>): Result<void> {
@@ -389,6 +439,17 @@ export class PiAgentAdapter implements AgentPort {
           ...(resultInputIds?.length ? { resultInputIds } : {}) } : undefined;
       const snapshot = this.exportSession(nativeSessionId);
       let saved: Result<void>;
+      let source: NativeInputContextBinding | undefined;
+      if (entry.type === 'message' && active && entry.message.role === 'user') {
+        const state = inputId === undefined ? undefined : active.inputs.get(inputId);
+        source = { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null,
+          snapshotId: state?.contextSnapshotId ?? null };
+        const previous = record.contextEntries.get(entry.id);
+        if (previous && !isDeepStrictEqual(previous, source)) {
+          const error = appError('context_binding_conflict', 'runtime', 'Input entry provenance conflicts.');
+          this.failToolRun(record, active, error); throw error;
+        }
+      }
       try {
         saved = entry.type === 'message' && active && ordinal === undefined
           ? fail(appError('session_history_invalid', 'session', 'Native message has no actual live identity.'))
@@ -406,6 +467,10 @@ export class PiAgentAdapter implements AgentPort {
         throw new Error('native_history_write_failed');
       }
       if (snapshot.ok) record.lastSavedHistory = structuredClone(snapshot.data);
+      if (source && entry.type === 'message') {
+        const frozen = Object.freeze(structuredClone(source));
+        record.contextEntries.set(entry.id, frozen); record.contextMessages.set(entry.message, frozen);
+      }
       if (active && inputId !== undefined) active.openInputIds.add(inputId);
       if (active && entry.type === 'message' && resultInputIds?.length) {
         active.resultBindings.set(entry.message, { inputIds: resultInputIds, entryId: entry.id });
@@ -470,12 +535,14 @@ export class PiAgentAdapter implements AgentPort {
         const moved = await record.session.navigateTree(targetEntryId, { summarize: false });
         if (moved.cancelled || record.manager.getLeafId() !== targetEntryId) throw new Error('branch_not_confirmed');
       } else record.manager.branch(targetEntryId);
+      const seeded = this.reseedContext(record);
+      if (!seeded.ok) return seeded;
       return this.exportSession(nativeSessionId);
     } catch { return fail(appError('session_history_invalid', 'session', 'Conversation position could not be confirmed.')); }
     finally { record.preparing = false; }
   }
 
-  public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory, _bindings?: readonly NativeContextBindingSeed[]): Result<void> {
+  public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
     if (record.preparing || record.running || record.session && !record.session.isIdle)
@@ -491,6 +558,8 @@ export class PiAgentAdapter implements AgentPort {
       const restored = this.exportSession(nativeSessionId);
       if (!restored.ok || !isDeepStrictEqual(JSON.parse(JSON.stringify(restored.data)), JSON.parse(JSON.stringify(committed))))
         throw new Error('branch_restore_unconfirmed');
+      const seeded = this.reseedContext(record, bindings);
+      if (!seeded.ok) { record.unusable = true; return seeded; }
       record.lastSavedHistory = structuredClone(committed);
       return ok(undefined);
     } catch {
@@ -508,6 +577,9 @@ export class PiAgentAdapter implements AgentPort {
       || encoder.encode(input.text).byteLength > 65_000 || typeof input.promptText !== 'string' || !input.promptText.trim())
       return fail(appError('input_invalid', 'input', 'Input does not belong to the active Run.'));
     if (active.goalMode === 'fill-form') return fail(appError('tool_access_denied', 'runtime', 'A form application Run cannot accept additional inputs.'));
+    if ((active.input.contextHooks !== undefined) !== (input.contextSnapshotId !== undefined)
+      || input.contextSnapshotId !== undefined && (!Number.isSafeInteger(input.contextSnapshotId) || input.contextSnapshotId <= 0))
+      return fail(appError('context_binding_unknown', 'runtime', 'Input context association is unavailable.'));
     try {
       const dispatched = await this.dispatchInput(record, active, input, () => input.mode === 'steer'
         ? record.session!.steer(input.promptText) : record.session!.followUp(input.promptText), true);
@@ -563,7 +635,7 @@ export class PiAgentAdapter implements AgentPort {
     session.agent.followUp = message => { capture([message]); followUp(message); };
   }
 
-  private dispatchInput(record: SessionRecord, active: ActiveExecution, input: Pick<AgentInputDispatch, 'inputId' | 'text' | 'promptText'>,
+  private dispatchInput(record: SessionRecord, active: ActiveExecution, input: Pick<AgentInputDispatch, 'inputId' | 'text' | 'promptText' | 'contextSnapshotId'>,
     invoke: () => Promise<void>, streaming: boolean): Promise<{ execution: Promise<void> }> {
     const dispatched = (record.dispatchTail ?? Promise.resolve()).then(async () => {
       if (record.active !== active || active.admissionClosed || active.signal.aborted || active.failure
@@ -733,6 +805,9 @@ export class PiAgentAdapter implements AgentPort {
           }
         };
         session.agent.toolExecution = 'parallel';
+        // The controlled resourcePolicy=none has no context handlers. Pi's empty
+        // ExtensionRunner still clones messages; preserve the saved native identities.
+        session.agent.transformContext = async messages => messages;
         session.setActiveToolsByName(activeToolNames);
         session.agent.streamFunction = this.wrapStream(record, session, session.agent.streamFunction);
         this.installInputCapture(record, session);
@@ -763,6 +838,8 @@ export class PiAgentAdapter implements AgentPort {
         }
       }
       if (session) {
+        const seeded = this.reseedContext(record);
+        if (!seeded.ok) return seeded;
         session.agent.toolExecution = 'parallel';
         session.setActiveToolsByName(activeToolNames);
         session.setSteeringMode('one-at-a-time');
@@ -852,6 +929,12 @@ export class PiAgentAdapter implements AgentPort {
       }
 
       active.callSequence += 1;
+      let requestBinding: RequestContextBinding | undefined;
+      if (active.input.contextHooks) {
+        const binding = this.bindContext(record, active, context, model);
+        if (!binding.ok) { this.failToolRun(record, active, binding.error); return errorStream(model, binding.error); }
+        requestBinding = binding.data;
+      }
       active.attemptsAtCallStart = active.attempts;
       active.responseStarted = false;
       active.complete = false;
@@ -867,11 +950,49 @@ export class PiAgentAdapter implements AgentPort {
         contextBytes: contextSize,
       });
       const output = createAssistantMessageEventStream();
-      const worker = this.forwardStream(record, session, active, nativeStream, model, requestContext, options, output);
+      const worker = this.forwardStream(record, session, active, nativeStream, model, requestContext, options, output, requestBinding);
       active.streams.add(worker);
       void worker.then(() => active.streams.delete(worker), () => active.streams.delete(worker));
       return output;
     };
+  }
+
+  private bindContext(record: SessionRecord, active: ActiveExecution, context: StreamContext, model: StreamModel): Result<RequestContextBinding> {
+    const hooks = active.input.contextHooks!;
+    const includedBindings: NativeInputContextBinding[] = [];
+    const includedToolResults: NativeToolResultContextBinding[] = [];
+    try {
+      for (const message of context.messages) {
+        if (message.role === 'user') {
+          const source = record.contextMessages.get(message);
+          if (!source) return fail(appError('context_binding_unknown', 'runtime', 'Actual input provenance is unavailable.'));
+          includedBindings.push(source);
+        } else if (message.role === 'toolResult') {
+          const source = hooks.resolveToolResult({ sessionId: active.sessionId, nativeToolCallId: message.toolCallId });
+          if (!source.ok) return source;
+          const parsed = NativeToolResultContextBindingSchema.safeParse(source.data);
+          if (!parsed.success || parsed.data.nativeToolCallId !== message.toolCallId)
+            return fail(appError('context_binding_unknown', 'runtime', 'Actual tool result provenance is unavailable.'));
+          includedToolResults.push(parsed.data);
+        }
+        if (includedBindings.length + includedToolResults.length > 512)
+          return fail(appError('context_evidence_too_large', 'runtime', 'Request provenance exceeds its budget.'));
+      }
+      const primary = [...includedBindings].reverse().find(source => source.originRunId === active.runId && source.snapshotId !== null);
+      if (!primary || primary.inputId === null)
+        return fail(appError('context_binding_unknown', 'runtime', 'The current request has no saved input context.'));
+      const parsed = RequestContextBindingSchema.safeParse({ runId: active.runId, sessionId: active.sessionId,
+        nativeSessionId: active.nativeSessionId, requestSequence: active.callSequence, callSequence: active.callSequence,
+        inputId: primary.inputId, snapshotId: primary.snapshotId, includedBindings, includedToolResults });
+      if (!parsed.success) return fail(appError('context_binding_unknown', 'runtime', 'Request provenance is inconsistent.'));
+      const binding = structuredClone(parsed.data);
+      for (const source of binding.includedBindings) Object.freeze(source);
+      for (const source of binding.includedToolResults) { if (source.context) Object.freeze(source.context); Object.freeze(source); }
+      Object.freeze(binding.includedBindings); Object.freeze(binding.includedToolResults); Object.freeze(binding);
+      const saved = hooks.bind({ binding, api: model.api,
+        transport: observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch) ? 'observed-fetch' : 'not-observable', at: now().at });
+      return saved.ok ? ok(binding) : saved;
+    } catch { return fail(appError('context_binding_unknown', 'runtime', 'Request provenance could not be confirmed.')); }
   }
 
   private withRuntimeAwareness(active: ActiveExecution, context: StreamContext, maxModelCalls: number,
@@ -1147,6 +1268,7 @@ export class PiAgentAdapter implements AgentPort {
     context: StreamContext,
     options: StreamOptions,
     output: ReturnType<typeof createAssistantMessageEventStream>,
+    _requestBinding?: RequestContextBinding,
   ): Promise<void> {
     const callSequence = active.callSequence;
     const callStartedAt = performance.now();
@@ -1448,6 +1570,10 @@ export class PiAgentAdapter implements AgentPort {
       || !input.verifyInputUse || !input.completeInputResult)) {
       return this.notStarted(nativeSessionId, appError('agent_execution_invalid', 'input', 'Input identity, frozen prompt, and persistence callbacks are required.'));
     }
+    if ((input.contextHooks !== undefined) !== (input.contextSnapshotId !== undefined)
+      || input.contextHooks !== undefined && (input.inputId === undefined
+        || !Number.isSafeInteger(input.contextSnapshotId) || input.contextSnapshotId! <= 0))
+      return this.notStarted(nativeSessionId, appError('context_binding_unknown', 'runtime', 'Execution context association is unavailable.'));
 
     const active: ActiveExecution = {
       input, nextLiveOrdinal: 0, liveOrdinals: new WeakMap(), nativeFailures: new Set(),
@@ -1527,7 +1653,7 @@ export class PiAgentAdapter implements AgentPort {
     try {
       try {
         if (input.inputId !== undefined) {
-          const dispatched = await this.dispatchInput(record, active, { inputId: input.inputId, text: input.text, promptText: input.promptText! },
+          const dispatched = await this.dispatchInput(record, active, { inputId: input.inputId, text: input.text, promptText: input.promptText!, contextSnapshotId: input.contextSnapshotId },
             () => session.prompt(input.promptText!, { expandPromptTemplates: false }), false);
           await dispatched.execution;
         } else await session.prompt(formatExecutionPrompt({ ...input, business: input.toolBinding !== undefined }), { expandPromptTemplates: false });

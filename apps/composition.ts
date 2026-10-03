@@ -80,6 +80,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     sessionInputs: database.data.sessionInputs,
     workspaceVerifier,
     contextService,
+    contextRepository: database.data.context,
     isSessionManaging: sessionId => sessionService?.isManaging(sessionId) ?? false,
     provider,
     agent,

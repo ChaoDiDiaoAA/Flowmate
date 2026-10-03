@@ -58,6 +58,7 @@ function fixture(legacy = false, preparedMarker: 'p8-context-v1' | undefined = u
     } }); }, releaseSession: async () => ({ stopped: true, closed: true, errors: [] }), close: async () => ({ stopped: true, closed: true, errors: [] }) };
   const service = new ContextService({ store, materials: { inspectParsed() { throw new Error('Chat cannot inspect material.'); } } });
   const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent,
+    contextRepository: store.context,
     ...(legacy ? {} : { contextService: { build: request => { builds++; expect(store.db.inTransaction).toBe(true); return service.build(request); } } }),
     provider: { async prepare() { throw new Error('No direct provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });

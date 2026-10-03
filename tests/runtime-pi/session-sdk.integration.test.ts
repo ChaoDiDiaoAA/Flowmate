@@ -245,6 +245,31 @@ async function createTempWorkspace() {
 }
 
 describe('Pi 0.85.1 AgentSession contract', () => {
+  it('clones an empty-extension context before conversion and exposes the controlled identity transform', async () => {
+    const originalFetch = globalThis.fetch;
+    const harness = makeFetchHarness(); Reflect.set(globalThis, 'fetch', harness.fetch);
+    const workspace = await createTempWorkspace();
+    let session: Awaited<ReturnType<typeof createFixtureSession>>['session'] | undefined;
+    try {
+      const fixture = await createFixtureRuntime();
+      const created = await createFixtureSession(workspace.cwd, workspace.agentDir, fixture.runtime, fixture.model);
+      session = created.session;
+      const original = session.agent.convertToLlm.bind(session.agent);
+      const identities: boolean[] = [];
+      session.agent.convertToLlm = async messages => {
+        const savedUsers = created.manager.buildContextEntries().filter(entry => entry.type === 'message' && entry.message.role === 'user');
+        identities.push(messages.filter(message => message.role === 'user').every((message, index) => {
+          const entry = savedUsers[index]; return entry?.type === 'message' && entry.message === message;
+        }));
+        return original(messages);
+      };
+      await session.prompt('Identical text.', { expandPromptTemplates: false });
+      session.agent.transformContext = async messages => messages;
+      await session.prompt('Identical text.', { expandPromptTemplates: false });
+      expect(identities).toEqual([false, true]);
+      expect(harness.requests).toHaveLength(2);
+    } finally { session?.dispose(); Reflect.set(globalThis, 'fetch', originalFetch); await rm(workspace.root, { recursive: true, force: true }); }
+  });
   it('binds ordinary Loop message_end by object before persist and idle custom after persist', async () => {
     const originalFetch = globalThis.fetch;
     const harness = makeFetchHarness();

@@ -43,6 +43,7 @@ import type {
   ResolvedRuntimeBudget,
   RuntimeStrategySnapshot,
   RuntimeStrategyPolicy,
+  ContextHooks,
 } from '@flowmate/contracts';
 import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
 import { ensureNativeSession } from '../sessions/service.ts';
@@ -50,6 +51,7 @@ import type { ToolExecutor } from '../tools/executor.ts';
 import type { SessionInputAdmission, SessionInputLedger } from '../sessions/input-ledger.ts';
 import type { WorkspaceVerifier } from '../workspace/verification.ts';
 import type { ContextService } from '../context/service.ts';
+import type { ContextRepository } from '../context/repository.ts';
 
 export interface RuntimeLogger {
   write(event: { at: string; level: 'info' | 'warn' | 'error'; component: string; runId?: number; event: string; code?: string }): void;
@@ -65,6 +67,7 @@ export type RuntimeDependencies = {
   sessionInputs?: SessionInputLedger;
   workspaceVerifier?: WorkspaceVerifier;
   contextService?: Pick<ContextService, 'build'>;
+  contextRepository?: Pick<ContextRepository, 'bindRequest' | 'recordRequest' | 'resolveToolResult'>;
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
@@ -800,6 +803,23 @@ export class RuntimeService {
     const agent = this.dependencies.agent;
     if (context.scope) this.dependencies.tools?.setRunDeadline(active.runId, active.startedAt + request.timeoutMs);
     if (!agent) return this.finishAgent(context, null, appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'), true);
+    const savedRun = this.dependencies.runs.get(active.runId);
+    if (!savedRun.ok) return this.finishAgent(context, null, savedRun.error, true);
+    const p8 = savedRun.data.config.contextPolicyVersion === 'p8-context-v1';
+    const repository = this.dependencies.contextRepository;
+    if (p8 && (!repository || context.contextSnapshotId === undefined))
+      return this.finishAgent(context, null, appError('context_binding_unknown', 'runtime', 'Context persistence is unavailable.', false, active.runId), true);
+    const contextHooks: ContextHooks | undefined = p8 && repository ? {
+      resolveToolResult: source => source.sessionId === request.sessionId
+        ? repository.resolveToolResult(source)
+        : fail(appError('context_binding_unknown', 'runtime', 'Tool result does not belong to this Session.')),
+      bind: value => value.binding.runId === active.runId && value.binding.sessionId === request.sessionId
+        && value.binding.nativeSessionId === session.nativeSessionId ? repository.bindRequest(value)
+        : fail(appError('context_binding_unknown', 'runtime', 'Request does not belong to this Run.')),
+      record: (binding, update) => binding.runId === active.runId && binding.sessionId === request.sessionId
+        && binding.nativeSessionId === session.nativeSessionId ? repository.recordRequest(binding, update)
+        : fail(appError('context_binding_unknown', 'runtime', 'Request does not belong to this Run.')),
+    } : undefined;
     if (context.admission && context.workingDirectory) {
       try {
         if (request.workingDirectory === undefined) mkdirSync(context.workingDirectory, { recursive: true });
@@ -935,6 +955,7 @@ export class RuntimeService {
       sessionId: request.sessionId,
       inputId: context.inputId,
       contextSnapshotId: context.contextSnapshotId,
+      ...(contextHooks ? { contextHooks } : {}),
       promptText: context.promptText,
       runtimeBudget: request.budget, runtimeStrategy: context.runtimeStrategy,
       budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
