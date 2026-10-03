@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AgentRunSnapshot, BusinessEventSnapshot, DocumentSnapshot, JobSnapshot, PromptTraceResult,
-  RunSnapshot, RuntimeEvent, RuntimeState, RuntimeToolView, SessionSnapshot } from '@flowmate/contracts';
+  RunSnapshot, RuntimeEvent, RuntimeState, RuntimeToolView, SessionSnapshot, ContextReference } from '@flowmate/contracts';
 import type { EventViewState } from './event-state.ts';
 
 const eventLabels: Record<RuntimeEvent['type'], string> = {
@@ -21,6 +21,7 @@ type Props = {
   onObserve(runId: number, sessionId: number | null): void; onRefresh(): void;
   onSegment(after: number): void; onRetryPrefix(): void;
   onOpenInvoice(documentId: number): void; onOpenProcessing(jobId: number): void;
+  onOpenContextBasis(input: { sessionId: number; runId: number; context: ContextReference }): void;
 };
 
 export function ActivityPage(props: Props) {
@@ -189,7 +190,9 @@ export function ActivityPage(props: Props) {
           <div><dt>Stopped</dt><dd>{toolDetail.stopped === null ? 'Unknown' : toolDetail.stopped ? 'Confirmed' : 'Unconfirmed'}</dd></div>
           <div><dt>Delivery</dt><dd>{toolDetail.deliveryState.replaceAll('_', ' ')}</dd></div><div><dt>Form update</dt><dd>{toolDetail.formApplicationOutcome ?? 'Not applicable'}</dd></div>
           {toolDetail.committedCandidateId !== null && snapshot?.jobId && <div><dt>Saved result</dt><dd><button className="text-button" onClick={() => props.onOpenProcessing(snapshot.jobId!)}>View saved result</button></dd></div>}
-          {toolDetail.errorCode && <div><dt>Issue</dt><dd>{toolDetail.errorCode}</dd></div>}</dl>}</div>
+          {toolDetail.errorCode && <div><dt>Issue</dt><dd>{toolDetail.errorCode}</dd></div>}
+          {toolDetail.context && <div><dt>Context</dt><dd><button className="text-button" onClick={() => props.onOpenContextBasis({ sessionId: toolDetail.sessionId,
+            runId: toolDetail.runId, context: toolDetail.context! })}>View original context basis</button></dd></div>}</dl>}</div>
       <details className="activity-diagnostics"><summary onClick={() => void loadTrace()}>Model request diagnostics</summary>
         <p>This diagnostic buffer belongs to the current process and is separate from saved activity.</p>
         {traceError ? <p role="alert">Model request diagnostics are unavailable.</p> : trace && <><p>{trace.availability === 'evicted' ? 'These diagnostics were evicted from the process buffer.' : trace.availability === 'process-exited' ? 'The process that collected these diagnostics has exited.' : trace.availability.replaceAll('-', ' ')} · {trace.calls.length} request(s) · {trace.droppedCalls ?? 'Unknown'} evicted request(s)</p>

@@ -13,6 +13,8 @@ import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJ
 import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type MessageViewState } from './message-state.ts';
 import { ActivityPage } from './activity.tsx';
 import { WorkspacePage } from './workspace.tsx';
+import { SessionDetails, type ContextBasis } from './session-details.tsx';
+import { hasNewContextEvents } from './context-state.ts';
 import { createWorkspaceState, beginWorkspaceRequest, acceptWorkspaceSnapshot, failWorkspaceRequest,
   resetWorkspaceHost, sameWorkspaceBasis, sameWorkspaceSelection, selectionLabel, workspaceReady, type WorkspaceState } from './workspace-state.ts';
 import { createEventView, bindEventSubscription, applyEventWake, applyEventRead, eventReadRequest,
@@ -165,6 +167,11 @@ export function App() {
   const [sidebarRenameTitle, setSidebarRenameTitle] = useState('');
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
+  const [sessionDetails, setSessionDetails] = useState<{ sessionId: number; basis: ContextBasis | null; token: number } | null>(null);
+  const [contextRefresh, setContextRefresh] = useState(0);
+  const [contextSourceError, setContextSourceError] = useState<string | null>(null);
+  const contextNavigation = useRef(0);
+  const contextTarget = useRef<{ sessionId: number; runId: number | null } | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null);
   const [workspaceState, setWorkspaceState] = useState(createWorkspaceState);
   const [workspacePending, setWorkspacePending] = useState(0);
@@ -334,7 +341,9 @@ export function App() {
             window.flowmate.listRunToolCalls({ runId: request.runId, sessionId: request.sessionId, limit: 50 }),
           ]);
           if (!observation.wanted || generation !== observation.view.generation || observation.view.subscriptionId !== id) return;
+          const previousView = observation.view;
           observation.view = applyEventRead(observation.view, result, request, generation);
+          if (contextTarget.current && hasNewContextEvents(previousView, observation.view, contextTarget.current)) setContextRefresh(value => value + 1);
           observation.snapshotError = !snapshot.ok || snapshot.data.runId !== request.runId || snapshot.data.sessionId !== request.sessionId;
           if (snapshot.ok && !observation.snapshotError) observation.snapshot = snapshot.data;
           observation.toolsError = !tools.ok;
@@ -1531,6 +1540,41 @@ export function App() {
     }
   }
 
+  function closeSessionDetails() {
+    contextNavigation.current++; contextTarget.current = null; setSessionDetails(null); setContextSourceError(null);
+  }
+  function openSessionDetails(sessionId: number, basis: ContextBasis | null = null) {
+    const token = ++contextNavigation.current;
+    contextTarget.current = { sessionId, runId: basis?.runId ?? null };
+    setContextSourceError(null); setSessionDetails({ sessionId, basis, token });
+  }
+  async function openCandidateContextBasis(original: CandidateSummary) {
+    const epoch = workspaceHostEpoch.current, token = ++contextNavigation.current;
+    const current = () => hostReadyRef.current && workspaceHostEpoch.current === epoch && contextNavigation.current === token;
+    setContextSourceError(null);
+    try {
+      let candidate = original;
+      const seen = new Set<number>();
+      while (candidate.origin === 'human_edit' && candidate.basedOnCandidateId != null) {
+        if (seen.has(candidate.candidateId)) throw new Error('Candidate basis cycle');
+        seen.add(candidate.candidateId);
+        const result = await window.flowmate.queryJobCandidate({ jobId: original.jobId, candidateId: candidate.basedOnCandidateId });
+        if (!current()) return;
+        if (!result.ok || result.data.candidate.jobId !== original.jobId || result.data.candidate.candidateId !== candidate.basedOnCandidateId)
+          throw new Error('Candidate basis not verified');
+        candidate = result.data.candidate;
+      }
+      if ((candidate.origin ?? 'model') !== 'model' || candidate.runId === null || candidate.context === null) {
+        if (current()) setContextSourceError('Evidence unavailable · No model context basis was saved.'); return;
+      }
+      const result = await window.flowmate.queryRun(candidate.runId);
+      if (!current()) return;
+      if (!result.ok || result.data.kind !== 'agent' || result.data.runId !== candidate.runId || result.data.jobId !== original.jobId
+        || typeof result.data.sessionId !== 'number' || !Number.isSafeInteger(result.data.sessionId) || result.data.sessionId < 1) throw new Error('Original Run not verified');
+      openSessionDetails(result.data.sessionId, { sessionId: result.data.sessionId, runId: result.data.runId, context: candidate.context });
+    } catch { if (current()) setContextSourceError('The original candidate context could not be loaded. Refresh to try again.'); }
+  }
+
   async function createNewSession(preserveDraft = false): Promise<SessionSnapshot | null> {
     if (!await confirmFormLeave()) return null;
     if (!state?.ready || sessionLoading || sessionMutating) return null;
@@ -2565,6 +2609,7 @@ export function App() {
             historicalView={historicalInvoiceView}
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
+            onOpenContextBasis={candidate => void openCandidateContextBasis(candidate)}
             onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)}
             formControls={invoiceFormControls}
             dependentReady={dependentReady}
@@ -2611,6 +2656,7 @@ export function App() {
             selectedJobId={historyJobId ?? workspace?.jobId ?? null}
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
+            onOpenContextBasis={candidate => void openCandidateContextBasis(candidate)}
             activity={activity}
             notice={notice}
             onOpenJob={(jobId) => void openJob(jobId)}
@@ -2631,6 +2677,7 @@ export function App() {
             onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onLoadMore={() => void loadMoreSessions()} />
         ) : page === 'activity' ? (
           <ActivityPage sessions={sessions} selectedSessionId={selectedSessionId} jobs={jobs} documents={documents}
+            onOpenContextBasis={basis => openSessionDetails(basis.sessionId, basis)}
             currentRun={run} runtime={runtimeState} view={activityView} snapshot={activitySnapshot} tools={activityTools}
             snapshotError={activitySnapshotError} toolsError={activityToolsError} toolsVerified={activityToolsVerified}
             nextToolId={activityToolCursor} toolsLoading={activityToolsLoading} onLoadMoreTools={() => void loadEarlierActivityTools()}
@@ -2772,6 +2819,7 @@ export function App() {
         historyError={historyError}
         runFeedbacks={runFeedbacks}
         onRefreshHistory={() => { if (selectedSessionIdRef.current !== null) void loadSession(selectedSessionIdRef.current); }}
+        onSessionDetails={() => { if (selectedSessionIdRef.current !== null) openSessionDetails(selectedSessionIdRef.current); }}
         transcriptRef={chatTranscriptRef}
         input={chatInput}
         runtimeLimits={<details className="next-run-limits"><summary>Next Run limits</summary>
@@ -2823,6 +2871,11 @@ export function App() {
                 : !modelReady ? 'Save a model and its API key to start a chat.'
                   : goalMode === 'save-candidate' && (!workspace?.documentRef || !workspace.jobId) ? 'Process an invoice first to generate a result.' : ''}
       />
+      {contextSourceError && !sessionDetails && <p className="notice bad context-source-error" role="alert">{contextSourceError}</p>}
+      {sessionDetails && <SessionDetails key={sessionDetails.token} sessionId={sessionDetails.sessionId} basis={sessionDetails.basis}
+        navigationToken={sessionDetails.token} hostEpoch={workspaceHostEpoch.current} hostReady={Boolean(state?.ready)} refreshToken={contextRefresh}
+        sourceError={contextSourceError} onClose={closeSessionDetails} onRunChange={id => { contextNavigation.current++; contextTarget.current = { sessionId: sessionDetails.sessionId, runId: id }; }}
+        onOpenCandidateBasis={candidate => void openCandidateContextBasis(candidate)} />}
     </div>
   );
 }
@@ -2924,6 +2977,7 @@ function InvoicesPage(props: {
   historicalView: 'original' | 'parsed' | 'candidate';
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
+  onOpenContextBasis(candidate: CandidateSummary): void;
   formControls: ReactNode;
   dependentReady: boolean;
   onSelectCandidate(jobId: number, candidateId: number): void;
@@ -2986,7 +3040,7 @@ function InvoicesPage(props: {
       {view === 'candidate' && !historical && workspace && <div className="invoice-results">{candidates.length === 0
         ? <div className="empty-route"><strong>No results yet</strong><span>Choose Process this invoice, then send the request in Assistant.</span></div>
         : <div className="model-list">{candidates.map((item) => <button className="route-row" key={item.candidateId} onClick={() => workspace.jobId && props.onOpenCandidate(workspace.jobId, item.candidateId)}><span className="route-icon">✓</span><span className="route-name"><strong>Result {item.sequence}</strong><small>{item.issueCount ? `${item.issueCount} issues to review` : 'No issues found'} · {new Date(item.createdAt).toLocaleDateString()}</small></span></button>)}</div>}
-        {candidateDetail && <><CandidateDetails detail={candidateDetail} />
+        {candidateDetail && <><CandidateDetails detail={candidateDetail} onOpenContextBasis={props.onOpenContextBasis} />
           {workspace.jobId && <button className="secondary-button" disabled={workspace.candidateRef?.id === candidateDetail.candidate.candidateId}
             onClick={() => props.onSelectCandidate(workspace.jobId!, candidateDetail.candidate.candidateId)}>Select result</button>}
           </>}{props.formControls}</div>}
@@ -3010,6 +3064,7 @@ function TasksPage(props: {
   selectedJobId: number | null;
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
+  onOpenContextBasis(candidate: CandidateSummary): void;
   activity: readonly BusinessEventSnapshot[];
   notice: Notice;
   onOpenJob(jobId: number): void;
@@ -3041,7 +3096,7 @@ function TasksPage(props: {
             {!documentInfo(job.documentRef.id)?.isHidden && item.status === 'generated' && item.candidateId !== job.currentCandidateId && <button className="secondary-button" onClick={() => props.onSelectCandidate(job.jobId, item.candidateId)}>Select</button>}
           </div>)}</div>}
       </section>
-      {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><h2>Result details</h2></div><CandidateDetails detail={candidateDetail} /></section>}
+      {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><h2>Result details</h2></div><CandidateDetails detail={candidateDetail} onOpenContextBasis={props.onOpenContextBasis} /></section>}
       <section className="panel profile-panel"><div className="panel-head"><h2>Activity</h2></div>
         {activity.length === 0 ? <p className="config-note">No actions recorded yet.</p> : <ol>{activity.map((event) => <li key={event.id}><strong>{activityLabel(event.type)}</strong> · {event.result} · {event.safeSummary} · {new Date(event.occurredAt).toLocaleString()}</li>)}</ol>}
       </section>
@@ -3096,9 +3151,10 @@ function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, op
   </section>;
 }
 
-function CandidateDetails({ detail }: { detail: CandidateJobDetail }) {
+function CandidateDetails({ detail, onOpenContextBasis }: { detail: CandidateJobDetail; onOpenContextBasis(candidate: CandidateSummary): void }) {
   const candidate = detail.candidate;
   return <div className="candidate-details">
+    {(candidate.context || candidate.basedOnCandidateId) && <button className="text-button" onClick={() => onOpenContextBasis(candidate)}>View original context basis</button>}
     <div className="profile-fields">{Object.entries(candidate.fields).map(([name, field]) => <div key={name}><strong>{name.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase())}</strong><p>{field.normalized ?? field.raw ?? '—'}</p><small>{field.state.replaceAll('_', ' ')}</small></div>)}</div>
     {candidate.lines.length > 0 && <><h3>Line items</h3><ul>{candidate.lines.map((line, index) => <li key={index}>{line.description.raw ?? 'Unnamed item'} · {line.quantity.normalized ?? line.quantity.raw ?? '—'} × {line.unitPrice.normalized ?? line.unitPrice.raw ?? '—'} = {line.totalAmount.normalized ?? line.totalAmount.raw ?? '—'}</li>)}</ul></>}
     <h3>Issues</h3>{candidate.issues.length ? <ul>{candidate.issues.map((issue, index) => <li key={index}>{issue.severity} · {issue.message}</li>)}</ul> : <p className="config-note">No validation issues.</p>}
@@ -3144,6 +3200,7 @@ function AgentChatPanel({
   historyError,
   runFeedbacks,
   onRefreshHistory,
+  onSessionDetails,
   transcriptRef,
   input,
   runtimeLimits,
@@ -3191,6 +3248,7 @@ function AgentChatPanel({
   historyError: string | null;
   runFeedbacks: readonly RunFeedback[];
   onRefreshHistory(): void;
+  onSessionDetails(): void;
   transcriptRef: RefObject<HTMLDivElement | null>;
   input: string;
   runtimeLimits: ReactNode;
@@ -3235,6 +3293,7 @@ function AgentChatPanel({
     </header>
     <div className="chat-model-row"><span className={`status-dot ${modelName ? 'is-ready' : 'is-error'}`} /><div><strong>{modelName ?? 'Set up a model in Settings'}</strong></div></div>
     {selectedSession && <div className="chat-session-state"><span className={`status-dot ${selectedSession.availability === 'ready' ? 'is-ready' : selectedSession.availability === 'busy' ? 'is-warning' : 'is-error'}`} />
+      <button className="text-button" type="button" onClick={onSessionDetails}>Session details</button>
       <span>{selectedSession.deletePending ? 'Delete incomplete · retry Delete in Chats' : selectedSession.status === 'archived' ? 'Archived · unarchive in Chats to continue'
         : selectedSession.historyState === 'legacy-read-only' ? 'Read only · older conversation' : selectedSession.historyState === 'invalid' ? 'History cannot be restored' : selectedSession.availability === 'ready' ? 'Ready' : selectedSession.availability === 'busy' ? 'Responding' : selectedSession.availability === 'unusable' ? 'Cannot continue' : 'Unavailable'}</span>
     </div>}
