@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { AppErrorSchema } from './runtime.ts';
 import type { AppError, Result } from './runtime.ts';
+import { CONTEXT_ERROR_FACTS } from './errors.ts';
+export { CONTEXT_ERROR_FACTS } from './errors.ts';
 import { DocumentRefSchema, InvoiceIssueSchema, ParsedBlockSchema, SourceRefSchema, StoredInvoiceFieldSchema,
   invoiceHeaderFields, invoiceLineFields, MAX_INVOICE_BLOCKS_PER_PAGE, MAX_INVOICE_LINES, MAX_INVOICE_PAGES } from './invoice.ts';
 import { WorkspaceContextSchema, WorkspaceInputSchema, WorkspaceSelectionSchema } from './workspace.ts';
@@ -53,11 +55,6 @@ export const CONTEXT_SAFE_ERROR_CODES = [
 ] as const;
 export const ContextSafeErrorCodeSchema = z.enum(CONTEXT_SAFE_ERROR_CODES);
 export type ContextSafeErrorCode = z.infer<typeof ContextSafeErrorCodeSchema>;
-export const CONTEXT_ERROR_FACTS: Readonly<Partial<Record<ContextSafeErrorCode, readonly [AppError['category'], boolean]>>> = {
-  context_evidence_too_large: ['runtime', false], context_binding_unknown: ['runtime', false],
-  context_binding_conflict: ['runtime', false], context_payload_mismatch: ['runtime', false],
-  context_snapshot_not_found: ['input', false], provider_transport_error: ['provider', false], internal_error: ['internal', false],
-};
 function checkErrorFacts(error: { code: ContextSafeErrorCode; category: AppError['category']; retryable: boolean }, context: z.RefinementCtx) {
   const facts = CONTEXT_ERROR_FACTS[error.code];
   if (facts && (error.category !== facts[0] || error.retryable !== facts[1])) report(context, 'Context error facts disagree with its registered code.');

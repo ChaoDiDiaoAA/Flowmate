@@ -12,7 +12,8 @@ import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
-import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand } from './protocol.ts';
+import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand, isContextHostCommand,
+  parseContextHostResult, matchesContextResponse, contextHostFailure } from './protocol.ts';
 import type { HostCommand, HostOutput } from './protocol.ts';
 
 for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) {
@@ -198,6 +199,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     send({ version: 1, type: 'response', requestId: command.requestId,
       value: checked ?? (command.type === 'query_runtime_events' ? { ok: false, error, context: null } : fail(error)) });
   };
+  const contextReply = (command: HostCommand, value: unknown) => {
+    const checked = parseContextHostResult(command.type, value);
+    return send({ version: 1, type: 'response', requestId: command.requestId,
+      value: checked !== null && matchesContextResponse(command, checked) ? checked : contextHostFailure() });
+  };
   const catalog = await createPiModelCatalog();
   const requireDesktopPiKey = async (profile: ModelProfile): Promise<Result<void>> => {
     const revision = currentSettings.revision;
@@ -309,6 +315,9 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     }
     if (command.type === 'list_run_tool_calls') { runtimeReply(command, await application.listRunToolCalls(command.input)); return; }
     if (command.type === 'query_run_tool_call') { runtimeReply(command, await application.queryRunToolCall(command.input)); return; }
+    if (command.type === 'list_context_snapshots') { await contextReply(command, await application.listContextSnapshots(command.input)); return; }
+    if (command.type === 'query_context_snapshot') { await contextReply(command, await application.queryContextSnapshot(command.input)); return; }
+    if (command.type === 'list_context_requests') { await contextReply(command, await application.listContextRequests(command.input)); return; }
     if (command.type === 'invoice_form_response') {
       const pending = pendingForms.get(command.requestId);
       if (!pending) return;
@@ -829,6 +838,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       const error = appError('host_command_failed', 'runtime', 'Host 命令处理失败。', true);
       if (isRuntimeHostCommand(command.type)) runtimeReply(command, command.type === 'query_runtime_events'
         ? { ok: false, error, context: null } : fail(error));
+      else if (isContextHostCommand(command.type)) void contextReply(command, contextHostFailure());
       else send({ version: 1, type: 'response', requestId: command.requestId, value: fail(error) });
     });
   });

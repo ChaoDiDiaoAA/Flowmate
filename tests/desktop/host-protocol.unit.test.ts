@@ -38,6 +38,22 @@ describe('P7 Workspace protocol', () => {
   });
 });
 
+describe('P8 Context commands', () => {
+  it.each(['list_context_snapshots', 'list_context_requests'] as const)('normalizes %s and rejects forged request fields', type => {
+    const input = { sessionId: 1, ...(type === 'list_context_requests' ? { runId: 2 } : {}) };
+    expect(parseHostCommand({ version: 1, requestId: 'context-page', type, input }))
+      .toMatchObject({ version: 1, requestId: 'context-page', type, input: { ...input, limit: 20 } });
+    for (const patch of [{ limit: 21 }, { limit: 0 }, { extra: true }, { beforeId: 0 }, { beforeRequestSequence: 0 }])
+      expect(parseHostCommand({ version: 1, requestId: 'context-page', type, input: { ...input, ...patch } })).toBeNull();
+  });
+  it('requires original detail identities without accepting internal material', () => {
+    const command = { version: 1 as const, requestId: 'context-detail', type: 'query_context_snapshot' as const, input: { sessionId: 1, runId: 2, snapshotId: 3 } };
+    expect(parseHostCommand(command)).toEqual(command);
+    expect(parseHostCommand({ ...command, input: { ...command.input, promptText: 'forged' } })).toBeNull();
+    expect(parseHostCommand({ ...command, input: { sessionId: 1, snapshotId: 3 } })).toBeNull();
+  });
+});
+
 describe('versioned desktop Host protocol', () => {
   it('shares new Run budget bounds across chat, ordinary Run, and Fill while active inputs cannot override them', () => {
     const overrides = { budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 }, timeoutMs: 1_800_000, stopGraceMs: 10_000 };

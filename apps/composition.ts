@@ -120,6 +120,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     events: database.data.businessEvents,
     runtimeEvents: database.data.runtimeEvents,
     toolCalls: database.data.toolCalls,
+    contextService,
     ...(invoiceForms ? { invoiceForms } : {}),
     invoiceEdits,
     importInvoiceMaterial: (sourceDirectory) => documents.importVoxel51({ sourceDirectory }),

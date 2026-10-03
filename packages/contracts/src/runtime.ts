@@ -522,6 +522,9 @@ export interface Application {
     listener: (wake: import('./events.ts').RuntimeEventsAvailable) => void): Promise<Result<import('./events.ts').RuntimeEventSubscription>>;
   listRunToolCalls(input: import('./events.ts').RunToolCallsRequest): Promise<Result<import('./workspace.ts').Page<import('./events.ts').RuntimeToolView>>>;
   queryRunToolCall(input: import('./events.ts').RunToolCallRequest): Promise<Result<import('./events.ts').RuntimeToolView>>;
+  listContextSnapshots(input: import('./context.ts').ContextSnapshotsRequest): Promise<Result<import('./context.ts').ContextSnapshotsPage>>;
+  queryContextSnapshot(input: import('./context.ts').ContextSnapshotRequest): Promise<Result<import('./context.ts').ContextSnapshotDetail>>;
+  listContextRequests(input: import('./context.ts').ContextRequestsRequest): Promise<Result<import('./context.ts').ContextRequestsPage>>;
   createSession(request?: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
   queryNativeTools(): Promise<Result<readonly import('./tools.ts').NativeToolAvailability[]>>;
   renameSession(request: RenameSessionRequest): Promise<Result<SessionSnapshot>>;

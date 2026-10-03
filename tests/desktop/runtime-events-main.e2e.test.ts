@@ -323,3 +323,140 @@ it('P6 real Main releases a subscription when its actual IPC wake delivery throw
   } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
   finally { complete?.(); await server.stop(); await closeDesktopFixture(app, userData, failure); }
 });
+
+it('T08 real Electron exposes all three Context queries through Main and Preload', async () => {
+  const {app,page,userData}=await fixture();let failure:Error|undefined;
+  try {
+    expect(await page.evaluate(()=>({ snapshots:typeof window.flowmate.listContextSnapshots,
+      detail:typeof window.flowmate.queryContextSnapshot,requests:typeof window.flowmate.listContextRequests })))
+      .toEqual({snapshots:'function',detail:'function',requests:'function'});
+    const session=await page.evaluate(()=>window.flowmate.createSession({title:'Empty Context query'}));
+    if(!session.ok)throw new Error(session.error.code);
+    expect(await page.evaluate(sessionId=>window.flowmate.listContextSnapshots({sessionId}),session.data.sessionId))
+      .toMatchObject({ok:true,data:{sessionId:session.data.sessionId,runId:null,items:[],nextBeforeId:null}});
+    expect(await page.evaluate(sessionId=>window.flowmate.queryContextSnapshot({sessionId,runId:1,snapshotId:999}),session.data.sessionId))
+      .toMatchObject({ok:false,error:{code:'state_conflict',category:'runtime',retryable:false}});
+    expect(await page.evaluate(sessionId=>window.flowmate.listContextRequests({sessionId,runId:1}),session.data.sessionId))
+      .toMatchObject({ok:false,error:{code:'state_conflict',category:'runtime',retryable:false}});
+  }catch(error){failure=error instanceof Error?error:new Error(String(error));throw failure;}
+  finally{await closeDesktopFixture(app,userData,failure);}
+});
+
+it('T08 real Main preserves original Context evidence and rejects trust, malformed receipts and closing without replay', async () => {
+  const {app,page,userData}=await fixture();let failure:Error|undefined,requests=0;
+  const server=await createHttpProvider(()=>{requests++;
+    const chunk=(delta:unknown,finish_reason:string|null)=>'data: '+JSON.stringify({id:'t08-original-response',choices:[{index:0,delta,finish_reason}]})+'\n\n';
+    return new Response(chunk({role:'assistant',content:'Original Context answer'},null)+chunk({},'stop')+'data: [DONE]\n\n',
+      {headers:{'content-type':'text/event-stream'}});
+  });
+  try {
+    expect(await page.evaluate(async baseUrl=>{
+      const state=await window.flowmate.getState();if(!state.ok)return state;
+      return window.flowmate.saveSettings({...state.data.settings,models:[{id:'t08-main',credentialRef:'t08_main_controlled_key',name:'T08 Main',kind:'custom',providerId:null,
+        baseUrl,model:'t08-main',api:'openai-completions',contextWindow:64000,maxTokens:16384,reasoning:false}],defaultModelId:'t08-main'},
+        {modelId:'t08-main',apiKey:'synthetic-t08-main-key'});
+    },`http://127.0.0.1:${server.port}/v1`)).toMatchObject({ok:true});
+    const session=await page.evaluate(()=>window.flowmate.createSession({title:'Original Context'}));if(!session.ok)throw new Error(session.error.code);
+    const workspace=await page.evaluate(async sessionId=>{
+      const current=await window.flowmate.readWorkspace();if(!current.ok)return current;
+      return window.flowmate.updateWorkspace({expectedRevision:current.data.revision,change:{kind:'session',sessionId}});
+    },session.data.sessionId);if(!workspace.ok)throw new Error(workspace.error.code);
+    const accepted=await page.evaluate(({sessionId,workspace})=>window.flowmate.submitInput({sessionId,clientSequence:1,mode:'prompt',goalMode:'answer',modelId:'t08-main',
+      text:'User text C:/user/receipt.txt',workspace:{revision:workspace.revision,documentRef:workspace.documentRef,jobId:workspace.jobId,candidateRef:workspace.candidateRef,sessionId}}),
+      {sessionId:session.data.sessionId,workspace:workspace.data});
+    if(!accepted.ok)throw new Error(accepted.error.code);
+    await expect.poll(()=>page.evaluate(()=>window.flowmate.queryRuntimeState())).toMatchObject({ok:true,data:{active:null}});
+    const input={sessionId:session.data.sessionId,runId:accepted.data.runId};
+    const snapshots=await page.evaluate(value=>window.flowmate.listContextSnapshots(value),input);
+    expect(snapshots).toMatchObject({ok:true,data:{...input,items:[{inputId:accepted.data.inputId,mode:'prompt'}]}});
+    if(!snapshots.ok||!snapshots.data.items[0])throw new Error('Missing actual snapshot');
+    const detailInput={...input,snapshotId:snapshots.data.items[0].id};
+    const detail=await page.evaluate(value=>window.flowmate.queryContextSnapshot(value),detailInput);
+    expect(detail).toMatchObject({ok:true,data:{snapshot:{id:detailInput.snapshotId,json:{text:'User text C:/user/receipt.txt',hasWorkingDirectory:true}},
+      input:{inputId:accepted.data.inputId,status:'consumed',processingStatus:'completed'}}});
+    expect(JSON.stringify(detail)).not.toContain(userData);
+    const evidence=await page.evaluate(value=>window.flowmate.listContextRequests(value),input);
+    expect(evidence).toMatchObject({ok:true,data:{...input,collection:'collected',items:[{binding:{...input,inputId:accepted.data.inputId,snapshotId:detailInput.snapshotId},
+      sdkPayload:{inclusion:'confirmed'},attempts:[{attempt:1,responseStatus:200,nativeRequestId:null}]}]}});
+    expect(requests).toBe(1);
+    const baseline=(await mainTrace(app)).commands.length;
+    // The live Main handlers, child pipe and Preload remain intact. Only the next actual reply bytes or close write are controlled.
+    await app.evaluate((_electron,root)=>{
+      const handles=(process as typeof process & {_getActiveHandles():unknown[]})._getActiveHandles();
+      const child=handles.find(value=>value&&typeof value==='object'&&'spawnargs'in value&&Array.isArray(value.spawnargs)&&value.spawnargs.includes(root)
+        &&value.spawnargs.includes('apps/host/main.ts')) as import('node:child_process').ChildProcessWithoutNullStreams|undefined;
+      if(!child?.stdin||!child.stdout)throw new Error('Actual owned Host missing');
+      const types=new Map<string,string>(),trace:{type:string;requestId:string}[]=[];let fault:string|null=null,hold=false;
+      let held:unknown[]|null=null;const write=child.stdin.write,emit=child.stdout.emit;let bytes=Buffer.alloc(0);
+      child.stdin.write=function(chunk:unknown,encodingOrCallback?:BufferEncoding|((error:Error|null|undefined)=>void),callback?:(error:Error|null|undefined)=>void){
+        const args=[chunk,encodingOrCallback,callback];
+        const command=JSON.parse(String(chunk));types.set(command.requestId,command.type);
+        if(command.type.includes('context'))trace.push({type:command.type,requestId:command.requestId});
+        if(command.type==='close'&&hold){held=args;return true;}
+        return Reflect.apply(write,this,args);
+      };
+      child.stdout.emit=function(event:string,...values:unknown[]){
+        if(event!=='data'||!Buffer.isBuffer(values[0]))return Reflect.apply(emit,this,[event,...values]);
+        bytes=Buffer.concat([bytes,values[0]]);const forward:Buffer[]=[];
+        for(let newline=bytes.indexOf(10);newline!==-1;newline=bytes.indexOf(10)){
+          let line=bytes.subarray(0,newline+1);bytes=bytes.subarray(newline+1);const packet=JSON.parse(line.toString());
+          if(packet.type==='response'&&types.get(packet.requestId)?.includes('context')&&fault){
+            if(fault==='owner'){if(packet.value.data.snapshot){packet.value.data.snapshot.id=999999;}else packet.value.data.sessionId=999999;}
+            else packet.value={ok:false,error:{code:'host_command_failed',category:'runtime',retryable:true,message:'private/raw/SDK exception'}};
+            line=Buffer.from(JSON.stringify(packet)+'\n');fault=null;
+          } forward.push(line);
+        }return forward.length?Reflect.apply(emit,this,[event,Buffer.concat(forward),...values.slice(1)]):true;
+      };
+      Reflect.set(globalThis,'t08ContextGate',{arm(value:string){fault=value;},snapshot(){return {trace,held:held!==null};},
+        holdClose(){hold=true;},releaseClose(){hold=false;if(held){Reflect.apply(write,child.stdin,held);held=null;}}});
+    },userData);
+    for(const kind of ['snapshots','detail','requests'] as const){
+      const query=()=>page.evaluate(async({kind,input,detailInput})=>kind==='snapshots'?window.flowmate.listContextSnapshots(input)
+        :kind==='detail'?window.flowmate.queryContextSnapshot(detailInput):window.flowmate.listContextRequests(input),{kind,input,detailInput});
+      for(const fault of ['owner','unsafe-error']){
+        await app.evaluate((_electron,value)=>Reflect.get(globalThis,'t08ContextGate').arm(value),fault);
+        expect(await query()).toEqual({ok:false,error:{code:'internal_error',category:'internal',retryable:false,message:'Context query could not be completed.'}});
+      }
+      const trusted=await app.evaluate(async({ipcMain,BrowserWindow},{kind,input,detailInput})=>{
+        const channel=kind==='snapshots'?'flowmate:list-context-snapshots':kind==='detail'?'flowmate:query-context-snapshot':'flowmate:list-context-requests';
+        const handlers=(ipcMain as unknown as {_invokeHandlers:Map<string,(event:unknown,input:unknown)=>Promise<unknown>>})._invokeHandlers;
+        const main=BrowserWindow.getAllWindows()[0]!,other=new BrowserWindow({show:false});await other.loadURL('about:blank');
+        try{return {wrongSender:await handlers.get(channel)!({sender:other.webContents,senderFrame:other.webContents.mainFrame},kind==='detail'?detailInput:input),
+          wrongFrame:await handlers.get(channel)!({sender:main.webContents,senderFrame:other.webContents.mainFrame},kind==='detail'?detailInput:input)};}
+        finally{other.destroy();}
+      },{kind,input,detailInput});
+      for(const result of Object.values(trusted))expect(result).toEqual({ok:false,error:{code:'internal_error',category:'internal',retryable:false,message:'Context query could not be completed.'}});
+      expect(await query()).toEqual(kind==='snapshots'?snapshots:kind==='detail'?detail:evidence);
+    }
+    expect(await page.evaluate(async input=>window.flowmate.listContextRequests({...input,limit:21}),input))
+      .toMatchObject({ok:false,error:{code:'input_invalid',category:'input',retryable:false}});
+    const originalUrl=page.url();await page.goto('data:text/html,<title>untrusted url</title>');
+    for(const result of await page.evaluate(async({input,detailInput})=>[await window.flowmate.listContextSnapshots(input),
+      await window.flowmate.queryContextSnapshot(detailInput),await window.flowmate.listContextRequests(input)],{input,detailInput}))
+      expect(result).toEqual({ok:false,error:{code:'internal_error',category:'internal',retryable:false,message:'Context query could not be completed.'}});
+    await page.goto(originalUrl);await page.getByRole('heading',{name:'Invoices',exact:true}).waitFor();
+    expect(requests).toBe(1);
+    const queryTrace=await app.evaluate(()=>Reflect.get(globalThis,'t08ContextGate').snapshot().trace);
+    expect(queryTrace).toHaveLength(9);
+    expect([...new Set(queryTrace.map((command:{type:string})=>command.type))].sort())
+      .toEqual(['list_context_requests','list_context_snapshots','query_context_snapshot']);
+    expect((await mainTrace(app)).commands.slice(baseline).filter(command=>['submit_session_input','call_provider','cancel_run'].includes(command.type))).toEqual([]);
+    await app.evaluate(({app})=>{Reflect.get(globalThis,'t08ContextGate').holdClose();app.emit('before-quit',{preventDefault(){}});});
+    await expect.poll(()=>app.evaluate(()=>Reflect.get(globalThis,'t08ContextGate').snapshot().held)).toBe(true);
+    for(const result of await page.evaluate(async({input,detailInput})=>[await window.flowmate.listContextSnapshots(input),
+      await window.flowmate.queryContextSnapshot(detailInput),await window.flowmate.listContextRequests(input)],{input,detailInput}))
+      expect(result).toMatchObject({ok:false,error:{code:'runtime_busy',category:'runtime',retryable:false}});
+    expect(requests).toBe(1);
+    expect(await app.evaluate(()=>Reflect.get(globalThis,'t08ContextGate').snapshot().trace)).toEqual(queryTrace);
+    await it.info().attach('t08-actual-main-context-trace',{body:Buffer.from(JSON.stringify(await app.evaluate(()=>Reflect.get(globalThis,'t08ContextGate').snapshot()))),contentType:'application/json'});
+  }catch(error){failure=error instanceof Error?error:new Error(String(error));throw failure;}
+  finally{
+    await app.evaluate(()=>Reflect.get(globalThis,'t08ContextGate')?.releaseClose()).catch(()=>{});
+    await server.stop();await closeDesktopFixture(app,userData,failure);
+  }
+  const db=new Database(join(userData,'data/app.sqlite'),{readonly:true});
+  try{expect(db.query('SELECT COUNT(*) AS count FROM context_snapshots').get()).toEqual({count:1});
+    expect(db.query('SELECT COUNT(*) AS count FROM session_inputs').get()).toEqual({count:1});
+    expect(db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({count:0});}
+  finally{db.close();}
+});

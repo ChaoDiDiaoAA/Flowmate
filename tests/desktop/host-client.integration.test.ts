@@ -989,8 +989,9 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     const beforeToolsRead = { facts: readToolFacts(savedDb), requests: requests.length, credentials: credentials.length,
       finished: finished.length, upserts: upserts.length };
     expect(beforeToolsRead.facts.counts).toMatchObject({ tools: 1, inputs: 3 });
-    const storedTool = savedDb.query('SELECT id,run_id,session_id,args_json,result_json FROM tool_calls').get() as {
+    const storedTool = savedDb.query('SELECT id,run_id,session_id,args_json,result_json,context_snapshot_id,request_sequence FROM tool_calls').get() as {
       id: number; run_id: number; session_id: number; args_json: string; result_json: string;
+      context_snapshot_id: number; request_sequence: number;
     };
     expect(storedTool).toMatchObject({ run_id: first.data.runId, session_id: sessionId });
     expect(JSON.parse(storedTool.args_json)).toMatchObject({ raw: args, final: args });
@@ -1019,9 +1020,12 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     expect(actualTool.requestedAt).toBeString();
     expect(actualTool.startedAt).toBeString();
     expect(actualTool.endedAt).toBeString();
+    expect(storedTool.context_snapshot_id).toBeGreaterThan(0);
+    expect(storedTool.request_sequence).toBeGreaterThan(0);
+    expect(actualTool.context).toEqual({ snapshotId: storedTool.context_snapshot_id, requestSequence: storedTool.request_sequence });
     expect(Object.keys(actualTool).sort()).toEqual(['toolCallId', 'runId', 'sessionId', 'toolName', 'status',
       'requestedAt', 'startedAt', 'endedAt', 'stoppedAt', 'committedCandidateId', 'errorCode', 'stopped',
-      'deliveryState', 'formApplicationOutcome'].sort());
+      'deliveryState', 'formApplicationOutcome', 'context'].sort());
     expect(RuntimeToolViewSchema.safeParse(actualTool).success).toBe(true);
     expect(JSON.stringify(actualTool)).not.toContain('netAmount');
     expect(JSON.stringify(actualTool)).not.toContain('taxRate');
@@ -1224,3 +1228,132 @@ async function waitFor(check: () => boolean): Promise<void> {
   while (!check() && Date.now() < deadline) await new Promise((resolveWait) => setTimeout(resolveWait, 10));
   expect(check()).toBe(true);
 }
+import { describe } from 'bun:test';
+import { ContextSnapshotsResultSchema, ContextRequestsResultSchema, ContextSnapshotResultSchema, ContextRequestsPageSchema } from '@flowmate/contracts';
+
+const contextAt = '2026-10-03T00:00:00.000Z';
+const contextSummary = { id: 3, sessionId: 1, runId: 2, jobId: null, sequence: 1, createdAt: contextAt,
+  inputId: 4, mode: 'prompt', documentRef: null, candidateRef: null, selection: null, fragmentCount: 0, gapCount: 0 };
+const contextRequest = { binding: { runId: 2, sessionId: 1, nativeSessionId: 'original-native', requestSequence: 3, callSequence: 3,
+  inputId: 4, snapshotId: 3, includedBindings: [{ originRunId: 2, inputId: 4, nativeEntryId: 'user-original', snapshotId: 3 }], includedToolResults: [] },
+  api: 'openai-completions', boundAt: contextAt, sdkPayload: null, transport: 'observed-fetch', attempts: [] };
+const contextReplies = {
+  list_context_snapshots: ContextSnapshotsResultSchema.parse({ ok: true, data: { sessionId: 1, runId: 2, items: [contextSummary], nextBeforeId: 3 } }),
+  list_context_requests: ContextRequestsResultSchema.parse({ ok: true, data: { sessionId: 1, runId: 2, collection: 'collected', items: [contextRequest], nextBeforeRequestSequence: 3 } }),
+  query_context_snapshot: ContextSnapshotResultSchema.parse({ ok: true, data: { snapshot: { id: 3, sessionId: 1, runId: 2, jobId: null, sequence: 1, createdAt: contextAt,
+    json: { version: 1, policyVersion: 'p8-context-v1', text: 'Original text', goalMode: 'answer', workspaceContext: null, hasWorkingDirectory: false,
+      resourcePolicy: 'none', modelProjection: { taskGoal: null, candidate: null, fragments: [], issues: [], gaps: [] },
+      budgets: { projectionBytes: 65536, fragmentBytes: 4096, fragments: 32, issueCount: 20, snapshotBytes: 262144 } } },
+    input: { inputId: 4, sessionId: 1, clientSequence: 1, mode: 'prompt', goalMode: 'answer', runId: 2,
+      status: 'consumed', processingStatus: 'completed', nativeEntryId: 'user-original', resultEntryId: 'assistant-original',
+      dispatchedAt: contextAt, createdAt: contextAt, updatedAt: contextAt, error: null } } }),
+};
+async function contextProtocolFixture(overrides: Record<string, unknown> = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-p8-context-pipe-'));
+  mkdirSync(join(root, 'apps', 'host'), { recursive: true });
+  writeFileSync(join(root, 'apps', 'host', 'main.ts'), `
+    import { createInterface } from 'node:readline';
+    import { createWriteStream } from 'node:fs';
+    const stdout = createWriteStream('', {fd:1,autoClose:false});
+    const replies=${JSON.stringify(contextReplies)}, overrides=${JSON.stringify(overrides)}; let held,lastInput;
+    const respond=(id,value)=>stdout.write(JSON.stringify({version:1,type:'response',requestId:id,value})+'\\n');
+    stdout.write(JSON.stringify({version:1,type:'ready',state:{version:1,ready:true,host:'ready',userDataPath:'synthetic'}})+'\\n');
+    const input=createInterface({input:process.stdin});
+    input.on('line',line=>{const command=JSON.parse(line); lastInput=command.input??lastInput;
+      if(command.type==='get_state'){ if(held)respond(held.id,replies[held.type]);respond(command.requestId,{held:!!held,lastInput});return; }
+      if(command.requestId==='held-context'){held={id:command.requestId,type:command.type};return;}
+      respond(command.requestId,overrides[command.requestId]??replies[command.type]);
+    }); input.on('close',()=>process.exit(0));
+  `); return root;
+}
+
+describe('T08 Context actual HostClient pipe', () => {
+  it('delivers all three strict result shapes and normalizes an omitted limit before sending', async () => {
+    const root=await contextProtocolFixture(), client=new HostClient();
+    expect(await client.start(root,'0.1.0',root)).toMatchObject({ok:true});
+    const child=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;
+    try {
+      expect(await client.request({type:'list_context_snapshots',input:{sessionId:1,runId:2}})).toEqual(contextReplies.list_context_snapshots);
+      expect(await client.request({type:'get_state'})).toMatchObject({lastInput:{sessionId:1,runId:2,limit:20}});
+      expect(await client.request({type:'list_context_requests',input:{sessionId:1,runId:2}})).toEqual(contextReplies.list_context_requests);
+      expect(await client.request({type:'query_context_snapshot',input:{sessionId:1,runId:2,snapshotId:3}})).toEqual(contextReplies.query_context_snapshot);
+    } finally { await finishProtocolChild(child); }
+  });
+  it('rejects empty-page ownership, original cursor and detail ownership violations on the real pipe', async () => {
+    if (!contextReplies.query_context_snapshot.ok) throw new Error('Missing detail fixture');
+    const overrides = {
+      'empty-session':{ok:true,data:{sessionId:9,runId:2,items:[],nextBeforeId:null}},
+      'empty-run':{ok:true,data:{sessionId:1,runId:9,items:[],nextBeforeId:null}},
+      'empty-requests':{ok:true,data:{sessionId:9,runId:2,collection:'collected',items:[],nextBeforeRequestSequence:null}},
+      'detail-owner':{...contextReplies.query_context_snapshot,data:{...contextReplies.query_context_snapshot.data,
+        snapshot:{...contextReplies.query_context_snapshot.data.snapshot,id:999}}},
+    };
+    const root=await contextProtocolFixture(overrides),client=new HostClient();
+    expect(await client.start(root,'0.1.0',root)).toMatchObject({ok:true});const child=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;
+    const invalid = async(command:Parameters<HostClient['request']>[0])=>expect(await client.request(command,500).then(()=> 'resolved',error=>error.message)).toBe('host_protocol_invalid');
+    try {
+      await invalid({type:'list_context_snapshots',requestId:'empty-session',input:{sessionId:1,runId:2}});
+      await invalid({type:'list_context_snapshots',requestId:'empty-run',input:{sessionId:1,runId:2}});
+      await invalid({type:'list_context_requests',requestId:'empty-requests',input:{sessionId:1,runId:2}});
+      await invalid({type:'query_context_snapshot',requestId:'detail-owner',input:{sessionId:1,runId:2,snapshotId:3}});
+      await invalid({type:'list_context_snapshots',input:{sessionId:1,runId:2,beforeId:3}});
+      await invalid({type:'list_context_requests',input:{sessionId:1,runId:2,beforeRequestSequence:3}});
+    } finally { await finishProtocolChild(child); }
+  });
+  it('rejects each failure identity location, unknown codes and unknown fields without laundering the remote response', async () => {
+    const error={code:'state_conflict',category:'runtime',message:'Original mismatch',retryable:false};
+    const overrides={
+      'outer-run':{ok:false,error,runId:9}, 'error-run':{ok:false,error:{...error,runId:9}},
+      'error-session':{ok:false,error:{...error,sessionId:9}}, 'no-filter-run':{ok:false,error,runId:2},
+      'unknown-code':{ok:false,error:{...error,code:'private_provider_secret'}},
+      'unknown-fact':{ok:false,error:{...error,private:'private/raw/path'}},
+      'registered-facts':{ok:false,error},
+    };
+    const root=await contextProtocolFixture(overrides),client=new HostClient();
+    expect(await client.start(root,'0.1.0',root)).toMatchObject({ok:true});const child=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;
+    try {
+      for(const requestId of ['outer-run','error-run','error-session','unknown-code','unknown-fact'])
+        expect(await client.request({type:'list_context_requests',requestId,input:{sessionId:1,runId:2}},500).then(()=> 'resolved',error=>error.message)).toBe('host_protocol_invalid');
+      expect(await client.request({type:'list_context_snapshots',requestId:'no-filter-run',input:{sessionId:1}},500).then(()=> 'resolved',error=>error.message)).toBe('host_protocol_invalid');
+      expect(await client.request({type:'list_context_requests',requestId:'registered-facts',input:{sessionId:1,runId:2}})).toEqual({ok:false,error});
+    } finally { await finishProtocolChild(child); }
+  });
+  it('rejects successful pages over the original limit and whole Result byte budget', async () => {
+    const summaries=Array.from({length:2},(_,i)=>({...contextSummary,id:3-i,inputId:4+i}));
+    const big=Array.from({length:10},(_,i)=>({...contextRequest,binding:{...contextRequest.binding,requestSequence:10-i,callSequence:10-i,
+      includedBindings:Array.from({length:512},()=>({...contextRequest.binding.includedBindings[0],nativeEntryId:'x'}))}}));
+    const oversized={sessionId:1,runId:2,collection:'collected',items:big,nextBeforeRequestSequence:1};
+    let remaining = 1048566 - Buffer.byteLength(JSON.stringify(oversized));
+    for (const request of big) for (const source of request.binding.includedBindings) {
+      const extra = Math.min(remaining, 255); source.nativeEntryId += 'x'.repeat(extra); remaining -= extra;
+    }
+    expect(remaining).toBe(0);
+    expect(ContextRequestsPageSchema.safeParse(oversized).success).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(oversized))).toBeLessThanOrEqual(1048576);
+    expect(Buffer.byteLength(JSON.stringify({ok:true,data:oversized}))).toBeGreaterThan(1048576);
+    const root=await contextProtocolFixture({limit:{ok:true,data:{sessionId:1,runId:2,items:summaries,nextBeforeId:2}},
+      budget:{ok:true,data:oversized}}),client=new HostClient();
+    expect(await client.start(root,'0.1.0',root)).toMatchObject({ok:true});const child=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;
+    try {
+      expect(await client.request({type:'list_context_snapshots',requestId:'limit',input:{sessionId:1,runId:2,limit:1}},1000)
+        .then(()=> 'resolved',error=>error.message)).toBe('host_protocol_invalid');
+      expect(await client.request({type:'list_context_requests',requestId:'budget',input:{sessionId:1,runId:2}},1000)
+        .then(()=> 'resolved',error=>error.message)).toBe('host_protocol_invalid');
+    } finally { await finishProtocolChild(child); }
+  });
+  it('cannot resolve reused Context identity with a late packet from the original child epoch',async()=>{
+    const first=await contextProtocolFixture(),second=await contextProtocolFixture(),client=new HostClient();
+    expect(await client.start(first,'0.1.0',first)).toMatchObject({ok:true});const old=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;
+    let next:ChildProcessWithoutNullStreams|null=null;
+    try {
+      const installed=client.request({type:'list_context_requests',requestId:'held-context',input:{sessionId:1,runId:2}});
+      expect(await client.request({type:'get_state'})).toMatchObject({held:true});await installed;
+      const oldPending=client.request({type:'list_context_requests',requestId:'held-context',input:{sessionId:1,runId:2}}).then(()=> 'resolved',error=>error.message);
+      expect(await client.start(second,'0.1.0',second)).toMatchObject({ok:true});expect(await oldPending).toBe('host_replaced');
+      next=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;let settled=false;
+      const current=client.request({type:'list_context_requests',requestId:'held-context',input:{sessionId:1,runId:2}}).then(value=>{settled=true;return value;});
+      const packet=once(old.stdout,'data');old.stdin.write(JSON.stringify({version:1,type:'get_state',requestId:'old-release'})+'\n');await packet;await Promise.resolve();expect(settled).toBe(false);
+      expect(await client.request({type:'get_state'})).toMatchObject({held:true});expect(await current).toEqual(contextReplies.list_context_requests);
+    }finally{await finishProtocolChild(old);if(next)await finishProtocolChild(next);}
+  });
+});

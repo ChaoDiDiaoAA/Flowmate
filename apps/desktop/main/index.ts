@@ -44,6 +44,10 @@ import {
   RuntimeSubscriptionReleaseResultSchema,
   RuntimeToolPageResultSchema,
   RuntimeToolResultSchema,
+  ContextSnapshotsRequestSchema,
+  ContextSnapshotRequestSchema,
+  ContextRequestsRequestSchema,
+  ContextErrorSchema,
   ok,
 } from '@flowmate/contracts';
 import type {
@@ -82,6 +86,8 @@ import { systemSecureStorage } from './secure-storage.ts';
 import { HostClient } from './host-client.ts';
 import type { HostCredentialRequest } from '../../host/protocol.ts';
 import { DesktopSessionInputRequestSchema, InvoiceFormRunInputSchema } from '../../host/protocol.ts';
+import { contextHostFailure, matchesContextResponse, parseContextHostResult } from '../../host/protocol.ts';
+import type { HostCommand } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
 const channels = {
@@ -100,6 +106,9 @@ const channels = {
   unsubscribeRuntimeEvents: 'flowmate:unsubscribe-runtime-events',
   listRunToolCalls: 'flowmate:list-run-tool-calls',
   queryRunToolCall: 'flowmate:query-run-tool-call',
+  listContextSnapshots: 'flowmate:list-context-snapshots',
+  queryContextSnapshot: 'flowmate:query-context-snapshot',
+  listContextRequests: 'flowmate:list-context-requests',
   createSession: 'flowmate:create-session',
   queryNativeTools: 'flowmate:query-native-tools',
   chooseWorkingDirectory: 'flowmate:choose-working-directory',
@@ -396,13 +405,24 @@ function readProductVersion(appRoot: string): string {
   }
 }
 
+async function contextIpcQuery(command: Extract<HostCommand, { type: 'list_context_snapshots' | 'query_context_snapshot' | 'list_context_requests' }>) {
+  try {
+    const { version: _version, requestId: _requestId, ...request } = command;
+    const checked = parseContextHostResult(command.type, await host.request(request));
+    return checked !== null && matchesContextResponse(command, checked) ? checked : contextHostFailure();
+  } catch { return contextHostFailure(); }
+}
+
 function registerIpc(): void {
   if (ipcRegistered) return;
   ipcRegistered = true;
   const handle = (channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>) => {
     ipcMain.handle(channel, async (event, ...args) => {
       const failure = (error: import('@flowmate/contracts').AppError) => channel === channels.queryRuntimeEvents
-        ? { ok: false, error, context: null } : fail(error);
+        ? { ok: false, error, context: null }
+        : (channel === channels.listContextSnapshots || channel === channels.queryContextSnapshot || channel === channels.listContextRequests)
+          ? (() => { const parsed = ContextErrorSchema.safeParse(error); return parsed.success ? fail(parsed.data) : contextHostFailure(); })()
+          : fail(error);
       if (!isTrustedSender(event)) return failure(appError('ipc_forbidden', 'input', '请求来源不受信任。'));
       if (desktopClosing) return failure(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
       try { return await handler(event, ...args); }
@@ -465,6 +485,21 @@ function registerIpc(): void {
     if (!input.success) return fail(appError('input_invalid', 'input', 'Run tool request is invalid.'));
     try { return RuntimeToolResultSchema.parse(await host.request({ type: 'query_run_tool_call', input: input.data })); }
     catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool could not be confirmed.', true)); }
+  });
+  handle(channels.listContextSnapshots, async (_event, raw) => {
+    const input = ContextSnapshotsRequestSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Context snapshot list request is invalid.'));
+    return contextIpcQuery({ version: 1, requestId: 'context-ipc', type: 'list_context_snapshots', input: input.data });
+  });
+  handle(channels.queryContextSnapshot, async (_event, raw) => {
+    const input = ContextSnapshotRequestSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Context snapshot request is invalid.'));
+    return contextIpcQuery({ version: 1, requestId: 'context-ipc', type: 'query_context_snapshot', input: input.data });
+  });
+  handle(channels.listContextRequests, async (_event, raw) => {
+    const input = ContextRequestsRequestSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Context request list request is invalid.'));
+    return contextIpcQuery({ version: 1, requestId: 'context-ipc', type: 'list_context_requests', input: input.data });
   });
   handle(channels.createSession, async (_event, inputRaw) => createSession(inputRaw));
   handle(channels.queryNativeTools, async () => productHostRequest({ type: 'query_native_tools' }, 'Native tool availability could not be loaded.'));

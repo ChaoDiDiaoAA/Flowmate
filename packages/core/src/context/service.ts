@@ -24,6 +24,15 @@ const buildConfig = z.object({ contextPolicyVersion: z.literal('p8-context-v1'),
 
 export class ContextService {
   constructor(private readonly options: ContextServiceOptions) {}
+  listContextSnapshots(input: import('@flowmate/contracts').ContextSnapshotsRequest): Result<import('@flowmate/contracts').ContextSnapshotsPage> {
+    return this.options.store.context.listContextSnapshots(input);
+  }
+  queryContextSnapshot(input: import('@flowmate/contracts').ContextSnapshotRequest): Result<import('@flowmate/contracts').ContextSnapshotDetail> {
+    return this.options.store.context.queryContextSnapshot(input);
+  }
+  listContextRequests(input: import('@flowmate/contracts').ContextRequestsRequest): Result<import('@flowmate/contracts').ContextRequestsPage> {
+    return this.options.store.context.listContextRequests(input);
+  }
   /** The caller owns admission and its rollback. Material inspection never writes availability. */
   build(raw: ContextBuildRequest): Result<ContextBuildResult> {
     const { store, materials } = this.options;
