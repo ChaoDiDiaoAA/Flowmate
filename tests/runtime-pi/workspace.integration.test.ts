@@ -4,9 +4,9 @@ import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { CandidateDraftSchema, invoiceHeaderFields, invoiceLineFields } from '@flowmate/contracts';
+import { CandidateDraftSchema, ContextObservationsSchema, invoiceFieldDisplayValue, invoiceHeaderFields, invoiceLineFields } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, InvoiceFormBridgeRequest, ProviderConfig, Result, SessionInputRequest,
-  WorkspaceSnapshot } from '@flowmate/contracts';
+  WorkspaceSnapshot, InvoiceFormDraft } from '@flowmate/contracts';
 import { createApplication } from '../../apps/composition.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import { deferCleanup, mkdtempSync } from '../support/resources.ts';
@@ -51,7 +51,7 @@ async function begin(app: Application, input: SessionInputRequest) {
   return { accepted, terminal };
 }
 async function fixture(onRequest: (ordinal: number, app: Application) => Promise<Response> | Response,
-  bridgeCalls: InvoiceFormBridgeRequest[] = []) {
+  bridgeCalls: InvoiceFormBridgeRequest[] = [], failDelivery = false) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p7-sdk-'));
   const product = join(root, 'product');
   const paths = { root: product, databaseFile: join(product, 'data', 'app.sqlite'), logsDir: join(product, 'logs'),
@@ -78,7 +78,9 @@ async function fixture(onRequest: (ordinal: number, app: Application) => Promise
         observedAt: new Date().toISOString(), outcome: 'applied', appliedRevision: request.target.expectedRevision + 1,
         appliedAt: new Date().toISOString() };
     }, agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
-      credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p7-key' }) }));
+      credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p7-key', sessionSetup(session) {
+        if (failDelivery) session.agent.afterToolCall = async () => { throw new Error('Controlled candidate delivery failure.'); };
+      } }) }));
   deferCleanup(() => app.close());
   const document = need(await app.importInvoiceMaterial(source)); documentId = document.documentRef.id;
   const session = need(await app.createSession({ title: 'P7 positioning', expectedRevision: need(await app.readWorkspace()).revision }));
@@ -88,7 +90,7 @@ async function fixture(onRequest: (ordinal: number, app: Application) => Promise
     documentRef: document.documentRef, goal: 'Review selected invoice' }));
   const saved = await begin(app, { sessionId: session.sessionId, clientSequence: 1, mode: 'prompt', text: 'Save candidate.',
     goalMode: 'save-candidate', workspace: expected(task.workspace), config, timeoutMs: 5000, stopGraceMs: 500 });
-  expect((await saved.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect((await saved.terminal).result).toMatchObject({ ok: true, data: { status: failDelivery ? 'failed' : 'completed' } });
   const candidateId = need(await app.listJobCandidates({ jobId: task.job.jobId })).items[0]!.candidateId;
   const selected = need(await app.selectCandidate({ jobId: task.job.jobId, candidateId, expectedCandidateId: null,
     expectedRevision: need(await app.readWorkspace()).revision }));
@@ -99,6 +101,74 @@ async function fixture(onRequest: (ordinal: number, app: Application) => Promise
 }
 
 describe('P7 frozen positioning through real Pi and loopback HTTP', () => {
+  it.each(['accept', 'reject'] as const)('P8 preserves committed model and human provenance after delivery failure and %s', async decision => {
+    const f = await fixture(() => reply(), [], true);
+    const original = need(await f.app.queryJobCandidate({ jobId: f.workspace.jobId!, candidateId: f.candidateId })).candidate;
+    const run = need(await f.app.queryRun(original.runId!));
+    expect(run).toMatchObject({ status: 'failed', toolCallCount: 1 });
+    const tool = need(await f.app.listRunToolCalls({ runId: run.runId, sessionId: f.session.sessionId })).items[0]!;
+    expect(tool).toMatchObject({ status: 'succeeded', committedCandidateId: f.candidateId, deliveryState: 'failed' });
+    expect(original.context).toMatchObject({ snapshotId: expect.any(Number), requestSequence: 1 });
+    expect(f.payloads).toHaveLength(1);
+    const draft: InvoiceFormDraft = { fields: Object.fromEntries(invoiceHeaderFields.map(name =>
+      [name, invoiceFieldDisplayValue(name, original.fields[name])])) as InvoiceFormDraft['fields'], lines: [], notes: ['Human review'] };
+    const saved = need(await f.app.saveInvoiceCandidate({ operationRef: `p8-human-${decision}`, jobId: original.jobId,
+      basedOnCandidateId: original.candidateId, expectedCandidateId: original.candidateId, expectedRevision: f.workspace.revision, draft }));
+    expect(saved.candidate).toMatchObject({ origin: 'human_edit', basedOnCandidateId: original.candidateId,
+      runId: null, toolCallId: null, context: null });
+    const request = { operationRef: `p8-human-decision-${decision}`, jobId: original.jobId, candidateId: saved.candidate.candidateId,
+      expectedCandidateId: saved.candidate.candidateId, expectedRevision: saved.workspace.revision };
+    const result = decision === 'accept' ? need(await f.app.acceptInvoiceCandidate({ ...request, dirty: false }))
+      : need(await f.app.rejectInvoiceCandidate({ ...request, reason: 'Review again' }));
+    expect(result.candidate).toMatchObject({ context: null, basedOnCandidateId: original.candidateId, status: decision === 'accept' ? 'accepted' : 'rejected' });
+    expect(need(await f.app.queryJobCandidate({ jobId: original.jobId, candidateId: original.candidateId })).candidate).toEqual(original);
+    expect(need(await f.app.queryRun(run.runId))).toEqual(run);
+    expect(need(await f.app.listRunToolCalls({ runId: run.runId, sessionId: f.session.sessionId })).items).toEqual([tool]);
+    need(await f.app.close());
+    const db = new Database(f.paths.databaseFile, { readonly: true });
+    try {
+      const originalTool = db.query<{ context_snapshot_id: number; request_sequence: number; result_json: string; delivery_json: string }, [number]>
+        ('SELECT context_snapshot_id,request_sequence,result_json,delivery_json FROM tool_calls WHERE id=?').get(tool.toolCallId)!;
+      expect({ snapshotId: originalTool.context_snapshot_id, requestSequence: originalTool.request_sequence }).toEqual(original.context!);
+      expect(JSON.parse(originalTool.result_json)).toMatchObject({ status: 'succeeded', committedCandidateId: f.candidateId });
+      expect(JSON.parse(originalTool.delivery_json)).toMatchObject({ state: 'failed', includedInCallSequence: null, requestDispatchedAt: null });
+      expect(db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 1 });
+      expect(db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 2 });
+      expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    } finally { db.close(); }
+  });
+  it('P8 inherits the original candidate tool basis through saved native result and following HTTP', async () => {
+    const f = await fixture(() => reply());
+    const detail = need(await f.app.queryJobCandidate({ jobId: f.workspace.jobId!, candidateId: f.candidateId }));
+    const runId = detail.candidate.runId!;
+    const input = need(await f.app.listSessionInputs({ sessionId: f.session.sessionId })).items[0]!;
+    expect(detail.candidate.context).toEqual({ snapshotId: input.contextSnapshotId!, requestSequence: 1 });
+    expect(input).toMatchObject({ status: 'consumed', processingStatus: 'completed', nativeEntryId: expect.any(String) });
+    expect(need(await f.app.queryRun(runId))).toMatchObject({ status: 'completed', toolCallCount: 1 });
+    expect(f.payloads).toHaveLength(2);
+    const wire = f.payloads[1]!.messages.find(message => message.role === 'tool' && message.tool_call_id === 'p7-save');
+    if (typeof wire?.content !== 'string') throw new Error('The real HTTP must include the original tool result.');
+    expect(JSON.parse(wire.content)).toMatchObject({ candidateId: f.candidateId, sequence: 1 });
+    need(await f.app.close());
+    const db = new Database(f.paths.databaseFile, { readonly: true });
+    try {
+      const tool = db.query<{ id: number; context_snapshot_id: number; request_sequence: number; delivery_json: string }, []>
+        ('SELECT id,context_snapshot_id,request_sequence,delivery_json FROM tool_calls').get()!;
+      expect(tool).toMatchObject({ context_snapshot_id: input.contextSnapshotId!, request_sequence: 1 });
+      expect(JSON.parse(tool.delivery_json)).toMatchObject({ state: 'request_observed', includedInCallSequence: 2 });
+      expect(db.query('SELECT context_snapshot_id,request_sequence FROM invoice_candidates WHERE id=?').get(f.candidateId))
+        .toEqual({ context_snapshot_id: input.contextSnapshotId!, request_sequence: 1 });
+      const journal = ContextObservationsSchema.parse(JSON.parse(db.query<{ context_observations_json: string }, [number]>
+        ('SELECT context_observations_json FROM runs WHERE id=?').get(runId)!.context_observations_json));
+      expect(journal.requests[1]!.binding.includedToolResults).toEqual([{ nativeToolCallId: 'p7-save', toolCallId: tool.id,
+        originRunId: runId, context: { snapshotId: input.contextSnapshotId!, requestSequence: 1 } }]);
+      expect(journal.requests.map(request => request.attempts[0]?.responseStatus)).toEqual([200, 200]);
+      expect(db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_generated'").get()).toEqual({ count: 1 });
+      const entries = db.query<{ entry_json: string }, []>('SELECT entry_json FROM session_native_entries').all();
+      expect(entries.map(entry => JSON.parse(entry.entry_json)).filter(entry => entry.type === 'message' && entry.message.role === 'toolResult'))
+        .toMatchObject([{ message: { toolCallId: 'p7-save', isError: false } }]);
+    } finally { db.close(); }
+  });
   it('blocks a queued frozen source before native user and HTTP when its original parsed material is corrupt', async () => {
     const entered = barrier(), release = barrier();
     deferCleanup(() => release.release());

@@ -79,7 +79,8 @@ type PiAgentEventListener = Parameters<AgentSession['agent']['subscribe']>[0];
 type PiAgentEvent = Parameters<PiAgentEventListener>[0];
 type PiAgentEventSignal = Parameters<PiAgentEventListener>[1];
 type ModelCallUsage = { callSequence: number; usage: UsageRecordV1; tokens: TokenColumns; complete: boolean };
-type ToolRequestState = { name: string; raw: unknown; invoked: boolean; terminal: boolean; messageObserved: boolean; messageObservedAt: string | null; requestObservedAtSequence: number | null;
+type ToolRequestState = { name: string; raw: unknown; sdkRaw: unknown; invoked: boolean; terminal: boolean; messageObserved: boolean; messageObservedAt: string | null; requestObservedAtSequence: number | null;
+  requestBinding?: RequestContextBinding;
   failureStage?: 'sdk_arguments' | 'sdk_before' | 'unknown'; sdkBlocked?: boolean;
   feedback?: AgentToolResult<unknown>; feedbackIsError?: boolean };
 type InputDispatchState = { inputId: number; text: string; promptText: string; contextSnapshotId?: number; started: boolean; message?: object };
@@ -107,6 +108,7 @@ type ActiveExecution = {
   nativeFailures: Set<string>;
   toolBinding?: AgentToolBinding;
   toolRequests: Map<string, ToolRequestState>;
+  assistantBindings: WeakMap<object, RequestContextBinding>;
   modelCallUsages: ModelCallUsage[];
   modelCalls: NonNullable<AgentNativeOutcome['agent']['modelCalls']>;
   attemptsAtCallStart: number;
@@ -737,7 +739,7 @@ export class PiAgentAdapter implements AgentPort {
             definition,
             (toolCallId, input, toolSignal) => this.executePiTool(record, definition, toolCallId, input, toolSignal),
             raw => {
-              const requests = [...record.active?.toolRequests.values() ?? []].filter(call => call.name === definition.name && call.raw === raw && !call.invoked);
+              const requests = [...record.active?.toolRequests.values() ?? []].filter(call => call.name === definition.name && call.sdkRaw === raw && !call.invoked);
               if (requests.length === 1) requests[0]!.failureStage = 'sdk_arguments';
             },
           )) : [],
@@ -767,7 +769,7 @@ export class PiAgentAdapter implements AgentPort {
               // The SDK retains this raw block for execution, result identity, and history.
               for (const key of Object.keys(toolCall)) Reflect.deleteProperty(toolCall, key);
               Object.assign(toolCall, original);
-              if (request) request.raw = toolCall.arguments;
+              if (request) request.sdkRaw = toolCall.arguments;
             }
           }
           if (changed) result = { block: true, reason: 'The SDK before hook changed the original tool request.' };
@@ -1093,15 +1095,26 @@ export class PiAgentAdapter implements AgentPort {
     const binding = active.toolBinding;
     if (!active.p3 || !binding) return;
     const signal = eventSignal ?? active.signal;
-    const ensureRequest = (name: string, raw: unknown, nativeToolCallId: string): ToolRequestState | null => {
+    const ensureRequest = (name: string, raw: unknown, nativeToolCallId: string, requestBinding?: RequestContextBinding): ToolRequestState | null => {
       const prior = active.toolRequests.get(nativeToolCallId);
-      if (prior) return prior;
-      const observed = binding.observeRequest(name, raw, { nativeToolCallId, signal });
+      if (prior) {
+        if (prior.name !== name || !isDeepStrictEqual(prior.raw, raw)
+          || requestBinding !== undefined && !isDeepStrictEqual(prior.requestBinding, requestBinding)) {
+          this.failToolRun(record, active, appError('context_binding_conflict', 'runtime', 'Tool request conflicts with its original generating request.'));
+          return null;
+        }
+        return prior;
+      }
+      if (active.input.contextHooks && !requestBinding) {
+        this.failToolRun(record, active, appError('context_binding_unknown', 'runtime', 'The tool has no confirmed generating request.'));
+        return null;
+      }
+      const observed = binding.observeRequest(name, raw, { nativeToolCallId, signal, ...(requestBinding ? { requestBinding } : {}) });
       if (!observed.ok) {
         this.failToolRun(record, active, observed.error);
         return null;
       }
-      const state: ToolRequestState = { name, raw, invoked: false, terminal: false,
+      const state: ToolRequestState = { name, raw: structuredClone(raw), sdkRaw: raw, ...(requestBinding ? { requestBinding } : {}), invoked: false, terminal: false,
         messageObserved: false, messageObservedAt: null, requestObservedAtSequence: null };
       active.toolRequests.set(nativeToolCallId, state);
       return state;
@@ -1120,7 +1133,8 @@ export class PiAgentAdapter implements AgentPort {
             : state.failureStage === 'sdk_before'
               ? appError(state.sdkBlocked ? 'tool_sdk_blocked' : 'tool_sdk_before_failed', 'tool', 'The SDK rejected this tool before execution.', false, active.runId, active.sessionId, nativeToolCallId)
               : appError('tool_execution_not_started', 'tool', 'The SDK did not start this tool execution.', false, active.runId, active.sessionId, nativeToolCallId);
-      const rejected = binding.rejectRequest(state.name, state.raw, { nativeToolCallId, signal },
+      const rejected = binding.rejectRequest(state.name, state.raw, { nativeToolCallId, signal,
+        ...(state.requestBinding ? { requestBinding: state.requestBinding } : {}) },
         feedbackText === undefined ? error : { ...error, message: feedbackText }, state.failureStage ?? 'unknown');
       if (!rejected.ok) this.failToolRun(record, active, rejected.error);
       state.terminal = true;
@@ -1131,7 +1145,12 @@ export class PiAgentAdapter implements AgentPort {
         liveOrdinal: null, persistence: 'pending', phase: 'ended' });
       if (!valid.ok) { this.failToolRun(record, active, valid.error); return; }
       const calls = event.message.content.filter((part): part is Extract<typeof part, { type: 'toolCall' }> => part.type === 'toolCall');
-      for (const call of calls) ensureRequest(call.name, call.arguments, call.id);
+      const requestBinding = active.assistantBindings.get(event.message);
+      if (active.input.contextHooks && calls.length && !requestBinding) {
+        this.failToolRun(record, active, appError('context_binding_unknown', 'runtime', 'The terminal assistant has no generating request.'));
+        return;
+      }
+      for (const call of calls) ensureRequest(call.name, call.arguments, call.id, requestBinding);
       if (event.message.stopReason === 'stop' && calls.length === 0) active.finalAssistantMessage = event.message;
     }
 
@@ -1180,18 +1199,27 @@ export class PiAgentAdapter implements AgentPort {
     const active = record.active;
     const binding = active?.toolBinding;
     if (!active || !active.p3 || !binding) throw new Error('工具调用缺少有效 Run 绑定。');
-    const toolCall = Object.freeze({ nativeToolCallId, signal: toolSignal
-      ? AbortSignal.any([active.signal, toolSignal]) : active.signal });
     let request = active.toolRequests.get(nativeToolCallId);
     if (!request) {
-      const observed = binding.observeRequest(definition.name, input, toolCall);
+      if (active.input.contextHooks) {
+        const error = appError('context_binding_unknown', 'runtime', 'The tool has no original request state.');
+        this.failToolRun(record, active, error); throw new Error(error.message);
+      }
+      const observed = binding.observeRequest(definition.name, input, { nativeToolCallId, signal: active.signal });
       if (!observed.ok) {
         this.failToolRun(record, active, observed.error);
         throw new Error(observed.error.message);
       }
-      request = { name: definition.name, raw: input, invoked: false, terminal: false, messageObserved: false, messageObservedAt: null, requestObservedAtSequence: null };
+      request = { name: definition.name, raw: structuredClone(input), sdkRaw: input, invoked: false, terminal: false, messageObserved: false, messageObservedAt: null, requestObservedAtSequence: null };
       active.toolRequests.set(nativeToolCallId, request);
     }
+    if (active.input.contextHooks && !request.requestBinding || request.name !== definition.name) {
+      const error = appError('context_binding_unknown', 'runtime', 'The tool generating request is unavailable.');
+      this.failToolRun(record, active, error); throw new Error(error.message);
+    }
+    const toolCall = Object.freeze({ nativeToolCallId, signal: toolSignal
+      ? AbortSignal.any([active.signal, toolSignal]) : active.signal,
+      ...(request.requestBinding ? { requestBinding: request.requestBinding } : {}) });
     request.invoked = true;
     let invocation;
     try {
@@ -1470,10 +1498,18 @@ export class PiAgentAdapter implements AgentPort {
             : this.providerError(active, event.error);
           active.stopReason = active.failure.code;
         }
-        if (event.type === 'done') finalMessage = event.message;
+        if (event.type === 'done') {
+          finalMessage = event.message;
+          if (requestBinding && (event.message.stopReason === 'stop' || event.message.stopReason === 'toolUse'))
+            active.assistantBindings.set(event.message, requestBinding);
+        }
         if (!outputEnded) output.push(event);
       }
-      finalMessage ??= await stream.result();
+      if (finalMessage === undefined) {
+        finalMessage = await stream.result();
+        if (requestBinding && (finalMessage.stopReason === 'stop' || finalMessage.stopReason === 'toolUse'))
+          active.assistantBindings.set(finalMessage, requestBinding);
+      }
       if (finalMessage) {
         try { active.assistantContentBytes = contentBytes(finalMessage); }
         catch { active.assistantContentBytes = maxAssistantContentBytes + 1; }
@@ -1651,7 +1687,7 @@ export class PiAgentAdapter implements AgentPort {
       resultBindings: new WeakMap(), queueCleared: false,
       goalMode: input.goalMode ?? 'answer',
       ...(input.toolBinding ? { toolBinding: input.toolBinding } : {}),
-      toolRequests: new Map(), modelCallUsages: [], modelCalls: [], attemptsAtCallStart: 0, totalOutputBytes: 0,
+      toolRequests: new Map(), assistantBindings: new WeakMap(), modelCallUsages: [], modelCalls: [], attemptsAtCallStart: 0, totalOutputBytes: 0,
       callSequence: 0, turnOrdinal: 0, attempts: 0, responseStatus: null,
       responseStarted: false, complete: false, wireMaxTokens: null,
       text: '', textBytes: 0, assistantContentBytes: 0, failure: null,

@@ -158,7 +158,8 @@ async function begin(app: Application, input: SessionInputRequest) {
   const accepted = need(await app.submitInput(input, { onEvent(event) { if (event.type === 'run_finished') finish(event); } }));
   return { accepted, terminal };
 }
-async function fixture(onRequest: (ordinal: number) => Promise<Response> | Response = () => reply()) {
+async function fixture(onRequest: (ordinal: number) => Promise<Response> | Response = () => reply(), beforeTool?: () => Promise<void>,
+  toolFault?: 'error-terminal' | 'error-result' | 'aborted-result' | 'tool-result' | 'binding-lost') {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p8-context-sdk-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
@@ -171,10 +172,55 @@ async function fixture(onRequest: (ordinal: number) => Promise<Response> | Respo
     modelRef: { provider: 'p8-context-fixture', model: 'p8-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
     connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
-  let adapter!: PiAgentAdapter;
+  let adapter!: PiAgentAdapter, executions = 0;
   const app = need(await createApplication({ paths, logger: { write() {}, async close() {} },
-    agentFactory: tools => adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
-      credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p8-key' }) }));
+    agentFactory: tools => {
+      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+      credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p8-key',
+      sessionSetup(session) {
+        if (beforeTool) { const original = session.agent.beforeToolCall;
+          session.agent.beforeToolCall = async (...args) => { await beforeTool(); return original?.(...args); }; }
+        if (toolFault && toolFault !== 'binding-lost') {
+          const native = session.agent.streamFunction;
+          // Fault boundary around the real SDK HTTP stream: partial tool content ends as an error, never done/result success.
+          session.agent.streamFunction = (model, context, options) => {
+            const output = createAssistantMessageEventStream();
+            queueMicrotask(async () => {
+              const stream = await native(model, context, options);
+              for await (const event of stream) {
+                if (event.type === 'done') {
+                  if (toolFault === 'tool-result') { output.end(event.message); return; }
+                  const failed = { ...event.message, stopReason: toolFault === 'aborted-result' ? 'aborted' as const : 'error' as const,
+                    errorMessage: 'Controlled terminal failure.' };
+                  if (toolFault === 'error-terminal') output.push({ type: 'error', reason: 'error', error: failed });
+                  output.end(failed); return;
+                }
+                output.push(event);
+              }
+              output.end(await stream.result());
+            });
+            return output;
+          };
+        }
+      } });
+      const prepare = adapter.prepare.bind(adapter);
+      adapter.prepare = async (...args) => {
+        const prepared = await prepare(...args); if (!prepared.ok) return prepared;
+        const execute = prepared.data.execute;
+        return { ...prepared, data: { ...prepared.data, execute(input, signal, observe) {
+          const binding = input.toolBinding; if (!binding) return execute(input, signal, observe);
+          return execute({ ...input, toolBinding: { ...binding,
+            observeRequest(name, raw, call) {
+              if (toolFault !== 'binding-lost') return binding.observeRequest(name, raw, call);
+              const { requestBinding: _lost, ...withoutBinding } = call;
+              return binding.observeRequest(name, raw, withoutBinding);
+            },
+            execute(...call) { executions++; return binding.execute(...call); },
+          } }, signal, observe);
+        } } };
+      };
+      return adapter;
+    } }));
   deferCleanup(() => app.close());
   const session = need(await app.createSession({ title: 'Context identity', expectedRevision: need(await app.readWorkspace()).revision }));
   const journal = (runId: number) => {
@@ -185,7 +231,7 @@ async function fixture(onRequest: (ordinal: number) => Promise<Response> | Respo
   };
   const prompt = (clientSequence: number, text = 'same text'): SessionInputRequest => ({ sessionId: session.sessionId,
     clientSequence, mode: 'prompt', text, config, timeoutMs: 5000, stopGraceMs: 500 });
-  return { app, adapter, paths, session, payloads, journal, prompt };
+  return { app, adapter, paths, session, payloads, journal, prompt, executions: () => executions };
 }
 
 async function storedFixture(withRepository = true, toolOrigin: false | 'legacy' | 'p8' = false, extraToolResults = 0, preledgerUsers = 0) {
@@ -269,7 +315,7 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
               JSON.stringify({ version: 1, state: 'not_attempted', messageObservedAt: null, includedInCallSequence: null, requestDispatchedAt: null, error: null }),
               JSON.stringify({ version: 1, stopped: false, stopReason: null, errors: [] }), at(), generating.snapshotId, generating.requestSequence).lastInsertRowid);
           need(store.toolCalls.getById(originalCallId));
-        } else originalCallId = need(store.toolCalls.request({ runId, sessionId: session.sessionId,
+        } else originalCallId = need(store.toolCalls.request({ context: null, runId, sessionId: session.sessionId,
           nativeToolCallId: call.nativeToolCallId, toolName: name, toolVersion: '1', effect: 'READ', rawArguments: raw, requestedAt: at() })).toolCallId;
         return ok(undefined); },
       rejectRequest: () => fail(appError('tool_execution_failed', 'tool', 'Unexpected fixture rejection.')),
@@ -531,6 +577,114 @@ describe('T06 public SDK codec conversion', () => {
 });
 
 describe('P8 actual Pi request context', () => {
+  it.each(['error-terminal', 'error-result', 'aborted-result', 'binding-lost'] as const)('refuses P8 tool execution with %s despite actual SDK HTTP', async fault => {
+    const raw = { operation: 'sum', values: ['0.1', '0.2'], scale: 2 };
+    const response = () => new Response('data: ' + JSON.stringify({ id: 'untrusted-terminal', choices: [{ index: 0,
+      delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'untrusted-call', type: 'function',
+        function: { name: 'calculate_invoice_amounts', arguments: JSON.stringify(raw) } }] }, finish_reason: null }] })
+      + '\n\ndata: ' + JSON.stringify({ id: 'untrusted-terminal', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+      + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    const f = await fixture(response, undefined, fault), workspace = need(await f.app.readWorkspace());
+    const accepted = await begin(f.app, { ...f.prompt(1), workspace: { revision: workspace.revision, sessionId: f.session.sessionId,
+      documentRef: null, jobId: null, candidateRef: null } });
+    expect((await accepted.terminal).result).toMatchObject({ ok: true, data: { status: 'failed',
+      ...(fault === 'binding-lost' ? { error: { code: 'context_binding_unknown' } } : {}) } });
+    expect(f.executions()).toBe(0); expect(f.payloads).toHaveLength(1);
+    expect(need(await f.app.listRunToolCalls({ runId: accepted.accepted.runId, sessionId: f.session.sessionId })).items).toEqual([]);
+    expect(need(await f.app.queryRun(accepted.accepted.runId))).toMatchObject({ status: 'failed', toolCallCount: 0 });
+    need(await f.app.close());
+    expect(f.journal(accepted.accepted.runId).requests[0]!.attempts[0]).toMatchObject({ responseStatus: 200 });
+    const db = new Database(f.paths.databaseFile, { readonly: true });
+    try {
+      expect(db.query('SELECT COUNT(*) AS count FROM tool_calls').get()).toEqual({ count: 0 });
+      expect(db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 0 });
+      expect(db.query("SELECT COUNT(*) AS count FROM runtime_events WHERE type LIKE 'tool_%'").get()).toEqual({ count: 0 });
+    } finally { db.close(); }
+  });
+  it('keeps valid toolUse and stop result fallbacks bound through real SDK HTTP', async () => {
+    const raw = { operation: 'sum', values: ['0.1', '0.2'], scale: 2 };
+    const f = await fixture(ordinal => ordinal === 1 ? new Response('data: ' + JSON.stringify({ id: 'valid-result', choices: [{ index: 0,
+      delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'fallback-call', type: 'function',
+        function: { name: 'calculate_invoice_amounts', arguments: JSON.stringify(raw) } }] }, finish_reason: null }] })
+      + '\n\ndata: ' + JSON.stringify({ id: 'valid-result', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+      + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) : reply(), undefined, 'tool-result');
+    const workspace = need(await f.app.readWorkspace());
+    const accepted = await begin(f.app, { ...f.prompt(1), workspace: { revision: workspace.revision, sessionId: f.session.sessionId,
+      documentRef: null, jobId: null, candidateRef: null } });
+    expect((await accepted.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(f.executions()).toBe(1); expect(f.payloads).toHaveLength(2);
+    const input = need(await f.app.querySessionInput({ sessionId: f.session.sessionId, inputId: accepted.accepted.inputId })).input!;
+    const tools = need(await f.app.listRunToolCalls({ runId: accepted.accepted.runId, sessionId: f.session.sessionId })).items;
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ status: 'succeeded', deliveryState: 'request_observed' });
+    expect(f.payloads[1]).toMatchObject({ messages: expect.arrayContaining([
+      { role: 'tool', tool_call_id: 'fallback-call', content: expect.any(String) }]) });
+    need(await f.app.close());
+    const journal = f.journal(accepted.accepted.runId);
+    expect(journal.requests[1]!.binding.includedToolResults).toEqual([{ nativeToolCallId: 'fallback-call', toolCallId: tools[0]!.toolCallId,
+      originRunId: accepted.accepted.runId, context: { snapshotId: input.contextSnapshotId!, requestSequence: 1 } }]);
+    expect(journal.requests.map(request => request.attempts[0]?.responseStatus)).toEqual([200, 200]);
+  });
+  it('keeps the generating tool request after newer input admission and returns the original call after completion', async () => {
+    const entered = barrier(), release = barrier();
+    const raw = { operation: 'sum', values: ['0.1', '0.2'], scale: 2 };
+    const f = await fixture(ordinal => ordinal === 1 ? new Response('data: ' + JSON.stringify({ id: 'p8-tool', choices: [{ index: 0,
+      delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'original-call', type: 'function',
+        function: { name: 'calculate_invoice_amounts', arguments: JSON.stringify(raw) } }] }, finish_reason: null }] })
+      + '\n\ndata: ' + JSON.stringify({ id: 'p8-tool', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+      + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) : reply(),
+      async () => { entered.release(); await release.ready; });
+    deferCleanup(() => release.release());
+    const workspace = need(await f.app.readWorkspace());
+    const first = await begin(f.app, { ...f.prompt(1), workspace: { revision: workspace.revision, sessionId: f.session.sessionId,
+      documentRef: null, jobId: null, candidateRef: null } });
+    const result = await Promise.race([entered.ready.then(() => null), first.terminal]);
+    expect(result).toBeNull();
+    const a = need(await f.app.querySessionInput({ sessionId: f.session.sessionId, inputId: first.accepted.inputId })).input!;
+    const tools = need(await f.app.listRunToolCalls({ runId: first.accepted.runId, sessionId: f.session.sessionId })).items;
+    expect(tools).toHaveLength(1);
+    const tool = tools[0]!;
+    expect(tool.status).toBe('requested');
+    const b = need(await f.app.submitInput({ sessionId: f.session.sessionId, runId: first.accepted.runId,
+      clientSequence: 2, mode: 'steer', text: 'Use the saved calculation.', workspace: {
+        revision: workspace.revision, sessionId: f.session.sessionId, documentRef: null, jobId: null, candidateRef: null } }));
+    const inputB = need(await f.app.querySessionInput({ sessionId: f.session.sessionId, inputId: b.inputId })).input!;
+    expect(inputB).toMatchObject({ status: 'queued', nativeEntryId: null });
+    expect(need(await f.app.queryRun(first.accepted.runId)).currentContextSnapshotId).toBe(inputB.contextSnapshotId);
+    expect(inputB.contextSnapshotId).not.toBe(a.contextSnapshotId);
+    release.release(); expect((await first.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(f.executions()).toBe(1);
+    need(await f.app.close());
+    const requests = f.journal(first.accepted.runId).requests;
+    expect(requests.map(item => item.binding.inputId)).toEqual([first.accepted.inputId, b.inputId]);
+    expect(requests[1]!.binding.includedToolResults).toEqual([{ nativeToolCallId: 'original-call', toolCallId: tool.toolCallId,
+      originRunId: first.accepted.runId, context: { snapshotId: a.contextSnapshotId!, requestSequence: 1 } }]);
+    expect(f.payloads).toHaveLength(2);
+    expect(f.payloads[1]).toMatchObject({ messages: expect.arrayContaining([{ role: 'tool', tool_call_id: 'original-call', content: expect.any(String) }]) });
+    const store = need(openTestDatabase(f.paths));
+    const original = need(store.toolCalls.getById(tool.toolCallId));
+    expect(original.context).toEqual({ snapshotId: a.contextSnapshotId!, requestSequence: 1 });
+    expect(original).toMatchObject({ status: 'succeeded', args: { raw, final: raw }, delivery: { state: 'request_observed', includedInCallSequence: 2 } });
+    const before = store.db.query('SELECT * FROM tool_calls WHERE id=?').get(tool.toolCallId);
+    const input = { runId: first.accepted.runId, sessionId: f.session.sessionId, nativeToolCallId: 'original-call',
+      toolName: 'calculate_invoice_amounts', toolVersion: '1', effect: 'PURE' as const, rawArguments: raw,
+      context: original.context, requestedAt: new Date().toISOString() };
+    // A late repository notification after request2 is not SDK concurrent tool delivery.
+    expect(store.toolCalls.request(input)).toEqual(ok(original));
+    expect(store.toolCalls.request({ ...input, context: { snapshotId: inputB.contextSnapshotId!, requestSequence: 2 } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(store.toolCalls.request({ ...input, rawArguments: { ...raw, scale: 3 } }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(store.toolCalls.request({ ...input, nativeToolCallId: 'unbound-call', context: null }))
+      .toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
+    expect(store.toolCalls.request({ ...input, nativeToolCallId: 'missing-journal-call',
+      context: { snapshotId: a.contextSnapshotId!, requestSequence: 3 } }))
+      .toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
+    expect(store.db.query('SELECT COUNT(*) AS count FROM tool_calls WHERE run_id=?').get(first.accepted.runId)).toEqual({ count: 1 });
+    expect(store.db.query('SELECT * FROM tool_calls WHERE id=?').get(tool.toolCallId)).toEqual(before);
+    expect(need(store.runs.get(first.accepted.runId))).toMatchObject({ status: 'completed', toolCallCount: 1 });
+    expect(f.executions()).toBe(1);
+  });
   it('binds saved prompt steer followUp users and retains completed input provenance', async () => {
     const entered = barrier(), release = barrier(); deferCleanup(() => release.release());
     const f = await fixture(async ordinal => { if (ordinal === 1) { entered.release(); await release.ready; } return reply(); });

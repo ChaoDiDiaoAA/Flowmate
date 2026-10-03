@@ -273,7 +273,7 @@ describe('P3 Tool Executor', () => {
       { id: 'truncated-timeout', error: appError('tool_timeout', 'runtime', 'Run deadline truncated the tool.'), stage: 'execute', truncated: true },
     ];
     for (const sample of diagnostics) {
-      const requested = store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: sample.id,
+      const requested = store.toolCalls.request({ context: null, runId: 1, sessionId: store.sessionId, nativeToolCallId: sample.id,
         toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: { value: 1 }, requestedAt: store.at });
       if (!requested.ok) throw new Error(requested.error.code);
       const toolCallId = requested.data.toolCallId;
@@ -325,7 +325,7 @@ describe('P3 Tool Executor', () => {
     let next = 0;
     const record = (success: boolean, durationMs: number, timeout = false, truncated = false,
       toolName = 'read_fixture', effect: ToolEffect = 'READ', key = groupKey) => {
-      const requested = store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: `sample-${next++}`,
+      const requested = store.toolCalls.request({ context: null, runId: 1, sessionId: store.sessionId, nativeToolCallId: `sample-${next++}`,
         toolName, toolVersion: '1', effect, rawArguments: {}, requestedAt: store.at });
       if (!requested.ok) throw new Error(requested.error.code);
       store.toolCalls.fixArguments({ toolCallId: requested.data.toolCallId, finalArguments: {} });
@@ -382,7 +382,7 @@ describe('P3 Tool Executor', () => {
       }] } } });
     }
     store.db.query('UPDATE runs SET config_json=? WHERE id=1').run(JSON.stringify({ runtimeStrategy: initial.data }));
-    const crashed = store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'crash-without-observation',
+    const crashed = store.toolCalls.request({ context: null, runId: 1, sessionId: store.sessionId, nativeToolCallId: 'crash-without-observation',
       toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.at });
     if (!crashed.ok) throw new Error(crashed.error.code);
     store.toolCalls.fixArguments({ toolCallId: crashed.data.toolCallId, finalArguments: {} });

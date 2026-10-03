@@ -87,7 +87,7 @@ describe('selected candidate Workspace admission', () => {
     const issues: InvoiceIssue[] = [{ code: 'missing_invoice_number', severity: 'warning', origin: 'model',
       fieldPaths: ['/fields/invoiceNumber'], message: 'Invoice number was not present in the material.', rule: null }];
     const argumentsValue = { documentId: 1, candidate };
-    const call = required(store.toolCalls.request({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-selected-1',
+    const call = required(store.toolCalls.request({ context: null, runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-selected-1',
       toolName: 'save_invoice_candidate', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: argumentsValue, requestedAt: stamp }));
     required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: argumentsValue }));
     required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: stamp }));

@@ -127,7 +127,7 @@ it('cold-start does not clear process-exit uncertainty merely because it acquire
 it.each(['powershell', 'bash'])('cold-start retains actual stop uncertainty for an interrupted %s even when its Run is already completed', async (toolName) => {
   const { store, paths } = fixture();
   const { runId, sessionId } = agentRun(store, toolName);
-  const call = store.toolCalls.request({ runId, sessionId, nativeToolCallId: 'original-native-call', toolName,
+  const call = store.toolCalls.request({ context: null, runId, sessionId, nativeToolCallId: 'original-native-call', toolName,
     toolVersion: '0.85.1', effect: 'LOCAL_WRITE', rawArguments: { command: 'synthetic command, never executed' }, requestedAt: stamp });
   if (!call.ok) throw new Error(call.error.code);
   expect(store.toolCalls.fixArguments({ toolCallId: call.data.toolCallId, finalArguments: {} }).ok).toBe(true);
@@ -153,7 +153,7 @@ it.each(['powershell', 'bash'])('cold-start retains actual stop uncertainty for 
 it('cold-start closes a provably unstarted requested tool without claiming a historical stopped timestamp', async () => {
   const { store, paths } = fixture();
   const { runId, sessionId } = agentRun(store);
-  const call = store.toolCalls.request({ runId, sessionId, nativeToolCallId: 'never-started', toolName: 'powershell',
+  const call = store.toolCalls.request({ context: null, runId, sessionId, nativeToolCallId: 'never-started', toolName: 'powershell',
     toolVersion: '0.85.1', effect: 'LOCAL_WRITE', rawArguments: {}, requestedAt: stamp });
   if (!call.ok) throw new Error(call.error.code);
   expect(finish(store, runId).ok).toBe(true);
@@ -172,7 +172,7 @@ it('cold-start closes a provably unstarted requested tool without claiming a his
 it('cold-start keeps history unusable local to its Session and does not treat diagnostic errors or delivery failure as global stop uncertainty', async () => {
   const { store, paths } = fixture();
   const { runId, sessionId } = agentRun(store, 'powershell', true);
-  const call = store.toolCalls.request({ runId, sessionId, nativeToolCallId: 'finished-shell', toolName: 'powershell',
+  const call = store.toolCalls.request({ context: null, runId, sessionId, nativeToolCallId: 'finished-shell', toolName: 'powershell',
     toolVersion: '0.85.1', effect: 'LOCAL_WRITE', rawArguments: {}, requestedAt: stamp });
   if (!call.ok) throw new Error(call.error.code);
   expect(store.toolCalls.fixArguments({ toolCallId: call.data.toolCallId, finalArguments: {} }).ok).toBe(true);
@@ -231,7 +231,7 @@ it.each([
 
 function finishedToolWithMissingResult(store: ReturnType<typeof fixture>['store']) {
   const { runId, sessionId } = agentRun(store);
-  const call = store.toolCalls.request({ runId, sessionId, nativeToolCallId: 'finished-with-save-gap', toolName: 'powershell',
+  const call = store.toolCalls.request({ context: null, runId, sessionId, nativeToolCallId: 'finished-with-save-gap', toolName: 'powershell',
     toolVersion: '0.85.1', effect: 'LOCAL_WRITE', rawArguments: {}, requestedAt: stamp });
   if (!call.ok) throw new Error(call.error.code);
   expect(store.toolCalls.fixArguments({ toolCallId: call.data.toolCallId, finalArguments: {} }).ok).toBe(true);

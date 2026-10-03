@@ -29,7 +29,8 @@ export function createToolRecorder(repository: ToolCallRepository, now: () => st
       return repository.request({ runId: input.context.runId, sessionId: input.context.sessionId,
         nativeToolCallId: input.call.nativeToolCallId, toolName: input.name,
         toolVersion: input.definition?.version ?? null, effect: input.definition?.effect ?? null,
-        rawArguments: input.raw, requestedAt: now() });
+        rawArguments: input.raw, context: input.call.requestBinding ? {
+          snapshotId: input.call.requestBinding.snapshotId, requestSequence: input.call.requestBinding.requestSequence } : null, requestedAt: now() });
     },
     fixArguments(toolCallId: DbId, finalArguments: unknown) {
       return repository.fixArguments({ toolCallId, finalArguments });

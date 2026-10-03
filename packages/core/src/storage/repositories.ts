@@ -10,7 +10,7 @@ import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/veri
 import { contextReferenceFromColumns, readRunContextOwner, readContextSnapshotOwner, readToolContext } from '../context/repository.ts';
 import { formatContextPrompt } from '../context/service.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, NativeInputContextBindingSchema, SessionInputContentSchema } from '@flowmate/contracts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, NativeInputContextBindingSchema, SessionInputContentSchema, ContextReferenceSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -45,6 +45,7 @@ import type {
   JobSnapshot,
   CandidateSnapshot,
   CandidateSummary,
+  ContextReference,
   CandidateReceipt,
   CandidateDraft,
   CheckResult,
@@ -245,6 +246,7 @@ export interface JobRepository {
 }
 
 export type NewToolCall = {
+  context: ContextReference | null;
   runId: DbId;
   sessionId: DbId;
   nativeToolCallId: string;
@@ -1627,6 +1629,8 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           || input.toolVersion !== null && (typeof input.toolVersion !== 'string' || input.toolVersion.length < 1 || input.toolVersion.length > MAX_TOOL_VERSION_CHARS)
           || input.effect !== null && !ToolEffectSchema.safeParse(input.effect).success
           || (input.toolVersion === null) !== (input.effect === null)) return fail(appError('input_invalid', 'input', '原生 ToolCall 身份无效。'));
+        if (input.context !== null && !ContextReferenceSchema.safeParse(input.context).success)
+          return fail(appError('context_binding_unknown', 'runtime', 'ToolCall context reference is unavailable.'));
         const raw = JSON.stringify(input.rawArguments);
         if (raw === undefined || !NATIVE_TOOL_NAMES.includes(input.toolName as (typeof NATIVE_TOOL_NAMES)[number])
           && Buffer.byteLength(raw, 'utf8') > TOOL_CONFIG.payload.maxRawArgumentsBytes) return fail(appError('tool_result_too_large', 'input', 'ToolCall 参数超过记录上限。'));
@@ -1635,22 +1639,27 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         if (existing) {
           const call = toolCallSnapshot(db, existing);
           if (call.runId !== input.runId || call.toolName !== input.toolName || call.toolVersion !== input.toolVersion
-            || call.effect !== input.effect || stableJson(call.args.raw) !== stableJson(input.rawArguments)) {
+            || call.effect !== input.effect || stableJson(call.args.raw) !== stableJson(input.rawArguments)
+            || !sameContextReference(call.context, input.context)) {
             return fail(appError('state_conflict', 'runtime', '原生 ToolCall ID 已属于不同的执行请求。'));
           }
           return ok(call);
         }
         const run = db.query("SELECT session_id,status FROM runs WHERE id=? AND kind='agent'").get(input.runId) as { session_id: number; status: string } | null;
         if (!run || run.session_id !== input.sessionId) return fail(appError('tool_access_denied', 'runtime', 'ToolCall 与可信 Agent Run 不匹配.'));
+        try { readToolContext(db, { run_id: input.runId, session_id: input.sessionId,
+          context_snapshot_id: input.context?.snapshotId ?? null, request_sequence: input.context?.requestSequence ?? null }); }
+        catch { return fail(appError('context_binding_unknown', 'runtime', 'ToolCall generating request could not be verified.')); }
         if (!['created', 'running'].includes(run.status)) return fail(appError('run_state_invalid', 'runtime', 'Run 已停止接纳新的 ToolCall。'));
         const id = writeTransaction(() => {
           const inserted = db.query(`INSERT INTO tool_calls(run_id,session_id,native_tool_call_id,tool_name,tool_version,effect,args_json,
-            delivery_json,cleanup_json,requested_at) VALUES (?,?,?,?,?,?,?, ?,?,?)`)
+            delivery_json,cleanup_json,requested_at,context_snapshot_id,request_sequence) VALUES (?,?,?,?,?,?,?, ?,?,?,?,?)`)
             .run(input.runId, input.sessionId, input.nativeToolCallId, input.toolName, input.toolVersion, input.effect,
               JSON.stringify({ version: 1, raw: input.rawArguments, final: null }),
               JSON.stringify({ version: 1, state: 'not_attempted', messageObservedAt: null, includedInCallSequence: null,
                 requestDispatchedAt: null, error: null }),
-              JSON.stringify({ version: 1, stopReason: null, stopped: false, errors: [] }), input.requestedAt);
+              JSON.stringify({ version: 1, stopReason: null, stopped: false, errors: [] }), input.requestedAt,
+              input.context?.snapshotId ?? null, input.context?.requestSequence ?? null);
           const counted = db.query("UPDATE runs SET tool_call_count=tool_call_count+1 WHERE id=? AND status IN ('created','running')")
             .run(input.runId).changes;
           if (counted !== 1) throw new Error('tool_call_run_closed');
@@ -2341,7 +2350,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         const committed = transaction(db, () => {
           const facts = db.query(`SELECT run.status AS run_status,run.session_id,run.job_id,run.scope_json,
               job.document_id,job.status AS job_status,document.version AS document_version,document.status AS document_status,
-              session.metadata_json,tool.id AS tool_call_id,tool.status AS tool_status,tool.tool_name,tool.native_tool_call_id,tool.args_json
+              session.metadata_json,tool.id AS tool_call_id,tool.status AS tool_status,tool.tool_name,tool.native_tool_call_id,tool.args_json,
+              tool.context_snapshot_id,tool.request_sequence
             FROM runs run JOIN sessions session ON session.id=run.session_id
             JOIN tool_calls tool ON tool.run_id=run.id AND tool.session_id=run.session_id
             JOIN jobs job ON job.id=run.job_id JOIN documents document ON document.id=job.document_id
@@ -2349,6 +2359,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
               run_status: string; session_id: number; job_id: number; scope_json: string; document_id: number; tool_call_id: number;
               job_status: string; document_version: string; document_status: string; metadata_json: string;
               tool_status: string; tool_name: string; native_tool_call_id: string; args_json: string;
+              context_snapshot_id: number | null; request_sequence: number | null;
             } | null;
           if (!facts || facts.run_status !== 'running' || facts.job_status !== 'running' || facts.document_status !== 'available') {
             return { ok: false as const, error: appError('state_conflict', 'runtime', 'Run、Job 或正式材料已不可提交候选。') };
@@ -2368,11 +2379,14 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           if (storedArgs.version !== 1 || stableJson(storedArgs.final) !== stableJson(JSON.parse(finalArgs))) {
             return { ok: false as const, error: appError('state_conflict', 'runtime', '候选与已固定的 ToolCall 参数不一致。') };
           }
+          const toolContext = readToolContext(db, { run_id: input.runId, session_id: input.sessionId,
+            context_snapshot_id: facts.context_snapshot_id, request_sequence: facts.request_sequence });
           const existing = db.query('SELECT id FROM invoice_candidates WHERE tool_call_id=?').get(facts.tool_call_id) as { id: number } | null;
           if (existing) {
             const candidate = candidateSnapshot(db, queryCandidateRow(db, existing.id, facts.job_id));
             if (candidate.snapshot.runId !== input.runId || stableJson({ fields: candidate.snapshot.fields, lines: candidate.snapshot.lines, notes: candidate.snapshot.notes })
-              !== stableJson(draft)) return { ok: false as const, error: appError('state_conflict', 'runtime', '同一 ToolCall 已提交了不同候选。') };
+              !== stableJson(draft) || !sameContextReference(candidate.snapshot.context, toolContext))
+              return { ok: false as const, error: appError('state_conflict', 'runtime', '同一 ToolCall 已提交了不同候选。') };
             return { ok: true as const, candidate, created: false };
           }
           if (facts.session_id < 1 || facts.document_version.length < 1 || !['running'].includes(facts.tool_status)) {
@@ -2380,10 +2394,11 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           }
           const sequence = (db.query('SELECT COALESCE(MAX(sequence),0)+1 AS next FROM invoice_candidates WHERE job_id=?')
             .get(facts.job_id) as { next: number }).next;
-          const inserted = db.query(`INSERT INTO invoice_candidates(job_id,run_id,tool_call_id,sequence,origin,status,fields_json,lines_json,issues_json,created_at)
-            VALUES (?,?,?,?,'model','generated',?,?,?,?)`).run(facts.job_id, input.runId, facts.tool_call_id, sequence,
+          const inserted = db.query(`INSERT INTO invoice_candidates(job_id,run_id,tool_call_id,sequence,origin,status,fields_json,lines_json,issues_json,created_at,context_snapshot_id,request_sequence)
+            VALUES (?,?,?,?,'model','generated',?,?,?,?,?,?)`).run(facts.job_id, input.runId, facts.tool_call_id, sequence,
             asJson({ version: 1, values: draft.fields }), asJson({ version: 1, items: draft.lines }),
-            asJson({ version: 1, notes: draft.notes, checks, items: issues }), input.at);
+            asJson({ version: 1, notes: draft.notes, checks, items: issues }), input.at,
+            toolContext?.snapshotId ?? null, toolContext?.requestSequence ?? null);
           const candidateId = Number(inserted.lastInsertRowid);
           if (!Number.isSafeInteger(candidateId) || candidateId < 1) throw new Error('unsafe_candidate_id');
           db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,candidate_id,run_id,result,safe_summary)

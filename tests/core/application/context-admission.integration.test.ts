@@ -127,13 +127,13 @@ describe('T04 real Ledger Context admission', () => {
       .toEqual({ context_observations_json: null, current_context_snapshot_id: null });
     expect(f.counts().builds).toBe(0);
   });
-  it('identifies the staged Tool recorder failure as the actual 015 null-context guard', async () => {
+  it('rejects a missing Tool binding before storage while retaining the actual 015 null-context guard', async () => {
     const f = fixture(); const accepted = need(await f.sessions.submitInput(f.request)); await f.executing;
-    expect(f.store.toolCalls.request({ runId: accepted.runId, sessionId: f.session.sessionId, nativeToolCallId: 'staged-tool',
+    expect(f.store.toolCalls.request({ context: null, runId: accepted.runId, sessionId: f.session.sessionId, nativeToolCallId: 'staged-tool',
       toolName: 'read', toolVersion: '0.85.1', effect: 'READ', rawArguments: {}, requestedAt: at }))
-      .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      .toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
     const before = f.rows();
-    // Same omitted columns as the production request INSERT; inspect the underlying SQLite guard error.
+    // Independently omit the association columns to exercise the underlying SQLite guard.
     expect(() => f.store.db.query(`INSERT INTO tool_calls(run_id,session_id,native_tool_call_id,tool_name,tool_version,effect,args_json,
       delivery_json,cleanup_json,requested_at) VALUES (?,?,?,?,?,?,?, ?,?,?)`).run(accepted.runId, f.session.sessionId,
       'staged-tool-raw', 'read', '0.85.1', 'READ', JSON.stringify({ version: 1, raw: {}, final: null }),

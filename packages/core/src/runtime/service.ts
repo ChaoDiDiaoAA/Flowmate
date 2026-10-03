@@ -980,12 +980,12 @@ export class RuntimeService {
         context: productContext,
         observeRequest: (name, raw, call) => {
           const result = this.dependencies.tools!.observeRequest(name, raw, { ...productContext,
-            nativeToolCallId: call.nativeToolCallId, signal: call.signal });
+            nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) });
           return result.ok ? ok(undefined) : result;
         },
         rejectRequest: (name, raw, call, error, stage) => {
           const result = this.dependencies.tools!.rejectRequest(name, raw, { ...productContext,
-            nativeToolCallId: call.nativeToolCallId, signal: call.signal }, error, stage);
+            nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) }, error, stage);
           return result.ok ? ok(undefined) : result;
         },
         recordDelivery: (nativeToolCallId, delivery) => this.dependencies.tools!.recordDelivery(productContext, nativeToolCallId, delivery),
@@ -995,6 +995,7 @@ export class RuntimeService {
           context.emit({ type: 'tool_progress', toolName: name, label, phase: 'running' });
           const result = await this.dependencies.tools!.execute(name, input, {
             ...productContext, nativeToolCallId: call.nativeToolCallId, signal: call.signal,
+            ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}),
           }, rawArguments);
           context.emit({ type: 'tool_progress', toolName: name, label,
             phase: result.result.status === 'succeeded' ? 'succeeded' : result.result.status === 'cancelled' ? 'cancelled' : 'failed' });

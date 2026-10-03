@@ -73,7 +73,7 @@ describe('ToolCall serialized byte boundaries', () => {
     const raw = utf8Sized(262_144, text => ({ text }));
     expect(Buffer.byteLength(JSON.stringify(raw), 'utf8')).toBe(262_144);
     expect(JSON.stringify(raw).length).toBeLessThan(262_144);
-    const request = { runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'raw-boundary',
+    const request = { context: null, runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'raw-boundary',
       toolName: 'read_fixture', toolVersion: '1', effect: 'READ' as const, rawArguments: raw, requestedAt: store.stamp };
     expect(store.toolCalls.request({ ...request, rawArguments: { text: raw.text + 'x' } }))
       .toMatchObject({ ok: false, error: { code: 'tool_result_too_large' } });
@@ -90,7 +90,7 @@ describe('ToolCall serialized byte boundaries', () => {
 
   it('fixes final arguments at 64 KiB and leaves rejected arguments unfixed', () => {
     const store = makeStore();
-    const call = required(store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId,
+    const call = required(store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId,
       nativeToolCallId: 'final-boundary', toolName: 'read_fixture', toolVersion: '1', effect: 'READ',
       rawArguments: {}, requestedAt: store.stamp }));
     const finalArguments = utf8Sized(65_536, text => ({ text }));
@@ -107,7 +107,7 @@ describe('ToolCall serialized byte boundaries', () => {
 
   it.each(['finish', 'reject'] as const)('counts the complete %s envelope and preserves open facts when one byte over', mode => {
     const store = makeStore();
-    const call = required(store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId,
+    const call = required(store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId,
       nativeToolCallId: `envelope-${mode}`, toolName: 'read_fixture', toolVersion: '1', effect: 'READ',
       rawArguments: {}, requestedAt: store.stamp }));
     if (mode === 'finish') {
@@ -233,7 +233,7 @@ describe('Runtime fixed observations', () => {
   });
   it('commits terminal and strict observation atomically and preserves them after delivery failure', () => {
     const store = makeStore();
-    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'atomic-observation',
+    const call = required(store.toolCalls.request({ context: null, runId: 1, sessionId: store.sessionId, nativeToolCallId: 'atomic-observation',
       toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
     expect(call.runtimeObservation).toBeNull();
     required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
@@ -259,7 +259,7 @@ describe('Runtime fixed observations', () => {
 
   it('recovers a committed terminal after response loss without generating another end time', () => {
     const store = makeStore();
-    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'response-loss',
+    const call = required(store.toolCalls.request({ context: null, runId: 1, sessionId: store.sessionId, nativeToolCallId: 'response-loss',
       toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
     required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
     required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: store.stamp }));
@@ -278,7 +278,7 @@ describe('Runtime fixed observations', () => {
 
   it.each(['finish', 'reject'] as const)('recovers the original %s facts when its committed response throws', (operation) => {
     const store = makeStore();
-    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: `thrown-${operation}`,
+    const call = required(store.toolCalls.request({ context: null, runId: 1, sessionId: store.sessionId, nativeToolCallId: `thrown-${operation}`,
       toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
     if (operation === 'finish') {
       required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
@@ -309,7 +309,7 @@ describe('Runtime fixed observations', () => {
 
   it.each(['returned', 'thrown'] as const)('keeps terminal response loss unknown when its recovery query is %s', (queryFailure) => {
     const store = makeStore();
-    const call = required(store.toolCalls.request({ runId: 1, sessionId: store.sessionId, nativeToolCallId: `query-${queryFailure}`,
+    const call = required(store.toolCalls.request({ context: null, runId: 1, sessionId: store.sessionId, nativeToolCallId: `query-${queryFailure}`,
       toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp }));
     required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
     required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: store.stamp }));
@@ -372,7 +372,7 @@ function makeFormStore(started = true) {
     sellerTaxId: missingField(), buyerName: missingField(), buyerTaxId: missingField(), currency: missingField(),
     netAmount: missingField(), taxAmount: missingField(), totalAmount: missingField() }, lines: [], notes: [] };
   const args = { documentId: 1, candidate };
-  const saveCall = required(store.toolCalls.request({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
+  const saveCall = required(store.toolCalls.request({ context: null, runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
     toolName: 'save_invoice_candidate', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: args, requestedAt: stamp }));
   required(store.toolCalls.fixArguments({ toolCallId: saveCall.toolCallId, finalArguments: args }));
   required(store.toolCalls.start({ toolCallId: saveCall.toolCallId, startedAt: stamp }));
@@ -396,7 +396,7 @@ function makeFormStore(started = true) {
     text: 'Store a trusted form receipt.', messageTimestamp: 2, goal: task.job.goal, config, usage, cleanup, createdAt: stamp }, verify));
   const frozenConfig = { ...config, goalMode: 'fill-form' as const, workspaceContext: form.workspaceContext, formTarget: target };
   required(store.runs.start(form.runId, frozenConfig, stamp));
-  const call = required(store.toolCalls.request({ runId: form.runId, sessionId: session.sessionId, nativeToolCallId: 'fill-storage-1',
+  const call = required(store.toolCalls.request({ context: null, runId: form.runId, sessionId: session.sessionId, nativeToolCallId: 'fill-storage-1',
     toolName: 'fill_invoice_form', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: { candidateId: saved.receipt.candidateId }, requestedAt: stamp }));
   required(store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: { candidateId: saved.receipt.candidateId } }));
   if (started) required(store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: stamp }));
@@ -541,7 +541,7 @@ describe('ToolCall form application facts', () => {
 describe('ToolCall and business event storage', () => {
   it.each(['message_observed', 'request_observed', 'failed', 'unknown'] as const)('does not write an equivalent repeated %s delivery observation', (state) => {
     const store = makeStore();
-    const requested = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'delivery-idempotent',
+    const requested = store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'delivery-idempotent',
       toolName: 'list_invoice_pages', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp });
     expect(requested.ok).toBe(true);
     if (!requested.ok) return;
@@ -568,7 +568,7 @@ describe('ToolCall and business event storage', () => {
 
   it.each(['messageObservedAt', 'includedInCallSequence', 'requestDispatchedAt', 'error'] as const)('rejects same-state delivery with conflicting %s and preserves its first fact', (field) => {
     const store = makeStore();
-    const requested = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'delivery-conflict',
+    const requested = store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'delivery-conflict',
       toolName: 'list_invoice_pages', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp });
     expect(requested.ok).toBe(true);
     if (!requested.ok) return;
@@ -593,7 +593,7 @@ describe('ToolCall and business event storage', () => {
 
   it('deduplicates only the same native request and preserves fixed arguments and terminal facts', () => {
     const store = makeStore();
-    const request = { runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'native-call-1',
+    const request = { context: null, runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'native-call-1',
       toolName: 'list_invoice_pages', toolVersion: '1', effect: 'READ' as const,
       rawArguments: { documentId: 3, page: null }, requestedAt: store.stamp };
     const created = store.toolCalls.request(request);
@@ -623,7 +623,7 @@ describe('ToolCall and business event storage', () => {
 
   it('records a failed call, monotonic delivery observations, Run pagination, and job Activity', () => {
     const store = makeStore();
-    const first = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'native-call-1',
+    const first = store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'native-call-1',
       toolName: 'get_invoice_candidate', toolVersion: '1', effect: 'READ', rawArguments: { jobId: 4 }, requestedAt: store.stamp });
     expect(first.ok).toBe(true);
     if (!first.ok) return;
@@ -642,7 +642,7 @@ describe('ToolCall and business event storage', () => {
     expect(store.toolCalls.finish({ toolCallId: first.data.toolCallId, result: failure,
       cleanup: { version: 1, stopReason: 'tool-error', stopped: true, errors: [] }, endedAt: store.stamp, stoppedAt: store.stamp }))
       .toMatchObject({ ok: true, data: { status: 'failed', result: failure } });
-    const second = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'native-call-2',
+    const second = store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'native-call-2',
       toolName: 'list_invoice_pages', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: store.stamp });
     expect(second.ok).toBe(true);
     expect(store.toolCalls.list({ runId: store.runId, limit: 1 })).toMatchObject({ ok: true, data: { items: [{ nativeToolCallId: 'native-call-2' }], nextBeforeId: 2 } });
@@ -679,7 +679,7 @@ describe('ToolCall and business event storage', () => {
       sellerTaxId: missingField(), buyerName: missingField(), buyerTaxId: missingField(), currency: missingField(),
       netAmount: missingField(), taxAmount: missingField(), totalAmount: missingField() }, lines: [], notes: ['Draft from model'] };
     const args = { documentId: 1, candidate };
-    const call = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'save-call-1',
+    const call = store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId, nativeToolCallId: 'save-call-1',
       toolName: 'save_invoice_candidate', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: args, requestedAt: store.stamp });
     expect(call.ok).toBe(true);
     if (!call.ok) return;
@@ -713,7 +713,7 @@ describe('ToolCall and business event storage', () => {
       status,metadata_json,created_at,updated_at) VALUES
       (1,'fixture','doc-1','v1',1,2,'available','{}',?,?)`).run(store.stamp, store.stamp);
     const source = { documentId: 1, version: 'v1', artifactId: 1, page: 1, blockId: null, quote: null };
-    const call = store.toolCalls.request({ runId: store.runId, sessionId: store.sessionId,
+    const call = store.toolCalls.request({ context: null, runId: store.runId, sessionId: store.sessionId,
       nativeToolCallId: 'original-evidence-1', toolName: 'read_invoice_evidence', toolVersion: '1', effect: 'READ',
       rawArguments: { documentId: 1, page: 1, kind: 'original', blockId: null }, requestedAt: store.stamp });
     expect(call.ok).toBe(true);
