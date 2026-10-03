@@ -16,7 +16,7 @@ import {
   type AgentToolResult,
   type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
-import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
   AgentObservation,
@@ -33,6 +33,7 @@ import type {
   NativeInputContextBinding,
   NativeToolResultContextBinding,
   RequestContextBinding,
+  ContextEvidenceUpdate,
   PromptTraceBuffer,
   PromptTraceEntry,
   PromptTraceEvent,
@@ -61,6 +62,7 @@ import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import { toPiTool } from './tools.ts';
 import { getNativeToolParameters } from './native-tools.ts';
 import { projectSessionEvent } from './events.ts';
+import { checkPayload, checkWire, preparePayloadCodec, sdkRequestId } from './context-evidence.ts';
 import { formatExecutionPrompt, validateNativeHistory, validateModelMessages, projectSessionMessages, projectMessageView } from './messages.ts';
 
 const maxContextBytes = RUNTIME_CONFIG.llmPayload.maxChatContextBytes;
@@ -1268,7 +1270,7 @@ export class PiAgentAdapter implements AgentPort {
     context: StreamContext,
     options: StreamOptions,
     output: ReturnType<typeof createAssistantMessageEventStream>,
-    _requestBinding?: RequestContextBinding,
+    requestBinding?: RequestContextBinding,
   ): Promise<void> {
     const callSequence = active.callSequence;
     const callStartedAt = performance.now();
@@ -1288,10 +1290,34 @@ export class PiAgentAdapter implements AgentPort {
         outputEnded = true;
       }
     };
+    const codecResult = requestBinding ? preparePayloadCodec(model.api, context, model.input.includes('image')) : ok(undefined);
+    if (!codecResult.ok) { failStream(codecResult.error); return; }
+    const codec = codecResult.data;
+    const modelIdentity = { api: model.api, provider: model.provider, model: model.id };
+    const recordEvidence = (update: ContextEvidenceUpdate): Result<void> => {
+      if (!requestBinding) return ok(undefined);
+      let saved: Result<void>;
+      try { saved = active.input.contextHooks!.record(requestBinding, update); }
+      catch { saved = fail(appError('storage_write_failed', 'storage', 'Request evidence could not be saved.', true)); }
+      if (!saved.ok) failStream(saved.error);
+      return saved;
+    };
+    const requireEvidence = (update: ContextEvidenceUpdate) => {
+      const saved = recordEvidence(update); if (!saved.ok) throw new Error(saved.error.code);
+    };
+    let localAttempt = 0;
+    let sdkPayloadFact: Extract<ContextEvidenceUpdate, { kind: 'sdk-payload' }> | undefined;
+    let sdkSuccessSlot: { attempt: number; status: number; responseAt: string } | undefined;
+    let consumedResponse: { status: number; nativeRequestId: string | null; api: string; provider: string; model: string } | undefined;
+    const observable = observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch) !== undefined;
     const baseFetch: FetchLike = (options?.fetch as FetchLike | undefined)
       ?? this.dependencies.fetch
       ?? ((request, init) => globalThis.fetch(request, init));
     const fetch: FetchLike = async (request, init) => {
+      const wire = requestBinding ? await checkWire(codec, request, init) : ok({ inclusion: 'confirmed' as const, reason: null });
+      if (!wire.ok) { failStream(wire.error); throw new Error(wire.error.code); }
+      if (signal.aborted) { const error = appError('agent_cancelled', 'runtime', 'The request was cancelled before dispatch.');
+        this.failToolRun(record, active, error); throw new Error(error.code); }
       if ((active.input.remainingRunMs?.() ?? Infinity) <= 0) {
         const error = appError('agent_timeout', 'runtime', 'The Run deadline elapsed before dispatch.');
         this.failToolRun(record, active, error);
@@ -1303,24 +1329,52 @@ export class PiAgentAdapter implements AgentPort {
         throw new Error(allowed.error.code);
       }
       if (!this.observeOutgoingToolResults(record, active, context)) throw new Error('tool_result_delivery_failed');
+      const attempt = ++localAttempt;
+      if (requestBinding) requireEvidence({ kind: 'attempt-prepared', evidence: { attempt, preparedAt: now().at,
+        enteredAt: null, responseAt: null, responseStatus: null, transportErrorCode: null, nativeRequestId: null,
+        wireInclusion: wire.data.inclusion, wireReason: wire.data.reason } });
       active.attempts += 1;
       const requestUrl = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url;
       this.observe(active, 'request_dispatched', { callSequence: active.callSequence, attempt: active.attempts, url: safeUrl(requestUrl) });
-      try {
-        const response = await baseFetch(request, init);
+      let launched: Promise<Response>;
+      try { launched = baseFetch(request, init); } catch (error) { launched = Promise.reject(error); }
+      // Attach immediately: an entered-write rejection must not abandon a rejected launched request.
+      const settled = launched.then(response => ({ response }), error => ({ error }));
+      const entered = requestBinding ? recordEvidence({ kind: 'attempt-entered', attempt, at: now().at }) : ok(undefined);
+      const outcome = await settled;
+      if ('response' in outcome) {
+        const response = outcome.response;
+        const responseAt = now().at;
+        const recorded = requestBinding ? recordEvidence({ kind: 'response', attempt, at: responseAt,
+          status: response.status, nativeRequestId: null }) : ok(undefined);
         active.responseStatus = response.status;
         active.responseStarted = true;
         this.observe(active, 'response_started', { callSequence: active.callSequence, attempt: active.attempts, status: response.status });
+        if (!entered.ok) throw new Error(entered.error.code);
+        if (!recorded.ok) throw new Error(recorded.error.code);
+        if (requestBinding && response.ok && codec) sdkSuccessSlot = { attempt, status: response.status, responseAt };
         return response;
-      } catch (error) {
-        if (!active.failure) active.failure = this.providerError(active, error, true);
-        throw error;
       }
+      if (!entered.ok) throw new Error(entered.error.code);
+      if (requestBinding) {
+        const failure = active.failure ?? (active.signal.aborted ? appError('agent_cancelled', 'runtime', 'The request was cancelled.')
+          : appError('provider_transport_error', 'provider', 'The request transport failed.'));
+        const safeCode = ContextSafeErrorCodeSchema.safeParse(failure.code);
+        requireEvidence({ kind: 'transport-failed', attempt, at: now().at, code: safeCode.success ? safeCode.data : 'provider_transport_error' });
+        failStream(failure);
+      } else if (!active.failure) active.failure = this.providerError(active, outcome.error, true);
+      throw outcome.error;
     };
     const signal = options?.signal ? AbortSignal.any([options.signal, active.signal]) : active.signal;
     const onPayload = async (payload: unknown, requestedModel: StreamModel) => {
       const replacement = await options?.onPayload?.(payload, requestedModel);
       const outgoing = replacement === undefined ? payload : replacement;
+      if (requestBinding) {
+        const inclusion = checkPayload(codec, outgoing);
+        if (!inclusion.ok) { failStream(inclusion.error); throw new Error(inclusion.error.code); }
+        const fact = { kind: 'sdk-payload' as const, at: sdkPayloadFact?.at ?? now().at, ...inclusion.data };
+        requireEvidence(fact); sdkPayloadFact ??= fact;
+      }
       if (outgoing && typeof outgoing === 'object') {
         const body = outgoing as Record<string, unknown>;
         const generation = body.generationConfig as Record<string, unknown> | undefined;
@@ -1331,7 +1385,20 @@ export class PiAgentAdapter implements AgentPort {
       return replacement;
     };
     const onResponse = async (response: { status: number; headers: Record<string, string> }, requestedModel: StreamModel) => {
+      const captured = { status: response.status, nativeRequestId: sdkRequestId(response.headers),
+        api: requestedModel.api, provider: requestedModel.provider, model: requestedModel.id };
       await options?.onResponse?.(response, requestedModel);
+      if (requestBinding && codec && observable) {
+        const slot = sdkSuccessSlot;
+        const code = !slot ? 'context_binding_unknown' : captured.status !== slot.status || captured.api !== modelIdentity.api
+          || captured.provider !== modelIdentity.provider || captured.model !== modelIdentity.model
+          || consumedResponse && !isDeepStrictEqual(consumedResponse, captured) ? 'context_binding_conflict' : null;
+        if (code) { const error = appError(code, 'runtime', 'The SDK response does not match its original request.'); failStream(error); throw new Error(code); }
+        if (!consumedResponse) {
+          requireEvidence({ kind: 'response', attempt: slot!.attempt, at: slot!.responseAt, status: slot!.status, nativeRequestId: captured.nativeRequestId });
+          consumedResponse = captured;
+        }
+      }
       active.responseStatus = response.status;
       active.responseStarted = true;
       this.observe(active, 'response_started', { callSequence: active.callSequence, attempt: active.attempts || 1, status: response.status });

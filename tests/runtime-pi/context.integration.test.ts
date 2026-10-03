@@ -1,18 +1,22 @@
 import { describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { InMemoryCredentialStore, createAssistantMessageEventStream, type AssistantMessage, type Context } from '@earendil-works/pi-ai';
+import { streamSimple as completionsStream } from '@earendil-works/pi-ai/api/openai-completions';
+import { streamSimple as responsesStream } from '@earendil-works/pi-ai/api/openai-responses';
+import { ModelRuntime, type AgentSession } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ContextObservationsSchema, SessionInputContentV2Schema, appError, fail, ok } from '@flowmate/contracts';
-import type { AgentRunEvent, Application, ProviderConfig, Result, SessionInputRequest, AgentToolBinding, ToolDefinition, RequestContextBinding } from '@flowmate/contracts';
+import type { AgentRunEvent, Application, ProviderConfig, Result, SessionInputRequest, AgentToolBinding, ToolDefinition, RequestContextBinding, ContextEvidenceUpdate } from '@flowmate/contracts';
 import { z } from 'zod';
 import { createApplication } from '../../apps/composition.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
-import { deferCleanup, mkdtempSync } from '../support/resources.ts';
+import { deferCleanup, mkdtempSync, waitFor } from '../support/resources.ts';
 import { openTestDatabase } from '../support/database.ts';
 import { ContextService } from '../../packages/core/src/context/service.ts';
 import { RuntimeService } from '../../packages/core/src/runtime/service.ts';
 import { SessionService } from '../../packages/core/src/sessions/service.ts';
+import { checkPayload, checkWire, preparePayloadCodec } from '../../packages/runtime-pi/src/context-evidence.ts';
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 function barrier() { let release!: () => void; const ready = new Promise<void>(resolve => { release = resolve; }); return { ready, release }; }
@@ -21,6 +25,132 @@ function reply(text = 'Controlled answer.') {
     choices: [{ index: 0, delta, finish_reason: finish }] }) + '\n\n';
   return new Response(chunk({ role: 'assistant', content: text }, null) + chunk({}, 'stop') + 'data: [DONE]\n\n',
     { headers: { 'content-type': 'text/event-stream' } });
+}
+function responsesReply() {
+  const item = { id: 'message-1', type: 'message', role: 'assistant', status: 'completed',
+    content: [{ type: 'output_text', text: 'Controlled answer.', annotations: [] }] };
+  const events = [{ type: 'response.created', response: { id: 'response-1' } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+    { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'Controlled answer.' },
+    { type: 'response.output_item.done', output_index: 0, item },
+    { type: 'response.completed', response: { id: 'response-1', status: 'completed', output: [item],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }];
+  return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),
+    { headers: { 'content-type': 'text/event-stream', 'x-request-id': 'response-success' } });
+}
+async function evidenceFixture(options: {
+  api?: 'openai-completions' | 'openai-responses' | 'pi-messages' | 'google-generative-ai'; retries?: 0 | 1;
+  response?: (ordinal: number) => Response | Promise<Response>;
+  replacement?: (payload: unknown) => unknown | Promise<unknown>;
+  reject?: (update: ContextEvidenceUpdate) => boolean;
+  onResponse?: (response: { status: number; headers: Record<string, string> }) => void | Promise<void>;
+  sdkCallback?: 'same' | 'null-then-id' | 'status' | 'identity' | 'missing-slot';
+  wire?: 'request' | 'opaque' | 'remove-user';
+  networkThrow?: boolean; ignoreAbort?: boolean;
+  syncThrow?: boolean; timeoutMs?: number; afterRecord?: (update: ContextEvidenceUpdate) => void;
+  nativeUnavailable?: boolean;
+} = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-p8-evidence-'));
+  const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), logsDir: join(root, 'logs'),
+    artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
+  const store = need(openTestDatabase(paths)), payloads: unknown[] = [], updates: ContextEvidenceUpdate[] = [];
+  let baseCalls = 0;
+  const api = options.api ?? 'openai-completions';
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    payloads.push(await request.json());
+    if (options.response) return options.response(payloads.length);
+    const response = api === 'openai-responses' ? responsesReply() : reply();
+    response.headers.set('x-request-id', 'response-success'); return response;
+  } });
+  deferCleanup(() => server.stop(true));
+  let sdk!: AgentSession;
+  const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir,
+    credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-evidence-key', sessionSetup: session => { sdk = session; },
+    ...(options.networkThrow || options.ignoreAbort || options.syncThrow ? { fetch: (input, init) => {
+      baseCalls++; if (options.syncThrow) throw new Error('PRIVATE_SYNC_THROW');
+      return options.networkThrow ? Promise.reject(new Error('PRIVATE_TOKEN_BODY_DO_NOT_PERSIST'))
+        : globalThis.fetch(input, { ...init, signal: undefined }); } } : {}) });
+  const native = need(adapter.createSession());
+  const at = () => new Date().toISOString();
+  const session = need(store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'Evidence', at: at(),
+    nativeHistory: need(adapter.exportSession(native.nativeSessionId)) }));
+  need(adapter.watchSession(native.nativeSessionId, (history, context) => store.sessions.saveHistory(session.sessionId, history, context)));
+  const config: ProviderConfig = { version: 1, name: 'Evidence', revision: 1, modelRef: { provider: 'evidence-fixture', model: 'fixture' },
+    native: { authPath: join(root, 'unused.json'), modelsPath: null },
+    connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api, contextWindow: 64000, maxTokens: 16384 },
+    parameters: { maxRetries: options.retries ?? 0, maxRetryDelayMs: 1000 } };
+  need(await adapter.prepare(native.nativeSessionId, config, { timeoutMs: 5000, stopGraceMs: 500 }, new AbortController().signal, { sessionInputs: true }));
+  if (options.replacement || options.onResponse) {
+    const wrapped = sdk.agent.streamFunction;
+    // Public outer wrapper sends original callback options into Pi's evidence wrapper, never around it.
+    sdk.agent.streamFunction = (model, context, streamOptions) => wrapped(model, context, { ...streamOptions,
+      ...(options.replacement ? { onPayload: payload => options.replacement!(payload) } : {}),
+      ...(options.onResponse ? { onResponse: async response => { await options.onResponse!(response); } } : {}) });
+  }
+  if (options.sdkCallback || options.wire || options.nativeUnavailable) {
+    const original = ModelRuntime.prototype.streamSimple;
+    ModelRuntime.prototype.streamSimple = function (model, context, streamOptions) {
+      if (options.nativeUnavailable) {
+        const stream = createAssistantMessageEventStream();
+        const message: AssistantMessage = { role: 'assistant', api: model.api, provider: model.provider, model: model.id,
+          content: [{ type: 'text', text: 'Controlled unavailable API answer.' }], stopReason: 'stop', timestamp: 1,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        queueMicrotask(async () => {
+          try {
+            await streamOptions?.onPayload?.({ unsupportedShape: true }, model);
+            // Deliberate SDK capability fixture: no custom fetch API still makes a real loopback request.
+            const response = await (streamOptions?.fetch ?? globalThis.fetch)(`${config.connection!.baseUrl}/unavailable`,
+              { method: 'POST', body: JSON.stringify({ unsupportedShape: true }) });
+            await streamOptions?.onResponse?.({ status: response.status, headers: { 'x-request-id': 'unsupported-id' } }, model);
+            stream.push({ type: 'done', reason: 'stop', message }); stream.end(message);
+          } catch (error) { const failed = { ...message, stopReason: 'error' as const, errorMessage: String(error) };
+            stream.push({ type: 'error', reason: 'error', error: failed }); stream.end(failed); }
+        });
+        return stream;
+      }
+      return original.call(this, model, context, { ...streamOptions,
+        fetch: options.sdkCallback === 'missing-slot' ? globalThis.fetch : options.wire ? Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+          if (options.wire === 'request') return streamOptions!.fetch!(new Request(input, init));
+          if (options.wire === 'opaque') return streamOptions!.fetch!(input, { ...init, body: new Blob([String(init?.body)]) });
+          const body = JSON.parse(String(init?.body));
+          return streamOptions!.fetch!(input, { ...init, body: JSON.stringify({ ...body, messages: [] }) });
+        }, { preconnect: globalThis.fetch.preconnect }) : streamOptions?.fetch,
+        onResponse: async (response, requested) => {
+          const callback = streamOptions?.onResponse;
+          if (options.sdkCallback === 'status') { await callback?.({ ...response, status: 201 }, requested); return; }
+          if (options.sdkCallback === 'identity') { await callback?.(response, { ...requested, id: 'different-model' }); return; }
+          if (options.sdkCallback === 'null-then-id') {
+            await callback?.({ ...response, headers: {} }, requested);
+            await callback?.(response, requested); return;
+          }
+          await callback?.(response, requested);
+          if (options.sdkCallback === 'same') await callback?.(response, requested);
+        } });
+    };
+    deferCleanup(() => { ModelRuntime.prototype.streamSimple = original; });
+  }
+  const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent: adapter,
+    contextService: new ContextService({ store, materials: { inspectParsed() { throw new Error('No chat material.'); } } }),
+    contextRepository: { bindRequest: store.context.bindRequest, resolveToolResult: store.context.resolveToolResult,
+      recordRequest(binding, update) { updates.push(update);
+        if (options.reject?.(update)) return fail(appError('storage_write_failed', 'storage', 'Controlled necessary evidence rejection.', true));
+        const saved = store.context.recordRequest(binding, update); if (saved.ok) options.afterRecord?.(update); return saved; } },
+    provider: { async prepare() { throw new Error('No direct Provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
+    log: { write() {}, async close() {} }, now: at, monotonicNow: () => performance.now() });
+  deferCleanup(() => runtime.close());
+  const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.sessionInputs,
+    (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
+  const start = async (text = 'Text with \ud800 lone and 😀 paired', clientSequence = 1) => {
+    let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+    const terminal = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finish = resolve; });
+    const accepted = need(await sessions.submitInput({ sessionId: session.sessionId, clientSequence, mode: 'prompt', text,
+      config, timeoutMs: options.timeoutMs ?? 5000, stopGraceMs: 500 }, { onEvent(event) { if (event.type === 'run_finished') finish(event); } }));
+    return { accepted, terminal };
+  };
+  const journal = (runId: number) => ContextObservationsSchema.parse(JSON.parse(store.db.query<{ context_observations_json: string }, [number]>
+    ('SELECT context_observations_json FROM runs WHERE id=?').get(runId)!.context_observations_json));
+  return { store, adapter, sdk, session, runtime, sessions, config, payloads, updates, start, journal, baseCalls: () => baseCalls };
 }
 async function begin(app: Application, input: SessionInputRequest) {
   let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
@@ -179,6 +309,227 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
   return { store, adapter, session, config, start, journal, calls: () => calls, legacyRunId, originalCallId };
 }
 
+describe('T06 actual payload and transport evidence', () => {
+  it.each(['openai-completions', 'openai-responses'] as const)('records final %s replacement and real wire response', async api => {
+    let replacements = 0;
+    const f = await evidenceFixture({ api, replacement: payload => { replacements++; return { ...(payload as object), temperature: 0 }; } });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    const request = f.journal(run.accepted.runId).requests[0]!;
+    expect(request.sdkPayload).toMatchObject({ inclusion: 'confirmed', reason: null, observedAt: expect.any(String) });
+    expect(request.attempts).toHaveLength(1);
+    expect(request.attempts[0]).toMatchObject({ attempt: 1, enteredAt: expect.any(String), responseAt: expect.any(String),
+      responseStatus: 200, nativeRequestId: 'response-success', wireInclusion: 'confirmed', wireReason: null });
+    expect(f.payloads).toHaveLength(1); expect(f.payloads[0]).toMatchObject({ temperature: 0 }); expect(replacements).toBe(1);
+    expect(JSON.stringify(f.payloads[0])).toContain('Text with  lone and 😀 paired');
+  });
+  it.each(['sdk-payload', 'attempt-prepared'] as const)('stops HTTP at necessary %s rejection', async kind => {
+    const f = await evidenceFixture({ reject: update => update.kind === kind });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'storage_write_failed' } } });
+    expect(f.payloads).toHaveLength(0); expect(f.journal(run.accepted.runId).requests[0]!.attempts).toEqual([]);
+  });
+  it('rejects a replacement that removes necessary user content before HTTP', async () => {
+    const f = await evidenceFixture({ replacement: payload => ({ ...(payload as object), messages: [] }) });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'context_payload_mismatch' } } });
+    expect(f.payloads).toHaveLength(0);
+  });
+  it.each(['openai-completions', 'openai-responses'] as const)('retains original %s request across SDK retry', async api => {
+    let payloadCallbacks = 0, responseCallbacks = 0;
+    const f = await evidenceFixture({ api, retries: 1, onResponse: () => { responseCallbacks++; }, replacement: payload => { payloadCallbacks++; return payload; }, response: ordinal =>
+      ordinal === 1 ? new Response(JSON.stringify({ error: { message: 'controlled retry' } }), { status: 503,
+        headers: { 'content-type': 'application/json', 'retry-after-ms': '1', 'x-request-id': 'failed-attempt' } })
+      : api === 'openai-responses' ? responsesReply() : new Response(reply().body, { headers: { 'content-type': 'text/event-stream', 'x-request-id': 'response-success' } }) });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    const request = f.journal(run.accepted.runId).requests[0]!;
+    expect(request.attempts.map(item => ({ attempt: item.attempt, status: item.responseStatus, id: item.nativeRequestId })))
+      .toEqual([{ attempt: 1, status: 503, id: null }, { attempt: 2, status: 200, id: 'response-success' }]);
+    expect(f.payloads).toHaveLength(2); expect(f.payloads[1]).toEqual(f.payloads[0]); expect(payloadCallbacks).toBe(1);
+    expect(f.journal(run.accepted.runId).requests).toHaveLength(1); expect(responseCallbacks).toBe(1);
+  });
+  it.each(['attempt-entered', 'response', 'id'] as const)('preserves actual dispatched facts when %s write fails', async kind => {
+    const f = await evidenceFixture({ ignoreAbort: true, reject: update => kind === 'id'
+      ? update.kind === 'response' && update.nativeRequestId !== null : update.kind === kind });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'storage_write_failed' } } });
+    expect(f.payloads).toHaveLength(1);
+    const attempt = f.journal(run.accepted.runId).requests[0]!.attempts[0]!;
+    expect(attempt.preparedAt).toBeString(); expect(attempt.nativeRequestId).toBeNull();
+    expect(attempt.enteredAt === null).toBe(kind === 'attempt-entered');
+    expect(attempt.responseAt === null).toBe(kind === 'response');
+    expect(attempt.transportErrorCode).toBeNull();
+  });
+  it.each(['request', 'opaque', 'remove-user'] as const)('observes the actual %s wire shape independently of SDK payload', async wire => {
+    const f = await evidenceFixture({ wire }); const run = await f.start(); const end = await run.terminal;
+    expect(end.result).toMatchObject(wire === 'remove-user' ? { ok: true, data: { status: 'failed', error: { code: 'context_payload_mismatch' } } }
+      : { ok: true, data: { status: 'completed' } });
+    const request = f.journal(run.accepted.runId).requests[0]!;
+    expect(request.sdkPayload?.inclusion).toBe('confirmed');
+    expect(f.payloads).toHaveLength(wire === 'remove-user' ? 0 : 1);
+    if (wire !== 'remove-user') expect(request.attempts[0]).toMatchObject(wire === 'opaque'
+      ? { wireInclusion: 'unavailable', wireReason: 'body_unavailable' } : { wireInclusion: 'confirmed', wireReason: null });
+  });
+  it.each(['same', 'null-then-id', 'status', 'identity', 'missing-slot'] as const)('checks the SDK success slot at the controlled %s callback boundary', async sdkCallback => {
+    const f = await evidenceFixture({ sdkCallback }); const run = await f.start(); const end = await run.terminal;
+    expect(end.result).toMatchObject(sdkCallback === 'same' ? { ok: true, data: { status: 'completed' } }
+      : { ok: true, data: { status: 'failed', error: { code: sdkCallback === 'missing-slot' ? 'context_binding_unknown' : 'context_binding_conflict' } } });
+    expect(f.payloads).toHaveLength(1);
+    const request = f.journal(run.accepted.runId).requests[0]!;
+    if (sdkCallback === 'missing-slot') expect(request.attempts).toEqual([]);
+    else {
+      expect(request.attempts[0]?.responseStatus).toBe(200);
+      expect(request.attempts[0]?.nativeRequestId).toBe(sdkCallback === 'same' ? 'response-success' : null);
+      expect(request.attempts[0]?.transportErrorCode).toBeNull();
+    }
+  });
+  it('captures SDK response values before an existing callback mutates its plain headers', async () => {
+    const f = await evidenceFixture({ onResponse: response => { response.status = 409; response.headers['x-request-id'] = 'mutated'; } });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(f.journal(run.accepted.runId).requests[0]!.attempts[0]).toMatchObject({ responseStatus: 200, nativeRequestId: 'response-success' });
+  });
+  it.each([null, 'x'.repeat(257)] as const)('keeps an absent or invalid SDK ID as a normal NULL observation: %s', async id => {
+    const f = await evidenceFixture({ response: () => new Response(reply().body, { headers: { 'content-type': 'text/event-stream',
+      ...(id === null ? {} : { 'x-request-id': id }) } }) });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(f.journal(run.accepted.runId).requests[0]!.attempts[0]).toMatchObject({ responseStatus: 200, nativeRequestId: null });
+  });
+  it('records a safe network throw and prevents a second actual dispatch despite configured retry', async () => {
+    const f = await evidenceFixture({ networkThrow: true, retries: 1 });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'provider_transport_error' } } });
+    const request = f.journal(run.accepted.runId).requests[0]!;
+    expect(request.attempts).toHaveLength(1);
+    expect(request.attempts[0]).toMatchObject({ responseAt: null, transportErrorCode: 'provider_transport_error' });
+    expect(JSON.stringify(request)).not.toContain('PRIVATE_TOKEN_BODY'); expect(f.payloads).toHaveLength(0);
+  });
+  it('records actual baseFetch invocation when it synchronously throws without claiming server receipt', async () => {
+    const f = await evidenceFixture({ syncThrow: true, retries: 1 }); const run = await f.start();
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'provider_transport_error' } } });
+    expect(f.baseCalls()).toBe(1); expect(f.payloads).toHaveLength(0);
+    expect(f.journal(run.accepted.runId).requests[0]!.attempts).toEqual([expect.objectContaining({ attempt: 1,
+      enteredAt: expect.any(String), responseAt: null, transportErrorCode: 'provider_transport_error' })]);
+  });
+  it.each(['pi-messages', 'google-generative-ai'] as const)('preserves unsupported %s evidence without invented ID or fetch attempt', async api => {
+    const f = await evidenceFixture({ api, nativeUnavailable: true }); const run = await f.start();
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    const request = f.journal(run.accepted.runId).requests[0]!;
+    expect(request.sdkPayload).toMatchObject({ inclusion: 'unavailable', reason: 'payload_codec_unavailable' });
+    expect(f.payloads).toHaveLength(1);
+    if (api === 'google-generative-ai') { expect(request.transport).toBe('not-observable'); expect(request.attempts).toEqual([]); }
+    else expect(request.attempts).toEqual([expect.objectContaining({ responseStatus: 200, nativeRequestId: null,
+      wireInclusion: 'unavailable', wireReason: 'payload_codec_unavailable' })]);
+  });
+  it.each(['openai-completions', 'openai-responses'] as const)('keeps the original %s retry binding after a newer queued Input', async api => {
+    const entered = barrier(), release = barrier(); deferCleanup(() => release.release());
+    const f = await evidenceFixture({ api, retries: 1, response: async ordinal => {
+      if (ordinal === 1) { entered.release(); await release.ready; return new Response(JSON.stringify({ error: { message: 'retry' } }),
+        { status: 429, headers: { 'content-type': 'application/json', 'retry-after-ms': '1' } }); }
+      const response = api === 'openai-responses' ? responsesReply() : reply(); response.headers.set('x-request-id', `success-${ordinal}`); return response;
+    } });
+    const run = await f.start('First original'); await entered.ready;
+    const next = need(await f.sessions.submitInput({ sessionId: f.session.sessionId, runId: run.accepted.runId,
+      clientSequence: 2, mode: 'followUp', text: 'Newer queued' }));
+    const pointer = need(f.store.runs.get(run.accepted.runId)).currentContextSnapshotId;
+    release.release(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    const requests = f.journal(run.accepted.runId).requests;
+    expect(requests[0]!.binding.inputId).toBe(run.accepted.inputId);
+    expect(requests[0]!.binding.snapshotId).not.toBe(pointer); expect(requests[0]!.attempts).toHaveLength(2);
+    expect(f.payloads[1]).toEqual(f.payloads[0]); expect(requests[1]!.binding.inputId).toBe(next.inputId);
+    expect(requests[0]!.attempts[0]!.nativeRequestId).toBeNull(); expect(requests[0]!.attempts[1]!.nativeRequestId).toBe('success-2');
+  });
+  it.each(['cancel', 'revoke', 'deadline'] as const)('blocks a second retry attempt after actual first response and %s', async cause => {
+    let f!: Awaited<ReturnType<typeof evidenceFixture>>;
+    f = await evidenceFixture({ retries: 1, ...(cause === 'deadline' ? { timeoutMs: 200 } : {}), response: () =>
+      new Response(JSON.stringify({ error: { message: 'retry after qualification change' } }), { status: 503,
+        headers: { 'content-type': 'application/json', 'retry-after-ms': '400' } }),
+      afterRecord: update => {
+        if (update.kind !== 'response' || update.status !== 503) return;
+        if (cause === 'cancel') need(f.runtime.cancel(f.runtime.state().active!.runId));
+        if (cause === 'revoke') f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
+          .run(JSON.stringify({ documentIds: [1], at: new Date().toISOString(), reason: 'document_use_revoked' }), f.session.sessionId);
+      } });
+    const run = await f.start(); const end = await run.terminal;
+    expect(end.result).toMatchObject({ ok: true, data: { status: cause === 'cancel' ? 'cancelled' : 'failed' } });
+    expect(f.payloads).toHaveLength(1); expect(f.journal(run.accepted.runId).requests[0]!.attempts)
+      .toEqual([expect.objectContaining({ attempt: 1, responseStatus: 503, nativeRequestId: null, transportErrorCode: null })]);
+  });
+  it('handles the launched rejection after an entered write failure without inventing a transport failure', async () => {
+    const f = await evidenceFixture({ networkThrow: true, retries: 1, reject: update => update.kind === 'attempt-entered' });
+    const run = await f.start(); expect((await run.terminal).result).toMatchObject({ ok: true,
+      data: { status: 'failed', error: { code: 'storage_write_failed' } } });
+    expect(f.baseCalls()).toBe(1); expect(f.payloads).toHaveLength(0);
+    expect(f.journal(run.accepted.runId).requests[0]!.attempts).toEqual([expect.objectContaining({ enteredAt: null,
+      responseAt: null, transportErrorCode: null })]);
+  });
+  it.each(['cancel', 'revoke'] as const)('rechecks qualification after an asynchronous payload callback and %s before HTTP', async cause => {
+    const entered = barrier(), release = barrier(); deferCleanup(() => release.release());
+    const f = await evidenceFixture({ replacement: async payload => { entered.release(); await release.ready; return payload; } });
+    const run = await f.start(); await entered.ready;
+    if (cause === 'cancel') need(f.runtime.cancel(run.accepted.runId));
+    else f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
+      .run(JSON.stringify({ documentIds: [1], at: new Date().toISOString(), reason: 'document_use_revoked' }), f.session.sessionId);
+    release.release(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: cause === 'cancel' ? 'cancelled' : 'failed' } });
+    expect(f.payloads).toHaveLength(0); expect(f.journal(run.accepted.runId).requests[0]!.attempts).toEqual([]);
+  });
+  it('supplements only the original request after cancellation has finished with an unconfirmed worker stop', async () => {
+    const entered = barrier(), release = barrier(); deferCleanup(() => release.release());
+    const f = await evidenceFixture({ ignoreAbort: true, response: async () => { entered.release(); await release.ready;
+      const response = reply(); response.headers.set('x-request-id', 'late-original'); return response; } });
+    const run = await f.start('Original late request'); await entered.ready;
+    need(f.runtime.cancel(run.accepted.runId));
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', stopped: false,
+      error: { code: 'agent_cancelled' }, cleanupErrors: [expect.objectContaining({ code: 'stop_unconfirmed' })] } });
+    expect(f.journal(run.accepted.runId).requests[0]!.attempts[0]!.responseAt).toBeNull();
+    release.release(); await waitFor(async () => f.journal(run.accepted.runId).requests[0]!.attempts[0]!.responseStatus === 200);
+    const request = f.journal(run.accepted.runId).requests[0]!;
+    expect(request.binding.inputId).toBe(run.accepted.inputId); expect(request.attempts).toHaveLength(1);
+    expect(request.attempts[0]!.transportErrorCode).toBeNull(); expect(f.payloads).toHaveLength(1);
+    expect(need(f.store.runs.get(run.accepted.runId)).status).toBe('failed'); expect(f.runtime.state().active).toBeNull();
+  });
+});
+
+describe('T06 public SDK codec conversion', () => {
+  it.each(['openai-completions', 'openai-responses'] as const)('preserves actual %s message and text block boundaries', async api => {
+    const f = await evidenceFixture({ api });
+    const context: Context = { messages: [{ role: 'user', timestamp: 1, content: [{ type: 'text', text: 'a\ud800' }, { type: 'text', text: 'b😀' }] },
+      { role: 'user', timestamp: 2, content: 'second' }] };
+    const codec = need(preparePayloadCodec(api, context, true)); let payload: unknown;
+    const options = { apiKey: 'synthetic-codec-key', maxRetries: 0, fetch: globalThis.fetch,
+      onPayload: (outgoing: unknown) => { payload = outgoing; expect(need(checkPayload(codec, outgoing)).inclusion).toBe('confirmed'); } };
+    const stream = api === 'openai-completions' ? completionsStream({ ...f.sdk.model!, api }, context, options)
+      : responsesStream({ ...f.sdk.model!, api }, context, options);
+    await stream.result(); expect(f.payloads).toHaveLength(1); expect(payload).toEqual(f.payloads[0]);
+    const body = payload as { messages?: Array<{ role: string; content: unknown }>; input?: Array<{ role: string; content: unknown }> };
+    const rows = (body.messages ?? body.input)!;
+    const changed = { ...body, [api === 'openai-completions' ? 'messages' : 'input']: rows.map(row => row.role === 'user'
+      ? { ...row, content: api === 'openai-completions' ? 'ab😀second' : [{ type: 'input_text', text: 'ab😀second' }] } : row) };
+    expect(checkPayload(codec, changed)).toMatchObject({ ok: false, error: { code: 'context_payload_mismatch' } });
+  });
+  it('checks actual SDK grouped tool images, ordered temporary URLs and synthetic caption without creating an Input', async () => {
+    const f = await evidenceFixture();
+    const assistant: AssistantMessage = { role: 'assistant', api: 'openai-completions', provider: 'evidence-fixture', model: 'fixture',
+      content: [{ type: 'toolCall', id: 'read-a', name: 'read', arguments: { path: '/a.png' } },
+        { type: 'toolCall', id: 'read-b', name: 'read', arguments: { path: '/b.png' } }], stopReason: 'toolUse', timestamp: 2,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const context: Context = { messages: [{ role: 'user', content: 'Read images', timestamp: 1 }, assistant,
+      { role: 'toolResult', toolCallId: 'read-a', toolName: 'read', isError: false, timestamp: 3,
+        content: [{ type: 'text', text: 'first image' }, { type: 'image', mimeType: 'image/png', data: 'FIRST' }] },
+      { role: 'toolResult', toolCallId: 'read-b', toolName: 'read', isError: false, timestamp: 4,
+        content: [{ type: 'text', text: 'second image' }, { type: 'image', mimeType: 'image/png', data: 'SECOND' }] }] };
+    const codec = need(preparePayloadCodec('openai-completions', context, true)); let payload: unknown;
+    const stream = completionsStream({ ...f.sdk.model!, api: 'openai-completions', input: ['text', 'image'] }, context, { apiKey: 'synthetic-codec-key', maxRetries: 0,
+      fetch: globalThis.fetch, onPayload: outgoing => { payload = outgoing; expect(need(checkPayload(codec, outgoing)).inclusion).toBe('confirmed'); } });
+    const result = await stream.result(); expect(result.stopReason).toBe('stop'); expect(f.payloads).toHaveLength(1);
+    const body = payload as { messages: Array<{ role: string; content: unknown }> };
+    const synthetic = body.messages.filter(row => row.role === 'user').at(-1)!;
+    expect(synthetic.content).toEqual([{ type: 'text', text: 'Attached image(s) from tool result:' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,FIRST' } }, { type: 'image_url', image_url: { url: 'data:image/png;base64,SECOND' } }]);
+    expect(need(await checkWire(codec, 'http://fixture.invalid', { body: JSON.stringify(body) })).inclusion).toBe('confirmed');
+    const malformed = { ...body, messages: [...body.messages, synthetic] };
+    expect(checkPayload(codec, malformed)).toMatchObject({ ok: false, error: { code: 'context_payload_mismatch' } });
+    const reordered = structuredClone(body); const last = reordered.messages.at(-1)!;
+    const blocks = last.content as unknown[]; [blocks[1], blocks[2]] = [blocks[2], blocks[1]];
+    expect(checkPayload(codec, reordered)).toMatchObject({ ok: false, error: { code: 'context_payload_mismatch' } });
+    expect(f.store.db.query('SELECT count(*) AS count FROM session_inputs').get()).toEqual({ count: 0 });
+  });
+});
+
 describe('P8 actual Pi request context', () => {
   it('binds saved prompt steer followUp users and retains completed input provenance', async () => {
     const entered = barrier(), release = barrier(); deferCleanup(() => release.release());
@@ -206,7 +557,9 @@ describe('P8 actual Pi request context', () => {
         inputId: current.inputId, snapshotId: input.contextSnapshotId, includedToolResults: [] });
       expect(requests[index]!.binding.includedBindings.at(-1)).toEqual({ originRunId: first.accepted.runId,
         inputId: current.inputId, nativeEntryId: input.nativeEntryId, snapshotId: input.contextSnapshotId });
-      expect(requests[index]!.sdkPayload).toBeNull(); expect(requests[index]!.attempts).toEqual([]);
+      expect(requests[index]!.sdkPayload).toMatchObject({ inclusion: 'confirmed', reason: null });
+      expect(requests[index]!.attempts).toEqual([expect.objectContaining({ attempt: 1, enteredAt: expect.any(String),
+        responseAt: expect.any(String), responseStatus: 200, nativeRequestId: null, wireInclusion: 'confirmed', wireReason: null })]);
     }
     expect(new Set(inputs.map(item => item.nativeEntryId)).size).toBe(3);
     expect(f.journal(next.accepted.runId).requests[0]!.binding.includedBindings.map(source => source.inputId))
