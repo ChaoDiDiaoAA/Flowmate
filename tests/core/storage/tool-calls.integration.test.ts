@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareTestWorkspaceVerifier } from '../../support/workspace.ts';
@@ -187,27 +187,35 @@ describe('Runtime fixed observations', () => {
   it('migrates an existing database with NULL observations and rolls back failed version registration', () => {
     for (const registrationFails of [false, true]) {
       const root = mkdtempSync(join(tmpdir(), 'flowmate-observation-migration-'));
-      const store = required(openDatabase(paths(root)));
+      mkdirSync(join(root,'data'), {recursive:true});
+      const originalDb = new Database(paths(root).databaseFile);
+      originalDb.exec('PRAGMA foreign_keys=ON');
+      const migrations = ['001_provider','002_agent_sessions','003_invoice_tools','004_parsed_documents','005_native_session_history',
+        '006_hidden_processing','007_hidden_chats_invoices','008_native_entry_runs','009_session_inputs','010_human_candidates','011_session_management'];
+      for (const [index,name] of migrations.entries()) {
+        const sql=readFileSync(new URL(`../../../packages/core/src/storage/migrations/${name}.sql`,import.meta.url),'utf8');
+        for (const statement of sql.split(';').map(part=>part.trim()).filter(Boolean)) originalDb.exec(statement);
+        if ([4,10,11].includes(index+1)) originalDb.exec('COMMIT');
+        originalDb.exec('PRAGMA foreign_keys=ON');
+      }
       const stamp = '2026-10-02T00:00:00.000Z';
-      const session = required(store.sessions.create({ nativeSessionId: 'observation-migration', title: 'Fixture', at: stamp }));
-      store.db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+      originalDb.query("INSERT INTO sessions(id,native_session_id,title,created_at,updated_at) VALUES(1,'observation-migration','Fixture',?,?)").run(stamp,stamp);
+      originalDb.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
         VALUES ('agent',?,'{"version":2,"allowedTools":[],"allowedDocumentIds":[],"allowedArtifactIds":[],"allowedResourcePaths":[]}',
-        'running','fixture','{}','{}','{}','{}',?)`).run(session.sessionId, stamp);
-      const call = required(store.toolCalls.request({ runId: 1, sessionId: session.sessionId, nativeToolCallId: 'old-row',
-        toolName: 'unknown_tool', toolVersion: null, effect: null, rawArguments: {}, requestedAt: stamp }));
-      store.db.exec('DROP TABLE runtime_events');
-      store.db.exec('DELETE FROM schema_migrations WHERE version>=13');
-      store.db.exec('DROP INDEX tool_calls_runtime_observation_recent');
-      store.db.exec('ALTER TABLE tool_calls DROP COLUMN runtime_observation_json');
-      store.db.exec('DELETE FROM schema_migrations WHERE version=12');
-      if (registrationFails) store.db.exec(`CREATE TRIGGER reject_migration_registration BEFORE INSERT ON schema_migrations
+        'running','fixture','{}','{}','{}','{}',?)`).run(1, stamp);
+      originalDb.query(`INSERT INTO tool_calls(id,run_id,session_id,native_tool_call_id,tool_name,args_json,delivery_json,cleanup_json,requested_at)
+        VALUES(1,1,1,'old-row','unknown_tool',?,?,?,?)`).run(JSON.stringify({version:1,raw:{},final:null}),
+          JSON.stringify({version:1,state:'not_attempted',messageObservedAt:null,includedInCallSequence:null,requestDispatchedAt:null,error:null}),
+          JSON.stringify({version:1,stopped:false,stopReason:null,errors:[]}),stamp);
+      const call={toolCallId:1};
+      if (registrationFails) originalDb.exec(`CREATE TRIGGER reject_migration_registration BEFORE INSERT ON schema_migrations
         WHEN NEW.version=12 BEGIN SELECT RAISE(ABORT,'registration unavailable'); END;`);
-      store.close();
+      originalDb.close();
       const reopened = openDatabase(paths(root));
       expect(reopened.ok).toBe(!registrationFails);
       const db = reopened.ok ? reopened.data.db : new Database(paths(root).databaseFile);
       deferCleanup(() => reopened.ok ? reopened.data.close() : db.close());
-      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 14 });
+      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 15 });
       const columns = db.query('PRAGMA table_info(tool_calls)').all() as Array<{ name: string }>;
       expect(columns.some(column => column.name === 'runtime_observation_json')).toBe(!registrationFails);
       expect(db.query('SELECT id,native_tool_call_id FROM tool_calls WHERE id=?').get(call.toolCallId))

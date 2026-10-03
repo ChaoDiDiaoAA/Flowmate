@@ -6,6 +6,7 @@ export * from './configuration/settings.ts';
 export * from './storage/database.ts';
 export * from './storage/file-store.ts';
 export * from './storage/repositories.ts';
+export * from './context/repository.ts';
 export * from './runtime/service.ts';
 export * from './sessions/service.ts';
 export * from './workspace/service.ts';

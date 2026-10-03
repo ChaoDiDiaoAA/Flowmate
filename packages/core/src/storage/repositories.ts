@@ -6,6 +6,7 @@ import { associateInputResult, completeSessionInputs, createSessionInputLedger, 
 import type { InputResultBatch, SessionInputAdmission } from '../sessions/input-ledger.ts';
 import type { RuntimeEventStore } from '../events/store.ts';
 import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/verification.ts';
+import { contextReferenceFromColumns, readRunContextOwner, readContextSnapshotOwner, readToolContext } from '../context/repository.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
 import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema } from '@flowmate/contracts';
 import type {
@@ -330,6 +331,8 @@ type RunRow = {
   kind: 'provider' | 'agent';
   session_id: number | null;
   job_id?: number | null;
+  current_context_snapshot_id?: number | null;
+  context_observations_json?: string | null;
   scope_json: string | null;
   status: RunSnapshot['status'];
   goal: string;
@@ -441,6 +444,7 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
 
 function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
   const raw = object(value, 'config');
+  if (Object.hasOwn(raw, 'contextPolicyVersion') && (raw.contextPolicyVersion !== 'p8-context-v1' || kind !== 'agent')) throw new Error('invalid_context_policy');
   const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
   if (typeof record.name !== 'string' || !Number.isSafeInteger(record.revision) || Number(record.revision) <= 0) throw new Error('invalid_config_shape');
   const model = (candidate: unknown, label: string) => {
@@ -778,7 +782,7 @@ function deriveFormApplicationRequest(db: Database, call: FormApplicationCall): 
   const target = InvoiceFormTargetSchema.parse(config.formTarget);
   const scope = RunScopeSchema.parse(readJson(run.scope_json, 'run_scope'));
   const args = FillInvoiceFormInputSchema.parse(call.args.final);
-  const candidate = candidateSnapshot(queryCandidateRow(db, args.candidateId, run.job_id));
+  const candidate = candidateSnapshot(db, queryCandidateRow(db, args.candidateId, run.job_id));
   if (config.goalMode !== 'fill-form' || scope.allowedTools.length !== 1 || scope.allowedTools[0] !== 'fill_invoice_form'
     || context.sessionId !== call.sessionId || context.jobId !== run.job_id
     || context.documentRef?.id !== candidate.documentRef.id || context.documentRef.version !== candidate.documentRef.version
@@ -816,6 +820,7 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
     tool_version: string | null; effect: string | null; status: string; args_json: string; result_json: string | null;
     delivery_json: string; cleanup_json: string; requested_at: string; started_at: string | null;
     ended_at: string | null; stopped_at: string | null; runtime_observation_json: string | null;
+    context_snapshot_id?: number | null; request_sequence?: number | null;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.run_id) || row.run_id < 1
     || !Number.isSafeInteger(row.session_id) || row.session_id < 1 || typeof row.native_tool_call_id !== 'string'
@@ -855,7 +860,7 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
   }, formApplication);
   return {
     toolCallId: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
-    context: null,
+    context: readToolContext(db, row),
     toolName: row.tool_name, toolVersion: row.tool_version, effect: row.effect as ToolCallSnapshot['effect'],
     status: row.status as ToolCallStatus, args: args as unknown as ToolCallSnapshot['args'], result,
     ...(formApplication === undefined ? {} : { formApplication }),
@@ -890,12 +895,13 @@ function businessEventSnapshot(value: unknown): BusinessEventSnapshot {
     runId: row.run_id, result: row.result as BusinessEventSnapshot['result'], safeSummary: row.safe_summary, errorCode: row.error_code };
 }
 
-function candidateSnapshot(value: unknown): { snapshot: CandidateSnapshot; documentRef: { id: DbId; version: string } } {
+function candidateSnapshot(db: Database, value: unknown): { snapshot: CandidateSnapshot; documentRef: { id: DbId; version: string } } {
   const row = value as {
     id: number; job_id: number; run_id: number | null; tool_call_id: number | null; sequence: number; status: string;
     origin: string; based_on_candidate_id?: number | null;
     fields_json: string; lines_json: string; issues_json: string; created_at: string; accepted_at: string | null;
     document_id: number; document_version: string;
+    context_snapshot_id?: number | null; request_sequence?: number | null;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.job_id) || row.job_id < 1
     || (row.origin === 'model' ? !Number.isSafeInteger(row.run_id) || Number(row.run_id) < 1
@@ -929,12 +935,23 @@ function candidateSnapshot(value: unknown): { snapshot: CandidateSnapshot; docum
   }
   const snapshot: CandidateSnapshot = {
     candidateId: row.id, jobId: row.job_id, runId: row.run_id, toolCallId: row.tool_call_id, sequence: row.sequence,
-    context: null,
+    context: contextReferenceFromColumns(row),
     status: row.status as CandidateSummary['status'], issueCount: issues.length, createdAt: row.created_at,
     fields: candidate.fields, lines: candidate.lines, notes: candidate.notes, checks, issues, sources: [...sourceMap.values()],
     ...(row.origin === 'human_edit' ? { origin: 'human_edit' as const, basedOnCandidateId: row.based_on_candidate_id! } : {}),
   };
+  if (row.origin === 'human_edit') {
+    if (snapshot.context !== null) throw new Error('unexpected_human_context');
+  } else {
+    const original = db.query('SELECT * FROM tool_calls WHERE id=? AND run_id=?').get(row.tool_call_id!, row.run_id!) as Parameters<typeof readToolContext>[1] | null;
+    if (!original || !sameContextReference(snapshot.context, readToolContext(db, original))) throw new Error('invalid_candidate_context');
+    if (snapshot.context !== null) readContextSnapshotOwner(db, snapshot.context.snapshotId, { id: row.run_id!, session_id: original.session_id, job_id: row.job_id });
+  }
   return { snapshot, documentRef: DocumentRefSchema.parse({ id: row.document_id, version: row.document_version }) };
+}
+
+function sameContextReference(left: CandidateSnapshot['context'], right: CandidateSnapshot['context']) {
+  return left === null ? right === null : right !== null && left.snapshotId === right.snapshotId && left.requestSequence === right.requestSequence;
 }
 
 export function createDocumentRepository(db: Database): DocumentRepository {
@@ -1190,7 +1207,7 @@ function workspaceCandidate(db: Database, workspace: Pick<WorkspaceSnapshot, 'ca
   if (!workspace.candidateRef) return null;
   const row = queryCandidateRow(db, workspace.candidateRef.id, workspace.jobId ?? undefined);
   if (!row) throw new Error('candidate_authority_missing');
-  const candidate = candidateSnapshot(row).snapshot;
+  const candidate = candidateSnapshot(db, row).snapshot;
   if (candidate.jobId !== workspace.jobId || candidate.sequence !== workspace.candidateRef.sequence) throw new Error('candidate_authority_mismatch');
   return { id: candidate.candidateId, sequence: candidate.sequence, fields: candidate.fields, lines: candidate.lines, issues: candidate.issues };
 }
@@ -1669,7 +1686,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           WHERE tool.id=? AND tool.run_id=? AND tool.session_id=? AND candidate.run_id=run.id AND run.session_id=tool.session_id`)
           .get(input.toolCallId, input.runId, input.sessionId) as { id: number } | null;
         if (!row) return ok(null);
-        const { snapshot } = candidateSnapshot(queryCandidateRow(db, row.id));
+        const { snapshot } = candidateSnapshot(db, queryCandidateRow(db, row.id));
         return ok({ candidateId: snapshot.candidateId, jobId: snapshot.jobId, sequence: snapshot.sequence,
           issueCount: snapshot.issueCount, checks: snapshot.checks });
       } catch { return fail(appError('storage_corrupt', 'storage', 'Candidate commit could not be verified.')); }
@@ -2119,7 +2136,7 @@ function findInvoiceExport(db: Database, input: ExportInvoiceCandidateRequest): 
     if (!artifact) throw new Error('missing_export_artifact');
     const meta = exactRecord(readJson(artifact.metadata_json, 'export_metadata'), 'export_metadata',
       ['version', 'candidateId', 'basedOnCandidateId', 'format', 'sha256', 'requestHash']);
-    const saved = candidateSnapshot(queryCandidateRow(db, input.candidateId));
+    const saved = candidateSnapshot(db, queryCandidateRow(db, input.candidateId));
     const job = readJob(db, saved.snapshot.jobId);
     if (meta.version !== 1 || meta.candidateId !== input.candidateId || meta.format !== input.format
       || typeof meta.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(meta.sha256)
@@ -2141,7 +2158,7 @@ function recordInvoiceEvent(db: Database, type: BusinessEventType, operationRef:
 
 export function createCandidateRepository(db: Database): InvoiceEditRepository {
   const readDecision = (candidateId: DbId, jobId: DbId, at: string): InvoiceCandidateDecisionResponse => {
-    const candidate = candidateSnapshot(queryCandidateRow(db, candidateId, jobId)).snapshot;
+    const candidate = candidateSnapshot(db, queryCandidateRow(db, candidateId, jobId)).snapshot;
     const job = readJob(db, jobId);
     if (!job) throw new Error('job_not_found');
     return { candidate, job, workspace: workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), at) };
@@ -2166,7 +2183,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
       if (!facts.ok) return facts;
       const row = queryCandidateRow(db, input.candidateId, input.jobId);
       if (!row) return fail(appError('candidate_not_found', 'input', '当前 Job 不存在该候选。'));
-      const candidate = candidateSnapshot(row).snapshot;
+      const candidate = candidateSnapshot(db, row).snapshot;
       if (candidate.status === 'accepted' || input.candidateId !== input.expectedCandidateId) {
         return fail(appError('state_conflict', 'input', '候选不再满足确认条件。'));
       }
@@ -2205,7 +2222,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         const hash = kind === 'save' ? object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestHash
           : object(readJson(prior.safeSummary, 'decision'), 'decision').requestHash;
         if (hash !== invoiceRequestHash(request)) return fail(appError('state_conflict', 'input', '同一操作引用已有不同载荷。'));
-        if (kind === 'save') return ok({ changed: true, candidate: candidateSnapshot(row).snapshot,
+        if (kind === 'save') return ok({ changed: true, candidate: candidateSnapshot(db, row).snapshot,
           workspace: workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), at) });
         return ok(readDecision(prior.candidateId, request.jobId, at));
       } catch { return fail(appError('storage_corrupt', 'storage', '操作事实无法读取。')); }
@@ -2222,7 +2239,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           if (!row || object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestHash !== hash) {
             return fail(appError('state_conflict', 'input', '同一操作引用已有不同人工版本。'));
           }
-          return ok({ changed: true, candidate: candidateSnapshot(row).snapshot,
+          return ok({ changed: true, candidate: candidateSnapshot(db, row).snapshot,
             workspace: workspaceSnapshot(db, ensureWorkspace(db, at), at) });
         }
         const facts = invoiceOperationFacts(db, input, at);
@@ -2230,7 +2247,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (input.basedOnCandidateId !== input.expectedCandidateId) return fail(appError('state_conflict', 'input', '编辑依据不是当前候选。'));
         const row = queryCandidateRow(db, input.basedOnCandidateId, input.jobId);
         if (!row) return fail(appError('candidate_not_found', 'input', '编辑依据不存在。'));
-        const basis = candidateSnapshot(row).snapshot;
+        const basis = candidateSnapshot(db, row).snapshot;
         if (basis.status === 'accepted') return fail(appError('state_conflict', 'input', '已接受结果不能编辑。'));
         let candidate: StoredCandidateDraft;
         try { candidate = humanDraft(input, basis); }
@@ -2254,7 +2271,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         const candidateId = Number(inserted.lastInsertRowid);
         db.query('UPDATE jobs SET current_candidate_id=?,updated_at=? WHERE id=?').run(candidateId, at, input.jobId);
         db.query('UPDATE workspace SET selection_json=NULL,revision=revision+1,updated_at=? WHERE id=1').run(at);
-        const saved = candidateSnapshot(queryCandidateRow(db, candidateId, input.jobId)).snapshot;
+        const saved = candidateSnapshot(db, queryCandidateRow(db, candidateId, input.jobId)).snapshot;
         recordInvoiceEvent(db, 'candidate_edited', input.operationRef, saved, facts.data.job.documentRef.id, at, 'Human changes saved');
         return ok({ changed: true, candidate: saved, workspace: workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), at) });
       });
@@ -2264,7 +2281,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
     reject(input) { return decision(input, false); },
     readAccepted(candidateId) {
       try {
-        const candidate = candidateSnapshot(queryCandidateRow(db, candidateId));
+        const candidate = candidateSnapshot(db, queryCandidateRow(db, candidateId));
         const job = readJob(db, candidate.snapshot.jobId);
         if (candidate.snapshot.status !== 'accepted' || job?.status !== 'completed' || job.acceptedCandidateId !== candidateId
           || job.currentCandidateId !== candidateId) return fail(appError('state_conflict', 'input', '只能导出指定的已接受结果。'));
@@ -2281,7 +2298,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (!prior.ok) return prior;
         if (prior.data) return prior.data.relativePath === relativePath && prior.data.bytes === bytes && prior.data.sha256 === sha256
           ? prior : fail(appError('state_conflict', 'input', '同一操作已有不同的文件登记事实。'));
-        const saved = candidateSnapshot(queryCandidateRow(db, input.candidateId));
+        const saved = candidateSnapshot(db, queryCandidateRow(db, input.candidateId));
         const job = readJob(db, saved.snapshot.jobId);
         if (saved.snapshot.status !== 'accepted' || job?.acceptedCandidateId !== input.candidateId || job.currentCandidateId !== input.candidateId
           || job.status !== 'completed') return fail(appError('state_conflict', 'input', '导出结果不再满足接受条件。'));
@@ -2348,7 +2365,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           }
           const existing = db.query('SELECT id FROM invoice_candidates WHERE tool_call_id=?').get(facts.tool_call_id) as { id: number } | null;
           if (existing) {
-            const candidate = candidateSnapshot(queryCandidateRow(db, existing.id, facts.job_id));
+            const candidate = candidateSnapshot(db, queryCandidateRow(db, existing.id, facts.job_id));
             if (candidate.snapshot.runId !== input.runId || stableJson({ fields: candidate.snapshot.fields, lines: candidate.snapshot.lines, notes: candidate.snapshot.notes })
               !== stableJson(draft)) return { ok: false as const, error: appError('state_conflict', 'runtime', '同一 ToolCall 已提交了不同候选。') };
             return { ok: true as const, candidate, created: false };
@@ -2367,7 +2384,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,candidate_id,run_id,result,safe_summary)
             VALUES ('candidate_generated',?,'agent',?,?,?,?,?,'succeeded','Invoice candidate generated')`)
             .run(input.at, `tool-call-id:${facts.tool_call_id}`, input.documentId, facts.job_id, candidateId, input.runId);
-          const candidate = candidateSnapshot(queryCandidateRow(db, candidateId, facts.job_id));
+          const candidate = candidateSnapshot(db, queryCandidateRow(db, candidateId, facts.job_id));
           return { ok: true as const, candidate, created: true };
         });
         if (!committed.ok) return committed;
@@ -2393,7 +2410,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           ? db.query('SELECT id FROM invoice_candidates WHERE job_id=? ORDER BY sequence DESC LIMIT ?').all(input.jobId, input.limit + 1)
           : db.query('SELECT id FROM invoice_candidates WHERE job_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?')
             .all(input.jobId, input.beforeSequence, input.limit + 1);
-        const items = (rows as Array<{ id: number }>).map(({ id }) => candidateSnapshot(queryCandidateRow(db, id, input.jobId)).snapshot)
+        const items = (rows as Array<{ id: number }>).map(({ id }) => candidateSnapshot(db, queryCandidateRow(db, id, input.jobId)).snapshot)
           .map(({ candidateId, jobId, runId, sequence, status, issueCount, createdAt, context, origin, basedOnCandidateId }) =>
             ({ candidateId, jobId, runId, sequence, status, issueCount, createdAt, context,
               ...(origin === undefined ? {} : { origin, basedOnCandidateId }) }));
@@ -2411,7 +2428,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (!readJob(db, input.jobId)) return fail(appError('job_not_found', 'input', 'Job 不存在。'));
         const row = queryCandidateRow(db, input.candidateId, input.jobId);
         if (!row) return fail(appError('candidate_not_found', 'input', '此 Job 下不存在该 Candidate。'));
-        const { snapshot, documentRef } = candidateSnapshot(row);
+        const { snapshot, documentRef } = candidateSnapshot(db, row);
         return ok({ documentRef, candidate: snapshot });
       } catch { return fail(appError('storage_corrupt', 'storage', 'Candidate 无法读取。')); }
     },
@@ -2429,7 +2446,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           ? db.query('SELECT * FROM invoice_candidates WHERE job_id=? ORDER BY sequence DESC LIMIT ?').all(run.job_id, input.limit + 1)
           : db.query('SELECT * FROM invoice_candidates WHERE job_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?').all(run.job_id, input.beforeSequence, input.limit + 1);
         const items = (rows as Array<{ id: number }>).map((row) => {
-          const record = candidateSnapshot(queryCandidateRow(db, row.id, run.job_id!)).snapshot;
+          const record = candidateSnapshot(db, queryCandidateRow(db, row.id, run.job_id!)).snapshot;
           return { candidateId: record.candidateId, runId: record.runId, sequence: record.sequence, issueCount: record.issueCount,
             ...(record.origin === undefined ? {} : { origin: record.origin, basedOnCandidateId: record.basedOnCandidateId }) };
         });
@@ -2448,7 +2465,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (!run?.job_id) return fail(appError('candidate_not_found', 'input', 'Candidate 不存在。'));
         const row = queryCandidateRow(db, input.candidateId, run.job_id);
         if (!row) return fail(appError('candidate_not_found', 'input', 'Candidate 不存在。'));
-        const { snapshot, documentRef } = candidateSnapshot(row);
+        const { snapshot, documentRef } = candidateSnapshot(db, row);
         return ok({ candidateId: snapshot.candidateId, jobId: snapshot.jobId, runId: snapshot.runId,
           sequence: snapshot.sequence, issueCount: snapshot.issueCount,
           documentRef, toolCallId: snapshot.toolCallId,
@@ -2459,7 +2476,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
   };
 }
 
-function snapshotFromRow(row: RunRow): RunSnapshot {
+function snapshotFromRow(db: Database, row: RunRow): RunSnapshot {
+  const context = readRunContextOwner(db, row);
   const output = row.output_json === null ? null : validatedOutput(readJson(row.output_json, 'output'), row.kind);
   const error = validatedError(readJson(row.error_json ?? 'null', 'error'));
   const input = validatedInput(readJson(row.input_json, 'input'));
@@ -2468,7 +2486,7 @@ function snapshotFromRow(row: RunRow): RunSnapshot {
   const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
   const base = {
     runId: row.id,
-    currentContextSnapshotId: null,
+    currentContextSnapshotId: context.pointer,
     status: row.status,
     input,
     config,
@@ -2867,11 +2885,14 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
           db.query('UPDATE sessions SET hidden_at=?,metadata_json=?,updated_at=? WHERE id=?').run(at, asJson(completedMetadata), at, sessionId);
           return ok('hidden' as const);
         }
+        db.query("UPDATE runs SET current_context_snapshot_id=NULL WHERE kind='agent' AND session_id=?").run(sessionId);
+        db.query('UPDATE session_inputs SET context_snapshot_id=NULL WHERE session_id=?').run(sessionId);
+        db.query('DELETE FROM context_snapshots WHERE session_id=?').run(sessionId);
         db.query('DELETE FROM session_inputs WHERE session_id=?').run(sessionId);
         db.query("DELETE FROM runs WHERE kind='agent' AND session_id=?").run(sessionId);
         // Bun counts rows removed by the native-history cascades too.
         if (db.query('DELETE FROM sessions WHERE id=?').run(sessionId).changes < 1) {
-          return fail(appError('session_not_found', 'session', 'Session 不存在。'));
+          throw new Error('session_delete_missing');
         }
         return ok('permanent' as const);
       });
@@ -2928,7 +2949,7 @@ function freezeWorkspaceInput(db: Database, input: Pick<NewWorkspaceAgentRun, 's
         if (job?.currentCandidateId !== null && job?.currentCandidateId !== undefined) {
           const row = queryCandidateRow(db, job.currentCandidateId, job.jobId);
           if (!row) return fail(appError('state_conflict', 'input', '当前候选引用无效。'));
-          const saved = candidateSnapshot(row).snapshot;
+          const saved = candidateSnapshot(db, row).snapshot;
           if (fill && (saved.status !== 'generated' || saved.candidateId !== expected.data.candidateRef?.id
             || saved.sequence !== expected.data.candidateRef.sequence)) {
             return fail(appError('state_conflict', 'input', '填表需要当前 generated 候选的真实版本。'));
@@ -3156,7 +3177,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           if (job.status === 'completed') return fail(appError('job_completed', 'input', 'The input task has already completed.'));
           if (frozen.candidateRef !== null) {
             const row = queryCandidateRow(db, frozen.candidateRef.id, frozen.jobId);
-            if (!row || candidateSnapshot(row).snapshot.sequence !== frozen.candidateRef.sequence)
+            if (!row || candidateSnapshot(db, row).snapshot.sequence !== frozen.candidateRef.sequence)
               return fail(appError('state_conflict', 'input', 'Frozen input candidate references changed.'));
             candidate = workspaceCandidate(db, frozen);
           }
@@ -3289,7 +3310,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
       try {
         const row = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (!row) return fail(appError('run_not_found', 'input', 'Run 不存在。', false, runId));
-        return ok(snapshotFromRow(row));
+        return ok(snapshotFromRow(db, row));
       } catch {
         return fail(appError('storage_corrupt', 'storage', 'Run 事实无法读取。', false, runId));
       }
@@ -3304,7 +3325,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
             .all(request.sessionId, request.limit + 1)
           : db.query("SELECT * FROM runs WHERE session_id=? AND kind='agent' AND id<? ORDER BY id DESC LIMIT ?")
             .all(request.sessionId, request.beforeRunId, request.limit + 1);
-        const mapped = (rows as RunRow[]).map((row) => snapshotFromRow(row) as AgentRunSnapshot);
+        const mapped = (rows as RunRow[]).map((row) => snapshotFromRow(db, row) as AgentRunSnapshot);
         const hasMore = mapped.length > request.limit;
         const items = hasMore ? mapped.slice(0, request.limit) : mapped;
         return ok({ items, nextBeforeRunId: hasMore ? items.at(-1)?.runId ?? null : null });

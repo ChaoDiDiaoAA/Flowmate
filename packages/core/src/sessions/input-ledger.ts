@@ -1,22 +1,23 @@
 import { createHash } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import type { RuntimeEventStore } from '../events/store.ts';
+import { readInputContext } from '../context/repository.ts';
 import { appError, fail, normalizeSessionInputRequest, ok, SessionInputContentV2Schema,
   SessionInputQuerySchema, SessionInputSnapshotSchema, SessionInputsRequestSchema, LegacySessionInputRequestSchema } from '@flowmate/contracts';
 import type { AppError, DbId, NormalizedSessionInputRequest, Result, SessionInputQuery, SessionInputQueryResult,
   SessionInputRequest, SessionInputSnapshot, SessionInputsRequest, SessionInputsPage, SessionInputContentV2 } from '@flowmate/contracts';
 
 type InputRow = { id: number; session_id: number; client_sequence: number; mode: string; goal_mode: string;
-  request_hash: string; run_id: number | null; content_json: string; status: string; processing_status: string;
+  request_hash: string; run_id: number | null; context_snapshot_id?: number | null; content_json: string; status: string; processing_status: string;
   native_entry_id: string | null; result_entry_id: string | null; dispatched_at: string | null;
   error_json: string | null; created_at: string; updated_at: string };
 type NativeEntry = { id: string; parentId: string | null; type: string;
   message?: { role?: string; content?: Array<{ type?: string; text?: string }>; stopReason?: string; toolCallId?: string } };
 export type SessionInputAdmission = { runId: DbId; content: SessionInputContentV2 };
 export type InputResultBatch = { inputIds: readonly DbId[]; resultEntryId: string };
-function snapshot(row: InputRow): SessionInputSnapshot {
+function snapshot(db: Database, row: InputRow): SessionInputSnapshot {
   return SessionInputSnapshotSchema.parse({ inputId: row.id, sessionId: row.session_id, clientSequence: row.client_sequence,
-    mode: row.mode, goalMode: row.goal_mode, runId: row.run_id, contextSnapshotId: null, content: JSON.parse(row.content_json), status: row.status,
+    mode: row.mode, goalMode: row.goal_mode, runId: row.run_id, contextSnapshotId: readInputContext(db, row), content: JSON.parse(row.content_json), status: row.status,
     processingStatus: row.processing_status, nativeEntryId: row.native_entry_id, resultEntryId: row.result_entry_id ?? null,
     dispatchedAt: row.dispatched_at, error: row.error_json === null ? null : JSON.parse(row.error_json),
     createdAt: row.created_at, updatedAt: row.updated_at });
@@ -28,7 +29,7 @@ function appendInputState(db: Database, inputId: DbId, events: RuntimeEventStore
   if (!events) return;
   const row = db.query('SELECT * FROM session_inputs WHERE id=?').get(inputId) as InputRow | null;
   if (!row || row.run_id === null) throw new Error('event_input_missing');
-  const input = snapshot(row);
+  const input = snapshot(db, row);
   events.appendInTransaction({ runId: row.run_id, sessionId: row.session_id, toolCallId: null,
     type: 'input_state_changed', occurredAt: input.updatedAt,
     dedupeKey: `input:${inputId}:${input.status}:${input.processingStatus}:${input.nativeEntryId ?? 'none'}:${input.resultEntryId ?? 'none'}`,
@@ -57,7 +58,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
         .get(request.sessionId, request.clientSequence) as InputRow | null;
       if (!row) return ok(null);
       if (desktopRequestHash !== undefined) {
-        const input = snapshot(row);
+        const input = snapshot(db, row);
         return input.content.version === 2 && input.content.desktopRequestHash === desktopRequestHash ? ok(input)
           : fail(appError('state_conflict', 'input', 'This client sequence belongs to another input.'));
       }
@@ -66,7 +67,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
         return fail(appError('state_conflict', 'input', 'This client sequence belongs to another input.'));
       if (row.request_hash !== requestHash(request, content.version === 1, content.requestIdentityVersion))
         return fail(appError('state_conflict', 'input', 'This client sequence belongs to another input.'));
-      return ok(snapshot(row));
+      return ok(snapshot(db, row));
     } catch { return readFailure(); }
   }
   return {
@@ -94,7 +95,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
           .get(sessionId) as { sequence: number }).sequence;
         const row = inputId !== undefined ? db.query('SELECT * FROM session_inputs WHERE session_id=? AND id=?').get(sessionId, inputId)
           : clientSequence !== undefined ? db.query('SELECT * FROM session_inputs WHERE session_id=? AND client_sequence=?').get(sessionId, clientSequence) : null;
-        return ok({ input: row ? snapshot(row as InputRow) : null, nextClientSequence: max < Number.MAX_SAFE_INTEGER ? max + 1 : null });
+        return ok({ input: row ? snapshot(db, row as InputRow) : null, nextClientSequence: max < Number.MAX_SAFE_INTEGER ? max + 1 : null });
       } catch { return readFailure(); }
     },
     list(raw: SessionInputsRequest): Result<SessionInputsPage> {
@@ -112,15 +113,15 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
         const rows = db.query(`SELECT * FROM session_inputs WHERE session_id=? AND (? IS NULL OR run_id=?)
           AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?`).all(request.sessionId, request.runId ?? null,
           request.runId ?? null, request.beforeInputId ?? null, request.beforeInputId ?? null, request.limit + 1) as InputRow[];
-        const items = rows.slice(0, request.limit).map(snapshot);
+        const items = rows.slice(0, request.limit).map(row => snapshot(db, row));
         return ok({ items, nextBeforeInputId: rows.length > request.limit ? items.at(-1)!.inputId : null });
       } catch { return readFailure(); }
     },
     get(inputId: DbId): Result<SessionInputSnapshot | null> {
-      try { const row = byId(inputId); return ok(row ? snapshot(row) : null); } catch { return readFailure(); }
+      try { const row = byId(inputId); return ok(row ? snapshot(db, row) : null); } catch { return readFailure(); }
     },
     forRun(runId: DbId): Result<SessionInputSnapshot[]> {
-      try { return ok((db.query('SELECT * FROM session_inputs WHERE run_id=? ORDER BY id').all(runId) as InputRow[]).map(snapshot)); }
+      try { return ok((db.query('SELECT * FROM session_inputs WHERE run_id=? ORDER BY id').all(runId) as InputRow[]).map(row => snapshot(db, row))); }
       catch { return readFailure(); }
     },
     admit(raw: SessionInputRequest, admitInput: () => Result<SessionInputAdmission>, at: string, desktopRequestHash?: string): Result<{ input: SessionInputSnapshot; created: boolean }> {
@@ -160,7 +161,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
             .run(request.sessionId, request.clientSequence, request.mode, goalMode, requestHash(request, false, content.requestIdentityVersion),
               admission.runId, JSON.stringify(content), at, at);
           appendInputState(db, Number(inserted.lastInsertRowid), events);
-          return ok({ input: snapshot(byId(Number(inserted.lastInsertRowid))!), created: true });
+          return ok({ input: snapshot(db, byId(Number(inserted.lastInsertRowid))!), created: true });
         });
       } catch { return rejected ?? writeFailure(); }
     },
@@ -179,7 +180,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
         const rows = verifiedResultMembers(db, runId, inputIds, resultEntryId);
         const path = resultPath(db, rows[0]!.session_id, runId, resultEntryId);
         const firstUser = Math.max(...rows.map(row => path.findIndex(entry => entry.id === row.native_entry_id)));
-        return ok({ inputs: rows.map(snapshot), toolCallIds: path.slice(0, firstUser).flatMap(entry => entry.message?.role === 'toolResult'
+        return ok({ inputs: rows.map(row => snapshot(db, row)), toolCallIds: path.slice(0, firstUser).flatMap(entry => entry.message?.role === 'toolResult'
           && typeof entry.message.toolCallId === 'string' ? [entry.message.toolCallId] : []) });
       } catch { return fail(appError('input_processing_unconfirmed', 'runtime', 'Saved input result cannot be confirmed.', true, runId)); }
     },
