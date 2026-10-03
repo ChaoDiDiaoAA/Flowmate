@@ -4,9 +4,11 @@ import type { AppError, DbId } from './runtime.ts';
 import type { StoredCandidateDraft, CheckResult, DocumentRef, InvoiceIssue, SourceRef, InvoiceFormApplicationReceipt } from './invoice.ts';
 import type { ToolEffect, ToolResult } from './tools.ts';
 import type { JobStatus } from './workspace.ts';
+import type { ContextReference } from './context.ts';
 
 export type CandidateSummary = {
   candidateId: DbId;
+  context: ContextReference | null;
   jobId: DbId;
   runId: DbId | null;
   origin?: 'model' | 'human_edit';
@@ -125,6 +127,7 @@ export type StoredToolResult = {
 
 export type ToolCallSnapshot = {
   toolCallId: DbId;
+  context: ContextReference | null;
   runId: DbId;
   sessionId: DbId;
   nativeToolCallId: string;

@@ -87,6 +87,7 @@ export const SessionInputContentSchema = z.union([LegacySessionInputContentSchem
 export type SessionInputContent = z.infer<typeof SessionInputContentSchema>;
 export const SessionInputSnapshotSchema = z.object({ inputId: id, sessionId: id, clientSequence: id,
   mode: z.enum(['prompt', 'steer', 'followUp']), goalMode: z.enum(['answer', 'save-candidate', 'fill-form']), runId: id.nullable(),
+  contextSnapshotId: id.nullable(),
   content: SessionInputContentSchema,
   status: z.enum(['queued', 'consumed', 'failed', 'cancelled', 'delivery_unknown']),
   processingStatus: z.enum(['pending', 'completed', 'failed', 'cancelled']),
@@ -94,6 +95,7 @@ export const SessionInputSnapshotSchema = z.object({ inputId: id, sessionId: id,
   error: AppErrorSchema.nullable(), createdAt: z.string().datetime(), updatedAt: z.string().datetime(),
 }).strict().superRefine((value, context) => {
   if ((value.status === 'consumed') !== (value.nativeEntryId !== null)
+    || value.contextSnapshotId !== null && value.runId === null
     || value.processingStatus === 'completed' && value.status !== 'consumed'
     || value.resultEntryId !== null && value.status !== 'consumed'
     || value.content.version === 2 && value.processingStatus === 'completed' && value.resultEntryId === null

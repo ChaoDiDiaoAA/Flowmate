@@ -358,6 +358,7 @@ describe('P3 invoice tool contracts', () => {
     };
     const toolCall: ToolCallSnapshot = {
       toolCallId: 1, runId: 4, sessionId: 3, nativeToolCallId: 'native-call-1',
+      context: null,
       toolName: 'get_invoice_candidate', toolVersion: '1', effect: 'READ', status: 'succeeded',
       args: { version: 1, raw: { candidateId: 5 }, final: { candidateId: 5 } },
       result: { version: 1, status: 'succeeded', data: { candidateId: 5 }, committedCandidateId: null },

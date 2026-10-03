@@ -507,6 +507,7 @@ export function createToolExecutor(input: {
 
 function unavailableCall(context: Partial<ToolExecutionContext>, name: string): ToolCallSnapshot {
   return { toolCallId: 0, runId: context.runId ?? 0, sessionId: context.sessionId ?? 0,
+    context: null,
     nativeToolCallId: context.nativeToolCallId ?? 'invalid', toolName: name, toolVersion: null, effect: null,
     status: 'failed', args: { version: 1, raw: null, final: null }, result: null,
     delivery: { version: 1, state: 'not_attempted', messageObservedAt: null, includedInCallSequence: null, requestDispatchedAt: null, error: null },

@@ -855,6 +855,7 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
   }, formApplication);
   return {
     toolCallId: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
+    context: null,
     toolName: row.tool_name, toolVersion: row.tool_version, effect: row.effect as ToolCallSnapshot['effect'],
     status: row.status as ToolCallStatus, args: args as unknown as ToolCallSnapshot['args'], result,
     ...(formApplication === undefined ? {} : { formApplication }),
@@ -928,6 +929,7 @@ function candidateSnapshot(value: unknown): { snapshot: CandidateSnapshot; docum
   }
   const snapshot: CandidateSnapshot = {
     candidateId: row.id, jobId: row.job_id, runId: row.run_id, toolCallId: row.tool_call_id, sequence: row.sequence,
+    context: null,
     status: row.status as CandidateSummary['status'], issueCount: issues.length, createdAt: row.created_at,
     fields: candidate.fields, lines: candidate.lines, notes: candidate.notes, checks, issues, sources: [...sourceMap.values()],
     ...(row.origin === 'human_edit' ? { origin: 'human_edit' as const, basedOnCandidateId: row.based_on_candidate_id! } : {}),
@@ -2392,8 +2394,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           : db.query('SELECT id FROM invoice_candidates WHERE job_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?')
             .all(input.jobId, input.beforeSequence, input.limit + 1);
         const items = (rows as Array<{ id: number }>).map(({ id }) => candidateSnapshot(queryCandidateRow(db, id, input.jobId)).snapshot)
-          .map(({ candidateId, jobId, runId, sequence, status, issueCount, createdAt, origin, basedOnCandidateId }) =>
-            ({ candidateId, jobId, runId, sequence, status, issueCount, createdAt,
+          .map(({ candidateId, jobId, runId, sequence, status, issueCount, createdAt, context, origin, basedOnCandidateId }) =>
+            ({ candidateId, jobId, runId, sequence, status, issueCount, createdAt, context,
               ...(origin === undefined ? {} : { origin, basedOnCandidateId }) }));
         const hasMore = items.length > input.limit;
         const page = hasMore ? items.slice(0, input.limit) : items;
@@ -2466,6 +2468,7 @@ function snapshotFromRow(row: RunRow): RunSnapshot {
   const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
   const base = {
     runId: row.id,
+    currentContextSnapshotId: null,
     status: row.status,
     input,
     config,

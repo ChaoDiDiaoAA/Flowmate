@@ -16,7 +16,7 @@ export type SessionInputAdmission = { runId: DbId; content: SessionInputContentV
 export type InputResultBatch = { inputIds: readonly DbId[]; resultEntryId: string };
 function snapshot(row: InputRow): SessionInputSnapshot {
   return SessionInputSnapshotSchema.parse({ inputId: row.id, sessionId: row.session_id, clientSequence: row.client_sequence,
-    mode: row.mode, goalMode: row.goal_mode, runId: row.run_id, content: JSON.parse(row.content_json), status: row.status,
+    mode: row.mode, goalMode: row.goal_mode, runId: row.run_id, contextSnapshotId: null, content: JSON.parse(row.content_json), status: row.status,
     processingStatus: row.processing_status, nativeEntryId: row.native_entry_id, resultEntryId: row.result_entry_id ?? null,
     dispatchedAt: row.dispatched_at, error: row.error_json === null ? null : JSON.parse(row.error_json),
     createdAt: row.created_at, updatedAt: row.updated_at });

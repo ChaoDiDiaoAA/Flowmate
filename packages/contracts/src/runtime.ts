@@ -470,6 +470,7 @@ export type SessionRunsPage = { items: AgentRunSnapshot[]; nextBeforeRunId: DbId
 
 export type RunSnapshotBase = {
   runId: DbId;
+  currentContextSnapshotId: DbId | null;
   jobId: DbId | null;
   status: RunStatus;
   input: Readonly<InputRecord>;

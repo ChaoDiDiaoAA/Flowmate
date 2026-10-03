@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { AppErrorSchema } from './runtime.ts';
+import { CONTEXT_ERROR_FACTS } from './context.ts';
 import type { AppError, DbId, Result, RunStatus, TokenColumns } from './runtime.ts';
 import type { ToolCallSnapshot } from './activity.ts';
 import type { SessionInputSnapshot } from './session-inputs.ts';
@@ -194,6 +195,7 @@ const p6ErrorFacts: Readonly<Record<string, readonly [AppError['category'], bool
   event_cursor_invalid: ['input', false], event_gap: ['storage', false], event_subscription_limit: ['runtime', false],
   event_subscription_invalid: ['input', false], event_query_busy: ['runtime', true], storage_read_failed: ['storage', true],
   storage_corrupt: ['storage', false], state_conflict: ['runtime', false],
+  ...CONTEXT_ERROR_FACTS,
 };
 export const RuntimeEventErrorSchema = AppErrorSchema.superRefine((error, context) => {
   const facts = Object.hasOwn(p6ErrorFacts, error.code) ? p6ErrorFacts[error.code] : undefined;

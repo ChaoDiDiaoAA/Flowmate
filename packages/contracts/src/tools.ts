@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { AppError, DbId } from './runtime.ts';
+import { RequestContextBindingSchema } from './context.ts';
 
 // 工具身份的固定契约长度，供装配、记录与 Schema 共用。
 export const MAX_TOOL_NAME_CHARS = 128;
@@ -98,14 +99,17 @@ export const ToolExecutionContextSchema = z.object({
   runId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   sessionId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   nativeToolCallId: z.string().min(1).max(256),
+  requestBinding: RequestContextBindingSchema.optional(),
   scope: RunScopeSchema,
   signal: z.custom<AbortSignal>((value) => typeof value === 'object' && value !== null
     && typeof (value as AbortSignal).aborted === 'boolean'
     && typeof (value as AbortSignal).addEventListener === 'function'),
-}).strict();
+}).strict().refine(value => value.requestBinding === undefined
+  || value.requestBinding.runId === value.runId && value.requestBinding.sessionId === value.sessionId,
+  'Tool request binding belongs to a different Run or Session.');
 
 export type ToolExecutionContext = Readonly<Omit<z.infer<typeof ToolExecutionContextSchema>, 'scope'> & { scope: RunScope }>;
-export type ToolCallContext = Pick<ToolExecutionContext, 'nativeToolCallId' | 'signal'>;
+export type ToolCallContext = Pick<ToolExecutionContext, 'nativeToolCallId' | 'signal' | 'requestBinding'>;
 export type ProductToolContext = Pick<ToolExecutionContext, 'sessionId' | 'runId' | 'scope'>;
 
 export type ToolResult<O> =

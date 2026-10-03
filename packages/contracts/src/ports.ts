@@ -21,6 +21,7 @@ import type { CandidateJobDetail, CandidateJobPage, GoalMode, WorkspaceContext, 
 import type { ToolCallDelivery } from './activity.ts';
 import type { CandidateSnapshot } from './activity.ts';
 import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput } from './invoice.ts';
+import type { ContextHooks, NativeContextBindingSeed } from './context.ts';
 
 export type SaveCandidateRecord = {
   runId: DbId;
@@ -54,6 +55,7 @@ export type SafeConfigSnapshot = {
   native: { authSource: 'pi-native' | 'pi-runtime-api-key' | 'unknown'; modelsSelection: string | null };
   runtimeBudget?: ResolvedRuntimeBudget;
   runtimeStrategy?: RuntimeStrategySnapshot;
+  contextPolicyVersion?: 'p8-context-v1';
 };
 
 export type NativeInput = {
@@ -154,6 +156,8 @@ export type AgentToolBinding = {
 export type AgentExecutionInput = NativeInput & {
   runId: DbId;
   sessionId: DbId;
+  contextSnapshotId?: DbId;
+  contextHooks?: ContextHooks;
   workspaceInput?: WorkspaceInput;
   workspaceContext?: WorkspaceContext;
   goalMode?: GoalMode;
@@ -245,7 +249,7 @@ export interface PreparedAgent {
 export interface AgentPort {
   createSession(): Result<{ nativeSessionId: string }>;
   exportSession?(nativeSessionId: string): Result<import('./runtime.ts').NativeSessionHistory>;
-  restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory): Result<void>;
+  restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void>;
   watchSession?(nativeSessionId: string, save: (history: import('./runtime.ts').NativeSessionHistory, context?: NativeHistoryAppendContext) => Result<void>): Result<void>;
   projectSessionMessages?(input: NativeMessageProjectionInput): Result<Pick<SessionMessagesPage, 'items' | 'nextBeforeEntryId'>>;
   enqueueInput?(nativeSessionId: string, input: AgentInputDispatch): Promise<Result<void>>;
@@ -267,4 +271,5 @@ export interface AgentPort {
 }
 
 export type AgentInputDispatch = { inputId: DbId; runId: DbId; sessionId: DbId;
+  contextSnapshotId?: DbId;
   mode: 'steer' | 'followUp'; text: string; promptText: string };

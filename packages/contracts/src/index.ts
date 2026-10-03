@@ -12,3 +12,4 @@ export * from './workspace.ts';
 export * from './activity.ts';
 export * from './session-inputs.ts';
 export * from './events.ts';
+export * from './context.ts';
