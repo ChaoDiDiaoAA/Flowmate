@@ -47,6 +47,53 @@ describe('P9 T01', () => {
       expect(normalize('normalizeForkSessionRequest', { ...fork, ...patch })).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
   });
 
+  // A same-key lookup returns the evolved target's current commit and its original creation entry.
+  it('accepts an evolved fork target whose current leaf differs from its creation entry', () => {
+    const result = { session: { sessionId: 5, nativeSessionId: 'fork-native', title: 'Fork', status: 'active',
+      createdAt: at, updatedAt: at, availability: 'ready', historyState: 'recoverable', activeRunId: null,
+      modelUseBlocked: false, hasBusinessHistory: false, deletePending: false },
+      commit: { commitRevision: 3, entryCount: 2, leafId: 'later-entry' }, sourceSessionId: 4, selectedEntryId: 'user' };
+    expect(schema('ForkSessionResultSchema').parse(result)).toEqual(result);
+    expect(schema('ForkSessionResponseSchema').parse({ ok: true, data: result })).toEqual({ ok: true, data: result });
+  });
+
+  it('accepts a fork target with inherited entries and a later empty current path', () => {
+    const result = { session: { sessionId: 5, nativeSessionId: 'fork-native', title: 'Fork', status: 'active',
+      createdAt: at, updatedAt: at, availability: 'ready', historyState: 'recoverable', activeRunId: null,
+      modelUseBlocked: false, hasBusinessHistory: false, deletePending: false },
+      commit: { commitRevision: 4, entryCount: 2, leafId: null }, sourceSessionId: 4, selectedEntryId: 'user' };
+    expect(schema('ForkSessionResultSchema').parse(result)).toEqual(result);
+    expect(schema('ForkSessionResponseSchema').parse({ ok: true, data: result })).toEqual({ ok: true, data: result });
+  });
+
+  it('retains fork identity, strict public fields, safe errors and complete response budgets', () => {
+    const result = { session: { sessionId: 5, nativeSessionId: 'fork-native', title: 'Fork', status: 'active',
+      createdAt: at, updatedAt: at, availability: 'ready', historyState: 'recoverable', activeRunId: null,
+      modelUseBlocked: false, hasBusinessHistory: false, deletePending: false },
+      commit, sourceSessionId: 4, selectedEntryId: 'user' };
+    const dataSchema = schema('ForkSessionResultSchema');
+    const responseSchema = schema('ForkSessionResponseSchema');
+    expect(responseSchema.safeParse({ ok: true, data: result }).success).toBe(true);
+    for (const patch of [{ sourceSessionId: 5 }, { sourceSessionId: 0 }, { sourceSessionId: Number.MAX_SAFE_INTEGER + 1 },
+      { selectedEntryId: '' }, { selectedEntryId: 'x'.repeat(257) }, { commit: { ...commit, entryCount: 0 } },
+      { commit: { ...commit, commitRevision: -1 } }, { commit: { ...commit, commitRevision: Number.MAX_SAFE_INTEGER + 1 } },
+      { commit: { ...commit, entryCount: 1.5 } }, { commit: { ...commit, entryCount: Number.MAX_SAFE_INTEGER + 1 } },
+      { commit: { ...commit, leafId: 7 } }, { commit: { ...commit, leafId: 'x'.repeat(257) } },
+      { commit: { ...commit, owner: 8 } }, { owner: 8 }, { history },
+      { session: { ...result.session, nativeHeader: history.header } }]) {
+      expect(dataSchema.safeParse({ ...result, ...patch }).success).toBe(false);
+      expect(responseSchema.safeParse({ ok: true, data: { ...result, ...patch } }).success).toBe(false);
+    }
+    expect(responseSchema.safeParse({ ok: true, data: result, owner: 8 }).success).toBe(false);
+    const error = { code: 'session_history_invalid', category: 'session', message: 'Unavailable', retryable: false };
+    expect(responseSchema.safeParse({ ok: false, error }).success).toBe(true);
+    expect(responseSchema.safeParse({ ok: false, error: { ...error, code: 'token=private-value' } }).success).toBe(false);
+    expect(responseSchema.safeParse({ ok: false, error: { ...error, owner: 8 } }).success).toBe(false);
+    expect(responseSchema.safeParse({ ok: false, error: { ...error, message: '\u0000'.repeat(23000) } }).success).toBe(false);
+    expect(responseSchema.safeParse({ ok: true, data: { ...result,
+      session: { ...result.session, title: '\u0000'.repeat(23000) } } }).success).toBe(false);
+  });
+
   // These catch lossy parse/role narrowing and missing seed coverage, without importing SDK objects.
   it('preserves complete native JSON and recovery seed identity', () => {
     const usage = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 1, totalTokens: 3,

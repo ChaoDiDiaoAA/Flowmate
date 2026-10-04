@@ -255,9 +255,10 @@ const normalizedTitle = z.string().transform((title, context) => {
 export const ForkSessionRequestSchema = z.object({ sourceSessionId: id, expected: HistoryCommitStateSchema,
   targetEntryId: NativeEntryIdSchema, title: normalizedTitle, clientOperationId: z.string().uuid().transform(value => value.toLowerCase()) }).strict();
 export type ForkSessionRequest = z.infer<typeof ForkSessionRequestSchema>;
+// selectedEntryId records creation intent; idempotent lookup reports the target's current commit.
 export const ForkSessionResultSchema = z.object({ session: SessionSnapshotSchema, commit: HistoryCommitStateSchema,
   sourceSessionId: id, selectedEntryId: NativeEntryIdSchema }).strict().refine(value => value.session.sessionId !== value.sourceSessionId
-    && value.commit.leafId === value.selectedEntryId && value.commit.entryCount > 0, 'Fork must identify an independent committed Session.').readonly();
+    && value.commit.entryCount > 0, 'Fork must identify an independent committed Session.').readonly();
 export type ForkSessionResult = z.infer<typeof ForkSessionResultSchema>;
 export const NativeHistoryInspectionSchema = z.object({ positions: z.array(z.object({ entryId: NativeEntryIdSchema,
   isCurrentPath: z.boolean(), contextState: z.enum(['empty', 'complete', 'incomplete-tool-pair', 'unsupported']) }).strict()).readonly() }).strict()
