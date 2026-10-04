@@ -242,13 +242,13 @@ export class SessionService {
     if (!current.data.bundle.commit) return fail(appError('session_history_unavailable', 'session', 'Fork history is unavailable.'));
     const row = current.data.row;
     try {
-      const restored = ensureNativeSession(this.repository, this.agent, row, this.memory);
+      const restored = installNativeSession(this.repository, this.agent, row, this.memory);
       if (!restored.ok) {
         // A failed cache installation does not invalidate the committed collection.
         if (restored.error.code !== 'session_busy') try { await this.agent.releaseSession(row.nativeSessionId); } catch { /* Preserve durable target. */ }
         return restored;
       }
-      return ok({ session: this.project(row), commit: current.data.bundle.commit,
+      return ok({ session: this.project(restored.data.row), commit: restored.data.commit,
         sourceSessionId: request.sourceSessionId, selectedEntryId: request.targetEntryId });
     } catch {
       try { await this.agent.releaseSession(row.nativeSessionId); } catch { /* Preserve durable target. */ }
@@ -395,6 +395,13 @@ export class SessionService {
 }
 
 export function ensureNativeSession(repository: SessionRepository, agent: AgentPort, row: SessionRow, memory: Pick<MemoryStore, 'load' | 'commit'>): Result<void> {
+  const installed = installNativeSession(repository, agent, row, memory);
+  return installed.ok ? ok(undefined) : installed;
+}
+
+/** The returned row and receipt are from the exact authorized snapshot installed below. */
+function installNativeSession(repository: SessionRepository, agent: AgentPort, row: SessionRow,
+  memory: Pick<MemoryStore, 'load' | 'commit'>): Result<{ row: SessionRow; commit: HistoryCommitReceipt }> {
   if (row.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'This conversation cannot continue after an interrupted request.'));
   let availability: ReturnType<AgentPort['inspect']>['availability'];
   try {
@@ -406,16 +413,20 @@ export function ensureNativeSession(repository: SessionRepository, agent: AgentP
     return fail(appError(row.historyState === 'invalid' ? 'session_history_invalid' : 'session_history_unavailable',
       'session', 'This conversation cannot be restored. Start a new chat.'));
   }
-  const bundle = repository.readHistorySnapshot(row.sessionId, value => value.blocked
-    ? fail(appError('session_scope_revoked', 'session', 'Material access was revoked.')) : ok(value.bundle));
-  if (!bundle.ok) return bundle;
-  if (!bundle.data.history || !bundle.data.commit || !agent.watchSession)
+  const current = repository.readHistorySnapshot(row.sessionId, value => value.blocked
+    ? fail(appError('session_scope_revoked', 'session', 'Material access was revoked.')) : ok(value));
+  if (!current.ok) return current;
+  const { row: installedRow, bundle } = current.data;
+  if (installedRow.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'This conversation cannot continue after an interrupted request.'));
+  if (!bundle.history || !bundle.commit || !agent.watchSession)
     return fail(appError('session_history_unavailable', 'session', 'This conversation has no saved native history.'));
   const restore = availability === 'ready' ? agent.restoreSessionLeaf : agent.restoreSession;
   if (!restore) return fail(appError('context_binding_unknown', 'runtime', 'Saved conversation sources cannot be reconnected.'));
-  const restored = restore.call(agent, row.nativeSessionId, bundle.data.history, bundle.data.seed, bundle.data.commit);
+  const restored = restore.call(agent, installedRow.nativeSessionId, bundle.history, bundle.seed, bundle.commit);
   if (!restored.ok) return restored;
-  return agent.watchSession(row.nativeSessionId, bundle.data.commit, bundle.data.seed, write => commitNativeWrite(repository, memory, row.sessionId, write));
+  const watched = agent.watchSession(installedRow.nativeSessionId, bundle.commit, bundle.seed,
+    write => commitNativeWrite(repository, memory, installedRow.sessionId, write));
+  return watched.ok ? ok({ row: installedRow, commit: bundle.commit }) : watched;
 }
 
 function sameJson(a: unknown, b: unknown): boolean { return isDeepStrictEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b))); }

@@ -6,7 +6,8 @@ import { openDatabase } from '../../../packages/core/src/storage/database.ts';
 import { SessionService, ensureNativeSession } from '../../../packages/core/src/sessions/service.ts';
 import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
 import { ContextService } from '../../../packages/core/src/context/service.ts';
-import { appError, fail, ok, ContextSnapshotJsonSchema, type ForkSessionRequest, type NativeSessionEntry, type Result, type RuntimeState } from '@flowmate/contracts';
+import { appError, fail, ok, ContextSnapshotJsonSchema, type ForkSessionRequest, type NativeSessionEntry, type Result, type RuntimeState,
+  type HistoryCommitReceipt, type NativeSessionHistory } from '@flowmate/contracts';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readdirSync } from 'node:fs';
@@ -449,4 +450,70 @@ it('P9 T06 rejects a persisted active source Run admitted during detached constr
   };
   expect(await f.service.forkSession(request)).toMatchObject({ ok: false, error: { code: 'session_busy' } });
   expect(facts(f)).toEqual(raced!); f.quiet();
+});
+
+// A returned receipt from the first read must never differ from the receipt actually restored and watched.
+it.each(['ready', 'missing'] as const)('P9 T06 returns the exact installed receipt after target advances between recovery reads: %s', async availability => {
+  const f = fixture(), first = need(await f.service.forkSession(f.request));
+  const target = first.session.sessionId, nativeId = first.session.nativeSessionId, source = sourceFacts(f), before = facts(f);
+  if (availability === 'missing') await f.agent.releaseSession(nativeId);
+  const read = f.store.sessions.readHistorySnapshot.bind(f.store.sessions);
+  let advance = true, latest: HistoryCommitReceipt | undefined;
+  f.store.sessions.readHistorySnapshot = (id, callback, writeInputIds) => {
+    const result = read(id, callback, writeInputIds);
+    if (id === target && advance && result.ok) {
+      advance = false; expect(f.store.db.inTransaction).toBe(false);
+      const saved = need(f.store.memory.load(target))!;
+      latest = need(f.store.memory.commit({ sessionId: target, expected: saved.commit, header: saved.history.header,
+        appendEntries: availability === 'missing' ? [user('advanced', 'b')] : [],
+        leafId: availability === 'missing' ? 'advanced' : 'a', unusable: false, contexts: [] }));
+      need(f.store.sessions.rename({ sessionId: target, title: 'Advanced target', at }));
+    }
+    return result;
+  };
+  const installed: { history: NativeSessionHistory; receipt: HistoryCommitReceipt }[] = [], watched: HistoryCommitReceipt[] = [];
+  const restore = f.agent.restoreSession.bind(f.agent), restoreLeaf = f.agent.restoreSessionLeaf.bind(f.agent), watch = f.agent.watchSession.bind(f.agent);
+  f.agent.restoreSession = (...args) => { installed.push({ history: structuredClone(args[1]), receipt: structuredClone(args[3]) }); return restore(...args); };
+  f.agent.restoreSessionLeaf = (...args) => { installed.push({ history: structuredClone(args[1]), receipt: structuredClone(args[3]) }); return restoreLeaf(...args); };
+  f.agent.watchSession = (...args) => { watched.push(structuredClone(args[1])); return watch(...args); };
+  const repeated = need(await f.service.forkSession(f.request));
+  expect(latest).toEqual(availability === 'missing' ? { commitRevision: 2, entryCount: 3, leafId: 'advanced' }
+    : { commitRevision: 2, entryCount: 2, leafId: 'a' });
+  expect(installed).toHaveLength(1); expect(watched).toEqual([latest!]);
+  expect(installed[0]!.receipt).toEqual(latest!);
+  expect(installed[0]!.history.entries.map(entry => entry.id)).toEqual(availability === 'missing' ? ['a', 'b', 'advanced'] : ['a', 'b']);
+  expect(installed[0]!.history.leafId).toBe(availability === 'missing' ? 'advanced' : 'a');
+  expect(need(f.agent.exportSession(nativeId))).toEqual(installed[0]!.history);
+  expect(repeated.commit).toEqual(latest!); expect(repeated.session.title).toBe('Advanced target');
+  expect(repeated.session.sessionId).toBe(target); expect(repeated.selectedEntryId).toBe('b');
+  expect(f.store.db.query('SELECT * FROM session_forks').all()).toHaveLength(1);
+  expect(sourceFacts(f)).toEqual(source); noExecutionChanges(before, f);
+});
+
+it.each(['ancestor-revoked', 'target-hidden', 'target-unusable', 'source-body'] as const)
+('P9 T06 rechecks full authorization and proof at the installed snapshot: %s', async fault => {
+  const f = fixture(), first = need(await f.service.forkSession(f.request)), target = first.session.sessionId;
+  const read = f.store.sessions.readHistorySnapshot.bind(f.store.sessions);
+  let mutate = true, raced: ReturnType<typeof facts>;
+  f.store.sessions.readHistorySnapshot = (id, callback, writeInputIds) => {
+    const result = read(id, callback, writeInputIds);
+    if (id === target && mutate && result.ok) {
+      mutate = false; expect(f.store.db.inTransaction).toBe(false);
+      if (fault === 'ancestor-revoked') f.store.db.query('UPDATE sessions SET metadata_json=? WHERE id=?').run(JSON.stringify({ version: 1,
+        model_use_blocked: { reason: 'document_use_revoked', documentIds: [1], at } }), f.session.sessionId);
+      if (fault === 'target-hidden') f.store.db.query('UPDATE sessions SET hidden_at=? WHERE id=?').run(at, target);
+      if (fault === 'target-unusable') need(f.store.sessions.markHistoryUnusable(target));
+      if (fault === 'source-body') f.store.db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.message.content','changed') WHERE session_id=? AND entry_id='a'").run(f.session.sessionId);
+      raced = facts(f);
+    }
+    return result;
+  };
+  let restores = 0, watches = 0;
+  const restore = f.agent.restoreSessionLeaf.bind(f.agent), watch = f.agent.watchSession.bind(f.agent);
+  f.agent.restoreSessionLeaf = (...args) => { restores++; return restore(...args); };
+  f.agent.watchSession = (...args) => { watches++; return watch(...args); };
+  const code = { 'ancestor-revoked': 'session_scope_revoked', 'target-hidden': 'session_not_found',
+    'target-unusable': 'agent_session_unusable', 'source-body': 'context_binding_unknown' };
+  expect(await f.service.forkSession(f.request)).toMatchObject({ ok: false, error: { code: code[fault] } });
+  expect(restores).toBe(0); expect(watches).toBe(0); expect(facts(f)).toEqual(raced!); f.quiet();
 });
