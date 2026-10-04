@@ -43,12 +43,15 @@ import type {
   ResolvedRuntimeBudget,
   RuntimeStrategySnapshot,
   RuntimeStrategyPolicy,
+  ContextHooks,
 } from '@flowmate/contracts';
 import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
 import { ensureNativeSession } from '../sessions/service.ts';
 import type { ToolExecutor } from '../tools/executor.ts';
-import type { SessionInputLedger } from '../sessions/input-ledger.ts';
+import type { SessionInputAdmission, SessionInputLedger } from '../sessions/input-ledger.ts';
 import type { WorkspaceVerifier } from '../workspace/verification.ts';
+import type { ContextService } from '../context/service.ts';
+import type { ContextRepository } from '../context/repository.ts';
 
 export interface RuntimeLogger {
   write(event: { at: string; level: 'info' | 'warn' | 'error'; component: string; runId?: number; event: string; code?: string }): void;
@@ -63,6 +66,8 @@ export type RuntimeDependencies = {
   sessions?: SessionRepository;
   sessionInputs?: SessionInputLedger;
   workspaceVerifier?: WorkspaceVerifier;
+  contextService?: Pick<ContextService, 'build'>;
+  contextRepository?: Pick<ContextRepository, 'bindRequest' | 'recordRequest' | 'resolveToolResult'>;
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
@@ -117,6 +122,7 @@ type AgentExecutionContext = {
   runtimeStrategy?: RuntimeStrategySnapshot;
   workingDirectory?: string;
   inputId?: number;
+  contextSnapshotId?: number;
   promptText: string;
   control: AgentControl;
   stopPromise: Promise<StopIntent>;
@@ -325,8 +331,11 @@ export class RuntimeService {
       if (agent.inspect(active.nativeSessionId).availability !== 'busy') return fail(appError('input_admission_closed', 'session', 'The native Run is not streaming.', true));
     } catch { return fail(appError('agent_session_unavailable', 'session', 'Native state cannot be confirmed.', true)); }
     const at = this.dependencies.now();
-    const admitted = ledger.admit(request, () => runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
-      text: request.text, expected: request.workspace, at }, this.dependencies.workspaceVerifier), at);
+    const admitted = ledger.admit(request, () => {
+      const frozen = runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
+        text: request.text, expected: request.workspace, at }, this.dependencies.workspaceVerifier);
+      return frozen.ok ? this.buildInput(frozen.data.runId, request.sessionId, frozen.data.content, at) : frozen;
+    }, at);
     if (!admitted.ok) return admitted;
     const input = admitted.data.input;
     if (!admitted.data.created) return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
@@ -335,10 +344,28 @@ export class RuntimeService {
     if (!dispatched.ok) { active.stop('user'); return dispatched; }
     let enqueued: Result<void>;
     try { enqueued = await agent.enqueueInput(active.nativeSessionId, { inputId: input.inputId, runId: request.runId,
-      sessionId: request.sessionId, mode: request.mode, text: input.content.text, promptText: input.content.promptText }); }
+      sessionId: request.sessionId, mode: request.mode, text: input.content.text, promptText: input.content.promptText,
+      ...(input.contextSnapshotId === null ? {} : { contextSnapshotId: input.contextSnapshotId }) }); }
     catch { enqueued = fail(appError('input_delivery_unknown', 'session', 'Native input delivery could not be confirmed.', true, request.runId)); }
     if (!enqueued.ok) { active.stop('user'); return enqueued; }
     return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
+  }
+
+  private buildInput(runId: number, sessionId: number, content: SessionInputContentV2, at: string): Result<SessionInputAdmission> {
+    const contextService = this.dependencies.contextService;
+    if (!contextService) return ok({ runId, content }); // Explicit legacy Runtime construction.
+    const run = this.dependencies.runs.get(runId);
+    if (!run.ok) return run;
+    if (run.data.kind !== 'agent') return fail(appError('run_state_invalid', 'runtime', 'Context requires an Agent Run.'));
+    const goalMode = run.data.config.goalMode ?? 'answer';
+    if (goalMode !== 'answer' && goalMode !== 'save-candidate' && goalMode !== 'fill-form')
+      return fail(appError('storage_corrupt', 'storage', 'Saved Context goal is invalid.'));
+    const built = contextService.build({ runId, sessionId, jobId: run.data.jobId, text: content.text,
+      goalMode, workspaceContext: content.workspaceContext, workspaceInput: content.workspaceInput,
+      allowedDocumentIds: content.allowedDocumentIds, allowedArtifactIds: content.allowedArtifactIds,
+      workingDirectory: typeof run.data.config.workingDirectory === 'string' ? run.data.config.workingDirectory : null, createdAt: at });
+    return built.ok ? ok({ runId, content: { ...content, promptText: built.data.promptText },
+      contextPolicyVersion: 'p8-context-v1', contextSnapshotId: built.data.snapshot.id }) : built;
   }
 
   private verifyInputUse(context: AgentExecutionContext, inputId: number): Result<void> {
@@ -380,7 +407,8 @@ export class RuntimeService {
         || !sameIds(content.allowedDocumentIds, run.data.scope.allowedDocumentIds)
         || !sameIds(content.allowedArtifactIds, run.data.scope.allowedArtifactIds)) return corrupt();
     } else return corrupt();
-    return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier);
+    return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier, {
+      runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
   }
 
   private qualifyInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Result<boolean> {
@@ -539,7 +567,8 @@ export class RuntimeService {
         const created = this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
           expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
           messageTimestamp: input.messageTimestamp, goal: INVOICE_CHAT_GOAL,
-          config: initialP3AgentSnapshot(request, session.nativeSessionId), usage: initialUsage(createdAt),
+          config: { ...initialP3AgentSnapshot(request, session.nativeSessionId),
+            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}) }, usage: initialUsage(createdAt),
           cleanup: initialCleanup(), createdAt,
           ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
           ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
@@ -553,7 +582,8 @@ export class RuntimeService {
           workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(runId), 'work');
       } else {
         const created = this.dependencies.runs.createAgent({ goal: INVOICE_CHAT_GOAL, input,
-          config: initialAgentSnapshot(request, session.nativeSessionId), usage: initialUsage(createdAt),
+          config: { ...initialAgentSnapshot(request, session.nativeSessionId),
+            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}) }, usage: initialUsage(createdAt),
           cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: chatScope });
         if (!created.ok) return created;
         runId = created.data;
@@ -568,7 +598,7 @@ export class RuntimeService {
           ...(admission ? { workspaceInput: admission.workspaceInput, workspaceContext: admission.workspaceContext,
             goalMode: request.goalMode ?? 'answer' } : {}),
           ...(workingDirectory ? { workingDirectory } : {}) }) };
-      return ok({ runId, content });
+      return this.buildInput(runId, request.sessionId, content, createdAt);
     }, createdAt, control.desktopRequestHash);
     const accepted = inputSubmission ? createInput(inputSubmission)
       : this.dependencies.sessionInputs.allocateSequence(request.sessionId, sequence => {
@@ -635,7 +665,9 @@ export class RuntimeService {
     active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
     this.active = active;
     const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: frozenContent.promptText,
-      ...(inputId === undefined ? {} : { inputId }), control, stopPromise, readStop: () => stopIntent, emit };
+      ...(inputId === undefined ? {} : { inputId }),
+      ...(accepted.data.input.contextSnapshotId === null ? {} : { contextSnapshotId: accepted.data.input.contextSnapshotId }),
+      control, stopPromise, readStop: () => stopIntent, emit };
     const timer = setTimeout(() => active.stop('timeout'), request.timeoutMs);
     emit({ type: 'run_progress', phase: 'created' });
     const execution = this.executeAgent(context).catch(() => this.finishAgent(context, null,
@@ -771,6 +803,23 @@ export class RuntimeService {
     const agent = this.dependencies.agent;
     if (context.scope) this.dependencies.tools?.setRunDeadline(active.runId, active.startedAt + request.timeoutMs);
     if (!agent) return this.finishAgent(context, null, appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'), true);
+    const savedRun = this.dependencies.runs.get(active.runId);
+    if (!savedRun.ok) return this.finishAgent(context, null, savedRun.error, true);
+    const p8 = savedRun.data.config.contextPolicyVersion === 'p8-context-v1';
+    const repository = this.dependencies.contextRepository;
+    if (p8 && (!repository || context.contextSnapshotId === undefined))
+      return this.finishAgent(context, null, appError('context_binding_unknown', 'runtime', 'Context persistence is unavailable.', false, active.runId), true);
+    const contextHooks: ContextHooks | undefined = p8 && repository ? {
+      resolveToolResult: source => source.sessionId === request.sessionId
+        ? repository.resolveToolResult(source)
+        : fail(appError('context_binding_unknown', 'runtime', 'Tool result does not belong to this Session.')),
+      bind: value => value.binding.runId === active.runId && value.binding.sessionId === request.sessionId
+        && value.binding.nativeSessionId === session.nativeSessionId ? repository.bindRequest(value)
+        : fail(appError('context_binding_unknown', 'runtime', 'Request does not belong to this Run.')),
+      record: (binding, update) => binding.runId === active.runId && binding.sessionId === request.sessionId
+        && binding.nativeSessionId === session.nativeSessionId ? repository.recordRequest(binding, update)
+        : fail(appError('context_binding_unknown', 'runtime', 'Request does not belong to this Run.')),
+    } : undefined;
     if (context.admission && context.workingDirectory) {
       try {
         if (request.workingDirectory === undefined) mkdirSync(context.workingDirectory, { recursive: true });
@@ -850,8 +899,8 @@ export class RuntimeService {
       const saved = initial.data.config as Record<string, unknown>;
       const preparedFacts = prepared.snapshot as SafeConfigSnapshot & Record<string, unknown>;
       const { agent: _preparedAgent, goalMode: _preparedGoal, workspaceContext: _preparedWorkspace,
-        workingDirectory: _preparedDirectory, formTarget: _preparedTarget, ...preparedWithoutAgent } = preparedFacts;
-      const { agent: frozenAgent, ...frozenExtensions } = saved;
+        workingDirectory: _preparedDirectory, formTarget: _preparedTarget, contextPolicyVersion: _preparedContext, ...preparedWithoutAgent } = preparedFacts;
+      const { agent: frozenAgent, contextPolicyVersion: savedContextPolicy, ...frozenExtensions } = saved;
       const actualAgent = prepared.snapshot.agent;
       const frozenFacts = frozenAgent as typeof actualAgent;
       const frozenRuntime = frozenFacts as RuntimeAgentConfigFacts;
@@ -866,6 +915,7 @@ export class RuntimeService {
         || actualBudget.toolTimeoutMs !== request.budget.toolTimeoutMs)
         return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared Agent policy differs from Run admission.', false, active.runId), true);
       startedConfig = { ...frozenExtensions, ...preparedWithoutAgent, version: 2, runtimeBudget: request.budget,
+        ...(savedContextPolicy === 'p8-context-v1' ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
         limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
         agent: { ...actualAgent, policyVersion: 'runtime-v1', taskPolicyVersion: frozenRuntime.taskPolicyVersion,
           ...request.budget } } as SafeConfigSnapshot;
@@ -904,6 +954,8 @@ export class RuntimeService {
       runId: active.runId,
       sessionId: request.sessionId,
       inputId: context.inputId,
+      contextSnapshotId: context.contextSnapshotId,
+      ...(contextHooks ? { contextHooks } : {}),
       promptText: context.promptText,
       runtimeBudget: request.budget, runtimeStrategy: context.runtimeStrategy,
       budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
@@ -928,12 +980,12 @@ export class RuntimeService {
         context: productContext,
         observeRequest: (name, raw, call) => {
           const result = this.dependencies.tools!.observeRequest(name, raw, { ...productContext,
-            nativeToolCallId: call.nativeToolCallId, signal: call.signal });
+            nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) });
           return result.ok ? ok(undefined) : result;
         },
         rejectRequest: (name, raw, call, error, stage) => {
           const result = this.dependencies.tools!.rejectRequest(name, raw, { ...productContext,
-            nativeToolCallId: call.nativeToolCallId, signal: call.signal }, error, stage);
+            nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) }, error, stage);
           return result.ok ? ok(undefined) : result;
         },
         recordDelivery: (nativeToolCallId, delivery) => this.dependencies.tools!.recordDelivery(productContext, nativeToolCallId, delivery),
@@ -943,6 +995,7 @@ export class RuntimeService {
           context.emit({ type: 'tool_progress', toolName: name, label, phase: 'running' });
           const result = await this.dependencies.tools!.execute(name, input, {
             ...productContext, nativeToolCallId: call.nativeToolCallId, signal: call.signal,
+            ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}),
           }, rawArguments);
           context.emit({ type: 'tool_progress', toolName: name, label,
             phase: result.result.status === 'succeeded' ? 'succeeded' : result.result.status === 'cancelled' ? 'cancelled' : 'failed' });

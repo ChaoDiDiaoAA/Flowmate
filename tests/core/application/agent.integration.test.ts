@@ -56,7 +56,8 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
       history.create(nativeSessionId);
       return ok({ nativeSessionId });
     },
-    ...(!options.legacyHistory ? { exportSession: history.exportSession, watchSession: history.watchSession } : {}),
+    ...(!options.legacyHistory ? { exportSession: history.exportSession, watchSession: history.watchSession,
+      restoreSessionLeaf: history.restoreSessionLeaf } : {}),
     inspect(nativeSessionId) {
       const record = records.get(nativeSessionId);
       return { availability: !record ? 'missing' : record.busy ? 'busy' : 'ready' };

@@ -14,6 +14,9 @@ import {
   RunToolCallRequestSchema,
   RuntimeToolViewSchema,
   RuntimeToolPageSchema,
+  ContextSnapshotsResultSchema,
+  ContextSnapshotResultSchema,
+  ContextRequestsResultSchema,
   ok,
 } from '@flowmate/contracts';
 import type {
@@ -48,6 +51,8 @@ import type { WorkspaceService } from './workspace/service.ts';
 import type { JobService } from './jobs/service.ts';
 import type { InvoiceFormService } from './tools/invoice-form.ts';
 import type { InvoiceEditService } from './invoice-edit/service.ts';
+import type { ContextService } from './context/service.ts';
+import type { z } from 'zod';
 
 export interface RuntimeServicePort {
   callProvider(
@@ -72,6 +77,7 @@ type ProductApplicationOptions = {
   events: BusinessEventRepository;
   runtimeEvents?: EventService;
   toolCalls?: Pick<ToolCallRepository, 'list' | 'getById'>;
+  contextService?: Pick<ContextService, 'listContextSnapshots' | 'queryContextSnapshot' | 'listContextRequests'>;
   invoiceForms?: Pick<InvoiceFormService, 'query'>;
   invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'queryOperation'>;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
@@ -106,6 +112,9 @@ export function makeApplication(
       return normalized.ok ? runtime.callProvider(normalized.data, control) : normalized;
     },
     queryRun: async (runId) => isDbId(runId) ? runs.get(runId) : fail(appError('input_invalid', 'input', 'Run ID 无效。')),
+    listContextSnapshots: async input => contextRead(ContextSnapshotsResultSchema, () => products?.contextService?.listContextSnapshots(input)),
+    queryContextSnapshot: async input => contextRead(ContextSnapshotResultSchema, () => products?.contextService?.queryContextSnapshot(input)),
+    listContextRequests: async input => contextRead(ContextRequestsResultSchema, () => products?.contextService?.listContextRequests(input)),
     queryRuntimeEvents: async input => products?.runtimeEvents?.query(input) ?? ({ ok: false,
       error: appError('runtime_events_unavailable', 'runtime', 'Runtime 事件服务尚未组装。', true), context: null }),
     subscribeRuntimeEvents: async (input, listener) => products?.runtimeEvents?.subscribe(input, listener)
@@ -374,7 +383,16 @@ function toolView(call: ToolCallSnapshot): RuntimeToolView {
     endedAt: call.endedAt, stoppedAt: call.stoppedAt, committedCandidateId: call.result?.committedCandidateId ?? null,
     errorCode: call.result && call.result.status !== 'succeeded' ? call.result.error.code : null,
     stopped: typeof call.cleanup.stopped === 'boolean' ? call.cleanup.stopped : null,
-    deliveryState: call.delivery.state, formApplicationOutcome: call.formApplication?.outcome ?? null });
+    deliveryState: call.delivery.state, formApplicationOutcome: call.formApplication?.outcome ?? null,
+    context: call.context === null ? null : { snapshotId: call.context.snapshotId, requestSequence: call.context.requestSequence } });
+}
+
+function contextRead<T>(schema: z.ZodType<Result<T>>, read: () => Result<T> | undefined): Result<T> {
+  try {
+    const parsed = schema.safeParse(read());
+    if (parsed.success) return parsed.data;
+  } catch { /* Only the fixed public failure crosses this boundary. */ }
+  return fail(appError('internal_error', 'internal', 'Context query could not be completed.'));
 }
 
 function normalizePageRequest(value: unknown, allowedExtra: readonly string[] = []): Result<{ beforeId?: number; limit: number }> {

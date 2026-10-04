@@ -94,11 +94,30 @@ export function makeSelectedCandidate(schema9 = false, withSource = false) {
       state: 'present' as const, alternatives: [], sources: [{ documentId: 1, version: 'v1', artifactId: 2, page: 1,
         blockId: 'b1', quote: 'Total 113.00' }] } : missingField() }, lines: [], notes: [] };
   const args = { documentId: 1, candidate };
-  const saveCall = required(store.toolCalls.request({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
+  // Migration-only builder: current writers require 015 columns, while this database is physically schema 9.
+  const historical = schema9 ? store.db.transaction(() => {
+    const toolCallId = Number(store.db.query(`INSERT INTO tool_calls(run_id,session_id,native_tool_call_id,tool_name,tool_version,effect,
+      args_json,status,delivery_json,cleanup_json,requested_at,started_at) VALUES(?,?,'save-form-candidate','save_invoice_candidate','1',
+      'LOCAL_WRITE',?,'running',?,?,?,?)`).run(first.runId, session.sessionId, JSON.stringify({ version: 1, raw: args, final: args }),
+        JSON.stringify({ version: 1, state: 'not_attempted', messageObservedAt: null, includedInCallSequence: null, requestDispatchedAt: null, error: null }),
+        JSON.stringify({ version: 1, stopReason: null, stopped: false, errors: [] }), stamp, stamp).lastInsertRowid);
+    store.db.query('UPDATE runs SET tool_call_count=tool_call_count+1 WHERE id=?').run(first.runId);
+    const candidateId = Number(store.db.query(`INSERT INTO invoice_candidates(job_id,run_id,tool_call_id,sequence,origin,status,
+      fields_json,lines_json,issues_json,created_at) VALUES(?,?,?,1,'model','generated',?,?,?,?)`).run(task.job.jobId, first.runId, toolCallId,
+        JSON.stringify({ version: 1, values: candidate.fields }), JSON.stringify({ version: 1, items: candidate.lines }),
+        JSON.stringify({ version: 1, notes: candidate.notes, checks: [], items: [] }), stamp).lastInsertRowid);
+    store.db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,candidate_id,run_id,result,safe_summary)
+      VALUES('candidate_generated',?,'agent',?,1,?,?,?,'succeeded','Invoice candidate generated')`)
+      .run(stamp, `tool-call-id:${toolCallId}`, task.job.jobId, candidateId, first.runId);
+    return { toolCallId, receipt: { candidateId, jobId: task.job.jobId, sequence: 1, issueCount: 0, checks: [] } };
+  })() : null;
+  const saveCall = historical ?? required(store.toolCalls.request({ context: null, runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
     toolName: 'save_invoice_candidate', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: args, requestedAt: stamp }));
-  required(store.toolCalls.fixArguments({ toolCallId: saveCall.toolCallId, finalArguments: args }));
-  required(store.toolCalls.start({ toolCallId: saveCall.toolCallId, startedAt: stamp }));
-  const saved = required(store.candidates.save({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
+  if (!schema9) {
+    required(store.toolCalls.fixArguments({ toolCallId: saveCall.toolCallId, finalArguments: args }));
+    required(store.toolCalls.start({ toolCallId: saveCall.toolCallId, startedAt: stamp }));
+  }
+  const saved = historical ?? required(store.candidates.save({ runId: first.runId, sessionId: session.sessionId, nativeToolCallId: 'save-form-candidate',
     documentId: 1, candidate, checks: [], issues: [], at: stamp }));
   const terminal: Parameters<typeof store.toolCalls.finish>[0] = { toolCallId: saveCall.toolCallId,
     result: { version: 1, committedCandidateId: saved.receipt.candidateId, status: 'succeeded', data: saved.receipt },

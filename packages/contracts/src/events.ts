@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { AppErrorSchema } from './runtime.ts';
+import { CONTEXT_ERROR_FACTS } from './errors.ts';
 import type { AppError, DbId, Result, RunStatus, TokenColumns } from './runtime.ts';
 import type { ToolCallSnapshot } from './activity.ts';
 import type { SessionInputSnapshot } from './session-inputs.ts';
@@ -63,6 +64,7 @@ export type RuntimeToolView = Pick<ToolCallSnapshot,
   'toolCallId' | 'runId' | 'sessionId' | 'toolName' | 'status' | 'requestedAt' | 'startedAt' | 'endedAt' | 'stoppedAt'> & {
   committedCandidateId: DbId | null; errorCode: string | null; stopped: boolean | null;
   deliveryState: ToolCallSnapshot['delivery']['state']; formApplicationOutcome: 'applied' | 'not_applied' | 'unknown' | null;
+  context: import('./context.ts').ContextReference | null;
 };
 export type RunToolCallsRequest = { runId: DbId; sessionId: DbId | null; beforeId?: DbId; limit?: number };
 export type RunToolCallRequest = { runId: DbId; sessionId: DbId; toolCallId: DbId };
@@ -194,6 +196,7 @@ const p6ErrorFacts: Readonly<Record<string, readonly [AppError['category'], bool
   event_cursor_invalid: ['input', false], event_gap: ['storage', false], event_subscription_limit: ['runtime', false],
   event_subscription_invalid: ['input', false], event_query_busy: ['runtime', true], storage_read_failed: ['storage', true],
   storage_corrupt: ['storage', false], state_conflict: ['runtime', false],
+  ...CONTEXT_ERROR_FACTS,
 };
 export const RuntimeEventErrorSchema = AppErrorSchema.superRefine((error, context) => {
   const facts = Object.hasOwn(p6ErrorFacts, error.code) ? p6ErrorFacts[error.code] : undefined;
@@ -227,7 +230,8 @@ export const RuntimeToolViewSchema: z.ZodType<RuntimeToolView> = z.object({ tool
   requestedAt: utc, startedAt: utc.nullable(), endedAt: utc.nullable(), stoppedAt: utc.nullable(),
   committedCandidateId: dbId.nullable(), errorCode, stopped: z.boolean().nullable(),
   deliveryState: z.enum(['not_attempted', 'message_observed', 'request_observed', 'failed', 'unknown']),
-  formApplicationOutcome: z.enum(['applied', 'not_applied', 'unknown']).nullable() }).strict();
+  formApplicationOutcome: z.enum(['applied', 'not_applied', 'unknown']).nullable(),
+  context: z.object({ snapshotId: dbId, requestSequence: dbId }).strict().readonly().nullable() }).strict();
 export const RunToolCallsRequestSchema = z.object({ runId: dbId, sessionId: dbId.nullable(), beforeId: dbId.optional(),
   limit: safeInteger.min(1).max(100).default(50) }).strict();
 export const RunToolCallRequestSchema: z.ZodType<RunToolCallRequest> = z.object({ runId: dbId, sessionId: dbId, toolCallId: dbId }).strict();

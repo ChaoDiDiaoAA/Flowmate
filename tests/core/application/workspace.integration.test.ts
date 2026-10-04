@@ -221,7 +221,7 @@ describe('P7 Workspace authority and recovery', () => {
     need(f.runs.start(admitted.runId, startedConfig, f.stamp));
     const saved = need(f.candidates.readByJob({ jobId: f.jobId, candidateId: f.candidateId })).candidate;
     const candidate = { fields: saved.fields, lines: saved.lines, notes: [] };
-    const call = need(f.toolCalls.request({ runId: admitted.runId, sessionId: f.session.sessionId, nativeToolCallId: 'p7-second-model',
+    const call = need(f.toolCalls.request({ context: null, runId: admitted.runId, sessionId: f.session.sessionId, nativeToolCallId: 'p7-second-model',
       toolName: 'save_invoice_candidate', toolVersion: '1', effect: 'LOCAL_WRITE', rawArguments: { documentId: 1, candidate }, requestedAt: f.stamp }));
     need(f.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: { documentId: 1, candidate } }));
     need(f.toolCalls.start({ toolCallId: call.toolCallId, startedAt: f.stamp }));

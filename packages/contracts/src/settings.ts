@@ -188,6 +188,9 @@ export type DesktopBridge = {
   unsubscribeRuntimeEvents(subscriptionId: string): Promise<import('./runtime.ts').Result<void>>;
   listRunToolCalls(input: import('./events.ts').RunToolCallsRequest): Promise<import('./runtime.ts').Result<import('./workspace.ts').Page<import('./events.ts').RuntimeToolView>>>;
   queryRunToolCall(input: import('./events.ts').RunToolCallRequest): Promise<import('./runtime.ts').Result<import('./events.ts').RuntimeToolView>>;
+  listContextSnapshots(input: import('./context.ts').ContextSnapshotsRequest): Promise<import('./runtime.ts').Result<import('./context.ts').ContextSnapshotsPage>>;
+  queryContextSnapshot(input: import('./context.ts').ContextSnapshotRequest): Promise<import('./runtime.ts').Result<import('./context.ts').ContextSnapshotDetail>>;
+  listContextRequests(input: import('./context.ts').ContextRequestsRequest): Promise<import('./runtime.ts').Result<import('./context.ts').ContextRequestsPage>>;
   readWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
   updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
   restoreWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceRestoreResult>>;

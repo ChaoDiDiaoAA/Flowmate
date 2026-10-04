@@ -676,3 +676,13 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 @media (max-width: 1079px) {
   .workspace-summary dl, .workspace-fields { grid-template-columns: minmax(0, 1fr); }
 }
+.context-dialog-backdrop { position: fixed; inset: 0; z-index: 120; background: var(--overlay, #0006); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.session-details { width: min(900px, 100%); max-height: calc(100vh - 48px); overflow: auto; margin: 0; }
+.context-controls, .context-snapshots { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-block: 16px; }
+.context-controls label { display: grid; gap: 6px; flex: 1; }
+.context-controls select { width: 100%; }
+.context-snapshot-detail, .context-request, .context-candidate { border-top: 1px solid var(--border); padding-block: 16px; }
+.context-fragment pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.context-bindings p, .context-fragment p { overflow-wrap: anywhere; }
+.context-source-error { position: fixed; bottom: 24px; left: 24px; z-index: 120; max-width: min(600px, calc(100vw - 48px)); }
+@media (max-width: 640px) { .context-dialog-backdrop { padding: 8px; } .session-details { max-height: calc(100vh - 16px); } }

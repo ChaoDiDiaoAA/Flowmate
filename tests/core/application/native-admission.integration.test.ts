@@ -34,6 +34,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
     createSession: () => { const nativeSessionId = `native-local-${++nativeId}`; history.create(nativeSessionId); return ok({ nativeSessionId }); },
     exportSession: history.exportSession,
     watchSession: history.watchSession,
+    restoreSessionLeaf: history.restoreSessionLeaf,
     inspect: () => ({ availability: 'ready' }),
     prepare: async (nativeSessionId, selected, limits, _signal, settings) => { preparations.push(settings); return ok({ snapshot: {
       version: 1, name: selected.name, revision: selected.revision,

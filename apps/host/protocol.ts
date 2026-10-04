@@ -8,7 +8,9 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeSubscriptionIdSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema, RuntimeEventsReadResultSchema, RuntimeSubscriptionResultSchema,
   RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
-  WorkspaceUpdateRequestSchema, WorkspaceSnapshotSchema, WorkspaceRestoreResultSchema, AppErrorSchema, invoiceToolSchemas } from '@flowmate/contracts';
+  WorkspaceUpdateRequestSchema, WorkspaceSnapshotSchema, WorkspaceRestoreResultSchema, AppErrorSchema, invoiceToolSchemas,
+  ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema, ContextRequestsRequestSchema,
+  ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema } from '@flowmate/contracts';
 import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
@@ -46,6 +48,9 @@ const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optiona
 
 const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('query_runtime_events'), ownerToken, input: RuntimeEventsQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_context_snapshots'), input: ContextSnapshotsRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_context_snapshot'), input: ContextSnapshotRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_context_requests'), input: ContextRequestsRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('subscribe_runtime_events'), ownerToken,
     subscriptionId: RuntimeSubscriptionIdSchema, input: RuntimeEventsSubscriptionRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('unsubscribe_runtime_events'), ownerToken, subscriptionId: RuntimeSubscriptionIdSchema }).strict(),
@@ -208,6 +213,47 @@ const runtimeResultSchemas = {
   list_run_tool_calls: RuntimeToolPageResultSchema,
   query_run_tool_call: RuntimeToolResultSchema,
 };
+
+const contextResultSchemas = {
+  list_context_snapshots: ContextSnapshotsResultSchema,
+  query_context_snapshot: ContextSnapshotResultSchema,
+  list_context_requests: ContextRequestsResultSchema,
+};
+export function isContextHostCommand(type: string): type is keyof typeof contextResultSchemas {
+  return Object.hasOwn(contextResultSchemas, type);
+}
+export function parseContextHostResult(type: string, value: unknown) {
+  if (!isContextHostCommand(type)) return null;
+  const parsed = contextResultSchemas[type].safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+export function contextHostFailure() {
+  return { ok: false as const, error: { code: 'internal_error' as const, category: 'internal' as const,
+    message: 'Context query could not be completed.', retryable: false } };
+}
+/** Strict result schemas know their own rows; the captured command supplies original ownership and cursor. */
+export function matchesContextResponse(command: HostCommand, value: unknown): boolean {
+  if (command.type !== 'list_context_snapshots' && command.type !== 'query_context_snapshot' && command.type !== 'list_context_requests') return false;
+  const result = parseContextHostResult(command.type, value);
+  if (!result) return false;
+  const input = command.input;
+  if (!result.ok) {
+    const runId = 'runId' in input ? input.runId : undefined;
+    return (result.error.sessionId === undefined || result.error.sessionId === input.sessionId)
+      && (result.runId === undefined || runId !== undefined && result.runId === runId)
+      && (result.error.runId === undefined || runId !== undefined && result.error.runId === runId);
+  }
+  const data = result.data;
+  if (command.type === 'query_context_snapshot') return 'snapshot' in data && data.snapshot.id === command.input.snapshotId
+    && data.snapshot.sessionId === command.input.sessionId && data.snapshot.runId === command.input.runId
+    && data.input.sessionId === command.input.sessionId && data.input.runId === command.input.runId;
+  if (command.type === 'list_context_snapshots') return 'nextBeforeId' in data && data.sessionId === command.input.sessionId
+    && data.runId === (command.input.runId ?? null) && data.items.length <= command.input.limit
+    && data.items.every(item => command.input.beforeId === undefined || item.id < command.input.beforeId);
+  return 'collection' in data && data.sessionId === command.input.sessionId && data.runId === command.input.runId
+    && data.items.length <= command.input.limit
+    && data.items.every(item => command.input.beforeRequestSequence === undefined || item.binding.requestSequence < command.input.beforeRequestSequence);
+}
 export function isRuntimeHostCommand(type: string): type is keyof typeof runtimeResultSchemas {
   return Object.hasOwn(runtimeResultSchemas, type);
 }

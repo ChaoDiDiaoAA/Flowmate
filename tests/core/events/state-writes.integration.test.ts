@@ -300,7 +300,7 @@ describe('P6 real state write entry points', () => {
     const admitted = required(f.admit()).input;
     const runId = admitted.runId!;
     required(f.runs.start(runId, f.agentConfig, stamp));
-    const request = { runId, sessionId: f.sessionId, nativeToolCallId: 'p6-real-tool', toolName: 'read_fixture',
+    const request = { context: null, runId, sessionId: f.sessionId, nativeToolCallId: 'p6-real-tool', toolName: 'read_fixture',
       toolVersion: '1', effect: 'READ' as const, rawArguments: {}, requestedAt: stamp };
     f.db.exec("CREATE TRIGGER reject_tool_request BEFORE INSERT ON runtime_events WHEN NEW.type='tool_requested' BEGIN SELECT RAISE(ABORT,'fixture request failure'); END;");
     const before = f.query(runId, f.sessionId);
@@ -351,7 +351,7 @@ describe('P6 real state write entry points', () => {
     const admitted = required(f.admit()).input;
     const runId = admitted.runId!;
     required(f.runs.start(runId, f.agentConfig, stamp));
-    const call = required(f.toolCalls.request({ runId, sessionId: f.sessionId, nativeToolCallId: 'p6-cancelled-tool',
+    const call = required(f.toolCalls.request({ context: null, runId, sessionId: f.sessionId, nativeToolCallId: 'p6-cancelled-tool',
       toolName: 'read_fixture', toolVersion: '1', effect: 'READ', rawArguments: {}, requestedAt: stamp }));
     const before = f.query(runId, f.sessionId);
     const facts = { toolCallId: call.toolCallId, endedAt: later,
@@ -525,7 +525,7 @@ describe('P6 real state write entry points', () => {
     const runId = admitted.runId!;
     required(f.runs.start(runId, f.agentConfig, stamp));
     required(f.ledger.dispatch(admitted.inputId, stamp));
-    const request = { runId, sessionId: f.sessionId, toolName: 'read_fixture', toolVersion: '1', effect: 'READ' as const,
+    const request = { context: null, runId, sessionId: f.sessionId, toolName: 'read_fixture', toolVersion: '1', effect: 'READ' as const,
       rawArguments: {}, requestedAt: stamp };
     const requested = required(f.toolCalls.request({ ...request, nativeToolCallId: 'old-requested' }));
     const running = required(f.toolCalls.request({ ...request, nativeToolCallId: 'old-running' }));

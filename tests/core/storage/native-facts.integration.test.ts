@@ -39,7 +39,7 @@ function fixture(toolName = 'powershell') {
   if (!accepted.ok) throw new Error(accepted.error.message);
   const context: ProductToolContext = { runId: accepted.data, sessionId: session.data.sessionId, scope };
   expect(store.runs.start(context.runId, snapshot, stamp).ok).toBe(true);
-  const requested = store.toolCalls.request({ runId: context.runId, sessionId: context.sessionId,
+  const requested = store.toolCalls.request({ context: null, runId: context.runId, sessionId: context.sessionId,
     nativeToolCallId: 'native-call', toolName, toolVersion: '0.85.1', effect: toolName === 'grep' ? 'READ' : 'LOCAL_WRITE',
     rawArguments: {}, requestedAt: stamp });
   if (!requested.ok) throw new Error(requested.error.message);

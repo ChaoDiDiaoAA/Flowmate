@@ -201,7 +201,8 @@ export function createToolExecutor(input: {
         bound.signal.aborted ? 'Run 已取消，工具未执行。' : 'Run 已停止接纳新的工具调用。', false,
         bound.runId, bound.sessionId, bound.nativeToolCallId));
     }
-    const requested = input.recorder.request({ context: bound, call: { nativeToolCallId: bound.nativeToolCallId, signal: bound.signal },
+    const requested = input.recorder.request({ context: bound, call: { nativeToolCallId: bound.nativeToolCallId, signal: bound.signal,
+      ...(bound.requestBinding ? { requestBinding: bound.requestBinding } : {}) },
       name, definition: byName.get(name), raw });
     if (!requested.ok) { budget.fatal = true; return requested; }
     if (!prior.ok) budget.ids.add(bound.nativeToolCallId);
@@ -326,7 +327,8 @@ export function createToolExecutor(input: {
     let endedMs = startedMs;
     let afterStructure: ToolRuntimeObservation['afterStructure'] = 'unknown';
     try {
-      const call = Object.freeze({ nativeToolCallId: context.nativeToolCallId, signal });
+      const call = Object.freeze({ nativeToolCallId: context.nativeToolCallId, signal,
+        ...(context.requestBinding ? { requestBinding: context.requestBinding } : {}) });
       const product = Object.freeze({ runId: context.runId, sessionId: context.sessionId, scope: context.scope });
       data = await definition.execute(use.arguments, call, product);
       endedMs = monotonicNow();
@@ -507,6 +509,7 @@ export function createToolExecutor(input: {
 
 function unavailableCall(context: Partial<ToolExecutionContext>, name: string): ToolCallSnapshot {
   return { toolCallId: 0, runId: context.runId ?? 0, sessionId: context.sessionId ?? 0,
+    context: null,
     nativeToolCallId: context.nativeToolCallId ?? 'invalid', toolName: name, toolVersion: null, effect: null,
     status: 'failed', args: { version: 1, raw: null, final: null }, result: null,
     delivery: { version: 1, state: 'not_attempted', messageObservedAt: null, includedInCallSequence: null, requestDispatchedAt: null, error: null },

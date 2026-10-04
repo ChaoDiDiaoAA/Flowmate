@@ -1,5 +1,6 @@
-import { ok } from '@flowmate/contracts';
-import type { AgentExecutionInput, AgentNativeOutcome, AgentPort, NativeHistoryAppendContext, NativeSessionHistory, Result } from '@flowmate/contracts';
+import { isDeepStrictEqual } from 'node:util';
+import { appError, fail, ok } from '@flowmate/contracts';
+import type { AgentExecutionInput, AgentNativeOutcome, AgentPort, NativeContextBindingSeed, NativeHistoryAppendContext, NativeSessionHistory, Result } from '@flowmate/contracts';
 
 // Controlled agents still cross the real SQLite history writer and input ledger.
 export function createAgentHistoryFixture(cwd: string, at: () => string) {
@@ -13,6 +14,23 @@ export function createAgentHistoryFixture(cwd: string, at: () => string) {
   };
   const exportSession: NonNullable<AgentPort['exportSession']> = nativeId => ok(histories.get(nativeId) ?? create(nativeId));
   const watchSession: NonNullable<AgentPort['watchSession']> = (nativeId, save) => { writers.set(nativeId, save); return ok(undefined); };
+  const restorations: { kind: 'missing' | 'leaf'; nativeId: string; history: NativeSessionHistory; bindings: readonly NativeContextBindingSeed[] | undefined }[] = [];
+  function restoreSession(nativeId: string, history: NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
+    if (histories.has(nativeId) || history.header.id !== nativeId || history.unusable)
+      return fail(appError('session_history_invalid', 'session', 'Fixture cannot restore this history.'));
+    histories.set(nativeId, structuredClone(history));
+    restorations.push({ kind: 'missing', nativeId, history: structuredClone(history), bindings: structuredClone(bindings) });
+    return ok(undefined);
+  }
+  function restoreSessionLeaf(nativeId: string, history: NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
+    const current = histories.get(nativeId);
+    if (!current || history.unusable || !isDeepStrictEqual(current.header, history.header)
+      || !isDeepStrictEqual(current.entries, history.entries) || history.leafId !== null && !history.entries.some(entry => entry.id === history.leafId))
+      return fail(appError('session_history_invalid', 'session', 'Fixture cannot reconnect this history.'));
+    histories.set(nativeId, structuredClone(history));
+    restorations.push({ kind: 'leaf', nativeId, history: structuredClone(history), bindings: structuredClone(bindings) });
+    return ok(undefined);
+  }
   function append(nativeId: string, message: Record<string, unknown>, context: NativeHistoryAppendContext) {
     const previous = histories.get(nativeId) ?? create(nativeId);
     const entryId = context.entryId;
@@ -43,5 +61,5 @@ export function createAgentHistoryFixture(cwd: string, at: () => string) {
     }
     input.onInputAdmissionClosed?.();
   }
-  return { create, exportSession, watchSession, saveUser, saveResult };
+  return { create, exportSession, watchSession, restoreSession, restoreSessionLeaf, restorations, saveUser, saveResult };
 }

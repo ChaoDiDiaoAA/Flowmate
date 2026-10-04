@@ -3,6 +3,8 @@ import * as contracts from '@flowmate/contracts';
 import type { ZodTypeAny } from 'zod';
 import { makeApplication } from '../../packages/core/src/application.ts';
 import type { RuntimeServicePort } from '../../packages/core/src/application.ts';
+import { CONTEXT_ERROR_FACTS as portableFacts } from '../../packages/contracts/src/errors.ts';
+import { CONTEXT_ERROR_FACTS as originalFacts } from '../../packages/contracts/src/context.ts';
 
 const at = '2026-10-03T00:00:00.000Z';
 const base = { eventId: 1, runId: 21, sequence: 1, sessionId: 12, toolCallId: null,
@@ -17,7 +19,7 @@ const query = { runId: 21, sessionId: 12, cursor: { runId: 21, lastPersistedSequ
 const none = { runId: 21, sessionId: null, highWatermark: 0, availableRange: null, coverage: 'none' };
 const tool = { toolCallId: 8, runId: 21, sessionId: 12, toolName: 'read_invoice_document', status: 'succeeded',
   requestedAt: at, startedAt: at, endedAt: at, stoppedAt: null, committedCandidateId: null,
-  errorCode: null, stopped: null, deliveryState: 'unknown', formApplicationOutcome: null };
+  errorCode: null, stopped: null, deliveryState: 'unknown', formApplicationOutcome: null, context: null };
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
 const schemas = {
   RuntimeEventSchema: contracts.RuntimeEventSchema, RuntimeEventsQuerySchema: contracts.RuntimeEventsQuerySchema,
@@ -321,4 +323,34 @@ describe('P6 persistent Runtime event contracts', () => {
     expect(contracts.RuntimeEventsPageSchema.safeParse({ ...page, coverage: 'from-created', availableRange: { fromSequence: 3, toSequence: 3 },
       items: [{ ...created, eventId: 3, sequence: 3 }], nextCursor: { runId: 21, lastPersistedSequence: 3 }, hasMore: false }).success).toBe(true);
   });
+});
+
+it('T08 RuntimeToolView exposes only a nullable strict ContextReference with equivalent ID boundaries', () => {
+  expect(contracts.RuntimeToolViewSchema.parse(tool).context).toBeNull();
+  for (const context of [{ snapshotId: 51, requestSequence: 1 }, { snapshotId: Number.MAX_SAFE_INTEGER, requestSequence: Number.MAX_SAFE_INTEGER },
+    { snapshotId: 0, requestSequence: 1 }, { snapshotId: -1, requestSequence: 1 }, { snapshotId: 1.5, requestSequence: 1 },
+    { snapshotId: Number.MAX_SAFE_INTEGER + 1, requestSequence: 1 }, { snapshotId: 1, requestSequence: 0 },
+    { snapshotId: 1 }, { requestSequence: 1 }, { snapshotId: 1, requestSequence: 1, rawSnapshot: {} },
+    { snapshotId: 1, requestSequence: 1, runId: 21 }]) {
+    expect(contracts.RuntimeToolViewSchema.safeParse({ ...tool, context }).success)
+      .toBe(contracts.ContextReferenceSchema.safeParse(context).success);
+  }
+  const { context: _context, ...missing } = tool;
+  expect(contracts.RuntimeToolViewSchema.safeParse(missing).success).toBe(false);
+});
+
+it('T08 portable Context error facts keep the original export binding and exact registered facts', () => {
+  expect(portableFacts).toBe(originalFacts); expect(contracts.CONTEXT_ERROR_FACTS).toBe(originalFacts);
+  expect(portableFacts).toEqual({ context_evidence_too_large:['runtime',false],context_binding_unknown:['runtime',false],
+    context_binding_conflict:['runtime',false],context_payload_mismatch:['runtime',false],context_snapshot_not_found:['input',false],
+    provider_transport_error:['provider',false],internal_error:['internal',false] });
+  for (const [code,[category,retryable]] of Object.entries(portableFacts)) {
+    const error={code,category,retryable,message:'Controlled product failure.'};
+    expect(contracts.ContextErrorSchema.safeParse(error).success).toBe(true);
+    expect(contracts.RuntimeEventErrorSchema.safeParse(error).success).toBe(true);
+    for(const schema of [contracts.ContextErrorSchema,contracts.RuntimeEventErrorSchema]) {
+      expect(schema.safeParse({...error,retryable:!retryable}).success).toBe(false);
+      expect(schema.safeParse({...error,category:'evaluation'}).success).toBe(false);
+    }
+  }
 });

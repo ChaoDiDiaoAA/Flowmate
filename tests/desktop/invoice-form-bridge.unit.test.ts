@@ -15,7 +15,7 @@ function request(): InvoiceFormBridgeRequest {
     target: { formInstanceId: 'form-1', expectedRevision: 0 } };
 }
 function run(): AgentRunSnapshot {
-  return { runId: 101, kind: 'agent', jobId: 7, sessionId: 12, status: 'running', cancelRequestedAt: null,
+  return { runId: 101, currentContextSnapshotId: null, kind: 'agent', jobId: 7, sessionId: 12, status: 'running', cancelRequestedAt: null,
     config: { goalMode: 'fill-form', formTarget: binding().target,
       workspaceContext: { ...workspace, formatVersion: 1, activeView: 'candidate', selection: null } },
     scope: { version: 2, allowedTools: ['fill_invoice_form'], allowedDocumentIds: [4], allowedArtifactIds: [], allowedResourcePaths: [] },

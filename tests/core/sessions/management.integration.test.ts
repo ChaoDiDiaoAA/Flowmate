@@ -5,11 +5,12 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
-import { SessionService } from '../../../packages/core/src/sessions/service.ts';
+import { SessionService, ensureNativeSession } from '../../../packages/core/src/sessions/service.ts';
 import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
+import { ContextService } from '../../../packages/core/src/context/service.ts';
 import { appError, fail } from '@flowmate/contracts';
-import type { AgentRunEvent, NativeSessionHistory, Result, RuntimeState } from '@flowmate/contracts';
-import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
+import type { AgentPort, AgentRunEvent, NativeContextBindingSeed, NativeSessionHistory, Result, RuntimeState } from '@flowmate/contracts';
+import { deferCleanup, mkdtempSync, waitFor } from '../../support/resources.ts';
 const at = '2026-10-02T00:00:00.000Z';
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 function fixture() {
@@ -47,6 +48,120 @@ async function savedConversation(app: ReturnType<typeof fixture>) {
     request: { sessionId: session.sessionId, expectedLeafId: history.leafId,
       expectedEntryCount: history.entries.length, targetEntryId: firstReply } };
 }
+describe('T04 explicit restore and persisted Session queries', () => {
+  it('branches the original ready Pi after two real Runtime replies and keeps management available', async () => {
+    const app = fixture(); const session = need(await app.service.create({ title: 'Original ready SDK' }));
+    let requests = 0;
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      await request.json(); requests++;
+      const chunk = (delta: unknown, reason: string | null) => `data: ${JSON.stringify({ id: `ready-${requests}`,
+        model: 'fixture', choices: [{ index: 0, delta, finish_reason: reason }] })}\n\n`;
+      return new Response(`${chunk({ role: 'assistant', content: `Reply ${requests}` }, null)}${chunk({}, 'stop')}data: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    deferCleanup(() => server.stop(true));
+    const config = { version: 1 as const, name: 'Ready branch fixture', revision: 1,
+      modelRef: { provider: 'ready-branch-fixture', model: 'fixture' }, native: { authPath: join(app.paths.root, 'unused.json'), modelsPath: null },
+      connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' as const, contextWindow: 64_000, maxTokens: 16_384 },
+      parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
+    const runtime = new RuntimeService({ runs: app.store.runs, sessions: app.store.sessions, sessionInputs: app.store.sessionInputs,
+      contextRepository: app.store.context,
+      agent: app.agent, contextService: new ContextService({ store: app.store,
+        materials: { inspectParsed() { throw new Error('Pure chat cannot inspect material.'); } } }),
+      provider: { async prepare() { throw new Error('No direct Provider calls.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
+      log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
+    deferCleanup(async () => { await runtime.close(); });
+    for (const text of ['First question', 'Second question']) {
+      let finished!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+      const terminal = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finished = resolve; });
+      need(await runtime.start({ sessionId: session.sessionId, text, config, timeoutMs: 5000, stopGraceMs: 500 },
+        { onEvent(event) { if (event.type === 'run_finished') finished(event); } }));
+      expect((await terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+      await waitFor(async () => runtime.state().active === null);
+    }
+    const bundle = need(app.store.sessions.loadHistoryForContext(session.sessionId));
+    const saved = bundle.history!;
+    const exported = need(app.agent.exportSession(session.nativeSessionId));
+    expect(app.agent.inspect(session.nativeSessionId).availability).toBe('ready');
+    expect(Object.hasOwn(exported.header, 'parentSession')).toBe(true);
+    expect(Object.hasOwn(saved.header, 'parentSession')).toBe(false);
+    expect(JSON.parse(JSON.stringify(exported))).toEqual(saved);
+    expect(bundle.bindings).toHaveLength(2);
+    expect(bundle.bindings.every(binding => binding.snapshotId !== null && binding.inputId !== null)).toBe(true);
+    const firstReply = saved.entries.find(entry => entry.type === 'message'
+      && (entry.message as { role?: string; stopReason?: string } | undefined)?.role === 'assistant'
+      && (entry.message as { stopReason?: string }).stopReason === 'stop')!;
+    const branched = await app.service.branch({ sessionId: session.sessionId, expectedLeafId: saved.leafId,
+      expectedEntryCount: saved.entries.length, targetEntryId: firstReply.id });
+    expect(branched).toMatchObject({ ok: true, data: { leafId: firstReply.id, entryCount: saved.entries.length } });
+    const committed = need(app.store.sessions.loadHistoryForContext(session.sessionId));
+    expect(committed).toEqual({ history: { ...saved, leafId: firstReply.id }, bindings: bundle.bindings });
+    expect(JSON.parse(JSON.stringify(need(app.agent.exportSession(session.nativeSessionId))))).toEqual(committed.history);
+    expect(app.service.isManaging(session.sessionId)).toBe(false);
+    expect(await app.service.branch({ sessionId: session.sessionId, expectedLeafId: firstReply.id,
+      expectedEntryCount: saved.entries.length, targetEntryId: firstReply.id })).toMatchObject({ ok: true });
+    expect(requests).toBe(2);
+  });
+  it('restores a fresh ready Pi Session from its complete SQLite JSON representation', async () => {
+    const app = fixture(); const session = need(await app.service.create({ title: 'Fresh empty history' }));
+    const persisted = need(app.store.sessions.loadHistoryForContext(session.sessionId));
+    expect(persisted.history?.entries).toEqual([]);
+    expect(persisted.bindings).toEqual([]);
+    expect(ensureNativeSession(app.store.sessions, app.agent, need(app.store.sessions.get(session.sessionId)))).toEqual({ ok: true, data: undefined });
+    expect(JSON.parse(JSON.stringify(need(app.agent.exportSession(session.nativeSessionId))))).toEqual(persisted.history);
+  });
+  it.each(['missing', 'ready'] as const)('queries %s native state without restore, watch or prepare', async state => {
+    const app = fixture(); const { session } = await savedConversation(app);
+    if (state === 'ready') need(ensureNativeSession(app.store.sessions, app.agent, need(app.store.sessions.get(session.sessionId))));
+    const port: AgentPort = app.agent;
+    const calls = { restore: 0, leaf: 0, watch: 0, prepare: 0, enqueue: 0 };
+    const restore = port.restoreSession!.bind(port), leaf = port.restoreSessionLeaf!.bind(port), watch = port.watchSession!.bind(port);
+    const prepare = port.prepare.bind(port), enqueue = port.enqueueInput!.bind(port);
+    port.restoreSession = (...args) => { calls.restore++; return restore(...args); };
+    port.restoreSessionLeaf = (...args) => { calls.leaf++; return leaf(...args); };
+    port.watchSession = (...args) => { calls.watch++; return watch(...args); };
+    port.prepare = (...args) => { calls.prepare++; return prepare(...args); };
+    port.enqueueInput = (...args) => { calls.enqueue++; return enqueue(...args); };
+    const before = app.store.db.query('SELECT * FROM session_native_history').all();
+    expect(need(app.service.get(session.sessionId))).toMatchObject({ historyState: 'recoverable', availability: 'ready' });
+    expect(calls).toEqual({ restore: 0, leaf: 0, watch: 0, prepare: 0, enqueue: 0 });
+    expect(app.store.db.query('SELECT * FROM session_native_history').all()).toEqual(before);
+  });
+  it('keeps corrupt persisted history invalid without asking the SDK to restore it', async () => {
+    const app = fixture(); const { session } = await savedConversation(app);
+    let restored = 0;
+    const original = app.agent.restoreSession.bind(app.agent);
+    app.agent.restoreSession = (...args) => { restored++; return original(...args); };
+    app.store.db.query("UPDATE session_native_history SET header_json='{}' WHERE session_id=?").run(session.sessionId);
+    const before = app.store.db.query('SELECT * FROM session_native_history').all();
+    expect(need(app.service.get(session.sessionId)).historyState).toBe('invalid');
+    expect(restored).toBe(0); expect(app.store.db.query('SELECT * FROM session_native_history').all()).toEqual(before);
+  });
+  it.each(['saved', 'rejected', 'lost-receipt'] as const)('passes the exact DB-confirmed branch and seeds after %s', async kind => {
+    const app = fixture(); const { session, history, request } = await savedConversation(app);
+    const port: AgentPort = app.agent;
+    const restored: { history: NativeSessionHistory; bindings: readonly NativeContextBindingSeed[] | undefined }[] = [];
+    const originalLeaf = port.restoreSessionLeaf!.bind(port);
+    port.restoreSessionLeaf = (nativeId, committed, bindings) => {
+      restored.push({ history: structuredClone(committed), bindings: structuredClone(bindings) });
+      return originalLeaf(nativeId, committed, bindings);
+    };
+    if (kind === 'rejected') app.store.db.exec(`CREATE TRIGGER reject_t04_leaf BEFORE UPDATE OF leaf_id ON session_native_history
+      WHEN NEW.leaf_id!=OLD.leaf_id BEGIN SELECT RAISE(ABORT,'leaf save failed'); END;`);
+    if (kind === 'lost-receipt') {
+      const save = app.store.sessions.saveHistory;
+      app.store.sessions.saveHistory = (...args) => { need(save(...args)); return fail(appError('storage_write_failed', 'storage', 'Lost receipt.')); };
+    }
+    const branched = await app.service.branch(request);
+    expect(branched.ok).toBe(kind !== 'rejected');
+    const committed = need(app.store.sessions.loadHistory(session.sessionId))!;
+    expect(committed).toEqual({ ...history, leafId: kind === 'rejected' ? history.leafId : request.targetEntryId });
+    expect(restored.at(-1)).toEqual({ history: committed, bindings: history.entries.filter(entry =>
+      (entry.message as { role?: string } | undefined)?.role === 'user').map(entry =>
+      ({ nativeEntryId: entry.id, originRunId: null, inputId: null, snapshotId: null })) });
+    expect(need(app.agent.exportSession(session.nativeSessionId))).toEqual(committed);
+  });
+});
 describe('P5 same-Session management', () => {
   it('archives and unarchives an idle Session without adding native messages or Runs', async () => {
     const { store, service } = fixture();
@@ -164,7 +279,7 @@ describe('P5 same-Session management', () => {
       modelRef: { provider: 'management-fixture', model: 'fixture' }, native: { authPath: join(app.paths.root, 'unused.json'), modelsPath: null },
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' as const, contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
-    need(app.service.get(session.sessionId));
+    need(ensureNativeSession(app.store.sessions, app.agent, need(app.store.sessions.get(session.sessionId))));
     need(await app.agent.prepare(session.nativeSessionId, config, { timeoutMs: 5000, stopGraceMs: 500 }, new AbortController().signal,
       { sessionInputs: true }));
     const history = need(app.store.sessions.loadHistory(session.sessionId))!;

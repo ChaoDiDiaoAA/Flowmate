@@ -17,7 +17,7 @@ async function prepareProtocolFixture(body: string): Promise<string> {
     `const journal=${JSON.stringify(join(root, 'journal.jsonl'))};`,
     "const context={runId:1,sessionId:null,highWatermark:0,availableRange:null,coverage:'none'};",
     "const page={...context,items:[],nextCursor:{runId:1,lastPersistedSequence:0},hasMore:false,nextAvailableAfterSequence:null};",
-    "const tool={toolCallId:9,runId:1,sessionId:1,toolName:'safe',status:'requested',requestedAt:'2026-10-03T00:00:00.000Z',startedAt:null,endedAt:null,stoppedAt:null,committedCandidateId:null,errorCode:null,stopped:null,deliveryState:'not_attempted',formApplicationOutcome:null};",
+    "const tool={toolCallId:9,runId:1,sessionId:1,toolName:'safe',status:'requested',requestedAt:'2026-10-03T00:00:00.000Z',startedAt:null,endedAt:null,stoppedAt:null,committedCandidateId:null,errorCode:null,stopped:null,deliveryState:'not_attempted',formApplicationOutcome:null,context:null};",
     "const response=(command,value)=>{ appendFileSync(journal,JSON.stringify({trace:'response',type:command.type,runId:command.input?.runId})+'\\n'); return stdout.write(JSON.stringify({version:1,type:'response',requestId:command.requestId,value})+'\\n'); };",
     "stdout.write(JSON.stringify({version:1,type:'ready',state:{version:1,ready:true,host:'ready',userDataPath:'synthetic'}})+'\\n');",
     `const input=createInterface({input:process.stdin}); input.on('line',line=>{const command=JSON.parse(line); ${body} });`,
