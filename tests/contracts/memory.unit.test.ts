@@ -22,6 +22,17 @@ function normalize(name: string, input: unknown) {
 }
 
 describe('P9 T01', () => {
+  it('P9 T08 preserves the branch wire shape behind a strict complete Result schema', () => {
+    const session = { sessionId: 5, nativeSessionId: 'native', title: 'Branch', status: 'active', createdAt: at, updatedAt: at,
+      availability: 'ready', historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: false, deletePending: false };
+    const value = { ok: true, data: { session, leafId: 'user', entryCount: 1 } };
+    expect(schema('BranchSessionResponseSchema').parse(value)).toEqual(value);
+    for (const bad of [{ ...value, sdk: {} }, { ...value, data: { ...value.data, receipt: commit } },
+      { ...value, data: { ...value.data, entryCount: Number.MAX_SAFE_INTEGER + 1 } },
+      { ...value, data: { ...value.data, session: { ...session, cwd: 'private' } } },
+      { ok: false, error: { code: 'private_sdk_error', category: 'runtime', retryable: false, message: 'secret' } }])
+      expect(schema('BranchSessionResponseSchema').safeParse(bad).success).toBe(false);
+  });
   // These catch missing strict boundary checks, unsafe identity ranges, and accidental owner injection.
   it('strict history fork and branch requests', () => {
     expect(normalize('normalizeNativeHistoryPageRequest', { sessionId: 4 })).toEqual({ ok: true, data: { sessionId: 4, limit: 50 } });

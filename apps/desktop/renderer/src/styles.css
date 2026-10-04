@@ -686,3 +686,12 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
 .context-bindings p, .context-fragment p { overflow-wrap: anywhere; }
 .context-source-error { position: fixed; bottom: 24px; left: 24px; z-index: 120; max-width: min(600px, calc(100vw - 48px)); }
 @media (max-width: 640px) { .context-dialog-backdrop { padding: 8px; } .session-details { max-height: calc(100vh - 16px); } }
+.session-history { margin-block: 1rem; border-block: 1px solid var(--border, #d9dce1); padding-block: 1rem; }
+.history-tree { display: grid; gap: .75rem; padding-inline-start: 1.5rem; }
+.history-tree li { padding: .5rem; border-inline-start: 2px solid var(--border, #d9dce1); }
+.history-tree p { margin: .25rem 0; overflow-wrap: anywhere; }
+.history-tree button { text-align: left; overflow-wrap: anywhere; }
+.history-tree button[aria-pressed="true"] { font-weight: 700; text-decoration: underline; }
+.session-history pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; padding: .75rem; background: #f6f7f9; }
+.history-fork { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; margin-block: 1rem; }
+.history-fork label { display: grid; gap: .25rem; }

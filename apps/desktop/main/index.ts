@@ -31,7 +31,6 @@ import {
   SessionInputQuerySchema,
   SessionInputsRequestSchema,
   SetSessionStatusRequestSchema,
-  BranchSessionRequestSchema,
   InvoiceCandidateOperationQuerySchema,
   RuntimeEventsQuerySchema,
   RuntimeEventsSubscriptionRequestSchema,
@@ -87,6 +86,7 @@ import { HostClient } from './host-client.ts';
 import type { HostCredentialRequest } from '../../host/protocol.ts';
 import { DesktopSessionInputRequestSchema, InvoiceFormRunInputSchema } from '../../host/protocol.ts';
 import { contextHostFailure, matchesContextResponse, parseContextHostResult } from '../../host/protocol.ts';
+import { historyHostFailure, matchesHistoryResponse, parseHistoryHostResult, parseHostCommand, isHistoryHostCommand } from '../../host/protocol.ts';
 import type { HostCommand } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
@@ -124,6 +124,9 @@ const channels = {
   listSessionInputs: 'flowmate:list-session-inputs',
   setSessionStatus: 'flowmate:set-session-status',
   branchSession: 'flowmate:branch-session',
+  querySessionHistory: 'flowmate:query-session-history',
+  querySessionHistoryEntry: 'flowmate:query-session-history-entry',
+  forkSession: 'flowmate:fork-session',
   registerInvoiceFormTarget: 'flowmate:register-invoice-form-target',
   invalidateInvoiceFormTarget: 'flowmate:invalidate-invoice-form-target',
   setInvoiceFormDirty: 'flowmate:set-invoice-form-dirty',
@@ -418,7 +421,8 @@ function registerIpc(): void {
   ipcRegistered = true;
   const handle = (channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>) => {
     ipcMain.handle(channel, async (event, ...args) => {
-      const failure = (error: import('@flowmate/contracts').AppError) => channel === channels.queryRuntimeEvents
+      const failure = (error: import('@flowmate/contracts').AppError) => [channels.querySessionHistory, channels.querySessionHistoryEntry, channels.forkSession, channels.branchSession].some(value => value === channel)
+        ? historyHostFailure() : channel === channels.queryRuntimeEvents
         ? { ok: false, error, context: null }
         : (channel === channels.listContextSnapshots || channel === channels.queryContextSnapshot || channel === channels.listContextRequests)
           ? (() => { const parsed = ContextErrorSchema.safeParse(error); return parsed.success ? fail(parsed.data) : contextHostFailure(); })()
@@ -527,11 +531,19 @@ function registerIpc(): void {
     return input.success ? productHostRequest({ type: 'set_session_status', input: input.data }, 'Chat status could not be changed.')
       : fail(appError('input_invalid', 'input', 'Chat status request is invalid.'));
   });
-  handle(channels.branchSession, async (_event, raw) => {
-    const input = BranchSessionRequestSchema.safeParse(raw);
-    return input.success ? productHostRequest({ type: 'branch_session', input: input.data }, 'Chat position could not be saved.')
-      : fail(appError('input_invalid', 'input', 'Chat position request is invalid.'));
-  });
+  for (const [channel, type] of [[channels.querySessionHistory, 'query_session_history'],
+    [channels.querySessionHistoryEntry, 'query_session_history_entry'], [channels.forkSession, 'fork_session'], [channels.branchSession, 'branch_session']] as const) {
+    handle(channel, async (_event, raw) => {
+      const command = parseHostCommand({ version: 1, requestId: randomUUID(), type, input: raw });
+      if (!command || !isHistoryHostCommand(command.type)) return fail(appError('input_invalid', 'input', 'Session history request is invalid.'));
+      const epoch = host.connectionEpoch;
+      try {
+        const { version: _version, ...request } = command;
+        const value = parseHistoryHostResult(type, await host.request(request));
+        return epoch === host.connectionEpoch && value !== null && matchesHistoryResponse(command, value) ? value : historyHostFailure();
+      } catch { return historyHostFailure(); }
+    });
+  }
   handle(channels.registerInvoiceFormTarget, async (event, raw) => registerInvoiceFormTarget(event, raw));
   handle(channels.invalidateInvoiceFormTarget, async (event, id) => {
     if (!ownedInvoiceForm(event, id)) return fail(appError('state_conflict', 'input', 'Form target is no longer current.'));

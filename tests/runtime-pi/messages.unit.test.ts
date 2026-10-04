@@ -140,6 +140,20 @@ describe('P4 native messages and projection', () => {
       .toEqual({ ok: true, data: undefined });
   });
 
+  it('P9 T08 retains the SDK empty aborted terminal after an unresolved tool request without completing its pair', () => {
+    const aborted = { ...assistant([{ type: 'text', text: '' }], 'aborted'), errorMessage: 'tool_budget_exceeded' };
+    expect(api().validateNativeHistory(history([user, call, aborted]))).toEqual({ ok: true, data: undefined });
+    expect(api().validateModelMessages([user, call, aborted])).toMatchObject({ ok: false });
+    for (const invalid of [
+      { ...aborted, stopReason: 'stop' }, { ...aborted, stopReason: 'error' }, { ...aborted, stopReason: 'deferred' },
+      { ...aborted, errorMessage: '' }, { ...aborted, content: [{ type: 'text', text: 'extra output' }] },
+      { ...aborted, content: [{ type: 'text', text: '', textSignature: 'not-the-SDK-terminal' }] },
+      { ...aborted, content: [{ type: 'toolCall', id: 'another', name: 'read', arguments: {} }] },
+    ]) expect(api().validateNativeHistory(history([user, call, invalid as AssistantMessage]))).toMatchObject({ ok: false });
+    for (const later of [user, result, assistant([{ type: 'text', text: 'later' }]), aborted])
+      expect(api().validateNativeHistory(history([user, call, aborted, later]))).toMatchObject({ ok: false });
+  });
+
   it('rejects orphan, duplicate, mismatched and reused tool identities in their own path', () => {
     for (const messages of [[user, result], [user, call, result, result],
       [user, call, { ...result, toolName: 'wrong' }], [user, call, result, call],

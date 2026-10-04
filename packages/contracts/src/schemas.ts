@@ -1,4 +1,5 @@
 import { isAbsolute } from 'node:path';
+import { normalizeSessionTitle } from './session-title.ts';
 import { z } from 'zod';
 import { appError, fail, ok } from './errors.ts';
 import type {
@@ -102,11 +103,6 @@ const agentRunRequestSchema = z.object({
 
 function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
-}
-
-function normalizeSessionTitle(value: string): string | null {
-  const title = value.trim();
-  return title.length > 0 && [...title].length <= 120 && byteLength(title) <= 480 ? title : null;
 }
 
 export function normalizeProviderRequest(raw: unknown): Result<ProviderRequest> {

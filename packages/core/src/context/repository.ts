@@ -3,7 +3,7 @@ import { SQLiteError, type Database } from 'bun:sqlite';
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { appError, fail, ok, ContextSnapshotSchema, ContextSnapshotJsonSchema, ContextReferenceSchema,
-  ContextObservationsSchema, readContextObservations, RequestContextBindingSchema, ContextEvidenceUpdateSchema, ContextRequestEvidenceSchema,
+  ContextObservationsSchema, NativeContextObservationsSchema, readContextObservations, RequestContextBindingSchema, ContextEvidenceUpdateSchema, ContextRequestEvidenceSchema,
   ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema,
   ContextRequestsRequestSchema, ContextSnapshotDetailSchema, ContextInputErrorSchema,
   ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema,
@@ -56,12 +56,27 @@ export function readRunContext(row: { id: number; kind: string; session_id: numb
   if (pointer !== null) id.parse(pointer);
   const raw = row.context_observations_json ?? null;
   if (enabled !== (raw !== null) || row.kind !== 'agent' && (enabled || pointer !== null)) throw new Error('invalid_context_run_state');
-  const observations = raw === null ? null : ContextObservationsSchema.parse(json(raw));
-  if (Object.hasOwn(config, 'historyPolicyVersion') && config.historyPolicyVersion !== 'p9-native-history-v1') unknownBinding();
+  let observations: ContextObservations | null = null;
   if (raw !== null) {
-    const checked = readContextObservations(json(raw), config.historyPolicyVersion as 'p9-native-history-v1' | undefined);
-    if (!checked.ok) throw new NativeOriginFault(checked.error);
+    const decoded = json(raw);
+    if (config.historyPolicyVersion === 'p9-native-history-v1') {
+      if (!NativeContextObservationsSchema.safeParse(decoded).success) {
+        // Preserve malformed-storage precedence; valid legacy shape is still
+        // insufficient proof for a marked Run. Neither path projects public DTOs.
+        ContextObservationsSchema.parse(decoded);
+        throw new NativeOriginFault(appError('context_binding_unknown', 'runtime', 'Stored native context evidence is invalid or was not collected.'));
+      }
+      // Preserve the stored object's ordering and optional-field presence.
+      observations = decoded as ContextObservations;
+    } else observations = ContextObservationsSchema.parse(decoded);
+    if (!Object.hasOwn(config, 'historyPolicyVersion')) {
+      // Legacy public projection adds nullable fields and can cross the 4 MiB
+      // boundary even when stored bytes fit. Preserve that original refusal.
+      const checked = readContextObservations(decoded);
+      if (!checked.ok) throw new NativeOriginFault(checked.error);
+    }
   }
+  if (Object.hasOwn(config, 'historyPolicyVersion') && config.historyPolicyVersion !== 'p9-native-history-v1') unknownBinding();
   if (observations !== null) {
     const agent = z.object({ nativeSessionId: z.string().min(1).max(256) }).parse(config.agent);
     if (observations.requests.some(request => request.binding.runId !== row.id || request.binding.sessionId !== row.session_id

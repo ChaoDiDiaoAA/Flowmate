@@ -1235,7 +1235,7 @@ const contextAt = '2026-10-03T00:00:00.000Z';
 const contextSummary = { id: 3, sessionId: 1, runId: 2, jobId: null, sequence: 1, createdAt: contextAt,
   inputId: 4, mode: 'prompt', documentRef: null, candidateRef: null, selection: null, fragmentCount: 0, gapCount: 0 };
 const contextRequest = { binding: { runId: 2, sessionId: 1, nativeSessionId: 'original-native', requestSequence: 3, callSequence: 3,
-  inputId: 4, snapshotId: 3, includedBindings: [{ originRunId: 2, inputId: 4, nativeEntryId: 'user-original', snapshotId: 3 }], includedToolResults: [] },
+  inputId: 4, snapshotId: 3, includedBindings: [{ originRunId: 2, inputId: 4, nativeEntryId: 'user-original', snapshotId: 3 }], includedToolResults: [], includedNativeContexts: null },
   api: 'openai-completions', boundAt: contextAt, sdkPayload: null, transport: 'observed-fetch', attempts: [] };
 const contextReplies = {
   list_context_snapshots: ContextSnapshotsResultSchema.parse({ ok: true, data: { sessionId: 1, runId: 2, items: [contextSummary], nextBeforeId: 3 } }),
@@ -1255,7 +1255,8 @@ async function contextProtocolFixture(overrides: Record<string, unknown> = {}) {
     import { createInterface } from 'node:readline';
     import { createWriteStream } from 'node:fs';
     const stdout = createWriteStream('', {fd:1,autoClose:false});
-    const replies=${JSON.stringify(contextReplies)}, overrides=${JSON.stringify(overrides)}; let held,lastInput;
+    const replies=${JSON.stringify({ ...contextReplies, query_session_history: { ok: true, data: { session: { sessionId: 12, nativeSessionId: 'history-pipe', title: 'History pipe', status: 'active', createdAt: contextAt, updatedAt: contextAt,
+      availability: 'ready', historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: false, deletePending: false }, commit: { commitRevision: 1, entryCount: 0, leafId: null }, items: [], nextAfterSequence: null } } })}, overrides=${JSON.stringify(overrides)}; let held,lastInput;
     const respond=(id,value)=>stdout.write(JSON.stringify({version:1,type:'response',requestId:id,value})+'\\n');
     stdout.write(JSON.stringify({version:1,type:'ready',state:{version:1,ready:true,host:'ready',userDataPath:'synthetic'}})+'\\n');
     const input=createInterface({input:process.stdin});
@@ -1266,6 +1267,43 @@ async function contextProtocolFixture(overrides: Record<string, unknown> = {}) {
     }); input.on('close',()=>process.exit(0));
   `); return root;
 }
+
+describe('P9 T08 History actual HostClient pipe', () => {
+  it('ignores an old process reply even when the replacement reuses its request ID', async () => {
+    const first = await contextProtocolFixture(), second = await contextProtocolFixture(), client = new HostClient();
+    expect(await client.start(first, '0.1.0', first)).toMatchObject({ ok: true });
+    const old = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    let next: ChildProcessWithoutNullStreams | null = null;
+    try {
+      const pending = client.request({ type: 'query_session_history', requestId: 'held-context', input: { sessionId: 12 } }).then(() => 'resolved', error => error.message);
+      expect(await client.start(second, '0.1.0', second)).toMatchObject({ ok: true }); expect(await pending).toBe('host_replaced');
+      next = (client as unknown as { child: ChildProcessWithoutNullStreams }).child; let settled = false;
+      const current = client.request({ type: 'query_session_history', requestId: 'held-context', input: { sessionId: 12 } }).then(result => { settled = true; return result; });
+      const packet = once(old.stdout, 'data'); old.stdin.write(JSON.stringify({ version: 1, type: 'get_state', requestId: 'release-old' }) + '\n'); await packet; await Promise.resolve();
+      expect(settled).toBe(false); await client.request({ type: 'get_state' });
+      expect(await current).toMatchObject({ ok: true, data: { session: { sessionId: 12 }, items: [] } });
+    } finally { await finishProtocolChild(old); if (next) await finishProtocolChild(next); }
+  });
+  it('normalizes requests and refuses malformed results and error identities on the actual pipe', async () => {
+    const root = await contextProtocolFixture({ safe: { ok: false, error: { code: 'state_conflict', category: 'runtime', retryable: false, message: 'private SDK credential' } },
+      bad: { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'secret', sessionId: 99 } } });
+    const client = new HostClient();
+    expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: true });
+    const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    try {
+      const result = await client.request({ type: 'query_session_history', requestId: 'safe', input: { sessionId: 12 } } as Parameters<HostClient['request']>[0]);
+      expect(result).toEqual({ ok: false, error: { code: 'state_conflict', category: 'runtime', retryable: false, message: 'History changed. Reload to continue.' } });
+      expect(await client.request({ type: 'get_state' })).toMatchObject({ lastInput: { sessionId: 12, limit: 50 } });
+      for (const type of ['query_session_history', 'query_session_history_entry', 'fork_session', 'branch_session'] as const) {
+        const input = type === 'query_session_history' ? { sessionId: 12 } : type === 'query_session_history_entry'
+          ? { sessionId: 12, entryId: 'user', expectedCommitRevision: 7 } : type === 'fork_session'
+            ? { sourceSessionId: 12, expected: { commitRevision: 7, leafId: 'user', entryCount: 1 }, targetEntryId: 'user', title: 'Child', clientOperationId: '5d095824-9dbf-4219-be5b-a85b2bd12a24' }
+            : { sessionId: 12, expectedCommitRevision: 7, expectedLeafId: 'user', expectedEntryCount: 1, targetEntryId: 'user' };
+        expect(await client.request({ type, input, requestId: 'bad' } as Parameters<HostClient['request']>[0]).then(() => 'resolved', error => error.message)).toBe('host_protocol_invalid');
+      }
+    } finally { await finishProtocolChild(child); }
+  });
+});
 
 describe('T08 Context actual HostClient pipe', () => {
   it('delivers all three strict result shapes and normalizes an omitted limit before sending', async () => {

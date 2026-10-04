@@ -10,7 +10,9 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   WorkspaceUpdateRequestSchema, WorkspaceSnapshotSchema, WorkspaceRestoreResultSchema, AppErrorSchema, invoiceToolSchemas,
   ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema, ContextRequestsRequestSchema,
-  ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema } from '@flowmate/contracts';
+  ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema,
+  NativeHistoryPageRequestSchema, SessionHistoryEntryRequestSchema, ForkSessionRequestSchema,
+  NativeHistoryPageResultSchema, SessionHistoryEntryResultSchema, ForkSessionResponseSchema, BranchSessionResponseSchema } from '@flowmate/contracts';
 import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
@@ -47,6 +49,9 @@ const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_session_history'), input: NativeHistoryPageRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_session_history_entry'), input: SessionHistoryEntryRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('fork_session'), input: ForkSessionRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_runtime_events'), ownerToken, input: RuntimeEventsQuerySchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_context_snapshots'), input: ContextSnapshotsRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_context_snapshot'), input: ContextSnapshotRequestSchema }).strict(),
@@ -204,6 +209,69 @@ export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRe
 export function parseHostCommand(value: unknown): HostCommand | null {
   const parsed = hostCommandSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
+}
+
+const historyResultSchemas = {
+  query_session_history: NativeHistoryPageResultSchema, query_session_history_entry: SessionHistoryEntryResultSchema,
+  fork_session: ForkSessionResponseSchema, branch_session: BranchSessionResponseSchema,
+};
+export type HistoryHostCommand = Extract<HostCommand, { type: keyof typeof historyResultSchemas }>;
+export function isHistoryHostCommand(type: string): type is keyof typeof historyResultSchemas {
+  return Object.hasOwn(historyResultSchemas, type);
+}
+export function historyHostFailure() {
+  return { ok: false as const, error: { code: 'internal_error' as const, category: 'internal' as const,
+    message: 'History is unavailable.', retryable: false } };
+}
+/** Error text is never trusted SDK output, even when the code and its facts are valid. */
+export function parseHistoryHostResult(type: string, value: unknown) {
+  if (!isHistoryHostCommand(type)) return null;
+  const parsed = historyResultSchemas[type].safeParse(value);
+  if (!parsed.success) return null;
+  const result = parsed.data;
+  if (result.ok) return result;
+  const messages: Partial<Record<typeof result.error.code, string>> = {
+    state_conflict: 'History changed. Reload to continue.',
+    input_invalid: 'Session history request is invalid.',
+    session_scope_revoked: 'The source chat is no longer authorized.',
+    session_not_found: 'The chat no longer exists.',
+    session_delete_in_progress: 'The chat is being deleted.',
+    storage_write_failed: 'History could not be saved. Check the saved history before continuing.',
+    session_branch_unavailable: 'This entry cannot be continued.',
+    session_busy: 'Wait for this chat to stop before changing its history.',
+    agent_session_unusable: 'History is unavailable.',
+    operation_result_unknown: 'The operation receipt is unknown. Retry the same fork request to check its result.',
+  };
+  const deletedFork = type === 'fork_session' && result.error.code === 'session_history_unavailable'
+    && result.error.message === 'The original fork target was deleted.';
+  return { ...result, error: { ...result.error, message: deletedFork ? 'The original fork target was deleted.' : messages[result.error.code] ?? 'History is unavailable.' } };
+}
+export function matchesHistoryResponse(command: HostCommand, value: unknown): boolean {
+  if (!isHistoryHostCommand(command.type)) return false;
+  const result = parseHistoryHostResult(command.type, value);
+  if (!result) return false;
+  const captured = command as HistoryHostCommand;
+  if (!result.ok) {
+    const sessionId = captured.type === 'fork_session' ? captured.input.sourceSessionId : captured.input.sessionId;
+    return (result.error.sessionId === undefined || result.error.sessionId === sessionId)
+      && result.runId === undefined && result.error.runId === undefined && result.error.toolCallId === undefined;
+  }
+  const data = result.data;
+  if (captured.type === 'query_session_history') return 'items' in data
+    && data.session.sessionId === captured.input.sessionId
+    && (captured.input.expectedCommitRevision === undefined || data.commit.commitRevision === captured.input.expectedCommitRevision)
+    && data.items.length <= captured.input.limit
+    && data.items.every(item => captured.input.afterSequence === undefined || item.sequence > captured.input.afterSequence);
+  if (captured.type === 'query_session_history_entry') return 'summary' in data
+    && data.summary.entryId === captured.input.entryId && data.commit.commitRevision === captured.input.expectedCommitRevision
+    && (data.part === null ? captured.input.partIndex === 0 && captured.input.offset === 0
+      : data.partIndex === captured.input.partIndex ? data.offset === captured.input.offset
+        : data.partIndex > captured.input.partIndex && data.offset === 0);
+  if (captured.type === 'fork_session') return 'sourceSessionId' in data
+    && data.sourceSessionId === captured.input.sourceSessionId && data.selectedEntryId === captured.input.targetEntryId
+    && data.session.sessionId !== captured.input.sourceSessionId;
+  return 'leafId' in data && data.session.sessionId === captured.input.sessionId
+    && data.leafId === captured.input.targetEntryId && data.entryCount === captured.input.expectedEntryCount;
 }
 
 const runtimeResultSchemas = {

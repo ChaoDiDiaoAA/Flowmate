@@ -4,7 +4,7 @@ import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { appError, fail, ok, CandidateDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
+import { appError, fail, ok, CandidateDraftSchema, invoiceHeaderFields, NativeSessionHistorySchema } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, CandidateRepository, ProviderConfig, Result, WorkspaceSnapshot } from '@flowmate/contracts';
 import { ContextService, createFileStore, createToolExecutor, createToolRecorder, JobService, makeApplication, openDatabase,
   RuntimeService, SessionService, WorkspaceService } from '@flowmate/core';
@@ -94,7 +94,7 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
     modelRef: { provider: 'runtime-admission-fixture', model: 'runtime-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
     connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
-  return { app, store, tools, config, payloads, now, business: () => business, advanceClock: (ms: number) => { clockOffset += ms; } };
+  return { app, store, tools, config, payloads, paths, now, business: () => business, advanceClock: (ms: number) => { clockOffset += ms; } };
 }
 function expected(workspace: WorkspaceSnapshot) {
   if (workspace.sessionId === null) throw new Error('Expected a selected Session.');
@@ -115,6 +115,58 @@ function completion() {
 }
 
 describe('Runtime final admission after the real SDK before hook awaits', () => {
+  it('P9 T08 stops before the SDK appends an unowned budget-refused tool result', async () => {
+    let nativeSession!: AgentSession;
+    const f = fixture((_body, ordinal) => response('', { name: 'calculate_invoice_amounts',
+      args: { operation: 'sum', values: ['1', '2'], scale: 2 }, id: `budget-owner-${ordinal}` }), session => { nativeSession = session; }, { p8: true });
+    const { session, workspace } = await select(f.app), terminal = completion();
+    const accepted = need(await f.app.submitInput({ sessionId: session.sessionId, clientSequence: 1, mode: 'prompt',
+      text: 'Calculate with one admitted tool call.', config: f.config, workspace: expected(workspace), goalMode: 'answer',
+      budget: { maxToolCalls: 1, maxModelCalls: 4 }, timeoutMs: 5000, stopGraceMs: 500 }, terminal));
+    const ended = await terminal.ready;
+    console.error('T08 budget native terminal', JSON.stringify({ result: ended.result,
+      entries: nativeSession.sessionManager.getEntries(), leafId: nativeSession.sessionManager.getLeafId(),
+      saved: f.store.db.query('SELECT entry_id,run_id,entry_json FROM session_native_entries ORDER BY sequence').all() }));
+    expect(ended.result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true,
+      error: { code: 'tool_budget_exceeded' } } });
+    expect(f.payloads).toHaveLength(2); expect(f.business()).toBe(1);
+    expect(need(await f.app.queryRun(accepted.runId))).toMatchObject({ toolCallCount: 1, error: { code: 'tool_budget_exceeded' } });
+    expect(f.store.db.query('SELECT native_tool_call_id FROM tool_calls ORDER BY id').all()).toEqual([{ native_tool_call_id: 'budget-owner-1' }]);
+    const bundle = need(f.store.sessions.loadHistoryForContext(session.sessionId));
+    expect(bundle.history!.entries).toEqual(JSON.parse(JSON.stringify(nativeSession.sessionManager.getEntries())));
+    expect(bundle.commit).toMatchObject({ entryCount: nativeSession.sessionManager.getEntries().length,
+      leafId: nativeSession.sessionManager.getLeafId() });
+    expect(bundle.seed.origins.filter(origin => bundle.history!.entries.find(entry => entry.id === origin.nativeEntryId)?.type === 'message')
+      .every(origin => origin.originRunId === accepted.runId && origin.originSessionId === session.sessionId)).toBe(true);
+    const messages = NativeSessionHistorySchema.parse(bundle.history).entries.flatMap(entry => entry.type === 'message' ? [entry.message] : []);
+    expect(messages.at(-1)).toMatchObject({ role: 'assistant', stopReason: 'aborted', errorMessage: 'tool_budget_exceeded',
+      content: [{ type: 'text', text: '' }] });
+    expect(messages.filter(message => message.role === 'toolResult').map(message => message.toolCallId)).toEqual(['budget-owner-1']);
+    expect(messages.filter(message => message.role === 'assistant').flatMap(message => message.content
+      .flatMap(part => part.type === 'toolCall' ? [part.id] : []))).toEqual(['budget-owner-1', 'budget-owner-2']);
+    expect(await f.app.listSessionInputs({ sessionId: session.sessionId })).toMatchObject({ ok: true,
+      data: { items: [{ status: 'consumed' }] } });
+    expect(await f.app.listSessionMessages({ sessionId: session.sessionId })).toMatchObject({ ok: true });
+    const page = need(await f.app.querySessionHistory({ sessionId: session.sessionId }));
+    expect(page.items).toHaveLength(bundle.commit!.entryCount);
+    expect(page.items.every(item => !item.canSelect)).toBe(true);
+    expect(f.store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(await f.app.close()).toMatchObject({ ok: true, data: { stopped: true, closed: true } });
+    const reopened = need(openDatabase(f.paths));
+    try {
+      expect(need(reopened.sessions.loadHistoryForContext(session.sessionId))).toEqual(bundle);
+      const cold = new PiAgentAdapter({ cwd: f.paths.root });
+      expect(bundle.history!.unusable).toBe(true);
+      expect(cold.restoreSession(session.nativeSessionId, bundle.history!, bundle.seed, bundle.commit!)).toMatchObject({ ok: false,
+        error: { code: 'session_history_invalid' } });
+      expect(cold.inspectSessionHistory({ history: bundle.history!, seed: bundle.seed })).toMatchObject({ ok: true,
+        data: { positions: expect.arrayContaining([{ entryId: bundle.commit!.leafId, isCurrentPath: true, contextState: 'incomplete-tool-pair' }]) } });
+      expect(await cold.close()).toMatchObject({ stopped: true, closed: true });
+      expect(reopened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+      expect(f.payloads).toHaveLength(2);
+    } finally { reopened.close(); }
+  }, 15_000);
+
   it('T10 F8-18 rejects original synchronous candidate save after public revocation inside its real handler', async () => {
     const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
     const candidate = CandidateDraftSchema.parse({ fields: Object.fromEntries(invoiceHeaderFields.map(name => [name, missing])), lines: [], notes: [] });

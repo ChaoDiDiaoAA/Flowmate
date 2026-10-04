@@ -13,7 +13,8 @@ import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvide
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
 import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand, isContextHostCommand,
-  parseContextHostResult, matchesContextResponse, contextHostFailure } from './protocol.ts';
+  parseContextHostResult, matchesContextResponse, contextHostFailure,
+  isHistoryHostCommand, parseHistoryHostResult, matchesHistoryResponse, historyHostFailure } from './protocol.ts';
 import type { HostCommand, HostOutput } from './protocol.ts';
 
 for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) {
@@ -204,6 +205,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     return send({ version: 1, type: 'response', requestId: command.requestId,
       value: checked !== null && matchesContextResponse(command, checked) ? checked : contextHostFailure() });
   };
+  const historyReply = (command: HostCommand, value: unknown) => {
+    const checked = parseHistoryHostResult(command.type, value);
+    return send({ version: 1, type: 'response', requestId: command.requestId,
+      value: checked !== null && matchesHistoryResponse(command, checked) ? checked : historyHostFailure() });
+  };
   const catalog = await createPiModelCatalog();
   const requireDesktopPiKey = async (profile: ModelProfile): Promise<Result<void>> => {
     const revision = currentSettings.revision;
@@ -346,9 +352,12 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       return;
     }
     if (command.type === 'branch_session') {
-      send({ version: 1, type: 'response', requestId: command.requestId, value: await application.branchSession(command.input) });
+      await historyReply(command, await application.branchSession(command.input));
       return;
     }
+    if (command.type === 'query_session_history') { await historyReply(command, await application.querySessionHistory(command.input)); return; }
+    if (command.type === 'query_session_history_entry') { await historyReply(command, await application.querySessionHistoryEntry(command.input)); return; }
+    if (command.type === 'fork_session') { await historyReply(command, await application.forkSession(command.input)); return; }
     if (command.type === 'submit_session_input' && command.input.mode !== 'prompt') {
       const accepted = await application.submitInput(command.input, { onEvent(event: AgentRunEvent) {
         send({ version: 1, type: 'event', event: { type: 'agent_run_event', requestId: command.requestId, value: event } });
@@ -839,6 +848,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       if (isRuntimeHostCommand(command.type)) runtimeReply(command, command.type === 'query_runtime_events'
         ? { ok: false, error, context: null } : fail(error));
       else if (isContextHostCommand(command.type)) void contextReply(command, contextHostFailure());
+      else if (isHistoryHostCommand(command.type)) void historyReply(command, historyHostFailure());
       else send({ version: 1, type: 'response', requestId: command.requestId, value: fail(error) });
     });
   });

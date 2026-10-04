@@ -1229,7 +1229,10 @@ export class PiAgentAdapter implements AgentPort {
       const observed = binding.observeRequest(name, raw, { nativeToolCallId, signal, ...(requestBinding ? { requestBinding } : {}) });
       if (!observed.ok) {
         this.failToolRun(record, active, observed.error);
-        return null;
+        // Pi 0.85.1 awaits this listener after saving the generating assistant.
+        // Abort alone still enters its tool batch and appends an unowned result.
+        // Reject the awaited event so Pi takes its actual aborted-assistant path.
+        throw new Error(observed.error.code);
       }
       const state: ToolRequestState = { name, raw: structuredClone(raw), sdkRaw: raw, ...(requestBinding ? { requestBinding } : {}), invoked: false, terminal: false,
         messageObserved: false, messageObservedAt: null, requestObservedAtSequence: null };

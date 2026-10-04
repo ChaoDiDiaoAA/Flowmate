@@ -329,7 +329,7 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
     if (process.env[key]) env[key] = process.env[key]!;
   env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
   const app = await electron.launch({ executablePath: electronPath, args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
-  let failure: Error | undefined;
+  let failure: Error | undefined, stage = 'launch';
   try {
     const page = await app.firstWindow();
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
@@ -440,15 +440,48 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
       .toMatchObject([{ runId: 101, c: 1, d: 3, through: 3 }, { runId: 101, c: 1, d: 3, through: null }]);
     await expect(page.getByText('Showing an available segment. The continuous position is still 1.', { exact: true })).toBeVisible();
 
-    await app.evaluate(async ({ BrowserWindow }) => {
-      Reflect.set(globalThis, 'p6PrimaryWindow', BrowserWindow.getAllWindows()[0]!);
+    stage = 'secondary handoff';
+    const primaryHandle = await app.browserWindow(page);
+    const primaryId = await primaryHandle.evaluate(window => window.id); await primaryHandle.dispose();
+    await page.evaluate(() => {
+      const trace: unknown[] = [];
+      const record = (event: Event | string) => { trace.push({ at: Date.now(), event: typeof event === 'string' ? event : event.type,
+        hasFocus: document.hasFocus(), hidden: document.hidden, visibilityState: document.visibilityState }); if (trace.length > 32) trace.shift(); };
+      window.addEventListener('focus', record); window.addEventListener('blur', record); document.addEventListener('visibilitychange', record);
+      record('before-handoff'); Reflect.set(window, 'p6FocusTrace', trace);
+    });
+    await app.evaluate(async ({ BrowserWindow }, primaryId) => {
+      const primary = BrowserWindow.fromId(primaryId)!;
+      Reflect.set(globalThis, 'p6PrimaryWindow', primary);
       const focusWindow = new BrowserWindow({ width: 200, height: 160, show: false,
         webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
       Reflect.set(globalThis, 'p6FocusWindow', focusWindow);
-      await focusWindow.loadURL('about:blank'); focusWindow.show(); focusWindow.focus();
-    });
-    await expect.poll(() => page.evaluate(() => document.hasFocus())).toBe(false);
+      const trace: unknown[] = [];
+      const record = (event: string, id: number) => { trace.push({ at: Date.now(), event, id,
+        primaryDestroyed: primary.isDestroyed(), secondaryDestroyed: focusWindow.isDestroyed(),
+        primaryFocused: !primary.isDestroyed() && primary.isFocused(), secondaryFocused: !focusWindow.isDestroyed() && focusWindow.isFocused(), secondaryVisible: !focusWindow.isDestroyed() && focusWindow.isVisible(),
+        focusedId: BrowserWindow.getFocusedWindow()?.id ?? null, webContentsFocused: !primary.isDestroyed() && primary.webContents.isFocused() }); if (trace.length > 32) trace.shift(); };
+      Reflect.set(globalThis, 'p6NativeFocusTrace', trace);
+      for (const window of [primary, focusWindow]) { const id = window.id; window.on('focus', () => record('focus', id)); window.on('blur', () => record('blur', id));
+        window.on('show', () => record('show', id)); window.on('hide', () => record('hide', id)); }
+      record('before-load', primary.id);
+      await focusWindow.loadURL('about:blank'); record('before-show', focusWindow.id); focusWindow.show(); focusWindow.focus(); record('after-focus', focusWindow.id);
+    }, primaryId);
+    try {
+      await expect.poll(async () => ({ ...await app.evaluate(({ BrowserWindow }) => {
+        const primary = Reflect.get(globalThis, 'p6PrimaryWindow'), secondary = Reflect.get(globalThis, 'p6FocusWindow');
+        return { primaryFocused: primary.isFocused(), secondaryVisible: secondary.isVisible(), secondaryFocused: secondary.isFocused(),
+          focusedSecondary: BrowserWindow.getFocusedWindow()?.id === secondary.id };
+      }), domFocused: await page.evaluate(() => document.hasFocus()) }), { timeout: 5_000 }).toEqual({ primaryFocused: false,
+        secondaryVisible: true, secondaryFocused: true, focusedSecondary: true, domFocused: false });
+    } catch (error) {
+      try { console.error('[T08-P6-FOCUS]', JSON.stringify({ primaryId,
+        native: await app.evaluate(() => Reflect.get(globalThis, 'p6NativeFocusTrace')),
+        dom: await page.evaluate(() => ({ trace: Reflect.get(window, 'p6FocusTrace'), hasFocus: document.hasFocus() })) })); } catch { /* Preserve original assertion. */ }
+      throw error;
+    }
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').removed)).toContain(renewedId);
+    stage = 'secondary destroyed primary refocus';
     await app.evaluate(() => { Reflect.get(globalThis, 'p6FocusWindow').destroy(); Reflect.get(globalThis, 'p6PrimaryWindow').focus(); });
     await expect.poll(() => page.evaluate(() => document.hasFocus())).toBe(true);
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.length)).toBe(beforeExpiry + 2);
@@ -456,6 +489,7 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
     await expect.poll(() => app.evaluate((_electron, id) => Reflect.get(globalThis, 'p6Lifecycle').reads.some((read: { subscriptionId: string; c: number; d: number }) =>
       read.subscriptionId === id && read.c === 1 && read.d === 3), focusedId)).toBe(true);
     await cdp.detach();
+    stage = 'primary hidden';
     // CDP keeps document.visibilityState visible even for a hidden native window. Assert
     // the actual Electron visibility and focus, then the Renderer's release/reopen behavior.
     await app.evaluate(() => Reflect.get(globalThis, 'p6PrimaryWindow').hide());
@@ -465,6 +499,7 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
     const hiddenReads = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.length);
     await page.waitForTimeout(2_200);
     expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.length)).toBe(hiddenReads);
+    stage = 'primary visible reopen';
     await app.evaluate(() => { const window = Reflect.get(globalThis, 'p6PrimaryWindow'); window.show(); window.focus(); });
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6PrimaryWindow').isVisible())).toBe(true);
     await expect.poll(() => page.evaluate(() => !document.hidden && document.hasFocus())).toBe(true);
@@ -476,7 +511,18 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
     await expect(page.getByText('Showing an available segment. The continuous position is still 1.', { exact: true })).toBeVisible();
     await expect(page.getByRole('textbox', { name: 'Message to model' })).toHaveValue('Lifecycle observation preserves this draft');
     expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').commands)).toBe(0);
-  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  } catch (error) {
+    failure = error instanceof Error ? error : new Error(String(error));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { const facts = await Promise.race([Promise.all([
+      app.evaluate(() => { const value = Reflect.get(globalThis, 'p6Lifecycle'); return { native: Reflect.get(globalThis, 'p6NativeFocusTrace'),
+        opens: value?.opens.slice(-32), reads: value?.reads.slice(-32), removed: value?.removed.slice(-32), commands: value?.commands }; }),
+      app.firstWindow().then(page => page.evaluate(() => ({ dom: Reflect.get(window, 'p6FocusTrace'), focused: document.hasFocus(), hidden: document.hidden }))),
+    ]), new Promise(resolve => { timer = setTimeout(() => resolve('diagnostic timeout'), 1000); })]);
+      console.error('[T08-P6-STAGE]', JSON.stringify({ stage, facts }));
+    } catch { /* Preserve the original assertion and cleanup. */ } finally { clearTimeout(timer); }
+    throw failure;
+  }
   finally {
     await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle')?.releaseOpen?.()).catch(() => {});
     await closeDesktopFixture(app, userData, failure);
@@ -1174,7 +1220,15 @@ it(`desktop shows the actual frozen ${limit} allowance after budget exhaustion`,
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     const cause = limit === 'model' ? 'request' : 'tool';
     await page.getByRole('log').getByText(`The assistant reached the ${cause} limit before finishing. Check Processing History for any saved result.`, { exact: true })
-      .waitFor({ timeout: 15_000 });
+      .waitFor({ timeout: 15_000 }).catch(async error => {
+        console.error('[T08-BUDGET-FACTS]', JSON.stringify({ limit, calls: calls.length, facts: await page.evaluate(async () => {
+          const sessions = await window.flowmate.listSessions(); return { runtime: await window.flowmate.queryRuntimeState(), sessions,
+            runs: sessions.ok && sessions.data.items[0] ? await window.flowmate.listSessionRuns({ sessionId: sessions.data.items[0].sessionId }) : null,
+            log: document.querySelector('[role="log"]')?.textContent?.slice(0, 10000) };
+        }) }));
+        await it.info().attach('budget-failure', { body: await page.screenshot(), contentType: 'image/png' });
+        throw error;
+      });
     const current = await page.evaluate(async () => {
       const sessions = await window.flowmate.listSessions(); if (!sessions.ok || !sessions.data.items[0]) throw new Error('Missing budget Session');
       return window.flowmate.listSessionRuns({ sessionId: sessions.data.items[0].sessionId });

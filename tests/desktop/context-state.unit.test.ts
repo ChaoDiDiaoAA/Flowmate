@@ -3,7 +3,7 @@ import type { RuntimeEvent, RuntimeEventsReadResult } from '@flowmate/contracts'
 import { createEventView, applyEventRead, eventReadRequest } from '../../apps/desktop/renderer/src/event-state.ts';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { Children, isValidElement, type ReactNode } from 'react';
-import { ContextRequestEvidenceSchema, ContextRequestsPageSchema, ContextSnapshotDetailSchema } from '@flowmate/contracts';
+import { PublicContextRequestEvidenceSchema, ContextRequestsPageSchema, ContextSnapshotDetailSchema } from '@flowmate/contracts';
 import * as contextUi from '../../apps/desktop/renderer/src/session-details.tsx';
 
 const api = await import('../../apps/desktop/renderer/src/context-state.ts').catch(() => null);
@@ -82,10 +82,18 @@ function renderPublicFacts(name: string, props: object) {
 const at = '2026-10-03T00:00:00.000Z';
 const publicRequest = { binding: { runId: 31, sessionId: 5, nativeSessionId: 'native-5', requestSequence: 1, callSequence: 1,
   inputId: 100, snapshotId: 51, includedBindings: [{ originRunId: 31, inputId: 100, nativeEntryId: 'e100', snapshotId: 51 }],
-  includedToolResults: [] }, api: 'openai-completions', boundAt: at, sdkPayload: null, transport: 'observed-fetch', attempts: [] };
+  includedToolResults: [], includedNativeContexts: null }, api: 'openai-completions', boundAt: at, sdkPayload: null, transport: 'observed-fetch', attempts: [] };
 describe('P8 public facts rendering only', () => {
+  it('P9 T08 keeps legacy native-source NULL distinct from collected empty and original native provenance', () => {
+    const render = (includedNativeContexts: unknown) => renderPublicFacts('ContextRequestFacts', {
+      request: PublicContextRequestEvidenceSchema.parse({ ...publicRequest, binding: { ...publicRequest.binding, includedNativeContexts } }), onSnapshot() {}, onRequestBasis() {} });
+    expect(render(null)).toContain('Native context sources were not collected.');
+    expect(render([])).not.toContain('Native context sources were not collected.');
+    const html = render([{ nativeEntryId: 'inherited-summary', originSessionId: 4, entryType: 'branch_summary', messageRole: 'branchSummary', contextMessageIndex: 0, referenceEntryIds: ['original-user'] }]);
+    expect(html).toContain('Native context branch_summary'); expect(html).toContain('Source Session 4'); expect(html).toContain('inherited-summary');
+  });
   it('retains original Run and full request reference for primary and tool sources while user entry has no invented request', () => {
-    const request = ContextRequestEvidenceSchema.parse({ ...publicRequest, binding: { ...publicRequest.binding,
+    const request = PublicContextRequestEvidenceSchema.parse({ ...publicRequest, binding: { ...publicRequest.binding,
       includedToolResults: [{ nativeToolCallId: 'original-call', toolCallId: 71, originRunId: 30, context: { snapshotId: 41, requestSequence: 2 } }] } });
     const basis: unknown[] = [], snapshots: unknown[] = [], buttons: Array<() => void> = [];
     const component: unknown = Reflect.get(contextUi, 'ContextRequestFacts');
@@ -102,7 +110,7 @@ describe('P8 public facts rendering only', () => {
     expect(snapshots).toEqual([[31, 51]]);
   });
   it('keeps payload NULL and prepared-only distinct from observed transport response and request ID', () => {
-    const request = ContextRequestEvidenceSchema.parse({ ...publicRequest, attempts: [{ attempt: 1, preparedAt: at, enteredAt: null,
+    const request = PublicContextRequestEvidenceSchema.parse({ ...publicRequest, attempts: [{ attempt: 1, preparedAt: at, enteredAt: null,
       responseAt: null, responseStatus: null, transportErrorCode: null, nativeRequestId: null, wireInclusion: 'confirmed', wireReason: null }] });
     const html = renderPublicFacts('ContextRequestFacts', { request, onSnapshot() {}, onRequestBasis() {} });
     expect(html).toContain('Request context observed'); expect(html).toContain('Attempt 1 prepared');
@@ -113,7 +121,7 @@ describe('P8 public facts rendering only', () => {
     expect(html).not.toContain('Payload observed'); expect(html).not.toContain('Transport call observed'); expect(html).not.toContain('Response observed');
   });
   it('shows explicit unavailable and legacy collection gaps without inventing an unobserved attempt', () => {
-    const request = ContextRequestEvidenceSchema.parse({ ...publicRequest, transport: 'not-observable',
+    const request = PublicContextRequestEvidenceSchema.parse({ ...publicRequest, transport: 'not-observable',
       sdkPayload: { observedAt: null, inclusion: 'unavailable', reason: 'payload_codec_unavailable' } });
     const html = renderPublicFacts('ContextRequestFacts', { request, onSnapshot() {}, onRequestBasis() {} });
     expect(html).toContain('Evidence unavailable'); expect(html).toContain('payload_codec_unavailable'); expect(html).not.toContain('Attempt 1');

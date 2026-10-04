@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { parseHostCommand, parseWorkspaceHostResult } from '../../apps/host/protocol.ts';
+import * as historyProtocol from '../../apps/host/protocol.ts';
 import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeEventsReadResultSchema,
   RuntimeEventsWakeSchema, RuntimeSubscriptionResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema } from '@flowmate/contracts';
@@ -109,7 +110,7 @@ describe('versioned desktop Host protocol', () => {
     expect(parseHostCommand({ ...archive, input: { ...archive.input, status: 'hidden' } })).toBeNull();
     expect(parseHostCommand({ ...archive, input: { ...archive.input, hiddenAt: null } })).toBeNull();
     const branch = { version: 1, requestId: 'branch', type: 'branch_session',
-      input: { sessionId: 12, expectedLeafId: 'leaf-2', expectedEntryCount: 5, targetEntryId: 'assistant-1' } } as const;
+      input: { sessionId: 12, expectedLeafId: 'leaf-2', expectedEntryCount: 5, expectedCommitRevision: 7, targetEntryId: 'assistant-1' } } as const;
     expect(parseHostCommand(branch)).toEqual(branch);
     expect(parseHostCommand({ ...branch, input: { ...branch.input, newSessionId: 13 } })).toBeNull();
     expect(parseHostCommand({ ...branch, input: { ...branch.input, expectedEntryCount: -1 } })).toBeNull();
@@ -236,6 +237,58 @@ describe('versioned desktop Host protocol', () => {
     expect(parseHostCommand({ ...start, expectedSettingsRevision: 0 })).toBeNull();
     expect(parseHostCommand({ ...start, type: 'cancel_run', runId: 5 })).toBeNull();
     expect(parseHostCommand({ version: 1, requestId: 'stop-1', type: 'cancel_run', runId: 5, apiKey: 'secret' })).toBeNull();
+  });
+});
+
+describe('P9 T08 History public requests', () => {
+  it('checks complete results against captured identity, revision, cursor and safe error facts', () => {
+    const protocol = historyProtocol as unknown as { parseHistoryHostResult: (type: string, value: unknown) => unknown;
+      matchesHistoryResponse: (command: unknown, value: unknown) => boolean };
+    expect(typeof protocol.parseHistoryHostResult).toBe('function');
+    const session = { sessionId: 12, nativeSessionId: 'native', title: 'Chat', status: 'active', createdAt: '2026-10-04T00:00:00.000Z', updatedAt: '2026-10-04T00:00:00.000Z',
+      availability: 'ready', historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: false, deletePending: false };
+    const commit = { commitRevision: 7, leafId: 'user', entryCount: 1 };
+    const item = { sequence: 0, entryId: 'user', parentId: null, type: 'message', timestamp: session.createdAt, isCurrentPath: true, isLeaf: true,
+      preview: 'hello', truncated: false, originSessionId: 3, originRunId: 4, canSelect: true, cannotSelectReason: null };
+    const page = { ok: true, data: { session, commit, items: [item], nextAfterSequence: null } };
+    const command = parseHostCommand({ version: 1, requestId: 'x', type: 'query_session_history', input: { sessionId: 12, expectedCommitRevision: 7 } });
+    expect(protocol.matchesHistoryResponse(command, page)).toBe(true);
+    expect(protocol.matchesHistoryResponse(command, { ...page, data: { ...page.data, session: { ...session, sessionId: 99 } } })).toBe(false);
+    expect(protocol.matchesHistoryResponse(command, { ...page, data: { ...page.data, commit: { ...commit, commitRevision: 8 } } })).toBe(false);
+    expect(protocol.parseHistoryHostResult('query_session_history', { ...page, secret: 'credential' })).toBeNull();
+    const error = { code: 'state_conflict', category: 'runtime', retryable: false, message: 'private SDK credential' };
+    const safe = protocol.parseHistoryHostResult('query_session_history', { ok: false, error });
+    expect(safe).toMatchObject({ ok: false, error: { ...error, message: 'History changed. Reload to continue.' } });
+    expect(protocol.parseHistoryHostResult('fork_session', { ok: false, error: { code: 'session_history_unavailable', category: 'session', retryable: false, message: 'The original fork target was deleted.' } }))
+      .toMatchObject({ ok: false, error: { message: 'The original fork target was deleted.' } });
+    for (const value of [{ ok: false, error: { ...error, sessionId: 99 } }, { ok: false, error: { ...error, runId: 4 } },
+      { ok: false, error: { ...error, toolCallId: 4 } }, { ok: false, error, runId: 4 }, { ok: false, error: { ...error, code: 'internal_error', category: 'internal', retryable: true } }])
+      expect(protocol.matchesHistoryResponse(command, value)).toBe(false);
+    const fork = parseHostCommand({ version: 1, requestId: 'f', type: 'fork_session', input: { sourceSessionId: 12, expected: commit, targetEntryId: 'user', title: 'Child', clientOperationId: '5d095824-9dbf-4219-be5b-a85b2bd12a24' } });
+    expect(protocol.matchesHistoryResponse(fork, { ok: true, data: { session: { ...session, sessionId: 13 }, commit: { commitRevision: 9, entryCount: 2, leafId: 'later' }, sourceSessionId: 12, selectedEntryId: 'user' } })).toBe(true);
+    const branch = parseHostCommand({ version: 1, requestId: 'b', type: 'branch_session', input: { sessionId: 12, expectedCommitRevision: 7, expectedLeafId: 'user', expectedEntryCount: 1, targetEntryId: 'user' } });
+    expect(protocol.matchesHistoryResponse(branch, { ok: true, data: { session, leafId: 'user', entryCount: 1 } })).toBe(true);
+    expect(protocol.matchesHistoryResponse(branch, { ok: true, data: { session, leafId: 'other', entryCount: 1 } })).toBe(false);
+    const detail = { ok: true, data: { summary: item, commit, fields: { type: 'message', role: 'user', toolName: null, callId: null, stopReason: null, isError: null, hasImages: false, imageMimeTypes: [] }, part: { kind: 'text', text: 'hello' }, partIndex: 1, offset: 0, next: null } };
+    const detailCommand = parseHostCommand({ version: 1, requestId: 'd', type: 'query_session_history_entry', input: { sessionId: 12, entryId: 'user', expectedCommitRevision: 7 } });
+    expect(protocol.matchesHistoryResponse(detailCommand, detail)).toBe(true);
+    const endedPart = parseHostCommand({ version: 1, requestId: 'end', type: 'query_session_history_entry', input: { sessionId: 12, entryId: 'user', expectedCommitRevision: 7, partIndex: 0, offset: 17 } });
+    expect(protocol.matchesHistoryResponse(endedPart, detail)).toBe(true);
+    expect(protocol.matchesHistoryResponse(detailCommand, { ...detail, data: { ...detail.data, summary: { ...item, entryId: 'other', isLeaf: false } } })).toBe(false);
+  });
+  it('normalizes all history commands and rejects old branch requests and injected SDK fields', () => {
+    const envelope = { version: 1, requestId: 'history-request' } as const;
+    expect(parseHostCommand({ ...envelope, type: 'query_session_history', input: { sessionId: 12 } }))
+      .toEqual({ ...envelope, type: 'query_session_history', input: { sessionId: 12, limit: 50 } });
+    expect(parseHostCommand({ ...envelope, type: 'query_session_history_entry', input: { sessionId: 12, entryId: 'user', expectedCommitRevision: 7 } }))
+      .toEqual({ ...envelope, type: 'query_session_history_entry', input: { sessionId: 12, entryId: 'user', expectedCommitRevision: 7, partIndex: 0, offset: 0 } });
+    const fork = { sourceSessionId: 12, expected: { commitRevision: 7, entryCount: 2, leafId: 'user' }, targetEntryId: 'user',
+      title: '  Child  ', clientOperationId: '5D095824-9DBF-4219-BE5B-A85B2BD12A24' };
+    expect(parseHostCommand({ ...envelope, type: 'fork_session', input: fork })).toMatchObject({ input: { title: 'Child', clientOperationId: fork.clientOperationId.toLowerCase() } });
+    for (const input of [{ sessionId: 12, afterSequence: 0 }, { sessionId: 12, limit: 101 }, { sessionId: 12, cwd: 'private' }])
+      expect(parseHostCommand({ ...envelope, type: 'query_session_history', input })).toBeNull();
+    expect(parseHostCommand({ ...envelope, type: 'fork_session', input: { ...fork, runId: 3 } })).toBeNull();
+    expect(parseHostCommand({ ...envelope, type: 'branch_session', input: { sessionId: 12, expectedLeafId: 'user', expectedEntryCount: 2, targetEntryId: 'user' } })).toBeNull();
   });
 });
 

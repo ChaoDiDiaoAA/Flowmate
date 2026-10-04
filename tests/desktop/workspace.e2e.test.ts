@@ -450,10 +450,18 @@ it('P7 real Workspace selects every saved field and line, pages sources, freezes
     await expect(page.getByRole('button', { name: 'Select Tax amount', exact: true })).toHaveAttribute('aria-pressed', 'true');
     const countBeforeRestore = requests.length;
     const saved = await selected();
+    await holdOneWorkspaceRead(app, userData, 'query_job_candidate');
     await page.getByRole('button', { name: 'Refresh workspace', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Select Tax amount', exact: true })).toHaveAttribute('aria-pressed', 'true');
     expect((await selected()).revision).toBe(saved.revision);
     expect(requests.length).toBe(countBeforeRestore);
+    // Saved selection remains visible while the real candidate reply is still pending.
+    await expect.poll(() => app!.evaluate(() => (globalThis as typeof globalThis & { p7ReadGate: { held: number } }).p7ReadGate.held)).toBe(1);
+    await expect(page.getByRole('button', { name: 'Select Tax amount', exact: true })).toBeDisabled();
+    expect(await selected()).toMatchObject({ revision: saved.revision, selection: saved.selection });
+    expect(requests.length).toBe(countBeforeRestore);
+    await app.evaluate(() => (globalThis as typeof globalThis & { p7ReadGate: { release(): void } }).p7ReadGate.release());
+    await expect(page.getByRole('button', { name: 'Select Tax amount', exact: true })).toBeEnabled();
     const screenshots = process.env.FLOWMATE_SCREENSHOT_ROOT ? join(process.env.FLOWMATE_SCREENSHOT_ROOT, 'p7-workspace') : join(userData, 'workspace-layouts'); mkdirSync(screenshots, { recursive: true });
     for (const theme of ['light', 'dark'] as const) {
       expect(await page.evaluate(async theme => {

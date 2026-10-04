@@ -9,11 +9,12 @@ import { tmpdir } from 'node:os';
 import { openTestDatabase } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
-import { createContextRepository, readRunContextOwner } from '../../../packages/core/src/context/repository.ts';
+import { createContextRepository, readRunContext, readRunContextOwner } from '../../../packages/core/src/context/repository.ts';
 import { SessionService } from '../../../packages/core/src/sessions/service.ts';
 import { projectSessionMessages } from '../../../packages/runtime-pi/src/messages.ts';
 import { createNativeOriginReader, resolveNativeEntryOrigin } from '../../../packages/core/src/memory/origins.ts';
-import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok } from '@flowmate/contracts';
+import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, ContextObservationsSchema,
+  NativeContextObservationsSchema, PublicContextObservationsSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok } from '@flowmate/contracts';
 import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result, ToolRuntimeObservation } from '@flowmate/contracts';
 
 const at = '2026-10-03T00:00:00.000Z';
@@ -1109,4 +1110,61 @@ it('P9 T07 preserves genuinely absent historical markers and journal bytes after
   expect(page.items[0]!.binding.includedNativeContexts).toBeNull();
   expect(reopened.db.query('SELECT config_json,context_observations_json FROM runs WHERE id=?').get(f.runId)).toEqual(before);
   expect(reopened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+});
+
+it.each([false, true])('P9 T08 avoids duplicate native validation while preserving legacy public limits (native=%s)', marked => {
+  const f = fixture(), saved = f.append(); f.consume(saved.inputId, saved.content.text);
+  const full = f.binding(saved.inputId, saved.snapshot.id);
+  const { includedNativeContexts: _, ...legacy } = full;
+  const raw = { requests: [{ attempts: [], transport: 'observed-fetch', sdkPayload: null, boundAt: at,
+    api: 'openai-responses', binding: marked ? full : legacy }], version: 1 };
+  const row = { id: f.runId, kind: 'agent', session_id: f.session.sessionId, current_context_snapshot_id: saved.snapshot.id,
+    config_json: JSON.stringify({ ...f.config, ...(marked ? { historyPolicyVersion: 'p9-native-history-v1' } : {}) }),
+    context_observations_json: JSON.stringify(raw, null, 2) };
+  const generic = spyOn(ContextObservationsSchema, 'safeParse'), native = spyOn(NativeContextObservationsSchema, 'safeParse'),
+    projected = spyOn(PublicContextObservationsSchema, 'safeParse');
+  try {
+    const read = readRunContext(row);
+    expect(JSON.stringify(read.observations)).toBe(JSON.stringify(raw));
+    expect(generic).toHaveBeenCalledTimes(marked ? 0 : 2);
+    expect(native).toHaveBeenCalledTimes(marked ? 1 : 0);
+    expect(projected).toHaveBeenCalledTimes(marked ? 0 : 1);
+  } finally { generic.mockRestore(); native.mockRestore(); projected.mockRestore(); }
+});
+
+it('P9 T08 retains the legacy public 4 MiB boundary when adding nullable fields exceeds it', () => {
+  const f = fixture(), saved = f.append();
+  const { includedNativeContexts: _, ...binding } = f.binding(saved.inputId, saved.snapshot.id);
+  const requests = Array.from({ length: 64 }, (_unused, index) => ({ binding: { ...binding,
+    requestSequence: index + 1, callSequence: index + 1, includedBindings: [...binding.includedBindings] },
+    api: 'openai-responses', boundAt: at, sdkPayload: null, transport: 'observed-fetch', attempts: [] }));
+  const raw = { version: 1, requests }, limit = 4 * 1024 * 1024;
+  const extra = { nativeEntryId: 'legacy'.padEnd(256, 'x'), originRunId: null, inputId: null, snapshotId: null };
+  const count = Math.floor((limit - 128 - Buffer.byteLength(JSON.stringify(raw))) / (Buffer.byteLength(JSON.stringify(extra)) + 1));
+  for (let index = 0; index < count; index++) requests[index % requests.length]!.binding.includedBindings.unshift({ ...extra,
+    nativeEntryId: String(index).padEnd(256, 'x') });
+  expect(Buffer.byteLength(JSON.stringify(raw))).toBeLessThan(limit);
+  expect(ContextObservationsSchema.safeParse(raw).success).toBe(true);
+  expect(PublicContextObservationsSchema.safeParse({ ...raw, requests: requests.map(request => ({ ...request,
+    binding: { ...request.binding, includedNativeContexts: null } })) }).success).toBe(false);
+  expect(() => readRunContext({ id: f.runId, kind: 'agent', session_id: f.session.sessionId,
+    config_json: JSON.stringify(f.config), current_context_snapshot_id: saved.snapshot.id, context_observations_json: JSON.stringify(raw) }))
+    .toThrow('context_binding_unknown');
+});
+
+it('P9 T08 keeps malformed, missing-proof and unsupported-marker error precedence after journal read optimization', () => {
+  const f = fixture(), saved = f.append(); f.consume(saved.inputId, saved.content.text);
+  const { includedNativeContexts: _, ...legacy } = f.binding(saved.inputId, saved.snapshot.id);
+  const request = { binding: legacy, api: 'openai-responses', boundAt: at, sdkPayload: null, transport: 'observed-fetch', attempts: [] };
+  for (const [marker, journal, code] of [
+    ['p9-native-history-v1', { version: 1, requests: [request] }, 'context_binding_unknown'],
+    ['p9-native-history-v1', { version: 1 }, 'storage_corrupt'],
+    ['future-history', { version: 1 }, 'storage_corrupt'],
+    ['future-history', { version: 1, requests: [request] }, 'context_binding_unknown'],
+  ] as const) {
+    f.store.db.query('UPDATE runs SET config_json=?,context_observations_json=? WHERE id=?').run(
+      JSON.stringify({ ...f.config, historyPolicyVersion: marker }), JSON.stringify(journal), f.runId);
+    expect(f.store.context.listContextRequests({ sessionId: f.session.sessionId, runId: f.runId }))
+      .toMatchObject({ ok: false, error: { code } });
+  }
 });

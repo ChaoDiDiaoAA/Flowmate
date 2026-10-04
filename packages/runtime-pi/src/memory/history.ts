@@ -22,12 +22,21 @@ export function referenceIds(entry: NativeSessionHistory['entries'][number] | Se
 }
 function validSequence(messages: readonly AgentMessage[], complete: boolean): boolean {
   const used = new Set<string>(), pending = new Map<string, string>();
-  for (const message of convertToLlm([...messages])) {
+  const converted = convertToLlm([...messages]);
+  for (const [index, message] of converted.entries()) {
     if (message.role === 'toolResult') {
       if (pending.get(message.toolCallId) !== message.toolName) return false;
       pending.delete(message.toolCallId);
     } else {
-      if (pending.size) return false;
+      if (pending.size) {
+        // Fixed SDK handleRunFailure appends this terminal after an awaited
+        // admission refusal. It records the abort, never completes a tool pair.
+        if (!complete && index === converted.length - 1 && message.role === 'assistant'
+          && message.stopReason === 'aborted' && typeof message.errorMessage === 'string' && message.errorMessage.length > 0
+          && message.content.length === 1 && message.content[0]?.type === 'text' && message.content[0].text === ''
+          && Object.keys(message.content[0]).length === 2) continue;
+        return false;
+      }
       if (message.role === 'assistant') for (const part of message.content) if (part.type === 'toolCall') {
         if (used.has(part.id)) return false;
         used.add(part.id); pending.set(part.id, part.name);

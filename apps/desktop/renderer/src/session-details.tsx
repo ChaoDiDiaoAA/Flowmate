@@ -1,11 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CandidateJobDetail, ContextReference, ContextSnapshotDetail, ContextSnapshotsPage,
-  ContextRequestsPage, ContextRequestEvidence, Result, SessionRunsPage } from '@flowmate/contracts';
+  ContextRequestsPage, Result, SessionRunsPage } from '@flowmate/contracts';
 import { acceptContextRead, beginContextRead, contextReadLease, createContextRead, failContextRead, finishContextRead,
   matchesContextRead, sameContextIdentity, type ContextIdentity } from './context-state.ts';
+import { SessionHistory } from './session-history.tsx';
+import type { ForkSessionResult } from '@flowmate/contracts';
 
 export type ContextBasis = Readonly<{ sessionId: number; runId: number; context: ContextReference }>;
 type Props = { sessionId: number; hostEpoch: number; hostReady: boolean; navigationToken: number;
+  initialRunId?: number | null;
+  initialSnapshotId?: number | null;
+  onHistoryBranch(sessionId: number): void;
+  onHistoryFork(result: ForkSessionResult, current: () => boolean): Promise<boolean>;
+  onOpenOwner(sessionId: number, runId: number | null, context?: ContextReference, snapshotId?: number): void;
   basis: ContextBasis | null; refreshToken: number; sourceError: string | null; onRunChange(runId: number | null): void; onClose(): void;
   onOpenCandidateBasis(candidate: CandidateJobDetail['candidate']): void };
 
@@ -41,7 +48,7 @@ function useRead<T>(identity: ContextIdentity, scope = '') {
 function ReadIssue({ error, pending }: { error: string | null; pending: boolean }) {
   return <>{error && <p className="notice bad" role="alert">{error}</p>}{pending && <p role="status">Loading context…</p>}</>;
 }
-export function ContextRequestFacts({ request, onSnapshot, onRequestBasis }: { request: ContextRequestEvidence;
+export function ContextRequestFacts({ request, onSnapshot, onRequestBasis }: { request: ContextRequestsPage['items'][number];
   onSnapshot(runId: number, snapshotId: number): void; onRequestBasis(runId: number, context: ContextReference): void }) {
   const binding = request.binding;
   return <article className="context-request" data-testid="context-request" data-request-sequence={binding.requestSequence}>
@@ -57,6 +64,8 @@ export function ContextRequestFacts({ request, onSnapshot, onRequestBasis }: { r
         {input.snapshotId === null || input.originRunId === null ? ' Legacy basis unavailable' : <button className="text-button" onClick={() => onSnapshot(input.originRunId!, input.snapshotId!)}>Snapshot {input.snapshotId}</button>}</p>)}
       {binding.includedToolResults.map((tool, index) => <p key={`tool-${index}`}>Tool result {tool.nativeToolCallId} · Original Run {tool.originRunId ?? 'legacy'} ·
         {tool.context === null || tool.originRunId === null ? ' Legacy basis unavailable' : <button className="text-button" onClick={() => onRequestBasis(tool.originRunId!, tool.context!)}>Snapshot {tool.context.snapshotId} / Request {tool.context.requestSequence}</button>}</p>)}
+      {binding.includedNativeContexts === null ? <p>Native context sources were not collected.</p> : binding.includedNativeContexts.map(source =>
+        <p key={source.nativeEntryId}>Native context {source.entryType} · Entry {source.nativeEntryId} · Source Session {source.originSessionId}</p>)}
     </div>
     {request.attempts.map(attempt => <dl key={attempt.attempt} className="activity-facts"><div><dt>Attempt {attempt.attempt} prepared</dt><dd>{attempt.preparedAt}</dd></div>
       <div><dt>Transport call</dt><dd>{attempt.enteredAt ? `Transport call observed · ${attempt.enteredAt}` : 'Not observed'}</dd></div>
@@ -97,8 +106,8 @@ export function ContextSnapshotFacts({ detail, pendingCandidate, canQueryCandida
 }
 
 export function SessionDetails(props: Props) {
-  const [runId, setRunId] = useState<number | null>(props.basis?.runId ?? null);
-  const [snapshotId, setSnapshotId] = useState<number | null>(props.basis?.context.snapshotId ?? null);
+  const [runId, setRunId] = useState<number | null>(props.basis?.runId ?? props.initialRunId ?? null);
+  const [snapshotId, setSnapshotId] = useState<number | null>(props.basis?.context.snapshotId ?? props.initialSnapshotId ?? null);
   const [requestBasis, setRequestBasis] = useState<Pick<ContextBasis, 'runId' | 'context'> | null>(props.basis);
   const token = useRef(0), identityKey = `${props.hostEpoch}:${props.sessionId}:${props.navigationToken}:${runId}`;
   const priorIdentity = useRef('');
@@ -110,15 +119,40 @@ export function SessionDetails(props: Props) {
   const refreshBusy = useRef<string | null>(null), refreshPending = useRef(false), lastRefresh = useRef(0);
   const refreshIdentity = `${identityKey}:${snapshotId}`;
   const closeButton = useRef<HTMLButtonElement | null>(null), latest = useRef(refreshIdentity);
+  const dialog = useRef<HTMLElement | null>(null);
+  const ownerRequest = useRef(0), ownerAlive = useRef(true);
+  const [ownerError, setOwnerError] = useState<string | null>(null);
+  useEffect(() => { ownerAlive.current = true; return () => { ownerAlive.current = false; ownerRequest.current++; }; }, []);
   latest.current = refreshIdentity;
   useEffect(() => { const previous = document.activeElement; closeButton.current?.focus();
     return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); }; }, []);
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.stopPropagation(); props.onClose(); }
+      if (event.key === 'Tab' && !dialog.current?.contains(document.activeElement)) { event.preventDefault(); closeButton.current?.focus(); }
+    };
+    document.addEventListener('keydown', keydown);
+    return () => document.removeEventListener('keydown', keydown);
+  }, [props.onClose]);
   function selectRun(id: number) { setRunId(id); setSnapshotId(null); setRequestBasis(null); props.onRunChange(id); }
   function selectSnapshot(originRunId: number, id: number) {
     setRunId(originRunId); setSnapshotId(id); setRequestBasis(null); props.onRunChange(originRunId);
   }
   function selectRequestBasis(originRunId: number, context: ContextReference) {
     setRunId(originRunId); setSnapshotId(context.snapshotId); setRequestBasis({ runId: originRunId, context }); props.onRunChange(originRunId);
+  }
+  async function openOwner(sessionId: number | null, originRunId: number | null, context?: ContextReference, snapshotId?: number) {
+    const captured = latest.current, request = ++ownerRequest.current;
+    const current = () => ownerAlive.current && latest.current === captured && ownerRequest.current === request;
+    setOwnerError(null);
+    try {
+      if (originRunId === null) { if (sessionId !== null) props.onOpenOwner(sessionId, null); return; }
+      const result = await window.flowmate.queryRun(originRunId);
+      if (!current()) return;
+      if (!result.ok || result.data.kind !== 'agent' || result.data.runId !== originRunId || !Number.isSafeInteger(result.data.sessionId)
+        || typeof result.data.sessionId !== 'number' || result.data.sessionId < 1 || sessionId !== null && result.data.sessionId !== sessionId) throw new Error('Unverified owner');
+      props.onOpenOwner(result.data.sessionId, originRunId, context, snapshotId);
+    } catch { if (current()) setOwnerError('The original context owner could not be verified.'); }
   }
   async function loadRuns(beforeRunId?: number) {
     const page = await runs.read(`runs:${beforeRunId ?? 'first'}:20`, () => window.flowmate.listSessionRuns({ sessionId: props.sessionId, limit: 20,
@@ -180,11 +214,11 @@ export function SessionDetails(props: Props) {
       () => window.flowmate.queryJobCandidate({ jobId: saved.jobId!, candidateId: projection.candidate!.id }), value => value.candidate.jobId === saved.jobId
         && value.candidate.candidateId === projection.candidate!.id && value.candidate.sequence === projection.candidate!.sequence);
   }
-  return <div className="context-dialog-backdrop"><section className="panel session-details" role="dialog" aria-modal="true" aria-label="Session details"
+  return <div className="context-dialog-backdrop"><section ref={dialog} className="panel session-details" role="dialog" aria-modal="true" aria-label="Session details"
     onKeyDown={event => {
       if (event.key === 'Escape') { event.stopPropagation(); props.onClose(); }
       if (event.key === 'Tab') {
-        const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]), select:not([disabled]), a[href], [tabindex="0"]')]
+        const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href], [tabindex="0"]')]
           .filter(element => element.getClientRects().length > 0);
         const first = controls[0], last = controls.at(-1);
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
@@ -193,6 +227,9 @@ export function SessionDetails(props: Props) {
     }}>
     <div className="panel-head"><div><h2>Session details</h2><p>Session {props.sessionId} · Recorded facts</p></div>
       <button ref={closeButton} className="secondary-button" onClick={props.onClose}>Close details</button></div>
+    <SessionHistory sessionId={props.sessionId} hostEpoch={props.hostEpoch} navigationToken={props.navigationToken} hostReady={props.hostReady}
+      onBranch={props.onHistoryBranch} onFork={props.onHistoryFork} onOwner={(sessionId, runId) => void openOwner(sessionId, runId)} />
+    {ownerError && <p role="alert">{ownerError}</p>}
     <h3>Context</h3><p className="config-note">Saved context and request evidence are separate from the model's answer.</p>
     {props.sourceError && <p className="notice bad" role="alert">{props.sourceError}</p>}
     {!props.hostReady && <p className="notice bad" role="alert">The Host is unavailable. Reconnect to read saved context.</p>}
@@ -220,7 +257,11 @@ export function SessionDetails(props: Props) {
     <ReadIssue error={requests.state.error} pending={requests.state.pending} />
     {requests.state.data && <ContextCollectionNotice page={requests.state.data} />}
     {requests.state.data?.items.map(request => <div id={`context-request-${props.navigationToken}-${request.binding.requestSequence}`} key={request.binding.requestSequence}>
-      <ContextRequestFacts request={request} onSnapshot={selectSnapshot} onRequestBasis={selectRequestBasis} /></div>)}
+      <ContextRequestFacts request={request} onSnapshot={(originRunId, id) => {
+        if (originRunId === runId) selectSnapshot(originRunId, id); else void openOwner(null, originRunId, undefined, id);
+      }} onRequestBasis={(originRunId, context) => {
+        if (originRunId === runId) selectRequestBasis(originRunId, context); else void openOwner(null, originRunId, context);
+      }} /></div>)}
     {requests.state.data?.nextBeforeRequestSequence != null && <button className="text-button" disabled={requests.state.pending} onClick={() => void loadRequests(requests.state.data!.nextBeforeRequestSequence!)}>Earlier requests</button>}
   </section></div>;
 }

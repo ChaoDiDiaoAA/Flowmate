@@ -4,7 +4,7 @@ import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidat
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
 import { RuntimeBudgetOverridesSchema, RuntimeRequestOverridesSchema } from '../../../../packages/contracts/src/runtime.ts';
 import { RUNTIME_CONFIG } from '../../../../packages/contracts/src/runtime-config.ts';
-import type { RuntimeRequestOverrides, Result, SourceRef, WorkspaceSelection, WorkspaceView } from '@flowmate/contracts';
+import type { ForkSessionResult, HistoryCommitState, RuntimeRequestOverrides, Result, SourceRef, WorkspaceSelection, WorkspaceView } from '@flowmate/contracts';
 import { WorkspaceContextSchema } from '../../../../packages/contracts/src/workspace.ts';
 import type { DesktopInvoiceFormRunRequest, DesktopSessionInputRequest, InvoiceCandidateOperationQuery, InvoiceFormApplicationReceipt, InvoiceFormDraft, SaveInvoiceCandidateResponse, SessionInputSnapshot } from '@flowmate/contracts';
 import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoiceFormState, editInvoiceForm, invalidateInvoiceForm,
@@ -156,6 +156,7 @@ export function App() {
   const [messageState, setMessageState] = useState<MessageViewState | null>(null);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
   const [sessionInputs, setSessionInputs] = useState<SessionInputSnapshot[]>([]);
+  const [inputReadError, setInputReadError] = useState<string | null>(null);
   const [inputCursor, setInputCursor] = useState<number | null>(null);
   const [inputSubmitting, setInputSubmitting] = useState(false);
   const [unknownInput, setUnknownInput] = useState<{ sessionId: number; clientSequence: number } | null>(null);
@@ -167,7 +168,7 @@ export function App() {
   const [sidebarRenameTitle, setSidebarRenameTitle] = useState('');
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
-  const [sessionDetails, setSessionDetails] = useState<{ sessionId: number; basis: ContextBasis | null; token: number } | null>(null);
+  const [sessionDetails, setSessionDetails] = useState<{ sessionId: number; basis: ContextBasis | null; token: number; initialRunId?: number | null; initialSnapshotId?: number } | null>(null);
   const [contextRefresh, setContextRefresh] = useState(0);
   const [contextSourceError, setContextSourceError] = useState<string | null>(null);
   const contextNavigation = useRef(0);
@@ -273,9 +274,10 @@ export function App() {
   const messageStates = useRef(new Map<number, MessageViewState>());
   const messageCursors = useRef(new Map<number, string | null>());
   const inputPages = useRef(new Map<number, { items: SessionInputSnapshot[]; cursor: number | null }>());
+  const inputReadTokens = useRef(new Map<number, number>());
   const unknownInputs = useRef(new Map<number, DesktopSessionInputRequest & { submittedDraft?: string }>());
   const inputSubmittingRef = useRef(false);
-  const historyPositions = useRef(new Map<number, { leafId: string | null; entryCount: number }>());
+  const historyPositions = useRef(new Map<number, HistoryCommitState>());
   const nativeSessionIds = useRef(new Map<number, string>());
   const knownRunSessions = useRef(new Map<number, number>());
   const historyQueries = useRef(new Map<number, { inFlight: boolean; refreshPending: boolean; beforeEntryId?: string }>());
@@ -972,23 +974,23 @@ export function App() {
   }
 
   async function mutateWorkspace<T extends { workspace: WorkspaceSnapshot }>(operation: (current: WorkspaceSnapshot) => Promise<Result<T>>,
-    change: WorkspaceChange | null = null): Promise<T | null> {
+    change: WorkspaceChange | null = null, isCurrent: () => boolean = () => true): Promise<T | null> {
     const queuedEpoch = workspaceHostEpoch.current;
     workspacePendingRef.current++;
     setWorkspacePending(workspacePendingRef.current);
     const update = workspaceChanges.current.then(async () => {
-      if (queuedEpoch !== workspaceHostEpoch.current || !hostReadyRef.current) return null;
+      if (!isCurrent() || queuedEpoch !== workspaceHostEpoch.current || !hostReadyRef.current) return null;
       const epoch = queuedEpoch, token = ++workspaceToken.current;
       publishWorkspaceState(beginWorkspaceRequest(workspaceStateRef.current, token, 'saving', change));
       try {
         let current = workspaceRef.current;
         if (!current) {
           const read = await window.flowmate.readWorkspace();
-          if (!read.ok || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
+          if (!isCurrent() || !read.ok || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
           current = read.data;
         }
         const result = await operation(current);
-        if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
+        if (!isCurrent() || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
         if (!result.ok) {
           const status = result.error.code === 'state_conflict' ? 'conflict'
             : result.error.code === 'operation_result_unknown' ? 'unknown' : 'error';
@@ -996,16 +998,17 @@ export function App() {
           setNotice({ tone: 'bad', message: errorMessage(result) });
           if (status === 'conflict' || status === 'unknown') {
             const read = await window.flowmate.readWorkspace();
-            if (read.ok) acceptWorkspace(read.data, epoch, token);
+            if (isCurrent() && read.ok) acceptWorkspace(read.data, epoch, token);
           }
           return null;
         }
         return acceptWorkspace(result.data.workspace, epoch, token) ? result.data : null;
       } catch {
+        if (!isCurrent()) return null;
         publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token,
           'The workspace write receipt is unknown. Refresh to read the saved selection.', 'unknown'));
         // A lost write receipt is recovered by reading facts, never by repeating the write.
-        try { const read = await window.flowmate.readWorkspace(); if (read.ok) acceptWorkspace(read.data, epoch, token); } catch { /* keep unknown */ }
+        try { const read = await window.flowmate.readWorkspace(); if (isCurrent() && read.ok) acceptWorkspace(read.data, epoch, token); } catch { /* keep unknown */ }
         return null;
       }
     }).finally(() => {
@@ -1357,7 +1360,7 @@ export function App() {
   }
 
   async function loadSession(sessionId: number) {
-    await querySessionHistory(sessionId);
+    await queryChatMessages(sessionId);
   }
 
   function publishMessages(next: MessageViewState) {
@@ -1370,8 +1373,12 @@ export function App() {
   }
 
   async function loadSessionInputs(sessionId: number, beforeInputId?: number) {
-    const result = await window.flowmate.listSessionInputs({ sessionId, limit: 50, ...(beforeInputId ? { beforeInputId } : {}) });
-    if (!result.ok) return;
+    const epoch = workspaceHostEpoch.current, selection = sessionLoadSequence.current;
+    const request = (inputReadTokens.current.get(sessionId) ?? 0) + 1; inputReadTokens.current.set(sessionId, request);
+    const result = await window.flowmate.listSessionInputs({ sessionId, limit: 50, ...(beforeInputId ? { beforeInputId } : {}) }).catch(() => null);
+    if (inputReadTokens.current.get(sessionId) !== request || epoch !== workspaceHostEpoch.current || selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
+    if (!result?.ok) { setInputReadError('Saved inputs are unavailable.'); return; }
+    setInputReadError(null);
     const previous = beforeInputId ? inputPages.current.get(sessionId)?.items ?? [] : [];
     const items = [...new Map([...previous, ...result.data.items].map(input => [input.inputId, input])).values()]
       .sort((left, right) => right.inputId - left.inputId);
@@ -1426,12 +1433,13 @@ export function App() {
     setNotice({ tone: 'info', message: `Input ${result.data.input.inputId}: ${result.data.input.status} · ${result.data.input.processingStatus}` });
     await loadSessionInputs(sessionId);
     void refreshRuntimeState();
-    void querySessionHistory(sessionId);
+    void queryChatMessages(sessionId);
     } finally { inputSubmittingRef.current = false; setInputSubmitting(false); }
   }
 
-  async function querySessionHistory(sessionId: number, beforeEntryId?: string) {
+  async function queryChatMessages(sessionId: number, beforeEntryId?: string) {
     if (selectedSessionIdRef.current !== sessionId) return;
+    void loadSessionInputs(sessionId);
     const coordinator = historyQueries.current.get(sessionId) ?? { inFlight: false, refreshPending: false };
     historyQueries.current.set(sessionId, coordinator);
     if (coordinator.inFlight) {
@@ -1440,18 +1448,19 @@ export function App() {
       return;
     }
     coordinator.inFlight = true;
-    const selection = sessionLoadSequence.current;
+    const selection = sessionLoadSequence.current, epoch = workspaceHostEpoch.current;
     const historyQuery = beforeEntryId !== undefined ? { beforeEntryId }
       : { afterEntryId: [...(messageStates.current.get(sessionId)?.byEntryId.keys() ?? [])].at(-1) ?? null };
     setHistoryLoading(true);
     let failed = false;
     try {
-      const [sessionResult, runsResult, messagesResult] = await Promise.all([
+      const [sessionResult, runsResult, messagesResult, nativeHistory] = await Promise.all([
         window.flowmate.querySession(sessionId),
         window.flowmate.listSessionRuns({ sessionId, limit: 100 }),
         window.flowmate.listSessionMessages({ sessionId, limit: 50, ...(beforeEntryId ? { beforeEntryId } : {}) }),
+        window.flowmate.querySessionHistory({ sessionId, limit: 1 }),
       ]);
-      if (selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
+      if (selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId || epoch !== workspaceHostEpoch.current) return;
       if (!sessionResult.ok || !runsResult.ok || !messagesResult.ok) {
         failed = true;
         const rejection = !sessionResult.ok ? sessionResult : !runsResult.ok ? runsResult : messagesResult;
@@ -1467,8 +1476,8 @@ export function App() {
         return;
       }
       nativeSessionIds.current.set(sessionId, sessionResult.data.nativeSessionId);
-      historyPositions.current.set(sessionId, { leafId: messagesResult.data.leafId, entryCount: messagesResult.data.entryCount });
-      void loadSessionInputs(sessionId);
+      if (nativeHistory.ok && nativeHistory.data.session.sessionId === sessionId) historyPositions.current.set(sessionId, nativeHistory.data.commit);
+      else historyPositions.current.delete(sessionId);
       const base = messageStates.current.get(sessionId) ?? emptyMessageState(sessionId);
       const closedRuns = new Set(base.closedRuns);
       for (const item of runsResult.data.items) {
@@ -1499,7 +1508,7 @@ export function App() {
         }));
     } catch {
       failed = true;
-      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId) {
+      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId && epoch === workspaceHostEpoch.current) {
         setHistoryError('History could not be loaded. Refresh history to try again.');
       }
     } finally {
@@ -1508,13 +1517,14 @@ export function App() {
       const pendingBefore = coordinator.beforeEntryId;
       coordinator.refreshPending = false;
       delete coordinator.beforeEntryId;
-      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId) setHistoryLoading(false);
-      if (followUp) void querySessionHistory(sessionId, pendingBefore);
+      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId && epoch === workspaceHostEpoch.current) setHistoryLoading(false);
+      if (followUp) void queryChatMessages(sessionId, pendingBefore);
     }
   }
 
   function selectSession(sessionId: number | null, focusComposer = false) {
     chatDrafts.current.set(draftKey(selectedSessionIdRef.current), chatInputRef.current);
+    setSessionMutating(false);
     focusComposerWhenReady.current = focusComposer;
     selectedSessionIdRef.current = sessionId;
     sessionLoadSequence.current += 1;
@@ -1527,6 +1537,7 @@ export function App() {
     setMessageState(sessionId === null ? null : messageStates.current.get(sessionId) ?? null);
     setMessageCursor(sessionId === null ? null : messageCursors.current.get(sessionId) ?? null);
     setSessionInputs(sessionId === null ? [] : inputPages.current.get(sessionId)?.items ?? []);
+    setInputReadError(null);
     setInputCursor(sessionId === null ? null : inputPages.current.get(sessionId)?.cursor ?? null);
     setUnknownInput(sessionId !== null && unknownInputs.current.has(sessionId)
       ? { sessionId, clientSequence: unknownInputs.current.get(sessionId)!.clientSequence } : null);
@@ -1543,10 +1554,10 @@ export function App() {
   function closeSessionDetails() {
     contextNavigation.current++; contextTarget.current = null; setSessionDetails(null); setContextSourceError(null);
   }
-  function openSessionDetails(sessionId: number, basis: ContextBasis | null = null) {
+  function openSessionDetails(sessionId: number, basis: ContextBasis | null = null, initialRunId?: number | null, initialSnapshotId?: number) {
     const token = ++contextNavigation.current;
     contextTarget.current = { sessionId, runId: basis?.runId ?? null };
-    setContextSourceError(null); setSessionDetails({ sessionId, basis, token });
+    setContextSourceError(null); setSessionDetails({ sessionId, basis, token, initialRunId, initialSnapshotId });
   }
   async function openCandidateContextBasis(original: CandidateSummary) {
     const epoch = workspaceHostEpoch.current, token = ++contextNavigation.current;
@@ -1725,14 +1736,14 @@ export function App() {
     const sessionId = selectedSessionIdRef.current;
     if (sessionId !== null && selectedSession?.historyState !== 'legacy-read-only') {
       const cursor = messageCursors.current.get(sessionId);
-      if (cursor) await querySessionHistory(sessionId, cursor);
+      if (cursor) await queryChatMessages(sessionId, cursor);
       return;
     }
     const beforeRunId = runCursor;
     if (sessionId === null || beforeRunId === null) return;
-    const selection = sessionLoadSequence.current;
+    const selection = sessionLoadSequence.current, epoch = workspaceHostEpoch.current;
     const result = await window.flowmate.listSessionRuns({ sessionId, beforeRunId, limit: 100 });
-    if (selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
+    if (selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId || epoch !== workspaceHostEpoch.current) return;
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
     setRunCursor(result.data.nextBeforeRunId);
     setChatTurns((current) => [...result.data.items.slice().reverse().map(turnFromRun), ...current]);
@@ -2352,34 +2363,49 @@ export function App() {
       if (selectedSessionIdRef.current === sessionId) {
         sessionLoadSequence.current += 1;
         setSelectedSession(result.data);
-        void querySessionHistory(sessionId);
+        void queryChatMessages(sessionId);
       }
       void loadSessionList();
       setNotice({ tone: 'good', message: status === 'archived' ? 'Chat archived. Its messages and draft are preserved.' : 'Chat is ready to continue.' });
     } finally { setSessionMutating(false); }
   }
 
+  function historyBranchSaved(sessionId: number) {
+    if (selectedSessionIdRef.current !== sessionId) return;
+    const branchMessages = { ...emptyMessageState(sessionId), closedRuns: new Set(messageStates.current.get(sessionId)?.closedRuns ?? []) };
+    messageStates.current.set(sessionId, branchMessages); messageCursors.current.delete(sessionId); historyPositions.current.delete(sessionId);
+    setMessageState(branchMessages); void queryChatMessages(sessionId);
+  }
+
+  async function selectFork(result: ForkSessionResult, current: () => boolean): Promise<boolean> {
+    if (!current() || !await confirmFormLeave() || !current()) return false;
+    const epoch = workspaceHostEpoch.current, selection = sessionLoadSequence.current;
+    const valid = () => current() && epoch === workspaceHostEpoch.current && selection === sessionLoadSequence.current;
+    const saved = await mutateWorkspace(async workspace => {
+      if (!valid()) return { ok: false, error: { code: 'state_conflict', category: 'runtime', retryable: false, message: 'Chat selection changed.' } };
+      const update = await window.flowmate.updateWorkspace({ expectedRevision: workspace.revision, change: { kind: 'session', sessionId: result.session.sessionId } });
+      return update.ok ? { ok: true, data: { workspace: update.data } } : update;
+    }, { kind: 'session', sessionId: result.session.sessionId }, valid);
+    if (!valid() || !saved || saved.workspace.sessionId !== result.session.sessionId) return false;
+    selectSession(result.session.sessionId, true); closeSessionDetails(); void loadSessionList(); return true;
+  }
+
   async function branchSession(targetEntryId: string) {
     const sessionId = selectedSessionIdRef.current;
     const position = sessionId === null ? undefined : historyPositions.current.get(sessionId);
     if (!sessionId || !position || sessionMutating || historyLoading) return;
+    const epoch = workspaceHostEpoch.current, selection = sessionLoadSequence.current;
+    const current = () => epoch === workspaceHostEpoch.current && selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId;
     setSessionMutating(true);
     try {
       const result = await window.flowmate.branchSession({ sessionId, expectedLeafId: position.leafId,
-        expectedEntryCount: position.entryCount, targetEntryId });
-      if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
-      const branchMessages = { ...emptyMessageState(sessionId),
-        closedRuns: new Set(messageStates.current.get(sessionId)?.closedRuns ?? []) };
-      messageStates.current.set(sessionId, branchMessages);
-      messageCursors.current.delete(sessionId);
-      historyPositions.current.set(sessionId, { leafId: result.data.leafId, entryCount: result.data.entryCount });
-      if (selectedSessionIdRef.current === sessionId) {
-        sessionLoadSequence.current += 1;
-        setMessageState(branchMessages);
-      }
-      await querySessionHistory(sessionId);
+        expectedEntryCount: position.entryCount, expectedCommitRevision: position.commitRevision, targetEntryId });
+      if (!current()) return;
+      if (!result.ok) { setNotice({ tone: 'bad', message: result.error.message }); return; }
+      historyBranchSaved(sessionId);
       setNotice({ tone: 'good', message: 'Chat position saved. Your next Send will continue from this reply.' });
-    } finally { setSessionMutating(false); }
+    } catch { if (current()) setNotice({ tone: 'bad', message: 'History is unavailable.' }); }
+    finally { if (current()) setSessionMutating(false); }
   }
 
   async function newChatAndSend() {
@@ -2832,6 +2858,7 @@ export function App() {
         onAppend={mode => void appendChatInput(mode)}
         canAppend={canAppend}
         sessionInputs={sessionInputs}
+        inputReadError={inputReadError}
         hasOlderInputs={inputCursor !== null}
         onLoadOlderInputs={() => { if (selectedSessionIdRef.current !== null && inputCursor !== null) void loadSessionInputs(selectedSessionIdRef.current, inputCursor); }}
         unknownInput={unknownInput !== null}
@@ -2873,6 +2900,9 @@ export function App() {
       />
       {contextSourceError && !sessionDetails && <p className="notice bad context-source-error" role="alert">{contextSourceError}</p>}
       {sessionDetails && <SessionDetails key={sessionDetails.token} sessionId={sessionDetails.sessionId} basis={sessionDetails.basis}
+        initialRunId={sessionDetails.initialRunId} initialSnapshotId={sessionDetails.initialSnapshotId}
+        onHistoryBranch={historyBranchSaved} onHistoryFork={selectFork}
+        onOpenOwner={(sessionId, runId, context, snapshotId) => openSessionDetails(sessionId, context && runId !== null ? { sessionId, runId, context } : null, runId, snapshotId)}
         navigationToken={sessionDetails.token} hostEpoch={workspaceHostEpoch.current} hostReady={Boolean(state?.ready)} refreshToken={contextRefresh}
         sourceError={contextSourceError} onClose={closeSessionDetails} onRunChange={id => { contextNavigation.current++; contextTarget.current = { sessionId: sessionDetails.sessionId, runId: id }; }}
         onOpenCandidateBasis={candidate => void openCandidateContextBasis(candidate)} />}
@@ -3210,6 +3240,7 @@ function AgentChatPanel({
   onAppend,
   canAppend,
   sessionInputs,
+  inputReadError,
   hasOlderInputs,
   onLoadOlderInputs,
   unknownInput,
@@ -3258,6 +3289,7 @@ function AgentChatPanel({
   onAppend(mode: 'steer' | 'followUp'): void;
   canAppend: boolean;
   sessionInputs: readonly SessionInputSnapshot[];
+  inputReadError: string | null;
   hasOlderInputs: boolean;
   onLoadOlderInputs(): void;
   unknownInput: boolean;
@@ -3350,6 +3382,7 @@ function AgentChatPanel({
         {item.limits && <p className="chat-save-feedback">{item.limits}</p>}
       </div>)}
     </div>
+    {inputReadError && <p className="chat-save-feedback" role="alert">{inputReadError}</p>}
     {sessionInputs.length > 0 && <details className="chat-input-queue" open><summary>Inputs · {sessionInputs.length}</summary>
       <ul>{sessionInputs.slice().reverse().map(item => <li key={item.inputId} data-testid="session-input" data-input-id={item.inputId}>
         <span>Input {item.clientSequence} · {item.mode} · Run {item.runId ?? 'unconfirmed'}</span>

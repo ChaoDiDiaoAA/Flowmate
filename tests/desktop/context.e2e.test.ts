@@ -211,7 +211,19 @@ async function denseFixture() {
     import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
     import { resolveProductPaths } from '@flowmate/shared';
     import { invoiceHeaderFields, invoiceFieldDisplayValue } from '@flowmate/contracts';
+    import * as contracts from '@flowmate/contracts';
     import { join } from 'node:path';
+    const validationProfile={};
+    for(const name of ['ContextObservationsSchema','ContextSnapshotJsonSchema','NativeSessionHistorySchema','NativeHistoryRecoveryBundleSchema']) {
+      const schema=contracts[name];
+      for(const method of ['parse','safeParse']) {
+        const original=schema[method].bind(schema), key=name+'.'+method;
+        validationProfile[key]={count:0,ms:0,firstStack:null};
+        schema[method]=(...args)=>{const start=performance.now();try{return original(...args);}finally{
+          const item=validationProfile[key];item.count++;item.ms+=performance.now()-start;
+          item.firstStack??=new Error().stack;}};
+      }
+    }
     const need=value=>{if(!value.ok)throw new Error(value.error.code+': '+value.error.message);return value.data;};
     const input=JSON.parse(await Bun.stdin.text()); const paths=need(resolveProductPaths(input.userData));
     let enter;const entered=new Promise(resolve=>enter=resolve);let release;const barrier=new Promise(resolve=>release=resolve);
@@ -247,7 +259,7 @@ async function denseFixture() {
       workspace=need(await app.updateWorkspace({expectedRevision:workspace.revision,change:{kind:'document',documentId:secondDocument.documentRef.id}}));
       need(await app.hideJob(task.job.jobId)); console.error('Dense seed: ready for desktop');
       console.log(JSON.stringify({sessionId:session.sessionId,runId:accepted.runId,otherSessionId:b.sessionId,otherRunId:br.runId,jobId:task.job.jobId,candidateId:model.candidateId,humanId:human.candidate.candidateId,originalContext:original.context}));
-    } finally {release();need(await app.close());}
+    } finally {release();need(await app.close());console.error('T08 dense validation profile '+JSON.stringify(validationProfile));}
   `;
   let stdout = '', stderr = '';
   const child = spawn(process.env.FLOWMATE_BUN_EXECUTABLE || 'bun', ['--no-env-file', '--eval', script], { cwd: repository, env: cleanEnvironment(), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -271,6 +283,35 @@ async function denseFixture() {
   const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
   return { app, page, userData, seed, provider, requests: () => requests, rows, tables };
 }
+
+it('P9 T08 forks through History while preserving real invoice Job candidates and original evidence bytes', async () => {
+  it.setTimeout(90_000);
+  const f = await denseFixture(); let failure: Error | undefined;
+  try {
+    const baseline = await f.page.evaluate(() => window.flowmate.readWorkspace()); if (!baseline.ok) throw new Error(baseline.error.code);
+    const requests = f.requests();
+    await f.page.getByRole('textbox', { name: 'Message to model' }).fill('Keep the current invoice draft');
+    await f.page.getByRole('button', { name: 'Session details', exact: true }).click();
+    const panel = f.page.getByRole('dialog', { name: 'Session details', exact: true }); await panel.getByRole('button', { name: 'Browse history' }).click();
+    const history = await f.page.evaluate(id => window.flowmate.querySessionHistory({ sessionId: id }), f.seed.otherSessionId);
+    if (!history.ok) throw new Error(history.error.code);
+    const entry = history.data.items.find(item => item.canSelect && item.isLeaf)!;
+    await panel.getByTestId(`history-entry-${entry.entryId}`).click(); await panel.getByRole('button', { name: 'Fork chat', exact: true }).click();
+    await panel.getByLabel('Fork title').fill('Independent invoice chat'); await panel.getByRole('button', { name: 'Confirm fork' }).click();
+    await expect(panel).toHaveCount(0);
+    await expect(f.page.getByRole('textbox', { name: 'Message to model' })).toHaveValue('');
+    const workspace = await f.page.evaluate(() => window.flowmate.readWorkspace()); if (!workspace.ok) throw new Error(workspace.error.code);
+    expect(workspace.data.sessionId).not.toBe(f.seed.otherSessionId);
+    expect(workspace.data).toEqual({ ...baseline.data, sessionId: workspace.data.sessionId, revision: baseline.data.revision + 1, updatedAt: workspace.data.updatedAt });
+    expect(f.requests()).toBe(requests);
+    await it.info().attach('fork-preserved-invoice-workspace', { body: Buffer.from(JSON.stringify({ before: baseline.data, after: workspace.data, requests })), contentType: 'application/json' });
+  } catch (error) { failure = error as Error; throw error; }
+  finally { await f.provider.stop(); await closeDesktopFixture(f.app, f.userData, failure); }
+  const db = new Database(join(f.userData, 'data/app.sqlite'), { readonly: true });
+  try { for (const table of f.tables) expect(db.query(`SELECT * FROM ${table} ORDER BY id`).all()).toEqual(f.rows[table]);
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); }
+  finally { db.close(); }
+});
 
 it('starts a new snapshot refresh while the previous snapshot refresh is still pending', async () => {
   const f = await fixture(true); let failure: Error | undefined;

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { SessionSnapshotSchema } from './runtime.ts';
 import type { DbId, NativeHistoryAppendContext, NativeSessionHistory, Result } from './runtime.ts';
 import { ContextErrorSchema, NativeInputContextBindingSchema } from './context.ts';
-import { normalizeRenameSessionRequest } from './schemas.ts';
+import { normalizeSessionTitle } from './session-title.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const HistorySafeIntegerSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -248,9 +248,9 @@ export const SessionHistoryEntryDetailSchema = z.object({ summary: HistoryEntryS
   }).readonly();
 export type SessionHistoryEntryDetail = z.infer<typeof SessionHistoryEntryDetailSchema>;
 const normalizedTitle = z.string().transform((title, context) => {
-  const result = normalizeRenameSessionRequest({ sessionId: 1, title });
-  if (!result.ok) { issue(context, 'Session title is invalid.'); return z.NEVER; }
-  return result.data.title;
+  const result = normalizeSessionTitle(title);
+  if (result === null) { issue(context, 'Session title is invalid.'); return z.NEVER; }
+  return result;
 });
 export const ForkSessionRequestSchema = z.object({ sourceSessionId: id, expected: HistoryCommitStateSchema,
   targetEntryId: NativeEntryIdSchema, title: normalizedTitle, clientOperationId: z.string().uuid().transform(value => value.toLowerCase()) }).strict();
@@ -280,6 +280,8 @@ function resultSchema<T extends z.ZodTypeAny>(data: T, maximumBytes: number) {
 export const NativeHistoryPageResultSchema = resultSchema(NativeHistoryPageSchema, 1048576);
 export const SessionHistoryEntryResultSchema = resultSchema(SessionHistoryEntryDetailSchema, 131072);
 export const ForkSessionResponseSchema = resultSchema(ForkSessionResultSchema, 131072);
+export const BranchSessionResponseSchema = resultSchema(z.object({ session: SessionSnapshotSchema,
+  leafId: NativeEntryIdSchema, entryCount: HistorySafeIntegerSchema }).strict(), 131072);
 export interface MemoryStore {
   load(sessionId: DbId): Result<StoredNativeHistory | null>;
   commit(input: HistoryCommitInput): Result<HistoryCommitReceipt>;
