@@ -168,7 +168,7 @@ describe('P4 native messages and projection', () => {
     const cycle: Record<string, unknown> = {}; cycle.self = cycle;
     expect(api().validateModelMessages([{ ...result, details: cycle }])).toMatchObject({ ok: false });
     expect(api().validateModelMessages([{ ...user, content: [{ type: 'image', data: 'a', mimeType: 'image/png' }] }]))
-      .toMatchObject({ ok: false });
+      .toMatchObject({ ok: true });
     for (const invalid of [{ ...valid, leafId: 'missing' }, { ...valid, header: { ...valid.header, version: 2 } },
       { ...valid, entries: [valid.entries[0]!, { ...valid.entries[1]!, parentId: 'missing' }] },
       { ...valid, entries: [valid.entries[0]!, { ...valid.entries[1]!, id: valid.entries[0]!.id }] }]) {
@@ -198,7 +198,7 @@ describe('P4 native messages and projection', () => {
     ];
     for (const message of closed) expect(api().validateModelMessages([message as AgentMessage]).ok).toBe(false);
     expect(api().validateNativeHistory({ ...metadata, entries: [{ ...metadata.entries[0]!, type: 'custom_message',
-      customType: 'fixture', content: 'hidden', display: false, message: undefined }] }).ok).toBe(false);
+      customType: 'fixture', content: 'hidden', display: false, message: undefined }] }).ok).toBe(true);
   });
 
   it('projects only safe text/call identities and never mutates signed authoritative messages', () => {

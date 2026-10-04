@@ -1,19 +1,18 @@
 import { z } from 'zod';
 import type { Message } from '@earendil-works/pi-ai';
-import { SessionManager, type AgentSession, type FileEntry } from '@earendil-works/pi-coding-agent';
+import { type SessionEntry } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok, InputRecordV2Schema, invoiceToolSchemas, INVOICE_TOOL_NAMES,
   SessionMessageViewSchema, FillInvoiceFormOutputSchema, SessionInputContentSchema, formatExecutionPrompt, WorkspaceContextSchema } from '@flowmate/contracts';
 import type { DbId, MessageDisplayBlock, MessageRunInput, NativeMessageProjectionInput,
   NativeSessionHistory, Result, SessionMessageView, SessionMessagesPage, MessageSessionInput } from '@flowmate/contracts';
 export { formatExecutionPrompt } from '@flowmate/contracts';
-
-type AgentMessage = AgentSession['messages'][number];
+import { validateNativeHistory, validateLlmMessages, managerFor } from './memory/history.ts';
+export { validateNativeHistory } from './memory/history.ts';
 
 const textLimit = 65_536;
 const pageLimit = 1_048_576;
 const id = z.string().min(1);
 const finite = z.number().finite();
-const date = z.string().datetime({ offset: true });
 const dbId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const text = z.object({ type: z.literal('text'), text: z.string(), textSignature: z.string().optional() }).passthrough();
 const image = z.object({ type: z.literal('image'), data: z.string(), mimeType: id }).passthrough();
@@ -28,7 +27,7 @@ const diagnostics = z.object({ type: z.string(), timestamp: finite,
   error: z.object({ name: z.string().optional(), message: z.string(), stack: z.string().optional(),
     code: z.union([z.string(), finite]).optional() }).passthrough().optional(), details: z.record(z.unknown()).optional() }).passthrough();
 const messageSchema = z.discriminatedUnion('role', [
-  z.object({ role: z.literal('user'), content: z.union([z.string(), z.array(text)]), timestamp: finite }).passthrough(),
+  z.object({ role: z.literal('user'), content: z.union([z.string(), z.array(z.discriminatedUnion('type', [text, image]))]), timestamp: finite }).passthrough(),
   z.object({ role: z.literal('assistant'), content: z.array(z.discriminatedUnion('type', [text, thinking, toolCall])),
     api: id, provider: id, model: z.string(), usage,
     stopReason: z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']), timestamp: finite,
@@ -41,19 +40,6 @@ const messageSchema = z.discriminatedUnion('role', [
     isError: z.boolean(), timestamp: finite, details: z.unknown().optional(), usage: usage.optional(),
     addedToolNames: z.array(z.string()).optional() }).passthrough(),
 ]);
-const entryBase = { id, parentId: id.nullable(), timestamp: date };
-const entrySchema = z.discriminatedUnion('type', [
-  z.object({ ...entryBase, type: z.literal('message'), message: messageSchema }).passthrough(),
-  z.object({ ...entryBase, type: z.literal('model_change'), provider: z.string(), modelId: z.string() }).passthrough(),
-  z.object({ ...entryBase, type: z.literal('thinking_level_change'), thinkingLevel: z.string() }).passthrough(),
-  z.object({ ...entryBase, type: z.literal('custom'), customType: id, data: z.unknown().optional() }).passthrough(),
-  z.object({ ...entryBase, type: z.literal('label'), targetId: id, label: z.string().optional() }).passthrough(),
-  z.object({ ...entryBase, type: z.literal('session_info'), name: z.string().optional() }).passthrough(),
-]);
-const historySchema = z.object({ storageVersion: z.literal(1),
-  header: z.object({ type: z.literal('session'), id, version: z.literal(3), timestamp: date, cwd: z.string(),
-    parentSession: z.string().optional() }).strict(),
-  entries: z.array(entrySchema), leafId: id.nullable(), unusable: z.boolean() }).strict();
 const runInputSchema = z.object({ runId: dbId, goalMode: z.enum(['answer', 'save-candidate', 'fill-form']).nullable(),
   workingDirectory: z.string().min(1).max(4096).optional(),
   workspaceContext: WorkspaceContextSchema.optional(),
@@ -84,67 +70,7 @@ function jsonSafe(value: unknown, path = new Set<object>()): boolean {
 function invalid<T = never>(): Result<T> {
   return fail(appError('session_history_invalid', 'session', 'Conversation history is incompatible or incomplete.'));
 }
-function managerFor(history: NativeSessionHistory): SessionManager {
-  // SessionManager may apply SDK migration/normalization, so it only receives a detached validated snapshot.
-  const entries = structuredClone([history.header, ...history.entries]) as FileEntry[];
-  const manager = SessionManager.inMemory(history.header.cwd, undefined, entries);
-  if (history.leafId === null) manager.resetLeaf(); else manager.branch(history.leafId);
-  return manager;
-}
-function validSequence(messages: readonly Message[], complete: boolean): boolean {
-  const calls = new Map<string, string>();
-  const pending = new Map<string, string>();
-  for (const message of messages) {
-    if (message.role === 'toolResult') {
-      if (pending.get(message.toolCallId) !== message.toolName) return false;
-      pending.delete(message.toolCallId);
-    } else {
-      if (pending.size > 0) return false;
-      if (message.role === 'assistant') for (const block of message.content) {
-        if (block.type !== 'toolCall') continue;
-        if (calls.has(block.id)) return false;
-        calls.set(block.id, block.name); pending.set(block.id, block.name);
-      }
-    }
-  }
-  return !complete || pending.size === 0;
-}
-
-export function validateModelMessages(messages: readonly AgentMessage[]): Result<void> {
-  try {
-    if (!jsonSafe(messages)) return invalid();
-    const parsed = z.array(messageSchema).safeParse(messages);
-    if (!parsed.success || !validSequence(parsed.data as Message[], true)) return invalid();
-    return ok(undefined);
-  } catch { return invalid(); }
-}
-
-export function validateNativeHistory(history: NativeSessionHistory): Result<void> {
-  try {
-    if (!jsonSafe(history)) return invalid();
-    const parsed = historySchema.safeParse(history);
-    if (!parsed.success) return invalid();
-    const known = new Set<string>(); const toolIds = new Set<string>();
-    for (const entry of parsed.data.entries) {
-      if (known.has(entry.id) || (entry.parentId !== null && !known.has(entry.parentId))) return invalid();
-      if (entry.type === 'label' && !known.has(entry.targetId)) return invalid();
-      known.add(entry.id);
-      if (entry.type === 'message' && entry.message.role === 'assistant') for (const block of entry.message.content) {
-        if (block.type !== 'toolCall') continue;
-        if (toolIds.has(block.id)) return invalid();
-        toolIds.add(block.id);
-      }
-    }
-    if (history.leafId !== null && !known.has(history.leafId)) return invalid();
-    const manager = managerFor(history);
-    // ponytail: full path validation is O(n²); cache validated prefixes in P9 only if long-history measurements justify it.
-    for (const entry of history.entries) if (entry.type === 'message') {
-      const path = manager.getBranch(entry.id).filter(item => item.type === 'message').map(item => item.message) as Message[];
-      if (!validSequence(path, false)) return invalid();
-    }
-    return ok(undefined);
-  } catch { return invalid(); }
-}
+export const validateModelMessages = validateLlmMessages;
 
 export type MessageViewContext = {
   entryId: string | null; runId: DbId | null; liveOrdinal: number | null;
@@ -166,7 +92,7 @@ function limitedBlocks(blocks: MessageDisplayBlock[]): { blocks: MessageDisplayB
   return { blocks: output, truncated };
 }
 function nativeUserText(content: string | { type: 'text'; text: string }[]): string {
-  return typeof content === 'string' ? content : content.map(block => block.text).join('');
+  return typeof content === 'string' ? content : content.filter(block => block.type === 'text').map(block => block.text).join('');
 }
 function resultSummary(message: Extract<Message, { role: 'toolResult' }>): string {
   if (message.isError) return 'The tool returned an error. See the error details.';
@@ -300,7 +226,7 @@ export function projectSessionMessages(input: NativeMessageProjectionInput): Res
       if (bindings.get(binding.entryId) !== binding.runId || !dbId.safeParse(binding.liveOrdinal).success || live.has(binding.entryId) || ordinals.has(key)) return invalid();
       live.set(binding.entryId, binding.liveOrdinal); ordinals.add(key);
     }
-    const path = managerFor(input.history).getBranch().filter(entry => entry.type === 'message');
+    const path = managerFor(input.history).getBranch().filter((entry): entry is Extract<SessionEntry, { type: 'message' }> => entry.type === 'message' && ['user', 'assistant', 'toolResult'].includes(entry.message.role));
     let end = path.length;
     if (input.beforeEntryId !== undefined) {
       end = path.findIndex(entry => entry.id === input.beforeEntryId);

@@ -6,12 +6,12 @@ import { isAbsolute } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {
   createAgentSession,
+  sessionEntryToContextMessages,
+  convertToLlm,
   createExtensionRuntime,
   ModelRuntime,
   SessionManager,
   SettingsManager,
-  type SessionEntry,
-  type SessionHeader,
   type AgentSession,
   type AgentToolResult,
   type ResourceLoader,
@@ -30,6 +30,11 @@ import type {
   NativeObservation,
   NativeSessionHistory,
   NativeContextBindingSeed,
+  NativeHistoryRecoverySeed,
+  HistoryCommitState,
+  HistoryCommitReceipt,
+  NativeHistoryWrite,
+  NativeDerivedContextBinding,
   NativeInputContextBinding,
   NativeToolResultContextBinding,
   RequestContextBinding,
@@ -48,7 +53,6 @@ import type {
   ToolDefinition,
   UsageRecordV1,
   UsageRecordV2,
-  NativeHistoryAppendContext,
   NativeEntryLiveBinding,
   NativeMessageProjectionInput,
   SessionMessagesPage,
@@ -64,6 +68,9 @@ import { getNativeToolParameters } from './native-tools.ts';
 import { projectSessionEvent } from './events.ts';
 import { checkPayload, checkWire, preparePayloadCodec, sdkRequestId } from './context-evidence.ts';
 import { formatExecutionPrompt, validateNativeHistory, validateModelMessages, projectSessionMessages, projectMessageView } from './messages.ts';
+
+import { managerFor, validateRecovery, validateAgentContext, validateLlmMessages, referenceIds, inspectSessionHistory, buildForkSessionHistory } from './memory/history.ts';
+import { PiMemoryAdapter } from './memory/persistence.ts';
 
 const maxContextBytes = RUNTIME_CONFIG.llmPayload.maxChatContextBytes;
 const maxOutputBytes = RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
@@ -145,7 +152,13 @@ type SessionRecord = {
   preparing: boolean;
   running: boolean;
   unusable: boolean;
-  historyWriter?: (history: NativeSessionHistory, context?: NativeHistoryAppendContext) => Result<void>;
+  historyWriter?: (write: NativeHistoryWrite) => Result<HistoryCommitReceipt>;
+  memory?: PiMemoryAdapter;
+  recoverySeed?: NativeHistoryRecoverySeed;
+  receipt?: HistoryCommitState;
+  nativeObjects?: WeakMap<object, { entryId: string; original: unknown }>;
+  convertedOrigins?: WeakMap<object, NativeDerivedContextBinding>;
+  inheritedToolIds?: Set<string>;
   persistenceWatched?: boolean;
   lastSavedHistory?: NativeSessionHistory;
   liveBindings: Map<string, NativeEntryLiveBinding>;
@@ -353,24 +366,20 @@ export class PiAgentAdapter implements AgentPort {
     } catch { return fail(appError('session_history_invalid', 'session', 'Native conversation cannot be safely serialized.')); }
   }
 
-  public restoreSession(nativeSessionId: string, history: NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
+  public restoreSession(nativeSessionId: string, history: NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void> {
     if (this.closed || this.sessions.has(nativeSessionId)) return fail(appError('session_history_invalid', 'session', 'Conversation cannot be restored in this state.'));
     const cwd = this.dependencies.cwd ?? process.cwd();
-    const valid = validateNativeHistory(history);
+    const valid = validateRecovery(history, seed, commit);
     if (!valid.ok || history.header.id !== nativeSessionId || history.header.cwd !== cwd || history.unusable) {
       return fail(appError('session_history_invalid', 'session', 'Saved conversation history is incompatible. Start a new chat.'));
     }
     try {
-      const manager = SessionManager.inMemory(cwd, undefined,
-        [history.header as SessionHeader, ...history.entries as unknown as SessionEntry[]]);
-      if (history.leafId === null) manager.resetLeaf();
-      else if (manager.getLeafId() !== history.leafId) manager.branch(history.leafId);
-      if (manager.getSessionId() !== nativeSessionId || manager.getEntries().length !== history.entries.length) throw new Error('native_history_mismatch');
-      manager.buildSessionContext();
+      const manager = managerFor(history);
       const record: SessionRecord = { manager, preparing: false, running: false, unusable: false,
         lastSavedHistory: structuredClone(history), liveBindings: new Map(), contextEntries: new Map(),
         contextMessages: new WeakMap(), contextSeeded: false };
-      const seeded = this.reseedContext(record, bindings);
+      record.recoverySeed = structuredClone(seed); record.receipt = structuredClone(commit);
+      const seeded = this.reseedContext(record, seed.inputs);
       if (!seeded.ok) return seeded;
       this.sessions.set(nativeSessionId, record);
       return ok(undefined);
@@ -400,28 +409,43 @@ export class PiAgentAdapter implements AgentPort {
       }
     }
     const messages = new WeakMap<object, NativeInputContextBinding>();
+    const nativeObjects = new WeakMap<object, { entryId: string; original: unknown }>();
+    const assembled: AgentSession['messages'] = [];
     for (const entry of record.manager.buildContextEntries()) {
-      if (entry.type !== 'message' || entry.message.role !== 'user') continue;
-      const source = entries.get(entry.id);
-      if (source) messages.set(entry.message, source);
-    }
-    if (bindings !== undefined || record.contextSeeded) {
-      for (const message of record.manager.buildSessionContext().messages) {
-        if (message.role === 'user' && !messages.has(message))
-          return fail(appError('context_binding_unknown', 'runtime', 'Current input provenance is unavailable.'));
+      for (const message of sessionEntryToContextMessages(entry)) {
+        assembled.push(message); nativeObjects.set(message, { entryId: entry.id, original: structuredClone(message) });
+        if (message.role === 'user') {
+          const source = entries.get(entry.id);
+          if (source) messages.set(message, source);
+          else if (bindings !== undefined || record.contextSeeded) return fail(appError('context_binding_unknown', 'runtime', 'Current input provenance is unavailable.'));
+        }
       }
     }
+    // Install this exact array: helper-created derived objects are never interchangeable.
+    if (record.session) record.session.agent.state.messages = assembled;
+    record.nativeObjects = nativeObjects;
+    const origins = new Map(record.recoverySeed?.origins.map(o => [o.nativeEntryId, o]));
+    record.inheritedToolIds = new Set(record.manager.getEntries().flatMap(entry => entry.type === 'message'
+      && entry.message.role === 'assistant' && origins.get(entry.id)?.originSessionId !== undefined
+      && origins.get(entry.id)!.originSessionId !== record.recoverySeed?.sessionId
+      ? entry.message.content.flatMap(block => block.type === 'toolCall' ? [block.id] : []) : []));
     record.contextEntries = entries; record.contextMessages = messages;
     record.contextSeeded ||= bindings !== undefined;
     return ok(undefined);
   }
 
-  public watchSession(nativeSessionId: string, save: (history: NativeSessionHistory, context?: NativeHistoryAppendContext) => Result<void>): Result<void> {
+  public watchSession(nativeSessionId: string, commit: HistoryCommitState, seed: NativeHistoryRecoverySeed, save: (write: NativeHistoryWrite) => Result<HistoryCommitReceipt>): Result<void> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
-    record.historyWriter = save;
     const initial = this.exportSession(nativeSessionId);
-    if (initial.ok) record.lastSavedHistory ??= initial.data;
+    if (!initial.ok || typeof save !== 'function' || !validateRecovery(initial.data, seed, commit).ok
+      || record.recoverySeed && record.recoverySeed.sessionId !== seed.sessionId
+      || record.receipt && !isDeepStrictEqual(record.receipt, commit)
+      || record.recoverySeed && !isDeepStrictEqual(record.recoverySeed, seed)) return fail(appError('session_history_invalid', 'session', 'Saved history receipt or origins are inconsistent.'));
+    record.historyWriter = save;
+    record.memory = new PiMemoryAdapter(initial.data, commit, seed, save);
+    record.lastSavedHistory = structuredClone(initial.data); record.receipt = structuredClone(commit); record.recoverySeed = structuredClone(seed);
+    const reseeded = this.reseedContext(record, seed.inputs); if (!reseeded.ok) return reseeded;
     if (record.persistenceWatched) return ok(undefined);
     record.persistenceWatched = true;
     const manager = record.manager;
@@ -442,9 +466,9 @@ export class PiAgentAdapter implements AgentPort {
         ? { entryId: entry.id, runId: active.runId, ...(inputId === undefined ? {} : { inputId }),
           ...(resultInputIds?.length ? { resultInputIds } : {}) } : undefined;
       const snapshot = this.exportSession(nativeSessionId);
-      let saved: Result<void>;
+      let saved: Result<HistoryCommitReceipt>;
       let source: NativeInputContextBinding | undefined;
-      if (entry.type === 'message' && active && entry.message.role === 'user') {
+      if (entry.type === 'message' && active && entry.message.role === 'user' && ordinal !== undefined) {
         const state = inputId === undefined ? undefined : active.inputs.get(inputId);
         source = { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null,
           snapshotId: state?.contextSnapshotId ?? null };
@@ -454,15 +478,14 @@ export class PiAgentAdapter implements AgentPort {
           this.failToolRun(record, active, error); throw error;
         }
       }
+      if (entry.type === 'message' && entry.message.role === 'user' && !active)
+        source = { nativeEntryId: entry.id, originRunId: null, inputId: null, snapshotId: null };
       try {
-        saved = entry.type === 'message' && active && ordinal === undefined
-          ? fail(appError('session_history_invalid', 'session', 'Native message has no actual live identity.'))
-          : snapshot.ok ? record.historyWriter!(snapshot.data, context) : snapshot;
+        saved = snapshot.ok ? record.memory!.save(snapshot.data, context ? [context] : [], source ? [source] : []) : snapshot;
       }
       catch { saved = fail(appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true)); }
       if (!saved.ok) {
-        record.historyFailure = saved.error.code === 'session_history_invalid' ? saved.error
-          : appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true);
+        record.historyFailure = saved.error;
         record.unusable = true;
         if (active) {
           if (entry.type === 'message' && ordinal !== undefined) this.publishMessage(record, active, entry.message, ordinal, 'failed', 'ended');
@@ -470,7 +493,16 @@ export class PiAgentAdapter implements AgentPort {
         }
         throw new Error('native_history_write_failed');
       }
-      if (snapshot.ok) record.lastSavedHistory = structuredClone(snapshot.data);
+      record.lastSavedHistory = structuredClone(record.memory!.lastSavedHistory);
+      record.receipt = structuredClone(record.memory!.commit); record.recoverySeed = structuredClone(record.memory!.seed);
+      if (entry.type === 'message') record.nativeObjects?.set(entry.message, { entryId: entry.id, original: structuredClone(entry.message) });
+      if (entry.type === 'custom_message' && record.session?.isIdle) {
+        // Fixed 0.85.1 idle custom push precedes this append: its actual array tail is the source object.
+        const actual = record.session.messages.at(-1);
+        if (actual?.role === 'custom' && !record.nativeObjects?.has(actual) && actual.customType === entry.customType
+          && actual.display === entry.display && isDeepStrictEqual(actual.content, entry.content) && isDeepStrictEqual(actual.details, entry.details))
+          record.nativeObjects?.set(actual, { entryId: entry.id, original: structuredClone(actual) });
+      }
       if (source && entry.type === 'message') {
         const frozen = Object.freeze(structuredClone(source));
         record.contextEntries.set(entry.id, frozen); record.contextMessages.set(entry.message, frozen);
@@ -487,6 +519,9 @@ export class PiAgentAdapter implements AgentPort {
     };
     return ok(undefined);
   }
+
+  public inspectSessionHistory = inspectSessionHistory;
+  public buildForkSessionHistory = buildForkSessionHistory;
 
   public projectSessionMessages(input: NativeMessageProjectionInput): Result<Pick<SessionMessagesPage, 'items' | 'nextBeforeEntryId'>> {
     const record = this.sessions.get(input.history.header.id);
@@ -546,23 +581,25 @@ export class PiAgentAdapter implements AgentPort {
     finally { record.preparing = false; }
   }
 
-  public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
+  public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
     if (record.preparing || record.running || record.session && !record.session.isIdle)
       return fail(appError('agent_session_busy', 'session', 'Conversation is busy.'));
     try {
       const current = this.exportSession(nativeSessionId);
-      if (!validateNativeHistory(committed).ok || !current.ok || committed.unusable
+      if (!validateRecovery(committed, seed, commit).ok || record.recoverySeed && record.recoverySeed.sessionId !== seed.sessionId || !current.ok || committed.unusable
         || !isDeepStrictEqual(JSON.parse(JSON.stringify(current.data.header)), JSON.parse(JSON.stringify(committed.header)))
         || !isDeepStrictEqual(JSON.parse(JSON.stringify(current.data.entries)), JSON.parse(JSON.stringify(committed.entries))))
         throw new Error('branch_restore_mismatch');
       if (committed.leafId === null) record.manager.resetLeaf(); else record.manager.branch(committed.leafId);
-      if (record.session) record.session.agent.state.messages = record.manager.buildSessionContext().messages;
+
       const restored = this.exportSession(nativeSessionId);
       if (!restored.ok || !isDeepStrictEqual(JSON.parse(JSON.stringify(restored.data)), JSON.parse(JSON.stringify(committed))))
         throw new Error('branch_restore_unconfirmed');
-      const seeded = this.reseedContext(record, bindings);
+      record.recoverySeed = structuredClone(seed); record.receipt = structuredClone(commit);
+      if (record.historyWriter) record.memory = new PiMemoryAdapter(committed, commit, seed, record.historyWriter);
+      const seeded = this.reseedContext(record, seed.inputs);
       if (!seeded.ok) { record.unusable = true; return seeded; }
       record.lastSavedHistory = structuredClone(committed);
       return ok(undefined);
@@ -696,6 +733,8 @@ export class PiAgentAdapter implements AgentPort {
       return fail(appError('tool_runtime_unavailable', 'runtime', 'Run 获准的工具未在 Pi Runtime 注册。', true));
     }
 
+    const previousSettings = record.manager.buildSessionContext();
+    const prepareStartCount = record.manager.getEntries().length;
     record.preparing = true;
     let replacingSession = false;
     let sessionCreationStarted = false;
@@ -757,6 +796,8 @@ export class PiAgentAdapter implements AgentPort {
         const beforeToolCall = session.agent.beforeToolCall;
         session.agent.beforeToolCall = async (context, hookSignal) => {
           const toolCall = context.toolCall;
+          const inherited = this.guardInheritedTool(record, toolCall.id);
+          if (!inherited.ok) return { block: true, reason: inherited.error.message };
           const original = structuredClone(toolCall);
           const request = record.active?.toolRequests.get(context.toolCall.id);
           if (request) request.failureStage = 'sdk_before';
@@ -817,14 +858,47 @@ export class PiAgentAdapter implements AgentPort {
         this.installInputCapture(record, session);
         const nativeConvert = session.agent.convertToLlm.bind(session.agent);
         session.agent.convertToLlm = async (messages) => {
+          const rejectConversion = (error: ReturnType<typeof appError>): never => {
+            if (record.active) this.failToolRun(record, record.active, error); throw error;
+          };
           const allowed = this.verifyModelUse(record);
-          const valid = this.validateMessages(record, messages);
+          const valid = this.validateMessages(record, messages, true);
           if (!allowed.ok || !valid.ok) {
             const error = !allowed.ok ? allowed.error : !valid.ok ? valid.error : appError('session_history_invalid', 'session', 'Invalid model messages.');
             if (record.active) this.failToolRun(record, record.active, error);
             throw new Error(error.code);
           }
+          const nativeProof = messages.map(message => record.nativeObjects?.get(message));
+          for (let index = 0; index < messages.length; index++) {
+            const message = messages[index]!;
+            if ((record.contextSeeded || ['bashExecution', 'custom', 'branchSummary', 'compactionSummary'].includes(message.role))
+              && (!nativeProof[index] || !isDeepStrictEqual(message, nativeProof[index]!.original)))
+              rejectConversion(appError('context_binding_unknown', 'runtime', 'Native context object provenance is unavailable.'));
+          }
           const converted = await nativeConvert(messages);
+          const structure = validateLlmMessages(converted); if (!structure.ok) rejectConversion(structure.error);
+          // The fixed converter drops only excluded bash. Compare every actual output against its single source conversion.
+          const derived = new WeakMap<object, NativeDerivedContextBinding>();
+          let outputIndex = 0;
+          for (let inputIndex = 0; inputIndex < messages.length; inputIndex++) {
+            const message = messages[inputIndex]!, expected = convertToLlm([message]);
+            if (expected.length === 0) continue;
+            const output = converted[outputIndex++];
+            if (!output || !isDeepStrictEqual(output, expected[0])
+              || ['user', 'assistant', 'toolResult'].includes(message.role) && output !== message)
+              rejectConversion(appError('context_binding_unknown', 'runtime', 'Converted context no longer preserves its source.'));
+            if (!['user', 'assistant', 'toolResult'].includes(message.role)) {
+              const proof = nativeProof[inputIndex], entry = proof && record.manager.getEntry(proof.entryId);
+              const origin = record.recoverySeed?.origins.find(o => o.nativeEntryId === proof?.entryId);
+              if (!entry || !origin || !['message', 'custom_message', 'branch_summary', 'compaction'].includes(entry.type))
+                return rejectConversion(appError('context_binding_unknown', 'runtime', 'Native context origin is unavailable.'));
+              derived.set(output, { nativeEntryId: entry.id, originSessionId: origin.originSessionId,
+                entryType: entry.type as NativeDerivedContextBinding['entryType'], messageRole: message.role as NativeDerivedContextBinding['messageRole'],
+                contextMessageIndex: inputIndex, referenceEntryIds: referenceIds(entry) });
+            }
+          }
+          if (outputIndex !== converted.length) rejectConversion(appError('context_binding_unknown', 'runtime', 'Converted context contains unproven messages.'));
+          record.convertedOrigins = derived;
           const verified = this.validateMessages(record, converted);
           if (!verified.ok) {
             if (record.active) this.failToolRun(record, record.active, verified.error);
@@ -840,6 +914,17 @@ export class PiAgentAdapter implements AgentPort {
         } catch {
           return fail(record.historyFailure ?? appError('agent_model_switch_failed', 'session', '所选模型无法在此会话中使用。'));
         }
+      }
+      if (session) {
+        const appended = record.manager.getEntries().slice(prepareStartCount);
+        const effectiveModel = session.model;
+        if (effectiveModel && (previousSettings.model?.provider !== effectiveModel.provider || previousSettings.model?.modelId !== effectiveModel.id)
+          && !appended.some(e => e.type === 'model_change' && e.provider === effectiveModel.provider && e.modelId === effectiveModel.id))
+          record.manager.appendModelChange(effectiveModel.provider, effectiveModel.id);
+        if (previousSettings.thinkingLevel !== session.thinkingLevel
+          && !record.manager.getEntries().slice(prepareStartCount).some(e => e.type === 'thinking_level_change' && e.thinkingLevel === session.thinkingLevel))
+          record.manager.appendThinkingLevelChange(session.thinkingLevel);
+        if (record.historyFailure) return fail(record.historyFailure);
       }
       if (session) {
         const seeded = this.reseedContext(record);
@@ -873,7 +958,7 @@ export class PiAgentAdapter implements AgentPort {
       };
       const agent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts = options?.runtimeBudget
         ? { ...taskAgent, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : taskAgent;
-      record.snapshot = { ...snapshot, ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent };
+      record.snapshot = { ...snapshot, historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent };
       return ok({
         snapshot: record.snapshot,
         execute: (input, executionSignal, observe) => this.execute(record, nativeSessionId, input, executionSignal, observe),
@@ -965,12 +1050,16 @@ export class PiAgentAdapter implements AgentPort {
     const hooks = active.input.contextHooks!;
     const includedBindings: NativeInputContextBinding[] = [];
     const includedToolResults: NativeToolResultContextBinding[] = [];
+    const includedNativeContexts: NativeDerivedContextBinding[] = [];
     try {
       for (const message of context.messages) {
         if (message.role === 'user') {
+          const native = record.convertedOrigins?.get(message);
+          if (native) { includedNativeContexts.push(native); } else {
           const source = record.contextMessages.get(message);
           if (!source) return fail(appError('context_binding_unknown', 'runtime', 'Actual input provenance is unavailable.'));
           includedBindings.push(source);
+          }
         } else if (message.role === 'toolResult') {
           const source = hooks.resolveToolResult({ sessionId: active.sessionId, nativeToolCallId: message.toolCallId });
           if (!source.ok) return source;
@@ -979,7 +1068,7 @@ export class PiAgentAdapter implements AgentPort {
             return fail(appError('context_binding_unknown', 'runtime', 'Actual tool result provenance is unavailable.'));
           includedToolResults.push(parsed.data);
         }
-        if (includedBindings.length + includedToolResults.length > 512)
+        if (includedBindings.length + includedToolResults.length + includedNativeContexts.length > 512)
           return fail(appError('context_evidence_too_large', 'runtime', 'Request provenance exceeds its budget.'));
       }
       const primary = [...includedBindings].reverse().find(source => source.originRunId === active.runId && source.snapshotId !== null);
@@ -987,12 +1076,13 @@ export class PiAgentAdapter implements AgentPort {
         return fail(appError('context_binding_unknown', 'runtime', 'The current request has no saved input context.'));
       const parsed = RequestContextBindingSchema.safeParse({ runId: active.runId, sessionId: active.sessionId,
         nativeSessionId: active.nativeSessionId, requestSequence: active.callSequence, callSequence: active.callSequence,
-        inputId: primary.inputId, snapshotId: primary.snapshotId, includedBindings, includedToolResults });
+        inputId: primary.inputId, snapshotId: primary.snapshotId, includedBindings, includedToolResults, includedNativeContexts });
       if (!parsed.success) return fail(appError('context_binding_unknown', 'runtime', 'Request provenance is inconsistent.'));
       const binding = structuredClone(parsed.data);
       for (const source of binding.includedBindings) Object.freeze(source);
       for (const source of binding.includedToolResults) { if (source.context) Object.freeze(source.context); Object.freeze(source); }
-      Object.freeze(binding.includedBindings); Object.freeze(binding.includedToolResults); Object.freeze(binding);
+      for (const source of binding.includedNativeContexts) { Object.freeze(source.referenceEntryIds); Object.freeze(source); }
+      Object.freeze(binding.includedNativeContexts); Object.freeze(binding.includedBindings); Object.freeze(binding.includedToolResults); Object.freeze(binding);
       const saved = hooks.bind({ binding, api: model.api,
         transport: observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch) ? 'observed-fetch' : 'not-observable', at: now().at });
       return saved.ok ? ok(binding) : saved;
@@ -1055,19 +1145,22 @@ export class PiAgentAdapter implements AgentPort {
     catch { return fail(appError('storage_read_failed', 'storage', 'Session 使用权限无法确认。', true, active.runId, active.sessionId)); }
   }
 
-  private validateMessages(record: SessionRecord, messages: Parameters<typeof validateModelMessages>[0]): Result<void> {
+  private validateMessages(record: SessionRecord, messages: Parameters<typeof validateModelMessages>[0], agentContext = false): Result<void> {
     for (const message of messages) {
       if (!('content' in message) || !Array.isArray(message.content)
         || !message.content.some(block => block && typeof block === 'object' && 'type' in block && block.type === 'image')) continue;
-      if (message.role !== 'toolResult' || !NATIVE_TOOL_NAMES.includes(message.toolName as typeof NATIVE_TOOL_NAMES[number])) {
-        return fail(appError('agent_image_history_blocked', 'session', '当前 Session 历史包含不兼容的图像内容，未向模型发送。请通过 New Session 新建会话后继续。',
-          false, record.active?.runId, record.active?.sessionId));
-      }
+      const proven = message.role === 'toolResult'
+        ? NATIVE_TOOL_NAMES.includes(message.toolName as typeof NATIVE_TOOL_NAMES[number]) || !!record.nativeObjects?.get(message)
+        : message.role === 'user' ? !!record.contextMessages.get(message) || !!record.convertedOrigins?.get(message)
+        : message.role === 'custom' && !!record.nativeObjects?.get(message);
+      if (!proven) return fail(appError('context_binding_unknown', 'runtime', 'Image provenance is unavailable.'));
+      if (!['openai-completions', 'openai-responses'].includes(record.model?.api ?? ''))
+        return fail(appError('agent_image_history_blocked', 'session', 'The selected codec cannot preserve native images.'));
       if (!record.model?.input.includes('image')) return fail(appError('agent_model_image_unsupported', 'session',
         'The selected model does not support image tool results. The saved image was not sent or removed.',
         false, record.active?.runId, record.active?.sessionId));
     }
-    return validateModelMessages(messages);
+    return agentContext ? validateAgentContext(messages) : validateLlmMessages(messages);
   }
 
   private failToolRun(record: SessionRecord, active: ActiveExecution, error: ReturnType<typeof appError>): void {
@@ -1079,6 +1172,13 @@ export class PiAgentAdapter implements AgentPort {
     active.failure ??= error;
     active.stopReason = active.failure.code;
     this.stop(record, active);
+  }
+
+  private guardInheritedTool(record: SessionRecord, id: string): Result<void> {
+    if (!record.inheritedToolIds?.has(id)) return ok(undefined);
+    const error = appError('context_binding_conflict', 'runtime', 'An inherited native tool call ID cannot be executed again.');
+    if (record.active) { record.historyFailure ??= error; record.unusable = true; this.failToolRun(record, record.active, error); }
+    return fail(error);
   }
 
   private observeAgentEvent(record: SessionRecord, active: ActiveExecution, event: PiAgentEvent, eventSignal?: PiAgentEventSignal): void {
@@ -1096,6 +1196,7 @@ export class PiAgentAdapter implements AgentPort {
     if (!active.p3 || !binding) return;
     const signal = eventSignal ?? active.signal;
     const ensureRequest = (name: string, raw: unknown, nativeToolCallId: string, requestBinding?: RequestContextBinding): ToolRequestState | null => {
+      if (!this.guardInheritedTool(record, nativeToolCallId).ok) return null;
       const prior = active.toolRequests.get(nativeToolCallId);
       if (prior) {
         if (prior.name !== name || !isDeepStrictEqual(prior.raw, raw)
@@ -1199,6 +1300,7 @@ export class PiAgentAdapter implements AgentPort {
     const active = record.active;
     const binding = active?.toolBinding;
     if (!active || !active.p3 || !binding) throw new Error('工具调用缺少有效 Run 绑定。');
+    const inherited = this.guardInheritedTool(record, nativeToolCallId); if (!inherited.ok) throw inherited.error;
     let request = active.toolRequests.get(nativeToolCallId);
     if (!request) {
       if (active.input.contextHooks) {
@@ -1668,6 +1770,8 @@ export class PiAgentAdapter implements AgentPort {
     if (input.workingDirectory !== undefined && input.workingDirectory !== record.workingDirectory) {
       return this.notStarted(nativeSessionId, appError('tool_access_denied', 'runtime', 'The execution does not match its prepared working directory.'));
     }
+    if (record.recoverySeed && record.recoverySeed.sessionId !== input.sessionId)
+      return this.notStarted(nativeSessionId, appError('context_binding_unknown', 'runtime', 'Execution Session differs from its recovery origins.'));
     if (input.inputId !== undefined && (!Number.isSafeInteger(input.inputId) || input.inputId <= 0
       || typeof input.promptText !== 'string' || !input.promptText.trim() || !record.historyWriter
       || !input.verifyInputUse || !input.completeInputResult)) {
@@ -1696,6 +1800,8 @@ export class PiAgentAdapter implements AgentPort {
     record.running = true;
     record.active = active;
     const unsubscribe = session.subscribe((event) => {
+      if (event.type === 'message_end' && event.message.role === 'assistant')
+        for (const block of event.message.content) if (block.type === 'toolCall' && !this.guardInheritedTool(record, block.id).ok) return;
       if (event.type === 'agent_end' || event.type === 'agent_settled') this.closeInputAdmission(active);
       if (event.type === 'turn_start') active.turnOrdinal += 1;
       if (event.type === 'turn_end' && input.inputId !== undefined && !active.failure && !record.historyFailure) {
@@ -1822,25 +1928,15 @@ export class PiAgentAdapter implements AgentPort {
       const stopped = promptSettled && session.isIdle && active.streams.size === 0;
       if (!stopped) active.failure ??= appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true);
       if (active.promptEntered && active.failure) record.unusable = true;
-      if (record.historyWriter) {
-        const hadHistoryFailure = record.historyFailure !== undefined;
-        const snapshot = record.historyFailure && record.lastSavedHistory
-          ? ok({ ...record.lastSavedHistory, unusable: true }) : this.exportSession(nativeSessionId);
-        let saved: Result<void>;
-        try { saved = snapshot.ok ? record.historyWriter(snapshot.data) : snapshot; }
-        catch { saved = fail(appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true)); }
+      if (record.memory && !record.historyFailure) {
+        const snapshot = this.exportSession(nativeSessionId);
+        const saved = snapshot.ok ? record.memory.save(snapshot.data, []) : snapshot;
         if (!saved.ok) {
-          record.unusable = true;
-          record.historyFailure = appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true);
-          active.failure = record.historyFailure;
-          active.stopReason = record.historyFailure.code;
-          this.stop(record, active);
-          await active.abortPromise;
-          if (!hadHistoryFailure && record.lastSavedHistory) {
-            // A failed final flush may only mark the last confirmed prefix, never retry an uncertain tail.
-            const blocked = { ...record.lastSavedHistory, unusable: true };
-            try { if (record.historyWriter(blocked).ok) record.lastSavedHistory = blocked; } catch { /* Runtime's terminal/startup transaction also enforces the sticky block. */ }
-          }
+          record.unusable = true; record.historyFailure = saved.error; active.failure = saved.error;
+          active.stopReason = saved.error.code; this.stop(record, active); await active.abortPromise;
+        } else {
+          record.lastSavedHistory = structuredClone(record.memory.lastSavedHistory);
+          record.receipt = structuredClone(record.memory.commit); record.recoverySeed = structuredClone(record.memory.seed);
         }
       }
       const messageForUsage = finalMessage ?? systemError(active.failure ?? appError('agent_execution_failed', 'runtime', 'Agent 执行失败。'), model);

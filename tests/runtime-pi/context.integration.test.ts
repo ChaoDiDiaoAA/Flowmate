@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { InMemoryCredentialStore, createAssistantMessageEventStream, type AssistantMessage, type Context } from '@earendil-works/pi-ai';
 import { streamSimple as completionsStream } from '@earendil-works/pi-ai/api/openai-completions';
 import { streamSimple as responsesStream } from '@earendil-works/pi-ai/api/openai-responses';
-import { ModelRuntime, type AgentSession } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, SessionManager, type AgentSession } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ContextObservationsSchema, SessionInputContentV2Schema, appError, fail, ok } from '@flowmate/contracts';
@@ -19,6 +19,10 @@ import { SessionService } from '../../packages/core/src/sessions/service.ts';
 import { checkPayload, checkWire, preparePayloadCodec } from '../../packages/runtime-pi/src/context-evidence.ts';
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
+function readRevision(path: string, sessionId: number): number {
+  const db = new Database(path, { readonly: true });
+  try { return db.query<{ commit_revision: number }, [number]>('SELECT commit_revision FROM session_native_history WHERE session_id=?').get(sessionId)!.commit_revision; } finally { db.close(); }
+}
 function barrier() { let release!: () => void; const ready = new Promise<void>(resolve => { release = resolve; }); return { ready, release }; }
 function reply(text = 'Controlled answer.') {
   const chunk = (delta: unknown, finish: string | null) => 'data: ' + JSON.stringify({ id: 'p8-context',
@@ -48,7 +52,7 @@ async function evidenceFixture(options: {
   wire?: 'request' | 'opaque' | 'remove-user';
   networkThrow?: boolean; ignoreAbort?: boolean;
   syncThrow?: boolean; timeoutMs?: number; afterRecord?: (update: ContextEvidenceUpdate) => void;
-  nativeUnavailable?: boolean;
+  nativeUnavailable?: boolean; ancestor?: boolean;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p8-evidence-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), logsDir: join(root, 'logs'),
@@ -66,15 +70,33 @@ async function evidenceFixture(options: {
   let sdk!: AgentSession;
   const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir,
     credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-evidence-key', sessionSetup: session => { sdk = session; },
-    ...(options.networkThrow || options.ignoreAbort || options.syncThrow ? { fetch: (input, init) => {
+    fetch: (input, init) => {
       baseCalls++; if (options.syncThrow) throw new Error('PRIVATE_SYNC_THROW');
       return options.networkThrow ? Promise.reject(new Error('PRIVATE_TOKEN_BODY_DO_NOT_PERSIST'))
-        : globalThis.fetch(input, { ...init, signal: undefined }); } } : {}) });
+        : globalThis.fetch(input, options.ignoreAbort ? { ...init, signal: undefined } : init); } });
   const native = need(adapter.createSession());
   const at = () => new Date().toISOString();
-  const session = need(store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'Evidence', at: at(),
-    nativeHistory: need(adapter.exportSession(native.nativeSessionId)) }));
-  need(adapter.watchSession(native.nativeSessionId, (history, context) => store.sessions.saveHistory(session.sessionId, history, context)));
+  let initial = need(adapter.exportSession(native.nativeSessionId)); let sourceSessionId: number | null = null;
+  if (options.ancestor) {
+    const source = SessionManager.inMemory(paths.runtimeDir); source.appendSessionInfo('ancestor authorization fixture');
+    const sourceHistory = { storageVersion: 1 as const, header: source.getHeader()!, entries: source.getEntries().map(e => ({ ...e })), leafId: source.getLeafId(), unusable: false };
+    sourceSessionId = need(store.sessions.create({ nativeSessionId: sourceHistory.header.id, title: 'Ancestor', at: at(), nativeHistory: sourceHistory })).sessionId;
+    initial = { ...initial, entries: structuredClone(sourceHistory.entries), leafId: sourceHistory.leafId };
+    await adapter.releaseSession(native.nativeSessionId);
+  }
+  const session = need(store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'Evidence', at: at(), nativeHistory: initial }));
+  if (sourceSessionId !== null) {
+    // Trusted historical provenance in disposable SQL, not the T06 fork producer.
+    const source = need(store.memory.load(sourceSessionId))!;
+    store.db.query(`INSERT INTO session_forks(target_session_id,source_session_id,source_commit_revision,source_entry_count,
+      source_leaf_id,selected_entry_id,inherited_entry_count,client_operation_id,request_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(session.sessionId, sourceSessionId, source.commit.commitRevision, source.commit.entryCount, source.commit.leafId,
+        initial.leafId!, initial.entries.length, 't04-ancestor', JSON.stringify({ selectedEntryId: initial.leafId }), at());
+  }
+  const recovered = need(store.sessions.loadHistoryForContext(session.sessionId));
+  if (options.ancestor) need(adapter.restoreSession(native.nativeSessionId, recovered.history!, recovered.seed, recovered.commit!));
+  if (!recovered.history || !recovered.commit) throw new Error('Actual SQL receipt required.');
+  need(adapter.watchSession(native.nativeSessionId, recovered.commit, recovered.seed, write => store.memory.commit({ sessionId: session.sessionId, expected: write.expected, header: write.history.header, appendEntries: write.history.entries, leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts })));
   const config: ProviderConfig = { version: 1, name: 'Evidence', revision: 1, modelRef: { provider: 'evidence-fixture', model: 'fixture' },
     native: { authPath: join(root, 'unused.json'), modelsPath: null },
     connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api, contextWindow: 64000, maxTokens: 16384 },
@@ -150,7 +172,7 @@ async function evidenceFixture(options: {
   };
   const journal = (runId: number) => ContextObservationsSchema.parse(JSON.parse(store.db.query<{ context_observations_json: string }, [number]>
     ('SELECT context_observations_json FROM runs WHERE id=?').get(runId)!.context_observations_json));
-  return { store, adapter, sdk, session, runtime, sessions, config, payloads, updates, start, journal, baseCalls: () => baseCalls };
+  return { store, adapter, sdk, session, sourceSessionId, runtime, sessions, config, payloads, updates, start, journal, baseCalls: () => baseCalls };
 }
 async function begin(app: Application, input: SessionInputRequest) {
   let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
@@ -196,7 +218,7 @@ it('T10 F8-12 reopens a real Application and SQLite without query replay, then s
   const history = need(firstApp.adapter.exportSession(session.nativeSessionId));
   const target = history.entries.find(entry => entry.type === 'message' && typeof entry.message === 'object' && entry.message !== null
     && 'role' in entry.message && entry.message.role === 'assistant')!.id;
-  need(await firstApp.app.branchSession({ sessionId: session.sessionId, expectedLeafId: history.leafId, expectedEntryCount: history.entries.length, targetEntryId: target }));
+  need(await firstApp.app.branchSession({ sessionId: session.sessionId, expectedLeafId: history.leafId, expectedEntryCount: history.entries.length, expectedCommitRevision: readRevision(paths.databaseFile, session.sessionId), targetEntryId: target }));
   const branch = JSON.parse(JSON.stringify(need(firstApp.adapter.exportSession(session.nativeSessionId))));
   const oldInputs = [first, second].map(async run => need(await firstApp.app.querySessionInput({ sessionId: session.sessionId, inputId: run.accepted.inputId })).input!);
   const inputs = await Promise.all(oldInputs);
@@ -241,7 +263,7 @@ it('T10 F8-12 reopens a real Application and SQLite without query replay, then s
   expect(active.calls).toMatchObject({ restore: 1, leaf: 0, watch: 1, prepare: 1 });
   expect(active.restored[0]![0]).toBe(session.nativeSessionId);
   expect(JSON.parse(JSON.stringify(active.restored[0]![1]))).toEqual(branch);
-  expect(active.restored[0]![2]).toEqual([first, second].map((run, index) => {
+  expect(active.restored[0]![2].inputs).toEqual([first, second].map((run, index) => {
     const nativeEntryId = inputs[index]!.nativeEntryId;
     if (nativeEntryId === null) throw new Error('Persisted user entry required.');
     return { originRunId: run.accepted.runId, inputId: run.accepted.inputId, nativeEntryId, snapshotId: inputs[index]!.contextSnapshotId };
@@ -339,7 +361,7 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
   const store = need(openTestDatabase(paths));
-  let calls = 0, seededPreledger = false;
+  let calls = 0;
   const tool: ToolDefinition<{ value: number }, { value: number }> = { name: 'probe_read', version: '1', label: 'Read',
     description: 'Read a fixture value.', inputSchema: z.object({ value: z.number() }).strict(), outputSchema: z.object({ value: z.number() }).strict(),
     effect: 'READ', executionMode: 'parallel', execute: async value => value };
@@ -354,11 +376,6 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
       }
       return reply();
     }, sessionSetup: session => {
-      if (!seededPreledger) {
-        for (let index = 0; index < preledgerUsers; index++)
-          session.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'legacy same text' }], timestamp: index + 1 });
-        seededPreledger = true;
-      }
       if (!extraToolResults) return;
       const convert = session.agent.convertToLlm.bind(session.agent);
       session.agent.convertToLlm = async messages => {
@@ -369,9 +386,18 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
   deferCleanup(() => adapter.close());
   const native = need(adapter.createSession());
   const at = () => new Date().toISOString();
-  const session = need(store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'Stored context', at: at(),
-    nativeHistory: need(adapter.exportSession(native.nativeSessionId)) }));
-  need(adapter.watchSession(native.nativeSessionId, (history, context) => store.sessions.saveHistory(session.sessionId, history, context)));
+  let initial = need(adapter.exportSession(native.nativeSessionId));
+  if (preledgerUsers) {
+    const manager = SessionManager.inMemory(paths.runtimeDir);
+    for (let index = 0; index < preledgerUsers; index++) manager.appendMessage({ role: 'user', content: 'legacy same text', timestamp: index + 1 });
+    initial = { ...initial, entries: manager.getEntries().map(e => ({ ...e })), leafId: manager.getLeafId() };
+    await adapter.releaseSession(native.nativeSessionId);
+  }
+  const session = need(store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'Stored context', at: at(), nativeHistory: initial }));
+  const recovered = need(store.sessions.loadHistoryForContext(session.sessionId));
+  if (!recovered.history || !recovered.commit) throw new Error('Actual SQL receipt required.');
+  if (preledgerUsers) need(adapter.restoreSession(native.nativeSessionId, recovered.history, recovered.seed, recovered.commit));
+  need(adapter.watchSession(native.nativeSessionId, recovered.commit, recovered.seed, write => store.memory.commit({ sessionId: session.sessionId, expected: write.expected, header: write.history.header, appendEntries: write.history.entries, leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts })));
   const config: ProviderConfig = { version: 1, name: 'Stored SDK', revision: 1,
     modelRef: { provider: 'p8-store-fixture', model: 'p8-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
     connection: { baseUrl: 'https://fixture.invalid/v1', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 },
@@ -444,6 +470,15 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
   const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.sessionInputs,
     (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
   const start = async (clientSequence: number) => {
+    // This manual Runtime fixture owns its restoration boundary; full Application recovery remains T05.
+    if (adapter.inspect(native.nativeSessionId).availability === 'missing') {
+      const bundle = need(store.sessions.loadHistoryForContext(session.sessionId));
+      if (!bundle.history || !bundle.commit) throw new Error('Actual SQL receipt required.');
+      need(adapter.restoreSession(native.nativeSessionId, bundle.history, bundle.seed, bundle.commit));
+      need(adapter.watchSession(native.nativeSessionId, bundle.commit, bundle.seed, write => store.memory.commit({ sessionId: session.sessionId,
+        expected: write.expected, header: write.history.header, appendEntries: write.history.entries, leafId: write.history.leafId,
+        unusable: write.history.unusable, contexts: write.contexts })));
+    }
     let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
     const terminal = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finish = resolve; });
     const accepted = need(await sessions.submitInput({ sessionId: session.sessionId, clientSequence, mode: 'prompt', text: 'same text',
@@ -828,7 +863,7 @@ describe('P8 actual Pi request context', () => {
     const target = history.entries.find(entry => entry.type === 'message' && typeof entry.message === 'object'
       && entry.message !== null && 'role' in entry.message && entry.message.role === 'assistant')!.id;
     need(await f.app.branchSession({ sessionId: f.session.sessionId, expectedLeafId: history.leafId,
-      expectedEntryCount: history.entries.length, targetEntryId: target }));
+      expectedEntryCount: history.entries.length, expectedCommitRevision: readRevision(f.paths.databaseFile, f.session.sessionId), targetEntryId: target }));
     expect(f.payloads).toHaveLength(2);
     const third = await begin(f.app, f.prompt(3)); expect((await third.terminal).result.ok).toBe(true);
     expect((await f.adapter.releaseSession(f.session.nativeSessionId)).closed).toBe(true);
@@ -861,15 +896,15 @@ describe('P8 actual Pi request context', () => {
     const f = await storedFixture(); const run = await f.start(1); expect((await run.terminal).result.ok).toBe(true);
     const bundle = need(f.store.sessions.loadHistoryForContext(f.session.sessionId)); if (!bundle.history) throw new Error('Saved history required.');
     expect((await f.adapter.releaseSession(f.session.nativeSessionId)).closed).toBe(true);
-    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, [])).toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
+    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, { ...bundle.seed, inputs: [] }, bundle.commit!)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
     expect(f.adapter.inspect(f.session.nativeSessionId).availability).toBe('missing');
-    const source = bundle.bindings[0]!;
-    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, [{ ...source, nativeEntryId: 'missing-entry' }]))
-      .toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
-    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, [source, { ...source, snapshotId: source.snapshotId! + 100 }]))
-      .toMatchObject({ ok: false, error: { code: 'context_binding_conflict' } });
-    need(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, bundle.bindings));
-    expect(f.adapter.restoreSessionLeaf(f.session.nativeSessionId, bundle.history, [{ ...source, snapshotId: source.snapshotId! + 100 }]))
+    const source = bundle.seed.inputs[0]!;
+    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, { ...bundle.seed, inputs: [{ ...source, nativeEntryId: 'missing-entry' }] }, bundle.commit!))
+      .toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, { ...bundle.seed, inputs: [source, { ...source, snapshotId: source.snapshotId! + 100 }] }, bundle.commit!))
+      .toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    need(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, bundle.seed, bundle.commit!));
+    expect(f.adapter.restoreSessionLeaf(f.session.nativeSessionId, bundle.history, { ...bundle.seed, inputs: [{ ...source, snapshotId: source.snapshotId! + 100 }] }, bundle.commit!))
       .toMatchObject({ ok: false, error: { code: 'context_binding_conflict' } });
     expect(f.calls()).toBe(1);
   });
@@ -920,9 +955,9 @@ describe('P8 actual Pi request context', () => {
     const second = await f.start(2); expect((await second.terminal).result.ok).toBe(true);
     const bundle = need(f.store.sessions.loadHistoryForContext(f.session.sessionId)); if (!bundle.history) throw new Error('Saved history required.');
     expect((await f.adapter.releaseSession(f.session.nativeSessionId)).closed).toBe(true);
-    const a = bundle.bindings[0]!, b = bundle.bindings[1]!;
-    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, [a, { ...a, nativeEntryId: b.nativeEntryId }]))
-      .toMatchObject({ ok: false, error: { code: 'context_binding_conflict' } });
+    const a = bundle.seed.inputs[0]!, b = bundle.seed.inputs[1]!;
+    expect(f.adapter.restoreSession(f.session.nativeSessionId, bundle.history, { ...bundle.seed, inputs: [a, { ...a, nativeEntryId: b.nativeEntryId }] }, bundle.commit!))
+      .toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
     expect(f.calls()).toBe(2);
   });
 
@@ -932,4 +967,47 @@ describe('P8 actual Pi request context', () => {
     expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'session_history_invalid' } } });
     expect(f.calls()).toBe(2); expect(f.journal(run.accepted.runId).requests).toEqual([]);
   });
+});
+
+for (const boundary of ['payload', 'retry'] as const) for (const cause of ['blocked', 'unknown'] as const)
+it(`P9 T04 ancestor-only ${cause} at actual ${boundary} boundary blocks next attempt without target cancellation`, async () => {
+  const entered = barrier(), release = barrier(); deferCleanup(() => release.release());
+  let f!: Awaited<ReturnType<typeof evidenceFixture>>;
+  const revokeOnlyAncestor = () => {
+    f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
+      .run(JSON.stringify(cause === 'unknown' ? {} : { documentIds: [1], at: new Date().toISOString(), reason: 'document_use_revoked' }), f.sourceSessionId!);
+    const target = f.store.db.query<{ status: string; metadata_json: string }, [number]>('SELECT status,metadata_json FROM sessions WHERE id=?').get(f.session.sessionId)!;
+    expect(target.status).toBe('active'); expect(JSON.parse(target.metadata_json).model_use_blocked).toBeNull();
+  };
+  f = await evidenceFixture({ ancestor: true, retries: boundary === 'retry' ? 1 : 0,
+    ...(boundary === 'payload' ? { replacement: async (payload: unknown) => { entered.release(); await release.ready; return payload; } }
+      : { response: () => new Response('retry', { status: 503 }), afterRecord: (update: ContextEvidenceUpdate) => { if (update.kind === 'response' && update.status === 503) revokeOnlyAncestor(); } }) });
+  expect(need(f.store.sessions.isModelUseBlocked(f.session.sessionId))).toBe(false);
+  const run = await f.start();
+  if (boundary === 'payload') { await entered.ready; revokeOnlyAncestor(); release.release(); }
+  const terminal = await run.terminal;
+  expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: cause === 'blocked' ? 'session_scope_revoked' : 'storage_read_failed' } } });
+  const count = boundary === 'payload' ? 0 : 1;
+  expect(f.baseCalls()).toBe(count); expect(f.payloads).toHaveLength(count);
+  expect(f.updates.filter(u => u.kind === 'attempt-prepared')).toHaveLength(count);
+  expect(f.updates.filter(u => u.kind === 'attempt-entered')).toHaveLength(count);
+  expect(f.journal(run.accepted.runId).requests[0]!.attempts).toHaveLength(count);
+});
+
+
+it('P9 T04 persists late idle native facts without reopening the terminal SQL Run or inventing Input ownership', async () => {
+  const f = await storedFixture();
+  const run = await f.start(1); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const beforeRun = need(f.store.runs.get(run.accepted.runId)), beforeCalls = f.calls();
+  const before = need(f.store.sessions.loadHistoryForContext(f.session.sessionId));
+  const record = (f.adapter as any).sessions.get(f.session.nativeSessionId);
+  expect(record.active).toBeUndefined();
+  await record.session.sendCustomMessage({ customType: 'late', content: 'late native context', display: false });
+  const userId = record.manager.appendMessage({ role: 'user', content: 'late native user', timestamp: 123 });
+  const after = need(f.store.sessions.loadHistoryForContext(f.session.sessionId));
+  expect(after.history!.entries.length).toBe(before.history!.entries.length + 2);
+  expect(after.seed.origins.slice(-2).every(origin => origin.originSessionId === f.session.sessionId && origin.originRunId === null)).toBe(true);
+  expect(after.seed.inputs.find(input => input.nativeEntryId === userId)).toEqual({ nativeEntryId: userId, originRunId: null, inputId: null, snapshotId: null });
+  expect(need(f.store.runs.get(run.accepted.runId))).toEqual(beforeRun);
+  expect(f.calls()).toBe(beforeCalls); expect(record.active).toBeUndefined();
 });

@@ -131,7 +131,8 @@ describe('P4 real candidate commit and message persistence failures', () => {
             };
           } } : {}) });
         const watch = adapter.watchSession.bind(adapter);
-        adapter.watchSession = (nativeId, save) => watch(nativeId, (history, context) => {
+        adapter.watchSession = (nativeId, commit, seed, save) => watch(nativeId, commit, seed, write => {
+          const history = write.history; const context = write.contexts[0];
           const entry = history.entries.at(-1);
           const message = entry?.type === 'message' ? entry.message as Record<string, unknown> : null;
           const target = fault === 'assistant-save' ? message?.role === 'assistant' && message.stopReason === 'stop'
@@ -142,7 +143,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
             failedEntryId = context.entryId;
             return fail(appError('storage_write_failed', 'storage', 'Controlled native message save failure.', true));
           }
-          const result = save(history, context);
+          const result = save(write);
           if (result.ok) priorPrefix = structuredClone(history);
           return result;
         });

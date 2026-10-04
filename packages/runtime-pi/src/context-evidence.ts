@@ -5,8 +5,8 @@ import { appError, fail, ok } from '@flowmate/contracts';
 import type { ContextEvidenceReason, Result } from '@flowmate/contracts';
 
 export type InclusionFact = { inclusion: 'confirmed'; reason: null } | { inclusion: 'unavailable'; reason: ContextEvidenceReason };
-type ExpectedUser = { texts: string[]; images: string[]; toolIds?: string[] };
-export type PayloadCodec = { api: 'openai-completions' | 'openai-responses'; users: ExpectedUser[] };
+type ExpectedUser = { texts: string[]; images: string[]; toolIds?: string[]; order?: ('text' | 'image')[] };
+export type PayloadCodec = { api: 'openai-completions' | 'openai-responses'; users: ExpectedUser[]; toolImages: { callId: string; texts: string[]; images: string[] }[] };
 const imageCaption = 'Attached image(s) from tool result:';
 const mismatch = () => fail(appError('context_payload_mismatch', 'runtime', 'The outgoing payload does not preserve the request inputs.'));
 function record(value: unknown): Record<string, unknown> | null {
@@ -15,15 +15,20 @@ function record(value: unknown): Record<string, unknown> | null {
 
 /** Message boundaries remain intact; identity was established before this text codec. */
 export function preparePayloadCodec(api: string, context: Pick<Context, 'messages'>, supportsImages: boolean): Result<PayloadCodec | undefined> {
+  const hasImages = context.messages.some(m => Array.isArray(m.content) && m.content.some(b => b.type === 'image'));
+  if (hasImages && (!supportsImages || !['openai-completions', 'openai-responses'].includes(api))) return mismatch();
   if (api !== 'openai-completions' && api !== 'openai-responses') return ok(undefined);
-  const users: ExpectedUser[] = [];
+  const users: ExpectedUser[] = []; const toolImages: PayloadCodec['toolImages'] = [];
   for (let index = 0; index < context.messages.length; index++) {
     const message = context.messages[index]!;
     if (message.role === 'user') {
       const texts = typeof message.content === 'string' ? [sanitizeSurrogates(message.content)]
         : message.content.filter(block => block.type === 'text').map(block => sanitizeSurrogates(block.text));
-      if (typeof message.content !== 'string' && message.content.some(block => block.type !== 'text')) return mismatch();
-      users.push({ texts, images: [] });
+      const blocks = typeof message.content === 'string' ? [{ type: 'text' as const, text: message.content }] : message.content;
+      users.push({ texts, images: blocks.flatMap(block => block.type === 'image' ? [`data:${block.mimeType};base64,${block.data}`] : []), order: blocks.map(block => block.type) });
+    } else if (api === 'openai-responses' && message.role === 'toolResult' && message.content.some(b => b.type === 'image')) {
+      const text = message.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+      toolImages.push({ callId: message.toolCallId.split('|')[0]!, texts: text ? [sanitizeSurrogates(text)] : [], images: message.content.flatMap(b => b.type === 'image' ? [`data:${b.mimeType};base64,${b.data}`] : []) });
     } else if (api === 'openai-completions' && message.role === 'toolResult') {
       const images: string[] = [], toolIds: string[] = [];
       while (index < context.messages.length && context.messages[index]!.role === 'toolResult') {
@@ -37,7 +42,7 @@ export function preparePayloadCodec(api: string, context: Pick<Context, 'message
       if (images.length) users.push({ texts: [imageCaption], images, toolIds });
     }
   }
-  return ok({ api, users });
+  return ok({ api, users, toolImages });
 }
 
 /** No payload, image URL, or tool result text leaves this request-local comparison. */
@@ -45,26 +50,34 @@ export function checkPayload(codec: PayloadCodec | undefined, payload: unknown):
   if (!codec) return ok({ inclusion: 'unavailable', reason: 'payload_codec_unavailable' });
   const body = record(payload), messages = body?.[codec.api === 'openai-responses' ? 'input' : 'messages'];
   if (!Array.isArray(messages)) return mismatch();
-  let userIndex = 0;
+  let userIndex = 0; let toolImageIndex = 0;
   for (let index = 0; index < messages.length; index++) {
     const message = record(messages[index]);
     if (!message) return mismatch();
+    if (message.type === 'function_call_output' && Array.isArray(message.output) && message.output.some(b => record(b)?.type === 'input_image')) {
+      const expected = codec.toolImages[toolImageIndex++];
+      if (!expected || expected.callId !== message.call_id || !isDeepStrictEqual(message.output, [
+        ...expected.texts.map(text => ({ type: 'input_text', text })), ...expected.images.map(image_url => ({ type: 'input_image', detail: 'auto', image_url }))])) return mismatch();
+    }
     if (message.role !== 'user') continue;
     const expected = codec.users[userIndex++];
     if (!expected) return mismatch();
-    const texts: string[] = [], images: string[] = [];
-    if (typeof message.content === 'string' && codec.api === 'openai-completions') texts.push(message.content);
+    const texts: string[] = [], images: string[] = []; const order: ('text' | 'image')[] = [];
+    if (typeof message.content === 'string' && codec.api === 'openai-completions') { texts.push(message.content); order.push('text'); }
     else {
       if (!Array.isArray(message.content)) return mismatch();
       for (const raw of message.content) {
         const block = record(raw);
         if (!block) return mismatch();
-        if (block.type === (codec.api === 'openai-responses' ? 'input_text' : 'text') && typeof block.text === 'string') texts.push(block.text);
+        if (block.type === (codec.api === 'openai-responses' ? 'input_text' : 'text') && typeof block.text === 'string') { texts.push(block.text); order.push('text'); }
         else if (codec.api === 'openai-completions' && block.type === 'image_url' && typeof record(block.image_url)?.url === 'string')
-          images.push(record(block.image_url)!.url as string);
+          { images.push(record(block.image_url)!.url as string); order.push('image'); }
+        else if (codec.api === 'openai-responses' && block.type === 'input_image' && typeof block.image_url === 'string' && block.detail === 'auto')
+          { images.push(block.image_url); order.push('image'); }
         else return mismatch();
       }
     }
+    if (expected.order && !isDeepStrictEqual(order, expected.order)) return mismatch();
     if (!isDeepStrictEqual(texts, expected.texts) || !isDeepStrictEqual(images, expected.images)) return mismatch();
     if (expected.toolIds) {
       const blocks = message.content;
@@ -79,7 +92,7 @@ export function checkPayload(codec: PayloadCodec | undefined, payload: unknown):
       }
     }
   }
-  return userIndex === codec.users.length ? ok({ inclusion: 'confirmed', reason: null }) : mismatch();
+  return userIndex === codec.users.length && toolImageIndex === codec.toolImages.length ? ok({ inclusion: 'confirmed', reason: null }) : mismatch();
 }
 
 export async function checkWire(codec: PayloadCodec | undefined, request: RequestInfo | URL, init?: RequestInit): Promise<Result<InclusionFact>> {

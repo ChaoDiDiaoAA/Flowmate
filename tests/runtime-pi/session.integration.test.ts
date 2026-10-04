@@ -5,13 +5,46 @@ import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { afterEach, describe, expect, it } from 'bun:test';
 import { AgentSession, ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { INVOICE_CHAT_GOAL, INVOICE_TOOLS_SYSTEM_PROMPT, CandidateDraftSchema, FillInvoiceFormInputSchema, FillInvoiceFormOutputSchema, appError, fail, ok } from '@flowmate/contracts';
-import type { AgentToolBinding, PromptTraceBuffer, ToolDefinition } from '@flowmate/contracts';
+import type { NativeSessionHistory, NativeHistoryRecoverySeed, HistoryCommitState, NativeHistoryAppendContext, Result, AgentToolBinding, PromptTraceBuffer, ToolDefinition } from '@flowmate/contracts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import type { AgentExecutionInput, AgentObservation } from '../../packages/contracts/src/ports.ts';
 import type { ProviderConfig } from '../../packages/contracts/src/runtime.ts';
 import { z } from 'zod';
+import { isDeepStrictEqual } from 'node:util';
 import { createNativeTools, getNativeToolParameters } from '../../packages/runtime-pi/src/native-tools.ts';
 import { toPiTool } from '../../packages/runtime-pi/src/tools.ts';
+
+
+// Component-only receipt producer. SQL/Application persistence is exercised in context.integration.test.ts.
+const componentHistory = new Map<string, { history: NativeSessionHistory; seed: NativeHistoryRecoverySeed; commit: HistoryCommitState }>();
+function watchFixture(adapter: PiAgentAdapter, sessionId: number, id: string,
+  observe: (history: NativeSessionHistory, context?: NativeHistoryAppendContext) => Result<void>) {
+  const exported = adapter.exportSession(id); if (!exported.ok) return exported;
+  let saved = componentHistory.get(id);
+  if (!saved) {
+    saved = { history: structuredClone(exported.data), commit: { commitRevision: 1, entryCount: exported.data.entries.length, leafId: exported.data.leafId },
+      seed: { sessionId, origins: exported.data.entries.map(e => ({ nativeEntryId: e.id, originSessionId: sessionId, originRunId: null })),
+        inputs: exported.data.entries.flatMap(e => e.type === 'message' && (e.message as { role: string }).role === 'user' ? [{ nativeEntryId: e.id, originRunId: null, inputId: null, snapshotId: null }] : []) } };
+    componentHistory.set(id, saved);
+  }
+  return adapter.watchSession(id, saved.commit, saved.seed, write => {
+    if (!isDeepStrictEqual(write.expected, saved!.commit)) return fail(appError('state_conflict', 'session', 'Component stale writer.'));
+    const changed = !isDeepStrictEqual(write.history, saved!.history);
+    const observed = observe(write.history, write.contexts[0]); if (!observed.ok) return observed;
+    const added = write.history.entries.slice(saved!.history.entries.length);
+    const commit = { commitRevision: write.expected.commitRevision + (changed ? 1 : 0), entryCount: write.history.entries.length, leafId: write.history.leafId };
+    const seed: NativeHistoryRecoverySeed = { sessionId, origins: [...saved!.seed.origins, ...added.map(e => ({ nativeEntryId: e.id, originSessionId: sessionId, originRunId: write.contexts.find(c => c.entryId === e.id)?.runId ?? null }))],
+      inputs: [...saved!.seed.inputs, ...added.flatMap(e => { const c = write.contexts.find(c => c.entryId === e.id);
+        return e.type === 'message' && (e.message as { role: string }).role === 'user' ? [{ nativeEntryId: e.id, originRunId: c?.runId ?? null, inputId: c?.inputId ?? null, snapshotId: null }] : []; })] };
+    saved = { history: structuredClone(write.history), commit, seed }; componentHistory.set(id, saved); return ok(commit);
+  });
+}
+function restoreFixture(adapter: PiAgentAdapter, id: string, history: NativeSessionHistory, leaf = false) {
+  const saved = componentHistory.get(id); if (!saved) throw new Error('Component receipt required.');
+  if (leaf) return adapter.restoreSessionLeaf(id, history, saved.seed, saved.commit);
+  const restored = adapter.restoreSession(id, history, saved.seed, saved.commit);
+  return restored.ok ? watchFixture(adapter, saved.seed.sessionId, id, () => ok(undefined)) : restored;
+}
 
 const endpoint = 'https://fixture.invalid/v1';
 const fixtureRoots = new Set<string>();
@@ -148,7 +181,7 @@ describe('PiAgentAdapter', () => {
     const app = await fixture(() => { fetchEntered.resolve(); return reply.promise; });
     const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal;
-    app.adapter.watchSession(id, () => ok(undefined));
+    watchFixture(app.adapter, 21, id, () => ok(undefined));
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     const record = (Reflect.get(app.adapter, 'sessions') as Map<string, { session: AgentSession }>).get(id)!;
@@ -168,7 +201,7 @@ describe('PiAgentAdapter', () => {
     const app = await fixture(() => { entered.resolve(); return reply.promise; });
     const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal; const consumed: number[] = []; const completed: number[][] = [];
-    app.adapter.watchSession(id, (_history, context) => { if (context?.inputId) consumed.push(context.inputId); return ok(undefined); });
+    watchFixture(app.adapter, 21, id, (_history, context) => { if (context?.inputId) consumed.push(context.inputId); return ok(undefined); });
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
@@ -187,7 +220,7 @@ describe('PiAgentAdapter', () => {
     const app = await fixture(() => { if (app.requests.length === 1) { entered.resolve(); return reply.promise; } return response('bounded answer'); });
     const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal; const completed: number[][] = [];
-    app.adapter.watchSession(id, () => ok(undefined));
+    watchFixture(app.adapter, 21, id, () => ok(undefined));
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
@@ -205,7 +238,7 @@ describe('PiAgentAdapter', () => {
   it.each(['return', 'throw'] as const)('retains the saved result identity when its synchronous completion callback fails by %s', async kind => {
     const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal; let resultEntry: string | undefined;
-    app.adapter.watchSession(id, (_history, context) => { if (context?.resultInputIds?.length) resultEntry = context.entryId; return ok(undefined); });
+    watchFixture(app.adapter, 21, id, (_history, context) => { if (context?.resultInputIds?.length) resultEntry = context.entryId; return ok(undefined); });
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     const result = await prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
@@ -222,7 +255,8 @@ describe('PiAgentAdapter', () => {
   it('blocks the native record when leaf restoration cannot verify the committed entry set', async () => {
     const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const history = app.adapter.exportSession(id); if (!history.ok) throw new Error(history.error.code);
-    expect(app.adapter.restoreSessionLeaf(id, { ...history.data, header: { ...history.data.header, id: 'wrong-native-session' } })).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    watchFixture(app.adapter, 21, id, () => ok(undefined));
+    expect(restoreFixture(app.adapter, id, { ...history.data, header: { ...history.data.header, id: 'wrong-native-session' } }, true)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
     expect(app.adapter.inspect(id)).toEqual({ availability: 'unusable' }); expect(app.requests).toHaveLength(0);
   });
   it('refuses an unconsumed receipt when the SDK still reports a pending queue after settled cleanup', async () => {
@@ -231,7 +265,7 @@ describe('PiAgentAdapter', () => {
       throw new DOMException('Controlled transport abort.', 'AbortError'); });
     const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const controller = new AbortController();
-    app.adapter.watchSession(id, () => ok(undefined));
+    watchFixture(app.adapter, 21, id, () => ok(undefined));
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, controller.signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     const record = (Reflect.get(app.adapter, 'sessions') as Map<string, { session: AgentSession }>).get(id)!;
@@ -253,7 +287,7 @@ describe('PiAgentAdapter', () => {
   it('does not bind or complete an empty stopped assistant as a P5 input result', async () => {
     const app = await fixture(() => response('')); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal; let completed = 0; let bound = 0;
-    app.adapter.watchSession(id, (_history, context) => { if (context?.resultInputIds?.length) bound++; return ok(undefined); });
+    watchFixture(app.adapter, 21, id, (_history, context) => { if (context?.resultInputIds?.length) bound++; return ok(undefined); });
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     const result = await prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
@@ -285,7 +319,7 @@ describe('PiAgentAdapter', () => {
     const id = native.data.nativeSessionId; const signal = new AbortController().signal;
     const saved: import('@flowmate/contracts').NativeHistoryAppendContext[] = [];
     let history = app.adapter.exportSession(id); const completed: Array<{ ids: readonly number[]; entry: string }> = [];
-    app.adapter.watchSession(id, (value, context) => { history = ok(value); if (context) saved.push(context); return ok(undefined); });
+    watchFixture(app.adapter, 21, id, (value, context) => { history = ok(value); if (context) saved.push(context); return ok(undefined); });
     const binding: AgentToolBinding = { context: { runId: 71, sessionId: 21, scope: { version: 2,
       allowedTools: ['probe_read'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] } },
     observeRequest: () => ok(undefined), rejectRequest: () => ok(undefined), recordDelivery: () => ok(undefined),
@@ -325,7 +359,7 @@ describe('PiAgentAdapter', () => {
     const app = await fixture(() => { if (app.requests.length === 1) { entered.resolve(); return reply.promise; } return response('follow-up answer'); });
     const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal;
-    app.adapter.watchSession(id, () => ok(undefined));
+    watchFixture(app.adapter, 21, id, () => ok(undefined));
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     expect(prepared.data.snapshot.agent).toMatchObject({ policyVersion: 'p5-session-inputs-v1', maxModelCalls: 12, maxContextBytes: 524_288 });
@@ -355,7 +389,7 @@ describe('PiAgentAdapter', () => {
     const refresh = record.session.agent.prepareNextTurnWithContext;
     record.session.agent.prepareNextTurnWithContext = async (turn, signal) => { entered.resolve(); await release.promise; return refresh?.(turn, signal); };
     const consumed: number[] = [];
-    app.adapter.watchSession(id, (_history, context) => { if (context?.inputId) consumed.push(context.inputId); return ok(undefined); });
+    watchFixture(app.adapter, 21, id, (_history, context) => { if (context?.inputId) consumed.push(context.inputId); return ok(undefined); });
     let queued: Promise<unknown> | undefined;
     const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
       verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined) }, controller.signal, event => {
@@ -374,7 +408,7 @@ describe('PiAgentAdapter', () => {
   it.each(['user', 'result'] as const)('does not complete a P5 batch when its %s history write fails', async kind => {
     const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal; let completed = 0;
-    app.adapter.watchSession(id, (_history, context) => context && (kind === 'user' ? context.inputId !== undefined : context.resultInputIds !== undefined)
+    watchFixture(app.adapter, 21, id, (_history, context) => context && (kind === 'user' ? context.inputId !== undefined : context.resultInputIds !== undefined)
       ? fail(appError('storage_write_failed', 'storage', 'Controlled history failure.')) : ok(undefined));
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
@@ -387,7 +421,7 @@ describe('PiAgentAdapter', () => {
   it('moves and restores a saved assistant leaf with or without prepared credentials without generating messages', async () => {
     const app = await fixture(); const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal;
-    app.adapter.watchSession(id, () => ok(undefined));
+    watchFixture(app.adapter, 21, id, () => ok(undefined));
     for (const run of [71, 72]) {
       const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal);
       if (!prepared.ok) throw new Error(prepared.error.code);
@@ -397,12 +431,12 @@ describe('PiAgentAdapter', () => {
     const target = committed.data.entries.find(entry => entry.type === 'message' && (entry.message as { role: string }).role === 'assistant')!.id;
     expect(typeof app.adapter.moveSessionLeaf).toBe('function');
     const moved = await app.adapter.moveSessionLeaf(id, target); expect(moved).toMatchObject({ ok: true, data: { leafId: target } });
-    expect(app.adapter.restoreSessionLeaf(id, committed.data)).toEqual(ok(undefined));
+    expect(restoreFixture(app.adapter, id, committed.data, true)).toEqual(ok(undefined));
     expect(app.adapter.exportSession(id)).toEqual(committed);
     expect((await app.adapter.releaseSession(id)).closed).toBe(true);
-    expect(app.adapter.restoreSession(id, committed.data)).toEqual(ok(undefined));
+    expect(restoreFixture(app.adapter, id, committed.data)).toEqual(ok(undefined));
     expect(await app.adapter.moveSessionLeaf(id, target)).toMatchObject({ ok: true, data: { leafId: target } });
-    expect(app.adapter.restoreSessionLeaf(id, committed.data)).toEqual(ok(undefined));
+    expect(restoreFixture(app.adapter, id, committed.data, true)).toEqual(ok(undefined));
     expect(app.adapter.exportSession(id)).toEqual(committed); expect(app.requests).toHaveLength(2);
     expect(await app.adapter.moveSessionLeaf(id, committed.data.entries.find(entry => entry.type === 'message')!.id)).toMatchObject({ ok: false });
     expect(await app.adapter.moveSessionLeaf(id, target)).toMatchObject({ ok: true });
@@ -544,7 +578,7 @@ describe('PiAgentAdapter', () => {
     const created = app.adapter.createSession();
     if (!created.ok) throw new Error(created.error.code);
     let saved = app.adapter.exportSession(created.data.nativeSessionId);
-    expect(app.adapter.watchSession(created.data.nativeSessionId, history => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
+    expect(watchFixture(app.adapter, 212, created.data.nativeSessionId, history => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
     const scope = { version: 2 as const, allowedTools: ['read'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] };
     let executions = 0;
     const binding: AgentToolBinding = { context: { runId: 112, sessionId: 212, scope },
@@ -569,7 +603,7 @@ describe('PiAgentAdapter', () => {
     if (vision) {
       expect(JSON.stringify(app.requests[1]?.body)).toContain(`data:image/png;base64,${png.toString('base64')}`);
       expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
-      expect(app.adapter.restoreSession(created.data.nativeSessionId, saved.data)).toEqual(ok(undefined));
+      expect(restoreFixture(app.adapter, created.data.nativeSessionId, saved.data)).toEqual(ok(undefined));
     }
   });
   it('publishes saved message snapshots with real entries and keeps their bridge after the Run', async () => {
@@ -578,7 +612,7 @@ describe('PiAgentAdapter', () => {
     if (!created.ok) throw new Error('fixture session');
     const bindings: Array<{ entryId: string; runId: number }> = [];
     let saved = app.adapter.exportSession(created.data.nativeSessionId);
-    expect(app.adapter.watchSession(created.data.nativeSessionId, (history, context) => {
+    expect(watchFixture(app.adapter, 204, created.data.nativeSessionId, (history, context) => {
       saved = ok(history);
       if (context) bindings.push(context);
       return ok(undefined);
@@ -630,7 +664,7 @@ describe('PiAgentAdapter', () => {
     let saved = app.adapter.exportSession(native.data.nativeSessionId);
     const attempted: import('@flowmate/contracts').NativeSessionHistory[] = [];
     let failed = false;
-    app.adapter.watchSession(native.data.nativeSessionId, (history) => {
+    watchFixture(app.adapter, 206, native.data.nativeSessionId, (history) => {
       attempted.push(structuredClone(history));
       if (!failed && history.entries.some((entry) => entry.type === 'message' && (entry.message as { role?: string }).role === 'user')) {
         failed = true;
@@ -647,7 +681,8 @@ describe('PiAgentAdapter', () => {
     expect(outcome.stopped).toBe(true);
     expect(app.requests).toHaveLength(0);
     if (!saved.ok) throw new Error(saved.error.message);
-    expect(saved.data.unusable).toBe(true);
+    // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
+    expect(saved.data.unusable).toBe(false);
     expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(0);
     const firstFailure = attempted.findIndex((history) => history.entries.some((entry) => entry.type === 'message'));
     expect(attempted.slice(firstFailure + 1).every((history) => !history.entries.some((entry) => entry.type === 'message'))).toBe(true);
@@ -670,14 +705,14 @@ describe('PiAgentAdapter', () => {
     expect(outcome.stopped).toBe(true);
   });
 
-  it.each(['return', 'throw'] as const)('retains the saved prefix and settles an actual stop when final save fails by %s', async (mode) => {
+  it.each(['return', 'throw'] as const)('retains the saved prefix and stops when the necessary final assistant append fails by %s', async (mode) => {
     const app = await fixture();
     const native = app.adapter.createSession();
     if (!native.ok) throw new Error(native.error.message);
     let saved = app.adapter.exportSession(native.data.nativeSessionId);
     let finalFailed = false;
-    app.adapter.watchSession(native.data.nativeSessionId, (history, context) => {
-      if (!finalFailed && context === undefined && history.entries.filter((entry) => entry.type === 'message').length === 2) {
+    watchFixture(app.adapter, 208, native.data.nativeSessionId, (history, context) => {
+      if (!finalFailed && context !== undefined && history.entries.find(entry => entry.id === context.entryId)?.type === 'message' && history.entries.filter((entry) => entry.type === 'message').length === 2) {
         finalFailed = true;
         if (mode === 'throw') throw new Error('Controlled final save exception.');
         return fail(appError('storage_write_failed', 'storage', 'Controlled final save failure.'));
@@ -693,18 +728,19 @@ describe('PiAgentAdapter', () => {
     expect(outcome.stopped).toBe(true);
     expect(app.requests).toHaveLength(1);
     if (!saved.ok) throw new Error(saved.error.message);
-    expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(2);
-    expect(saved.data.unusable).toBe(true);
+    expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(1);
+    // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
+    expect(saved.data.unusable).toBe(false);
     expect(app.adapter.inspect(native.data.nativeSessionId).availability).toBe('unusable');
+    expect(await app.adapter.prepare(native.data.nativeSessionId, config, { timeoutMs: 3000, stopGraceMs: 100 }, new AbortController().signal)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect((await app.adapter.releaseSession(native.data.nativeSessionId)).closed).toBe(true);
-    expect(app.adapter.restoreSession(native.data.nativeSessionId, saved.data)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
   });
 
   it.each(['message_start', 'message_end'] as const)('rejects a repeated assistant %s instead of reusing or replacing its live identity', async (type) => {
     const app = await fixture();
     const created = app.adapter.createSession();
     if (!created.ok) throw new Error(created.error.message);
-    app.adapter.watchSession(created.data.nativeSessionId, () => ok(undefined));
+    watchFixture(app.adapter, 211, created.data.nativeSessionId, () => ok(undefined));
     const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
       { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
     if (!prepared.ok) throw new Error(prepared.error.message);
@@ -736,7 +772,7 @@ describe('PiAgentAdapter', () => {
     if (!created.ok) throw new Error(created.error.message);
     let saved = app.adapter.exportSession(created.data.nativeSessionId);
     const bindings: Array<{ entryId: string; runId: number }> = [];
-    app.adapter.watchSession(created.data.nativeSessionId, (history, context) => {
+    watchFixture(app.adapter, 212, created.data.nativeSessionId, (history, context) => {
       saved = ok(structuredClone(history));
       if (context) bindings.push(context);
       return ok(undefined);
@@ -762,7 +798,8 @@ describe('PiAgentAdapter', () => {
       expect(app.requests).toHaveLength(1);
       if (!saved.ok) throw new Error(saved.error.message);
       expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(2);
-      expect(saved.data.unusable).toBe(true);
+      // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
+    expect(saved.data.unusable).toBe(false);
       expect(bindings).toHaveLength(2);
       expect(observations.filter((event) => event.type === 'display_message'
         && event.message.role === 'assistant' && event.message.persistence === 'saved')).toHaveLength(1);
@@ -782,7 +819,7 @@ describe('PiAgentAdapter', () => {
     const nativeId = app.adapter.createSession();
     if (!nativeId.ok) throw new Error(nativeId.error.message);
     let saved = app.adapter.exportSession(nativeId.data.nativeSessionId);
-    app.adapter.watchSession(nativeId.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); });
+    watchFixture(app.adapter, 209, nativeId.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); });
     const prepared = await app.adapter.prepare(nativeId.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
     if (!prepared.ok) throw new Error(prepared.error.message);
     const records = (app.adapter as unknown as { sessions: Map<string, { session: AgentSession }> }).sessions;
@@ -797,7 +834,8 @@ describe('PiAgentAdapter', () => {
       expect(app.requests).toHaveLength(0);
       if (!saved.ok) throw new Error(saved.error.message);
       expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(0);
-      expect(saved.data.unusable).toBe(true);
+      // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
+    expect(saved.data.unusable).toBe(false);
       expect((await app.adapter.releaseSession(nativeId.data.nativeSessionId)).closed).toBe(true);
     } finally { unsubscribe(); }
   });
@@ -807,7 +845,7 @@ describe('PiAgentAdapter', () => {
     const created = app.adapter.createSession();
     if (!created.ok) throw new Error(created.error.message);
     let saved = app.adapter.exportSession(created.data.nativeSessionId);
-    app.adapter.watchSession(created.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); });
+    watchFixture(app.adapter, 210, created.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); });
     const prepared = await app.adapter.prepare(created.data.nativeSessionId, config, { timeoutMs: 60000, stopGraceMs: 5000 }, new AbortController().signal);
     if (!prepared.ok) throw new Error(prepared.error.message);
     const records = (app.adapter as unknown as { sessions: Map<string, { session: AgentSession }> }).sessions;
@@ -822,7 +860,8 @@ describe('PiAgentAdapter', () => {
       expect(app.requests).toHaveLength(1);
       if (!saved.ok) throw new Error(saved.error.message);
       expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(1);
-      expect(saved.data.unusable).toBe(true);
+      // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
+    expect(saved.data.unusable).toBe(false);
       expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
     } finally { unsubscribe(); }
   });
@@ -861,7 +900,7 @@ describe('PiAgentAdapter', () => {
     const nativeId = created.data.nativeSessionId;
     let saved = app.adapter.exportSession(nativeId);
     expect(saved.ok).toBe(true);
-    expect(app.adapter.watchSession(nativeId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
+    expect(watchFixture(app.adapter, 201, nativeId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
     const first = await app.adapter.prepare(nativeId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
     expect(first.ok).toBe(true);
     if (!first.ok) return;
@@ -869,8 +908,8 @@ describe('PiAgentAdapter', () => {
     expect(saved.ok && saved.data.entries.length > 1).toBe(true);
     expect((await app.adapter.releaseSession(nativeId)).closed).toBe(true);
     if (!saved.ok) return;
-    expect(app.adapter.restoreSession(nativeId, saved.data)).toEqual(ok(undefined));
-    expect(app.adapter.watchSession(nativeId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
+    expect(restoreFixture(app.adapter, nativeId, saved.data)).toEqual(ok(undefined));
+    expect(watchFixture(app.adapter, 201, nativeId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
     const second = await app.adapter.prepare(nativeId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
     expect(second.ok).toBe(true);
     if (!second.ok) return;
@@ -884,7 +923,7 @@ describe('PiAgentAdapter', () => {
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const nativeId = created.data.nativeSessionId;
-    expect(app.adapter.watchSession(nativeId, () => fail(appError('storage_write_failed', 'storage', 'Fixture write failed.'))))
+    expect(watchFixture(app.adapter, 21, nativeId, () => fail(appError('storage_write_failed', 'storage', 'Fixture write failed.'))))
       .toEqual(ok(undefined));
     const prepared = await app.adapter.prepare(nativeId, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);
     expect(prepared).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
@@ -925,7 +964,7 @@ describe('PiAgentAdapter', () => {
     if (!created.ok) return;
     let saved = app.adapter.exportSession(created.data.nativeSessionId);
     expect(saved.ok).toBe(true);
-    expect(app.adapter.watchSession(created.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
+    expect(watchFixture(app.adapter, 19, created.data.nativeSessionId, (history) => { saved = ok(history); return ok(undefined); }).ok).toBe(true);
     const prepared = await app.adapter.prepare(created.data.nativeSessionId, config,
       { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: ['probe_read'] });
     if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
@@ -956,7 +995,7 @@ describe('PiAgentAdapter', () => {
     if (!saved.ok) return;
     expect(JSON.stringify(saved.data.entries)).toContain('p3-call-1');
     expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
-    expect(app.adapter.restoreSession(created.data.nativeSessionId, saved.data)).toEqual(ok(undefined));
+    expect(restoreFixture(app.adapter, created.data.nativeSessionId, saved.data)).toEqual(ok(undefined));
     const changed = await app.adapter.prepare(created.data.nativeSessionId,
       { ...config, modelRef: { ...config.modelRef, model: 'different-model' } },
       { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal, { activeToolNames: ['probe_read'] });
@@ -1007,7 +1046,7 @@ describe('PiAgentAdapter', () => {
     expect(outcome.error).toBeNull();
   });
 
-  it('blocks every P3 dispatch when the final native history contains an image and requires a new Session', async () => {
+  it('blocks every P3 dispatch when native image provenance is unavailable', async () => {
     const app = await fixture();
     const created = app.adapter.createSession();
     expect(created.ok).toBe(true);
@@ -1034,8 +1073,7 @@ describe('PiAgentAdapter', () => {
       workspaceInput: { documentRef: { id: 1, version: 'v1' }, job: null, candidate: null },
       goalMode: 'answer', toolBinding: binding }, new AbortController().signal, () => undefined);
     expect(app.requests).toHaveLength(0);
-    expect(outcome.error).toMatchObject({ code: 'agent_image_history_blocked' });
-    expect(outcome.error?.message).toContain('New Session');
+    expect(outcome.error).toMatchObject({ code: 'context_binding_unknown' });
     expect(app.adapter.inspect(created.data.nativeSessionId)).toEqual({ availability: 'unusable' });
   });
 
