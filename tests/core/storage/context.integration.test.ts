@@ -1092,3 +1092,21 @@ describe('P8 Context storage', () => {
     expect(f.store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 });
+
+it('P9 T07 preserves genuinely absent historical markers and journal bytes after reopen', () => {
+  // Historical P8 storage fixture: this Run is born without a P9 marker. It is
+  // not claimed as an Application-generated request or an image authorization.
+  const f = fixture(), saved = f.append(); f.consume(saved.inputId, saved.content.text);
+  expect(Object.hasOwn(f.config, 'historyPolicyVersion')).toBe(false);
+  const { includedNativeContexts: _notCollected, ...binding } = f.binding(saved.inputId, saved.snapshot.id);
+  const raw = JSON.stringify({ version: 1, requests: [{ binding, api: 'openai-responses', boundAt: at,
+    sdkPayload: null, transport: 'observed-fetch', attempts: [] }] }, null, 2);
+  f.store.db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(raw, f.runId); finish(f);
+  const before = f.store.db.query('SELECT config_json,context_observations_json FROM runs WHERE id=?').get(f.runId);
+  f.store.close();
+  const reopened = need(openTestDatabase(f.productPaths));
+  const page = need(reopened.context.listContextRequests({ sessionId: f.session.sessionId, runId: f.runId }));
+  expect(page.items[0]!.binding.includedNativeContexts).toBeNull();
+  expect(reopened.db.query('SELECT config_json,context_observations_json FROM runs WHERE id=?').get(f.runId)).toEqual(before);
+  expect(reopened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+});

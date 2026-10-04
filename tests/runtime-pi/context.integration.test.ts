@@ -6,6 +6,9 @@ import { streamSimple as responsesStream } from '@earendil-works/pi-ai/api/opena
 import { ModelRuntime, SessionManager, type AgentSession } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { openDatabase } from '@flowmate/core';
+import { CandidateDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
 import { ContextObservationsSchema, SessionInputContentV2Schema, appError, fail, ok } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, ProviderConfig, Result, SessionInputRequest, AgentToolBinding, ToolDefinition, RequestContextBinding, ContextEvidenceUpdate } from '@flowmate/contracts';
 import { z } from 'zod';
@@ -1013,4 +1016,451 @@ it('P9 T04 persists late idle native facts without reopening the terminal SQL Ru
   expect(after.seed.inputs.find(input => input.nativeEntryId === userId)).toEqual({ nativeEntryId: userId, originRunId: null, inputId: null, snapshotId: null });
   expect(need(f.store.runs.get(run.accepted.runId))).toEqual(beforeRun);
   expect(f.calls()).toBe(beforeCalls); expect(record.active).toBeUndefined();
+});
+
+// T07 qualification uses the public Application, actual SQLite ownership, native Pi
+// codecs and the original invoice ToolExecutor. Only the remote model is loopback.
+const t07Png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=';
+async function t07Fixture(api: 'openai-completions' | 'openai-responses' | 'google-generative-ai' = 'openai-completions', imageCapability = true) {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-p9-t07-'));
+  const paths = { root: join(root, 'product'), databaseFile: join(root, 'product/data/app.sqlite'), logsDir: join(root, 'product/logs'), artifactsDir: join(root, 'product/artifacts'),
+    outputsDir: join(root, 'product/outputs'), runtimeDir: join(root, 'product/runtime') };
+  const payloads: any[] = [], sdkPayloads: unknown[] = [], conversions: Array<{ input: any[]; output: any[] }> = [], bindings: any[] = [], records: any[] = [];
+  let loseUnconsumedReceipt = false, rejectM3 = false;
+  let replyTool: unknown, responseHook: (() => Response | Promise<Response>) | undefined;
+  let replacement: ((p: any) => unknown) | undefined, transform: ((m: any[]) => any[]) | undefined;
+  const calls = { http: 0, base: 0, observe: 0, execute: 0, enqueue: 0 };
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    payloads.push(await request.json()); calls.http++;
+    if (responseHook) return responseHook();
+    if (replyTool) {
+      const tool = replyTool; replyTool = undefined;
+      return new Response('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0,
+        id: 't07-original-call', type: 'function', function: { name: 'save_invoice_candidate', arguments: JSON.stringify(tool) } }] },
+        finish_reason: 'tool_calls' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    }
+    return api === 'openai-responses' ? responsesReply() : reply('T07 controlled answer');
+  } });
+  deferCleanup(() => server.stop(true));
+  const modelsPath = join(root, 'models.json');
+  writeFileSync(modelsPath, JSON.stringify({ providers: { 't07-loopback': { baseUrl: `http://127.0.0.1:${server.port}/v1`, api,
+    models: ['M1', 'M2', 'M3'].map(id => ({ id, name: id, reasoning: false, input: imageCapability ? ['text', 'image'] : ['text'],
+      contextWindow: 128000, maxTokens: 16384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) } } }));
+  const config = (model = 'M1', retries: 0 | 1 = 0): ProviderConfig => ({ version: 1, name: 'T07', revision: 1,
+    modelRef: { provider: 't07-loopback', model }, native: { authPath: join(root, 'unused.json'), modelsPath },
+    parameters: { maxRetries: retries, maxRetryDelayMs: 100 } });
+  let app!: Application, adapter!: PiAgentAdapter, sdk!: AgentSession, ownedDb!: Database;
+  const runtimeState = RuntimeService.prototype.state;
+  RuntimeService.prototype.state = function (...args) {
+    ownedDb = (this as any).dependencies.contextService.options.store.db; return runtimeState.apply(this, args);
+  };
+  deferCleanup(() => { RuntimeService.prototype.state = runtimeState; });
+  const sql = <T>(fn: (db: Database) => T): T => fn(ownedDb);
+  const open = async () => {
+    app = need(await createApplication({ paths, invoiceSourceRoot: join(root, 'source'), logger: { write() {}, async close() {} }, agentFactory: tools => {
+      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-t07',
+        fetch: (input, init) => { calls.base++; return globalThis.fetch(input, init); }, sessionSetup(session) {
+          sdk = session;
+        } });
+      const prepare = adapter.prepare.bind(adapter);
+      adapter.prepare = async (...args) => {
+        const prepared = await prepare(...args); if (!prepared.ok) return prepared;
+        const stream = sdk.agent.streamFunction;
+        sdk.agent.streamFunction = (model, context, options) => stream(model, context, { ...options,
+          onPayload: payload => { sdkPayloads.push(structuredClone(payload)); return replacement ? replacement(payload) : undefined; } });
+        const convert = sdk.agent.convertToLlm.bind(sdk.agent);
+        sdk.agent.convertToLlm = async messages => {
+          const output = await convert(messages); conversions.push({ input: [...messages], output: [...output] }); return output;
+        };
+        if (transform) sdk.agent.transformContext = async messages => transform!(messages);
+        const execute = prepared.data.execute;
+        return { ...prepared, data: { ...prepared.data, async execute(input, signal, observe) {
+          const hooks = input.contextHooks!, binding = input.toolBinding;
+          const outcome = await execute({ ...input, contextHooks: { ...hooks,
+            bind(value) { bindings.push(structuredClone(value)); return hooks.bind(value); },
+            record(binding, update) { records.push(structuredClone({ binding, update })); return hooks.record(binding, update); } },
+            ...(binding ? { toolBinding: { ...binding,
+              observeRequest(...call) { calls.observe++; return binding.observeRequest(...call); },
+              execute(...call) { calls.execute++; return binding.execute(...call); } } } : {}) }, signal, observe);
+          if (!loseUnconsumedReceipt) return outcome;
+          const { confirmedUnconsumedInputIds: _lost, ...agent } = outcome.agent;
+          return { ...outcome, agent };
+        } } };
+      };
+      const enqueue = adapter.enqueueInput.bind(adapter); adapter.enqueueInput = (...args) => { calls.enqueue++; return enqueue(...args); };
+      const watch = adapter.watchSession.bind(adapter);
+      adapter.watchSession = (id, receipt, seed, write) => watch(id, receipt, seed, value =>
+        rejectM3 && value.history.entries.some((e: any) => e.type === 'model_change' && e.modelId === 'M3')
+          ? fail(appError('storage_write_failed', 'storage', 'Controlled M3 metadata commit failure.')) : write(value));
+      return adapter;
+    } }));
+    await app.queryRuntimeState();
+    const opened = app; deferCleanup(() => opened.close()); return app;
+  };
+  await open();
+  const session = need(await app.createSession({ title: 'T07 source', expectedRevision: need(await app.readWorkspace()).revision }));
+  const input = async (sessionId: number, sequence: number, text: string, model = 'M1', material = false, retries: 0 | 1 = 0) => {
+    const workspace = need(await app.readWorkspace());
+    return begin(app, { sessionId, clientSequence: sequence, mode: 'prompt', text, config: config(model, retries), timeoutMs: 7000, stopGraceMs: 500,
+      ...(material ? { goalMode: 'save-candidate' as const, workspace: { revision: workspace.revision, documentRef: workspace.documentRef,
+        jobId: workspace.jobId, candidateRef: workspace.candidateRef, sessionId } } : {}) });
+  };
+  const fork = async (sourceSessionId: number, targetEntryId?: string) => {
+    const page = need(await app.querySessionHistory({ sessionId: sourceSessionId }));
+    return need(await app.forkSession({ sourceSessionId, expected: page.commit, targetEntryId: targetEntryId ?? page.commit.leafId!,
+      title: 'T07 fork', clientOperationId: crypto.randomUUID() }));
+  };
+  const branch = async (sessionId: number, targetEntryId: string) => {
+    const page = need(await app.querySessionHistory({ sessionId }));
+    return need(await app.branchSession({ sessionId, targetEntryId, expectedCommitRevision: page.commit.commitRevision,
+      expectedEntryCount: page.commit.entryCount, expectedLeafId: page.commit.leafId }));
+  };
+  const counts = () => sql(db => Object.fromEntries(['runs', 'session_inputs', 'context_snapshots', 'tool_calls', 'invoice_candidates'].map(t => [t,
+    (db.query(`SELECT COUNT(*) n FROM ${t}`).get() as { n: number }).n])));
+  const facts = (sessionId: number) => sql(db => ({ runs: db.query('SELECT * FROM runs WHERE session_id=? ORDER BY id').all(sessionId),
+    inputs: db.query('SELECT * FROM session_inputs WHERE session_id=? ORDER BY id').all(sessionId),
+    tools: db.query('SELECT * FROM tool_calls WHERE run_id IN (SELECT id FROM runs WHERE session_id=?) ORDER BY id').all(sessionId),
+    snapshots: db.query('SELECT * FROM context_snapshots WHERE session_id=? ORDER BY id').all(sessionId),
+    candidates: db.query('SELECT * FROM invoice_candidates ORDER BY id').all() }));
+  const journal = (runId: number) => sql(db => JSON.parse((db.query('SELECT context_observations_json FROM runs WHERE id=?').get(runId) as any).context_observations_json));
+  // Controlled historical entries only; ownership of actual user/tool facts is never fabricated.
+  const historical = async (sessionId: number, build: (history: import('@flowmate/contracts').NativeSessionHistory) => import('@flowmate/contracts').NativeSessionHistory) => {
+    need(await app.close());
+    const store = need(openDatabase(paths));
+    try {
+      const old = need(store.memory.load(sessionId))!, next = build(structuredClone(old.history));
+      const receipt = need(store.memory.commit({ sessionId, expected: old.commit, header: next.header, appendEntries: next.entries,
+        leafId: next.leafId, unusable: next.unusable, contexts: [] }));
+      const bundle = need(store.sessions.loadHistoryForContext(sessionId));
+      expect(bundle.commit).toEqual(receipt); expect(bundle.seed.origins).toHaveLength(next.entries.length);
+    } finally { store.close(); }
+    await open();
+  };
+  const material = async () => {
+    const source = join(root, 'source/000001'); mkdirSync(source, { recursive: true });
+    const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64'), content = JSON.stringify([{ type: 'text', text: 'T07 invoice 113.00', bbox: [0, 0, 1, 1], page_idx: 0 }]);
+    const pages = JSON.stringify([{ pageNumber: 1, text: 'T07 invoice 113.00', blockCount: 1 }]);
+    writeFileSync(join(source, 'original.png'), original); writeFileSync(join(source, 'content.json'), content); writeFileSync(join(source, 'pages.json'), pages);
+    writeFileSync(join(source, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId: '000001', datasetId: 'voxel51-hq-invoice-ocr',
+      sourceRecordId: 'synthetic-t07', datasetRevision: 'fixture', qualityStatus: 'complete', allowedUsesClaim: ['local test'], licenseVerification: 'not_verified',
+      files: [{ path: 'original.png', bytes: original.length }, { path: 'content.json', bytes: Buffer.byteLength(content) }, { path: 'pages.json', bytes: Buffer.byteLength(pages) }] }));
+    const document = need(await app.importInvoiceMaterial(source)), documentId = document.documentRef.id;
+    const selected = need(await app.updateWorkspace({ expectedRevision: need(await app.readWorkspace()).revision, change: { kind: 'document', documentId } }));
+    const task = need(await app.startTask({ clientSequence: 1, expectedRevision: selected.revision, documentRef: document.documentRef, goal: 'T07 save actual candidate' }));
+    const page = need(await app.readDocumentPage({ documentId, page: 1, afterBlockId: null, limit: 50 }));
+    const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
+    const candidate = CandidateDraftSchema.parse({ fields: { ...Object.fromEntries(invoiceHeaderFields.map(name => [name, missing])),
+      totalAmount: { raw: '113.00', normalized: '113.00', state: 'present', alternatives: [], sources: [{ documentId, version: document.documentRef.version,
+        artifactId: document.parsedArtifactId, page: 1, blockId: page.blocks[0]!.id, quote: '113.00' }] } }, lines: [], notes: [] });
+    replyTool = { documentId, candidate };
+    const run = await input(session.sessionId, 1, 'Original invoice request', 'M1', true);
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(calls).toMatchObject({ http: 2, base: 2, observe: 1, execute: 1 });
+    const saved = need(await app.listJobCandidates({ jobId: task.job.jobId })).items;
+    expect(saved).toHaveLength(1); expect(saved[0]!.context).toMatchObject({ snapshotId: expect.any(Number), requestSequence: 1 });
+    return { run, tool: { documentId, candidate }, saved: saved[0]! };
+  };
+  return { paths, session, config, input, fork, branch, counts, facts, journal, historical, material, open, sql, calls, payloads, sdkPayloads, bindings, records, conversions,
+    get app() { return app; }, get adapter() { return adapter; }, get sdk() { return sdk; },
+    loseReceipt(value: boolean) { loseUnconsumedReceipt = value; }, rejectMetadata(value: boolean) { rejectM3 = value; },
+    replace(fn: typeof replacement) { replacement = fn; }, transform(fn: typeof transform) { transform = fn; },
+    respond(fn: typeof responseHook) { responseHook = fn; }, tool(value: unknown) { replyTool = value; } };
+}
+
+it('P9 T07 sends only the selected corrected branch and original tool facts', async () => {
+  const f = await t07Fixture(), original = await f.material(), a = f.session.sessionId;
+  const base = need(await f.app.querySessionHistory({ sessionId: a })).commit.leafId!;
+  const abandoned = await f.input(a, 2, 'ABANDONED amount 999', 'M2'); expect((await abandoned.terminal).result.ok).toBe(true);
+  await f.branch(a, base);
+  const corrected = await f.input(a, 3, 'CORRECTED amount 113', 'M2'); expect((await corrected.terminal).result.ok).toBe(true);
+  const before = f.facts(a), count = f.counts(), effects = { ...f.calls };
+  const b = await f.fork(a), c = await f.fork(b.session.sessionId);
+  expect(f.counts()).toEqual(count); expect(f.calls).toEqual(effects);
+  need(await f.app.close()); await f.open();
+  for (const id of [a, b.session.sessionId, c.session.sessionId]) need(await f.app.querySessionHistory({ sessionId: id }));
+  need(await f.app.queryRun(original.run.accepted.runId));
+  need(await f.app.querySessionInput({ sessionId: a, inputId: original.run.accepted.inputId }));
+  need(await f.app.listContextRequests({ sessionId: a, runId: original.run.accepted.runId }));
+  expect(f.facts(a)).toEqual(before); expect(f.counts()).toEqual(count); expect(f.calls).toEqual(effects);
+  const next = await f.input(c.session.sessionId, 1, 'Use selected correction', 'M3');
+  expect((await next.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect(f.counts()).toEqual({ ...count, runs: count.runs! + 1, session_inputs: count.session_inputs! + 1, context_snapshots: count.context_snapshots! + 1 });
+  expect(f.calls).toMatchObject({ http: effects.http + 1, base: effects.base + 1, execute: 1, observe: 1 });
+  const wire = JSON.stringify(f.payloads.at(-1)); expect(wire).toContain('CORRECTED amount 113'); expect(wire).not.toContain('ABANDONED amount 999');
+  expect(wire).toContain('t07-original-call'); expect(wire).toContain('113.00'); expect(f.payloads.at(-1).model).toBe('M3');
+  const input = need(await f.app.querySessionInput({ sessionId: c.session.sessionId, inputId: next.accepted.inputId })).input!;
+  const request = f.journal(next.accepted.runId).requests[0];
+  expect(request.binding).toMatchObject({ sessionId: c.session.sessionId, inputId: next.accepted.inputId, snapshotId: input.contextSnapshotId,
+    includedNativeContexts: [] });
+  expect(request.binding.includedBindings.map((v: any) => v.inputId)).toEqual([original.run.accepted.inputId, corrected.accepted.inputId, next.accepted.inputId]);
+  expect(request.sdkPayload.inclusion).toBe('confirmed'); expect(request.attempts[0].wireInclusion).toBe('confirmed');
+  const originalTool = request.binding.includedToolResults[0];
+  expect(originalTool).toMatchObject({ originRunId: original.run.accepted.runId, nativeToolCallId: 't07-original-call' });
+  const toolView = need(await f.app.queryRunToolCall({ sessionId: a, runId: original.run.accepted.runId, toolCallId: originalTool.toolCallId }));
+  expect(toolView).toMatchObject({ toolCallId: originalTool.toolCallId, status: 'succeeded' });
+  const originalSnapshot = need(await f.app.queryContextSnapshot({ sessionId: a, runId: original.run.accepted.runId, snapshotId: originalTool.context.snapshotId }));
+  expect(originalSnapshot.snapshot.id).toBe(originalTool.context.snapshotId);
+  const targetSnapshot = need(await f.app.queryContextSnapshot({ sessionId: c.session.sessionId, runId: next.accepted.runId, snapshotId: input.contextSnapshotId! }));
+  expect(targetSnapshot.snapshot.id).not.toBe(originalSnapshot.snapshot.id);
+  expect(f.facts(a)).toEqual(before);
+  console.log('T07 selected real effects', JSON.stringify({ before: effects, after: f.calls, counts: f.counts() }));
+});
+
+it('P9 T07 binds inherited and native derived contexts through request reload', async () => {
+  const f = await t07Fixture(), actual = await f.material(), a = f.session.sessionId;
+  const history = need(f.adapter.exportSession(f.session.nativeSessionId));
+  const users = history.entries.filter((e: any) => e.type === 'message' && e.message.role === 'user');
+  const call = history.entries.find((e: any) => e.type === 'message' && e.message.role === 'assistant' && e.message.content.some((b: any) => b.type === 'toolCall'))!;
+  const result = history.entries.find((e: any) => e.type === 'message' && e.message.role === 'toolResult')!;
+  const oldFacts = f.facts(a);
+  await f.historical(a, h => {
+    const entries = [...h.entries]; let parentId = h.leafId;
+    const add = (id: string, value: any) => { entries.push({ id, parentId, timestamp: '2026-10-04T00:00:00.000Z', ...value }); parentId = id; };
+    for (const [id, excludeFromContext] of [['excluded-bash', true], ['included-bash', false]] as const)
+      add(id, { type: 'message', message: { role: 'bashExecution', command: 'printf fixture', output: id, excludeFromContext, exitCode: 0, cancelled: false, truncated: false, timestamp: 1 } });
+    add('custom-hidden', { type: 'custom_message', customType: 't07', content: 'same derived body', display: false });
+    add('custom-visible', { type: 'custom_message', customType: 't07', content: 'same derived body', display: true });
+    add('entry-summary', { type: 'branch_summary', fromId: result.id, summary: 'entry summary body' });
+    add('message-summary', { type: 'message', message: { role: 'branchSummary', fromId: call.id, summary: 'message summary body', timestamp: 2 } });
+    add('message-compaction', { type: 'message', message: { role: 'compactionSummary', summary: 'message compaction body', tokensBefore: 10, timestamp: 3 } });
+    add('entry-compaction', { type: 'compaction', firstKeptEntryId: users[0]!.id, summary: 'entry compaction body', tokensBefore: 20 });
+    return { ...h, entries, leafId: parentId };
+  });
+  const b = await f.fork(a), c = await f.fork(b.session.sessionId), before = f.counts(), effects = { ...f.calls };
+  const next = await f.input(c.session.sessionId, 1, 'New independent input', 'M3');
+  expect((await next.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const converted = f.conversions.at(-1)!;
+  expect(converted.input.map(m => m.role)).toEqual(['compactionSummary', 'user', 'assistant', 'toolResult', 'assistant', 'bashExecution', 'bashExecution', 'custom', 'custom', 'branchSummary', 'branchSummary', 'compactionSummary', 'user']);
+  expect(converted.output).toHaveLength(12); expect(converted.input[7]).not.toBe(converted.input[8]);
+  expect(converted.output[6].content).toEqual([{ type: 'text', text: 'same derived body' }]);
+  expect(converted.output[7].content).toEqual(converted.output[6].content);
+  expect(JSON.stringify(converted.output[5])).toContain('included-bash'); expect(JSON.stringify(converted.output)).not.toContain('excluded-bash');
+  const expected = ([
+    ['entry-compaction', 'compaction', 'compactionSummary', 0, [users[0]!.id]],
+    ['included-bash', 'message', 'bashExecution', 6, []],
+    ['custom-hidden', 'custom_message', 'custom', 7, []], ['custom-visible', 'custom_message', 'custom', 8, []],
+    ['entry-summary', 'branch_summary', 'branchSummary', 9, [result.id]],
+    ['message-summary', 'message', 'branchSummary', 10, [call.id]],
+    ['message-compaction', 'message', 'compactionSummary', 11, []],
+  ] as const).map(([nativeEntryId, entryType, messageRole, contextMessageIndex, referenceEntryIds]) => ({ nativeEntryId, originSessionId: a, entryType, messageRole, contextMessageIndex, referenceEntryIds }));
+  const request = f.journal(next.accepted.runId).requests[0];
+  expect(request.binding.includedNativeContexts).toEqual(expected);
+  expect(f.bindings.at(-1).binding).toEqual(request.binding);
+  expect(f.records.filter(r => r.binding.runId === next.accepted.runId).every(r => JSON.stringify(r.binding) === JSON.stringify(request.binding))).toBe(true);
+  expect(request.binding.includedBindings.map((v: any) => v.inputId)).toEqual([actual.run.accepted.inputId, next.accepted.inputId]);
+  expect(request.binding.includedToolResults[0]).toMatchObject({ originRunId: actual.run.accepted.runId });
+  expect(request.sdkPayload.inclusion).toBe('confirmed'); expect(request.attempts[0].wireInclusion).toBe('confirmed');
+  expect(f.counts()).toEqual({ ...before, runs: before.runs! + 1, session_inputs: before.session_inputs! + 1, context_snapshots: before.context_snapshots! + 1 });
+  expect(f.calls).toMatchObject({ http: effects.http + 1, observe: 1, execute: 1 }); expect(f.facts(a)).toEqual(oldFacts);
+  need(await f.app.close()); await f.open();
+  const publicRequests = need(await f.app.listContextRequests({ sessionId: c.session.sessionId, runId: next.accepted.runId }));
+  expect(publicRequests.items[0]!.binding.includedNativeContexts).toEqual(expected);
+  const page = need(await f.app.querySessionHistory({ sessionId: c.session.sessionId }));
+  for (const source of expected) {
+    expect(page.items.find(item => item.entryId === source.nativeEntryId)?.originSessionId).toBe(a);
+    const detail = need(await f.app.querySessionHistoryEntry({ sessionId: c.session.sessionId, entryId: source.nativeEntryId, expectedCommitRevision: page.commit.commitRevision }));
+    expect(detail.summary.originSessionId).toBe(a);
+  }
+  expect(f.journal(next.accepted.runId).requests).toEqual([request]);
+  const chat = need(await f.app.listSessionMessages({ sessionId: c.session.sessionId }));
+  expect(chat.items.every(item => ['user', 'assistant', 'toolResult'].includes(item.role))).toBe(true);
+  expect(JSON.stringify(chat)).not.toContain('same derived body');
+  for (const text of ['included-bash', 'same derived body', 'entry summary body', 'message summary body', 'message compaction body', 'entry compaction body'])
+    expect(JSON.stringify(f.payloads.at(-1))).toContain(text);
+  expect(f.calls.http).toBe(effects.http + 1);
+  console.log('T07 derived actual input/output indexes', JSON.stringify({ roles: converted.input.map(m => m.role), outputCount: converted.output.length, expected, effects: f.calls }));
+});
+
+for (const api of ['openai-completions', 'openai-responses'] as const) it(`P9 T07 delivers restored user and custom images through both real codecs: ${api}`, async () => {
+  const f = await t07Fixture(api), a = f.session.sessionId;
+  await f.historical(a, h => ({ ...h, entries: [
+    { id: 'root', type: 'message', parentId: null, timestamp: '2026-10-04T00:00:00.000Z', message: { role: 'user', content: [{ type: 'text', text: 'Legacy restored image' }, { type: 'image', data: t07Png, mimeType: 'image/png' }], timestamp: 1 } },
+    { id: 'image-custom', type: 'custom_message', parentId: 'root', timestamp: '2026-10-04T00:00:00.000Z', customType: 'image', display: false,
+      content: [{ type: 'image', data: t07Png, mimeType: 'image/png' }] },
+    { id: 'image-compaction', type: 'compaction', parentId: 'image-custom', timestamp: '2026-10-04T00:00:00.000Z', firstKeptEntryId: 'root', summary: 'Preserve literal root reference', tokensBefore: 20 },
+  ], leafId: 'image-compaction' }));
+  const b = await f.fork(a), before = f.counts();
+  const run = await f.input(b.session.sessionId, 1, 'Describe restored images', 'M3');
+  expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect(f.sdk.model?.input).toEqual(['text', 'image']);
+  expect(f.calls).toMatchObject({ http: 1, base: 1, observe: 0, execute: 0 });
+  const wire = JSON.stringify(f.payloads[0]); expect(wire.split(`data:image/png;base64,${t07Png}`).length - 1).toBe(2);
+  expect(JSON.stringify(f.sdkPayloads[0]).split(`data:image/png;base64,${t07Png}`).length - 1).toBe(2);
+  const request = f.journal(run.accepted.runId).requests[0];
+  expect(request.binding.includedBindings[0]).toEqual({ nativeEntryId: 'root', originRunId: null, inputId: null, snapshotId: null });
+  expect(request.binding.includedNativeContexts).toEqual([
+    { nativeEntryId: 'image-compaction', originSessionId: a, entryType: 'compaction', messageRole: 'compactionSummary', contextMessageIndex: 0, referenceEntryIds: ['root'] },
+    { nativeEntryId: 'image-custom', originSessionId: a, entryType: 'custom_message', messageRole: 'custom', contextMessageIndex: 2, referenceEntryIds: [] }]);
+  expect(request.sdkPayload.inclusion).toBe('confirmed'); expect(request.attempts[0].wireInclusion).toBe('confirmed');
+  expect(JSON.stringify(request)).not.toContain(t07Png);
+  expect(f.counts()).toEqual({ ...before, runs: 1, session_inputs: 1, context_snapshots: 1 });
+  need(await f.app.close()); await f.open();
+  const publicRequests = need(await f.app.listContextRequests({ sessionId: b.session.sessionId, runId: run.accepted.runId }));
+  const publicHistory = need(await f.app.querySessionHistory({ sessionId: b.session.sessionId }));
+  const publicDetail = need(await f.app.querySessionHistoryEntry({ sessionId: b.session.sessionId, entryId: 'root', expectedCommitRevision: publicHistory.commit.commitRevision }));
+  expect(publicDetail.summary.originSessionId).toBe(a);
+  expect(publicDetail.fields).toMatchObject({ hasImages: true, imageMimeTypes: ['image/png'] });
+  expect(JSON.stringify(publicRequests) + JSON.stringify(publicHistory) + JSON.stringify(publicDetail)).not.toContain(t07Png);
+  expect(publicRequests.items[0]!.binding.includedNativeContexts).toEqual(request.binding.includedNativeContexts);
+  expect(f.calls.http).toBe(1);
+  console.log('T07 actual image codec', api, JSON.stringify({ calls: f.calls, counts: f.counts(), inclusion: request.sdkPayload.inclusion, wire: request.attempts[0].wireInclusion }));
+});
+
+it('P9 T07 records M3 separately from historical M1 and M2', async () => {
+  const f = await t07Fixture(), a = f.session.sessionId;
+  const first = await f.input(a, 1, 'M1 input', 'M1'); expect((await first.terminal).result.ok).toBe(true);
+  const second = await f.input(a, 2, 'M2 input', 'M2'); expect((await second.terminal).result.ok).toBe(true);
+  const before = f.facts(a), history = need(f.adapter.exportSession(f.session.nativeSessionId));
+  need(await f.app.close()); await f.open();
+  need(await f.app.querySessionHistory({ sessionId: a })); expect(f.facts(a)).toEqual(before); expect(f.calls.http).toBe(2);
+  const third = await f.input(a, 3, 'M3 input', 'M3'); expect((await third.terminal).result.ok).toBe(true);
+  const after = f.facts(a), next = need(f.adapter.exportSession(f.session.nativeSessionId));
+  expect(after.runs.slice(0, 2)).toEqual(before.runs); expect(after.inputs.slice(0, 2)).toEqual(before.inputs);
+  expect(next.entries.slice(0, history.entries.length)).toEqual([...history.entries]);
+  const appended = next.entries.slice(history.entries.length), changes = appended.filter((e: any) => e.type === 'model_change');
+  expect(changes).toHaveLength(1); expect(changes[0]).toMatchObject({ provider: 't07-loopback', modelId: 'M3' });
+  expect(appended.findIndex(e => e.id === changes[0]!.id)).toBeLessThan(appended.findIndex((e: any) => e.type === 'message' && e.message.role === 'user'));
+  const config = JSON.parse((after.runs[2] as any).config_json);
+  expect(config.requestedModel.model).toBe('M3'); expect(config.resolvedModel.model).toBe('M3');
+  expect(config.historyPolicyVersion).toBe('p9-native-history-v1');
+  expect(f.payloads.map(p => p.model)).toEqual(['M1', 'M2', 'M3']);
+  expect(f.journal(third.accepted.runId).requests[0].binding.includedNativeContexts).toEqual([]);
+  expect(f.sql(db => (db.query('SELECT run_id FROM session_native_entries WHERE session_id=? AND entry_id=?').get(a, changes[0]!.id) as any).run_id)).toBeNull();
+});
+
+for (const count of [509, 510]) it(`P9 T07 refuses ambiguous sources incomplete pairs and inherited tool IDs before effects: combined ${count + 3}`, async () => {
+  const f = await t07Fixture(), original = await f.material(), a = f.session.sessionId;
+  await f.historical(a, h => {
+    let parentId = h.leafId; const entries = [...h.entries];
+    for (let index = 0; index < count; index++) { const id = `d${index}`;
+      entries.push({ id, parentId, timestamp: '2026-10-04T00:00:00.000Z', type: 'custom_message', customType: 'c', content: 'x', display: false }); parentId = id; }
+    return { ...h, entries, leafId: parentId };
+  });
+  const b = await f.fork(a), before = f.facts(a), effects = { ...f.calls }, counts = f.counts();
+  const next = await f.input(b.session.sessionId, 1, 'Explicit new execution', 'M3');
+  const terminal = await next.terminal;
+  expect(terminal.result).toMatchObject({ ok: true, data: { status: count === 509 ? 'completed' : 'failed' } });
+  expect(f.calls).toMatchObject({ http: effects.http + (count === 509 ? 1 : 0), base: effects.base + (count === 509 ? 1 : 0), observe: 1, execute: 1 });
+  expect(f.counts().tool_calls).toBe(counts.tool_calls); expect(f.counts().invoice_candidates).toBe(1); expect(f.facts(a)).toEqual(before);
+  if (count === 509) {
+    const binding = f.journal(next.accepted.runId).requests[0].binding;
+    expect(binding.includedNativeContexts).toHaveLength(509); expect(binding.includedBindings).toHaveLength(2); expect(binding.includedToolResults).toHaveLength(1);
+    expect(binding.includedToolResults[0].originRunId).toBe(original.run.accepted.runId);
+  } else expect(JSON.stringify(terminal)).toContain('context_evidence_too_large');
+  console.log('T07 combined provenance capacity', count + 3, JSON.stringify(f.calls));
+});
+
+for (const fault of ['incomplete-pair', 'ambiguous-source', 'object-replacement', 'source-break', 'ancestor-revoked', 'inherited-id', 'retry-revocation'] as const)
+  it(`P9 T07 refuses ambiguous sources incomplete pairs and inherited tool IDs before effects: ${fault}`, async () => {
+    const f = await t07Fixture(), actual = await f.material(), a = f.session.sessionId;
+    const b = await f.fork(a), c = await f.fork(b.session.sessionId), before = f.facts(a), effects = { ...f.calls }, counts = f.counts();
+    if (fault === 'incomplete-pair') f.transform(messages => messages.filter(m => m.role !== 'toolResult'));
+    if (fault === 'ambiguous-source') f.transform(messages => [...messages, messages.find(m => m.role === 'user')!]);
+    if (fault === 'object-replacement') f.transform(messages => messages.map(m => structuredClone(m)));
+    if (fault === 'source-break') f.sql(db => db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.message.content','changed source') WHERE session_id=? AND entry_id=?")
+      .run(a, (before.inputs[0] as any).native_entry_id));
+    if (fault === 'ancestor-revoked') f.sql(db => db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?").run(JSON.stringify({ documentIds: [actual.tool.documentId], at: '2026-10-04T00:00:00.000Z', reason: 'document_use_revoked' }), a));
+    if (fault === 'inherited-id') {
+      need(await f.app.updateWorkspace({ expectedRevision: need(await f.app.readWorkspace()).revision, change: { kind: 'session', sessionId: c.session.sessionId } }));
+      f.tool(actual.tool);
+    }
+    if (fault === 'retry-revocation') f.respond(() => {
+      f.sql(db => db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?").run(JSON.stringify({ documentIds: [actual.tool.documentId], at: '2026-10-04T00:00:00.000Z', reason: 'document_use_revoked' }), a));
+      return new Response('Controlled unavailable', { status: 503 });
+    });
+    let terminal: unknown;
+    try { const run = await f.input(c.session.sessionId, 1, 'Explicit new execution', 'M3', fault === 'inherited-id', fault === 'retry-revocation' ? 1 : 0); terminal = await run.terminal; }
+    catch (error) { terminal = String(error); }
+    expect(JSON.stringify(terminal)).not.toContain('"status":"completed"');
+    const prerequisite = ['inherited-id', 'retry-revocation'].includes(fault) ? 1 : 0;
+    expect(f.calls).toMatchObject({ http: effects.http + prerequisite, base: effects.base + prerequisite, observe: 1, execute: 1 });
+    expect(f.counts().tool_calls).toBe(counts.tool_calls); expect(f.counts().invoice_candidates).toBe(counts.invoice_candidates);
+    expect(f.facts(a)).toEqual(before);
+    const expectedError = { 'incomplete-pair': 'session_history_invalid', 'ambiguous-source': 'context_binding_unknown', 'object-replacement': 'context_binding_unknown', 'source-break': 'context_binding_unknown', 'ancestor-revoked': 'session_scope_revoked', 'inherited-id': 'context_binding_conflict', 'retry-revocation': 'session_scope_revoked' }[fault];
+    expect(JSON.stringify(terminal)).toContain(expectedError);
+    if (fault === 'retry-revocation') {
+      const requests = f.sql(db => JSON.parse((db.query('SELECT context_observations_json FROM runs WHERE session_id=?').get(c.session.sessionId) as any).context_observations_json)).requests;
+      expect(requests[0].attempts).toHaveLength(1); expect(requests[0].attempts[0].responseStatus).toBe(503);
+    }
+    console.log('T07 real negative', fault, JSON.stringify({ before: effects, after: f.calls, terminal }));
+  });
+
+for (const fault of ['no-capability', 'unsupported-codec', 'changed-payload-image', 'changed-object-image'] as const)
+  it(`P9 T07 delivers restored user and custom images through both real codecs: rejects ${fault}`, async () => {
+    const f = await t07Fixture(fault === 'unsupported-codec' ? 'google-generative-ai' : 'openai-completions', fault !== 'no-capability');
+    await f.historical(f.session.sessionId, h => ({ ...h, entries: [{ id: 'private-image', parentId: null, timestamp: '2026-10-04T00:00:00.000Z',
+      type: 'custom_message', customType: 'image', display: false, content: [{ type: 'image', data: t07Png, mimeType: 'image/png' }] }], leafId: 'private-image' }));
+    if (fault === 'changed-payload-image') f.replace(payload => JSON.parse(JSON.stringify(payload).replace(t07Png, 'AAAA')));
+    if (fault === 'changed-object-image') f.transform(messages => messages.map(m => m.role === 'custom' ? { ...m, content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] } : m));
+    const run = await f.input(f.session.sessionId, 1, 'Explicit image request', 'M3');
+    const terminal = await run.terminal;
+    expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed' } }); expect(f.calls).toMatchObject({ http: 0, base: 0, observe: 0, execute: 0 });
+    expect(f.counts()).toMatchObject({ tool_calls: 0, invoice_candidates: 0 });
+    expect(JSON.stringify(f.journal(run.accepted.runId))).not.toContain(t07Png);
+    console.log('T07 image refusal', fault, JSON.stringify({ terminal, calls: f.calls }));
+  });
+
+it('P9 T07 records M3 separately from historical M1 and M2: required metadata save precedes HTTP', async () => {
+  const f = await t07Fixture(), a = f.session.sessionId;
+  for (const [sequence, model] of [[1, 'M1'], [2, 'M2']] as const) { const run = await f.input(a, sequence, model, model); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } }); }
+  const before = f.facts(a), history = need(f.adapter.exportSession(f.session.nativeSessionId));
+  need(await f.app.close()); await f.open(); f.rejectMetadata(true);
+  const next = await f.input(a, 3, 'Explicit M3', 'M3');
+  expect((await next.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'storage_write_failed' } } });
+  expect(f.calls.http).toBe(2); expect(f.calls.base).toBe(2);
+  expect(f.facts(a).runs.slice(0, 2)).toEqual(before.runs); expect(f.facts(a).inputs.slice(0, 2)).toEqual(before.inputs);
+  expect(f.sql(db => db.query('SELECT entry_json FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(a).map((r: any) => JSON.parse(r.entry_json)))).toEqual([...history.entries]);
+});
+
+for (const unknown of [false, true]) it(`P9 T07 restores without replaying queued or unknown input after interruption: ${unknown ? 'unknown receipt' : 'confirmed queue'}`, async () => {
+  const f = await t07Fixture(), a = f.session.sessionId, entered = barrier(), release = barrier(); deferCleanup(() => release.release());
+  f.respond(async () => { entered.release(); await release.ready; return reply(); });
+  const first = await f.input(a, 1, 'Consumed original prompt');
+  expect(await Promise.race([entered.ready.then(() => 'entered'), first.terminal])).toBe('entered');
+  const queued = need(await f.app.submitInput({ sessionId: a, runId: first.accepted.runId, clientSequence: 2, mode: 'followUp', text: 'MUST NOT REPLAY QUEUED' }));
+  expect(need(await f.app.querySessionInput({ sessionId: a, inputId: queued.inputId })).input).toMatchObject({ status: 'queued', nativeEntryId: null });
+  f.loseReceipt(unknown);
+  need(await f.app.cancelRun(first.accepted.runId));
+  const terminal = await first.terminal; release.release();
+  expect(terminal.result).toMatchObject({ ok: true, data: { status: 'cancelled' } });
+  const consumed = need(await f.app.querySessionInput({ sessionId: a, inputId: first.accepted.inputId })).input!;
+  const stoppedInput = need(await f.app.querySessionInput({ sessionId: a, inputId: queued.inputId })).input!;
+  expect(consumed.status).toBe('consumed'); expect(stoppedInput).toMatchObject({ status: unknown ? 'delivery_unknown' : 'cancelled', nativeEntryId: null });
+  const before = f.facts(a), counts = f.counts(), effects = { ...f.calls };
+  need(await f.app.close()); await f.open(); f.respond(undefined); f.loseReceipt(false);
+  need(await f.app.querySessionHistory({ sessionId: a })); need(await f.app.queryRun(first.accepted.runId));
+  expect(need(await f.app.querySessionInput({ sessionId: a, inputId: queued.inputId })).input).toEqual(stoppedInput);
+  const messages = need(await f.app.listSessionMessages({ sessionId: a }));
+  expect(messages.items.some(item => item.role === 'user')).toBe(true);
+  expect(need(await f.app.listSessionInputs({ sessionId: a })).items.find(i => i.inputId === queued.inputId)?.status).toBe(unknown ? 'delivery_unknown' : 'cancelled');
+  expect(f.counts()).toEqual(counts); expect(f.calls).toEqual(effects); expect(f.facts(a)).toEqual(before);
+  expect(await f.app.submitInput({ sessionId: a, clientSequence: 3, mode: 'prompt', text: 'Blocked original Session', config: f.config('M3') })).toMatchObject({ ok: false });
+  expect(f.counts()).toEqual(counts); expect(f.calls).toEqual(effects);
+  const fresh = need(await f.app.createSession({ title: 'Explicit safe new Session', expectedRevision: need(await f.app.readWorkspace()).revision }));
+  const next = await f.input(fresh.sessionId, 1, 'Explicit new prompt only', 'M3');
+  expect((await next.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect(f.calls).toMatchObject({ http: effects.http + 1, base: effects.base + 1, enqueue: effects.enqueue, observe: 0, execute: 0 });
+  expect(JSON.stringify(f.payloads.at(-1))).toContain('Explicit new prompt only'); expect(JSON.stringify(f.payloads.at(-1))).not.toContain('MUST NOT REPLAY QUEUED');
+  const after = f.facts(a); expect(after.runs.slice(0, 1)).toEqual(before.runs); expect(after.inputs.slice(0, 2)).toEqual(before.inputs);
+  expect(f.counts()).toEqual({ ...counts, runs: counts.runs! + 1, session_inputs: counts.session_inputs! + 1, context_snapshots: counts.context_snapshots! + 1 });
+  console.log('T07 interruption retained', JSON.stringify({ unknown, consumed: consumed.status, undelivered: stoppedInput.status, before: effects, after: f.calls }));
+});
+
+it('P9 T07 keeps frozen fork sources after the ancestor appends and changes leaf', async () => {
+  const f = await t07Fixture(), original = await f.material(), a = f.session.sessionId;
+  const selected = need(await f.app.querySessionHistory({ sessionId: a })).commit.leafId!;
+  const b = await f.fork(a);
+  const later = await f.input(a, 2, 'ANCESTOR AFTER FROZEN PREFIX', 'M2');
+  expect((await later.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  await f.branch(a, selected);
+  const before = f.facts(a), counts = f.counts(), effects = { ...f.calls };
+  need(await f.app.close()); await f.open();
+  need(await f.app.querySessionHistory({ sessionId: b.session.sessionId }));
+  expect(f.calls).toEqual(effects); expect(f.counts()).toEqual(counts);
+  const next = await f.input(b.session.sessionId, 1, 'Use frozen original', 'M3');
+  expect((await next.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect(f.payloads.at(-1).model).toBe('M3'); expect(JSON.stringify(f.payloads.at(-1))).not.toContain('ANCESTOR AFTER FROZEN PREFIX');
+  expect(f.journal(next.accepted.runId).requests[0].binding.includedToolResults[0].originRunId).toBe(original.run.accepted.runId);
+  expect(f.facts(a)).toEqual(before); expect(f.calls).toMatchObject({ http: effects.http + 1, observe: 1, execute: 1 });
 });

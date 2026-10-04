@@ -16,6 +16,7 @@ import { createApplication } from '../../../apps/composition.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import type { AgentRunEvent } from '@flowmate/contracts';
+import type { RuntimeEventStore } from '../../../packages/core/src/events/store.ts';
 
 function writeContextMaterial(directory: string, sampleId: string, text: string) {
   mkdirSync(directory, { recursive: true });
@@ -189,7 +190,7 @@ function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.
 function fixture(selection: WorkspaceSelection | null = null, fill = false, human = false, workingDirectory?: string) {
   const base = makeSelectedCandidate(false, true);
   const store = { ...base, context: createContextRepository({ db: base.db, loadHistory: id => base.sessions.loadHistory(id) }) };
-  need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, store.session.sessionId, { storageVersion: 1,
+  need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore as RuntimeEventStore : undefined, store.session.sessionId, { storageVersion: 1,
     header: { type: 'session', id: store.session.nativeSessionId, timestamp: store.stamp, cwd: store.root, version: 3 },
     entries: [], leafId: null, unusable: false }));
   let workspace = store.selectedWorkspace;
