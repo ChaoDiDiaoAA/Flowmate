@@ -146,6 +146,50 @@ describe('P9 T01', () => {
     expect(JSON.stringify(schema('NativeSessionEntrySchema').parse(entry))).toBe(JSON.stringify(entry));
   });
 
+  // Native snapshot validation must reject inherited serialization hooks before they execute.
+  it('rejects inherited array serialization hooks without getter or function calls', () => {
+    const validator = schema('NativeSessionEntrySchema');
+    for (const kind of ['getter', 'function'] as const) {
+      let calls = 0;
+      const hook = kind === 'getter' ? { get() { calls++; throw new Error('inherited-array-getter-executed'); } }
+        : { value() { calls++; return ['rewritten']; } };
+      const data = ['kept'];
+      Object.setPrototypeOf(data, Object.create(Array.prototype, { toJSON: hook }));
+      let result: z.SafeParseReturnType<unknown, unknown> | undefined;
+      let thrown: unknown;
+      try { result = validator.safeParse({ ...user, type: 'custom', customType: 'fixture', data }); }
+      catch (error) { thrown = error; }
+      expect(calls).toBe(0);
+      expect(thrown).toBeUndefined();
+      expect(result?.success).toBe(false);
+    }
+  });
+
+  it('rejects inherited hooks on ordinary JSON prototypes without executing them', () => {
+    const validator = schema('NativeSessionEntrySchema');
+    for (const prototype of [Array.prototype, Object.prototype]) for (const kind of ['getter', 'function'] as const) {
+      const previous = Object.getOwnPropertyDescriptor(prototype, 'toJSON');
+      let calls = 0;
+      let result: z.SafeParseReturnType<unknown, unknown> | undefined;
+      let thrown: unknown;
+      try {
+        Object.defineProperty(prototype, 'toJSON', kind === 'getter'
+          ? { configurable: true, get() { calls++; throw new Error('inherited-json-getter-executed'); } }
+          : { configurable: true, value() { calls++; return []; } });
+        try { result = validator.safeParse({ ...user, type: 'custom', customType: 'fixture', data: ['kept'] }); }
+        catch (error) { thrown = error; }
+      } finally {
+        if (previous) Object.defineProperty(prototype, 'toJSON', previous);
+        else Reflect.deleteProperty(prototype, 'toJSON');
+      }
+      expect(calls).toBe(0);
+      expect(thrown).toBeUndefined();
+      expect(result?.success).toBe(false);
+    }
+    const plain = { ...user, type: 'custom', customType: 'fixture', data: [Object.assign(Object.create(null), { optional: undefined, kept: true })] };
+    expect(JSON.stringify(validator.parse(plain))).toBe(JSON.stringify(plain));
+  });
+
   it('enforces public whitelist identity and UTF8 display budgets', () => {
     const summary = { sequence: 0, entryId: 'user', parentId: null, type: 'message', timestamp: at,
       isCurrentPath: true, isLeaf: true, preview: 'Hello', truncated: false,

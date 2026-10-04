@@ -19,6 +19,14 @@ export const HistorySelectionReasonSchema = z.enum(['empty-context', 'incomplete
   'source-unavailable', 'context-unsupported', 'session-unavailable', 'busy']);
 export type HistorySelectionReason = z.infer<typeof HistorySelectionReasonSchema>;
 
+function hasUnsafeSerializationHook(value: object): boolean {
+  for (let owner: object | null = value; owner !== null; owner = Object.getPrototypeOf(owner)) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, 'toJSON');
+    if (descriptor) return !('value' in descriptor) || typeof descriptor.value === 'function';
+  }
+  return false;
+}
+
 /** Inspect descriptors before parsing so a malformed snapshot cannot execute a getter. */
 function isNativeJson(value: unknown, ancestors = new Set<object>(), allowUndefined = true): boolean {
   if (value === undefined) return allowUndefined;
@@ -28,7 +36,8 @@ function isNativeJson(value: unknown, ancestors = new Set<object>(), allowUndefi
   try {
     const array = Array.isArray(value);
     const prototype = Object.getPrototypeOf(value);
-    if (!array && prototype !== Object.prototype && prototype !== null) return false;
+    if (prototype !== (array ? Array.prototype : Object.prototype) && prototype !== null) return false;
+    if (hasUnsafeSerializationHook(value)) return false;
     const descriptors = Object.getOwnPropertyDescriptors(value);
     if (Reflect.ownKeys(value).some(key => typeof key === 'symbol')) return false;
     ancestors.add(value);
