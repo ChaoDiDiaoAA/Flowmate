@@ -248,12 +248,13 @@ describe('P2 Session and Agent Run storage', () => {
     const store = nativeFixture(paths);
     const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
     expect(typeof store.sessions.readHistoryForDisplay).toBe('function');
-    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history: store.history, bindings: [], sessionInputs: [] } });
-    expect(store.sessions.readHistoryForDisplay(999_999)).toEqual({ ok: true, data: { history: null, bindings: [], sessionInputs: [] } });
+    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history: store.history, bindings: [], sessionInputs: [], origins: [] } });
+    expect(store.sessions.readHistoryForDisplay(999_999)).toEqual({ ok: true, data: { history: null, bindings: [], sessionInputs: [], origins: [] } });
     const context = { entryId: store.entry.id, runId: store.runId };
     expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
     expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history,
-      bindings: [{ entryId: 'p4-e1', runId: store.runId }], sessionInputs: [] } });
+      bindings: [{ entryId: 'p4-e1', runId: store.runId }], sessionInputs: [],
+      origins: [{ nativeEntryId: 'p4-e1', originSessionId: store.sessionId, originRunId: store.runId }] } });
     expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: history });
     store.db.exec("CREATE TRIGGER reject_duplicate_append BEFORE INSERT ON session_native_entries BEGIN SELECT RAISE(ABORT,'duplicate append'); END;");
     expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
@@ -418,7 +419,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(other.ok).toBe(true);
     if (!other.ok) return;
     store.db.query('UPDATE runs SET session_id=? WHERE id=?').run(other.data.sessionId, store.runId);
-    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    expect(store.sessions.readHistoryForDisplay(store.sessionId)).toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
     expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
     expect(store.sessions.get(store.sessionId)).toMatchObject({ ok: true, data: { historyState: 'invalid' } });
     expect(store.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: JSON.stringify(store.entry), run_id: store.runId });

@@ -1,8 +1,10 @@
+import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.ts';
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { z } from 'zod';
+import { isDeepStrictEqual } from 'node:util';
 import { appError, fail, ok, ContextSnapshotSchema, ContextSnapshotJsonSchema, ContextReferenceSchema,
-  ContextObservationsSchema, RequestContextBindingSchema, ContextEvidenceUpdateSchema, ContextRequestEvidenceSchema,
-  NativeToolResultContextBindingSchema, ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema,
+  ContextObservationsSchema, readContextObservations, RequestContextBindingSchema, ContextEvidenceUpdateSchema, ContextRequestEvidenceSchema,
+  ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema,
   ContextRequestsRequestSchema, ContextSnapshotDetailSchema, ContextInputErrorSchema,
   ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema,
   SessionInputSnapshotSchema } from '@flowmate/contracts';
@@ -27,7 +29,7 @@ const runRowSchema = z.object({ id, kind: z.enum(['agent', 'provider']), session
   config_json: z.string(), current_context_snapshot_id: id.nullable(), context_observations_json: z.string().nullable() });
 type RunRow = z.infer<typeof runRowSchema>;
 const json = (value: string): unknown => JSON.parse(value);
-const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+const same = isDeepStrictEqual;
 const bytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 class ContextFault extends Error {
   constructor(readonly error: AppError) { super(error.code); }
@@ -55,6 +57,11 @@ export function readRunContext(row: { id: number; kind: string; session_id: numb
   const raw = row.context_observations_json ?? null;
   if (enabled !== (raw !== null) || row.kind !== 'agent' && (enabled || pointer !== null)) throw new Error('invalid_context_run_state');
   const observations = raw === null ? null : ContextObservationsSchema.parse(json(raw));
+  if (Object.hasOwn(config, 'historyPolicyVersion') && config.historyPolicyVersion !== 'p9-native-history-v1') unknownBinding();
+  if (raw !== null) {
+    const checked = readContextObservations(json(raw), config.historyPolicyVersion as 'p9-native-history-v1' | undefined);
+    if (!checked.ok) throw new NativeOriginFault(checked.error);
+  }
   if (observations !== null) {
     const agent = z.object({ nativeSessionId: z.string().min(1).max(256) }).parse(config.agent);
     if (observations.requests.some(request => request.binding.runId !== row.id || request.binding.sessionId !== row.session_id
@@ -124,122 +131,34 @@ const textBlock = z.object({ type: z.literal('text'), text: z.string() }).passth
 const imageBlock = z.object({ type: z.literal('image'), data: z.string(), mimeType: z.string().min(1) }).passthrough();
 const userMessage = z.object({ role: z.literal('user'), content: z.union([z.string(), z.array(z.union([textBlock, imageBlock]))]),
   timestamp: z.number().finite() }).passthrough();
-const resultMessage = z.object({ role: z.literal('toolResult'), toolCallId: z.string().min(1).max(256), toolName: z.string().min(1),
-  content: z.array(z.union([textBlock, imageBlock])), isError: z.boolean(), timestamp: z.number().finite() }).passthrough();
-const callBlock = z.object({ type: z.literal('toolCall'), id: z.string().min(1).max(256), name: z.string().min(1),
-  arguments: z.record(z.unknown()) }).passthrough();
-const usageSchema = z.object({ input: z.number().finite().nonnegative(), output: z.number().finite().nonnegative(),
-  cacheRead: z.number().finite().nonnegative(), cacheWrite: z.number().finite().nonnegative(), totalTokens: z.number().finite().nonnegative(),
-  cost: z.object({ input: z.number().finite().nonnegative(), output: z.number().finite().nonnegative(),
-    cacheRead: z.number().finite().nonnegative(), cacheWrite: z.number().finite().nonnegative(), total: z.number().finite().nonnegative() }) });
-const assistantMessage = z.object({ role: z.literal('assistant'), content: z.array(z.union([textBlock,
-  z.object({ type: z.literal('thinking'), thinking: z.string() }).passthrough(), callBlock])),
-  api: z.string().min(1), provider: z.string().min(1), model: z.string().min(1), usage: usageSchema,
-  stopReason: z.enum(['stop', 'length', 'toolUse', 'error', 'aborted']), timestamp: z.number().finite() }).passthrough();
-
 /** Validate original saved sources without following today's leaf or recursively reading another journal. */
 function verifySavedSources(db: Database, journal: ContextObservations) {
-  const sourceRunSchema = z.object({ id, kind: z.literal('agent'), session_id: id, job_id: id.nullable(), config_json: z.string(),
-    current_context_snapshot_id: id.nullable().optional(), context_observations_json: z.string().nullable().optional() });
-  const runs = new Map<number, { row: z.infer<typeof sourceRunSchema>; context: ReturnType<typeof readRunContext> }>();
-  const tools = new Map<number, z.infer<typeof toolSourceSchema>>();
-  const snapshots = new Map<number, ContextSnapshot>();
-  const legacyTools = new Set<string>();
-  const toolSourceSchema = z.object({ id, run_id: id, session_id: id, native_tool_call_id: z.string(), context_snapshot_id: id.nullable(), request_sequence: id.nullable() });
-  function origin(runId: number, sessionId: number) {
-    let saved = runs.get(runId);
-    if (!saved) {
-      const row = sourceRunSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(runId));
-      saved = { row, context: readRunContext(row) }; runs.set(runId, saved);
-    }
-    if (saved.row.session_id !== sessionId) throw new Error('invalid_context_source_session');
-    return saved;
-  }
-  function originalSnapshot(snapshotId: number, owner: z.infer<typeof sourceRunSchema>) {
-    let snapshot = snapshots.get(snapshotId);
-    if (!snapshot) { snapshot = readContextSnapshotOwner(db, snapshotId, owner); snapshots.set(snapshotId, snapshot); }
-    if (snapshot.runId !== owner.id || snapshot.sessionId !== owner.session_id || snapshot.jobId !== owner.job_id) throw new Error('invalid_context_source_snapshot');
-  }
+  const reader = createNativeOriginReader(db);
   for (const request of journal.requests) {
     const sessionId = request.binding.sessionId;
     for (const source of request.binding.includedBindings) {
-      const native = z.object({ entry_id: z.string(), entry_json: z.string(), run_id: id.nullable() })
-        .parse(db.query('SELECT entry_id,entry_json,run_id FROM session_native_entries WHERE session_id=? AND entry_id=?').get(sessionId, source.nativeEntryId));
-      const entry = z.object({ type: z.literal('message'), id: z.string(), message: userMessage }).passthrough().parse(json(native.entry_json));
-      if (entry.id !== source.nativeEntryId || native.run_id !== source.originRunId) throw new Error('invalid_context_source_entry');
-      if (source.inputId === null) {
-        if (db.query('SELECT id FROM session_inputs WHERE session_id=? AND native_entry_id=?').get(sessionId, source.nativeEntryId)
-          || source.originRunId !== null && origin(source.originRunId, sessionId).context.observations !== null) throw new Error('invalid_context_preledger_source');
-      } else {
-        const input = z.object({ id, run_id: id, session_id: id, native_entry_id: z.string(), context_snapshot_id: id.nullable(), status: z.literal('consumed') })
-          .parse(db.query('SELECT id,run_id,session_id,native_entry_id,context_snapshot_id,status FROM session_inputs WHERE id=?').get(source.inputId));
-        if (input.session_id !== sessionId || input.run_id !== source.originRunId || input.native_entry_id !== source.nativeEntryId
-          || input.context_snapshot_id !== source.snapshotId) throw new Error('invalid_context_saved_input');
-        const owner = origin(input.run_id, sessionId);
-        if ((source.snapshotId === null) !== (owner.context.observations === null)) throw new Error('invalid_context_saved_input_policy');
-        if (source.snapshotId !== null) originalSnapshot(source.snapshotId, owner.row);
-      }
+      const { originSessionId: _, ...binding } = reader.resolve(sessionId, source.nativeEntryId);
+      const entry = reader.entry(sessionId, source.nativeEntryId);
+      if (entry?.type !== 'message' || entry.message.role !== 'user' || !same(binding,source)) unknownBinding();
     }
-    for (const source of request.binding.includedToolResults) {
-      if (source.toolCallId === null) {
-        const key = JSON.stringify([sessionId, source.nativeToolCallId]);
-        if (!legacyTools.has(key)) {
-          if (db.query('SELECT id FROM tool_calls WHERE session_id=? AND native_tool_call_id=?').get(sessionId, source.nativeToolCallId)) throw new Error('invalid_context_legacy_tool');
-          const rows = z.array(z.object({ entry_id: z.string(), entry_json: z.string(), run_id: id.nullable() }))
-            .parse(db.query('SELECT entry_id,entry_json,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(sessionId));
-          const entries = rows.map(row => ({ row, entry: z.object({ id: z.string(), parentId: z.string().nullable(), type: z.string(), message: z.unknown().optional() }).passthrough().parse(json(row.entry_json)) }));
-          if (entries.some(item => item.row.entry_id !== item.entry.id)) throw new Error('invalid_context_legacy_entry');
-          const results = entries.filter(item => {
-            const message = z.object({ role: z.unknown().optional(), toolCallId: z.unknown().optional() }).passthrough().safeParse(item.entry.message);
-            return item.entry.type === 'message' && message.success && message.data.role === 'toolResult' && message.data.toolCallId === source.nativeToolCallId;
-          });
-          if (results.length !== 1) throw new Error('invalid_context_legacy_result');
-          const result = results[0]!, message = resultMessage.parse(result.entry.message), byId = new Map(entries.map(item => [item.entry.id,item]));
-          const calls: Array<{ runId: number | null; name: string }> = [], visited = new Set<string>();
-          let parent = result.entry.parentId;
-          while (parent !== null) {
-            const item = byId.get(parent);
-            if (!item || visited.has(parent)) throw new Error('invalid_context_legacy_path');
-            visited.add(parent);
-            const raw = z.object({ role: z.unknown().optional(), content: z.unknown().optional() }).passthrough().safeParse(item.entry.message);
-            if (item.entry.type === 'message' && raw.success && raw.data.role === 'assistant' && Array.isArray(raw.data.content)
-              && raw.data.content.some(block => typeof block === 'object' && block !== null && 'id' in block && block.id === source.nativeToolCallId)) {
-              const assistant = assistantMessage.parse(item.entry.message);
-              for (const block of assistant.content) if (block.type === 'toolCall' && block.id === source.nativeToolCallId) calls.push({runId:item.row.run_id,name:block.name});
-            }
-            parent = item.entry.parentId;
-          }
-          if (calls.length !== 1 || calls[0]!.name !== message.toolName || calls[0]!.runId === null || calls[0]!.runId !== result.row.run_id
-            || origin(calls[0]!.runId, sessionId).context.observations !== null) throw new Error('invalid_context_legacy_origin');
-          legacyTools.add(key);
-        }
-      } else {
-        let tool = tools.get(source.toolCallId);
-        if (!tool) { tool = toolSourceSchema.parse(db.query('SELECT * FROM tool_calls WHERE id=?').get(source.toolCallId)); tools.set(source.toolCallId, tool); }
-        if (tool.session_id !== sessionId || tool.run_id !== source.originRunId || tool.native_tool_call_id !== source.nativeToolCallId
-          || !same(contextReferenceFromColumns(tool), source.context)) throw new Error('invalid_context_original_tool');
-        const owner = origin(tool.run_id, sessionId);
-        if ((source.context === null) !== (owner.context.observations === null)) throw new Error('invalid_context_original_tool_policy');
-        if (source.context !== null) {
-          originalSnapshot(source.context.snapshotId, owner.row);
-          if (owner.context.observations?.requests[source.context.requestSequence - 1]?.binding.snapshotId !== source.context.snapshotId) throw new Error('invalid_context_original_tool_request');
-        }
-      }
-    }
+    for (const source of request.binding.includedToolResults)
+      if (!same(reader.tool(sessionId,source.nativeToolCallId,true),source)) unknownBinding();
+    if ('includedNativeContexts' in request.binding)
+      for (const source of request.binding.includedNativeContexts) reader.derived(sessionId,source);
   }
 }
 
 export function createContextRepository(input: { db: Database; loadHistory(sessionId: number): Result<NativeSessionHistory | null> }): ContextRepository {
   const { db, loadHistory } = input;
   function read<T>(fn: () => T): Result<T> {
-    try { return ok(fn()); }
-    catch (error) { return fail(error instanceof ContextFault ? error.error : error instanceof SQLiteError
+    try { return ok(db.inTransaction ? fn() : db.transaction(fn).deferred()); }
+    catch (error) { return fail(error instanceof ContextFault || error instanceof NativeOriginFault ? error.error : error instanceof SQLiteError
       ? appError('storage_read_failed', 'storage', 'Context evidence could not be read.', true)
       : appError('storage_corrupt', 'storage', 'Saved Context evidence is invalid.')); }
   }
   function write<T>(fn: () => T): Result<T> {
     try { return ok(db.transaction(fn).immediate()); }
-    catch (error) { return fail(error instanceof ContextFault ? error.error : appError('storage_write_failed', 'storage', 'Context evidence could not be saved.', true)); }
+    catch (error) { return fail(error instanceof ContextFault || error instanceof NativeOriginFault ? error.error : appError('storage_write_failed', 'storage', 'Context evidence could not be saved.', true)); }
   }
   function session(sessionId: number) {
     id.parse(sessionId);
@@ -254,7 +173,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     const row = runRowSchema.parse(raw);
     if (row.kind !== 'agent' || row.session_id !== sessionId) reject('state_conflict', 'runtime');
     let context: ReturnType<typeof readRunContext>;
-    try { context = readRunContextOwner(db, row); } catch (error) { if (error instanceof SQLiteError) throw error; return corrupt(); }
+    try { context = readRunContextOwner(db, row); } catch (error) { if (error instanceof SQLiteError || error instanceof NativeOriginFault || error instanceof ContextFault) throw error; return corrupt(); }
     return { row, ...context };
   }
   function snapshot(snapshotId: number, owner?: RunRow): ContextSnapshot {
@@ -304,97 +223,38 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     }
     return selected.reverse();
   }
-  function entryRun(sessionId: number, entryId: string): number | null {
-    const row = db.query('SELECT run_id FROM session_native_entries WHERE session_id=? AND entry_id=?').get(sessionId, entryId);
-    if (!row) return unknownBinding();
-    return z.object({ run_id: id.nullable() }).parse(row).run_id;
-  }
   function toolResult(input: Parameters<ContextHooks['resolveToolResult']>[0]): NativeToolResultContextBinding {
     const parsed = z.object({ sessionId: id, nativeToolCallId: z.string().min(1).max(256) }).strict().parse(input);
     session(parsed.sessionId);
-    const rows = db.query('SELECT id,run_id,context_snapshot_id,request_sequence FROM tool_calls WHERE session_id=? AND native_tool_call_id=?')
-      .all(parsed.sessionId, parsed.nativeToolCallId);
-    if (rows.length > 1) return unknownBinding();
-    if (rows.length === 1) {
-      try {
-        const row = z.object({ id, run_id: id, context_snapshot_id: id.nullable(), request_sequence: id.nullable() }).parse(rows[0]);
-        const owner = run(row.run_id, parsed.sessionId);
-        const context = contextReferenceFromColumns(row);
-        if (owner.observations === null ? context !== null : context === null) return unknownBinding();
-        if (context) {
-          snapshot(context.snapshotId, owner.row);
-          const request = owner.observations?.requests[context.requestSequence - 1];
-          if (!request || request.binding.snapshotId !== context.snapshotId) return unknownBinding();
-        }
-        return NativeToolResultContextBindingSchema.parse({ nativeToolCallId: parsed.nativeToolCallId,
-          toolCallId: row.id, originRunId: row.run_id, context });
-      } catch { return unknownBinding(); }
-    }
-    const selected = path(parsed.sessionId);
-    // A malformed match is uncertainty, even if a second well-formed message has the same ID.
-    for (const entry of selected) {
-      if (entry.type !== 'message') continue;
-      const message = z.object({ role: z.unknown().optional(), toolCallId: z.unknown().optional(), content: z.unknown().optional() }).passthrough().safeParse(entry.message);
-      if (!message.success) continue;
-      if (message.data.role === 'toolResult' && message.data.toolCallId === parsed.nativeToolCallId && !resultMessage.safeParse(entry.message).success) return unknownBinding();
-      if (message.data.role === 'assistant' && Array.isArray(message.data.content)
-        && message.data.content.some(block => typeof block === 'object' && block !== null && 'type' in block && block.type === 'toolCall'
-          && 'id' in block && block.id === parsed.nativeToolCallId) && !assistantMessage.safeParse(entry.message).success) return unknownBinding();
-    }
-    const results = selected.map((entry, index) => ({ entry, index, message: resultMessage.safeParse(entry.message) }))
-      .filter(item => item.entry.type === 'message' && item.message.success && item.message.data.toolCallId === parsed.nativeToolCallId);
-    if (results.length !== 1) return unknownBinding();
-    const result = results[0]!;
-    if (!result.message.success) return unknownBinding();
-    const resultToolName = result.message.data.toolName;
-    const calls = selected.flatMap((entry, index) => {
-      if (entry.type !== 'message') return [];
-      const parsedMessage = assistantMessage.safeParse(entry.message);
-      if (!parsedMessage.success) return [];
-      return parsedMessage.data.content.flatMap(block => block.type === 'toolCall' && block.id === parsed.nativeToolCallId
-        ? [{ entry, index, name: block.name }] : []);
-    });
-    if (calls.length !== 1 || calls[0]!.index >= result.index || calls[0]!.name !== resultToolName) return unknownBinding();
-    const origin = entryRun(parsed.sessionId, calls[0]!.entry.id);
-    if (origin === null || entryRun(parsed.sessionId, result.entry.id) !== origin) return unknownBinding();
-    try { if (run(origin, parsed.sessionId).observations !== null) return unknownBinding(); }
-    catch { return unknownBinding(); }
-    return { nativeToolCallId: parsed.nativeToolCallId, toolCallId: null, originRunId: null, context: null };
+    return createNativeOriginReader(db).tool(parsed.sessionId,parsed.nativeToolCallId);
   }
   function verifyBinding(binding: RequestContextBinding) {
-    const saved = RequestContextBindingSchema.parse(binding);
+    const parsed = RequestContextBindingSchema.safeParse(binding);
+    if (!parsed.success) return unknownBinding();
+    const saved = parsed.data;
     const owner = run(saved.runId, saved.sessionId);
     if (owner.observations === null || session(saved.sessionId).native_session_id !== saved.nativeSessionId) return unknownBinding();
     const selected = path(saved.sessionId);
     const entries = new Map(selected.map((entry, index) => [entry.id, { entry, index }]));
+    const reader = createNativeOriginReader(db);
     let previous = -1;
     for (const source of saved.includedBindings) {
       const native = entries.get(source.nativeEntryId);
-      if (!native || native.index <= previous || native.entry.type !== 'message' || !userMessage.safeParse(native.entry.message).success
-        || entryRun(saved.sessionId, native.entry.id) !== source.originRunId) return unknownBinding();
+      if (!native || native.index <= previous || native.entry.type !== 'message' || !userMessage.safeParse(native.entry.message).success) unknownBinding();
       previous = native.index;
-      if (source.inputId === null) {
-        if (source.snapshotId !== null || db.query('SELECT id FROM session_inputs WHERE session_id=? AND native_entry_id=?').get(saved.sessionId, source.nativeEntryId)) return unknownBinding();
-        if (source.originRunId !== null && run(source.originRunId, saved.sessionId).observations !== null) return unknownBinding();
-      } else {
-        const owners = db.query('SELECT id FROM session_inputs WHERE session_id=? AND native_entry_id=?').all(saved.sessionId, source.nativeEntryId);
-        if (owners.length !== 1 || z.object({ id }).parse(owners[0]).id !== source.inputId) return unknownBinding();
-        const row = db.query('SELECT * FROM session_inputs WHERE id=?').get(source.inputId);
-        if (!row) return unknownBinding();
-        const savedInput = thisInput(row);
-        if (savedInput.sessionId !== saved.sessionId || savedInput.runId !== source.originRunId
-          || savedInput.status !== 'consumed' || savedInput.nativeEntryId !== source.nativeEntryId
-          || savedInput.contextSnapshotId !== source.snapshotId) return unknownBinding();
-        const origin = run(source.originRunId!, saved.sessionId);
-        if ((origin.observations === null) !== (source.snapshotId === null)) return unknownBinding();
-        if (source.snapshotId !== null) snapshotInput(snapshot(source.snapshotId, origin.row));
-      }
+      const { originSessionId: _, ...binding } = reader.resolve(saved.sessionId,source.nativeEntryId);
+      if (!same(binding,source)) unknownBinding();
     }
-    for (const source of saved.includedToolResults) if (!same(toolResult({ sessionId: saved.sessionId, nativeToolCallId: source.nativeToolCallId }), source)) return unknownBinding();
+    for (const source of saved.includedToolResults)
+      if (!same(reader.tool(saved.sessionId, source.nativeToolCallId), source)) unknownBinding();
+    for (const source of saved.includedNativeContexts) reader.derived(saved.sessionId,source);
+    const primary = snapshotInput(snapshot(saved.snapshotId, owner.row));
+    if (primary.inputId !== saved.inputId || primary.sessionId !== saved.sessionId || primary.runId !== saved.runId
+      || primary.status !== 'consumed') unknownBinding();
     snapshot(saved.snapshotId, owner.row);
     return { binding: saved, owner };
   }
-  function thisInput(raw: unknown) { try { return savedInput(raw); } catch { return unknownBinding(); } }
+
   function persist(owner: RunRow, observations: ContextObservations) {
     if (bytes(observations) > 4194304) reject('context_evidence_too_large');
     ContextObservationsSchema.parse(observations);
@@ -452,7 +312,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
         const original = observations?.requests[binding.requestSequence - 1];
         if (!original || !same(original.binding, binding)) return conflict();
         // Merge only the original logical request. Terminal Run state and its current pointer are untouched.
-        const request: { -readonly [Key in keyof ContextRequestEvidence]: ContextRequestEvidence[Key] } = structuredClone(original);
+        const request = structuredClone(original) as { -readonly [Key in keyof typeof original]: (typeof original)[Key] };
         if (update.kind === 'sdk-payload') {
           const fact = { observedAt: update.at, inclusion: update.inclusion, reason: update.reason };
           if (request.sdkPayload !== null && !same(request.sdkPayload, fact)) return conflict();
@@ -544,7 +404,10 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
         const request = normalized.data;
         session(request.sessionId);
         const owner = run(request.runId, request.sessionId);
-        const matching = [...(owner.observations?.requests ?? [])].reverse()
+        const projected = owner.observations === null ? null : readContextObservations(owner.observations,
+          JSON.parse(owner.row.config_json).historyPolicyVersion);
+        if (projected && !projected.ok) throw new NativeOriginFault(projected.error);
+        const matching = [...(projected?.ok ? projected.data.requests : [])].reverse()
           .filter(item => request.beforeRequestSequence === undefined || item.binding.requestSequence < request.beforeRequestSequence);
         const page: ContextRequestsPage = { sessionId: request.sessionId, runId: request.runId,
           collection: owner.observations === null ? 'not-collected' : 'collected', items: [], nextBeforeRequestSequence: null };

@@ -8,13 +8,16 @@ import { tmpdir } from 'node:os';
 import { openTestDatabase } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
-import { createContextRepository } from '../../../packages/core/src/context/repository.ts';
+import { createContextRepository, readRunContextOwner } from '../../../packages/core/src/context/repository.ts';
+import { SessionService } from '../../../packages/core/src/sessions/service.ts';
+import { projectSessionMessages } from '../../../packages/runtime-pi/src/messages.ts';
+import { resolveNativeEntryOrigin } from '../../../packages/core/src/memory/origins.ts';
 import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, invoiceHeaderFields } from '@flowmate/contracts';
 import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result } from '@flowmate/contracts';
 
 const at = '2026-10-03T00:00:00.000Z';
 const later = '2026-10-03T00:00:01.000Z';
-const failure = { code: 'agent_execution_failed', category: 'runtime', message: 'fixture', retryable: false };
+const failure = { version: 1, code: 'agent_execution_failed', category: 'runtime', message: 'fixture', retryable: false };
 const delivery = { version: 1, state: 'not_attempted', messageObservedAt: null, includedInCallSequence: null, requestDispatchedAt: null, error: null };
 const toolCleanup = { version: 1, stopped: false, stopReason: null, errors: [] };
 function need<T>(value: Result<T>): T { if (!value.ok) throw new Error(value.error.code); return value.data; }
@@ -108,7 +111,7 @@ function fixture() {
     return store.runtimeEventStore.withTransaction(() => {
       const jobId=(store.db.query('SELECT job_id FROM runs WHERE id=?').get(runId) as {job_id:number|null}).job_id;
       const snapshot = need(store.context.appendInTransaction({ runId, sessionId: session.sessionId, jobId, json: json(text), at }));
-      const content = { version: 2, text, workspaceContext: null, workspaceInput: null,
+      const content = { version: 2 as const, text, workspaceContext: null, workspaceInput: null,
         allowedDocumentIds: [], allowedArtifactIds: [], promptText: text };
       const inserted = store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
         context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
@@ -133,6 +136,247 @@ function fixture() {
   }
   return { store, session, runId, config, append, consume, binding, productPaths };
 }
+
+// Represents already trusted T06 provenance in disposable SQLite; not a public fork implementation.
+function frozenFork(f: ReturnType<typeof fixture>, source: number, nativeId: string, ids?: string[]) {
+  const stored = need(f.store.memory.load(source))!;
+  const entries = stored.history.entries.filter(entry => !ids || ids.includes(entry.id));
+  const history = { ...stored.history, header: { ...stored.history.header, id: nativeId }, entries, leafId: entries.at(-1)!.id };
+  const target = need(f.store.sessions.create({ nativeSessionId: nativeId, title: nativeId, at, nativeHistory: history }));
+  f.store.db.query(`INSERT INTO session_forks(target_session_id,source_session_id,source_commit_revision,source_entry_count,
+    source_leaf_id,selected_entry_id,inherited_entry_count,client_operation_id,request_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    .run(target.sessionId,source,stored.commit.commitRevision,stored.commit.entryCount,stored.commit.leafId,history.leafId,
+      entries.length,nativeId,JSON.stringify({selectedEntryId:history.leafId}),at);
+  return target;
+}
+it('P9 T03 resolves nested inherited origins without degrading null copies', () => {
+  const f=fixture(), saved=f.append(), history=f.consume(saved.inputId,saved.content.text);
+  need(f.store.context.bindRequest({binding:f.binding(saved.inputId,saved.snapshot.id),api:'openai-responses',transport:'observed-fetch',at}));
+  const sourceBytes=f.store.db.query('SELECT * FROM session_inputs WHERE session_id=?').all(f.session.sessionId);
+  const child=frozenFork(f,f.session.sessionId,'child'),local=p9TargetInput(f,child),grandchild=frozenFork(f,child.sessionId,'grandchild');
+  expect(f.store.db.query('SELECT run_id FROM session_native_entries WHERE session_id=?').all(grandchild.sessionId)).toEqual([{run_id:null},{run_id:null}]);
+  const bundle=need(f.store.sessions.loadHistoryForContext(grandchild.sessionId));
+  expect(bundle).toMatchObject({commit:{commitRevision:1,entryCount:2,leafId:'target-user'},seed:{sessionId:grandchild.sessionId,
+    origins:[{nativeEntryId:'p8-user',originSessionId:f.session.sessionId,originRunId:f.runId},{nativeEntryId:'target-user',originSessionId:child.sessionId,originRunId:local.runId}],
+    inputs:[{nativeEntryId:'p8-user',originRunId:f.runId,inputId:saved.inputId,snapshotId:saved.snapshot.id},
+      {nativeEntryId:'target-user',originRunId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id}]}});
+  const display=need(f.store.sessions.readHistoryForDisplay(grandchild.sessionId));
+  expect(display.bindings).toContainEqual({entryId:'p8-user',runId:f.runId});
+  expect(display.sessionInputs).toContainEqual({inputId:saved.inputId,runId:f.runId,nativeEntryId:'p8-user',content:saved.content});
+  need(saveTestHistory(f.store.db,f.store.runtimeEventStore,f.session.sessionId,{...history,entries:[...history.entries,
+    {type:'session_info',id:'later',parentId:null,timestamp:at,name:'later'}],leafId:'later'}));
+  expect(need(f.store.sessions.loadHistoryForContext(grandchild.sessionId))).toEqual(bundle);
+  expect(f.store.db.query('SELECT * FROM session_inputs WHERE session_id=?').all(f.session.sessionId)).toEqual(sourceBytes);
+});
+it('P9 T03 rejects changed inherited JSON instead of treating copy NULL as legacy', () => {
+  const f=fixture(),saved=f.append();f.consume(saved.inputId,saved.content.text);
+  const target=frozenFork(f,f.session.sessionId,'changed');
+  const raw=f.store.db.query('SELECT entry_json FROM session_native_entries WHERE session_id=?').get(target.sessionId) as {entry_json:string};
+  const entry=JSON.parse(raw.entry_json);entry.message.content='forged';
+  f.store.db.query('UPDATE session_native_entries SET entry_json=? WHERE session_id=?').run(JSON.stringify(entry),target.sessionId);
+  expect(f.store.sessions.loadHistoryForContext(target.sessionId)).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+  expect(f.store.sessions.readHistoryForDisplay(target.sessionId)).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+});
+
+function p9ToolHistory(f: ReturnType<typeof fixture>, nativeId='inherited-call') {
+  const saved=f.append(),history=f.consume(saved.inputId,saved.content.text);
+  need(f.store.context.bindRequest({binding:f.binding(saved.inputId,saved.snapshot.id),api:'openai-responses',transport:'observed-fetch',at}));
+  const usage={input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}};
+  const entries=[...history.entries,{type:'session_info',id:'off-branch',parentId:null,timestamp:at,name:'unselected'},
+    {type:'message',id:'native-call',parentId:'p8-user',timestamp:at,message:{role:'assistant',
+    content:[{type:'toolCall',id:nativeId,name:'read_fixture',arguments:{}}],api:'openai-responses',provider:'fixture',model:'fixture',usage,stopReason:'toolUse',timestamp:2}},
+    {type:'message',id:'native-result',parentId:'native-call',timestamp:at,message:{role:'toolResult',toolCallId:nativeId,toolName:'read_fixture',content:[{type:'text',text:'result'}],isError:false,timestamp:3}}];
+  need(f.store.memory.commit({sessionId:f.session.sessionId,expected:need(f.store.memory.load(f.session.sessionId))!.commit,
+    header:history.header,appendEntries:entries,leafId:'native-result',unusable:false,
+    contexts:[{entryId:'native-call',runId:f.runId},{entryId:'native-result',runId:f.runId}]}));
+  const toolId=tool(f,nativeId,saved.snapshot.id,1);
+  return {saved,toolId};
+}
+function p9TargetInput(f: ReturnType<typeof fixture>, target: ReturnType<typeof frozenFork>) {
+  finish(f);
+  const db=f.store.db,config={...f.config,historyPolicyVersion:'p9-native-history-v1',agent:{...f.config.agent,nativeSessionId:target.nativeSessionId}};
+  const runId=Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,context_observations_json,created_at)
+    SELECT 'agent',?,scope_json,'running',goal,input_json,?,cleanup_json,usage_json,'{"version":1,"requests":[]}',? FROM runs WHERE id=?`)
+    .run(target.sessionId,JSON.stringify(config),at,f.runId).lastInsertRowid);
+  const snapshot=need(f.store.runtimeEventStore.withTransaction(()=>f.store.context.appendInTransaction({runId,sessionId:target.sessionId,jobId:null,json:json('target'),at})));
+  const content={version:2,text:'target',promptText:'target',workspaceContext:null,workspaceInput:null,allowedDocumentIds:[],allowedArtifactIds:[]};
+  const inputId=Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
+    VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`).run(target.sessionId,'c'.repeat(64),runId,snapshot.id,JSON.stringify(content),at,at).lastInsertRowid);
+  const history=need(f.store.memory.load(target.sessionId))!.history;
+  need(saveTestHistory(db,f.store.runtimeEventStore,target.sessionId,{...history,entries:[...history.entries,
+    {type:'message',id:'target-user',parentId:history.leafId,timestamp:at,message:{role:'user',content:'target',timestamp:4}}],leafId:'target-user'},
+    {entryId:'target-user',runId,inputId}));
+  return {runId,inputId,snapshot};
+}
+it('P9 T03 shares origin verification across five read paths and keeps target primary facts', () => {
+  const f=fixture(),{saved,toolId}=p9ToolHistory(f),target=frozenFork(f,f.session.sessionId,'five',['p8-user','native-call','native-result']),local=p9TargetInput(f,target);
+  const binding:RequestContextBinding={...f.binding(saved.inputId,saved.snapshot.id),sessionId:target.sessionId,nativeSessionId:target.nativeSessionId,
+    runId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id,includedBindings:[...f.binding(saved.inputId,saved.snapshot.id).includedBindings,
+      {nativeEntryId:'target-user',originRunId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id}],
+    includedToolResults:[{nativeToolCallId:'inherited-call',toolCallId:toolId,originRunId:f.runId,context:{snapshotId:saved.snapshot.id,requestSequence:1}}]};
+  const original=['runs','session_inputs','context_snapshots','tool_calls'].map(table=>f.store.db.query(`SELECT * FROM ${table} WHERE ${table==='runs'?'id':'run_id'}=?`).all(f.runId));
+  const service=new SessionService(f.store.sessions,{projectSessionMessages,inspect:()=>({availability:'missing'}),
+    createSession(){throw new Error('No native create during projection');},async prepare(){throw new Error('No model prepare during projection');},
+    async close(){return {stopped:true,closed:true,errors:[]};},async releaseSession(){return {stopped:true,closed:true,errors:[]};}},
+    ()=>({active:null,blocked:false,error:null}),()=>at,f.store.runs);
+  readRunContextOwner(f.store.db,f.store.db.query('SELECT * FROM runs WHERE id=?').get(f.runId) as Parameters<typeof readRunContextOwner>[1]);
+  expect(f.store.runs.get(f.runId).ok).toBe(true);
+  expect(f.store.runs.get(local.runId).ok).toBe(true);
+  const projected=need(service.listMessages({sessionId:target.sessionId,limit:50}));
+  expect(projected.items.find(item=>item.entryId==='p8-user')).toMatchObject({runId:f.runId,role:'user'});
+  expect(need(f.store.sessions.loadHistoryForContext(target.sessionId)).seed.inputs).toEqual(binding.includedBindings);
+  expect(f.store.db.query("SELECT session_id,sequence,run_id FROM session_native_entries WHERE entry_id='native-call' ORDER BY session_id").all())
+    .toEqual([{session_id:f.session.sessionId,sequence:2,run_id:f.runId},{session_id:target.sessionId,sequence:1,run_id:null}]);
+  expect(need(f.store.sessions.readHistoryForDisplay(target.sessionId)).bindings).toContainEqual({entryId:'native-result',runId:f.runId});
+  expect(need(f.store.context.resolveToolResult({sessionId:target.sessionId,nativeToolCallId:'inherited-call'}))).toEqual(binding.includedToolResults[0]);
+  need(f.store.context.bindRequest({binding,api:'openai-responses',transport:'observed-fetch',at}));
+  expect(need(f.store.context.listContextRequests({sessionId:target.sessionId,runId:local.runId})).items[0]!.binding).toEqual(binding);
+  const history=need(f.store.memory.load(target.sessionId))!.history;
+  need(saveTestHistory(f.store.db,f.store.runtimeEventStore,target.sessionId,{...history,leafId:'p8-user'}));
+  expect(need(f.store.context.listContextRequests({sessionId:target.sessionId,runId:local.runId})).items[0]!.binding).toEqual(binding);
+  expect(['runs','session_inputs','context_snapshots','tool_calls'].map(table=>f.store.db.query(`SELECT * FROM ${table} WHERE ${table==='runs'?'id':'run_id'}=?`).all(f.runId))).toEqual(original);
+  const raw=f.store.db.query('SELECT entry_json FROM session_native_entries WHERE session_id=? AND entry_id=?').get(target.sessionId,'p8-user') as {entry_json:string};
+  f.store.db.query('UPDATE session_native_entries SET entry_json=? WHERE session_id=? AND entry_id=?').run(raw.entry_json.replace('Explain this input.','forged'),target.sessionId,'p8-user');
+  for(const result of [f.store.sessions.loadHistoryForContext(target.sessionId),service.listMessages({sessionId:target.sessionId,limit:1}),f.store.sessions.readHistoryForDisplay(target.sessionId),
+    f.store.context.resolveToolResult({sessionId:target.sessionId,nativeToolCallId:'inherited-call'}),
+    f.store.context.bindRequest({binding,api:'openai-responses',transport:'observed-fetch',at}),
+    f.store.context.listContextRequests({sessionId:target.sessionId,runId:local.runId})])
+    expect(result).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+});
+
+it.each(['source-missing','source-changed','frozen-range','inherited-range','missing-input','wrong-input-content','wrong-request','forged-request-source','target-tool-conflict','intermediate-tool-conflict'] as const)
+  ('P9 T03 rejects broken source evidence through recovery and original tool readers: %s', scenario => {
+  const f=fixture();p9ToolHistory(f);const child=frozenFork(f,f.session.sessionId,`fault-${scenario}`),
+    target=scenario==='intermediate-tool-conflict'?frozenFork(f,child.sessionId,'nested-tool-conflict'):child,db=f.store.db;
+  if(scenario==='source-missing') db.query("DELETE FROM session_native_entries WHERE session_id=? AND entry_id='native-call'").run(f.session.sessionId);
+  if(scenario==='source-changed') db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.message.content','changed') WHERE session_id=? AND entry_id='p8-user'").run(f.session.sessionId);
+  if(scenario==='frozen-range' || scenario==='inherited-range') {
+    db.exec('DROP TRIGGER session_forks_immutable');
+    db.query(`UPDATE session_forks SET ${scenario==='frozen-range'?'source_entry_count':'inherited_entry_count'}=1 WHERE target_session_id=?`).run(target.sessionId);
+  }
+  if(scenario==='missing-input') db.query('DELETE FROM session_inputs WHERE run_id=?').run(f.runId);
+  if(scenario==='wrong-input-content') db.query("UPDATE session_inputs SET content_json=json_set(content_json,'$.text','wrong') WHERE run_id=?").run(f.runId);
+  if(scenario==='wrong-request') db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run('{"version":1,"requests":[]}',f.runId);
+  if(scenario==='forged-request-source') {
+    const raw=db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId) as {context_observations_json:string};
+    const journal=JSON.parse(raw.context_observations_json);
+    journal.requests[0].binding.includedBindings.unshift({nativeEntryId:'nonexistent',originRunId:null,inputId:null,snapshotId:null});
+    db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify(journal),f.runId);
+  }
+  if(scenario==='target-tool-conflict' || scenario==='intermediate-tool-conflict') {
+    const local=p9TargetInput(f,child);
+    db.query(`INSERT INTO tool_calls(run_id,session_id,native_tool_call_id,tool_name,tool_version,effect,args_json,delivery_json,cleanup_json,requested_at,context_snapshot_id,request_sequence)
+      VALUES(?,?,'inherited-call','read_fixture','1','READ',?,?,?,?,?,1)`).run(local.runId,child.sessionId,'{"version":1,"raw":{},"final":null}',JSON.stringify(delivery),JSON.stringify(toolCleanup),at,local.snapshot.id);
+  }
+  const before=db.query('SELECT entry_json,run_id FROM session_native_entries ORDER BY session_id,sequence').all();
+  expect(f.store.sessions.loadHistoryForContext(target.sessionId)).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+  expect(f.store.context.resolveToolResult({sessionId:target.sessionId,nativeToolCallId:'inherited-call'})).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+  expect(db.query('SELECT entry_json,run_id FROM session_native_entries ORDER BY session_id,sequence').all()).toEqual(before);
+});
+it('P9 T03 rejects inherited tool ID collisions before repository effects', () => {
+  const f=fixture();p9ToolHistory(f);const target=frozenFork(f,f.session.sessionId,'collision'),local=p9TargetInput(f,target);
+  const binding:RequestContextBinding={runId:local.runId,sessionId:target.sessionId,nativeSessionId:target.nativeSessionId,inputId:local.inputId,
+    snapshotId:local.snapshot.id,requestSequence:1,callSequence:1,includedBindings:[{nativeEntryId:'target-user',originRunId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id}],
+    includedToolResults:[],includedNativeContexts:[]};
+  need(f.store.context.bindRequest({binding,api:'openai-responses',transport:'observed-fetch',at}));
+  const before=['tool_calls','runtime_events','runs','invoice_candidates'].map(table=>f.store.db.query(`SELECT * FROM ${table}`).all());
+  expect(f.store.toolCalls.request({sessionId:target.sessionId,runId:local.runId,nativeToolCallId:'inherited-call',toolName:'read_fixture',
+    toolVersion:'1',effect:'READ',rawArguments:{},context:{snapshotId:local.snapshot.id,requestSequence:1},requestedAt:at})).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+  expect(['tool_calls','runtime_events','runs','invoice_candidates'].map(table=>f.store.db.query(`SELECT * FROM ${table}`).all())).toEqual(before);
+});
+it.each(['valid','missing-request','wrong-snapshot'] as const)('P9 T03 standalone tool origin verifies original request and snapshot: %s', scenario => {
+  const f=fixture(),{saved}=p9ToolHistory(f),target=frozenFork(f,f.session.sessionId,'standalone'),db=f.store.db;
+  if(scenario==='missing-request') db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run('{"version":1,"requests":[]}',f.runId);
+  if(scenario==='wrong-snapshot') {
+    // Keep SQL owner columns valid while corrupting the saved original generating request.
+    const second=f.append('second original snapshot',2);
+    const raw=db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId) as {context_observations_json:string};
+    const journal=JSON.parse(raw.context_observations_json);
+    journal.requests[0].binding.snapshotId=second.snapshot.id;
+    journal.requests[0].binding.includedBindings[0].snapshotId=second.snapshot.id;
+    db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify(journal),f.runId);
+  }
+  const before=db.query('SELECT * FROM tool_calls').all();
+  const result=resolveNativeEntryOrigin(db,{targetSessionId:target.sessionId,nativeEntryId:'native-result'});
+  expect(result).toMatchObject(scenario==='valid'?{ok:true,data:{originSessionId:f.session.sessionId,nativeEntryId:'native-result',originRunId:f.runId,
+    inputId:null,snapshotId:saved.snapshot.id}}:{ok:false,error:{code:'context_binding_unknown'}});
+  expect(db.query('SELECT * FROM tool_calls').all()).toEqual(before);
+});
+it('P9 T03 rechecks ancestor material authorization and atomically propagates revocation', () => {
+  const f=fixture();business(f);
+  f.store.db.query('UPDATE runs SET job_id=1 WHERE id=?').run(f.runId);
+  const saved=f.append();f.consume(saved.inputId,saved.content.text);
+  const child=frozenFork(f,f.session.sessionId,'auth-child'),target=frozenFork(f,child.sessionId,'auth-target');
+  p9TargetInput(f,target);
+  f.store.db.query("UPDATE sessions SET status='archived',hidden_at=? WHERE id=?").run(at,f.session.sessionId);
+  expect(need(f.store.sessions.isModelUseBlocked(target.sessionId))).toBe(false);
+  expect(f.store.documents.hide(1,at)).toMatchObject({ok:false,error:{code:'document_busy'}});
+  const before=f.store.db.query('SELECT metadata_json FROM sessions ORDER BY id').all();
+  f.store.db.exec(`CREATE TRIGGER reject_descendant BEFORE UPDATE OF metadata_json ON sessions WHEN NEW.id=${target.sessionId} BEGIN SELECT RAISE(ABORT,'descendant'); END`);
+  expect(f.store.sessions.revokeDocumentUse({documentId:1,at}).ok).toBe(false);
+  expect(f.store.db.query('SELECT metadata_json FROM sessions ORDER BY id').all()).toEqual(before);
+  f.store.db.exec('DROP TRIGGER reject_descendant');
+  expect(need(f.store.sessions.revokeDocumentUse({documentId:1,at})).affectedSessionIds).toEqual([f.session.sessionId,child.sessionId,target.sessionId]);
+  expect(need(f.store.sessions.isModelUseBlocked(target.sessionId))).toBe(true);
+  // Simulate missed propagation: ancestor recheck must still refuse the descendant.
+  f.store.db.query('UPDATE sessions SET metadata_json=? WHERE id IN (?,?)').run('{"version":1,"model_use_blocked":null}',child.sessionId,target.sessionId);
+  expect(need(f.store.sessions.isModelUseBlocked(target.sessionId))).toBe(true);
+  f.store.db.exec('DROP TABLE session_forks');
+  expect(f.store.sessions.isModelUseBlocked(target.sessionId)).toMatchObject({ok:false,error:{code:'storage_read_failed'}});
+});
+
+it('P9 T03 preserves legacy journal bytes and public NULL while enforcing new native context evidence', () => {
+  const f=fixture(),saved=f.append();f.consume(saved.inputId,saved.content.text);
+  const {includedNativeContexts:_,...binding}=f.binding(saved.inputId,saved.snapshot.id);
+  const raw=JSON.stringify({version:1,requests:[{binding,api:'openai-responses',boundAt:at,sdkPayload:null,transport:'observed-fetch',attempts:[]}]},null,2);
+  f.store.db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(raw,f.runId);
+  expect(need(f.store.context.listContextRequests({sessionId:f.session.sessionId,runId:f.runId})).items[0]!.binding.includedNativeContexts).toBeNull();
+  expect(f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId)).toEqual({context_observations_json:raw});
+  f.store.db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify({...f.config,historyPolicyVersion:'p9-native-history-v1'}),f.runId);
+  expect(f.store.context.listContextRequests({sessionId:f.session.sessionId,runId:f.runId})).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+  expect(f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId)).toEqual({context_observations_json:raw});
+});
+it('P9 T03 validates derived SDK direct references and preserves genuine legacy NULL origins', () => {
+  const f=fixture(),saved=f.append(),history=f.consume(saved.inputId,saved.content.text);
+  need(saveTestHistory(f.store.db,f.store.runtimeEventStore,f.session.sessionId,{...history,entries:[...history.entries,
+    {type:'custom_message',id:'custom',parentId:'p8-user',timestamp:at,customType:'fixture',content:'native custom',display:false},
+    {type:'branch_summary',id:'summary',parentId:'custom',timestamp:at,fromId:'p8-user',summary:'summary'},
+    {type:'message',id:'legacy-user',parentId:'summary',timestamp:at,message:{role:'user',content:'legacy',timestamp:2}}],leafId:'legacy-user'}));
+  const target=frozenFork(f,f.session.sessionId,'derived'),local=p9TargetInput(f,target);
+  const sources=[{nativeEntryId:'custom',originSessionId:f.session.sessionId,entryType:'custom_message' as const,messageRole:'custom' as const,contextMessageIndex:1,referenceEntryIds:[]},
+    {nativeEntryId:'summary',originSessionId:f.session.sessionId,entryType:'branch_summary' as const,messageRole:'branchSummary' as const,contextMessageIndex:2,referenceEntryIds:['p8-user']}];
+  const binding:RequestContextBinding={runId:local.runId,sessionId:target.sessionId,nativeSessionId:target.nativeSessionId,inputId:local.inputId,snapshotId:local.snapshot.id,
+    requestSequence:1,callSequence:1,includedBindings:need(f.store.sessions.loadHistoryForContext(target.sessionId)).seed.inputs,includedToolResults:[],includedNativeContexts:sources};
+  expect(binding.includedBindings).toContainEqual({nativeEntryId:'legacy-user',originRunId:null,inputId:null,snapshotId:null});
+  expect(need(f.store.sessions.loadHistoryForContext(target.sessionId)).seed.origins).toContainEqual({nativeEntryId:'legacy-user',originSessionId:f.session.sessionId,originRunId:null});
+  for(const changed of [{...sources[1]!,originSessionId:target.sessionId},{...sources[1]!,referenceEntryIds:[]},{...sources[1]!,messageRole:'custom' as const}])
+    expect(f.store.context.bindRequest({binding:{...binding,includedNativeContexts:[changed]},api:'openai-responses',transport:'observed-fetch',at}))
+      .toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+  need(f.store.context.bindRequest({binding,api:'openai-responses',transport:'observed-fetch',at}));
+  expect(need(f.store.context.listContextRequests({sessionId:target.sessionId,runId:local.runId})).items[0]!.binding.includedNativeContexts).toEqual(sources);
+});
+it.each(['fork-cycle','reference-cycle','missing-summary-reference','missing-label'] as const)('P9 T03 rejects nested closure faults: %s', scenario => {
+  const f=fixture(),saved=f.append(),history=f.consume(saved.inputId,saved.content.text);
+  const entries=[...history.entries,{type:'branch_summary',id:'summary',parentId:'p8-user',timestamp:at,fromId:'p8-user',summary:'summary'},
+    {type:'label',id:'label',parentId:'p8-user',timestamp:at,targetId:'p8-user',label:'important'}];
+  need(saveTestHistory(f.store.db,f.store.runtimeEventStore,f.session.sessionId,{...history,entries,leafId:'summary'}));
+  const child=frozenFork(f,f.session.sessionId,'closure-child'),target=frozenFork(f,child.sessionId,'closure-target');
+  const db=f.store.db;
+  if(scenario==='fork-cycle') {
+    db.exec('DROP TRIGGER session_forks_immutable');
+    db.query('UPDATE session_forks SET source_session_id=? WHERE target_session_id=?').run(target.sessionId,child.sessionId);
+  }
+  if(scenario==='reference-cycle') db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.fromId','summary') WHERE entry_id='summary'").run();
+  if(scenario==='missing-summary-reference') db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.fromId','missing') WHERE entry_id='summary'").run();
+  if(scenario==='missing-label') {
+    db.query("DELETE FROM session_native_entries WHERE session_id=? AND entry_id='label'").run(target.sessionId);
+    db.query('UPDATE session_native_history SET entry_count=2 WHERE session_id=?').run(target.sessionId);
+    db.exec('DROP TRIGGER session_forks_immutable');
+    db.query("UPDATE session_forks SET inherited_entry_count=2,selected_entry_id='summary' WHERE target_session_id=?").run(target.sessionId);
+  }
+  expect(f.store.sessions.loadHistoryForContext(target.sessionId)).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+  expect(f.store.sessions.isModelUseBlocked(target.sessionId)).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
+});
 describe('P8 Context storage', () => {
   it('migrates real 014 without rewriting legacy evidence and installs all guards', () => {
     const productPaths = paths(), old = schema14(productPaths);
@@ -363,7 +607,8 @@ describe('P8 Context storage', () => {
     expect(()=>f.store.db.query("UPDATE session_inputs SET status='consumed',native_entry_id='p8-user' WHERE id=?").run(second.inputId)).toThrow('UNIQUE constraint failed');
   });
   it.each(['foreign-user','changed-tool-context'] as const)('checks every saved request source on public read: %s', scenario => {
-    const f=fixture(),saved=f.append(); f.consume(saved.inputId,saved.content.text);
+    const f=fixture(),toolFacts=scenario==='changed-tool-context'?p9ToolHistory(f,'changed-context'):null;
+    const saved=toolFacts?.saved??f.append(); if(!toolFacts) f.consume(saved.inputId,saved.content.text);
     const binding=f.binding(saved.inputId,saved.snapshot.id);
     need(f.store.context.bindRequest({binding,api:'openai-responses',transport:'observed-fetch',at}));
     const changed:{-readonly [Key in keyof RequestContextBinding]:RequestContextBinding[Key]}=structuredClone(binding);
@@ -377,13 +622,13 @@ describe('P8 Context storage', () => {
       need(saveTestHistory(f.store.db, f.store.runtimeEventStore, other.sessionId,history,{runId:otherRun,inputId:otherInput,entryId:'foreign-user'}));
       changed.includedBindings=[{originRunId:otherRun,inputId:otherInput,snapshotId:null,nativeEntryId:'foreign-user'},...binding.includedBindings];
     } else {
-      const call=tool(f,'changed-context',saved.snapshot.id,1);
+      const call=toolFacts!.toolId;
       changed.includedToolResults=[{nativeToolCallId:'changed-context',toolCallId:call,originRunId:f.runId,context:{snapshotId:saved.snapshot.id,requestSequence:2}}];
     }
     f.store.db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify({version:1,requests:[{binding:changed,api:'openai-responses',
       boundAt:at,sdkPayload:null,transport:'observed-fetch',attempts:[]}]}),f.runId);
     expect(f.store.context.listContextRequests({sessionId:f.session.sessionId,runId:f.runId}))
-      .toMatchObject({ok:false,error:{code:'storage_corrupt'}});
+      .toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
     if(scenario==='changed-tool-context') {
       f.store.db.exec('DROP TABLE tool_calls');
       expect(f.store.context.listContextRequests({sessionId:f.session.sessionId,runId:f.runId}))
@@ -424,9 +669,7 @@ describe('P8 Context storage', () => {
     expect(f.store.db.query('SELECT * FROM session_native_entries ORDER BY sequence').all()).toEqual(before);
   });
   it('resolves original P8 Tool calls by Session and original journal, without mutating storage', () => {
-    const f=fixture(), saved=f.append(); f.consume(saved.inputId,saved.content.text);
-    need(f.store.context.bindRequest({binding:f.binding(saved.inputId,saved.snapshot.id),api:'openai-responses',transport:'observed-fetch',at}));
-    const call=tool(f,'original-call',saved.snapshot.id,1);
+    const f=fixture(), {saved,toolId:call}=p9ToolHistory(f,'original-call');
     finish(f); const newer=legacyRun(f);
     const before=f.store.db.query('SELECT * FROM tool_calls').all();
     expect(need(f.store.context.resolveToolResult({sessionId:f.session.sessionId,nativeToolCallId:'original-call'})))
@@ -506,12 +749,15 @@ describe('P8 Context storage', () => {
     expect(need(f.store.context.listContextRequests({sessionId:f.session.sessionId,runId:f.runId})).items[0]?.binding.snapshotId).toBe(saved.snapshot.id);
   });
   it('paginates whole request bindings within the full Result budget and rolls back 4 MiB overflow', () => {
-    const f=fixture(), saved=f.append(); f.consume(saved.inputId,saved.content.text);
-    const old=legacyRun(f), nativeId='legacy-'.padEnd(256,'x'), oldCall=tool(f,nativeId,null,null,old);
-    const includedToolResults=Array.from({length:511},()=>({nativeToolCallId:nativeId,toolCallId:oldCall,originRunId:old,context:null}));
+    const f=fixture(), saved=f.append(), history=f.consume(saved.inputId,saved.content.text);
+    const legacyEntries=Array.from({length:511},(_,index)=>({type:'message',id:`legacy-${index}`.padEnd(256,'x'),
+      parentId:index===0?'p8-user':`legacy-${index-1}`.padEnd(256,'x'),timestamp:at,message:{role:'user',content:'old',timestamp:index+2}}));
+    need(saveTestHistory(f.store.db,f.store.runtimeEventStore,f.session.sessionId,{...history,entries:[...history.entries,...legacyEntries],leafId:legacyEntries.at(-1)!.id}));
+    const includedBindings=[...f.binding(saved.inputId,saved.snapshot.id).includedBindings,
+      ...legacyEntries.map(entry=>({nativeEntryId:entry.id,originRunId:null,inputId:null,snapshotId:null}))];
     let accepted=0;
     for (let sequence=1;sequence<=64;sequence++) {
-      const binding={...f.binding(saved.inputId,saved.snapshot.id),requestSequence:sequence,callSequence:sequence,includedToolResults};
+      const binding={...f.binding(saved.inputId,saved.snapshot.id),requestSequence:sequence,callSequence:sequence,includedBindings};
       const before=f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId);
       const result=f.store.context.bindRequest({binding,api:'openai-responses',transport:'not-observable',at});
       if (!result.ok) {
@@ -527,7 +773,7 @@ describe('P8 Context storage', () => {
       const page=need(f.store.context.listContextRequests({sessionId:f.session.sessionId,runId:f.runId,beforeRequestSequence}));
       expect(new TextEncoder().encode(JSON.stringify({ok:true,data:page})).byteLength).toBeLessThanOrEqual(1048576);
       expect(page.items.length).toBeLessThan(20);
-      for (const item of page.items) { expect(item.binding.includedToolResults).toHaveLength(511); seen.push(item.binding.requestSequence); }
+      for (const item of page.items) { expect(item.binding.includedBindings).toHaveLength(512); seen.push(item.binding.requestSequence); }
       beforeRequestSequence=page.nextBeforeRequestSequence??undefined;
     } while (beforeRequestSequence!==undefined);
     expect(seen).toEqual(Array.from({length:accepted},(_,index)=>accepted-index));

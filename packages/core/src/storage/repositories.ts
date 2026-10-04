@@ -1,3 +1,4 @@
+import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.ts';
 import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction, markUnusableInTransaction } from '../memory/persistence.ts';
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { join, isAbsolute } from 'node:path';
@@ -11,7 +12,7 @@ import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/veri
 import { contextReferenceFromColumns, readRunContextOwner, readContextSnapshotOwner, readToolContext } from '../context/repository.ts';
 import { formatContextPrompt } from '../context/service.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, NativeInputContextBindingSchema, SessionInputContentSchema, ContextReferenceSchema } from '@flowmate/contracts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -29,7 +30,8 @@ import type {
   SessionStatus,
   SessionHistoryState,
   NativeSessionHistory,
-  NativeContextBindingSeed,
+  NativeHistoryRecoveryBundle,
+  NativeHistoryOriginSeed,
   NativeHistoryDisplayRecord,
   SafeConfigSnapshot,
   SdkUsageValues,
@@ -296,8 +298,8 @@ export interface SessionRepository {
   setStatus(input: SetSessionStatusRequest & { at: string }): Result<SessionRow>;
   delete(sessionId: DbId, at: string): Result<'hidden' | 'permanent'>;
   loadHistory(sessionId: DbId): Result<NativeSessionHistory | null>;
-  loadHistoryForContext(sessionId: DbId): Result<Readonly<{ history: NativeSessionHistory | null; bindings: readonly NativeContextBindingSeed[] }>>;
-  readHistoryForDisplay(sessionId: DbId): Result<NativeHistoryDisplayRecord & { sessionInputs: MessageSessionInput[] }>;
+  loadHistoryForContext(sessionId: DbId): Result<NativeHistoryRecoveryBundle>;
+  readHistoryForDisplay(sessionId: DbId): Result<NativeHistoryDisplayRecord & { sessionInputs: MessageSessionInput[]; origins: readonly NativeHistoryOriginSeed[] }>;
 }
 
 export type TerminalWrite = {
@@ -622,11 +624,20 @@ function runUsesDocument(row: DocumentRunAssociation, documentId: DbId): boolean
   } catch { return row.job_document_id === documentId || configPolicy(row.config_json) !== 'p2'; }
 }
 
-function blockSessionsUsingDocument(db: Database, documentId: DbId, at: string): DbId[] {
+function sessionsUsingDocument(db: Database, documentId: DbId): DbId[] {
   const rows = db.query(`SELECT run.session_id,run.scope_json,run.config_json,job.document_id AS job_document_id
     FROM runs run LEFT JOIN jobs job ON job.id=run.job_id WHERE run.kind='agent' AND run.session_id IS NOT NULL`).all() as DocumentRunAssociation[];
-  const affected = [...new Set(rows.filter((row) => runUsesDocument(row, documentId)).map((row) => row.session_id))]
-    .sort((left, right) => left - right);
+  const affected = new Set(rows.filter((row) => runUsesDocument(row, documentId)).map((row) => row.session_id));
+  for (const source of affected) {
+    const children = db.query('SELECT target_session_id FROM session_forks WHERE source_session_id=? AND target_session_id IS NOT NULL')
+      .all(source) as { target_session_id: number }[];
+    for (const child of children) affected.add(child.target_session_id);
+  }
+  return [...affected].sort((left,right)=>left-right);
+}
+
+function blockSessionsUsingDocument(db: Database, documentId: DbId, at: string): DbId[] {
+  const affected = sessionsUsingDocument(db, documentId);
   for (const sessionId of affected) {
     const row = db.query('SELECT metadata_json FROM sessions WHERE id=?').get(sessionId) as { metadata_json: string } | null;
     if (!row) throw new Error('revocation_session_missing');
@@ -1094,7 +1105,8 @@ export function createDocumentRepository(db: Database): DocumentRepository {
         const active = db.query(`SELECT run.session_id,run.scope_json,run.config_json,job.document_id AS job_document_id
           FROM runs run LEFT JOIN jobs job ON job.id=run.job_id
           WHERE run.kind='agent' AND run.status IN ('created','running')`).all() as DocumentRunAssociation[];
-        if (active.some((run) => runUsesDocument(run, documentId))) {
+        const materialSessions = new Set(sessionsUsingDocument(db, documentId));
+        if (active.some((run) => materialSessions.has(run.session_id))) {
           return fail(appError('document_busy', 'runtime', 'Wait for the active response or stop it before removing this invoice.', true));
         }
         if (!activeWorkspaceCanAdvance(db, 'active_document_id', documentId)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
@@ -1605,6 +1617,9 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
     return ok(toolCallSnapshot(db, row));
   };
   const trustedContext = (context: ProductToolContext): Result<string> => {
+    const permission = createSessionRepository(db).isModelUseBlocked(context.sessionId);
+    if (!permission.ok) return permission;
+    if (permission.data) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
     const row = db.query(`SELECT run.session_id,run.scope_json,run.config_json,run.status,session.status AS session_status,session.metadata_json
       FROM runs run JOIN sessions session ON session.id=run.session_id WHERE run.id=? AND run.kind='agent'`)
       .get(context.runId) as { session_id: number; scope_json: string; config_json: string; status: string; session_status: string; metadata_json: string } | null;
@@ -1621,6 +1636,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
   };
   return {
     request(input) {
+      const requested = writeTransaction(() => {
       try {
         if (!Number.isSafeInteger(input.runId) || input.runId < 1 || !Number.isSafeInteger(input.sessionId) || input.sessionId < 1
           || typeof input.nativeToolCallId !== 'string' || input.nativeToolCallId.length < 1 || input.nativeToolCallId.length > 256
@@ -1633,6 +1649,15 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         const raw = JSON.stringify(input.rawArguments);
         if (raw === undefined || !NATIVE_TOOL_NAMES.includes(input.toolName as (typeof NATIVE_TOOL_NAMES)[number])
           && Buffer.byteLength(raw, 'utf8') > TOOL_CONFIG.payload.maxRawArgumentsBytes) return fail(appError('tool_result_too_large', 'input', 'ToolCall 参数超过记录上限。'));
+        const reader = createNativeOriginReader(db);
+        const nativeCalls = (reader.history(input.sessionId)?.history.entries ?? []).flatMap(entry =>
+          entry.type === 'message' && entry.message.role === 'assistant'
+            ? entry.message.content.filter(block => block.type === 'toolCall' && block.id === input.nativeToolCallId).map(() => entry) : []);
+        if (nativeCalls.length > 1) throw new NativeOriginFault();
+        if (nativeCalls.length === 1) {
+          const origin = reader.resolve(input.sessionId, nativeCalls[0]!.id);
+          if (origin.originSessionId !== input.sessionId || origin.originRunId !== input.runId) throw new NativeOriginFault();
+        }
         const existing = db.query('SELECT * FROM tool_calls WHERE session_id=? AND native_tool_call_id=?')
           .get(input.sessionId, input.nativeToolCallId);
         if (existing) {
@@ -1667,9 +1692,12 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         });
         if (!id.ok) return id;
         return byId(id.data);
-      } catch {
+      } catch (error) {
+        if (error instanceof NativeOriginFault) return fail(error.error);
         return fail(databaseError('ToolCall 请求记录失败。'));
       }
+      });
+      return requested.ok ? requested.data : requested;
     },
 
     get(identity) {
@@ -2654,63 +2682,6 @@ function readNativeHistory(db: Database, sessionId: DbId): NativeSessionHistory 
   return loadNativeHistoryInTransaction(db, sessionId)?.history ?? null;
 }
 
-const nativeUserMessage = z.object({ role: z.literal('user'), timestamp: z.number().finite(), content: z.union([z.string(),
-  z.array(z.union([z.object({ type: z.literal('text'), text: z.string() }).passthrough(),
-    z.object({ type: z.literal('image'), data: z.string(), mimeType: z.string().min(1) }).passthrough()]))]) }).passthrough();
-/** This manifest preserves persisted identity; the adapter selects its lawful SDK history path. */
-function readNativeContextBindings(db: Database, sessionId: DbId, history: NativeSessionHistory | null): readonly NativeContextBindingSeed[] {
-  const positiveId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-  const nativeRows = db.query('SELECT entry_id,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence')
-    .all(sessionId) as { entry_id: string; run_id: number | null }[];
-  const origins = new Map(nativeRows.map(row => [row.entry_id, row.run_id]));
-  const inputSchema = z.object({ id: positiveId, session_id: positiveId, run_id: positiveId,
-    native_entry_id: z.string(), context_snapshot_id: positiveId.nullable(), status: z.literal('consumed'), content_json: z.string() });
-  const inputs = new Map<string, z.infer<typeof inputSchema>[]>();
-  for (const raw of db.query('SELECT id,session_id,run_id,native_entry_id,context_snapshot_id,status,content_json FROM session_inputs WHERE session_id=? AND native_entry_id IS NOT NULL').all(sessionId)) {
-    const input = inputSchema.parse(raw), group = inputs.get(input.native_entry_id) ?? [];
-    group.push(input); inputs.set(input.native_entry_id, group);
-  }
-  const ownerSchema = z.object({ id: positiveId, kind: z.literal('agent'), session_id: positiveId, job_id: positiveId.nullable(),
-    config_json: z.string(), current_context_snapshot_id: positiveId.nullable(), context_observations_json: z.string().nullable() });
-  const owners = new Map<number, { row: z.infer<typeof ownerSchema>; context: ReturnType<typeof readRunContextOwner> }>();
-  const owner = (runId: number) => {
-    const cached = owners.get(runId); if (cached) return cached;
-    const row = ownerSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(runId));
-    if (row.session_id !== sessionId) throw new Error('context_seed_run_session');
-    const value = { row, context: readRunContextOwner(db, row) }; owners.set(runId, value); return value;
-  };
-  const bindings: NativeContextBindingSeed[] = [];
-  for (const entry of history?.entries ?? []) {
-    const matching = inputs.get(entry.id) ?? [];
-    inputs.delete(entry.id);
-    const role = entry.type === 'message' ? z.object({ role: z.enum(['user', 'assistant', 'toolResult']) }).passthrough().parse(entry.message).role : null;
-    if (role !== 'user') { if (matching.length) throw new Error('context_seed_not_user'); continue; }
-    nativeUserMessage.parse(entry.message);
-    const originRunId = origins.get(entry.id);
-    if (originRunId === undefined || matching.length > 1) throw new Error('context_seed_ambiguous');
-    const original = originRunId === null ? null : owner(originRunId);
-    if (!matching.length) {
-      if (original !== null && original.context.observations !== null) throw new Error('context_seed_p8_input_missing');
-      bindings.push(NativeInputContextBindingSchema.parse({ originRunId, inputId: null, nativeEntryId: entry.id, snapshotId: null }));
-      continue;
-    }
-    const input = matching[0]!;
-    if (input.session_id !== sessionId || input.run_id !== originRunId || original === null) throw new Error('context_seed_input_owner');
-    const content = SessionInputContentSchema.parse(JSON.parse(input.content_json));
-    if ((input.context_snapshot_id === null) !== (original.context.observations === null)) throw new Error('context_seed_snapshot_missing');
-    if (input.context_snapshot_id !== null) {
-      if (content.version !== 2) throw new Error('context_seed_p8_content');
-      const snapshot = readContextSnapshotOwner(db, input.context_snapshot_id, original.row);
-      if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
-        || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
-        || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds)) throw new Error('context_seed_snapshot_content');
-    }
-    bindings.push(NativeInputContextBindingSchema.parse({ originRunId, inputId: input.id, nativeEntryId: entry.id, snapshotId: input.context_snapshot_id }));
-  }
-  if (inputs.size) throw new Error('context_seed_entry_missing');
-  return Object.freeze(bindings);
-}
-
 function hasTable(db: Database, table: string): boolean {
   return db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== null;
 }
@@ -2762,8 +2733,7 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       try {
         return db.transaction(() => {
           if (!db.query('SELECT id FROM sessions WHERE id=?').get(sessionId)) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
-          const history = readNativeHistory(db, sessionId);
-          return ok(Object.freeze({ history, bindings: readNativeContextBindings(db, sessionId, history) }));
+          return ok(createNativeOriginReader(db).bundle(sessionId));
         }).deferred();
       } catch (error) {
         return fail(error instanceof SQLiteError ? appError('storage_read_failed', 'storage', 'Context history could not be read.', true)
@@ -2774,16 +2744,20 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
     readHistoryForDisplay(sessionId) {
       try {
         return ok(db.transaction(() => {
-          const history = readNativeHistory(db, sessionId);
-          const bindings = db.query('SELECT entry_id,run_id FROM session_native_entries WHERE session_id=? AND run_id IS NOT NULL ORDER BY sequence')
-            .all(sessionId) as Array<{ entry_id: string; run_id: number }>;
-          const rows = db.query('SELECT id,run_id,native_entry_id,content_json FROM session_inputs WHERE session_id=? AND native_entry_id IS NOT NULL ORDER BY id')
-            .all(sessionId) as { id: number; run_id: number; native_entry_id: string; content_json: string }[];
-          return { history, bindings: bindings.map((entry) => ({ entryId: entry.entry_id, runId: entry.run_id })),
-            sessionInputs: rows.map(row => ({ inputId: row.id, runId: row.run_id, nativeEntryId: row.native_entry_id,
-              content: JSON.parse(row.content_json) })) };
+          if (!db.query('SELECT id FROM sessions WHERE id=?').get(sessionId))
+            return { history: null, bindings: [], sessionInputs: [], origins: [] };
+          const bundle = createNativeOriginReader(db).bundle(sessionId);
+          const bindings = bundle.seed.origins.flatMap(origin => origin.originRunId === null ? []
+            : [{ entryId: origin.nativeEntryId, runId: origin.originRunId }]);
+          const sessionInputs = bundle.seed.inputs.flatMap(binding => {
+            if (binding.inputId === null || binding.originRunId === null) return [];
+            const row = db.query('SELECT content_json FROM session_inputs WHERE id=?').get(binding.inputId) as { content_json: string };
+            return [{ inputId: binding.inputId, runId: binding.originRunId, nativeEntryId: binding.nativeEntryId,
+              content: SessionInputContentSchema.parse(JSON.parse(row.content_json)) }];
+          });
+          return { history: bundle.history, bindings, sessionInputs, origins: bundle.seed.origins };
         }).deferred());
-      } catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
+      } catch (error) { return fail(error instanceof SQLiteError ? appError('storage_read_failed', 'storage', 'History could not be read.', true) : new NativeOriginFault().error); }
     },
 
     list(request) {
@@ -2820,10 +2794,14 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
 
     isModelUseBlocked(sessionId) {
       try {
-        const row = db.query('SELECT metadata_json FROM sessions WHERE id=?').get(sessionId) as { metadata_json: string } | null;
-        if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
-        return ok(parseSessionModelUse(row.metadata_json) !== null);
-      } catch { return fail(appError('storage_corrupt', 'storage', 'Session 使用权限无法读取。', true)); }
+        const read = () => createNativeOriginReader(db).ancestors(sessionId).some(owner => {
+          const row = db.query('SELECT metadata_json FROM sessions WHERE id=?').get(owner) as { metadata_json: string } | null;
+          if (!row) throw new NativeOriginFault();
+          return parseSessionModelUse(row.metadata_json) !== null;
+        });
+        return ok(db.inTransaction ? read() : db.transaction(read).deferred());
+      } catch (error) { return fail(error instanceof NativeOriginFault ? error.error
+        : appError('storage_read_failed', 'storage', 'Session authorization could not be read.', true)); }
     },
 
     revokeDocumentUse(input) {
@@ -3338,7 +3316,8 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const row = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (!row) return fail(appError('run_not_found', 'input', 'Run 不存在。', false, runId));
         return ok(snapshotFromRow(db, row));
-      } catch {
+      } catch (error) {
+        if (error instanceof NativeOriginFault) return fail(error.error);
         return fail(appError('storage_corrupt', 'storage', 'Run 事实无法读取。', false, runId));
       }
     },
@@ -3356,7 +3335,8 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const hasMore = mapped.length > request.limit;
         const items = hasMore ? mapped.slice(0, request.limit) : mapped;
         return ok({ items, nextBeforeRunId: hasMore ? items.at(-1)?.runId ?? null : null });
-      } catch {
+      } catch (error) {
+        if (error instanceof NativeOriginFault) return fail(error.error);
         return fail(appError('storage_corrupt', 'storage', 'Session Run 列表无法读取。'));
       }
     },

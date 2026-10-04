@@ -381,7 +381,10 @@ export class RuntimeService {
       || !['created', 'running'].includes(run.data.status)) return fail(appError('input_admission_closed', 'session', 'Input use is closed.', true, active.runId));
     if (row.data.deletePending || row.data.status !== 'active' || row.data.nativeSessionId !== session.nativeSessionId)
       return fail(appError('session_history_invalid', 'session', 'Input Session is unavailable.', false, active.runId));
-    if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', 'Input material access was revoked.', false, active.runId));
+    const permission = this.dependencies.sessions?.isModelUseBlocked(session.sessionId);
+    if (!permission) return fail(appError('storage_read_failed', 'storage', 'Input material access cannot be verified.', true, active.runId));
+    if (!permission.ok) return permission;
+    if (permission.data) return fail(appError('session_scope_revoked', 'session', 'Input material access was revoked.', false, active.runId));
     if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'Saved history is unusable.', false, active.runId));
     const content = stored.data.content;
     const corrupt = () => fail(appError('storage_corrupt', 'storage', 'Saved input does not match its fixed Run scope.', false, active.runId));
@@ -969,7 +972,10 @@ export class RuntimeService {
         if (row.data.nativeSessionId !== session.nativeSessionId || row.data.status !== 'active' || row.data.deletePending) {
           return fail(appError('session_history_invalid', 'session', 'Run 与 Session 身份不一致。', false, active.runId, request.sessionId));
         }
-        if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
+        const permission = this.dependencies.sessions?.isModelUseBlocked(request.sessionId);
+        if (!permission) return fail(appError('storage_read_failed', 'storage', 'Material access cannot be verified.', true, active.runId, request.sessionId));
+        if (!permission.ok) return permission;
+        if (permission.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
         if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', '会话历史不可继续使用。', false, active.runId, request.sessionId));
         return ok(undefined);
       },

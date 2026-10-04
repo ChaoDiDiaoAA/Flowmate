@@ -165,12 +165,12 @@ export class SessionService {
           matchesPersistedHistory = isDeepStrictEqual(JSON.parse(JSON.stringify(bundle.data.history)), JSON.parse(JSON.stringify(confirmed)));
         } catch { /* Unserializable history cannot confirm the persisted branch. */ }
       }
-      if (!bundle.ok || !matchesPersistedHistory) {
+      if (!bundle.ok || !matchesPersistedHistory || bundle.data.commit === null) {
         retainBlocked = true;
         try { await this.agent.releaseSession(row.data.nativeSessionId); } catch { /* preserve the closed management gate */ }
         return bundle.ok ? fail(appError('context_binding_unknown', 'runtime', 'Committed branch sources could not be confirmed.')) : bundle;
       }
-      const reverted = this.agent.restoreSessionLeaf(row.data.nativeSessionId, confirmed, bundle.data.bindings);
+      const reverted = this.agent.restoreSessionLeaf(row.data.nativeSessionId, confirmed, bundle.data.seed, bundle.data.commit);
       if (!reverted.ok) {
         retainBlocked = true;
         this.repository.saveHistory(request.sessionId, { ...confirmed, unusable: true });
@@ -258,7 +258,7 @@ export class SessionService {
     const runInputs: MessageRunInput[] = [];
     for (const runId of new Set(stored.data.bindings.map((binding) => binding.runId))) {
       const run = this.runs.get(runId);
-      if (!run.ok || run.data.kind !== 'agent' || run.data.sessionId !== request.sessionId) {
+      if (!run.ok || run.data.kind !== 'agent' || !stored.data.origins.filter(origin => origin.originRunId === runId).every(origin => origin.originSessionId === run.data.sessionId)) {
         return fail(appError('session_history_invalid', 'session', 'Saved message Run identity is inconsistent.'));
       }
       const config = run.data.config as Record<string, unknown>;
@@ -330,12 +330,12 @@ export function ensureNativeSession(repository: SessionRepository, agent: AgentP
   }
   const bundle = repository.loadHistoryForContext(row.sessionId);
   if (!bundle.ok) return bundle;
-  if (!bundle.data.history) return availability === 'ready' ? ok(undefined)
+  if (!bundle.data.history || !bundle.data.commit) return availability === 'ready' ? ok(undefined)
     : fail(appError('session_history_unavailable', 'session', 'This conversation has no saved native history.'));
   if (availability === 'ready') return agent.restoreSessionLeaf
-    ? agent.restoreSessionLeaf(row.nativeSessionId, bundle.data.history, bundle.data.bindings)
+    ? agent.restoreSessionLeaf(row.nativeSessionId, bundle.data.history, bundle.data.seed, bundle.data.commit)
     : fail(appError('context_binding_unknown', 'runtime', 'Saved conversation sources cannot be reconnected.'));
-  const restored = agent.restoreSession!(row.nativeSessionId, bundle.data.history, bundle.data.bindings);
+  const restored = agent.restoreSession!(row.nativeSessionId, bundle.data.history, bundle.data.seed, bundle.data.commit);
   if (!restored.ok) return restored;
   return agent.watchSession!(row.nativeSessionId, (snapshot, context) => repository.saveHistory(row.sessionId, snapshot, context));
 }
