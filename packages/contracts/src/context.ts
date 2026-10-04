@@ -170,17 +170,42 @@ export const NativeToolResultContextBindingSchema = z.object({ nativeToolCallId:
   .refine(value => (value.toolCallId === null) === (value.originRunId === null)
     && (value.context === null || value.toolCallId !== null), 'Tool result identity and context are inconsistent.').readonly();
 export type NativeToolResultContextBinding = z.infer<typeof NativeToolResultContextBindingSchema>;
-export const RequestContextBindingSchema = z.object({ runId: id, sessionId: id, nativeSessionId: opaqueId,
+export const NativeDerivedContextBindingSchema = z.object({ nativeEntryId: opaqueId, originSessionId: id,
+  entryType: z.enum(['message', 'custom_message', 'compaction', 'branch_summary']),
+  messageRole: z.enum(['bashExecution', 'custom', 'compactionSummary', 'branchSummary']),
+  contextMessageIndex: nonnegative, referenceEntryIds: z.array(opaqueId).readonly(),
+}).strict().superRefine((value, context) => {
+  const expected = { custom_message: 'custom', compaction: 'compactionSummary', branch_summary: 'branchSummary' };
+  if (value.entryType !== 'message' && expected[value.entryType] !== value.messageRole)
+    report(context, 'Derived entry and message role disagree.');
+  if (!unique(value.referenceEntryIds) || value.referenceEntryIds.includes('root'))
+    report(context, 'References contain actual unique entry IDs, never the root sentinel.');
+}).readonly();
+export type NativeDerivedContextBinding = z.infer<typeof NativeDerivedContextBindingSchema>;
+const requestBindingShape = { runId: id, sessionId: id, nativeSessionId: opaqueId,
   requestSequence: id, callSequence: id, inputId: id, snapshotId: id,
   includedBindings: z.array(NativeInputContextBindingSchema).max(512).readonly(),
   includedToolResults: z.array(NativeToolResultContextBindingSchema).max(512).readonly(),
-}).strict().superRefine((value, context) => {
+};
+function checkRequestBinding(value: z.infer<z.ZodObject<typeof requestBindingShape>> & {
+  includedNativeContexts?: readonly NativeDerivedContextBinding[] | null }, context: z.RefinementCtx) {
   const primary = [...value.includedBindings].reverse().find(item => item.originRunId === value.runId && item.snapshotId !== null);
   if (primary?.inputId !== value.inputId || primary.snapshotId !== value.snapshotId) report(context, 'Primary binding must be the last current Run source.');
   if (value.callSequence !== value.requestSequence) report(context, 'Call and logical request sequences disagree.');
-  if (value.includedBindings.length + value.includedToolResults.length > 512) report(context, 'Combined request provenance exceeds 512 entries.');
-}).readonly();
+  if (value.includedBindings.length + value.includedToolResults.length + (value.includedNativeContexts?.length ?? 0) > 512)
+    report(context, 'Combined request provenance exceeds 512 entries.');
+  if (value.includedNativeContexts && !unique(value.includedNativeContexts.map(item => item.contextMessageIndex)))
+    report(context, 'Derived context positions must be unique.');
+}
+export const LegacyRequestContextBindingSchema = z.object(requestBindingShape).strict().superRefine(checkRequestBinding).readonly();
+export const RequestContextBindingSchema = z.object({ ...requestBindingShape,
+  includedNativeContexts: z.array(NativeDerivedContextBindingSchema).max(512).readonly(),
+}).strict().superRefine(checkRequestBinding).readonly();
 export type RequestContextBinding = z.infer<typeof RequestContextBindingSchema>;
+export const PublicRequestContextBindingSchema = z.object({ ...requestBindingShape,
+  includedNativeContexts: z.array(NativeDerivedContextBindingSchema).max(512).readonly().nullable(),
+}).strict().superRefine(checkRequestBinding).readonly();
+export type PublicRequestContextBinding = z.infer<typeof PublicRequestContextBindingSchema>;
 export const ContextEvidenceReasonSchema = z.enum(['payload_codec_unavailable', 'fetch_unavailable', 'body_unavailable']);
 export type ContextEvidenceReason = z.infer<typeof ContextEvidenceReasonSchema>;
 const inclusionShape = { inclusion: z.enum(['confirmed', 'unavailable']), reason: ContextEvidenceReasonSchema.nullable() };
@@ -203,23 +228,54 @@ export const ContextTransportEvidenceSchema = z.object({ attempt: id.max(2), pre
 }).readonly();
 export type ContextTransportEvidence = z.infer<typeof ContextTransportEvidenceSchema>;
 export const ContextApiSchema = z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/);
-export const ContextRequestEvidenceSchema = z.object({ binding: RequestContextBindingSchema, api: ContextApiSchema, boundAt: time,
+const requestEvidenceShape = { api: ContextApiSchema, boundAt: time,
   sdkPayload: ContextSdkPayloadEvidenceSchema.nullable(), transport: z.enum(['observed-fetch', 'not-observable']),
   attempts: z.array(ContextTransportEvidenceSchema).max(2).readonly(),
-}).strict().superRefine((value, context) => {
+};
+function checkRequestEvidence(value: z.infer<z.ZodObject<typeof requestEvidenceShape>>, context: z.RefinementCtx) {
   if (value.transport === 'not-observable' && value.attempts.length !== 0) report(context, 'Unobserved transport cannot invent fetch attempts.');
   if (value.attempts.some((item, index) => item.attempt !== index + 1)) report(context, 'Attempt sequences must be continuous.');
-}).readonly();
+}
+export const ContextRequestEvidenceSchema = z.object({ binding: RequestContextBindingSchema, ...requestEvidenceShape })
+  .strict().superRefine(checkRequestEvidence).readonly();
 export type ContextRequestEvidence = z.infer<typeof ContextRequestEvidenceSchema>;
-export const ContextObservationsSchema = z.object({ version: z.literal(1), requests: z.array(ContextRequestEvidenceSchema).max(64).readonly() })
-  .strict().superRefine((value, context) => {
-    if (value.requests.some((item, index) => item.binding.requestSequence !== index + 1)) report(context, 'Journal requests must start at one and be continuous.');
-    const first = value.requests[0]?.binding;
-    if (first && value.requests.some(item => item.binding.runId !== first.runId || item.binding.sessionId !== first.sessionId
-      || item.binding.nativeSessionId !== first.nativeSessionId)) report(context, 'Journal requests must belong to one native Run and Session.');
-    if (jsonBytes(value) > 4194304) report(context, 'Journal exceeds 4 MiB.');
-  }).readonly();
+export const LegacyContextRequestEvidenceSchema = z.object({ binding: LegacyRequestContextBindingSchema, ...requestEvidenceShape })
+  .strict().superRefine(checkRequestEvidence).readonly();
+export const PublicContextRequestEvidenceSchema = z.object({ binding: PublicRequestContextBindingSchema, ...requestEvidenceShape })
+  .strict().superRefine(checkRequestEvidence).readonly();
+export type PublicContextRequestEvidence = z.infer<typeof PublicContextRequestEvidenceSchema>;
+function checkObservations(value: { requests: readonly { binding: { requestSequence: number; runId: number; sessionId: number; nativeSessionId: string } }[] }, context: z.RefinementCtx) {
+  if (value.requests.some((item, index) => item.binding.requestSequence !== index + 1)) report(context, 'Journal requests must start at one and be continuous.');
+  const first = value.requests[0]?.binding;
+  if (first && value.requests.some(item => item.binding.runId !== first.runId || item.binding.sessionId !== first.sessionId
+    || item.binding.nativeSessionId !== first.nativeSessionId)) report(context, 'Journal requests must belong to one native Run and Session.');
+  if (jsonBytes(value) > 4194304) report(context, 'Journal exceeds 4 MiB.');
+}
+// Legacy storage parsing preserves field omission and original serialization; it never backfills proof.
+const storedObservations = z.object({ version: z.literal(1), requests: z.array(z.union([
+  ContextRequestEvidenceSchema, LegacyContextRequestEvidenceSchema,
+])).max(64).readonly() }).strict().superRefine(checkObservations).readonly();
+export const ContextObservationsSchema = z.unknown().superRefine((raw, context) => {
+  const parsed = storedObservations.safeParse(raw);
+  if (!parsed.success) for (const error of parsed.error.issues) context.addIssue(error);
+}).transform(raw => raw as z.output<typeof storedObservations>);
 export type ContextObservations = z.infer<typeof ContextObservationsSchema>;
+export const NativeContextObservationsSchema = z.object({ version: z.literal(1),
+  requests: z.array(ContextRequestEvidenceSchema).max(64).readonly() }).strict().superRefine(checkObservations).readonly();
+export const PublicContextObservationsSchema = z.object({ version: z.literal(1),
+  requests: z.array(PublicContextRequestEvidenceSchema).max(64).readonly() }).strict().superRefine(checkObservations).readonly();
+export type PublicContextObservations = z.infer<typeof PublicContextObservationsSchema>;
+export function readContextObservations(raw: unknown, historyPolicyVersion?: 'p9-native-history-v1'): Result<PublicContextObservations> {
+  const parsed = (historyPolicyVersion === 'p9-native-history-v1' ? NativeContextObservationsSchema : ContextObservationsSchema).safeParse(raw);
+  if (!parsed.success) return { ok: false, error: { code: 'context_binding_unknown', category: 'runtime',
+    message: 'Stored native context evidence is invalid or was not collected.', retryable: false } };
+  const projected = PublicContextObservationsSchema.safeParse({ ...parsed.data, requests: parsed.data.requests.map(request => ({
+    ...request, binding: { ...request.binding, includedNativeContexts: 'includedNativeContexts' in request.binding
+      ? request.binding.includedNativeContexts : null },
+  })) });
+  return projected.success ? { ok: true, data: projected.data } : { ok: false, error: { code: 'context_binding_unknown', category: 'runtime',
+    message: 'Public native context evidence is invalid.', retryable: false } };
+}
 export const ContextEvidenceUpdateSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('sdk-payload'), at: time, ...inclusionShape }).strict(),
   z.object({ kind: z.literal('attempt-prepared'), evidence: ContextTransportEvidenceSchema }).strict(),
@@ -281,7 +337,7 @@ export const ContextSnapshotDetailSchema = z.object({ snapshot: PublicContextSna
     'Detail Input must belong to its snapshot Run and Session.');
 export type ContextSnapshotDetail = z.infer<typeof ContextSnapshotDetailSchema>;
 export const ContextRequestsPageSchema = z.object({ sessionId: id, runId: id, collection: z.enum(['not-collected', 'collected']),
-  items: z.array(ContextRequestEvidenceSchema).max(20).readonly(), nextBeforeRequestSequence: id.nullable() }).strict()
+  items: z.array(PublicContextRequestEvidenceSchema).max(20).readonly(), nextBeforeRequestSequence: id.nullable() }).strict()
   .superRefine((value, context) => {
     if (value.collection === 'not-collected' && (value.items.length !== 0 || value.nextBeforeRequestSequence !== null))
       report(context, 'Uncollected requests cannot contain invented evidence.');

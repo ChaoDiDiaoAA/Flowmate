@@ -31,7 +31,7 @@ const userBinding = { originRunId: 31, inputId: 100, nativeEntryId: 'e100', snap
 const toolBinding = { nativeToolCallId: 'call_1', toolCallId: 71, originRunId: 30,
   context: { snapshotId: 50, requestSequence: 1 } };
 const binding = { runId: 31, sessionId: 5, nativeSessionId: 'native-5', requestSequence: 1, callSequence: 1,
-  inputId: 100, snapshotId: 51, includedBindings: [userBinding], includedToolResults: [toolBinding] };
+  inputId: 100, snapshotId: 51, includedBindings: [userBinding], includedToolResults: [toolBinding], includedNativeContexts: [] };
 const attempt = { attempt: 1, preparedAt: at, enteredAt: null, responseAt: null, responseStatus: null,
   transportErrorCode: null, nativeRequestId: null, wireInclusion: 'confirmed', wireReason: null };
 const request = { binding, api: 'openai-responses', boundAt: at,
@@ -39,6 +39,40 @@ const request = { binding, api: 'openai-responses', boundAt: at,
   transport: 'observed-fetch', attempts: [] };
 const summary = { id: 51, sessionId: 5, runId: 31, jobId: null, sequence: 1, createdAt: at, inputId: 100,
   mode: 'prompt', documentRef: null, candidateRef: null, selection: null, fragmentCount: 0, gapCount: 0 };
+
+describe('P9 T01 native context evidence', () => {
+  // These catch legacy backfill, new writers omitting proof, or derived messages forging Input identity.
+  it('distinguishes legacy native context evidence from explicit empty arrays', () => {
+    const { includedNativeContexts: _omitted, ...legacyBinding } = binding;
+    const legacy = { version: 1, requests: [{ ...request, binding: legacyBinding }] };
+    const bytesBefore = JSON.stringify(legacy);
+    expect(JSON.stringify(schema('ContextObservationsSchema').parse(legacy))).toBe(bytesBefore);
+    const reordered = { requests: [{ attempts: [], transport: request.transport, sdkPayload: request.sdkPayload,
+      boundAt: at, api: request.api, binding: legacyBinding }], version: 1 };
+    expect(JSON.stringify(schema('ContextObservationsSchema').parse(reordered))).toBe(JSON.stringify(reordered));
+    const read = Reflect.get(contracts, 'readContextObservations');
+    expect(read).toBeFunction();
+    expect(read(legacy)).toMatchObject({ ok: true, data: { requests: [{ binding: { includedNativeContexts: null } }] } });
+    expect(JSON.stringify(legacy)).toBe(bytesBefore);
+    expect(read(legacy, 'p9-native-history-v1')).toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
+    expect(read({ version: 1, requests: [request] }, 'p9-native-history-v1')).toMatchObject({ ok: true,
+      data: { requests: [{ binding: { includedNativeContexts: [] } }] } });
+    expect(schema('RequestContextBindingSchema').safeParse(legacyBinding).success).toBe(false);
+    const derived = { nativeEntryId: 'custom-entry', originSessionId: 2, entryType: 'custom_message', messageRole: 'custom',
+      contextMessageIndex: 0, referenceEntryIds: [] };
+    expect(schema('NativeDerivedContextBindingSchema').safeParse(derived).success).toBe(true);
+    for (const patch of [{ inputId: 100 }, { snapshotId: 51 }, { contextMessageIndex: -1 },
+      { contextMessageIndex: Number.MAX_SAFE_INTEGER + 1 }, { entryType: 'compaction' }, { referenceEntryIds: ['root'] }])
+      expect(schema('NativeDerivedContextBindingSchema').safeParse({ ...derived, ...patch }).success).toBe(false);
+    const validator = schema('RequestContextBindingSchema');
+    expect(validator.safeParse({ ...binding, includedToolResults: Array(510).fill(toolBinding), includedNativeContexts: [derived] }).success).toBe(true);
+    expect(validator.safeParse({ ...binding, includedToolResults: Array(511).fill(toolBinding), includedNativeContexts: [derived] }).success).toBe(false);
+    const publicPage = { sessionId: 5, runId: 31, collection: 'collected',
+      items: [{ ...request, binding: { ...legacyBinding, includedNativeContexts: null } }], nextBeforeRequestSequence: null };
+    expect(schema('ContextRequestsResultSchema').safeParse({ ok: true, data: publicPage }).success).toBe(true);
+    expect(schema('ContextRequestsResultSchema').safeParse({ ok: true, data: { ...publicPage, items: legacy.requests } }).success).toBe(false);
+  });
+});
 
 describe('P8 Context strict contracts', () => {
   it('rejects malformed or impossible fact dates without throwing', () => {

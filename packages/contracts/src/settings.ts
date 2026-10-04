@@ -164,6 +164,9 @@ export type DesktopBridge = {
   listSessionInputs(input: import('./session-inputs.ts').SessionInputsRequest): Promise<import('./runtime.ts').Result<import('./session-inputs.ts').SessionInputsPage>>;
   setSessionStatus(input: import('./runtime.ts').SetSessionStatusRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
   branchSession(input: import('./runtime.ts').BranchSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').BranchSessionResult>>;
+  querySessionHistory(input: import('./memory.ts').NativeHistoryPageRequest): Promise<import('./runtime.ts').Result<import('./memory.ts').NativeHistoryPage>>;
+  querySessionHistoryEntry(input: import('./memory.ts').SessionHistoryEntryRequest): Promise<import('./runtime.ts').Result<import('./memory.ts').SessionHistoryEntryDetail>>;
+  forkSession(input: import('./memory.ts').ForkSessionRequest): Promise<import('./runtime.ts').Result<import('./memory.ts').ForkSessionResult>>;
   registerInvoiceFormTarget(input: { purpose: 'fill' | 'edit'; workspace: DesktopInvoiceFormWorkspace; formRevision: number }): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceFormTarget>>;
   invalidateInvoiceFormTarget(formInstanceId: string): Promise<import('./runtime.ts').Result<void>>;
   setInvoiceFormDirty(formInstanceId: string, dirty: boolean, formRevision: number): Promise<import('./runtime.ts').Result<void>>;

@@ -137,12 +137,23 @@ describe('P5 input and management contracts', () => {
 
   it('requires explicit committed position expectations for native branches', () => {
     expect(messages.normalizeBranchSessionRequest).toBeFunction();
-    expect(messages.normalizeBranchSessionRequest({ sessionId: 4, expectedLeafId: null, expectedEntryCount: 0, targetEntryId: 'reply-1' }).ok).toBe(true);
+    expect(messages.normalizeBranchSessionRequest({ sessionId: 4, expectedLeafId: null, expectedEntryCount: 0, expectedCommitRevision: 0, targetEntryId: 'reply-1' }).ok).toBe(true);
     for (const request of [{ sessionId: 4, targetEntryId: 'reply-1' },
       { sessionId: 4, expectedLeafId: null, expectedEntryCount: -1, targetEntryId: 'reply-1' },
       { sessionId: 4, expectedLeafId: 'leaf', expectedEntryCount: 1, targetEntryId: '' }]) {
       expect(messages.normalizeBranchSessionRequest(request).ok).toBe(false);
     }
+  });
+});
+
+describe('P9 T01 branch revision', () => {
+  it('requires the saved revision while preserving count and leaf expectations', () => {
+    const request = { sessionId: 4, expectedLeafId: null, expectedEntryCount: 0, targetEntryId: 'reply-1' };
+    expect(messages.normalizeBranchSessionRequest(request)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(messages.normalizeBranchSessionRequest({ ...request, expectedCommitRevision: 0, targetEntryId: 'x'.repeat(256) }).ok).toBe(true);
+    for (const expectedCommitRevision of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1])
+      expect(messages.normalizeBranchSessionRequest({ ...request, expectedCommitRevision })).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(messages.normalizeBranchSessionRequest({ ...request, expectedCommitRevision: 0, targetEntryId: 'x'.repeat(257) }).ok).toBe(false);
   });
 });
 

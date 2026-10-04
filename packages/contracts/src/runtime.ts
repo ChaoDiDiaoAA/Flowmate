@@ -329,7 +329,7 @@ export type NativeMessageProjectionInput = {
 export type MessageSessionInput = { inputId: DbId; runId: DbId; nativeEntryId: string;
   content: import('./session-inputs.ts').SessionInputContent };
 export type SetSessionStatusRequest = { sessionId: DbId; expectedStatus: SessionStatus; status: SessionStatus };
-export type BranchSessionRequest = { sessionId: DbId; expectedLeafId: string | null; expectedEntryCount: number; targetEntryId: string };
+export type BranchSessionRequest = { sessionId: DbId; expectedLeafId: string | null; expectedEntryCount: number; expectedCommitRevision: number; targetEntryId: string };
 export type BranchSessionResult = { session: SessionSnapshot; leafId: string; entryCount: number };
 
 const messageDbIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -338,8 +338,9 @@ const messageCursorSchema = messageIdSchema.max(128);
 export const SetSessionStatusRequestSchema = z.object({ sessionId: messageDbIdSchema,
   expectedStatus: z.enum(['active', 'archived']), status: z.enum(['active', 'archived']) }).strict();
 export const BranchSessionRequestSchema = z.object({ sessionId: messageDbIdSchema,
-  expectedLeafId: messageCursorSchema.nullable(), expectedEntryCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  targetEntryId: messageCursorSchema }).strict();
+  expectedLeafId: messageIdSchema.max(256).nullable(), expectedEntryCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  expectedCommitRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  targetEntryId: messageIdSchema.max(256) }).strict();
 export function normalizeSetSessionStatusRequest(raw: unknown): Result<SetSessionStatusRequest> {
   const parsed = SetSessionStatusRequestSchema.safeParse(raw);
   return parsed.success ? { ok: true, data: parsed.data } : { ok: false,
@@ -540,6 +541,9 @@ export interface Application {
   listSessionInputs(request: import('./session-inputs.ts').SessionInputsRequest): Promise<Result<import('./session-inputs.ts').SessionInputsPage>>;
   setSessionStatus(request: SetSessionStatusRequest): Promise<Result<SessionSnapshot>>;
   branchSession(request: BranchSessionRequest): Promise<Result<BranchSessionResult>>;
+  querySessionHistory(input: import('./memory.ts').NativeHistoryPageRequest): Promise<Result<import('./memory.ts').NativeHistoryPage>>;
+  querySessionHistoryEntry(input: import('./memory.ts').SessionHistoryEntryRequest): Promise<Result<import('./memory.ts').SessionHistoryEntryDetail>>;
+  forkSession(input: import('./memory.ts').ForkSessionRequest): Promise<Result<import('./memory.ts').ForkSessionResult>>;
   queryInvoiceFormApplication(request: { runId: DbId; toolCallId: DbId }): Promise<Result<import('./invoice.ts').InvoiceFormApplicationReceipt>>;
   saveInvoiceCandidate(request: import('./invoice.ts').SaveInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').SaveInvoiceCandidateResponse>>;
   acceptInvoiceCandidate(request: import('./invoice.ts').AcceptInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;

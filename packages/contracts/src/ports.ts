@@ -12,7 +12,6 @@ import type {
   TokenColumns,
   SessionMessageView,
   SessionMessagesPage,
-  NativeHistoryAppendContext,
   NativeMessageProjectionInput,
   ResolvedRuntimeBudget,
 } from './runtime.ts';
@@ -21,7 +20,8 @@ import type { CandidateJobDetail, CandidateJobPage, GoalMode, WorkspaceContext, 
 import type { ToolCallDelivery } from './activity.ts';
 import type { CandidateSnapshot } from './activity.ts';
 import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput } from './invoice.ts';
-import type { ContextHooks, NativeContextBindingSeed } from './context.ts';
+import type { ContextHooks } from './context.ts';
+import type { HistoryCommitState, HistoryCommitReceipt, NativeHistoryRecoverySeed, NativeHistoryWrite, NativeHistoryInspection } from './memory.ts';
 
 export type SaveCandidateRecord = {
   runId: DbId;
@@ -56,6 +56,7 @@ export type SafeConfigSnapshot = {
   runtimeBudget?: ResolvedRuntimeBudget;
   runtimeStrategy?: RuntimeStrategySnapshot;
   contextPolicyVersion?: 'p8-context-v1';
+  historyPolicyVersion?: 'p9-native-history-v1';
 };
 
 export type NativeInput = {
@@ -238,7 +239,7 @@ export interface ProviderPort {
 }
 
 export interface PreparedAgent {
-  snapshot: SafeConfigSnapshot & { agent: RunAgentConfigFacts };
+  snapshot: SafeConfigSnapshot & { historyPolicyVersion: 'p9-native-history-v1'; agent: RunAgentConfigFacts };
   execute(
     input: AgentExecutionInput,
     signal: AbortSignal,
@@ -249,12 +250,15 @@ export interface PreparedAgent {
 export interface AgentPort {
   createSession(): Result<{ nativeSessionId: string }>;
   exportSession?(nativeSessionId: string): Result<import('./runtime.ts').NativeSessionHistory>;
-  restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void>;
-  watchSession?(nativeSessionId: string, save: (history: import('./runtime.ts').NativeSessionHistory, context?: NativeHistoryAppendContext) => Result<void>): Result<void>;
+  restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void>;
+  watchSession?(nativeSessionId: string, commit: HistoryCommitState, seed: NativeHistoryRecoverySeed,
+    save: (write: NativeHistoryWrite) => Result<HistoryCommitReceipt>): Result<void>;
   projectSessionMessages?(input: NativeMessageProjectionInput): Result<Pick<SessionMessagesPage, 'items' | 'nextBeforeEntryId'>>;
   enqueueInput?(nativeSessionId: string, input: AgentInputDispatch): Promise<Result<void>>;
   moveSessionLeaf?(nativeSessionId: string, targetEntryId: string): Promise<Result<import('./runtime.ts').NativeSessionHistory>>;
-  restoreSessionLeaf?(nativeSessionId: string, committed: import('./runtime.ts').NativeSessionHistory, bindings?: readonly NativeContextBindingSeed[]): Result<void>;
+  restoreSessionLeaf?(nativeSessionId: string, committed: import('./runtime.ts').NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void>;
+  inspectSessionHistory?(input: { history: import('./runtime.ts').NativeSessionHistory; seed: NativeHistoryRecoverySeed }): Result<NativeHistoryInspection>;
+  buildForkSessionHistory?(input: { source: import('./runtime.ts').NativeSessionHistory; targetEntryId: string }): Result<import('./runtime.ts').NativeSessionHistory>;
   inspect(nativeSessionId: string): {
     availability: AgentPortAvailability;
   };
