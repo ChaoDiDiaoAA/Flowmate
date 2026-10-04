@@ -333,6 +333,21 @@ describe('P2 Session and Agent Run storage', () => {
     expect(store.db.query('SELECT status FROM runs WHERE id=?').get(provider.data)).toEqual({ status: 'created' });
   }));
 
+  it('P9 T02 fix1 preserves revision exhaustion storage reason and rolls back Run terminal and P6', () => withDatabase((paths) => {
+    const store = nativeFixture(paths);
+    store.db.query('UPDATE session_native_history SET commit_revision=?').run(Number.MAX_SAFE_INTEGER);
+    const facts = () => ['runs', 'sessions', 'session_native_history', 'session_native_entries', 'session_inputs', 'runtime_events']
+      .map(table => store.db.query(`SELECT * FROM ${table}`).all());
+    const before = facts(), published: unknown[] = [];
+    store.runtimeEventStore.onCommitted(refs => published.push(refs));
+    expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true }))
+      .toMatchObject({ ok: false, error: { code: 'storage_write_failed', category: 'storage', retryable: false,
+        message: 'Conversation history commit revision is exhausted. Further changes cannot be saved.' } });
+    expect(facts()).toEqual(before);
+    expect(published).toEqual([]);
+    expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: false } });
+  }));
+
   it.each(['created', 'running'] as const)('blocks an interrupted %s Agent history on startup without blocking a completed Session', (status) => withDatabase((paths) => {
     const store = nativeFixture(paths);
     const completed = store.sessions.create({ nativeSessionId: 'native-completed', title: 'Complete', at: store.history.header.timestamp,

@@ -10,6 +10,10 @@ export class MemoryCommitFault extends Error {
 }
 function conflict(): never { throw new MemoryCommitFault(appError('state_conflict', 'session', 'Conversation history has changed.', true)); }
 function invalid(): never { throw new MemoryCommitFault(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
+function exhausted(): never {
+  throw new MemoryCommitFault(appError('storage_write_failed', 'storage',
+    'Conversation history commit revision is exhausted. Further changes cannot be saved.'));
+}
 function ordered(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(ordered);
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, ordered(child)]));
@@ -26,6 +30,20 @@ function historyRow(db: Database, sessionId: DbId) {
 }
 function entryRows(db: Database, sessionId: DbId) {
   return db.query('SELECT sequence,entry_id,entry_json,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(sessionId) as EntryRow[];
+}
+/** Existing contexts confirm original identities; they cannot fill an absent Input pointer. */
+function confirmOriginalAssociation(db: Database, sessionId: DbId, context: HistoryCommitInput['contexts'][number]): void {
+  type InputIdentity = { id: number; run_id: number | null; status: string; native_entry_id: string | null };
+  const users = db.query('SELECT id,run_id,status,native_entry_id FROM session_inputs WHERE session_id=? AND native_entry_id=?')
+    .all(sessionId, context.entryId) as InputIdentity[];
+  if (context.inputId === undefined ? users.length !== 0
+    : users.length !== 1 || users[0]!.id !== context.inputId || users[0]!.run_id !== context.runId || users[0]!.status !== 'consumed') conflict();
+  const results = db.query('SELECT id,run_id,status,native_entry_id FROM session_inputs WHERE session_id=? AND result_entry_id=?')
+    .all(sessionId, context.entryId) as InputIdentity[];
+  const expected = context.resultInputIds ?? [];
+  if (context.resultInputIds !== undefined && expected.length === 0 || new Set(expected).size !== expected.length
+    || results.length !== expected.length || results.some(row => !expected.includes(row.id) || row.run_id !== context.runId
+      || row.status !== 'consumed' || row.native_entry_id === null)) conflict();
 }
 /** Complete committed read. Resolver enrichment is assembled separately, under its read transaction. */
 export function loadNativeHistoryInTransaction(db: Database, sessionId: DbId): StoredNativeHistory | null {
@@ -85,9 +103,10 @@ export function commitInTransaction(db: Database, input: HistoryCommitInput, eve
     if (context.inputId !== undefined && (role !== 'user' || context.resultInputIds !== undefined)) conflict();
     if (context.resultInputIds !== undefined && role !== 'assistant') conflict();
     if (role === 'user' && context.inputId === undefined && db.query('SELECT id FROM session_inputs WHERE run_id=? LIMIT 1').get(context.runId)) conflict();
+    if (old) confirmOriginalAssociation(db, input.sessionId, context);
   }
   const changed = previous === null || added.length > 0 || input.leafId !== previous.history.leafId || unusable !== previous.history.unusable;
-  if (changed && previous?.commit.commitRevision === Number.MAX_SAFE_INTEGER) conflict();
+  if (changed && previous?.commit.commitRevision === Number.MAX_SAFE_INTEGER) exhausted();
   const revision = previous ? previous.commit.commitRevision + (changed ? 1 : 0) : 1;
   if (!previous) db.query('INSERT INTO session_native_history(session_id,storage_version,header_json,leaf_id,entry_count,unusable,commit_revision) VALUES(?,1,?,NULL,0,0,0)')
     .run(input.sessionId, JSON.stringify(input.header));
@@ -119,7 +138,7 @@ export function markUnusableInTransaction(db: Database, sessionId: DbId): void {
   const row = historyRow(db, sessionId);
   if (!row || row.unusable === 1) return;
   if (row.unusable !== 0 || !HistoryCommitStateSchema.safeParse({ commitRevision: row.commit_revision, entryCount: row.entry_count, leafId: row.leaf_id }).success) invalid();
-  if (row.commit_revision === Number.MAX_SAFE_INTEGER) conflict();
+  if (row.commit_revision === Number.MAX_SAFE_INTEGER) exhausted();
   const changed = db.query(`UPDATE session_native_history SET unusable=1,commit_revision=commit_revision+1
     WHERE session_id=? AND unusable=0 AND commit_revision=? AND entry_count=? AND leaf_id IS ?`)
     .run(sessionId, row.commit_revision, row.entry_count, row.leaf_id).changes;

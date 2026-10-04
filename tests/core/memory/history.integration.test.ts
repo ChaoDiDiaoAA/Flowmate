@@ -47,9 +47,92 @@ it('P9 T02 commits revision once and rejects ABA and stale writers', () => {
   expect(f.load().history.unusable).toBe(true);
   f.store.db.query('UPDATE session_native_history SET commit_revision=?').run(Number.MAX_SAFE_INTEGER);
   expect(need(f.commit()).commitRevision).toBe(Number.MAX_SAFE_INTEGER);
-  expect(f.commit({ leafId: 'a' })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  expect(f.commit({ leafId: 'a' })).toMatchObject({ ok: false, error: { code: 'storage_write_failed', category: 'storage',
+    message: 'Conversation history commit revision is exhausted. Further changes cannot be saved.', retryable: false } });
   expect(f.load().commit.commitRevision).toBe(Number.MAX_SAFE_INTEGER);
   expect(f.commit({ expected: null })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+});
+
+function agentInput(f: ReturnType<typeof fixture>, runId?: number, sequence = 1) {
+  const db = f.store.db;
+  runId ??= Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+    VALUES('agent',?,'{}','running','fixture','{}','{}','{}','{}',?)`).run(f.session.sessionId, at).lastInsertRowid);
+  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
+    VALUES(?,?,'prompt','answer',?,?,'{"version":2,"text":"a","promptText":"a","workspaceContext":null,"workspaceInput":null,"allowedDocumentIds":[],"allowedArtifactIds":[]}','queued','pending',?,?)`)
+    .run(f.session.sessionId, sequence, 'a'.repeat(64), runId, at, at).lastInsertRowid);
+  return { runId, inputId };
+}
+function persistenceFacts(f: ReturnType<typeof fixture>) {
+  return ['session_native_history', 'session_native_entries', 'session_inputs', 'runtime_events'].map(table => f.store.db.query(`SELECT * FROM ${table}`).all());
+}
+const assistant = () => ({ type: 'message', id: 'b', parentId: 'a', timestamp: at,
+  message: { ...nativeAssistantFacts, role: 'assistant', content: [{ type: 'text', text: 'Saved.' }], stopReason: 'stop', timestamp: 2 } });
+
+it('P9 T02 fix1 rejects late assistant result membership without rewriting SQL receipt P6 or notifications', () => {
+  const f = fixture(), { runId, inputId } = agentInput(f), b = assistant();
+  const receipt = need(f.commit({ appendEntries: [entry('a'), b], leafId: 'b', contexts: [
+    { entryId: 'a', runId, inputId }, { entryId: 'b', runId } ] }));
+  expect(f.store.db.query('SELECT native_entry_id,result_entry_id FROM session_inputs').get()).toEqual({ native_entry_id: 'a', result_entry_id: null });
+  const before = persistenceFacts(f), published: unknown[] = [];
+  f.store.runtimeEventStore.onCommitted(refs => published.push(refs));
+  expect(f.commit({ expected: receipt, appendEntries: [b], contexts: [{ entryId: 'b', runId, resultInputIds: [inputId] }] }))
+    .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  expect(persistenceFacts(f)).toEqual(before);
+  expect(f.load().commit).toEqual(receipt);
+  expect(published).toEqual([]);
+});
+
+it('P9 T02 fix1 rejects late user Input identity and confirms only complete original associations', () => {
+  const f = fixture(), db = f.store.db;
+  const runId = Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+    VALUES('agent',?,'{}','running','fixture','{}','{}','{}','{}',?)`).run(f.session.sessionId, at).lastInsertRowid);
+  const receipt = need(f.commit({ appendEntries: [entry('a')], leafId: 'a', contexts: [{ entryId: 'a', runId }] }));
+  const { inputId } = agentInput(f, runId);
+  const before = persistenceFacts(f), published: unknown[] = [];
+  f.store.runtimeEventStore.onCommitted(refs => published.push(refs));
+  expect(f.commit({ expected: receipt, appendEntries: [entry('a')], contexts: [{ entryId: 'a', runId, inputId }] }))
+    .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  expect(persistenceFacts(f)).toEqual(before);
+  expect(f.load().commit).toEqual(receipt);
+  expect(published).toEqual([]);
+
+  const exact = fixture(), original = agentInput(exact), b = assistant();
+  const contexts = [{ entryId: 'b', runId: original.runId, resultInputIds: [original.inputId] },
+    { entryId: 'a', runId: original.runId, inputId: original.inputId }];
+  const exactReceipt = need(exact.commit({ appendEntries: [entry('a'), b], leafId: 'b', contexts }));
+  const other = agentInput(exact, original.runId, 2);
+  const exactFacts = persistenceFacts(exact), exactPublished: unknown[] = [];
+  exact.store.runtimeEventStore.onCommitted(refs => exactPublished.push(refs));
+  expect(need(exact.commit({ expected: exactReceipt, appendEntries: [entry('a'), b], contexts }))).toEqual(exactReceipt);
+  expect(persistenceFacts(exact)).toEqual(exactFacts);
+  expect(exactPublished).toEqual([]);
+  for (const changed of [
+    [{ entryId: 'b', runId: original.runId }],
+    [{ entryId: 'b', runId: original.runId, resultInputIds: [other.inputId] }],
+    [{ entryId: 'b', runId: original.runId, resultInputIds: [original.inputId, other.inputId] }],
+    [{ entryId: 'a', runId: original.runId, inputId: other.inputId }],
+  ]) {
+    expect(exact.commit({ expected: exactReceipt, contexts: changed })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(persistenceFacts(exact)).toEqual(exactFacts);
+    expect(exact.load().commit).toEqual(exactReceipt);
+    expect(exactPublished).toEqual([]);
+  }
+});
+
+it.each(['active-run', 'completed-input'] as const)('P9 T02 fix1 reports exhausted sticky revision and rolls back %s recovery', recovery => {
+  const f = fixture(), { runId } = agentInput(f), db = f.store.db;
+  if (recovery === 'completed-input') db.query("UPDATE runs SET status='completed',ended_at=?,stopped_at=?,output_json='{}' WHERE id=?").run(at, at, runId);
+  db.query('UPDATE session_native_history SET commit_revision=?').run(Number.MAX_SAFE_INTEGER);
+  const before = persistenceFacts(f), runs = db.query('SELECT * FROM runs').all(), published: unknown[] = [];
+  f.store.runtimeEventStore.onCommitted(refs => published.push(refs));
+  expect(f.store.runs.failInterrupted(at)).toMatchObject({ ok: false, error: { code: 'storage_write_failed', category: 'storage',
+    message: 'Conversation history commit revision is exhausted. Further changes cannot be saved.', retryable: false } });
+  expect(persistenceFacts(f)).toEqual(before);
+  expect(db.query('SELECT * FROM runs').all()).toEqual(runs);
+  expect(published).toEqual([]);
+  expect(f.load().commit.commitRevision).toBe(Number.MAX_SAFE_INTEGER);
+  expect(need(f.commit()).commitRevision).toBe(Number.MAX_SAFE_INTEGER);
+  expect(db.query('SELECT status FROM runs WHERE id=?').get(runId)).toEqual({ status: recovery === 'active-run' ? 'running' : 'completed' });
 });
 
 it('P9 T02 rejects conflicting entries without changing the committed prefix', () => {
