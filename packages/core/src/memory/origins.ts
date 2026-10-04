@@ -2,7 +2,7 @@ import { SQLiteError, type Database } from 'bun:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, NativeSessionHistorySchema, NativeHistoryRecoveryBundleSchema, SessionInputContentSchema } from '@flowmate/contracts';
-import type { AppError, DbId, NativeSessionEntry, NativeHistoryRecoveryBundle, NativeToolResultContextBinding, NativeDerivedContextBinding, Result } from '@flowmate/contracts';
+import type { AppError, DbId, NativeSessionEntry, NativeSessionHistory, NativeHistoryRecoveryBundle, NativeToolResultContextBinding, NativeDerivedContextBinding, Result } from '@flowmate/contracts';
 import { loadNativeHistoryInTransaction } from './persistence.ts';
 import { readRunContext, readContextSnapshotOwner, contextReferenceFromColumns } from '../context/repository.ts';
 
@@ -25,6 +25,31 @@ export function nativeEntryReferences(entry: NativeSessionEntry, includeParent =
     : entry.type === 'message' && entry.message.role === 'branchSummary' ? entry.message.fromId : null;
   if (from !== null && from !== 'root') refs.push(from);
   return [...new Set(refs)];
+}
+
+/** Verify the detached SDK result against this transaction's frozen source, before writing copies. */
+export function verifyNativeForkCopy(source: NativeSessionHistory, target: NativeSessionHistory, selectedEntryId: string): void {
+  if (target.header.id === source.header.id || target.header.cwd !== source.header.cwd || target.header.parentSession !== undefined
+    || target.leafId !== selectedEntryId || target.unusable || !NativeSessionHistorySchema.safeParse(target).success) unknown();
+  const parsed = NativeSessionHistorySchema.safeParse(source);
+  if (!parsed.success) unknown();
+  const entries = new Map(parsed.data.entries.map(entry => [entry.id, entry]));
+  const included = new Set<string>(), visiting = new Set<string>();
+  const visit = (entryId: string): void => {
+    if (visiting.has(entryId)) unknown();
+    if (included.has(entryId)) return;
+    const entry = entries.get(entryId); if (!entry) unknown();
+    visiting.add(entryId);
+    for (const ref of nativeEntryReferences(entry)) visit(ref);
+    visiting.delete(entryId); included.add(entryId);
+  };
+  visit(selectedEntryId);
+  let previous = -1;
+  while (previous !== included.size) {
+    previous = included.size;
+    for (const entry of parsed.data.entries) if (entry.type === 'label' && included.has(entry.targetId)) visit(entry.id);
+  }
+  if (!isDeepStrictEqual(target.entries, source.entries.filter(entry => included.has(entry.id)))) unknown();
 }
 
 /** Cache lifetime is one caller-owned SQL snapshot. Never invokes the outer journal reader. */

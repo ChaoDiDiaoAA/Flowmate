@@ -219,6 +219,7 @@ export function makeApplication(
     listSessionInputs: async request => sessions?.listInputs(request) ?? fail(sessionServiceUnavailable()),
     setSessionStatus: async request => sessions?.setStatus(request) ?? fail(sessionServiceUnavailable()),
     branchSession: async request => sessions?.branch(request) ?? fail(sessionServiceUnavailable()),
+    forkSession: async request => sessions?.forkSession(request) ?? fail(sessionServiceUnavailable()),
     querySessionHistory: async request => sessions?.querySessionHistory(request) ?? fail(sessionServiceUnavailable()),
     querySessionHistoryEntry: async request => sessions?.querySessionHistoryEntry(request) ?? fail(sessionServiceUnavailable()),
     queryInvoiceFormApplication: async (request) => products?.invoiceForms?.query(request)

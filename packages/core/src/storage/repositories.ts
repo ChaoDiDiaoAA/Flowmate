@@ -1,4 +1,4 @@
-import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.ts';
+import { createNativeOriginReader, NativeOriginFault, verifyNativeForkCopy } from '../memory/origins.ts';
 import { evidenceReadFailure, readTransaction } from './reads.ts';
 import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction, markUnusableInTransaction } from '../memory/persistence.ts';
 import { SQLiteError, type Database } from 'bun:sqlite';
@@ -31,6 +31,7 @@ import type {
   SessionStatus,
   SessionHistoryState,
   NativeSessionHistory,
+  ForkSessionRequest,
   NativeHistoryRecoveryBundle,
   NativeHistoryOriginSeed,
   NativeHistoryDisplayRecord,
@@ -291,6 +292,9 @@ export interface BusinessEventRepository {
 export type SessionHistorySnapshot = { row: SessionRow; bundle: NativeHistoryRecoveryBundle; blocked: boolean;
   associations: { entries: { entry_id: string; run_id: number | null }[]; inputs: Record<string, unknown>[] } };
 export interface SessionRepository {
+  findFork(request: ForkSessionRequest): Result<DbId | null>;
+  createFork(input: { request: ForkSessionRequest; history: NativeSessionHistory; frozen: SessionHistorySnapshot; at: string;
+    qualify: (snapshot: SessionHistorySnapshot) => Result<void> }): Result<DbId>;
   markHistoryUnusable(sessionId: DbId): Result<void>;
   readHistorySnapshot<T>(sessionId: DbId, read: (value: SessionHistorySnapshot) => Result<T>, writeInputIds?: readonly DbId[]): Result<T>;
   create(input: NewSession): Result<SessionRow>;
@@ -2676,6 +2680,7 @@ function transaction<T>(db: Database, fn: () => T, events?: RuntimeEventStore): 
     return ok(events ? events.withTransaction(fn) : db.transaction(fn).immediate());
   } catch (error) {
     if (error instanceof MemoryCommitFault) return fail(error.error);
+    if (error instanceof NativeOriginFault) return fail(error.error);
     if (isBusyConstraint(error)) {
       return fail(appError('runtime_busy', 'runtime', '已有 Provider Run 正在执行。'));
     }
@@ -2724,6 +2729,49 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       : appError('storage_read_failed', 'storage', 'Session authorization could not be read.', true)); }
   };
   return {
+    findFork(request) {
+      try {
+        const row = db.query<{ target_session_id: number | null; request_json: string }, [number, string]>(
+          'SELECT target_session_id,request_json FROM session_forks WHERE source_session_id=? AND client_operation_id=?')
+          .get(request.sourceSessionId, request.clientOperationId);
+        if (!row) return ok(null);
+        if (!isDeepStrictEqual(JSON.parse(row.request_json), request))
+          return fail(appError('state_conflict', 'session', 'This fork operation has a different request.', true));
+        return row.target_session_id === null
+          ? fail(appError('session_history_unavailable', 'session', 'The original fork target was deleted.')) : ok(row.target_session_id);
+      } catch { return fail(appError('storage_read_failed', 'storage', 'Fork operation could not be read.', true)); }
+    },
+    createFork({ request, history, frozen, qualify, at }) {
+      const require = <T>(result: Result<T>): T => { if (!result.ok) throw new MemoryCommitFault(result.error); return result.data; };
+      return writeTransaction(() => {
+        // Another writer can have committed this intent after detached preparation.
+        const existing = require(this.findFork(request));
+        if (existing !== null) return existing;
+        if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(request.sourceSessionId))
+          throw new MemoryCommitFault(appError('session_busy', 'session', 'This Session has an active Run.', true));
+        const current = require(this.readHistorySnapshot(request.sourceSessionId, value => ok(value)));
+        require(qualify(current));
+        if (!isDeepStrictEqual(current.bundle, frozen.bundle) || !isDeepStrictEqual(current.associations, frozen.associations))
+          throw new MemoryCommitFault(appError('state_conflict', 'session', 'Fork source facts have changed.', true));
+        if (!current.bundle.history || !isDeepStrictEqual(current.bundle.commit, request.expected))
+          throw new MemoryCommitFault(appError('state_conflict', 'session', 'Fork source position has changed.', true));
+        verifyNativeForkCopy(current.bundle.history, history, request.targetEntryId);
+        const inserted = db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at,metadata_json) VALUES (?,?,?,?,?)')
+          .run(history.header.id, request.title, at, at, asJson({ version: 1, model_use_blocked: null }));
+        const target = Number(inserted.lastInsertRowid);
+        if (!Number.isSafeInteger(target) || target <= 0) throw new Error('unsafe_session_id');
+        commitInTransaction(db, { sessionId: target, expected: null, header: history.header, appendEntries: history.entries,
+          leafId: history.leafId, unusable: false, contexts: [] }, events);
+        db.query(`INSERT INTO session_forks(target_session_id,source_session_id,source_commit_revision,source_entry_count,
+          source_leaf_id,selected_entry_id,inherited_entry_count,client_operation_id,request_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+          .run(target, request.sourceSessionId, request.expected.commitRevision, request.expected.entryCount, request.expected.leafId,
+            request.targetEntryId, history.entries.length, request.clientOperationId, asJson(request), at);
+        // Only a fresh reader after provenance exists may resolve copied NULL associations.
+        require(this.readHistorySnapshot(target, value => value.blocked
+          ? fail(appError('session_scope_revoked', 'session', 'Material access was revoked.')) : ok(value.bundle)));
+        return target;
+      });
+    },
     markHistoryUnusable(sessionId) {
       const result = writeTransaction(() => markUnusableInTransaction(db, sessionId));
       return result.ok ? ok(undefined) : result;

@@ -1,5 +1,5 @@
 import { appError, fail, normalizeSessionInputRequest, ok, SessionMessagesPageSchema, normalizeAgentRunRequest,
-  SetSessionStatusRequestSchema, BranchSessionRequestSchema, WorkspaceContextSchema } from '@flowmate/contracts';
+  SetSessionStatusRequestSchema, BranchSessionRequestSchema, WorkspaceContextSchema, normalizeForkSessionRequest } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import type {
   AgentPort,
@@ -32,9 +32,10 @@ import type {
   BranchSessionResult,
   MemoryStore, NativeHistoryPageRequest, NativeHistoryPage, SessionHistoryEntryRequest, SessionHistoryEntryDetail,
   NativeHistoryWrite, HistoryCommitReceipt,
+  ForkSessionRequest, ForkSessionResult,
 } from '@flowmate/contracts';
 import { createHistoryReader } from '../memory/history.ts';
-import type { SessionRepository, SessionRow, RunRepository } from '../storage/repositories.ts';
+import type { SessionRepository, SessionRow, RunRepository, SessionHistorySnapshot } from '../storage/repositories.ts';
 import type { SessionInputLedger } from './input-ledger.ts';
 
 export class SessionService {
@@ -187,6 +188,72 @@ export class SessionService {
         return ok({ session: this.project(row), leafId: request.targetEntryId, entryCount: history.entries.length });
       return fail(failure);
     } finally { if (!retainBlocked) this.managing.delete(request.sessionId); }
+  }
+
+  public async forkSession(raw: ForkSessionRequest): Promise<Result<ForkSessionResult>> {
+    const parsed = normalizeForkSessionRequest(raw);
+    if (!parsed.ok) return parsed;
+    const request = parsed.data;
+    // A committed intent precedes the NEW-source management gate and stale source CAS.
+    const existing = this.repository.findFork(request);
+    if (!existing.ok) return existing;
+    if (existing.data !== null) return this.restoreFork(existing.data, request);
+    const acquired = this.acquireMutation(request.sourceSessionId);
+    if (!acquired.ok) return acquired;
+    try {
+      const qualify = ({ row, bundle, blocked }: SessionHistorySnapshot): Result<void> => {
+        const state = this.runtimeState();
+        if (state.blocked) return fail(state.error ?? appError('runtime_unusable', 'runtime', 'Runtime is unavailable.', true));
+        if (state.active?.kind === 'agent' && state.active.sessionId === row.sessionId)
+          return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
+        if (row.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
+        if (row.status !== 'active') return fail(appError('session_archived', 'session', 'Session is archived.'));
+        if (blocked) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
+        if (!bundle.history || !bundle.commit || bundle.history.unusable || row.historyState !== 'recoverable')
+          return fail(appError('session_history_invalid', 'session', 'Saved history is unusable.'));
+        if (!sameJson(bundle.commit, request.expected)) return fail(appError('state_conflict', 'session', 'Fork source position has changed.', true));
+        const eligibility = this.verifyMutation?.(row.sessionId); if (eligibility && !eligibility.ok) return eligibility;
+        const availability = this.agent.inspect(row.nativeSessionId).availability;
+        if (availability === 'busy') return fail(appError('session_busy', 'session', 'Native Session is active.', true));
+        if (availability === 'unusable') return fail(appError('agent_session_unusable', 'session', 'Native Session is unusable.'));
+        if (!this.agent.inspectSessionHistory || !this.agent.buildForkSessionHistory)
+          return fail(appError('session_branch_unavailable', 'session', 'Native fork is unavailable.'));
+        const inspected = this.agent.inspectSessionHistory({ history: bundle.history, seed: bundle.seed });
+        if (!inspected.ok) return inspected;
+        return inspected.data.positions.find(position => position.entryId === request.targetEntryId)?.contextState === 'complete'
+          ? ok(undefined) : fail(appError('session_branch_unavailable', 'session', 'Select a complete saved native context.'));
+      };
+      const frozen = this.repository.readHistorySnapshot(request.sourceSessionId, value => ok(value));
+      if (!frozen.ok) return frozen;
+      const qualified = qualify(frozen.data); if (!qualified.ok) return qualified;
+      // Keep the frozen source proof independent of the adapter's detached construction.
+      const built = this.agent.buildForkSessionHistory!({ source: structuredClone(frozen.data.bundle.history!), targetEntryId: request.targetEntryId });
+      if (!built.ok) return built;
+      const created = this.repository.createFork({ request, history: built.data, frozen: frozen.data, qualify, at: this.now() });
+      return created.ok ? await this.restoreFork(created.data, request) : created;
+    } catch { return fail(appError('session_history_unavailable', 'session', 'Fork history could not be assembled.', true)); }
+    finally { this.managing.delete(request.sourceSessionId); }
+  }
+
+  private async restoreFork(target: DbId, request: ForkSessionRequest): Promise<Result<ForkSessionResult>> {
+    const current = this.repository.readHistorySnapshot(target, value => value.blocked
+      ? fail(appError('session_scope_revoked', 'session', 'Material access was revoked.')) : ok(value));
+    if (!current.ok) return current;
+    if (!current.data.bundle.commit) return fail(appError('session_history_unavailable', 'session', 'Fork history is unavailable.'));
+    const row = current.data.row;
+    try {
+      const restored = ensureNativeSession(this.repository, this.agent, row, this.memory);
+      if (!restored.ok) {
+        // A failed cache installation does not invalidate the committed collection.
+        if (restored.error.code !== 'session_busy') try { await this.agent.releaseSession(row.nativeSessionId); } catch { /* Preserve durable target. */ }
+        return restored;
+      }
+      return ok({ session: this.project(row), commit: current.data.bundle.commit,
+        sourceSessionId: request.sourceSessionId, selectedEntryId: request.targetEntryId });
+    } catch {
+      try { await this.agent.releaseSession(row.nativeSessionId); } catch { /* Preserve durable target. */ }
+      return fail(appError('session_history_unavailable', 'session', 'The committed fork could not be installed. Retry the same operation.', true));
+    }
   }
 
   public async create(request: CreateSessionRequest): Promise<Result<SessionSnapshot>> {
