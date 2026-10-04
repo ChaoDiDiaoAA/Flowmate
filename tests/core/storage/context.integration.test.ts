@@ -1,4 +1,5 @@
-import { saveTestHistory } from '../../support/history.ts';
+import { saveTestHistory, nativeAssistantFacts } from '../../support/history.ts';
+import { createHash } from 'node:crypto';
 import { describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { z } from 'zod';
@@ -12,8 +13,8 @@ import { createContextRepository, readRunContextOwner } from '../../../packages/
 import { SessionService } from '../../../packages/core/src/sessions/service.ts';
 import { projectSessionMessages } from '../../../packages/runtime-pi/src/messages.ts';
 import { resolveNativeEntryOrigin } from '../../../packages/core/src/memory/origins.ts';
-import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, invoiceHeaderFields } from '@flowmate/contracts';
-import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result } from '@flowmate/contracts';
+import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok } from '@flowmate/contracts';
+import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result, ToolRuntimeObservation } from '@flowmate/contracts';
 
 const at = '2026-10-03T00:00:00.000Z';
 const later = '2026-10-03T00:00:01.000Z';
@@ -301,6 +302,173 @@ it.each(['valid','missing-request','wrong-snapshot'] as const)('P9 T03 standalon
   expect(result).toMatchObject(scenario==='valid'?{ok:true,data:{originSessionId:f.session.sessionId,nativeEntryId:'native-result',originRunId:f.runId,
     inputId:null,snapshotId:saved.snapshot.id}}:{ok:false,error:{code:'context_binding_unknown'}});
   expect(db.query('SELECT * FROM tool_calls').all()).toEqual(before);
+});
+function p9ReadFixture(appendAnswer=true) {
+  const f=fixture(),{saved}=p9ToolHistory(f),target=frozenFork(f,f.session.sessionId,'read-target'),local=p9TargetInput(f,target),db=f.store.db;
+  const binding:RequestContextBinding={...f.binding(saved.inputId,saved.snapshot.id),sessionId:target.sessionId,nativeSessionId:target.nativeSessionId,
+    runId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id,includedBindings:[...f.binding(saved.inputId,saved.snapshot.id).includedBindings,
+      {nativeEntryId:'target-user',originRunId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id}]};
+  need(f.store.context.bindRequest({binding,api:'openai-responses',transport:'observed-fetch',at}));
+  const request={sessionId:target.sessionId,clientSequence:1,mode:'prompt' as const,goalMode:'answer' as const,text:'target',
+    config:{version:1 as const,name:'fixture',revision:1,modelRef:{provider:'fixture',model:'fixture'},native:{authPath:join(f.productPaths.root,'unused-auth.json'),modelsPath:null},
+      parameters:{maxRetries:0,maxRetryDelayMs:100}}};
+  const normalized=need(normalizeSessionInputRequest(request));
+  db.query('UPDATE runs SET scope_json=? WHERE id=?').run(JSON.stringify({version:2,allowedTools:['read_fixture'],allowedDocumentIds:[],allowedArtifactIds:[],allowedResourcePaths:[]}),local.runId);
+  db.query('UPDATE session_inputs SET request_hash=? WHERE id=?').run(createHash('sha256').update(JSON.stringify({...normalized,timeoutMs:60000,stopGraceMs:5000})).digest('hex'),local.inputId);
+  const toolRequest={sessionId:target.sessionId,runId:local.runId,nativeToolCallId:'local-call',toolName:'read_fixture',toolVersion:'1',effect:'READ' as const,
+    rawArguments:{},context:{snapshotId:local.snapshot.id,requestSequence:1},requestedAt:at};
+  const call=need(f.store.toolCalls.request(toolRequest));
+  const observation:ToolRuntimeObservation={version:1,groupKey:'fixture-read',strategyVersion:'runtime-v1',sampleSource:'test',beforeOutcome:'allowed',failureStage:null,diagnosticCode:null,
+    afterStructure:'valid',afterDomain:'not_applicable',executionDurationMs:12,timingComplete:true,effectiveTimeoutMs:1000,timeoutSource:'configured',runDeadlineTruncated:false,
+    commit:'none_confirmed',commitError:null};
+  need(f.store.toolCalls.fixArguments({toolCallId:call.toolCallId,finalArguments:{}}));
+  need(f.store.toolCalls.start({toolCallId:call.toolCallId,startedAt:at}));
+  need(f.store.toolCalls.finish({toolCallId:call.toolCallId,result:{version:1,status:'succeeded',data:{},committedCandidateId:null},
+    cleanup:{version:1,stopped:true,stopReason:'settled',errors:[]},endedAt:at,stoppedAt:at,runtimeObservation:observation}));
+  const stored=need(f.store.memory.load(target.sessionId))!,history=stored.history;
+  const answer={sessionId:target.sessionId,expected:stored.commit,header:history.header,appendEntries:[{type:'message',id:'local-answer',parentId:history.leafId,timestamp:at,
+    message:{...nativeAssistantFacts,role:'assistant',content:[{type:'text',text:'answer'}],stopReason:'stop',timestamp:5}}],leafId:'local-answer',unusable:false,
+    contexts:[{entryId:'local-answer',runId:local.runId,resultInputIds:[local.inputId]}]};
+  if(appendAnswer) need(f.store.memory.commit(answer));
+  const readers={
+    runGet:()=>f.store.runs.get(local.runId),runList:()=>f.store.runs.listBySession({sessionId:target.sessionId,limit:20}),
+    toolGet:()=>f.store.toolCalls.get({runId:local.runId,sessionId:target.sessionId,nativeToolCallId:'local-call'}),
+    toolById:()=>f.store.toolCalls.getById(call.toolCallId),toolList:()=>f.store.toolCalls.list({runId:local.runId,limit:20}),
+    candidateCommit:()=>f.store.toolCalls.queryCandidateCommit({toolCallId:call.toolCallId,runId:local.runId,sessionId:target.sessionId}),
+    recentStarted:()=>f.store.toolCalls.recentStarted({groupKey:'fixture-read',cutoff:call.toolCallId}),
+    recentObservations:()=>f.store.toolCalls.recentObservations({groupKey:'fixture-read',cutoff:call.toolCallId}),
+    validateOutput:()=>f.store.toolCalls.validateOutput({toolCallId:call.toolCallId,data:{}}),
+    formRequest:()=>f.store.toolCalls.readFormApplicationRequest(call.toolCallId),
+    inputLookup:()=>f.store.sessionInputs.lookup(request),inputQuery:()=>f.store.sessionInputs.query({sessionId:target.sessionId,inputId:local.inputId}),
+    inputList:()=>f.store.sessionInputs.list({sessionId:target.sessionId,limit:20}),inputGet:()=>f.store.sessionInputs.get(local.inputId),
+    inputForRun:()=>f.store.sessionInputs.forRun(local.runId),
+    resultEvidence:()=>f.store.sessionInputs.resultEvidence(local.runId,[local.inputId],'local-answer')};
+  return {...f,target,local,readers,toolRequest,answer};
+}
+it('P9 T03 fix1 L1 commits actual P8 result Input and P6 only after native receipt COMMIT, then no-ops', () => {
+  const f=p9ReadFixture(false),db=f.store.db,published:unknown[]=[];
+  const journal=db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.local.runId);
+  const beforeEvents=db.query('SELECT * FROM runtime_events ORDER BY id').all();
+  f.store.runtimeEventStore.onCommitted(refs=>published.push({refs,inTransaction:db.inTransaction,
+    stored:f.store.memory.load(f.target.sessionId),input:f.store.sessionInputs.get(f.local.inputId)}));
+  const receipt=need(f.store.memory.commit(f.answer));
+  expect(receipt).toEqual({commitRevision:f.answer.expected.commitRevision+1,entryCount:f.answer.expected.entryCount+1,leafId:'local-answer'});
+  expect(published).toHaveLength(1);
+  expect(published[0]).toMatchObject({inTransaction:false,stored:{ok:true,data:{commit:receipt}},input:{ok:true,data:{status:'consumed',processingStatus:'pending',resultEntryId:'local-answer'}}});
+  const events=db.query('SELECT * FROM runtime_events ORDER BY id').all();expect(events).toHaveLength(beforeEvents.length+1);
+  expect(db.query("SELECT dedupe_key,type,payload_json FROM runtime_events WHERE run_id=? ORDER BY id DESC LIMIT 1").get(f.local.runId))
+    .toMatchObject({dedupe_key:`input:${f.local.inputId}:consumed:pending:target-user:local-answer`,type:'input_state_changed',
+      payload_json:JSON.stringify({version:1,inputId:f.local.inputId,origin:'live',status:'consumed',processingStatus:'pending',nativeEntryId:'target-user',resultEntryId:'local-answer',errorCode:null})});
+  expect(need(f.store.memory.commit({...f.answer,expected:receipt}))).toEqual(receipt);
+  expect(db.query('SELECT * FROM runtime_events ORDER BY id').all()).toEqual(events);expect(published).toHaveLength(1);
+  expect(db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.local.runId)).toEqual(journal);
+  expect(f.readers.runGet()).toMatchObject({ok:true});expect(f.readers.resultEvidence()).toMatchObject({ok:true});
+});
+it.each(['event','cas'] as const)('P9 T03 fix1 L1 rolls back native result Input receipt and P6 without publication: %s', fault => {
+  const f=p9ReadFixture(false),db=f.store.db,published:unknown[]=[];
+  f.store.runtimeEventStore.onCommitted(refs=>published.push(refs));
+  const facts=()=>['session_native_history','session_native_entries','session_inputs','runtime_events'].map(table=>db.query(`SELECT * FROM ${table}`).all());
+  const before=facts();
+  db.exec(fault==='event'?"CREATE TRIGGER reject_p6 BEFORE INSERT ON runtime_events BEGIN SELECT RAISE(ABORT,'event unavailable'); END"
+    :'CREATE TRIGGER reject_cas BEFORE UPDATE ON session_native_history BEGIN SELECT RAISE(IGNORE); END');
+  const query=db.query.bind(db),attempted:string[]=[];
+  const spy=spyOn(db,'query').mockImplementation(((sql:string)=>{if(/INSERT INTO runtime_events|UPDATE session_native_history SET/.test(sql)) attempted.push(sql);return query(sql);}) as typeof db.query);
+  try {expect(f.store.memory.commit(f.answer)).toMatchObject({ok:false,error:{code:fault==='event'?'storage_write_failed':'state_conflict'}});}
+  finally {spy.mockRestore();}
+  expect(attempted[0]).toContain('INSERT INTO runtime_events');
+  expect(attempted).toHaveLength(fault==='event'?1:2);
+  if(fault==='cas') expect(attempted[1]).toContain('UPDATE session_native_history SET');
+  expect(facts()).toEqual(before);expect(published).toEqual([]);
+});
+it.each(['inherited-source','target-primary','owner-only'] as const)('P9 T03 fix1 L1 rejects corrupt existing evidence before first native INSERT: %s', fault => {
+  const f=p9ReadFixture(false),db=f.store.db,published:unknown[]=[],inserts:string[]=[];
+  if(fault!=='target-primary') db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.message.content','corrupt') WHERE session_id=? AND entry_id='p8-user'").run(f.target.sessionId);
+  else db.query("UPDATE session_inputs SET content_json=json_set(content_json,'$.text','corrupt') WHERE id=?").run(f.local.inputId);
+  const facts=()=>['session_native_history','session_native_entries','session_inputs','runtime_events'].map(table=>db.query(`SELECT * FROM ${table}`).all());
+  const before=facts(),query=db.query.bind(db);
+  f.store.runtimeEventStore.onCommitted(refs=>published.push(refs));
+  const spy=spyOn(db,'query').mockImplementation(((sql:string)=>{if(/INSERT INTO session_native_entries/.test(sql)) inserts.push(sql);return query(sql);}) as typeof db.query);
+  try {expect(f.store.memory.commit(fault==='owner-only'?{...f.answer,contexts:[{entryId:'local-answer',runId:f.local.runId}]}:f.answer))
+    .toMatchObject({ok:false,error:{code:'context_binding_unknown',category:'runtime',retryable:false}});}
+  finally {spy.mockRestore();}
+  expect(inserts).toEqual([]);expect(facts()).toEqual(before);expect(published).toEqual([]);
+});
+it.each([false,true])('P9 T03 fix1 L1 validates later queued user before actual Input and P6 writes, corrupt=%s', corrupt => {
+  const f=p9ReadFixture(false),db=f.store.db;
+  const context=need(f.store.runtimeEventStore.withTransaction(()=>f.store.context.appendInTransaction({runId:f.local.runId,sessionId:f.target.sessionId,jobId:null,json:json('next'),at})));
+  const input=need(f.store.sessionInputs.admit({sessionId:f.target.sessionId,clientSequence:2,mode:'followUp',runId:f.local.runId,text:'next'},
+    ()=>ok({runId:f.local.runId,contextPolicyVersion:'p8-context-v1',contextSnapshotId:context.id,content:{version:2,text:'next',promptText:'next',workspaceContext:null,workspaceInput:null,allowedDocumentIds:[],allowedArtifactIds:[]}}),at)).input;
+  const published:unknown[]=[];f.store.runtimeEventStore.onCommitted(refs=>published.push({refs,inTransaction:db.inTransaction}));
+  if(corrupt) db.query("UPDATE session_inputs SET content_json=json_set(content_json,'$.text','wrong') WHERE id=?").run(input.inputId);
+  const facts=()=>['session_native_history','session_native_entries','session_inputs','runtime_events'].map(table=>db.query(`SELECT * FROM ${table}`).all()),before=facts();
+  const query=db.query.bind(db),inserts:string[]=[];
+  const spy=spyOn(db,'query').mockImplementation(((sql:string)=>{if(/INSERT INTO session_native_entries/.test(sql)) inserts.push(sql);return query(sql);}) as typeof db.query);
+  let result;
+  try { result=f.store.memory.commit({...f.answer,appendEntries:[...f.answer.appendEntries,{type:'message',id:'next-user',parentId:'local-answer',timestamp:at,message:{role:'user',content:'next',timestamp:6}}],
+    leafId:'next-user',contexts:[...f.answer.contexts,{entryId:'next-user',runId:f.local.runId,inputId:input.inputId}]}); }
+  finally {spy.mockRestore();}
+  if(corrupt) {expect(result).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});expect(inserts).toEqual([]);expect(facts()).toEqual(before);expect(published).toEqual([]);return;}
+  const receipt=need(result);
+  expect(receipt.commitRevision).toBe(f.answer.expected.commitRevision+1);
+  expect(f.store.sessionInputs.get(input.inputId)).toMatchObject({ok:true,data:{status:'consumed',nativeEntryId:'next-user',contextSnapshotId:context.id}});
+  expect(published).toHaveLength(1);expect(published[0]).toMatchObject({inTransaction:false});
+});
+const p9ReaderNames=['runGet','runList','toolGet','toolById','toolList','candidateCommit','recentStarted','recentObservations','validateOutput','formRequest',
+  'inputLookup','inputQuery','inputList','inputGet','inputForRun','resultEvidence'] as const;
+it.each([...p9ReaderNames])('P9 T03 fix1 public read snapshot and caller transaction reuse: %s', name => {
+  const f=p9ReadFixture(),db=f.store.db,query=db.query.bind(db),transaction=db.transaction.bind(db);
+  const states:boolean[]=[],transactions:boolean[]=[];
+  const querySpy=spyOn(db,'query').mockImplementation(((...args:Parameters<typeof db.query>)=>{states.push(db.inTransaction);return query(...args);}) as typeof db.query);
+  const txSpy=spyOn(db,'transaction').mockImplementation(((...args:Parameters<typeof db.transaction>)=>{transactions.push(db.inTransaction);return transaction(...args);}) as typeof db.transaction);
+  try {
+    const read=f.readers[name];
+      states.length=0;transactions.length=0;
+      const expected=name==='formRequest'?{ok:false,error:{code:'state_conflict'}}:{ok:true};
+      expect(read(),name).toMatchObject(expected);
+      expect(states.length,name).toBeGreaterThan(1);
+      expect(states.every(Boolean),name).toBe(true);
+      expect(transactions,name).toEqual([false]);
+      for(const mode of ['deferred','immediate'] as const) transaction(()=>{
+        states.length=0;transactions.length=0;
+        expect(read(),`${name}:${mode}`).toMatchObject(expected);
+        expect(states.every(Boolean),name).toBe(true);
+        expect(transactions,name).toEqual([]);
+      })[mode]();
+  } finally {querySpy.mockRestore();txSpy.mockRestore();}
+});
+it.each(p9ReaderNames.flatMap(name=>(['provenance','sql','json'] as const).map(fault=>({name,fault}))))('P9 T03 fix1 public evidence typed failures: $name $fault', ({name,fault}) => {
+  const f=p9ReadFixture(),db=f.store.db;
+  if(fault==='provenance') db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.message.content','changed') WHERE session_id=? AND entry_id='p8-user'").run(f.target.sessionId);
+  if(fault==='sql') db.exec('DROP TABLE session_forks');
+  if(fault==='json') db.query("UPDATE runs SET config_json='[]' WHERE id=?").run(f.local.runId);
+  const expected=fault==='provenance'?{code:'context_binding_unknown',category:'runtime',retryable:false}
+    :fault==='sql'?{code:'storage_read_failed',category:'storage',retryable:true}:{code:'storage_corrupt',category:'storage',retryable:false};
+  const read=f.readers[name];
+    if(name==='resultEvidence') expect(read(),name).toMatchObject({ok:false,error:{code:'input_processing_unconfirmed'}});
+    else expect(read(),name).toMatchObject({ok:false,error:expected});
+});
+it('P9 T03 fix1 tool request keeps actual original-context SQL failures distinct and writes nothing', () => {
+  const f=p9ReadFixture(),db=f.store.db;
+  const before=['tool_calls','runtime_events','runs'].map(table=>db.query(`SELECT * FROM ${table}`).all());
+  db.exec('DROP TABLE session_forks');
+  expect(f.store.toolCalls.request({...f.toolRequest,nativeToolCallId:'new-call'})).toMatchObject({ok:false,error:{code:'storage_write_failed',category:'storage',retryable:true}});
+  expect(['tool_calls','runtime_events','runs'].map(table=>db.query(`SELECT * FROM ${table}`).all())).toEqual(before);
+});
+it('P9 T03 fix1 WAL reader keeps initial product and original source facts in one committed snapshot', () => {
+  const f=p9ReadFixture(),db=f.store.db;
+  db.exec('PRAGMA locking_mode=NORMAL; PRAGMA journal_mode=WAL;');
+  const writer=new Database(f.productPaths.databaseFile);
+  deferCleanup(()=>writer.close());
+  expect(db.query('PRAGMA journal_mode').get()).toEqual({journal_mode:'wal'});
+  const query=db.query.bind(db);let sawProduct=false,changed=false,writerError:unknown=null;
+  const spy=spyOn(db,'query').mockImplementation(((sql:string)=>{
+    if(sawProduct&&!changed) {changed=true;try {writer.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.message.content','concurrent') WHERE session_id=? AND entry_id='p8-user'").run(f.target.sessionId);} catch(error) {writerError=error;throw error;}}
+    if(sql==='SELECT * FROM runs WHERE id=?') sawProduct=true;
+    return query(sql);
+  }) as typeof db.query);
+  try {const result=f.readers.runGet();expect(writerError).toBeNull();expect(result).toMatchObject({ok:true});expect(changed).toBe(true);}
+  finally {spy.mockRestore();writer.close();}
+  expect(f.readers.runGet()).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
 });
 it('P9 T03 rechecks ancestor material authorization and atomically propagates revocation', () => {
   const f=fixture();business(f);

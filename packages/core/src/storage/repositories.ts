@@ -1,4 +1,5 @@
 import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.ts';
+import { evidenceReadFailure, readTransaction } from './reads.ts';
 import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction, markUnusableInTransaction } from '../memory/persistence.ts';
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { join, isAbsolute } from 'node:path';
@@ -1611,11 +1612,11 @@ function appendToolState(db: Database, events: RuntimeEventStore | undefined, to
 
 export function createToolCallRepository(db: Database, events?: RuntimeEventStore): ToolCallRepository {
   const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
-  const byId = (toolCallId: DbId) => {
+  const byId = (toolCallId: DbId) => readTransaction(db, () => {
     const row = db.query('SELECT * FROM tool_calls WHERE id=?').get(toolCallId);
     if (!row) return fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
     return ok(toolCallSnapshot(db, row));
-  };
+  });
   const trustedContext = (context: ProductToolContext): Result<string> => {
     const permission = createSessionRepository(db).isModelUseBlocked(context.sessionId);
     if (!permission.ok) return permission;
@@ -1673,7 +1674,10 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         if (!run || run.session_id !== input.sessionId) return fail(appError('tool_access_denied', 'runtime', 'ToolCall 与可信 Agent Run 不匹配.'));
         try { readToolContext(db, { run_id: input.runId, session_id: input.sessionId,
           context_snapshot_id: input.context?.snapshotId ?? null, request_sequence: input.context?.requestSequence ?? null }); }
-        catch { return fail(appError('context_binding_unknown', 'runtime', 'ToolCall generating request could not be verified.')); }
+        catch (error) {
+          if (error instanceof SQLiteError || error instanceof NativeOriginFault) throw error;
+          return fail(appError('context_binding_unknown', 'runtime', 'ToolCall generating request could not be verified.'));
+        }
         if (!['created', 'running'].includes(run.status)) return fail(appError('run_state_invalid', 'runtime', 'Run 已停止接纳新的 ToolCall。'));
         const id = writeTransaction(() => {
           const inserted = db.query(`INSERT INTO tool_calls(run_id,session_id,native_tool_call_id,tool_name,tool_version,effect,args_json,
@@ -1702,21 +1706,24 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
 
     get(identity) {
       try {
+        return readTransaction(db, () => {
         const row = db.query('SELECT * FROM tool_calls WHERE run_id=? AND session_id=? AND native_tool_call_id=?')
           .get(identity.runId, identity.sessionId, identity.nativeToolCallId);
         return row ? ok(toolCallSnapshot(db, row)) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
-      } catch {
-        return fail(appError('storage_corrupt', 'storage', 'ToolCall 事实无法读取。'));
+        });
+      } catch (error) {
+        return evidenceReadFailure(error, 'ToolCall 事实无法读取。');
       }
     },
 
     getById(toolCallId) {
       try { return byId(toolCallId); }
-      catch { return fail(appError('storage_corrupt', 'storage', 'ToolCall 事实无法读取。', false, toolCallId)); }
+      catch (error) { return evidenceReadFailure(error, 'ToolCall 事实无法读取。'); }
     },
 
     queryCandidateCommit(input) {
       try {
+        return readTransaction(db, () => {
         const call = byId(input.toolCallId);
         if (!call.ok) return call;
         if (call.data.runId !== input.runId || call.data.sessionId !== input.sessionId) {
@@ -1730,7 +1737,8 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         const { snapshot } = candidateSnapshot(db, queryCandidateRow(db, row.id));
         return ok({ candidateId: snapshot.candidateId, jobId: snapshot.jobId, sequence: snapshot.sequence,
           issueCount: snapshot.issueCount, checks: snapshot.checks });
-      } catch { return fail(appError('storage_corrupt', 'storage', 'Candidate commit could not be verified.')); }
+        });
+      } catch (error) { return evidenceReadFailure(error, 'Candidate commit could not be verified.'); }
     },
 
     observationCutoff() {
@@ -1740,6 +1748,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
 
     recentStarted(input) {
       try {
+        return readTransaction(db, () => {
         const rows = db.query(`SELECT tool.* FROM tool_calls tool JOIN runs run ON run.id=tool.run_id
           WHERE tool.started_at IS NOT NULL AND tool.id<=? AND (
             tool.runtime_observation_json IS NOT NULL AND json_extract(tool.runtime_observation_json,'$.groupKey')=?
@@ -1749,15 +1758,18 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
               AND json_extract(strategy.value,'$.toolVersion')=tool.tool_version))
           ORDER BY tool.id DESC LIMIT ?`).all(input.cutoff, input.groupKey, input.groupKey, TOOL_CONFIG.statistics.maxAttempts);
         return ok(rows.map(row => toolCallSnapshot(db, row)));
-      } catch { return fail(appError('storage_corrupt', 'storage', 'Runtime observations could not be read.')); }
+        });
+      } catch (error) { return evidenceReadFailure(error, 'Runtime observations could not be read.'); }
     },
 
     recentObservations(input) {
       try {
+        return readTransaction(db, () => {
         return ok(db.query(`SELECT * FROM tool_calls WHERE runtime_observation_json IS NOT NULL
           AND json_extract(runtime_observation_json,'$.groupKey')=? AND id<=? ORDER BY id DESC LIMIT ?`)
           .all(input.groupKey, input.cutoff, TOOL_CONFIG.statistics.maxAttempts).map(row => toolCallSnapshot(db, row)));
-      } catch { return fail(appError('storage_corrupt', 'storage', 'Runtime experience could not be read.')); }
+        });
+      } catch (error) { return evidenceReadFailure(error, 'Runtime experience could not be read.'); }
     },
 
     verifyUse(context) {
@@ -1781,6 +1793,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
 
     validateOutput(input) {
       try {
+        return readTransaction(db, () => {
         const call = byId(input.toolCallId);
         if (!call.ok) return call;
         const run = db.query(`SELECT run.job_id,run.scope_json,job.document_id AS job_document_id FROM runs run
@@ -1827,11 +1840,13 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         };
         return visit(input.data) ? ok(checked ? 'valid' : 'not_applicable')
           : fail(appError('tool_invalid_output', 'tool', 'Invoice output references do not match the original Run.'));
-      } catch { return fail(appError('storage_corrupt', 'storage', 'Invoice output ownership could not be verified.')); }
+        });
+      } catch (error) { return evidenceReadFailure(error, 'Invoice output ownership could not be verified.'); }
     },
 
     list(input) {
       try {
+        return readTransaction(db, () => {
         if (!Number.isSafeInteger(input.runId) || input.runId < 1 || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100
           || input.beforeId !== undefined && (!Number.isSafeInteger(input.beforeId) || input.beforeId < 1)) return fail(appError('input_invalid', 'input', 'ToolCall 分页参数无效。'));
         const rows = input.beforeId === undefined
@@ -1841,8 +1856,9 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         const hasMore = calls.length > input.limit;
         const items = hasMore ? calls.slice(0, input.limit) : calls;
         return ok({ items, nextBeforeId: hasMore ? items.at(-1)?.toolCallId ?? null : null });
-      } catch {
-        return fail(appError('storage_corrupt', 'storage', 'ToolCall 列表无法读取。'));
+        });
+      } catch (error) {
+        return evidenceReadFailure(error, 'ToolCall 列表无法读取。');
       }
     },
 
@@ -2016,11 +2032,16 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
     readFormApplicationRequest(toolCallId) {
       if (!Number.isSafeInteger(toolCallId) || toolCallId < 1) return fail(appError('input_invalid', 'input', 'ToolCall 身份无效。'));
       try {
+        return readTransaction(db, () => {
         const before = byId(toolCallId);
         if (!before.ok) return before;
         try { return ok(deriveFormApplicationRequest(db, before.data)); }
-        catch { return fail(appError('state_conflict', 'runtime', '原调用没有可核验的填表依据。')); }
-      } catch { return fail(appError('storage_corrupt', 'storage', '原填表调用无法读取。')); }
+        catch (error) {
+          if (error instanceof SQLiteError || error instanceof NativeOriginFault) throw error;
+          return fail(appError('state_conflict', 'runtime', '原调用没有可核验的填表依据。'));
+        }
+        });
+      } catch (error) { return evidenceReadFailure(error, '原填表调用无法读取。'); }
     },
 
     getNativeWorkingDirectory(context) {
@@ -3313,17 +3334,19 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
 
     get(runId) {
       try {
+        return readTransaction(db, () => {
         const row = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (!row) return fail(appError('run_not_found', 'input', 'Run 不存在。', false, runId));
         return ok(snapshotFromRow(db, row));
+        });
       } catch (error) {
-        if (error instanceof NativeOriginFault) return fail(error.error);
-        return fail(appError('storage_corrupt', 'storage', 'Run 事实无法读取。', false, runId));
+        return evidenceReadFailure(error, 'Run 事实无法读取。', runId);
       }
     },
 
     listBySession(request) {
       try {
+        return readTransaction(db, () => {
         const session = db.query('SELECT id FROM sessions WHERE id=?').get(request.sessionId);
         if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         const rows = request.beforeRunId === undefined
@@ -3335,9 +3358,9 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const hasMore = mapped.length > request.limit;
         const items = hasMore ? mapped.slice(0, request.limit) : mapped;
         return ok({ items, nextBeforeRunId: hasMore ? items.at(-1)?.runId ?? null : null });
+        });
       } catch (error) {
-        if (error instanceof NativeOriginFault) return fail(error.error);
-        return fail(appError('storage_corrupt', 'storage', 'Session Run 列表无法读取。'));
+        return evidenceReadFailure(error, 'Session Run 列表无法读取。');
       }
     },
 

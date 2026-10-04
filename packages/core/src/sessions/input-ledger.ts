@@ -1,12 +1,14 @@
 import { markUnusableInTransaction } from '../memory/persistence.ts';
+import { evidenceReadFailure, readTransaction } from '../storage/reads.ts';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { Database } from 'bun:sqlite';
 import type { RuntimeEventStore } from '../events/store.ts';
-import { readInputContext, readContextSnapshotOwner } from '../context/repository.ts';
+import { readInputContext, readContextSnapshotOwner, readRunContextOwner } from '../context/repository.ts';
 import { appError, fail, normalizeSessionInputRequest, ok, SessionInputContentV2Schema,
-  SessionInputQuerySchema, SessionInputSnapshotSchema, SessionInputsRequestSchema, LegacySessionInputRequestSchema } from '@flowmate/contracts';
+  SessionInputQuerySchema, SessionInputSnapshotSchema, SessionInputsRequestSchema, LegacySessionInputRequestSchema, InputEventPayloadSchema, AppErrorSchema } from '@flowmate/contracts';
 import type { AppError, DbId, NormalizedSessionInputRequest, Result, SessionInputQuery, SessionInputQueryResult,
-  SessionInputRequest, SessionInputSnapshot, SessionInputsRequest, SessionInputsPage, SessionInputContentV2 } from '@flowmate/contracts';
+  SessionInputRequest, SessionInputSnapshot, SessionInputsRequest, SessionInputsPage, SessionInputContentV2, HistoryCommitInput } from '@flowmate/contracts';
 
 type InputRow = { id: number; session_id: number; client_sequence: number; mode: string; goal_mode: string;
   request_hash: string; run_id: number | null; context_snapshot_id?: number | null; content_json: string; status: string; processing_status: string;
@@ -28,18 +30,47 @@ function snapshot(db: Database, row: InputRow): SessionInputSnapshot {
     createdAt: row.created_at, updatedAt: row.updated_at });
 }
 const writeFailure = () => fail(appError('storage_write_failed', 'storage', 'Session input could not be saved.', true));
-const readFailure = () => fail(appError('storage_read_failed', 'storage', 'Session input could not be read.', true));
+const readFailure = (error: unknown) => evidenceReadFailure(error, 'Session input could not be read.');
+/** Called before the first native INSERT, while the saved history and receipt are coherent. */
+export function verifyNativeCommitContexts(db: Database, sessionId: DbId, contexts: HistoryCommitInput['contexts']): void {
+  const owners = new Map<number, Parameters<typeof readRunContextOwner>[1]>();
+  for (const context of contexts) {
+    let owner = owners.get(context.runId);
+    if (!owner) {
+      const row = db.query('SELECT * FROM runs WHERE id=?').get(context.runId) as Parameters<typeof readRunContextOwner>[1] | null;
+      if (!row || row.kind !== 'agent' || row.session_id !== sessionId) throw new Error('input_commit_owner_invalid');
+      readRunContextOwner(db, row);
+      owner = row; owners.set(context.runId, owner);
+    }
+    const inputIds = [...(context.inputId === undefined ? [] : [context.inputId]), ...(context.resultInputIds ?? [])];
+    for (const inputId of inputIds) {
+      const row = db.query('SELECT * FROM session_inputs WHERE id=?').get(inputId) as InputRow | null;
+      if (!row || row.run_id !== context.runId || row.session_id !== sessionId) throw new Error('input_commit_membership_invalid');
+      const input = snapshot(db, row);
+      if (input.contextSnapshotId !== null) {
+        const saved = readContextSnapshotOwner(db, input.contextSnapshotId, owner);
+        if (input.content.version !== 2 || input.content.text !== saved.json.text || input.goalMode !== saved.json.goalMode
+          || !isDeepStrictEqual(input.content.workspaceContext, saved.json.workspaceContext)
+          || !isDeepStrictEqual(input.content.allowedDocumentIds, saved.json.allowedDocumentIds)
+          || !isDeepStrictEqual(input.content.allowedArtifactIds, saved.json.allowedArtifactIds)) throw new Error('input_commit_snapshot_invalid');
+      }
+    }
+  }
+}
 function appendInputState(db: Database, inputId: DbId, events: RuntimeEventStore | undefined,
   origin: 'live' | 'recovery' = 'live'): void {
   if (!events) return;
   const row = db.query('SELECT * FROM session_inputs WHERE id=?').get(inputId) as InputRow | null;
   if (!row || row.run_id === null) throw new Error('event_input_missing');
-  const input = snapshot(db, row);
+  // During native association the appended rows precede the final receipt CAS. Only
+  // project actual event facts here; full source validation ran before native insertion.
+  const payload = InputEventPayloadSchema.parse({ version: 1, inputId, origin, status: row.status,
+    processingStatus: row.processing_status, nativeEntryId: row.native_entry_id, resultEntryId: row.result_entry_id,
+    errorCode: row.error_json === null ? null : AppErrorSchema.parse(JSON.parse(row.error_json)).code });
   events.appendInTransaction({ runId: row.run_id, sessionId: row.session_id, toolCallId: null,
-    type: 'input_state_changed', occurredAt: input.updatedAt,
-    dedupeKey: `input:${inputId}:${input.status}:${input.processingStatus}:${input.nativeEntryId ?? 'none'}:${input.resultEntryId ?? 'none'}`,
-    payload: { version: 1, inputId, origin, status: input.status, processingStatus: input.processingStatus,
-      nativeEntryId: input.nativeEntryId, resultEntryId: input.resultEntryId, errorCode: input.error?.code ?? null } });
+    type: 'input_state_changed', occurredAt: row.updated_at,
+    dedupeKey: `input:${inputId}:${payload.status}:${payload.processingStatus}:${payload.nativeEntryId ?? 'none'}:${payload.resultEntryId ?? 'none'}`,
+    payload });
 }
 /** Schema 009 hash bytes remain an existing idempotency fact. */
 function requestHash(request: NormalizedSessionInputRequest, legacy: boolean, identityVersion?: 1): string {
@@ -58,6 +89,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
     if (desktopRequestHash !== undefined && (normalized.data.mode !== 'prompt' || !/^[a-f0-9]{64}$/.test(desktopRequestHash)))
       return fail(appError('input_invalid', 'input', 'Desktop request identity is invalid.'));
     try {
+      return readTransaction(db, () => {
       const request = normalized.data;
       const row = db.query('SELECT * FROM session_inputs WHERE session_id=? AND client_sequence=?')
         .get(request.sessionId, request.clientSequence) as InputRow | null;
@@ -73,7 +105,8 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
       if (row.request_hash !== requestHash(request, content.version === 1, content.requestIdentityVersion))
         return fail(appError('state_conflict', 'input', 'This client sequence belongs to another input.'));
       return ok(snapshot(db, row));
-    } catch { return readFailure(); }
+      });
+    } catch (error) { return readFailure(error); }
   }
   return {
     lookup,
@@ -94,6 +127,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
       const parsed = SessionInputQuerySchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Session input query is invalid.'));
       try {
+        return readTransaction(db, () => {
         const { sessionId, clientSequence, inputId } = parsed.data;
         if (!db.query('SELECT id FROM sessions WHERE id=?').get(sessionId)) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
         const max = (db.query('SELECT COALESCE(MAX(client_sequence),0) AS sequence FROM session_inputs WHERE session_id=?')
@@ -101,12 +135,14 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
         const row = inputId !== undefined ? db.query('SELECT * FROM session_inputs WHERE session_id=? AND id=?').get(sessionId, inputId)
           : clientSequence !== undefined ? db.query('SELECT * FROM session_inputs WHERE session_id=? AND client_sequence=?').get(sessionId, clientSequence) : null;
         return ok({ input: row ? snapshot(db, row as InputRow) : null, nextClientSequence: max < Number.MAX_SAFE_INTEGER ? max + 1 : null });
-      } catch { return readFailure(); }
+        });
+      } catch (error) { return readFailure(error); }
     },
     list(raw: SessionInputsRequest): Result<SessionInputsPage> {
       const parsed = SessionInputsRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Session input page is invalid.'));
       try {
+        return readTransaction(db, () => {
         const request = parsed.data;
         if (!db.query('SELECT id FROM sessions WHERE id=?').get(request.sessionId)) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
         if (request.runId !== undefined) {
@@ -120,14 +156,16 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
           request.runId ?? null, request.beforeInputId ?? null, request.beforeInputId ?? null, request.limit + 1) as InputRow[];
         const items = rows.slice(0, request.limit).map(row => snapshot(db, row));
         return ok({ items, nextBeforeInputId: rows.length > request.limit ? items.at(-1)!.inputId : null });
-      } catch { return readFailure(); }
+        });
+      } catch (error) { return readFailure(error); }
     },
     get(inputId: DbId): Result<SessionInputSnapshot | null> {
-      try { const row = byId(inputId); return ok(row ? snapshot(db, row) : null); } catch { return readFailure(); }
+      try { return readTransaction(db, () => { const row = byId(inputId); return ok(row ? snapshot(db, row) : null); }); }
+      catch (error) { return readFailure(error); }
     },
     forRun(runId: DbId): Result<SessionInputSnapshot[]> {
-      try { return ok((db.query('SELECT * FROM session_inputs WHERE run_id=? ORDER BY id').all(runId) as InputRow[]).map(row => snapshot(db, row))); }
-      catch { return readFailure(); }
+      try { return readTransaction(db, () => ok((db.query('SELECT * FROM session_inputs WHERE run_id=? ORDER BY id').all(runId) as InputRow[]).map(row => snapshot(db, row)))); }
+      catch (error) { return readFailure(error); }
     },
     admit(raw: SessionInputRequest, admitInput: () => Result<SessionInputAdmission>, at: string, desktopRequestHash?: string): Result<{ input: SessionInputSnapshot; created: boolean }> {
       const normalized = normalizeSessionInputRequest(raw);
@@ -192,11 +230,13 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
     },
     resultEvidence(runId: DbId, inputIds: readonly DbId[], resultEntryId: string): Result<{ inputs: SessionInputSnapshot[]; toolCallIds: string[] }> {
       try {
+        return readTransaction(db, () => {
         const rows = verifiedResultMembers(db, runId, inputIds, resultEntryId);
         const path = resultPath(db, rows[0]!.session_id, runId, resultEntryId);
         const firstUser = Math.max(...rows.map(row => path.findIndex(entry => entry.id === row.native_entry_id)));
         return ok({ inputs: rows.map(row => snapshot(db, row)), toolCallIds: path.slice(0, firstUser).flatMap(entry => entry.message?.role === 'toolResult'
           && typeof entry.message.toolCallId === 'string' ? [entry.message.toolCallId] : []) });
+        });
       } catch { return fail(appError('input_processing_unconfirmed', 'runtime', 'Saved input result cannot be confirmed.', true, runId)); }
     },
     completeResult(runId: DbId, inputIds: readonly DbId[], resultEntryId: string, at: string): Result<void> {
@@ -206,7 +246,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
     failResult(runId: DbId, inputIds: readonly DbId[], resultEntryId: string, error: AppError, at: string): Result<void> {
       try {
         writeTransaction(() => {
-          verifiedResultMembers(db, runId, inputIds, resultEntryId);
+          for (const row of verifiedResultMembers(db, runId, inputIds, resultEntryId)) snapshot(db, row);
           for (const id of inputIds) {
             const changed = db.query("UPDATE session_inputs SET processing_status='failed',error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")
               .run(JSON.stringify(error), at, id).changes;
@@ -300,7 +340,7 @@ export function associateInputResult(db: Database, runId: DbId, inputIds: readon
 /** Caller verifies authorization, tools and goal for this response batch before this transaction. */
 export function completeSessionInputs(db: Database, runId: DbId, inputIds: readonly DbId[], resultEntryId: string, at: string,
   events?: RuntimeEventStore, origin: 'live' | 'recovery' = 'live'): void {
-  verifiedResultMembers(db, runId, inputIds, resultEntryId);
+  for (const row of verifiedResultMembers(db, runId, inputIds, resultEntryId)) snapshot(db, row);
   for (const id of inputIds) {
     const changed = db.query("UPDATE session_inputs SET processing_status='completed',error_json=NULL,updated_at=? WHERE id=? AND processing_status='pending'").run(at, id).changes;
     if (changed === 1) appendInputState(db, id, events, origin);
@@ -312,6 +352,7 @@ export function finishSessionInputs(db: Database, runId: DbId, status: 'complete
   const rows = db.query("SELECT * FROM session_inputs WHERE run_id=? AND processing_status='pending'").all(runId) as InputRow[];
   if (status === 'completed' && rows.some(row => row.status === 'consumed'
     || row.dispatched_at !== null && !confirmedUnconsumedInputIds.includes(row.id))) throw new Error('input_processing_unconfirmed');
+  for (const row of rows) snapshot(db, row);
   for (const row of rows) {
     if (status === 'completed') {
       const changed = db.query("UPDATE session_inputs SET status='cancelled',processing_status='cancelled',error_json=?,updated_at=? WHERE id=? AND processing_status='pending'")

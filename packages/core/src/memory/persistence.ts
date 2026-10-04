@@ -1,8 +1,9 @@
-import type { Database } from 'bun:sqlite';
+import { SQLiteError, type Database } from 'bun:sqlite';
 import { appError, fail, ok, HistoryCommitInputSchema, HistoryCommitStateSchema, NativeSessionHistorySchema } from '@flowmate/contracts';
 import type { AppError, DbId, HistoryCommitInput, HistoryCommitReceipt, MemoryStore, StoredNativeHistory } from '@flowmate/contracts';
 import type { RuntimeEventStore } from '../events/store.ts';
-import { associateInputResult, markInputConsumed } from '../sessions/input-ledger.ts';
+import { associateInputResult, markInputConsumed, verifyNativeCommitContexts } from '../sessions/input-ledger.ts';
+import { NativeOriginFault } from './origins.ts';
 
 /** Thrown through transaction boundaries; convert only after SQLite and pending events roll back. */
 export class MemoryCommitFault extends Error {
@@ -108,6 +109,12 @@ export function commitInTransaction(db: Database, input: HistoryCommitInput, eve
   const changed = previous === null || added.length > 0 || input.leafId !== previous.history.leafId || unusable !== previous.history.unusable;
   if (changed && previous?.commit.commitRevision === Number.MAX_SAFE_INTEGER) exhausted();
   const revision = previous ? previous.commit.commitRevision + (changed ? 1 : 0) : 1;
+  try { verifyNativeCommitContexts(db, input.sessionId, input.contexts); }
+  catch (error) {
+    if (error instanceof SQLiteError) throw error;
+    throw new MemoryCommitFault(error instanceof NativeOriginFault ? error.error
+      : appError('context_binding_unknown', 'runtime', 'Native commit source evidence could not be verified.'));
+  }
   if (!previous) db.query('INSERT INTO session_native_history(session_id,storage_version,header_json,leaf_id,entry_count,unusable,commit_revision) VALUES(?,1,?,NULL,0,0,0)')
     .run(input.sessionId, JSON.stringify(input.header));
   for (const [index, entry] of added.entries()) db.query('INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json,run_id) VALUES(?,?,?,?,?)')
