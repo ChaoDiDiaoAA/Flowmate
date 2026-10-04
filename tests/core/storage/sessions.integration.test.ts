@@ -1,3 +1,4 @@
+import { saveTestHistory } from '../../support/history.ts';
 import { readFileSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
@@ -111,7 +112,7 @@ function nativeFixture(paths: ProductPaths, historical = false) {
   const terminal = { status: 'failed' as const, output: null, error: { code: 'agent_failed', category: 'runtime' as const, message: 'fixture', retryable: false },
     usage, tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
     cleanup, endedAt: '2026-09-30T00:01:00.000Z', stoppedAt: null, durationMs: 1000 };
-  return { ...opened.data, runs, sessions, close, sessionId: session.data.sessionId, runId: run.data, history, entry, terminal };
+  return { ...opened.data, historyEvents: historical ? undefined : opened.data.runtimeEventStore, runs, sessions, close, sessionId: session.data.sessionId, runId: run.data, history, entry, terminal };
 }
 
 function createLegacyV1(paths: ProductPaths, includeActive = false) {
@@ -195,7 +196,7 @@ describe('P5 migration compatibility', () => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true); if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 15 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 16 });
     expect(opened.data.db.query('SELECT * FROM session_inputs').get()).toEqual({ ...before as object, result_entry_id: null, context_snapshot_id: null });
     const rows = opened.data.db.query('SELECT id,metadata_json,hidden_at,updated_at FROM sessions ORDER BY id').all() as Array<{ id: number; metadata_json: string; hidden_at: string | null; updated_at: string }>;
     expect(JSON.parse(rows[0]!.metadata_json)).toEqual({ version: 1, model_use_blocked: null, tool_profile: 'invoice', delete_pending: true });
@@ -250,12 +251,12 @@ describe('P2 Session and Agent Run storage', () => {
     expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history: store.history, bindings: [], sessionInputs: [] } });
     expect(store.sessions.readHistoryForDisplay(999_999)).toEqual({ ok: true, data: { history: null, bindings: [], sessionInputs: [] } });
     const context = { entryId: store.entry.id, runId: store.runId };
-    expect(store.sessions.saveHistory(store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
     expect(store.sessions.readHistoryForDisplay(store.sessionId)).toEqual({ ok: true, data: { history,
       bindings: [{ entryId: 'p4-e1', runId: store.runId }], sessionInputs: [] } });
     expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: history });
     store.db.exec("CREATE TRIGGER reject_duplicate_append BEFORE INSERT ON session_native_entries BEGIN SELECT RAISE(ABORT,'duplicate append'); END;");
-    expect(store.sessions.saveHistory(store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history, context)).toEqual({ ok: true, data: undefined });
     expect(store.db.query('SELECT COUNT(*) AS count FROM session_native_entries').get()).toEqual({ count: 1 });
     expect(() => store.db.query('UPDATE session_native_entries SET run_id=999999').run()).toThrow();
     store.db.exec('DROP TRIGGER reject_duplicate_append;');
@@ -280,24 +281,24 @@ describe('P2 Session and Agent Run storage', () => {
     const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
     for (const context of [{ entryId: store.entry.id, runId: 100 }, { entryId: store.entry.id, runId: 101 },
       { entryId: 'missing', runId: store.runId }, { entryId: store.entry.id, runId: 999_999 }]) {
-      expect(store.sessions.saveHistory(store.sessionId, history, context)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history, context)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
       expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: store.history });
     }
     const setting = { ...store.entry, type: 'model_change', provider: 'fixture', modelId: 'fixture' };
-    expect(store.sessions.saveHistory(store.sessionId, { ...history, entries: [setting] }, { entryId: setting.id, runId: store.runId }).ok).toBe(false);
-    expect(store.sessions.saveHistory(store.sessionId, history)).toEqual({ ok: true, data: undefined });
-    expect(store.sessions.saveHistory(store.sessionId, history, { entryId: store.entry.id, runId: store.runId }).ok).toBe(false);
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, { ...history, entries: [setting] }, { entryId: setting.id, runId: store.runId }).ok).toBe(false);
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history)).toEqual({ ok: true, data: undefined });
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history, { entryId: store.entry.id, runId: store.runId }).ok).toBe(false);
     expect(store.db.query('SELECT run_id FROM session_native_entries').get()).toEqual({ run_id: null });
   }));
 
   it('rolls back failed message binding with the header count leaf and committed JSON prefix unchanged', () => withDatabase((paths) => {
     const store = nativeFixture(paths);
     const prefix = { ...store.history, entries: [store.entry], leafId: store.entry.id };
-    expect(store.sessions.saveHistory(store.sessionId, prefix).ok).toBe(true);
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, prefix).ok).toBe(true);
     const before = store.db.query('SELECT * FROM session_native_history').get();
     const second = { ...store.entry, id: 'p4-e2', parentId: store.entry.id };
     store.db.exec("CREATE TRIGGER reject_run_binding BEFORE INSERT ON session_native_entries WHEN NEW.run_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'binding failed'); END;");
-    expect(store.sessions.saveHistory(store.sessionId, { ...prefix, entries: [store.entry, second], leafId: second.id },
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, { ...prefix, entries: [store.entry, second], leafId: second.id },
       { entryId: second.id, runId: store.runId })).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(store.db.query('SELECT * FROM session_native_history').get()).toEqual(before);
     expect(store.db.query('SELECT entry_id,entry_json,run_id FROM session_native_entries ORDER BY sequence').all())
@@ -309,7 +310,7 @@ describe('P2 Session and Agent Run storage', () => {
     const entry = { type: 'custom', id: 'sdk-metadata', parentId: null, timestamp: store.history.header.timestamp,
       customType: 'sdk-fixture-metadata', data: { type: 'image', note: 'metadata only' } };
     const history = { ...store.history, entries: [entry], leafId: entry.id };
-    expect(store.sessions.saveHistory(store.sessionId, history)).toEqual({ ok: true, data: undefined });
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history)).toEqual({ ok: true, data: undefined });
     expect(store.sessions.loadHistory(store.sessionId)).toEqual({ ok: true, data: history });
   }));
 
@@ -319,9 +320,11 @@ describe('P2 Session and Agent Run storage', () => {
     expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true }).ok).toBe(false);
     expect(store.db.query('SELECT status FROM runs WHERE id=?').get(store.runId)).toEqual({ status: 'created' });
     expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: false } });
+    expect(store.db.query('SELECT commit_revision FROM session_native_history').get()).toEqual({ commit_revision: 1 });
     store.db.exec('DROP TRIGGER reject_history_block;');
     expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true })).toEqual({ ok: true, data: true });
-    expect(store.sessions.saveHistory(store.sessionId, store.history).ok).toBe(true);
+    expect(store.db.query('SELECT commit_revision FROM session_native_history').get()).toEqual({ commit_revision: 2 });
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, store.history).ok).toBe(true);
     expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: true } });
     const provider = store.runs.create({ goal: runInput.goal, input: runInput, config: baseConfig, usage, cleanup, createdAt: store.terminal.endedAt });
     expect(provider.ok).toBe(true);
@@ -351,7 +354,7 @@ describe('P2 Session and Agent Run storage', () => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }]);
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }]);
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     opened.data.close();
   }));
@@ -369,7 +372,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
     try {
-      expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 15 });
+      expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 16 });
       expect(migrated.data.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: entry, run_id: null });
       expect(migrated.data.db.query('SELECT header_json,storage_version,leaf_id,entry_count FROM session_native_history').get())
         .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });
@@ -395,7 +398,7 @@ describe('P2 Session and Agent Run storage', () => {
   it('rejects inconsistent persisted Run ownership rather than displaying or restoring guessed facts', () => withDatabase((paths) => {
     const store = nativeFixture(paths, true);
     const history = { ...store.history, entries: [store.entry], leafId: store.entry.id };
-    expect(store.sessions.saveHistory(store.sessionId, history, { entryId: store.entry.id, runId: store.runId }).ok).toBe(true);
+    expect(saveTestHistory(store.db, store.historyEvents, store.sessionId, history, { entryId: store.entry.id, runId: store.runId }).ok).toBe(true);
     const other = store.sessions.create({ nativeSessionId: 'native-corrupt-other', title: 'Other', at: store.history.header.timestamp });
     expect(other.ok).toBe(true);
     if (!other.ok) return;
@@ -440,8 +443,8 @@ describe('P2 Session and Agent Run storage', () => {
     if (!created.ok) return;
     const sessionId = created.data.sessionId;
     const entry = { type: 'message', id: 'first', parentId: null, timestamp: header.timestamp,
-      message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } };
-    expect(first.data.sessions.saveHistory(sessionId, { storageVersion: 1, header, entries: [entry], leafId: entry.id, unusable: false }).ok).toBe(true);
+      message: { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: 1 } };
+    expect(saveTestHistory(first.data.db, first.data.runtimeEventStore, sessionId, { storageVersion: 1, header, entries: [entry], leafId: entry.id, unusable: false }).ok).toBe(true);
     first.data.close();
     const second = openDatabase(paths);
     expect(second.ok).toBe(true);

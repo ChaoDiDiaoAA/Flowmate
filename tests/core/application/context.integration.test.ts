@@ -1,3 +1,4 @@
+import { saveTestHistory } from '../../support/history.ts';
 import { describe, expect, it } from 'bun:test';
 import { createContextRepository, createFileStore, openDatabase } from '@flowmate/core';
 import { createDocumentService, DocumentService } from '@flowmate/data';
@@ -188,7 +189,7 @@ function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.
 function fixture(selection: WorkspaceSelection | null = null, fill = false, human = false, workingDirectory?: string) {
   const base = makeSelectedCandidate(false, true);
   const store = { ...base, context: createContextRepository({ db: base.db, loadHistory: id => base.sessions.loadHistory(id) }) };
-  need(store.sessions.saveHistory(store.session.sessionId, { storageVersion: 1,
+  need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, store.session.sessionId, { storageVersion: 1,
     header: { type: 'session', id: store.session.nativeSessionId, timestamp: store.stamp, cwd: store.root, version: 3 },
     entries: [], leafId: null, unusable: false }));
   let workspace = store.selectedWorkspace;

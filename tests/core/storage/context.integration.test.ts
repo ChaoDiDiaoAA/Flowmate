@@ -1,3 +1,4 @@
+import { saveTestHistory } from '../../support/history.ts';
 import { describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { z } from 'zod';
@@ -75,7 +76,7 @@ function persistLegacyTools(f: ReturnType<typeof fixture>, owner: number, native
       api:'openai-responses',provider:'fixture',model:'fixture',usage,stopReason:'toolUse',timestamp:1}},
       {type:'message',id:'old-result',parentId:'old-assistant',timestamp:at,message:{role:'toolResult',toolCallId:nativeId,toolName:'read_fixture',
         content:[{type:'text',text:'legacy result'}],isError:false,timestamp:2}}],leafId:'old-result',unusable:false };
-  need(f.store.sessions.saveHistory(f.session.sessionId,history));
+  need(saveTestHistory(f.store.db, f.store.runtimeEventStore, f.session.sessionId,history));
   f.store.db.query('UPDATE session_native_entries SET run_id=? WHERE session_id=?').run(owner,f.session.sessionId);
   return history;
 }
@@ -122,13 +123,13 @@ function fixture() {
       entries: [{ type: 'message', id: entryId, parentId: null, timestamp: at,
         message: { role: 'user', content: [{ type: 'text', text }], timestamp: 1 } }],
       leafId: entryId, unusable: false };
-    need(store.sessions.saveHistory(session.sessionId, history, { runId, entryId, inputId }));
+    need(saveTestHistory(store.db, store.runtimeEventStore, session.sessionId, history, { runId, entryId, inputId }));
     return history;
   }
   function binding(inputId: number, snapshotId: number): RequestContextBinding {
     return { runId, sessionId: session.sessionId, nativeSessionId: session.nativeSessionId, requestSequence: 1, callSequence: 1,
       inputId, snapshotId, includedBindings: [{ originRunId: runId, inputId, snapshotId, nativeEntryId: 'p8-user' }],
-      includedToolResults: [] };
+      includedToolResults: [], includedNativeContexts: [] };
   }
   return { store, session, runId, config, append, consume, binding, productPaths };
 }
@@ -139,7 +140,7 @@ describe('P8 Context storage', () => {
     const before = old.query('SELECT content_json,request_hash FROM session_inputs ORDER BY id').all();
     old.close();
     const migrated = need(openTestDatabase(productPaths));
-    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 15 });
+    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 16 });
     expect(migrated.db.query('SELECT content_json,request_hash FROM session_inputs ORDER BY id').all()).toEqual(before);
     expect(migrated.db.query('SELECT current_context_snapshot_id,context_observations_json FROM runs').all())
       .toEqual([{ current_context_snapshot_id: null, context_observations_json: null }]);
@@ -373,7 +374,7 @@ describe('P8 Context storage', () => {
         VALUES(?,1,'prompt','answer',?,?,?,'queued','pending',?,?)`).run(other.sessionId,'b'.repeat(64),otherRun,JSON.stringify(saved.content),at,at).lastInsertRowid);
       const history:NativeSessionHistory={storageVersion:1,header:{type:'session',version:3,id:other.nativeSessionId,timestamp:at,cwd:f.productPaths.root},
         entries:[{type:'message',id:'foreign-user',parentId:null,timestamp:at,message:{role:'user',content:saved.content.text,timestamp:1}}],leafId:'foreign-user',unusable:false};
-      need(f.store.sessions.saveHistory(other.sessionId,history,{runId:otherRun,inputId:otherInput,entryId:'foreign-user'}));
+      need(saveTestHistory(f.store.db, f.store.runtimeEventStore, other.sessionId,history,{runId:otherRun,inputId:otherInput,entryId:'foreign-user'}));
       changed.includedBindings=[{originRunId:otherRun,inputId:otherInput,snapshotId:null,nativeEntryId:'foreign-user'},...binding.includedBindings];
     } else {
       const call=tool(f,'changed-context',saved.snapshot.id,1);
@@ -392,7 +393,7 @@ describe('P8 Context storage', () => {
   it('reads an original saved request after the native leaf moves to another legal branch', () => {
     const f=fixture(),saved=f.append(),history=f.consume(saved.inputId,saved.content.text);
     need(f.store.context.bindRequest({binding:f.binding(saved.inputId,saved.snapshot.id),api:'openai-responses',transport:'observed-fetch',at}));
-    need(f.store.sessions.saveHistory(f.session.sessionId,{...history,entries:[...history.entries,{type:'message',id:'alternate-user',parentId:null,timestamp:later,
+    need(saveTestHistory(f.store.db, f.store.runtimeEventStore, f.session.sessionId,{...history,entries:[...history.entries,{type:'message',id:'alternate-user',parentId:null,timestamp:later,
       message:{role:'user',content:'another branch',timestamp:2}}],leafId:'alternate-user'}));
     expect(need(f.store.context.listContextRequests({sessionId:f.session.sessionId,runId:f.runId})).items[0]?.binding.snapshotId).toBe(saved.snapshot.id);
   });

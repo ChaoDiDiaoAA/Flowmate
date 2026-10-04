@@ -1,3 +1,4 @@
+import { saveTestHistory, nativeAssistantFacts } from '../../support/history.ts';
 import { createTestWorkspaceVerifier } from '../../support/workspace.ts';
 import { describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
@@ -48,12 +49,13 @@ function fixture() {
   const create = () => runs.create({ goal: input.goal, input, config, cleanup, usage, createdAt: stamp });
   const terminal = { status: 'failed' as const, output: null, error: appError('fixture_failed', 'provider', 'Fixture stopped.'),
     usage, tokens, cleanup: { ...cleanup, stopped: true, stopReason: 'fixture-stop' }, endedAt: later, stoppedAt: later, durationMs: 1 };
-  return { ...opened, paths, events, runs, sessions, toolCalls, ledger, published, query, create, terminal };
+  return { ...opened, paths, events, historyEvents: events as typeof events | undefined, runs, sessions, toolCalls, ledger, published, query, create, terminal };
 }
 
 function agentFixture(workspace = false, legacy = false) {
   const f = fixture();
   if (legacy) {
+    f.historyEvents = undefined;
     f.runs = createRunRepository(f.db);
     f.sessions = createSessionRepository(f.db);
     f.toolCalls = createToolCallRepository(f.db);
@@ -95,10 +97,10 @@ function bindResult(f: ReturnType<typeof agentFixture>) {
   const user = { type: 'message', id: 'batch-user', parentId: null, timestamp: stamp,
     message: { role: 'user', content: input.text, timestamp: 1 } };
   const result = { type: 'message', id: 'batch-result', parentId: user.id, timestamp: later,
-    message: { role: 'assistant', content: [{ type: 'text', text: 'Saved batch.' }], stopReason: 'stop', timestamp: 2 } };
-  required(f.sessions.saveHistory(f.sessionId, { ...f.history, entries: [user], leafId: user.id },
+    message: { ...nativeAssistantFacts, role: 'assistant', content: [{ type: 'text', text: 'Saved batch.' }], stopReason: 'stop', timestamp: 2 } };
+  required(saveTestHistory(f.db, f.historyEvents, f.sessionId, { ...f.history, entries: [user], leafId: user.id },
     { entryId: user.id, runId, inputId: admitted.inputId }));
-  required(f.sessions.saveHistory(f.sessionId, { ...f.history, entries: [user, result], leafId: result.id },
+  required(saveTestHistory(f.db, f.historyEvents, f.sessionId, { ...f.history, entries: [user, result], leafId: result.id },
     { entryId: result.id, runId, resultInputIds: [admitted.inputId] }));
   return { runId, inputId: admitted.inputId, resultEntryId: result.id };
 }
@@ -229,32 +231,32 @@ describe('P6 real state write entry points', () => {
     const queued = f.query(runId, f.sessionId);
     f.published.length = 0;
     f.db.exec("CREATE TRIGGER reject_consumption BEFORE INSERT ON runtime_events WHEN NEW.type='input_state_changed' AND json_extract(NEW.payload_json,'$.status')='consumed' BEGIN SELECT RAISE(ABORT,'fixture consumption failure'); END;");
-    expect(f.sessions.saveHistory(f.sessionId, userHistory, userContext))
+    expect(saveTestHistory(f.db, f.historyEvents, f.sessionId, userHistory, userContext))
       .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(required(f.sessions.loadHistory(f.sessionId))).toEqual(f.history);
     expect(required(f.ledger.query({ sessionId: f.sessionId, inputId: admitted.inputId })).input?.status).toBe('queued');
     expect(f.query(runId, f.sessionId)).toEqual(queued);
     expect(f.published).toEqual([]);
     f.db.exec('DROP TRIGGER reject_consumption');
-    required(f.sessions.saveHistory(f.sessionId, userHistory, userContext));
+    required(saveTestHistory(f.db, f.historyEvents, f.sessionId, userHistory, userContext));
     const consumed = f.query(runId, f.sessionId);
     expect(consumed.items.at(-1)?.payload).toMatchObject({ status: 'consumed', processingStatus: 'pending',
       nativeEntryId: user.id, resultEntryId: null });
     const result = { type: 'message', id: 'p6-result', parentId: user.id, timestamp: later,
-      message: { role: 'assistant', content: [{ type: 'text', text: 'Saved answer.' }], stopReason: 'stop', timestamp: 2 } };
+      message: { ...nativeAssistantFacts, role: 'assistant', content: [{ type: 'text', text: 'Saved answer.' }], stopReason: 'stop', timestamp: 2 } };
     const resultHistory = { ...userHistory, entries: [user, result], leafId: result.id };
     const resultContext = { entryId: result.id, runId, resultInputIds: [admitted.inputId] };
     f.db.exec("CREATE TRIGGER reject_result BEFORE INSERT ON runtime_events WHEN NEW.type='input_state_changed' AND json_extract(NEW.payload_json,'$.resultEntryId') IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture result failure'); END;");
-    expect(f.sessions.saveHistory(f.sessionId, resultHistory, resultContext)).toMatchObject({ ok: false });
+    expect(saveTestHistory(f.db, f.historyEvents, f.sessionId, resultHistory, resultContext)).toMatchObject({ ok: false });
     expect(required(f.sessions.loadHistory(f.sessionId))).toEqual(userHistory);
     expect(required(f.ledger.query({ sessionId: f.sessionId, inputId: admitted.inputId })).input?.resultEntryId).toBeNull();
     expect(f.query(runId, f.sessionId)).toEqual(consumed);
     f.db.exec('DROP TRIGGER reject_result');
-    required(f.sessions.saveHistory(f.sessionId, resultHistory, resultContext));
+    required(saveTestHistory(f.db, f.historyEvents, f.sessionId, resultHistory, resultContext));
     const associated = f.query(runId, f.sessionId);
     expect(associated.items.at(-1)?.payload).toMatchObject({ status: 'consumed', processingStatus: 'pending',
       nativeEntryId: user.id, resultEntryId: result.id });
-    required(f.sessions.saveHistory(f.sessionId, resultHistory, resultContext));
+    required(saveTestHistory(f.db, f.historyEvents, f.sessionId, resultHistory, resultContext));
     expect(f.query(runId, f.sessionId)).toEqual(associated);
     expect(f.published.length).toBe(2);
   });

@@ -1,3 +1,4 @@
+import { saveTestHistory, nativeAssistantFacts } from '../../support/history.ts';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
@@ -60,7 +61,7 @@ function fixture(withMaterial = false) {
     timestamp: at, cwd: root }, entries: [], leafId: null, unusable: false };
   if (selected) {
     store.db.query("UPDATE sessions SET native_session_id='native-fill-input' WHERE id=1").run();
-    need(store.sessions.saveHistory(1, history));
+    need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, 1, history));
   } else need(store.sessions.create({ nativeSessionId: 'native-fill-input', title: 'Fill input', at, nativeHistory: history }));
   const ledger = Reflect.get(store, 'sessionInputs') as import('../../../packages/core/src/sessions/input-ledger.ts').SessionInputLedger;
   expect(ledger).toBeDefined();
@@ -269,14 +270,14 @@ describe('idle Fill prompt input ledger', () => {
       message: { role: 'user', content: request.text, timestamp: 1 } };
     const history = { ...previous, entries: [entry], leafId: entry.id };
     store.db.exec("CREATE TRIGGER reject_consumption BEFORE UPDATE OF status ON session_inputs BEGIN SELECT RAISE(ABORT,'fixture consumption failure'); END;");
-    expect(store.sessions.saveHistory(1, history, { entryId: entry.id, runId: first.input.runId!, inputId: first.input.inputId }))
+    expect(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, 1, history, { entryId: entry.id, runId: first.input.runId!, inputId: first.input.inputId }))
       .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(need(store.sessions.loadHistory(1))).toMatchObject({ entries: [], leafId: null });
     expect(need(ledger.query({ sessionId: 1, clientSequence: 1 })).input).toMatchObject({ status: 'queued', nativeEntryId: null });
     store.db.exec('DROP TRIGGER reject_consumption');
-    need(store.sessions.saveHistory(1, history, { entryId: entry.id, runId: first.input.runId!, inputId: first.input.inputId }));
+    need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, 1, history, { entryId: entry.id, runId: first.input.runId!, inputId: first.input.inputId }));
     expect(need(ledger.query({ sessionId: 1, clientSequence: 1 })).input).toMatchObject({ status: 'consumed', nativeEntryId: entry.id });
-    need(store.sessions.saveHistory(1, history, { entryId: entry.id, runId: first.input.runId!, inputId: first.input.inputId }));
+    need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, 1, history, { entryId: entry.id, runId: first.input.runId!, inputId: first.input.inputId }));
     expect(need(store.sessions.loadHistory(1))?.entries).toHaveLength(1);
   });
 
@@ -380,7 +381,7 @@ describe('idle Fill prompt input ledger', () => {
       const previous = need(store.sessions.loadHistory(input.sessionId))!;
       const entry = { type: 'message', id: 'true-input', parentId: null, timestamp: at,
         message: { role: 'user', content: input.text, timestamp: input.messageTimestamp } };
-      need(store.sessions.saveHistory(input.sessionId, { ...previous, entries: [entry], leafId: entry.id },
+      need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, input.sessionId, { ...previous, entries: [entry], leafId: entry.id },
         { entryId: entry.id, runId: input.runId, inputId: input.inputId }));
       return { text: 'The form was filled.', partial: false, stopReason: 'stop' as const,
         responseId: null, responseModel: null, error: null, usage,
@@ -477,7 +478,7 @@ function p5Fixture() {
     const previous = p5Need(store.sessions.loadHistory(1))!;
     const entry = { type: 'message', id, parentId: previous.leafId, timestamp: p5At,
       message: { role: 'user', content: 'same text', timestamp: 1 } };
-    return store.sessions.saveHistory(1, { ...previous, entries: [...previous.entries, entry], leafId: id },
+    return saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, 1, { ...previous, entries: [...previous.entries, entry], leafId: id },
       { entryId: id, runId, inputId });
   };
   return { store, request, admit, append, created: () => created };
@@ -526,8 +527,8 @@ describe('P5 input identity and two-stage processing', () => {
     p5Need(append(input.runId!, input.inputId, 'user'));
     const previous = p5Need(store.sessions.loadHistory(1))!;
     const result = { type: 'message', id: 'result', parentId: 'user', timestamp: p5At,
-      message: { role: 'assistant', content: [{ type: 'text', text: 'Finished.' }], stopReason: 'stop', timestamp: 2 } };
-    p5Need(store.sessions.saveHistory(1, { ...previous, entries: [...previous.entries, result], leafId: 'result' },
+      message: { ...nativeAssistantFacts, role: 'assistant', content: [{ type: 'text', text: 'Finished.' }], stopReason: 'stop', timestamp: 2 } };
+    p5Need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore : undefined, 1, { ...previous, entries: [...previous.entries, result], leafId: 'result' },
       { entryId: 'result', runId: input.runId!, resultInputIds: [input.inputId] }));
     expect(p5Need(store.sessionInputs.query({ sessionId: 1, inputId: input.inputId })).input)
       .toMatchObject({ processingStatus: 'pending', resultEntryId: 'result' });

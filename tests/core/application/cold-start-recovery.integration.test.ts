@@ -281,6 +281,8 @@ it('cold-start blocks only the original Session when a stopped completed tool la
   if (!reopened.ok) throw new Error(reopened.error.code);
   deferCleanup(() => reopened.data.close());
   expect(reopened.data.sessions.loadHistory(sessionId)).toMatchObject({ ok: true, data: { unusable: true } });
+  expect(reopened.data.db.query('SELECT commit_revision,entry_count FROM session_native_history WHERE session_id=?').get(sessionId))
+    .toEqual({ commit_revision: 2, entry_count: 0 });
   expect(reopened.data.db.query('SELECT status,stopped_at,result_json FROM tool_calls WHERE id=?').get(toolCallId))
     .toEqual({ status: 'succeeded', stopped_at: stamp, result_json: '{"version":999}' });
 });
@@ -289,6 +291,8 @@ it('cold-start rolls back all recovery if a necessary Session history block cann
   const { store, paths } = fixture();
   const { sessionId, toolCallId } = finishedToolWithMissingResult(store);
   const runId = providerRun(store);
+  const beforeEvents = store.db.query('SELECT * FROM runtime_events ORDER BY id').all();
+  const beforeEntries = store.db.query('SELECT * FROM session_native_entries ORDER BY session_id,sequence').all();
   store.db.exec(`CREATE TRIGGER reject_history_block BEFORE UPDATE ON session_native_history
     BEGIN SELECT RAISE(ABORT,'synthetic necessary save failure'); END;`);
   store.close();
@@ -297,7 +301,10 @@ it('cold-start rolls back all recovery if a necessary Session history block cann
   deferCleanup(() => saved.close());
   expect(saved.query('SELECT status,stopped_at,ended_at FROM runs WHERE id=?').get(runId))
     .toEqual({ status: 'running', stopped_at: null, ended_at: null });
-  expect(saved.query('SELECT unusable FROM session_native_history WHERE session_id=?').get(sessionId)).toEqual({ unusable: 0 });
+  expect(saved.query('SELECT unusable,commit_revision,entry_count FROM session_native_history WHERE session_id=?').get(sessionId))
+    .toEqual({ unusable: 0, commit_revision: 1, entry_count: 0 });
   expect(saved.query('SELECT status,stopped_at,result_json FROM tool_calls WHERE id=?').get(toolCallId))
     .toEqual({ status: 'succeeded', stopped_at: stamp, result_json: '{"version":999}' });
+  expect(saved.query('SELECT * FROM runtime_events ORDER BY id').all()).toEqual(beforeEvents);
+  expect(saved.query('SELECT * FROM session_native_entries ORDER BY session_id,sequence').all()).toEqual(beforeEntries);
 });

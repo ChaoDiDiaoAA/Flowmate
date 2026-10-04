@@ -4,6 +4,7 @@ export * from './events/service.ts';
 export * from './configuration/service.ts';
 export * from './configuration/settings.ts';
 export * from './storage/database.ts';
+export * from './memory/persistence.ts';
 export * from './storage/file-store.ts';
 export * from './storage/repositories.ts';
 export * from './context/repository.ts';

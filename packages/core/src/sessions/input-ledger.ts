@@ -1,3 +1,4 @@
+import { markUnusableInTransaction } from '../memory/persistence.ts';
 import { createHash } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import type { RuntimeEventStore } from '../events/store.ts';
@@ -341,7 +342,7 @@ export function recoverSessionInputs(db: Database, at: string,
       const ids = members.map(row => row.id);
       verifiedResultMembers(db, input.run_id, ids, input.result_entry_id);
       if (!qualify(input.run_id, ids, input.result_entry_id, true)) throw new Error('input_processing_unconfirmed');
-    } catch { db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(input.session_id); }
+    } catch { markUnusableInTransaction(db, input.session_id); }
   }
   const rows = db.query(`SELECT DISTINCT run.id,run.session_id,run.status,run.error_json FROM session_inputs input JOIN runs run ON run.id=input.run_id
     WHERE input.processing_status='pending' AND run.status IN ('completed','failed','cancelled')`).all() as {
@@ -359,6 +360,6 @@ export function recoverSessionInputs(db: Database, at: string,
     const error = row.status === 'completed' ? appError('input_processing_unconfirmed', 'runtime', 'A terminal Run has unconfirmed input results.', true, row.id)
       : row.error_json === null ? null : JSON.parse(row.error_json);
     finishSessionInputs(db, row.id, row.status === 'completed' ? 'failed' : row.status, error, at, [], events, 'recovery');
-    if (row.status === 'completed') db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(row.session_id);
+    if (row.status === 'completed') markUnusableInTransaction(db, row.session_id);
   }
 }
