@@ -808,25 +808,42 @@ it('P9 T09 preserves Document rows during real concurrent artifact root rename a
   const f = await t09Fixture(), original = await f.material();
   const before = f.sql(db => db.query('SELECT * FROM documents ORDER BY id').all());
   const artifactRoot = f.paths.artifactsDir, held = artifactRoot + '.t09-held';
+  const messages: string[] = [];
   const child = Bun.spawn([process.execPath, '--no-env-file', '--eval', `
     const fs = require('node:fs'), p = require('node:path');
     const [owner, original, held] = process.argv.slice(1);
     for (const value of [original, held]) { const rel = p.relative(p.resolve(owner), p.resolve(value));
       if (!rel || rel.startsWith('..') || p.isAbsolute(rel)) throw new Error('not owned'); }
-    const startedAt = Date.now(), deadline = startedAt + 3500; let moves = 0;
-    process.send('ready'); await Bun.sleep(100);
-    try { while (Date.now() < deadline) { try { fs.renameSync(original, held); moves++; } catch {} try { fs.renameSync(held, original); } catch {} } }
-    finally { if (fs.existsSync(held) && !fs.existsSync(original)) fs.renameSync(held, original); }
-    process.send(JSON.stringify({ moves, startedAt, endedAt: Date.now() }));
+    await new Promise(resolve => { process.once('message', message => {
+      if (message !== 'start') throw new Error('unexpected command'); resolve();
+    }); process.send('ready'); });
+    const startedAt = Date.now(), deadline = startedAt + 3500;
+    let outwardMoves = 0, restores = 0, completedPairs = 0, pending = false;
+    const movementAt = []; const activity = () => {
+      const at = Date.now(); if (movementAt.at(-1) !== at) movementAt.push(at);
+    };
+    const restore = () => { fs.renameSync(held, original); restores++; activity();
+      if (pending) { completedPairs++; pending = false; } };
+    try { while (Date.now() < deadline) {
+      try { fs.renameSync(original, held); outwardMoves++; pending = true; activity(); } catch {}
+      try { restore(); } catch {}
+    } }
+    finally { if (fs.existsSync(held) && !fs.existsSync(original)) restore(); }
+    process.send(JSON.stringify({ kind: 'completed', outwardMoves, restores, completedPairs,
+      startedAt, endedAt: Date.now(), movementAt, restoredRoot: fs.statSync(original).isDirectory() }));
   `, f.paths.root, artifactRoot, held], { env: { ...process.env }, stdout: 'pipe', stderr: 'pipe', ipc(message) { messages.push(String(message)); } });
-  const messages: string[] = [], stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
+  const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
+  const readIntervals: Array<{ startedAt: number; endedAt: number }> = [];
   let observed: unknown, reads = 0;
   try {
     await waitFor(async () => messages.includes('ready'), 2000);
+    child.send('start');
     const deadline = Date.now() + 4500;
     for (let n = 0; n < 20000 && Date.now() < deadline; n++) {
       if (n % 16 === 0) await Bun.sleep(0);
+      const startedAt = Date.now();
       const result = await f.app.readDocumentPage({ documentId: original.tool.documentId, page: 1, afterBlockId: null, limit: 50 });
+      readIntervals.push({ startedAt, endedAt: Date.now() });
       reads++;
       const after = f.sql(db => db.query('SELECT * FROM documents ORDER BY id').all());
       if (JSON.stringify(after) !== JSON.stringify(before)) { observed = { n, result, before, after }; break; }
@@ -834,9 +851,35 @@ it('P9 T09 preserves Document rows during real concurrent artifact root rename a
     }
     const exit = await child.exited;
     expect(observed).toBeUndefined(); expect(exit).toBe(0);
+    const packets = messages.filter(message => message !== 'ready').map(message => JSON.parse(message));
+    expect(packets).toHaveLength(1);
+    const completion = packets[0] as { kind: string; outwardMoves: number; restores: number; completedPairs: number;
+      startedAt: number; endedAt: number; movementAt: number[]; restoredRoot: boolean };
+    expect(completion.kind).toBe('completed'); expect(completion.restoredRoot).toBe(true);
+    for (const value of [completion.outwardMoves, completion.restores, completion.completedPairs, reads,
+      completion.startedAt, completion.endedAt]) { expect(Number.isSafeInteger(value)).toBe(true); expect(value).toBeGreaterThan(0); }
+    expect(completion.endedAt).toBeGreaterThan(completion.startedAt);
+    expect(completion.completedPairs).toBe(completion.outwardMoves);
+    expect(completion.restores).toBe(completion.completedPairs);
+    expect(Array.isArray(completion.movementAt)).toBe(true);
+    expect(completion.movementAt.length).toBeGreaterThan(0);
+    expect(completion.movementAt.length).toBeLessThanOrEqual(completion.endedAt - completion.startedAt + 1);
+    for (let n = 0; n < completion.movementAt.length; n++) {
+      const at = completion.movementAt[n]!;
+      expect(Number.isSafeInteger(at)).toBe(true); expect(at).toBeGreaterThanOrEqual(completion.startedAt);
+      expect(at).toBeLessThanOrEqual(completion.endedAt);
+      if (n) expect(at).toBeGreaterThan(completion.movementAt[n - 1]!);
+    }
+    // Strict interior timestamps exclude same-millisecond ordering ambiguity.
+    const overlap = readIntervals.flatMap(interval => {
+      const movementAt = completion.movementAt.find(at => interval.startedAt < at && at < interval.endedAt);
+      return movementAt === undefined ? [] : [{ ...interval, movementAt }];
+    });
+    expect(readIntervals).toHaveLength(reads); expect(overlap.length).toBeGreaterThan(0);
     expect(f.sql(db => db.query('SELECT * FROM documents ORDER BY id').all())).toEqual(before);
     expect(await f.app.readDocumentPage({ documentId: original.tool.documentId, page: 1, afterBlockId: null, limit: 50 })).toMatchObject({ ok: true });
-    console.log('T09 workspace real rename diagnostic', JSON.stringify({ exit, reads, messages, stdout: await stdout, stderr: await stderr, observed,
+    console.log('T09 workspace real rename diagnostic', JSON.stringify({ childPid: child.pid, exit, reads, completion, overlapReads: overlap.length,
+      overlapWitness: overlap[0], stdout: await stdout, stderr: await stderr, observed,
       restoredRoot: statSync(artifactRoot).isDirectory(), readAfter: await f.app.readDocumentPage({ documentId: original.tool.documentId, page: 1, afterBlockId: null, limit: 50 }) }));
   } finally { if (child.exitCode === null && child.signalCode === null) { child.kill(); await child.exited; }
     console.log('T09 rename transport', JSON.stringify({ messages, stdout: await stdout, stderr: await stderr })); }
