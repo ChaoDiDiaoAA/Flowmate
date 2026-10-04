@@ -1494,3 +1494,37 @@ describe('PiAgentAdapter', () => {
     expect(await app.adapter.releaseSession(created.data.nativeSessionId)).toMatchObject({ stopped: true, closed: true });
   });
 });
+
+
+it.each([false, true])('P9 T04 fix1 confirms the active saved user association and rejects conflicts (conflict=%s)', async conflict => {
+  const entered = deferred<void>(), release = deferred<Response>();
+  const app = await fixture(() => { entered.resolve(); return app.requests.length === 1 ? release.promise : response(); });
+  const created = app.adapter.createSession(); if (!created.ok) throw created.error;
+  const id = created.data.nativeSessionId, signal = new AbortController().signal; let writes = 0;
+  expect(watchFixture(app.adapter, 21, id, () => { writes++; return ok(undefined); }).ok).toBe(true);
+  const prepared = await app.adapter.prepare(id, config, { timeoutMs: 3000, stopGraceMs: 100 }, signal, { sessionInputs: true });
+  if (!prepared.ok) throw prepared.error;
+  const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first', verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined) }, signal, () => {});
+  try {
+    await entered.promise;
+    const record = (app.adapter as any).sessions.get(id), user = record.manager.getEntries().find((e: any) => e.type === 'message' && e.message.role === 'user');
+    const before = structuredClone({ saved: record.lastSavedHistory, seed: record.recoverySeed, receipt: record.receipt }), count = writes;
+    if (conflict) record.active.inputMessages.set(user.message, 101);
+    if (conflict) expect(() => record.manager._persist(user)).toThrow();
+    else expect(() => record.manager._persist(user)).not.toThrow();
+    expect({ saved: record.lastSavedHistory, seed: record.recoverySeed, receipt: record.receipt }).toEqual(before);
+    expect(writes).toBe(count);
+    release.resolve(response());
+    const outcome = await running;
+    expect(outcome.error?.code ?? null).toBe(conflict ? 'context_binding_conflict' : null);
+    if (!conflict) {
+      const idleSaved = structuredClone({ seed: record.recoverySeed, receipt: record.receipt }), idleWrites = writes;
+      expect(() => record.manager._persist(user)).not.toThrow();
+      expect({ seed: record.recoverySeed, receipt: record.receipt }).toEqual(idleSaved); expect(writes).toBe(idleWrites);
+      const next = await app.adapter.prepare(id, config, { timeoutMs: 3000, stopGraceMs: 100 }, signal, { sessionInputs: true });
+      if (!next.ok) throw next.error;
+      expect((await next.data.execute({ ...input(72, 21, 'next'), inputId: 101, promptText: 'next', verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined) }, signal, () => {})).error).toBeNull();
+      expect(app.requests).toHaveLength(2);
+    } else expect(app.adapter.inspect(id).availability).toBe('unusable');
+  } finally { release.resolve(response()); await running; }
+});

@@ -178,8 +178,8 @@ export const NativeDerivedContextBindingSchema = z.object({ nativeEntryId: opaqu
   const expected = { custom_message: 'custom', compaction: 'compactionSummary', branch_summary: 'branchSummary' };
   if (value.entryType !== 'message' && expected[value.entryType] !== value.messageRole)
     report(context, 'Derived entry and message role disagree.');
-  if (!unique(value.referenceEntryIds) || value.referenceEntryIds.includes('root'))
-    report(context, 'References contain actual unique entry IDs, never the root sentinel.');
+  if (!unique(value.referenceEntryIds) || value.entryType !== 'compaction' && value.referenceEntryIds.includes('root'))
+    report(context, 'References contain actual unique entry IDs; only compaction may reference an entry named root.');
 }).readonly();
 export type NativeDerivedContextBinding = z.infer<typeof NativeDerivedContextBindingSchema>;
 const requestBindingShape = { runId: id, sessionId: id, nativeSessionId: opaqueId,

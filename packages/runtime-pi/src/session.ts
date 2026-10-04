@@ -457,18 +457,19 @@ export class PiAgentAdapter implements AgentPort {
       const ordinal = entry.type === 'message' && active ? active.liveOrdinals.get(entry.message) : undefined;
       const inputId = entry.type === 'message' && active && entry.message.role === 'user'
         ? active.inputMessages.get(entry.message) : undefined;
-      const resultInputIds = entry.type === 'message' && active && active.input.inputId !== undefined
+      const acknowledged = record.memory!.lastSavedHistory.entries.find(saved => saved.id === entry.id);
+      const resultInputIds = !acknowledged && entry.type === 'message' && active && active.input.inputId !== undefined
         && entry.message.role === 'assistant' && entry.message.stopReason === 'stop'
         && textFrom(entry.message).trim().length > 0
         && !entry.message.content.some(part => part.type === 'toolCall') && !active.failure
         ? [...active.openInputIds] : undefined;
-      const context = entry.type === 'message' && active && ordinal !== undefined
+      const context = !acknowledged && entry.type === 'message' && active && ordinal !== undefined
         ? { entryId: entry.id, runId: active.runId, ...(inputId === undefined ? {} : { inputId }),
           ...(resultInputIds?.length ? { resultInputIds } : {}) } : undefined;
       const snapshot = this.exportSession(nativeSessionId);
       let saved: Result<HistoryCommitReceipt>;
       let source: NativeInputContextBinding | undefined;
-      if (entry.type === 'message' && active && entry.message.role === 'user' && ordinal !== undefined) {
+      if (!acknowledged && entry.type === 'message' && active && entry.message.role === 'user' && ordinal !== undefined) {
         const state = inputId === undefined ? undefined : active.inputs.get(inputId);
         source = { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null,
           snapshotId: state?.contextSnapshotId ?? null };
@@ -478,10 +479,24 @@ export class PiAgentAdapter implements AgentPort {
           this.failToolRun(record, active, error); throw error;
         }
       }
-      if (entry.type === 'message' && entry.message.role === 'user' && !active)
+      if (!acknowledged && entry.type === 'message' && entry.message.role === 'user' && !active)
         source = { nativeEntryId: entry.id, originRunId: null, inputId: null, snapshotId: null };
+      // A repeat acknowledgement retains its original association. Only actual live identity
+      // can assert an association again; idle confirmation must not invent a legacy owner.
+      let confirmationError: ReturnType<typeof appError> | undefined;
+      if (acknowledged && !isDeepStrictEqual(acknowledged, entry))
+        confirmationError = appError('session_history_invalid', 'session', 'The confirmed native entry changed.');
+      if (acknowledged && active && entry.type === 'message' && (ordinal !== undefined || inputId !== undefined)) {
+        const origin = record.recoverySeed!.origins.find(value => value.nativeEntryId === entry.id);
+        const originalInput = record.recoverySeed!.inputs.find(value => value.nativeEntryId === entry.id);
+        const state = inputId === undefined ? undefined : active.inputs.get(inputId);
+        if (origin?.originRunId !== active.runId || entry.message.role === 'user' && !isDeepStrictEqual(originalInput,
+          { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null, snapshotId: state?.contextSnapshotId ?? null }))
+          confirmationError = appError('context_binding_conflict', 'runtime', 'Confirmed entry provenance conflicts.');
+      }
       try {
-        saved = snapshot.ok ? record.memory!.save(snapshot.data, context ? [context] : [], source ? [source] : []) : snapshot;
+        saved = confirmationError ? fail(confirmationError)
+          : snapshot.ok ? record.memory!.save(snapshot.data, context ? [context] : [], source ? [source] : []) : snapshot;
       }
       catch { saved = fail(appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true)); }
       if (!saved.ok) {
@@ -495,6 +510,7 @@ export class PiAgentAdapter implements AgentPort {
       }
       record.lastSavedHistory = structuredClone(record.memory!.lastSavedHistory);
       record.receipt = structuredClone(record.memory!.commit); record.recoverySeed = structuredClone(record.memory!.seed);
+      if (acknowledged) return;
       if (entry.type === 'message') record.nativeObjects?.set(entry.message, { entryId: entry.id, original: structuredClone(entry.message) });
       if (entry.type === 'custom_message' && record.session?.isIdle) {
         // Fixed 0.85.1 idle custom push precedes this append: its actual array tail is the source object.

@@ -3,6 +3,7 @@ import { expect, it } from 'bun:test';
 import { SessionManager, sessionEntryToContextMessages } from '@earendil-works/pi-coding-agent';
 import type { NativeSessionHistory, NativeHistoryRecoverySeed } from '@flowmate/contracts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
+import { referenceIds } from '../../packages/runtime-pi/src/memory/history.ts';
 import { appError, fail, ok } from '@flowmate/contracts';
 import { mkdtempSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -335,5 +336,61 @@ it('P9 T04 failed effective prepare keeps acknowledged history and prevents any 
     expect(await prepare()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(await prepare()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(attempts).toBe(1); expect(record.lastSavedHistory).toEqual(saved); expect(f.payloads).toHaveLength(0);
+  } finally { await f.close(); }
+});
+
+
+it('P9 T04 fix1 confirms an idle saved user without duplicating seed or receipt', async () => {
+  const f = await realFixture();
+  try {
+    expect((await f.adapter.prepare(f.history.header.id, f.config, { timeoutMs: 3000, stopGraceMs: 100 }, new AbortController().signal)).ok).toBe(true);
+    const record = (f.adapter as any).sessions.get(f.history.header.id);
+    const id = record.manager.appendMessage({ role: 'user', content: 'idle native user', timestamp: 8 });
+    const before = structuredClone({ saved: record.lastSavedHistory, seed: record.recoverySeed, receipt: record.receipt });
+    const writes = f.writes.length;
+    expect(() => record.manager._persist(record.manager.getEntry(id))).not.toThrow();
+    expect({ saved: record.lastSavedHistory, seed: record.recoverySeed, receipt: record.receipt }).toEqual(before);
+    expect(f.writes).toHaveLength(writes); expect(f.adapter.inspect(f.history.header.id).availability).toBe('ready');
+    expect((await f.adapter.prepare(f.history.header.id, f.config, { timeoutMs: 3000, stopGraceMs: 100 }, new AbortController().signal)).ok).toBe(true);
+    expect(f.payloads).toHaveLength(0);
+    record.manager.getEntry(id).message.content = 'changed same ID';
+    expect(() => record.manager._persist(record.manager.getEntry(id))).toThrow();
+    expect({ saved: record.lastSavedHistory, seed: record.recoverySeed, receipt: record.receipt }).toEqual(before);
+    expect(f.writes).toHaveLength(writes); expect(f.adapter.inspect(f.history.header.id).availability).toBe('unusable');
+  } finally { await f.close(); }
+});
+
+it('P9 T04 fix1 retains real root label and compaction references in fork and actual request binding', async () => {
+  const f = await realFixture(); const bindings: any[] = [];
+  try {
+    const header = SessionManager.inMemory(f.root).getHeader()!, timestamp = new Date(0).toISOString();
+    const history: NativeSessionHistory = { storageVersion: 1, header, unusable: false, leafId: 'compact', entries: [
+      { id: 'root', parentId: null, timestamp, type: 'message', message: { role: 'user', content: 'off-path real root', timestamp: 1 } },
+      { id: 'label', parentId: 'root', timestamp, type: 'label', targetId: 'root', label: 'root label' },
+      { id: 'selected', parentId: null, timestamp, type: 'message', message: { role: 'user', content: 'selected branch', timestamp: 2 } },
+      { id: 'compact', parentId: 'selected', timestamp, type: 'compaction', summary: 'kept summary', firstKeptEntryId: 'root', tokensBefore: 10 },
+    ] };
+    expect(validateNativeHistory(history).ok).toBe(true);
+    const before = structuredClone(history), files = readdirSync(f.root);
+    const fork = f.adapter.buildForkSessionHistory({ source: history, targetEntryId: 'compact' });
+    expect(fork.ok).toBe(true);
+    if (fork.ok) expect(fork.data.entries).toEqual(history.entries);
+    expect(history).toEqual(before); expect(readdirSync(f.root)).toEqual(files);
+    expect(referenceIds(history.entries[1]!)).toEqual(['root']); expect(referenceIds(history.entries[3]!)).toEqual(['root']);
+    for (const fromId of ['root', null]) {
+      expect(referenceIds({ id: 'summary', parentId: null, timestamp, type: 'branch_summary', summary: 'summary', fromId })).toEqual([]);
+      expect(referenceIds({ id: 'message', parentId: null, timestamp, type: 'message', message: { role: 'branchSummary', summary: 'summary', fromId, timestamp: 1 } })).toEqual([]);
+    }
+    const recovery = seed(history), commit = { commitRevision: 1, entryCount: history.entries.length, leafId: history.leafId };
+    expect(f.adapter.restoreSession(header.id, history, recovery, commit).ok).toBe(true);
+    expect(f.adapter.watchSession(header.id, commit, recovery, write => ok({ commitRevision: write.expected.commitRevision + 1,
+      entryCount: write.history.entries.length, leafId: write.history.leafId })).ok).toBe(true);
+    const prepared = await f.adapter.prepare(header.id, f.config, { timeoutMs: 3000, stopGraceMs: 100 }, new AbortController().signal);
+    if (!prepared.ok) throw prepared.error;
+    const outcome = await prepared.data.execute({ runId: 9, sessionId: 7, inputId: 50, contextSnapshotId: 60, text: 'new input', promptText: 'new input', goal: 'test', messageTimestamp: 4,
+      verifyModelUse: () => ok(undefined), verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined),
+      contextHooks: { bind: value => { bindings.push(value.binding); return ok(undefined); }, record: () => ok(undefined), resolveToolResult: () => fail(appError('context_binding_unknown', 'runtime', 'No tools.')) } }, new AbortController().signal, () => {});
+    expect(outcome.error).toBeNull(); expect(f.payloads).toHaveLength(1);
+    expect(bindings[0].includedNativeContexts).toContainEqual(expect.objectContaining({ nativeEntryId: 'compact', referenceEntryIds: ['root'] }));
   } finally { await f.close(); }
 });

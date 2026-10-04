@@ -14,8 +14,10 @@ export function managerFor(history: NativeSessionHistory): SessionManager {
 }
 export function referenceIds(entry: NativeSessionHistory['entries'][number] | SessionEntry): string[] {
   const e = entry as NativeSessionEntry;
-  const reference = e.type === 'label' ? e.targetId : e.type === 'compaction' ? e.firstKeptEntryId
-    : e.type === 'branch_summary' ? e.fromId : e.type === 'message' && e.message.role === 'branchSummary' ? e.message.fromId : null;
+  if (e.type === 'label') return [e.targetId];
+  if (e.type === 'compaction') return [e.firstKeptEntryId];
+  const reference = e.type === 'branch_summary' ? e.fromId
+    : e.type === 'message' && e.message.role === 'branchSummary' ? e.message.fromId : null;
   return reference === null || reference === 'root' ? [] : [reference];
 }
 function validSequence(messages: readonly AgentMessage[], complete: boolean): boolean {

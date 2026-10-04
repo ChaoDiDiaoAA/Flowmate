@@ -369,3 +369,21 @@ describe('P8 Context strict contracts', () => {
     expect(contracts.ToolExecutionContextSchema.safeParse({ ...toolContext, requestBinding: { ...binding, sessionId: 6 } }).success).toBe(false);
   });
 });
+
+
+it('P9 T04 fix1 admits the actual root entry reference only for compaction', () => {
+  const validator = schema('NativeDerivedContextBindingSchema');
+  const binding = { nativeEntryId: 'compact', originSessionId: 2, entryType: 'compaction', messageRole: 'compactionSummary',
+    contextMessageIndex: 0, referenceEntryIds: ['root'] };
+  expect(validator.safeParse(binding).success).toBe(true);
+  for (const patch of [
+    { entryType: 'branch_summary', messageRole: 'branchSummary' },
+    { entryType: 'message', messageRole: 'branchSummary' },
+    { entryType: 'custom_message', messageRole: 'custom' },
+    { entryType: 'message', messageRole: 'compactionSummary' },
+    { referenceEntryIds: ['root', 'root'] },
+    { referenceEntryIds: ['ordinary', 'ordinary'] },
+    { inputId: 3 },
+  ]) expect(validator.safeParse({ ...binding, ...patch }).success).toBe(false);
+  expect(validator.safeParse({ ...binding, referenceEntryIds: ['root', 'ordinary'] }).success).toBe(true);
+});
