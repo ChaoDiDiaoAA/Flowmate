@@ -88,7 +88,7 @@ function serviceFor(provider: ProviderPort, runsOverride?: RunRepository) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-'));
   const db = openDatabase(paths(root));
   if (!db.ok) throw new Error(db.error.message);
-  const service = new RuntimeService({
+  const service = new RuntimeService({ memory: db.data.memory,
     runs: runsOverride ?? db.data.runs,
     provider,
     log: { write: () => undefined, close: async () => undefined },
@@ -158,7 +158,7 @@ describe('RuntimeService lifecycle', () => {
       async close() { return { stopped: true, closed: true, errors: [] as const }; },
     };
     const service = new RuntimeService({
-      runs,
+      memory: db.data.memory, runs,
       provider,
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
@@ -279,7 +279,7 @@ describe('RuntimeService lifecycle', () => {
       },
       async close() { return { stopped: true, closed: true, errors: [] as const }; },
     };
-    const service = new RuntimeService({
+    const service = new RuntimeService({ memory: db.data.memory,
       runs: db.data.runs,
       provider,
       log: { write: () => undefined, close: async () => undefined },
@@ -524,7 +524,7 @@ describe('RuntimeService lifecycle', () => {
       },
     };
     const service = new RuntimeService({
-      runs,
+      memory: db.data.memory, runs,
       provider: new ControlledProvider('success'),
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
@@ -558,7 +558,7 @@ describe('RuntimeService lifecycle', () => {
       },
     });
     const service = new RuntimeService({
-      runs,
+      memory: db.data.memory, runs,
       provider: new ControlledProvider('abort'),
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
@@ -607,7 +607,7 @@ describe('RuntimeService lifecycle', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-deadline-'));
     const opened = openDatabase(paths(root));
     if (!opened.ok) throw new Error(opened.error.code);
-    const service = new RuntimeService({ runs: opened.data.runs, provider,
+    const service = new RuntimeService({ memory: opened.data.memory, runs: opened.data.runs, provider,
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z', monotonicNow: () => elapsed });
     const result = await service.callProvider(request, { onObservation(event) {
@@ -657,7 +657,7 @@ describe('RuntimeService lifecycle', () => {
       },
       async close() { return { stopped: !pendingWork, closed: !pendingWork, errors: pendingWork ? [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: 'Provider 请求仍在收口。', retryable: true }] : [] }; },
     };
-    const service = new RuntimeService({
+    const service = new RuntimeService({ memory: db.data.memory,
       runs: db.data.runs,
       provider,
       log: { write: () => undefined, close: async () => undefined },

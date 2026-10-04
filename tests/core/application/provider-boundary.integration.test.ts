@@ -11,7 +11,7 @@ function fixture(provider: ProviderPort) {
   const database = openDatabase({ root, databaseFile: join(root, 'data', 'trial.sqlite'),
     logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') });
   if (!database.ok) throw new Error(database.error.code);
-  const runtime = new RuntimeService({ runs: database.data.runs, provider,
+  const runtime = new RuntimeService({ memory: database.data.memory, runs: database.data.runs, provider,
     log: { write() {}, async close() {} }, now: () => new Date().toISOString(), monotonicNow: () => performance.now() });
   const app = makeApplication(runtime, database.data.runs, async () => {
     database.data.close();

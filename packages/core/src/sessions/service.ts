@@ -30,7 +30,10 @@ import type {
   SetSessionStatusRequest,
   BranchSessionRequest,
   BranchSessionResult,
+  MemoryStore, NativeHistoryPageRequest, NativeHistoryPage, SessionHistoryEntryRequest, SessionHistoryEntryDetail,
+  NativeHistoryWrite, HistoryCommitReceipt,
 } from '@flowmate/contracts';
+import { createHistoryReader } from '../memory/history.ts';
 import type { SessionRepository, SessionRow, RunRepository } from '../storage/repositories.ts';
 import type { SessionInputLedger } from './input-ledger.ts';
 
@@ -43,6 +46,7 @@ export class SessionService {
     private readonly runtimeState: () => RuntimeState,
     private readonly now: () => string,
     private readonly runs: RunRepository,
+    private readonly memory: Pick<MemoryStore, 'load' | 'commit'>,
     private readonly inputs?: SessionInputLedger,
     private readonly startInput?: (request: NormalizedAgentRunRequest, submission: NormalizedSessionInputRequest, control?: AgentControl) => Promise<Result<RunAccepted>>,
     private readonly appendInput?: (request: NormalizedActiveInputRequest) => Promise<Result<SessionInputAccepted>>,
@@ -50,6 +54,25 @@ export class SessionService {
   ) {}
 
   public isManaging(sessionId: DbId): boolean { return this.managing.has(sessionId); }
+
+  private historyReader() {
+    return createHistoryReader({ repository: this.repository, agent: this.agent, project: row => this.project(row),
+      managementReason: row => {
+        const state = this.runtimeState();
+        if (this.managing.has(row.sessionId) || state.active?.kind === 'agent' && state.active.sessionId === row.sessionId) return 'busy';
+        const eligibility = this.verifyMutation?.(row.sessionId);
+        if (state.blocked || eligibility && !eligibility.ok || row.status !== 'active' || row.deletePending) return 'session-unavailable';
+        try {
+          const availability = this.agent.inspect(row.nativeSessionId).availability;
+          if (availability === 'busy') return 'busy';
+          if (availability === 'unusable') return 'session-unavailable';
+        } catch { return 'session-unavailable'; }
+        return null;
+      } });
+  }
+  public listHistory(request: NativeHistoryPageRequest): Result<NativeHistoryPage> { return this.historyReader().list(request); }
+  public async querySessionHistory(request: NativeHistoryPageRequest): Promise<Result<NativeHistoryPage>> { return this.listHistory(request); }
+  public async querySessionHistoryEntry(request: SessionHistoryEntryRequest): Promise<Result<SessionHistoryEntryDetail>> { return this.historyReader().detail(request); }
 
   public async submitInput(raw: SessionInputRequest, control?: AgentControl): Promise<Result<SessionInputAccepted>> {
     const normalized = normalizeSessionInputRequest(raw);
@@ -112,73 +135,57 @@ export class SessionService {
     if (!acquired.ok) return acquired;
     let retainBlocked = false;
     try {
-      const row = this.repository.get(request.sessionId);
-      if (!row.ok) return row;
-      if (row.data.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
-      if (row.data.status !== 'active') return fail(appError('session_archived', 'session', 'Session is archived.'));
-      if (row.data.modelUseBlocked) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
-      if (row.data.nativeUnusable || row.data.historyState !== 'recoverable') return fail(appError('session_history_invalid', 'session', 'Saved history is unusable.'));
-      const restored = ensureNativeSession(this.repository, this.agent, row.data);
-      if (!restored.ok) return restored;
-      if (!this.agent.moveSessionLeaf || !this.agent.restoreSessionLeaf) return fail(appError('session_branch_unavailable', 'session', 'Native branch selection is unavailable.'));
-      if (this.agent.inspect(row.data.nativeSessionId).availability !== 'ready') return fail(appError('session_busy', 'session', 'Native Session is active.', true));
-      const loaded = this.repository.loadHistory(request.sessionId);
-      if (!loaded.ok) return loaded;
-      const committed = loaded.data;
-      if (!committed || committed.leafId !== request.expectedLeafId || committed.entries.length !== request.expectedEntryCount)
+      const frozen = this.repository.readHistorySnapshot(request.sessionId, value => ok(value));
+      if (!frozen.ok) return frozen;
+      const { row, bundle, blocked } = frozen.data;
+      if (row.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
+      if (row.status !== 'active') return fail(appError('session_archived', 'session', 'Session is archived.'));
+      if (blocked) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
+      const { history, commit, seed } = bundle;
+      if (!history || !commit || history.unusable || row.historyState !== 'recoverable')
+        return fail(appError('session_history_invalid', 'session', 'Saved history is unusable.'));
+      if (commit.commitRevision !== request.expectedCommitRevision || commit.entryCount !== request.expectedEntryCount || commit.leafId !== request.expectedLeafId)
         return fail(appError('state_conflict', 'session', 'Saved branch position has changed.', true));
-      const path = new Set<string>();
-      let entryId = committed.leafId;
-      while (entryId !== null) {
-        if (path.has(entryId)) return fail(appError('session_history_invalid', 'session', 'Saved path is invalid.'));
-        path.add(entryId);
-        const entry = committed.entries.find(item => item.id === entryId);
-        if (!entry) return fail(appError('session_history_invalid', 'session', 'Saved path is incomplete.'));
-        entryId = entry.parentId;
-      }
-      const target = committed.entries.find(entry => entry.id === request.targetEntryId);
-      const message = target?.message as { role?: string; stopReason?: string; content?: { type?: string; text?: string }[] } | undefined;
-      if (!path.has(request.targetEntryId) || target?.type !== 'message' || message?.role !== 'assistant' || message.stopReason !== 'stop'
-        || !Array.isArray(message.content) || message.content.some(part => part.type === 'toolCall')
-        || !message.content.some(part => part.type === 'text' && part.text?.trim()))
-        return fail(appError('input_invalid', 'input', 'Select a saved final assistant response on the current branch.'));
-      const moved = committed.leafId === request.targetEntryId ? ok(committed)
-        : await this.agent.moveSessionLeaf(row.data.nativeSessionId, request.targetEntryId);
-      let confirmed = committed.leafId === request.targetEntryId ? committed : null;
-      if (moved.ok && confirmed === null) {
-        const saved = this.repository.saveHistory(request.sessionId, moved.data);
-        if (saved.ok) confirmed = moved.data;
-      }
-      if (confirmed === null) {
-        const latest = this.repository.loadHistory(request.sessionId);
-        if (!latest.ok || !latest.data) {
-          retainBlocked = true;
-          try { await this.agent.releaseSession(row.data.nativeSessionId); } catch { /* the management gate remains closed */ }
-          return fail(appError('session_history_invalid', 'session', 'Committed branch position cannot be confirmed.', true));
-        }
-        confirmed = latest.data;
-      }
-      const bundle = this.repository.loadHistoryForContext(request.sessionId);
-      let matchesPersistedHistory = false;
-      if (bundle.ok) {
+      if (!this.agent.moveSessionLeaf || !this.agent.restoreSessionLeaf || !this.agent.inspectSessionHistory)
+        return fail(appError('session_branch_unavailable', 'session', 'Native branch selection is unavailable.'));
+      const inspection = this.agent.inspectSessionHistory({ history, seed });
+      if (!inspection.ok) return inspection;
+      if (inspection.data.positions.find(position => position.entryId === request.targetEntryId)?.contextState !== 'complete')
+        return fail(appError('session_branch_unavailable', 'session', 'Select a complete saved native context.'));
+      const restored = ensureNativeSession(this.repository, this.agent, row, this.memory);
+      if (!restored.ok) return restored;
+      const intended = { history: { ...history, leafId: request.targetEntryId }, seed,
+        commit: { ...commit, leafId: request.targetEntryId, commitRevision: commit.commitRevision + (history.leafId === request.targetEntryId ? 0 : 1) } };
+      const moved = await this.agent.moveSessionLeaf(row.nativeSessionId, request.targetEntryId);
+      let failure = moved.ok ? appError('storage_write_failed', 'storage', 'Branch selection could not be saved.', true) : moved.error;
+      if (moved.ok && sameJson(moved.data, intended.history)) {
         try {
-          matchesPersistedHistory = isDeepStrictEqual(JSON.parse(JSON.stringify(bundle.data.history)), JSON.parse(JSON.stringify(confirmed)));
-        } catch { /* Unserializable history cannot confirm the persisted branch. */ }
+          const saved = this.memory.commit({ sessionId: request.sessionId, expected: commit, header: history.header,
+            appendEntries: [], contexts: [], leafId: request.targetEntryId, unusable: history.unusable });
+          if (!saved.ok) failure = saved.error;
+        } catch { /* Query this operation once; never repeat a position mutation or CAS. */ }
       }
-      if (!bundle.ok || !matchesPersistedHistory || bundle.data.commit === null) {
+      const readback = this.repository.readHistorySnapshot(request.sessionId, value => ok(value));
+      const latest = readback.ok ? ok(readback.data.bundle) : readback;
+      const unchangedAssociations = readback.ok && sameJson(readback.data.associations, frozen.data.associations) && !readback.data.blocked;
+      const targetConfirmed = latest.ok && unchangedAssociations && sameJson(latest.data, intended);
+      const oldConfirmed = latest.ok && unchangedAssociations && sameJson(latest.data, bundle);
+      if (!latest.ok || !targetConfirmed && !oldConfirmed || !latest.data.history || !latest.data.commit) {
         retainBlocked = true;
-        try { await this.agent.releaseSession(row.data.nativeSessionId); } catch { /* preserve the closed management gate */ }
-        return bundle.ok ? fail(appError('context_binding_unknown', 'runtime', 'Committed branch sources could not be confirmed.')) : bundle;
+        const sticky = this.repository.markHistoryUnusable(request.sessionId);
+        try { await this.agent.releaseSession(row.nativeSessionId); } catch { /* The management gate remains closed. */ }
+        return !sticky.ok ? sticky : !latest.ok ? latest : fail(appError('session_history_invalid', 'session', 'Committed branch position cannot be confirmed.', true));
       }
-      const reverted = this.agent.restoreSessionLeaf(row.data.nativeSessionId, confirmed, bundle.data.seed, bundle.data.commit);
-      if (!reverted.ok) {
+      const confirmed = this.agent.restoreSessionLeaf(row.nativeSessionId, latest.data.history, latest.data.seed, latest.data.commit);
+      if (!confirmed.ok) {
         retainBlocked = true;
-        this.repository.saveHistory(request.sessionId, { ...confirmed, unusable: true });
-        return fail(appError('session_history_invalid', 'session', 'Native branch restoration could not be confirmed.', true));
+        const sticky = this.repository.markHistoryUnusable(request.sessionId);
+        try { await this.agent.releaseSession(row.nativeSessionId); } catch { /* Preserve the management gate. */ }
+        return !sticky.ok ? sticky : confirmed;
       }
-      if (confirmed.leafId === request.targetEntryId)
-        return ok({ session: this.project(row.data), leafId: request.targetEntryId, entryCount: confirmed.entries.length });
-      return moved.ok ? fail(appError('storage_write_failed', 'storage', 'Branch selection could not be saved.', true)) : moved;
+      if (targetConfirmed && moved.ok)
+        return ok({ session: this.project(row), leafId: request.targetEntryId, entryCount: history.entries.length });
+      return fail(failure);
     } finally { if (!retainBlocked) this.managing.delete(request.sessionId); }
   }
 
@@ -197,9 +204,11 @@ export class SessionService {
       try { await this.agent.releaseSession(native.data.nativeSessionId); } catch { /* preserve the failed DB insert */ }
       return row;
     }
-    const watched = this.agent.watchSession?.(native.data.nativeSessionId,
-      (snapshot, context) => this.repository.saveHistory(row.data.sessionId, snapshot, context));
-    if (watched && !watched.ok) {
+    // Older ports can still create a browse-only product identity; no durable
+    // Header means they cannot advertise native readiness or admit a new Run.
+    if (!history) return ok(this.project(row.data));
+    const watched = ensureNativeSession(this.repository, this.agent, row.data, this.memory);
+    if (!watched.ok) {
       await this.agent.releaseSession(native.data.nativeSessionId);
       return watched;
     }
@@ -292,6 +301,7 @@ export class SessionService {
       try {
         const inspected = this.agent.inspect(row.nativeSessionId);
         availability = row.nativeUnusable ? 'unusable'
+          : row.historyState !== 'recoverable' ? 'history-unavailable'
           : activeRunId !== null || inspected.availability === 'busy' ? 'busy'
           : inspected.availability === 'ready' ? 'ready'
             : inspected.availability === 'unusable' ? 'unusable'
@@ -317,27 +327,80 @@ export class SessionService {
   }
 }
 
-export function ensureNativeSession(repository: SessionRepository, agent: AgentPort, row: SessionRow): Result<void> {
+export function ensureNativeSession(repository: SessionRepository, agent: AgentPort, row: SessionRow, memory: Pick<MemoryStore, 'load' | 'commit'>): Result<void> {
   if (row.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'This conversation cannot continue after an interrupted request.'));
   let availability: ReturnType<AgentPort['inspect']>['availability'];
   try {
     availability = agent.inspect(row.nativeSessionId).availability;
   } catch { return fail(appError('agent_session_unavailable', 'session', 'Conversation state is unavailable.')); }
-  if (availability === 'busy' || availability === 'unusable') return ok(undefined);
+  if (availability === 'busy') return fail(appError('session_busy', 'session', 'Native Session is active.', true));
+  if (availability === 'unusable') return fail(appError('agent_session_unusable', 'session', 'Native Session is unusable.'));
   if (availability === 'missing' && (row.historyState !== 'recoverable' || !agent.restoreSession || !agent.watchSession)) {
     return fail(appError(row.historyState === 'invalid' ? 'session_history_invalid' : 'session_history_unavailable',
       'session', 'This conversation cannot be restored. Start a new chat.'));
   }
-  const bundle = repository.loadHistoryForContext(row.sessionId);
+  const bundle = repository.readHistorySnapshot(row.sessionId, value => value.blocked
+    ? fail(appError('session_scope_revoked', 'session', 'Material access was revoked.')) : ok(value.bundle));
   if (!bundle.ok) return bundle;
-  if (!bundle.data.history || !bundle.data.commit) return availability === 'ready' ? ok(undefined)
-    : fail(appError('session_history_unavailable', 'session', 'This conversation has no saved native history.'));
-  if (availability === 'ready') return agent.restoreSessionLeaf
-    ? agent.restoreSessionLeaf(row.nativeSessionId, bundle.data.history, bundle.data.seed, bundle.data.commit)
-    : fail(appError('context_binding_unknown', 'runtime', 'Saved conversation sources cannot be reconnected.'));
-  const restored = agent.restoreSession!(row.nativeSessionId, bundle.data.history, bundle.data.seed, bundle.data.commit);
+  if (!bundle.data.history || !bundle.data.commit || !agent.watchSession)
+    return fail(appError('session_history_unavailable', 'session', 'This conversation has no saved native history.'));
+  const restore = availability === 'ready' ? agent.restoreSessionLeaf : agent.restoreSession;
+  if (!restore) return fail(appError('context_binding_unknown', 'runtime', 'Saved conversation sources cannot be reconnected.'));
+  const restored = restore.call(agent, row.nativeSessionId, bundle.data.history, bundle.data.seed, bundle.data.commit);
   if (!restored.ok) return restored;
-  return agent.watchSession!(row.nativeSessionId, (snapshot, context) => repository.saveHistory(row.sessionId, snapshot, context));
+  return agent.watchSession(row.nativeSessionId, bundle.data.commit, bundle.data.seed, write => commitNativeWrite(repository, memory, row.sessionId, write));
+}
+
+function sameJson(a: unknown, b: unknown): boolean { return isDeepStrictEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b))); }
+function commitNativeWrite(repository: SessionRepository, memory: Pick<MemoryStore, 'load' | 'commit'>, sessionId: DbId,
+  write: NativeHistoryWrite): Result<HistoryCommitReceipt> {
+  const writeInputIds = [...new Set(write.contexts.flatMap(context => [
+    ...(context.inputId === undefined ? [] : [context.inputId]), ...(context.resultInputIds ?? [])]))];
+  const before = repository.readHistorySnapshot(sessionId, value => ok(value), writeInputIds);
+  if (!before.ok) return before;
+  const frozen = before.data;
+  if (!frozen.bundle.history || !sameJson(frozen.bundle.commit, write.expected))
+    return fail(appError('state_conflict', 'session', 'Conversation history has changed.', true));
+  const changed = !sameJson(frozen.bundle.history, write.history);
+  const intended = { commitRevision: write.expected.commitRevision + (changed ? 1 : 0), entryCount: write.history.entries.length, leafId: write.history.leafId };
+  const contexts = new Map(write.contexts.map(context => [context.entryId, context]));
+  const oldEntries = new Map(frozen.associations.entries.map(entry => [entry.entry_id, entry]));
+  // Freeze the exact association effects declared by this write, before invoking SQL.
+  const associations = { entries: write.history.entries.map(entry => oldEntries.get(entry.id)
+      ?? { entry_id: entry.id, run_id: contexts.get(entry.id)?.runId ?? null }),
+    inputs: structuredClone(frozen.associations.inputs) };
+  for (const entry of write.history.entries) {
+    const context = contexts.get(entry.id); if (!context) continue;
+    for (const input of associations.inputs) {
+      if (input.id === context.inputId && input.status !== 'consumed') {
+        input.status = 'consumed'; input.native_entry_id = entry.id; input.updated_at = entry.timestamp;
+      }
+      if (context.resultInputIds?.includes(input.id as number) && input.result_entry_id === null) {
+        input.result_entry_id = entry.id; input.updated_at = entry.timestamp;
+      }
+    }
+  }
+  let saved: Result<HistoryCommitReceipt>;
+  try { saved = memory.commit({ sessionId, expected: write.expected, header: write.history.header, appendEntries: write.history.entries,
+    leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts }); }
+  catch { saved = fail(appError('storage_write_failed', 'storage', 'Conversation history could not be saved.', true)); }
+  if (saved.ok && sameJson(saved.data, intended)) return saved;
+  const loaded = repository.readHistorySnapshot(sessionId, value => ok(value), writeInputIds);
+  if (loaded.ok && sameJson(loaded.data.bundle.history, write.history) && sameJson(loaded.data.bundle.commit, intended)
+    && sameJson(loaded.data.associations, associations)) {
+    const seed = loaded.data.bundle.seed;
+    const origins = new Map(seed.origins.map(origin => [origin.nativeEntryId, origin]));
+    const originalSourcesMatch = frozen.bundle.seed.origins.every(origin => sameJson(origin, origins.get(origin.nativeEntryId)))
+      && frozen.bundle.seed.inputs.every(input => sameJson(input, seed.inputs.find(item => item.nativeEntryId === input.nativeEntryId)));
+    const appendedSourcesMatch = write.history.entries.slice(write.expected.entryCount).every(entry => {
+      const context = contexts.get(entry.id); const origin = origins.get(entry.id);
+      return origin?.originSessionId === sessionId && origin.originRunId === (context?.runId ?? null);
+    });
+    if (originalSourcesMatch && appendedSourcesMatch) return ok(intended);
+  }
+  const blocked = repository.markHistoryUnusable(sessionId);
+  if (!blocked.ok) return blocked;
+  return !saved.ok ? saved : fail(appError('storage_write_failed', 'storage', 'Conversation history receipt could not be confirmed.', true));
 }
 
 function deleteInProgress<T>(): Result<T> {

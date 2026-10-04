@@ -24,7 +24,7 @@ function fixture(provider: ProviderPort, monotonicNow = () => performance.now())
     logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'),
     outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') });
   if (!database.ok) throw new Error(database.error.code);
-  const service = new RuntimeService({ runs: database.data.runs, provider,
+  const service = new RuntimeService({ memory: database.data.memory, runs: database.data.runs, provider,
     log: { write() {}, close: async () => undefined }, now: () => new Date().toISOString(), monotonicNow });
   return { service, database: database.data };
 }

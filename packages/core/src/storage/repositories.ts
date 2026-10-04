@@ -288,7 +288,11 @@ export interface BusinessEventRepository {
   getByOperation(input: { type: BusinessEventType; operationRef: string; result?: 'succeeded' | 'failed' }): Result<BusinessEventSnapshot | null>;
 }
 
+export type SessionHistorySnapshot = { row: SessionRow; bundle: NativeHistoryRecoveryBundle; blocked: boolean;
+  associations: { entries: { entry_id: string; run_id: number | null }[]; inputs: Record<string, unknown>[] } };
 export interface SessionRepository {
+  markHistoryUnusable(sessionId: DbId): Result<void>;
+  readHistorySnapshot<T>(sessionId: DbId, read: (value: SessionHistorySnapshot) => Result<T>, writeInputIds?: readonly DbId[]): Result<T>;
   create(input: NewSession): Result<SessionRow>;
   get(sessionId: DbId): Result<SessionRow>;
   list(request: NormalizedListSessionsRequest): Result<{ items: SessionRow[]; next: SessionCursor | null }>;
@@ -2709,7 +2713,21 @@ function hasTable(db: Database, table: string): boolean {
 
 export function createSessionRepository(db: Database, events?: RuntimeEventStore): SessionRepository {
   const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
+  const readAuthorization = (sessionId: DbId, origins = createNativeOriginReader(db)): Result<boolean> => {
+    try {
+      return ok(readTransaction(db, () => origins.ancestors(sessionId).some(owner => {
+        const row = db.query('SELECT metadata_json FROM sessions WHERE id=?').get(owner) as { metadata_json: string } | null;
+        if (!row) throw new NativeOriginFault();
+        return parseSessionModelUse(row.metadata_json) !== null;
+      })));
+    } catch (error) { return fail(error instanceof NativeOriginFault ? error.error
+      : appError('storage_read_failed', 'storage', 'Session authorization could not be read.', true)); }
+  };
   return {
+    markHistoryUnusable(sessionId) {
+      const result = writeTransaction(() => markUnusableInTransaction(db, sessionId));
+      return result.ok ? ok(undefined) : result;
+    },
     create(input) {
       const created = writeTransaction(() => {
         if (input.expectedRevision !== undefined) {
@@ -2750,12 +2768,47 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history is invalid. Start a new chat.')); }
     },
 
+    readHistorySnapshot(sessionId, read, writeInputIds = []) {
+      try {
+        return readTransaction(db, () => {
+          const raw = db.query('SELECT * FROM sessions WHERE id=? AND hidden_at IS NULL').get(sessionId);
+          if (!raw) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
+          const origins = createNativeOriginReader(db);
+          const bundle = origins.bundle(sessionId);
+          // The bundle already passed the same strict native-history reader. Reuse
+          // its state instead of loading and validating that body a second time.
+          const row: SessionRow = { ...sessionRow(raw), hasBusinessHistory: hasBusinessHistory(db, sessionId),
+            historyState: bundle.history ? 'recoverable' : 'legacy-read-only', nativeUnusable: bundle.history?.unusable ?? false };
+          const authorization = readAuthorization(sessionId, origins);
+          if (!authorization.ok) return authorization;
+          const blocked = authorization.data;
+          const owners = [...new Set([sessionId, ...bundle.seed.origins.map(origin => origin.originSessionId)])].sort((a, b) => a - b);
+          const associations = {
+            entries: db.query<{ entry_id: string; run_id: number | null }, [number]>('SELECT entry_id,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(sessionId),
+            inputs: owners.flatMap(owner => {
+              // Freeze associations of the proved prefix, including absent result links. An
+              // ancestor may independently accept later Inputs while this position is moving.
+              const entryIds = bundle.seed.origins.filter(origin => origin.originSessionId === owner).map(origin => origin.nativeEntryId);
+              // Target copies must not acquire target-side associations either.
+              if (owner === sessionId) entryIds.push(...(bundle.history?.entries.map(entry => entry.id) ?? []));
+              const selected = JSON.stringify(entryIds);
+              return db.query<Record<string, unknown>, [number, string, string, string]>(`SELECT * FROM session_inputs WHERE session_id=?
+                AND (native_entry_id IN (SELECT value FROM json_each(?)) OR result_entry_id IN (SELECT value FROM json_each(?))
+                  OR id IN (SELECT value FROM json_each(?))) ORDER BY id`)
+                .all(owner, selected, selected, JSON.stringify(owner === sessionId ? writeInputIds : []));
+            }),
+          };
+          return read({ row, bundle, blocked, associations });
+        });
+      } catch (error) { return evidenceReadFailure(error, 'History could not be read.'); }
+    },
+
     loadHistoryForContext(sessionId) {
       try {
-        return db.transaction(() => {
+        return readTransaction(db, () => {
           if (!db.query('SELECT id FROM sessions WHERE id=?').get(sessionId)) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
           return ok(createNativeOriginReader(db).bundle(sessionId));
-        }).deferred();
+        });
       } catch (error) {
         return fail(error instanceof SQLiteError ? appError('storage_read_failed', 'storage', 'Context history could not be read.', true)
           : appError('context_binding_unknown', 'runtime', 'Persisted input origins cannot be confirmed.'));
@@ -2764,7 +2817,7 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
 
     readHistoryForDisplay(sessionId) {
       try {
-        return ok(db.transaction(() => {
+        return ok(readTransaction(db, () => {
           if (!db.query('SELECT id FROM sessions WHERE id=?').get(sessionId))
             return { history: null, bindings: [], sessionInputs: [], origins: [] };
           const bundle = createNativeOriginReader(db).bundle(sessionId);
@@ -2777,7 +2830,7 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
               content: SessionInputContentSchema.parse(JSON.parse(row.content_json)) }];
           });
           return { history: bundle.history, bindings, sessionInputs, origins: bundle.seed.origins };
-        }).deferred());
+        }));
       } catch (error) { return fail(error instanceof SQLiteError ? appError('storage_read_failed', 'storage', 'History could not be read.', true) : new NativeOriginFault().error); }
     },
 
@@ -2813,17 +2866,7 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       return result.ok ? result.data : result;
     },
 
-    isModelUseBlocked(sessionId) {
-      try {
-        const read = () => createNativeOriginReader(db).ancestors(sessionId).some(owner => {
-          const row = db.query('SELECT metadata_json FROM sessions WHERE id=?').get(owner) as { metadata_json: string } | null;
-          if (!row) throw new NativeOriginFault();
-          return parseSessionModelUse(row.metadata_json) !== null;
-        });
-        return ok(db.inTransaction ? read() : db.transaction(read).deferred());
-      } catch (error) { return fail(error instanceof NativeOriginFault ? error.error
-        : appError('storage_read_failed', 'storage', 'Session authorization could not be read.', true)); }
-    },
+    isModelUseBlocked: readAuthorization,
 
     revokeDocumentUse(input) {
       const revoked = writeTransaction(() => {

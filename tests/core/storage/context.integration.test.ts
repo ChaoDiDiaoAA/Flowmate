@@ -12,7 +12,7 @@ import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
 import { createContextRepository, readRunContextOwner } from '../../../packages/core/src/context/repository.ts';
 import { SessionService } from '../../../packages/core/src/sessions/service.ts';
 import { projectSessionMessages } from '../../../packages/runtime-pi/src/messages.ts';
-import { resolveNativeEntryOrigin } from '../../../packages/core/src/memory/origins.ts';
+import { createNativeOriginReader, resolveNativeEntryOrigin } from '../../../packages/core/src/memory/origins.ts';
 import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok } from '@flowmate/contracts';
 import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result, ToolRuntimeObservation } from '@flowmate/contracts';
 
@@ -209,6 +209,60 @@ function p9TargetInput(f: ReturnType<typeof fixture>, target: ReturnType<typeof 
     {entryId:'target-user',runId,inputId}));
   return {runId,inputId,snapshot};
 }
+it('P9 T05 bounds repeated tool proofs to one read snapshot and keeps saved-path keys distinct', () => {
+  const f = fixture(); p9ToolHistory(f);
+  const db = f.store.db, query = spyOn(db, 'query');
+  db.transaction(() => {
+    const reader = createNativeOriginReader(db);
+    expect(Object.isFrozen(reader.history(f.session.sessionId)!.history.entries)).toBe(true);
+    const original = reader.tool(f.session.sessionId, 'inherited-call', true);
+    expect(reader.tool(f.session.sessionId, 'inherited-call', true)).toEqual(original);
+    expect(query.mock.calls.filter(([sql]) => sql === 'SELECT * FROM tool_calls WHERE session_id=? AND native_tool_call_id=?')).toHaveLength(1);
+    expect(query.mock.calls.filter(([sql]) => sql === 'SELECT * FROM context_snapshots WHERE id=?')).toHaveLength(1);
+  }).deferred();
+  query.mockRestore();
+  const saved = need(f.store.memory.load(f.session.sessionId))!;
+  need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: saved.commit, header: saved.history.header,
+    appendEntries: [], contexts: [], leafId: 'p8-user', unusable: false }));
+  db.transaction(() => {
+    const reader = createNativeOriginReader(db);
+    expect(reader.tool(f.session.sessionId, 'inherited-call', true).toolCallId).toBeGreaterThan(0);
+    expect(() => reader.tool(f.session.sessionId, 'inherited-call', false)).toThrow('context_binding_unknown');
+  }).deferred();
+  db.query("UPDATE tool_calls SET tool_name='corrupted-original' WHERE native_tool_call_id='inherited-call'").run();
+  expect(f.store.context.resolveToolResult({ sessionId: f.session.sessionId, nativeToolCallId: 'inherited-call' }))
+    .toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
+  expect(() => db.transaction(() => createNativeOriginReader(db).tool(f.session.sessionId, 'inherited-call', true)).deferred())
+    .toThrow('context_binding_unknown');
+});
+for (const fault of ['owner-run', 'owner-session', 'owner-job', 'missing', 'corrupt'] as const) it(`P9 T05 snapshot proof rejects ${fault} after a prior successful proof`, () => {
+  const f=fixture(),{saved}=p9ToolHistory(f),db=f.store.db;
+  expect(() => db.transaction(() => createNativeOriginReader(db).tool(f.session.sessionId,'inherited-call',true)).deferred()).not.toThrow();
+  // Simulate an externally corrupted database after the first coherent read.
+  db.exec('DROP TRIGGER context_run_update_guard; DROP TRIGGER context_snapshot_update_guard');
+  if(fault==='missing') { db.exec('PRAGMA foreign_keys=OFF'); db.query('UPDATE runs SET current_context_snapshot_id=999999 WHERE id=?').run(f.runId); db.exec('PRAGMA foreign_keys=ON'); }
+  else if(fault==='corrupt') db.query("UPDATE context_snapshots SET snapshot_json='{}' WHERE id=?").run(saved.snapshot.id);
+  else {
+    const otherSession=need(f.store.sessions.create({nativeSessionId:'other-owner',title:'Other',at}));
+    const otherRun=legacyRun(f,otherSession.nativeSessionId,otherSession.sessionId);
+    const jobId=fault==='owner-job'?business(f):null;
+    const history=need(f.store.memory.load(f.session.sessionId))!.history;
+    need(saveTestHistory(db,f.store.runtimeEventStore,otherSession.sessionId,{...history,header:{...history.header,id:otherSession.nativeSessionId},
+      entries:[{type:'message',id:'other-message',parentId:null,timestamp:at,message:{role:'assistant',content:[{type:'text',text:'Other'}],...nativeAssistantFacts,stopReason:'stop',timestamp:5}}],leafId:'other-message'}));
+    db.query("UPDATE session_native_entries SET run_id=? WHERE session_id=? AND entry_id='other-message'").run(otherRun,otherSession.sessionId);
+    db.query('UPDATE runs SET config_json=?,current_context_snapshot_id=?,context_observations_json=?,job_id=?,session_id=? WHERE id=?')
+      .run(JSON.stringify({...f.config,agent:{...f.config.agent,nativeSessionId:otherSession.nativeSessionId}}),saved.snapshot.id,JSON.stringify({version:1,requests:[]}),jobId,
+        fault==='owner-session'?f.session.sessionId:otherSession.sessionId,otherRun);
+    db.transaction(() => {
+      const reader=createNativeOriginReader(db);
+      expect(reader.tool(f.session.sessionId,'inherited-call',true).context?.snapshotId).toBe(saved.snapshot.id);
+      expect(() => reader.resolve(otherSession.sessionId,'other-message')).toThrow('context_binding_unknown');
+    }).deferred();
+    return;
+  }
+  expect(() => db.transaction(() => createNativeOriginReader(db).tool(f.session.sessionId,'inherited-call',true)).deferred())
+    .toThrow('context_binding_unknown');
+});
 it('P9 T03 shares origin verification across five read paths and keeps target primary facts', () => {
   const f=fixture(),{saved,toolId}=p9ToolHistory(f),target=frozenFork(f,f.session.sessionId,'five',['p8-user','native-call','native-result']),local=p9TargetInput(f,target);
   const binding:RequestContextBinding={...f.binding(saved.inputId,saved.snapshot.id),sessionId:target.sessionId,nativeSessionId:target.nativeSessionId,
@@ -219,7 +273,7 @@ it('P9 T03 shares origin verification across five read paths and keeps target pr
   const service=new SessionService(f.store.sessions,{projectSessionMessages,inspect:()=>({availability:'missing'}),
     createSession(){throw new Error('No native create during projection');},async prepare(){throw new Error('No model prepare during projection');},
     async close(){return {stopped:true,closed:true,errors:[]};},async releaseSession(){return {stopped:true,closed:true,errors:[]};}},
-    ()=>({active:null,blocked:false,error:null}),()=>at,f.store.runs);
+    ()=>({active:null,blocked:false,error:null}),()=>at,f.store.runs, f.store.memory);
   readRunContextOwner(f.store.db,f.store.db.query('SELECT * FROM runs WHERE id=?').get(f.runId) as Parameters<typeof readRunContextOwner>[1]);
   expect(f.store.runs.get(f.runId).ok).toBe(true);
   expect(f.store.runs.get(local.runId).ok).toBe(true);

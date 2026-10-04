@@ -78,13 +78,13 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
   deferCleanup(() => server.stop(true));
   const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir, tools: definitions,
     credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-runtime-key', sessionSetup: setup });
-  const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, tools, agent, workspaceVerifier: verify,
+  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, tools, agent, workspaceVerifier: verify,
     ...(options.p8 ? { contextService: new ContextService({ store, materials: {
       inspectParsed: input => documents.inspectParsedForContext(input) } }), contextRepository: store.context } : {}),
     provider: { async prepare() { throw new Error('No direct Provider request is authorized.'); },
       async close() { return { stopped: true, closed: true, errors: [] }; } }, log: { write() {}, async close() {} },
     now, monotonicNow: () => performance.now() + clockOffset });
-  const sessions = new SessionService(store.sessions, agent, () => runtime.state(), now, store.runs, store.sessionInputs,
+  const sessions = new SessionService(store.sessions, agent, () => runtime.state(), now, store.runs, store.memory, store.sessionInputs,
     (request, input, control) => runtime.start(request, control, input), request => runtime.appendInput(request),
     id => runtime.verifySessionMutation(id));
   app = makeApplication(runtime, store.runs, async () => { store.close(); return { stopped: true, closed: true, errors: [] }; },

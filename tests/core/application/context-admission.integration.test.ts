@@ -21,7 +21,10 @@ function fixture(legacy = false, preparedMarker: 'p8-context-v1' | undefined = u
   history.create('native-context');
   const session = need(store.sessions.create({ nativeSessionId: 'native-context', title: 'Context', at,
     nativeHistory: need(history.exportSession('native-context')) }));
-  need(history.watchSession(session.nativeSessionId, (saved, context) => store.sessions.saveHistory(session.sessionId, saved, context)));
+  const initial = need(store.sessions.loadHistoryForContext(session.sessionId));
+  need(history.watchSession(session.nativeSessionId, initial.commit!, initial.seed, write => store.memory.commit({ sessionId: session.sessionId,
+    expected: write.expected, header: write.history.header, appendEntries: write.history.entries,
+    leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts })));
   const config: ProviderConfig = { version: 1, name: 'Context fixture', revision: 1,
     modelRef: { provider: 'fixture', model: 'fixture' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
@@ -29,7 +32,7 @@ function fixture(legacy = false, preparedMarker: 'p8-context-v1' | undefined = u
     nativeSessionId: session.nativeSessionId, systemPrompt: 'fixture', thinkingLevel: 'off', resourcePolicy: 'none',
     historyPolicy: 'memory-only', maxContextBytes: 524288, maxAssistantContentBytes: 524288, maxOutputBytes: 262144,
     maxModelCalls: 12, maxToolCalls: 0, toolTimeoutMs: 10000, sessionRetry: false };
-  const prepared: SafeConfigSnapshot & { agent: RuntimeAgentConfigFacts } = { version: 2, name: config.name, revision: config.revision,
+  const prepared: SafeConfigSnapshot & { agent: RuntimeAgentConfigFacts; historyPolicyVersion: 'p9-native-history-v1' } = { historyPolicyVersion: 'p9-native-history-v1', version: 2, name: config.name, revision: config.revision,
     requestedModel: config.modelRef, resolvedModel: config.modelRef, api: 'openai-completions', endpoint: null,
     sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: config.parameters,
     native: { authSource: 'unknown', modelsSelection: null }, limits: { timeoutMs: 5000, stopGraceMs: 100 },
@@ -57,12 +60,12 @@ function fixture(legacy = false, preparedMarker: 'p8-context-v1' | undefined = u
       return outcome;
     } }); }, releaseSession: async () => ({ stopped: true, closed: true, errors: [] }), close: async () => ({ stopped: true, closed: true, errors: [] }) };
   const service = new ContextService({ store, materials: { inspectParsed() { throw new Error('Chat cannot inspect material.'); } } });
-  const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent,
+  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent,
     contextRepository: store.context,
     ...(legacy ? {} : { contextService: { build: request => { builds++; expect(store.db.inTransaction).toBe(true); return service.build(request); } } }),
     provider: { async prepare() { throw new Error('No direct provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
-  const sessions = new SessionService(store.sessions, agent, () => runtime.state(), () => at, store.runs, store.sessionInputs,
+  const sessions = new SessionService(store.sessions, agent, () => runtime.state(), () => at, store.runs, store.memory, store.sessionInputs,
     (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
   deferCleanup(async () => { await runtime.close(); });
   const request = { sessionId: session.sessionId, clientSequence: 1, mode: 'prompt' as const, text: 'same text', config,
@@ -109,9 +112,9 @@ describe('T04 real Ledger Context admission', () => {
     expect(f.counts().builds).toBe(0);
   });
   it('keeps direct Provider config behavior independent of Agent context admission', async () => {
-    const f = fixture(); const { agent: _agent, contextPolicyVersion: _marker, ...snapshot } = f.prepared;
+    const f = fixture(); const { agent: _agent, contextPolicyVersion: _marker, historyPolicyVersion: _history, ...snapshot } = f.prepared;
     const providerSnapshot = snapshot;
-    const runtime = new RuntimeService({ runs: f.store.runs, contextService: { build() { throw new Error('Provider cannot build Agent context.'); } },
+    const runtime = new RuntimeService({ memory: f.store.memory, runs: f.store.runs, contextService: { build() { throw new Error('Provider cannot build Agent context.'); } },
       provider: { async prepare() { return ok({ snapshot: providerSnapshot, async execute() { return { text: 'Provider reply', partial: false,
         stopReason: 'stop', responseId: null, responseModel: null, error: null, stopped: true, cleanupErrors: [],
         usage: { version: 1 as const, source: 'unknown' as const, reason: 'fixture', sdkValues: null, attempts: 1,
@@ -190,7 +193,7 @@ describe('T04 readonly persisted context seeds', () => {
         workspaceContext: { formatVersion: 1, revision: 0, sessionId: f.session.sessionId, documentRef: null,
           jobId: null, candidateRef: null, activeView: 'original', selection: null }, allowedDocumentIds: [], allowedArtifactIds: [] }), input.inputId);
     const before = f.rows();
-    expect(need(f.store.sessions.loadHistoryForContext(f.session.sessionId)).bindings).toEqual([
+    expect(need(f.store.sessions.loadHistoryForContext(f.session.sessionId)).seed.inputs).toEqual([
       { nativeEntryId: input.nativeEntryId, originRunId: accepted.runId, inputId: input.inputId, snapshotId: null }]);
     expect(f.rows()).toEqual(before);
   });
@@ -202,7 +205,7 @@ describe('T04 readonly persisted context seeds', () => {
       prepare: async () => { throw new Error('No prepare.'); }, restoreSession: () => { throw new Error('No restore.'); },
       restoreSessionLeaf: () => { throw new Error('No leaf restore.'); }, watchSession: () => { throw new Error('No watch.'); },
       releaseSession: async () => ({ stopped: true, closed: true, errors: [] }), close: async () => ({ stopped: true, closed: true, errors: [] }) };
-    expect(ensureNativeSession(f.store.sessions, port, need(f.store.sessions.get(f.session.sessionId)))).toEqual({ ok: true, data: undefined });
+    expect(ensureNativeSession(f.store.sessions, port, need(f.store.sessions.get(f.session.sessionId)), f.store.memory)).toMatchObject({ ok: false, error: { code: 'session_busy' } });
     expect(f.history.restorations).toEqual(before);
   });
   it('joins the consumed original Input and excludes later queued inputs without consulting the current pointer', async () => {
@@ -214,26 +217,31 @@ describe('T04 readonly persisted context seeds', () => {
     expect(typeof f.store.sessions.loadHistoryForContext).toBe('function');
     const bundle = need(f.store.sessions.loadHistoryForContext(f.session.sessionId));
     expect(bundle.history).toEqual(need(f.store.sessions.loadHistory(f.session.sessionId)));
-    expect(bundle.bindings).toEqual([{ originRunId: initial.runId, inputId: initial.inputId,
+    expect(bundle.seed.inputs).toEqual([{ originRunId: initial.runId, inputId: initial.inputId,
       nativeEntryId: first.nativeEntryId, snapshotId: first.contextSnapshotId }]);
     expect(f.rows()).toEqual(before);
   });
   it('preserves actual pre-ledger user origin including the original nullable 008 Run', () => {
     const f = fixture();
-    const { contextPolicyVersion: _marker, ...config } = f.prepared;
+    const { contextPolicyVersion: _marker, historyPolicyVersion: _history, ...config } = f.prepared;
     const runId = need(f.store.runs.createAgent({ sessionId: f.session.sessionId, scope: { version: 1, mode: 'chat-text', toolNames: [], resourcePaths: [] }, config,
       goal: 'Legacy', input: { version: 1, text: 'same text', goal: 'Legacy', messageTimestamp: 1 },
       usage: { version: 1, source: 'unknown', reason: 'fixture', sdkValues: null, attempts: null, attemptsComplete: false, costSource: null, updatedAt: at },
       cleanup: { version: 1, stopped: true, stopReason: null, errors: [], lateObservationRequired: false }, createdAt: at }));
+    expect(need(f.store.runs.get(runId)).config).not.toHaveProperty('historyPolicyVersion');
+    expect(f.store.db.query('SELECT current_context_snapshot_id,context_observations_json FROM runs WHERE id=?').get(runId)).toEqual({current_context_snapshot_id:null,context_observations_json:null});
     const previous = need(f.store.sessions.loadHistory(f.session.sessionId))!;
     const first = { type: 'message', id: 'pre-ledger-null', parentId: null, timestamp: at,
       message: { role: 'user', content: 'same text', timestamp: 1 } };
-    need(f.store.sessions.saveHistory(f.session.sessionId, { ...previous, entries: [first], leafId: first.id }));
+    const initial = need(f.store.memory.load(f.session.sessionId))!;
+    const firstReceipt = need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: initial.commit, header: previous.header,
+      appendEntries: [first], contexts: [], leafId: first.id, unusable: false }));
     const second = { ...first, id: 'pre-ledger-run', parentId: first.id };
-    need(f.store.sessions.saveHistory(f.session.sessionId, { ...previous, entries: [first, second], leafId: second.id }, { entryId: second.id, runId }));
+    need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: firstReceipt, header: previous.header,
+      appendEntries: [second], contexts: [{ entryId: second.id, runId }], leafId: second.id, unusable: false }));
     const before = f.rows();
     expect(typeof f.store.sessions.loadHistoryForContext).toBe('function');
-    expect(need(f.store.sessions.loadHistoryForContext(f.session.sessionId)).bindings).toEqual([
+    expect(need(f.store.sessions.loadHistoryForContext(f.session.sessionId)).seed.inputs).toEqual([
       { nativeEntryId: first.id, originRunId: null, inputId: null, snapshotId: null },
       { nativeEntryId: second.id, originRunId: runId, inputId: null, snapshotId: null },
     ]);

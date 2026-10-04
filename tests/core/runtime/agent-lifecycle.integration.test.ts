@@ -37,7 +37,7 @@ const config: ProviderConfig = {
   native: { authPath: 'C:\\Users\\test\\.pi\\auth.json', modelsPath: null },
   parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
 };
-const snapshot: SafeConfigSnapshot & { agent: P5ChatAgentConfigFacts } = {
+const snapshot: SafeConfigSnapshot & { agent: P5ChatAgentConfigFacts; historyPolicyVersion: 'p9-native-history-v1' } = { historyPolicyVersion: 'p9-native-history-v1',
   version: 1,
   name: config.name,
   revision: config.revision,
@@ -95,8 +95,14 @@ function fixture() {
   const nativeHistory = fixtureHistory.create('native-1');
   const session = opened.data.sessions.create({ nativeSessionId: 'native-1', title: 'Invoice chat', at: '2026-09-24T00:00:00.000Z', nativeHistory });
   if (!session.ok) throw new Error(session.error.code);
-  fixtureHistory.watchSession('native-1', (history, context) => opened.data.sessions.saveHistory(session.data.sessionId, history, context));
+  const initial = opened.data.sessions.loadHistoryForContext(session.data.sessionId);
+  if (!initial.ok) throw new Error(initial.error.code);
+  const watched = fixtureHistory.watchSession('native-1', initial.data.commit!, initial.data.seed, write => opened.data.memory.commit({ sessionId: session.data.sessionId,
+    expected: write.expected, header: write.history.header, appendEntries: write.history.entries,
+    leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts }));
+  if (!watched.ok) throw new Error(watched.error.code);
   const deps = {
+    memory: opened.data.memory,
     fixtureHistory,
     runs: opened.data.runs,
     sessions: opened.data.sessions,
@@ -124,6 +130,8 @@ function makeAgent(history: ReturnType<typeof createAgentHistoryFixture>, option
   }));
   return {
     createSession: () => ok({ nativeSessionId: 'native-2' }),
+    exportSession: history.exportSession,
+    watchSession: history.watchSession,
     restoreSessionLeaf: history.restoreSessionLeaf,
     inspect: (nativeSessionId) => options.inspection ?? ({
       availability: nativeSessionId === 'native-1' ? 'ready' : 'missing',
@@ -134,7 +142,12 @@ function makeAgent(history: ReturnType<typeof createAgentHistoryFixture>, option
       return ok({ ...prepared.data, execute: async (input, runSignal, observe) => {
         history.saveUser(nativeSessionId, input);
         const outcome = await prepared.data.execute(input, runSignal, observe);
-        history.saveResult(nativeSessionId, input, outcome, !runSignal.aborted);
+        try { history.saveResult(nativeSessionId, input, outcome, !runSignal.aborted); }
+        catch (error) {
+          // The already observed late outcome still carries usage even when the
+          // old writer cannot acknowledge history after a sticky terminal commit.
+          if (!runSignal.aborted || !(error instanceof Error) || error.message !== 'state_conflict') throw error;
+        }
         return outcome;
       } });
     },
@@ -252,7 +265,7 @@ describe('RuntimeService Agent lifecycle', () => {
         agent: { ...snapshot.agent, policyVersion: 'runtime-v1', taskPolicyVersion: 'p5-session-inputs-v1', ...budget } } });
     } };
     const runtime = new RuntimeService({ ...deps, agent, runtimeDefaults: () => { settingsReads++; return ok(defaults); } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
+    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
       (runRequest, input, control) => runtime.start(runRequest, control, input), input => runtime.appendInput(input));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
     const input = { sessionId: 1, mode: 'prompt' as const, clientSequence: 1, text: 'Budgeted invoice', config,
@@ -379,6 +392,10 @@ describe('RuntimeService Agent lifecycle', () => {
     await finished.done.promise;
     const before = db.runs.get(accepted.data.runId);
     expect(before).toMatchObject({ ok: true, data: { status: 'failed', output: null, stoppedAt: null } });
+    const savedFacts = () => ({ headers: db.db.query('SELECT * FROM session_native_history').all(),
+      entries: db.db.query('SELECT * FROM session_native_entries').all(), inputs: db.db.query('SELECT * FROM session_inputs').all(),
+      events: db.db.query("SELECT * FROM runtime_events WHERE type!='run_usage_updated'").all() });
+    const historyBeforeLate = savedFacts();
     work.resolve({
       ...nativeOutcome,
       usage: {
@@ -395,6 +412,8 @@ describe('RuntimeService Agent lifecycle', () => {
       usage: { source: 'sdk', sdkValues: { totalTokens: 3 } }, tokens: { totalTokens: 3 },
     } });
     expect(service.state()).toMatchObject({ blocked: true });
+    expect(savedFacts()).toEqual(historyBeforeLate);
+    expect(db.db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 1 });
   });
 
   it('poisons the runtime when a stopped Agent outcome cannot be persisted', async () => {
@@ -651,7 +670,7 @@ describe('P5 public input stopping and admission barriers', () => {
       if (++auditReads === 2) return fail(appError('storage_read_failed', 'storage', 'Final input audit unavailable.', true));
       return db.sessionInputs.forRun(runId);
     } } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
+    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
       id => runtime.verifySessionMutation(id));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
@@ -706,7 +725,7 @@ describe('P5 public input stopping and admission barriers', () => {
       if (rejectRead) { rejectRead = false; return fail(appError('storage_read_failed', 'storage', 'Transient input audit failure.', true)); }
       return db.sessionInputs.forRun(runId);
     } } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
+    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
       id => runtime.verifySessionMutation(id));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
@@ -777,7 +796,7 @@ describe('P5 public input stopping and admission barriers', () => {
     const runtime = new RuntimeService({ ...deps, agent, tools, workspaceVerifier: verify, nativeTools: {
       runtimeDir: nativeHeader.cwd,
       availability: [{ name: 'powershell', available: true, reason: null }] } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
+    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
       id => runtime.verifySessionMutation(id));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
@@ -868,7 +887,7 @@ describe('P5 public input stopping and admission barriers', () => {
       },
     };
     const runtime = new RuntimeService({ ...deps, agent });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.sessionInputs,
+    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
       id => runtime.verifySessionMutation(id));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);

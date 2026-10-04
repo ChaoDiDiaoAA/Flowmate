@@ -36,7 +36,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
     watchSession: history.watchSession,
     restoreSessionLeaf: history.restoreSessionLeaf,
     inspect: () => ({ availability: 'ready' }),
-    prepare: async (nativeSessionId, selected, limits, _signal, settings) => { preparations.push(settings); return ok({ snapshot: {
+    prepare: async (nativeSessionId, selected, limits, _signal, settings) => { preparations.push(settings); return ok({ snapshot: { historyPolicyVersion: 'p9-native-history-v1',
       version: 1, name: selected.name, revision: selected.revision,
       requestedModel: selected.modelRef, resolvedModel: selected.modelRef, api: selected.connection?.api ?? null,
       endpoint: selected.connection?.baseUrl ?? null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
@@ -74,7 +74,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
       return {};
     } })),
     recorder: createToolRecorder(db.toolCalls, now), now });
-  const runtime = new RuntimeService({ workspaceVerifier: createTestWorkspaceVerifier(db, root), runs: db.runs, sessions: db.sessions, sessionInputs: db.sessionInputs, agent, tools,
+  const runtime = new RuntimeService({ memory: db.memory, workspaceVerifier: createTestWorkspaceVerifier(db, root), runs: db.runs, sessions: db.sessions, sessionInputs: db.sessionInputs, agent, tools,
     provider: { prepare: async () => ({ ok: false, error: appError('unused', 'provider', 'Unused.') }),
       close: async () => ({ stopped: true, closed: true, errors: [] }) },
     log: { write() {}, close: async () => {} }, now, monotonicNow: () => performance.now(),
@@ -82,7 +82,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
       { name: 'powershell', available: true, reason: null }, { name: 'bash', available: false, reason: 'Not installed.' }],
  },
   });
-  const sessions = new SessionService(db.sessions, agent, () => runtime.state(), now, db.runs,
+  const sessions = new SessionService(db.sessions, agent, () => runtime.state(), now, db.runs, db.memory,
     db.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
   const app = makeApplication(runtime, db.runs, async () => {
     db.close(); return { stopped: true, closed: true, errors: [] };

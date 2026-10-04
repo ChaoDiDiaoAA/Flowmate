@@ -108,6 +108,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
     let failedEntryId: string | undefined;
     const deliveries: Array<{ state: string; result: Result<void> }> = [];
     let repeatedDeliveries = 0;
+    let failureRevision: number | null = null;
     let aborts = 0;
     const originalAbort = AgentSession.prototype.abort;
     AgentSession.prototype.abort = function(...args) { aborts += 1; return originalAbort.apply(this, args); };
@@ -139,6 +140,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
             : message?.role === 'toolResult';
           if (!afterFault && fault !== 'delivery-conflict' && context && target && !injected) {
             injected = true;
+            failureRevision = write.expected.commitRevision;
             prefixAtFailure = priorPrefix && structuredClone(priorPrefix);
             failedEntryId = context.entryId;
             return fail(appError('storage_write_failed', 'storage', 'Controlled native message save failure.', true));
@@ -290,7 +292,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
     const closeDb = () => { if (!dbClosed) { dbClosed = true; db.close(); } };
     deferCleanup(closeDb);
     const committedEntries = db.query('SELECT entry_id,entry_json,run_id FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(sessionId);
-    const head = db.query('SELECT leaf_id,entry_count,unusable FROM session_native_history WHERE session_id=?').get(sessionId) as { leaf_id: string | null; entry_count: number; unusable: number };
+    const head = db.query('SELECT leaf_id,entry_count,unusable,commit_revision,header_json FROM session_native_history WHERE session_id=?').get(sessionId) as { leaf_id: string | null; entry_count: number; unusable: number; commit_revision: number; header_json: string };
     expect(head.unusable).toBe(fault === 'blocking-write-failure' ? 0 : 1);
     expect(head.entry_count).toBe(committedEntries.length);
     expect(head.leaf_id).toBe((committedEntries.at(-1) as { entry_id: string } | undefined)?.entry_id ?? null);
@@ -314,6 +316,11 @@ describe('P4 real candidate commit and message persistence failures', () => {
       // Both objects retain their last committed running facts.
       expect(db.query('SELECT output_json,error_json,ended_at,stopped_at FROM runs WHERE id=?').get(accepted.data.runId))
         .toEqual({ output_json: null, error_json: null, ended_at: null, stopped_at: null });
+      expect(head.commit_revision).toBe(failureRevision! + 1);
+      expect(head.header_json).toBe(JSON.stringify(prefixAtFailure!.header));
+      expect(db.query("SELECT type FROM runtime_events WHERE run_id=? AND type IN ('run_completed','run_failed','run_cancelled')").all(accepted.data.runId)).toEqual([]);
+      expect(db.query('SELECT status,processing_status,result_entry_id FROM session_inputs WHERE run_id=?').all(accepted.data.runId))
+        .toEqual([{ status: 'consumed', processing_status: 'pending', result_entry_id: null }]);
       db.exec('DROP TRIGGER reject_job_terminal;');
     }
     const tool = db.query('SELECT status,result_json,delivery_json FROM tool_calls WHERE native_tool_call_id=?').get(callId) as { status: string; result_json: string; delivery_json: string };
@@ -323,6 +330,9 @@ describe('P4 real candidate commit and message persistence failures', () => {
       : fault === 'delivery-conflict' ? 'message_observed' : 'not_attempted');
     if (toolResultSaveFailed) expect(deliveries).toEqual([]);
     if (fault === 'blocking-write-failure') {
+      expect(failureRevision).not.toBeNull(); expect(head.commit_revision).toBe(failureRevision!);
+      expect(head.header_json).toBe(JSON.stringify(prefixAtFailure!.header));
+      expect(db.query("SELECT type FROM runtime_events WHERE run_id=? AND type IN ('run_completed','run_failed','run_cancelled')").all(accepted.data.runId)).toEqual([]);
       expect(db.query('SELECT status FROM runs WHERE id=?').get(accepted.data.runId)).toEqual({ status: 'running' });
       db.exec('DROP TRIGGER reject_unsafe_marker;');
       db.exec('DROP TRIGGER reject_failed_terminal;');

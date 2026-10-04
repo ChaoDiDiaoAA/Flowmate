@@ -56,6 +56,7 @@ function fixture(withMaterial = false) {
   const paths = { root, databaseFile: join(root, 'data', selected ? 'flowmate.sqlite' : 'test.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
   const store = selected ?? need(openDatabase(paths));
+  if (!('memory' in store)) throw new Error('Runtime input fixtures require the current committed MemoryStore.');
   deferCleanup(() => store.close());
   const history = { storageVersion: 1 as const, header: { type: 'session' as const, id: 'native-fill-input', version: 3,
     timestamp: at, cwd: root }, entries: [], leafId: null, unusable: false };
@@ -314,7 +315,7 @@ describe('idle Fill prompt input ledger', () => {
   it('returns the original input and Run before poisoned Runtime or stale Workspace admission', async () => {
     const { store, ledger, createRun, paths } = fixture();
     const first = need(ledger.admit(request, createRun, at));
-    const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: ledger,
+    const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: ledger,
       recoveryError: appError('stop_not_confirmed', 'runtime', 'Unrelated old Runtime is blocked.'),
       agent: new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir }),
       provider: { async prepare() { throw new Error('No provider call is authorized by this test.'); },
@@ -329,7 +330,7 @@ describe('idle Fill prompt input ledger', () => {
 
   it('rejects ordinary startRun fill requests even when called without public normalization', async () => {
     const { store, ledger, paths } = fixture();
-    const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: ledger,
+    const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: ledger,
       agent: new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir }),
       provider: { async prepare() { throw new Error('No provider call is authorized by this test.'); },
         async close() { return { stopped: true, closed: true, errors: [] }; } },
@@ -343,7 +344,7 @@ describe('idle Fill prompt input ledger', () => {
   it('keeps the admitted form target when a prepared SDK snapshot contains another target', async () => {
     const { store, ledger, paths, createRun, tools, verify } = fixture(true);
     const agent = new PiAgentAdapter({ cwd: paths.root, agentDir: paths.runtimeDir });
-    const snapshot = { ...safeConfig, agent: { ...safeConfig.agent, maxModelCalls: 16 as const }, api: 'openai-completions', resolvedModel: request.config.modelRef,
+    const snapshot: PreparedAgent['snapshot'] & { formTarget: { formInstanceId: string; expectedRevision: number } } = { ...safeConfig, historyPolicyVersion: 'p9-native-history-v1', agent: { ...safeConfig.agent, maxModelCalls: 16 as const }, api: 'openai-completions', resolvedModel: request.config.modelRef,
       formTarget: { formInstanceId: 'prepared-other-form', expectedRevision: 99 } };
     let preparedOptions: unknown;
     agent.prepare = async (_nativeId, _config, _limits, _signal, options) => { preparedOptions = options; return ok({ snapshot,
@@ -352,7 +353,7 @@ describe('idle Fill prompt input ledger', () => {
     let startedTarget: unknown;
     let finish!: () => void;
     const finished = new Promise<void>(resolve => { finish = resolve; });
-    const runtime = new RuntimeService({ workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun,
+    const runtime = new RuntimeService({ memory: store.memory, workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun,
       start(_runId, startedConfig) {
         startedTarget = (startedConfig as Record<string, unknown>).formTarget;
         return fail(appError('state_conflict', 'storage', 'Fixture stops at the preparation boundary.'));
@@ -377,7 +378,7 @@ describe('idle Fill prompt input ledger', () => {
   it('requires actual applied and delivered tool facts rather than a final model claim', async () => {
     const { store, ledger, paths, createRun, tools, verify } = fixture(true);
     const agent = new PiAgentAdapter({ cwd: paths.root, agentDir: paths.runtimeDir });
-    agent.prepare = async () => ok({ snapshot: { ...safeConfig, agent: { ...safeConfig.agent, maxModelCalls: 16 } }, async execute(input) {
+    agent.prepare = async () => ok({ snapshot: { ...safeConfig, historyPolicyVersion: 'p9-native-history-v1', agent: { ...safeConfig.agent, maxModelCalls: 16 } }, async execute(input) {
       const previous = need(store.sessions.loadHistory(input.sessionId))!;
       const entry = { type: 'message', id: 'true-input', parentId: null, timestamp: at,
         message: { role: 'user', content: input.text, timestamp: input.messageTimestamp } };
@@ -390,7 +391,7 @@ describe('idle Fill prompt input ledger', () => {
     } } satisfies PreparedAgent);
     let finish!: () => void;
     const finished = new Promise<void>(resolve => { finish = resolve; });
-    const runtime = new RuntimeService({ workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun },
+    const runtime = new RuntimeService({ memory: store.memory, workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun },
       sessions: store.sessions, sessionInputs: ledger, agent, tools,
       provider: { async prepare() { throw new Error('No provider call is authorized by this lifecycle test.'); },
         async close() { return { stopped: true, closed: true, errors: [] }; } },
@@ -409,7 +410,7 @@ describe('idle Fill prompt input ledger', () => {
   it('rejects a new Fill input before creating a Run when no trusted form tool is assembled', async () => {
     const { store, ledger, paths, createRun, creates, verify } = fixture(true);
     const agent = new PiAgentAdapter({ cwd: paths.root, agentDir: paths.runtimeDir });
-    const runtime = new RuntimeService({ workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun },
+    const runtime = new RuntimeService({ memory: store.memory, workspaceVerifier: verify, runs: { ...store.runs, createWorkspaceAgent: createRun },
       sessions: store.sessions, sessionInputs: ledger, agent,
       provider: { async prepare() { throw new Error('Unexpected model request.'); },
         async close() { return { stopped: true, closed: true, errors: [] }; } },
@@ -427,7 +428,7 @@ describe('idle Fill prompt input ledger', () => {
     const { store, ledger, paths } = fixture();
     const agent = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir });
     const service = new SessionService(store.sessions, agent, () => ({ active: null, ready: true, closing: false, blocked: false, error: null }),
-      () => at, store.runs, ledger, async () => fail(appError('runtime_busy', 'runtime', 'Busy.')));
+      () => at, store.runs, store.memory, ledger, async () => fail(appError('runtime_busy', 'runtime', 'Busy.')));
     expect(await service.submitInput({ ...request, mode: 'steer' } as unknown as SessionInputRequest))
       .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
     expect(await service.submitInput({ ...request, inputId: 100 } as SessionInputRequest))
@@ -564,11 +565,11 @@ describe('P5 public input chain with real SDK and SQLite', () => {
     const preparationBarrier = new Promise<void>(resolve => { releasePrepare = resolve; });
     const originalPrepare = agent.prepare.bind(agent);
     agent.prepare = async (...args) => { await preparationBarrier; return originalPrepare(...args); };
-    const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent,
+    const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent,
       provider: { async prepare() { throw new Error('Direct provider calls are outside this test.'); },
         async close() { return { stopped: true, closed: true, errors: [] }; } },
       log: { write() {}, async close() {} }, now: () => new Date().toISOString(), monotonicNow: () => performance.now() });
-    const service = new SessionService(store.sessions, agent, () => runtime.state(), () => new Date().toISOString(), store.runs,
+    const service = new SessionService(store.sessions, agent, () => runtime.state(), () => new Date().toISOString(), store.runs, store.memory,
       store.sessionInputs, (request, submission, control) => runtime.start(request, control, submission),
       request => runtime.appendInput(request), id => runtime.verifySessionMutation(id));
     const app = makeApplication(runtime, store.runs, async () => { store.close(); return { stopped: true, closed: true, errors: [] }; }, service);

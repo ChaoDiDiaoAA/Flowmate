@@ -33,16 +33,28 @@ export function createNativeOriginReader(db: Database) {
   const histories = new Map<number, Stored | null>();
   const entryIndexes = new Map<number, Map<string, NativeSessionEntry>>();
   const origins = new Map<string, NativeEntryOrigin>();
+  const toolResults = new Map<string, NativeToolResultContextBinding>();
+  const snapshots = new Map<string, ReturnType<typeof readContextSnapshotOwner>>();
   const owners = new Map<number, { row: z.infer<typeof ownerSchema>; context: ReturnType<typeof readRunContext> }>();
   const verifiedForks = new Set<number>();
   const forkSchema = z.object({ source_session_id: id, source_commit_revision: count, source_entry_count: count,
     source_leaf_id: z.string().nullable(), selected_entry_id: z.string(), inherited_entry_count: count.positive() });
+  function contextSnapshot(snapshotId: number, owner: Parameters<typeof readContextSnapshotOwner>[2]) {
+    const key = JSON.stringify([snapshotId, owner.id, owner.session_id, owner.job_id ?? null]);
+    const cached = snapshots.get(key); if (cached) return cached;
+    const value = readContextSnapshotOwner(db, snapshotId, owner);
+    // Reuse only a complete ownership proof within this immutable SQL read.
+    snapshots.set(key, value); return value;
+  }
   function history(sessionId: number) {
     id.parse(sessionId);
     if (!histories.has(sessionId)) {
       if (!db.query('SELECT id FROM sessions WHERE id=?').get(sessionId)) unknown();
       try { const stored=loadNativeHistoryInTransaction(db, sessionId);
-        histories.set(sessionId, stored ? { ...stored, history: NativeSessionHistorySchema.parse(stored.history) } : null); }
+        // The strict loader already validates this exact body. Preserve the schema's
+        // copied, readonly entry array without repeating its full JSON/schema walk.
+        histories.set(sessionId, stored ? { ...stored, history: { ...stored.history,
+          entries: Object.freeze([...stored.history.entries]) } as Stored['history'] } : null); }
       catch (error) { if (error instanceof SQLiteError) throw error; unknown(); }
     }
     return histories.get(sessionId)!;
@@ -100,12 +112,12 @@ export function createNativeOriginReader(db: Database) {
     const native = z.object({ agent: z.object({ nativeSessionId: z.string() }).optional() }).passthrough().parse(JSON.parse(row.config_json));
     const session = db.query('SELECT native_session_id FROM sessions WHERE id=?').get(sessionId) as { native_session_id: string };
     if (native.agent && native.agent.nativeSessionId !== session.native_session_id) unknown();
-    if (context.pointer !== null) readContextSnapshotOwner(db, context.pointer, row);
+    if (context.pointer !== null) contextSnapshot(context.pointer, row);
     // Memoize identity before following original request sources. A request contains its own
     // consumed user entry; revisiting that Run must not recurse through the outer journal reader.
     const owner={row,context}; owners.set(runId,owner);
     for (const request of context.observations?.requests ?? []) {
-      const snapshot = readContextSnapshotOwner(db, request.binding.snapshotId, row);
+      const snapshot = contextSnapshot(request.binding.snapshotId, row);
       const primary = db.query('SELECT session_id,run_id,context_snapshot_id,status,native_entry_id,content_json,goal_mode FROM session_inputs WHERE id=?')
         .get(request.binding.inputId) as { session_id: number; run_id: number; context_snapshot_id: number; status: string; native_entry_id: string; content_json: string; goal_mode: string } | null;
       if (!primary || primary.session_id !== sessionId || primary.run_id !== runId || primary.context_snapshot_id !== snapshot.id
@@ -154,7 +166,7 @@ export function createNativeOriginReader(db: Database) {
       if (input.run_id !== native.run_id || (input.context_snapshot_id === null) !== (owner.context.observations === null)) unknown();
       const content = SessionInputContentSchema.parse(JSON.parse(input.content_json));
       if (input.context_snapshot_id !== null) {
-        const snapshot = readContextSnapshotOwner(db,input.context_snapshot_id,owner.row);
+        const snapshot = contextSnapshot(input.context_snapshot_id,owner.row);
         if (content.version !== 2 || snapshot.json.text !== content.text || snapshot.json.goalMode !== input.goal_mode
           || !isDeepStrictEqual(snapshot.json.workspaceContext,content.workspaceContext)
           || !isDeepStrictEqual(snapshot.json.allowedDocumentIds,content.allowedDocumentIds)
@@ -176,6 +188,8 @@ export function createNativeOriginReader(db: Database) {
     return selected.reverse();
   }
   function tool(sessionId: number, nativeToolCallId: string, saved = false): NativeToolResultContextBinding {
+    const key = JSON.stringify([sessionId, nativeToolCallId, saved]);
+    const cached = toolResults.get(key); if (cached) return cached;
     const stored=history(sessionId); if (!stored) unknown();
     const candidates=(saved ? stored.history.entries : path(sessionId)).filter(entry => entry.type==='message'
       && entry.message.role==='toolResult' && entry.message.toolCallId===nativeToolCallId);
@@ -199,15 +213,18 @@ export function createNativeOriginReader(db: Database) {
       copiedSession=provenance.source_session_id;
     }
     if(rows.length===0) { if(owner.context.observations!==null) unknown();
-      return {nativeToolCallId,toolCallId:null,originRunId:null,context:null}; }
+      const binding = {nativeToolCallId,toolCallId:null,originRunId:null,context:null};
+      toolResults.set(key, binding); return binding; }
     if(rows.length!==1) unknown();
     const row=z.object({id,run_id:id,session_id:id,tool_name:z.string(),context_snapshot_id:id.nullable(),request_sequence:id.nullable()}).parse(rows[0]);
     if(row.run_id!==origin.originRunId || row.tool_name!==result.message.toolName) unknown();
     const context=contextReferenceFromColumns(row);
     if((context===null)!==(owner.context.observations===null)) unknown();
-    if(context) { readContextSnapshotOwner(db,context.snapshotId,owner.row);
+    if(context) { contextSnapshot(context.snapshotId,owner.row);
       if(owner.context.observations?.requests[context.requestSequence-1]?.binding.snapshotId!==context.snapshotId) unknown(); }
-    return {nativeToolCallId,toolCallId:row.id,originRunId:row.run_id,context};
+    const binding = {nativeToolCallId,toolCallId:row.id,originRunId:row.run_id,context};
+    // Only a complete proof is reusable, and only in this caller's SQL snapshot.
+    toolResults.set(key, binding); return binding;
   }
   function derived(sessionId: number, source: NativeDerivedContextBinding): void {
     const entry=nativeEntryAt(sessionId,source.nativeEntryId);

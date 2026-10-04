@@ -53,7 +53,7 @@ function preparedP2Agent(onPrepare: () => void, onExecute: () => void): AgentPor
         maxContextBytes: 524_288, maxOutputBytes: 262_144, maxAssistantContentBytes: 524_288, maxModelCalls: 12, sessionRetry: false };
       const preparedFacts: RunAgentConfigFacts = options?.activeToolNames ? { ...facts, policyVersion: 'p3-invoice-tools-v1',
         maxContextBytes: 8_388_608, maxModelCalls: 16, maxToolCalls: 24, toolTimeoutMs: 10_000 } : facts;
-      const snapshot: SafeConfigSnapshot & { agent: RunAgentConfigFacts } = { version: 1, name: receivedConfig.name,
+      const snapshot: SafeConfigSnapshot & { agent: RunAgentConfigFacts; historyPolicyVersion: 'p9-native-history-v1' } = { historyPolicyVersion: 'p9-native-history-v1', version: 1, name: receivedConfig.name,
         revision: receivedConfig.revision, requestedModel: receivedConfig.modelRef, resolvedModel: receivedConfig.modelRef,
         api: receivedConfig.connection?.api ?? null, endpoint: receivedConfig.connection?.baseUrl ?? null,
         sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: receivedConfig.parameters, limits,
@@ -97,7 +97,7 @@ describe('P3 Workspace and Run admission', () => {
       close: async () => ({ stopped: true, closed: true, errors: [] }),
     };
     const sessionAgent = preparedP2Agent(() => undefined, () => undefined);
-    const sessionService = new SessionService(opened.data.sessions, sessionAgent, () => stubRuntime.state(), now, opened.data.runs);
+    const sessionService = new SessionService(opened.data.sessions, sessionAgent, () => stubRuntime.state(), now, opened.data.runs, opened.data.memory);
     const productApplication = { documents: opened.data.documents, jobs: opened.data.jobs, candidates: opened.data.candidates,
       events: opened.data.businessEvents, importInvoiceMaterial: async () => opened.data.documents.get(1),
       readDocumentPage: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
@@ -166,13 +166,18 @@ describe('P3 Workspace and Run admission', () => {
     let preparations = 0;
     let executes = 0;
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executes += 1; });
-    agent.watchSession!('native-fixture', (history, context) => opened.data.sessions.saveHistory(native.data.sessionId, history, context));
+    const initial = opened.data.sessions.loadHistoryForContext(native.data.sessionId);
+    if (!initial.ok) throw new Error(initial.error.code);
+    const watched = agent.watchSession!('native-fixture', initial.data.commit!, initial.data.seed, write => opened.data.memory.commit({ sessionId: native.data.sessionId,
+      expected: write.expected, header: write.history.header, appendEntries: write.history.entries,
+      leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts }));
+    if (!watched.ok) throw new Error(watched.error.code);
     const tools = createToolExecutor({ definitions: [], recorder: createToolRecorder(opened.data.toolCalls, now), now });
-    const runtime = new RuntimeService({ workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools,
+    const runtime = new RuntimeService({ memory: opened.data.memory, workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const stale = { revision: current.data.revision - 1, documentRef: current.data.documentRef, jobId: current.data.jobId,
       candidateRef: current.data.candidateRef, sessionId: native.data.sessionId };
-    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs);
+    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs, opened.data.memory);
     const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService);
     expect(await app.startRun({ sessionId: native.data.sessionId, text: 'Review invoice', config, workspace: stale }))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
@@ -214,9 +219,9 @@ describe('P3 Workspace and Run admission', () => {
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executions += 1; executionStarted(); });
     const toolExecutor = createToolExecutor({ definitions: [],
       recorder: createToolRecorder(opened.data.toolCalls, now), isSessionModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId), now });
-    const runtime = new RuntimeService({ workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools: toolExecutor,
+    const runtime = new RuntimeService({ memory: opened.data.memory, workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools: toolExecutor,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
-    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs);
+    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs, opened.data.memory);
     const workspaceService = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
     const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService,
       undefined, workspaceService);

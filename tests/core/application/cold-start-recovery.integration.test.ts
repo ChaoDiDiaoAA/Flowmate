@@ -5,6 +5,9 @@ import { Database } from 'bun:sqlite';
 import { appError, ok, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
 import type { AgentPort, ProductPaths, ProviderPort, ProviderRequest, SafeConfigSnapshot, NativeSessionHistory } from '@flowmate/contracts';
 import { openDatabase } from '@flowmate/core';
+import { createAgentHistoryFixture } from './agent-history-fixture.ts';
+import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
+import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { createApplication } from '../../../apps/composition.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 
@@ -21,6 +24,40 @@ const config: SafeConfigSnapshot = { version: 1, name: 'Recovery fixture', revis
 const request: ProviderRequest = { goal: input.goal, text: '', timeoutMs: 1_000, stopGraceMs: 100,
   config: { version: 1, name: config.name, revision: 1, modelRef: config.requestedModel,
     parameters: config.parameters, native: { authPath: join(tmpdir(), 'synthetic-recovery-auth.json'), modelsPath: null } } };
+
+it('P9 T05 preserves unknown input gaps and independent Workspace when complete persisted history is corrupt', async () => {
+  const { store, paths } = fixture(); const { runId, sessionId } = agentRun(store);
+  expect(finish(store, runId).ok).toBe(true);
+  const saved = store.memory.load(sessionId); if (!saved.ok || !saved.data) throw new Error('Missing initial receipt.');
+  const entries = Array.from({ length: 61 }, (_, n) => ({ type: 'message', id: `legacy-${n}`, parentId: n ? `legacy-${n - 1}` : null,
+    timestamp: stamp, message: { role: 'user', content: `legacy ${n}`, timestamp: n } }));
+  expect(store.memory.commit({ sessionId, expected: saved.data.commit, header: saved.data.history.header, appendEntries: entries,
+    contexts: [], leafId: 'legacy-60', unusable: false }).ok).toBe(true);
+  const content = { version: 1, text: 'Unknown delivery must never be replayed.', workspaceContext: { formatVersion: 1, revision: 0, sessionId,
+    documentRef: null, jobId: null, candidateRef: null, activeView: 'original', selection: null }, allowedDocumentIds: [], allowedArtifactIds: [] };
+  store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
+    VALUES(?,1,'prompt','answer',?,?,?,'delivery_unknown','failed',?,?)`).run(sessionId, 'a'.repeat(64), runId, JSON.stringify(content), stamp, stamp);
+  store.db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.parentId','missing-parent') WHERE entry_id='legacy-60'").run();
+  const facts = (db: Database) => ({ header: db.query('SELECT * FROM session_native_history').all(), entries: db.query('SELECT * FROM session_native_entries').all(),
+    inputs: db.query('SELECT * FROM session_inputs').all(), runs: db.query('SELECT * FROM runs').all() });
+  const before = facts(store.db); store.close();
+  let requests = 0, prepares = 0;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() { requests++; return new Response('unexpected', { status: 500 }); } });
+  deferCleanup(() => server.stop(true));
+  const adapter = new PiAgentAdapter({ cwd: tmpdir(), agentDir: paths.runtimeDir, credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-recovery' });
+  const prepare = adapter.prepare.bind(adapter); adapter.prepare = (...args) => { prepares++; return prepare(...args); };
+  const created = await createApplication({ paths, agent: adapter, logger: { write() {}, async close() {} } });
+  if (!created.ok) throw new Error(created.error.code); const app = created.data; deferCleanup(() => app.close());
+  expect(await app.readWorkspace()).toMatchObject({ ok: true });
+  expect(await app.querySessionHistory({ sessionId })).toMatchObject({ ok: false });
+  expect(await app.querySessionInput({ sessionId, inputId: 1 })).toMatchObject({ ok: true, data: { input: { status: 'delivery_unknown', nativeEntryId: null, processingStatus: 'failed' } } });
+  expect(await app.startRun({ sessionId, text: 'Explicit new input', config: { ...request.config,
+    connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 1000 } } })).toMatchObject({ ok: false });
+  expect(requests).toBe(0); expect(prepares).toBe(0);
+  expect(await app.close()).toMatchObject({ ok: true, data: { closed: true } });
+  const persisted = new Database(paths.databaseFile, { readonly: true });
+  try { expect(facts(persisted)).toEqual(before); } finally { persisted.close(); }
+});
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-cold-start-'));
@@ -79,11 +116,12 @@ async function application(paths: ProductPaths) {
   let agentCalls = 0;
   let sessionCounter = 0;
   const createdSessions = new Set<string>();
+  const history = createAgentHistoryFixture(paths.runtimeDir, () => stamp);
   const provider: ProviderPort = { prepare: async () => { providerCalls += 1; return { ok: false,
     error: appError('provider_auth_failed', 'provider', 'Synthetic authentication failure.') }; },
     close: async () => ({ stopped: true, closed: true, errors: [] }) };
-  const agent: AgentPort = { createSession: () => { const nativeSessionId = `synthetic-new-${++sessionCounter}`;
-    createdSessions.add(nativeSessionId); return ok({ nativeSessionId }); },
+  const agent: AgentPort = { exportSession: history.exportSession, watchSession: history.watchSession, restoreSession: history.restoreSession, restoreSessionLeaf: history.restoreSessionLeaf, createSession: () => { const nativeSessionId = `synthetic-new-${++sessionCounter}`;
+    history.create(nativeSessionId); createdSessions.add(nativeSessionId); return ok({ nativeSessionId }); },
     inspect: id => ({ availability: createdSessions.has(id) ? 'ready' : 'missing' }),
     prepare: async () => { agentCalls += 1; return { ok: false, error: appError('offline', 'runtime', 'Synthetic preparation.') }; },
     releaseSession: async () => ({ stopped: true, closed: true, errors: [] }),

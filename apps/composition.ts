@@ -7,7 +7,7 @@ import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createNativeTools } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
-import type { Application, ProductPaths, PromptTraceBuffer, Result, RuntimeRequestOverrides, RuntimeStrategyPolicy } from '@flowmate/contracts';
+import type { Application, MemoryStore, ProductPaths, PromptTraceBuffer, Result, RuntimeRequestOverrides, RuntimeStrategyPolicy } from '@flowmate/contracts';
 import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ProviderPort, ToolDefinition } from '@flowmate/contracts';
 import type { SafeLogger } from '@flowmate/shared';
 
@@ -73,7 +73,9 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const agent = options.agentFactory?.(definitions) ?? options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace,
     tools: definitions });
   let sessionService: SessionService;
+  const memory: MemoryStore = Object.assign(database.data.memory, { list: (input: Parameters<MemoryStore['list']>[0]) => sessionService.listHistory(input) });
   const runtime = new RuntimeService({
+    memory,
     runs: database.data.runs,
     recoveryError: database.data.recoveryError,
     sessions: database.data.sessions,
@@ -94,7 +96,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       availability: native.availability.filter(item => definitions.some(definition => definition.name === item.name)) },
   });
   sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs,
-    database.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission),
+    memory, database.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission),
     request => runtime.appendInput(request), sessionId => runtime.verifySessionMutation(sessionId));
   const workspaceService = createWorkspaceService(database.data.workspace, now, workspaceVerifier);
   const jobService = createJobService(database.data.jobs, now);

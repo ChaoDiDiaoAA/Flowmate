@@ -44,6 +44,7 @@ import type {
   RuntimeStrategySnapshot,
   RuntimeStrategyPolicy,
   ContextHooks,
+  MemoryStore,
 } from '@flowmate/contracts';
 import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
 import { ensureNativeSession } from '../sessions/service.ts';
@@ -59,6 +60,7 @@ export interface RuntimeLogger {
 }
 
 export type RuntimeDependencies = {
+  memory: Pick<MemoryStore, 'load' | 'commit'>;
   runs: RunRepository;
   recoveryError?: AppError | null;
   provider: ProviderPort;
@@ -539,7 +541,7 @@ export class RuntimeService {
     const modelUseBlocked = sessions.isModelUseBlocked(request.sessionId);
     if (!modelUseBlocked.ok) return modelUseBlocked;
     if (modelUseBlocked.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限，请新建 Session。'));
-    const restored = ensureNativeSession(sessions, agent, session);
+    const restored = ensureNativeSession(sessions, agent, session, this.dependencies.memory);
     if (!restored.ok) return restored;
     let inspected: ReturnType<AgentPort['inspect']>;
     try {
@@ -1204,6 +1206,12 @@ export class RuntimeService {
     if (!committed.ok) {
       active.poisoned = true;
       this.poisoned = true;
+      // The terminal transaction rolled back. This independent conservative block
+      // preserves that failure while preventing reuse of SQL's last committed prefix.
+      if (terminal.nativeHistoryUnusable && this.dependencies.sessions) {
+        const blocked = this.dependencies.sessions.markHistoryUnusable(session.sessionId);
+        if (!blocked.ok) return fail(blocked.error, active.runId);
+      }
       return fail(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, active.runId), active.runId);
     }
     if (!committed.data) {

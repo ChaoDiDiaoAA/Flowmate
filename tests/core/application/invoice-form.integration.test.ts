@@ -530,11 +530,12 @@ describe('Fill backend through the public Application', () => {
           credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-form-key' });
         if (outcome === 'toolResult-save-failure') {
           const watch = adapter.watchSession.bind(adapter);
-          adapter.watchSession = (nativeId, save) => watch(nativeId, (history, context) => {
+          adapter.watchSession = (nativeId, commit, seed, save) => watch(nativeId, commit, seed, write => {
+            const history = write.history;
             const entry = history.entries.at(-1);
             const message = entry?.type === 'message' ? entry.message as { role?: string; toolCallId?: string } : null;
-            return context && message?.role === 'toolResult' && message.toolCallId === 'form-call-3'
-              ? fail(appError('storage_write_failed', 'storage', 'Fixture rejects the actual Fill toolResult save.')) : save(history, context);
+            return write.contexts.length > 0 && message?.role === 'toolResult' && message.toolCallId === 'form-call-3'
+              ? fail(appError('storage_write_failed', 'storage', 'Fixture rejects the actual Fill toolResult save.')) : save(write);
           });
         }
         return adapter;

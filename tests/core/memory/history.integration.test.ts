@@ -1,3 +1,9 @@
+import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
+import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { SessionService, ensureNativeSession } from '../../../packages/core/src/sessions/service.ts';
+import type { NativeSessionEntry } from '@flowmate/contracts';
+import { appError, fail, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
 import { expect, it, spyOn } from 'bun:test';
 import { Database, type SQLQueryBindings, type Statement } from 'bun:sqlite';
 import { readFileSync, readdirSync, mkdirSync } from 'node:fs';
@@ -366,5 +372,386 @@ it('P9 T02 migrates 015 atomically without rewriting original facts', () => {
     expect(opened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(opened.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     opened.close();
+  }
+});
+
+function historyFixture(entries: NativeSessionEntry[]) {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-p9-history-'));
+  const paths = { root, databaseFile: join(root, 'test.sqlite'), logsDir: join(root, 'logs'),
+    artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
+  const store = need(openDatabase(paths)); deferCleanup(() => store.close());
+  let requests = 0;
+  const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir, credentials: new InMemoryCredentialStore(),
+    fetch: async () => { requests++; throw new Error('Unexpected model HTTP during history management'); } });
+  deferCleanup(async () => { await agent.close(); });
+  const native = need(agent.createSession()); const empty = need(agent.exportSession(native.nativeSessionId));
+  const session = need(store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'History', at,
+    nativeHistory: { ...empty, entries, leafId: entries.at(-1)?.id ?? null } }));
+  const service = new SessionService(store.sessions, agent, () => ({ active: null, blocked: false, error: null }),
+    () => at, store.runs, store.memory);
+  return { store, agent, service, session, requests: () => requests };
+}
+const user = (id: string, parentId: string | null, text: string): NativeSessionEntry => ({ type: 'message', id, parentId,
+  timestamp: at, message: { role: 'user', content: text, timestamp: 1 } });
+const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const historyAssistant = (content: unknown[]) => ({ role: 'assistant', content, api: 'openai-completions', provider: 'fixture', model: 'fixture', usage, stopReason: 'stop', timestamp: 1 });
+function historyRun(f: ReturnType<typeof historyFixture>) {
+  const config = { version: 1 as const, name: 'History fixture', revision: 1,
+    requestedModel: { provider: 'synthetic', model: 'synthetic' }, resolvedModel: null, api: null, endpoint: null,
+    sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 },
+    limits: { timeoutMs: 1000, stopGraceMs: 100 }, native: { authSource: 'unknown' as const, modelsSelection: null },
+    goalMode: 'answer' as const, agent: { policyVersion: 'p3-invoice-tools-v1' as const, nativeSessionId: f.session.nativeSessionId,
+      systemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT, thinkingLevel: 'off' as const, resourcePolicy: 'none' as const,
+      historyPolicy: 'memory-only' as const, maxContextBytes: 8388608 as const, maxOutputBytes: 262144 as const,
+      maxAssistantContentBytes: 524288 as const, maxModelCalls: 12 as const, maxToolCalls: 24 as const,
+      toolTimeoutMs: 10000 as const, sessionRetry: false as const } };
+  return need(f.store.runs.createAgent({ sessionId: f.session.sessionId, goal: 'History',
+    input: { version: 1, goal: 'History', text: '', messageTimestamp: 1 }, config,
+    scope: { version: 2, allowedTools: [], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] },
+    usage: { version: 1, source: 'unknown', reason: 'offline', sdkValues: null, attempts: null,
+      attemptsComplete: false, costSource: null, updatedAt: at },
+    cleanup: { version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false }, createdAt: at }));
+}
+
+it('P9 T05 pages the whole tree at one committed revision', async () => {
+  const entries = Array.from({ length: 121 }, (_, n) => user(`u${n}`, n ? 'u0' : null, `question ${n}`));
+  const f = historyFixture(entries);
+  const before = f.store.db.query('SELECT * FROM session_native_entries').all();
+  const first = await f.service.querySessionHistory?.({ sessionId: f.session.sessionId });
+  expect(first).toMatchObject({ ok: true, data: { commit: { commitRevision: 1, entryCount: 121 }, nextAfterSequence: 49 } });
+  if (!first?.ok) return;
+  expect(first.data.items).toHaveLength(50);
+  expect(need(await f.service.querySessionHistory({ sessionId: f.session.sessionId, limit: 100 })).items).toHaveLength(100);
+  expect(await f.service.querySessionHistory({ sessionId: f.session.sessionId, limit: 101 })).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+  expect(first.data.items[1]).toMatchObject({ entryId: 'u1', sequence: 1, isCurrentPath: false, canSelect: true });
+  const second = need(await f.service.querySessionHistory({ sessionId: f.session.sessionId, expectedCommitRevision: 1, afterSequence: 49, limit: 100 }));
+  expect(second.items).toHaveLength(71); expect(second.items[0]?.sequence).toBe(50); expect(second.nextAfterSequence).toBeNull();
+  expect(need(await f.service.querySessionHistory({ sessionId: f.session.sessionId, afterSequence: 120, expectedCommitRevision: 1 })).items).toEqual([]);
+  expect(await f.service.querySessionHistory({ sessionId: f.session.sessionId, afterSequence: 49 })).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+  const original = need(f.store.memory.load(f.session.sessionId))!;
+  need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: original.commit, header: original.history.header,
+    appendEntries: [], contexts: [], leafId: 'u1', unusable: false }));
+  expect(await f.service.querySessionHistory({ sessionId: f.session.sessionId, expectedCommitRevision: 1 })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  expect(await f.service.querySessionHistoryEntry({ sessionId: f.session.sessionId, entryId: 'u0', expectedCommitRevision: 1 })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(before);
+});
+
+it('P9 T05 browses empty and incomplete positions, uses current authorization, and rejects unprovable origins', async () => {
+  const f = historyFixture([{ type: 'custom', id: 'metadata', parentId: null, timestamp: at, customType: 'opaque', data: { secret: 'private' } },
+    user('u', 'metadata', 'user'), { type: 'message', id: 'call', parentId: 'u', timestamp: at,
+      message: { ...historyAssistant([{ type: 'toolCall', id: 'call-id', name: 'tool', arguments: { secret: 'private' } }]), stopReason: 'toolUse' } } as NativeSessionEntry]);
+  const page = need(await f.service.querySessionHistory({ sessionId: f.session.sessionId }));
+  expect(page.items.map(item => [item.entryId, item.canSelect, item.cannotSelectReason]))
+    .toEqual([['metadata', false, 'empty-context'], ['u', true, null], ['call', false, 'incomplete-tool-pair']]);
+  expect(await f.service.querySessionHistoryEntry({ sessionId: f.session.sessionId, entryId: 'call', expectedCommitRevision: 1 }))
+    .toMatchObject({ ok: true, data: { part: null, partIndex: 0, offset: 0, next: null } });
+  expect(await f.service.branch({ sessionId: f.session.sessionId, expectedCommitRevision: 1, expectedLeafId: 'call', expectedEntryCount: 3, targetEntryId: 'call' }))
+    .toMatchObject({ ok: false, error: { code: 'session_branch_unavailable' } });
+  f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
+    .run(JSON.stringify({ documentIds: [1], at, reason: 'document_use_revoked' }), f.session.sessionId);
+  expect(need(await f.service.querySessionHistory({ sessionId: f.session.sessionId })).items[1]).toMatchObject({ canSelect: false, cannotSelectReason: 'source-unavailable' });
+  expect(ensureNativeSession(f.store.sessions, f.agent, f.session, f.store.memory)).toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
+  f.store.db.exec('PRAGMA foreign_keys=OFF');
+  f.store.db.query("UPDATE session_native_entries SET run_id=999 WHERE entry_id='u'").run();
+  expect(await f.service.querySessionHistory({ sessionId: f.session.sessionId })).toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
+});
+
+it('P9 T05 reads complete display text through safe UTF8 parts', async () => {
+  const text = '中文🙂'.repeat(18000);
+  const entry: NativeSessionEntry = { type: 'custom_message', id: 'long', parentId: null, timestamp: at, customType: 'fixture', display: false,
+    content: [{ type: 'text', text: '' }, { type: 'text', text }, { type: 'text', text: '' }, { type: 'text', text: '尾🙂' }], details: { secret: 'never expose' } };
+  const f = historyFixture([entry]);
+  const first = await f.service.querySessionHistoryEntry?.({ sessionId: f.session.sessionId, entryId: 'long', expectedCommitRevision: 1 });
+  expect(first).toMatchObject({ ok: true, data: { partIndex: 1, offset: 0, part: { kind: 'text' } } });
+  if (!first?.ok) return;
+  let part = first.data; let recovered = '';
+  for (;;) {
+    expect(Buffer.byteLength(JSON.stringify({ ok: true, data: part }))).toBeLessThanOrEqual(131072);
+    expect(Buffer.byteLength(part.part!.text)).toBeLessThanOrEqual(65536);
+    recovered += part.part!.text;
+    if (!part.next) break;
+    part = need(await f.service.querySessionHistoryEntry({ sessionId: f.session.sessionId, entryId: 'long', expectedCommitRevision: 1, ...part.next }));
+  }
+  expect(recovered).toBe(text + '尾🙂'); expect(JSON.stringify(first)).not.toContain('never expose');
+  expect(await f.service.querySessionHistoryEntry({ sessionId: f.session.sessionId, entryId: 'long', expectedCommitRevision: 1, partIndex: 1, offset: 1 }))
+    .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+});
+
+it.each(['user', 'custom_message'] as const)('P9 T05 selects complete nodes on other branches without preparing a model: %s', async kind => {
+  const other: NativeSessionEntry = kind === 'user' ? user('other', 'first', 'other')
+    : { type: 'custom_message', id: 'other', parentId: 'first', timestamp: at, customType: 'fixture', display: false, content: 'other' };
+  const f = historyFixture([user('first', null, 'first'), other, user('current', 'first', 'current')]);
+  await f.agent.releaseSession(f.session.nativeSessionId);
+  const before = f.store.db.query('SELECT * FROM session_native_entries').all();
+  let prepares = 0; f.agent.prepare = async () => { prepares++; throw new Error('Management must not prepare'); };
+  const selected = await f.service.branch({ sessionId: f.session.sessionId, expectedCommitRevision: 1,
+    expectedEntryCount: 3, expectedLeafId: 'current', targetEntryId: 'other' });
+  expect(selected).toMatchObject({ ok: true, data: { leafId: 'other' } });
+  expect(need(f.store.memory.load(f.session.sessionId))?.commit).toEqual({ commitRevision: 2, entryCount: 3, leafId: 'other' });
+  expect(need(f.agent.exportSession(f.session.nativeSessionId)).leafId).toBe('other');
+  expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(before); expect(prepares).toBe(0);
+});
+
+it('P9 T05 restores complete history beyond the first page for missing and ready instances', async () => {
+  const f = historyFixture(Array.from({ length: 61 }, (_, n) => user(`u${n}`, n ? `u${n - 1}` : null, `question ${n}`)));
+  await f.agent.releaseSession(f.session.nativeSessionId);
+  expect(ensureNativeSession(f.store.sessions, f.agent, f.session, f.store.memory)).toEqual({ ok: true, data: undefined });
+  expect(need(f.agent.exportSession(f.session.nativeSessionId)).entries).toHaveLength(61);
+  expect(ensureNativeSession(f.store.sessions, f.agent, f.session, f.store.memory)).toEqual({ ok: true, data: undefined });
+  const created = await f.service.create({ title: 'Receipt installation' });
+  expect(created).toMatchObject({ ok: true });
+});
+
+it('P9 T05 shrinks whole rows by complete page bytes with an advancing exclusive cursor', async () => {
+  const timestamp = `2026-10-04T00:00:00.${'0'.repeat(7000)}Z`;
+  const f = historyFixture(Array.from({ length: 121 }, (_, n) => ({ ...user(`u${n}`, n ? 'u0' : null, '\u0000'.repeat(1024)), timestamp })));
+  let afterSequence: number | undefined; const ids: string[] = [];
+  do {
+    const result = await f.service.querySessionHistory({ sessionId: f.session.sessionId, expectedCommitRevision: 1, limit: 100,
+      ...(afterSequence === undefined ? {} : { afterSequence }) });
+    const page = need(result); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1048576);
+    expect(page.items.length).toBeGreaterThan(0); expect(page.items.length).toBeLessThan(100);
+    ids.push(...page.items.map(item => item.entryId)); afterSequence = page.nextAfterSequence ?? undefined;
+  } while (afterSequence !== undefined);
+  expect(ids).toEqual(Array.from({ length: 121 }, (_, n) => `u${n}`));
+  f.store.db.query('UPDATE sessions SET created_at=? WHERE id=?').run(`2026-10-04T00:00:00.${'0'.repeat(1048576)}Z`, f.session.sessionId);
+  expect(await f.service.querySessionHistory({ sessionId: f.session.sessionId })).toMatchObject({ ok: false, error: { code: 'context_evidence_too_large' } });
+});
+
+it.each(['newer-revision', 'changed-body', 'unknown-read', 'sticky-failure'] as const)('P9 T05 never confirms unknown or different committed facts: %s', async fault => {
+  const f = historyFixture([user('old', null, 'old'), user('target', 'old', 'target')]);
+  await f.agent.releaseSession(f.session.nativeSessionId);
+  const original = f.store.memory.commit; const read = f.store.sessions.readHistorySnapshot; let written = false; let writes = 0;
+  const before = f.store.db.query('SELECT * FROM session_native_entries').all();
+  const old = need(read(f.session.sessionId, value => ({ ok: true, data: value })));
+  const move = f.agent.moveSessionLeaf.bind(f.agent); let nativeMoved: unknown; let moves = 0;
+  f.agent.moveSessionLeaf = async (...args) => { moves++; const result = await move(...args); nativeMoved = result; return result; };
+  f.store.memory.commit = input => {
+    writes++; const saved = need(original(input)); written = true;
+    if (fault === 'newer-revision') {
+      const a = need(original({ ...input, expected: saved, leafId: 'target' })); need(original({ ...input, expected: a }));
+    }
+    if (fault === 'changed-body') f.store.db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.message.content','different') WHERE entry_id='old'").run();
+    return fail(appError('storage_write_failed', 'storage', 'Lost receipt.'));
+  };
+  if (fault === 'unknown-read' || fault === 'sticky-failure') f.store.sessions.readHistorySnapshot = (...args) => written
+    ? fail(appError('storage_read_failed', 'storage', 'Unknown readback.')) : read(...args);
+  if (fault === 'sticky-failure') f.store.db.exec("CREATE TRIGGER reject_sticky BEFORE UPDATE OF unusable ON session_native_history WHEN NEW.unusable=1 BEGIN SELECT RAISE(ABORT,'sticky failed'); END;");
+  const request = { sessionId: f.session.sessionId, expectedCommitRevision: 1, expectedEntryCount: 2, expectedLeafId: 'target', targetEntryId: 'old' };
+  const result = await f.service.branch(request);
+  expect(result).toMatchObject({ ok: false }); expect(writes).toBe(1); expect(moves).toBe(1);
+  expect(f.service.isManaging(f.session.sessionId)).toBe(true); expect(await f.service.branch(request)).toMatchObject({ ok: false, error: { code: 'session_busy' } });
+  expect(f.agent.inspect(f.session.nativeSessionId).availability).toBe('missing');
+  const saved = need(f.store.memory.load(f.session.sessionId))!;
+  expect(saved.commit).toEqual({ leafId: 'old', entryCount: 2, commitRevision: fault === 'newer-revision' ? 5 : fault === 'sticky-failure' ? 2 : 3 });
+  expect(saved.history.unusable).toBe(fault !== 'sticky-failure');
+  if (fault !== 'changed-body') expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(before);
+  expect(f.store.db.query('SELECT * FROM runs').all()).toEqual([]); expect(f.store.db.query('SELECT * FROM session_inputs').all()).toEqual([]);
+  console.log('P9 T05 position evidence', JSON.stringify({ fault, old, intended: { history: { ...old.bundle.history!, leafId: 'old' },
+    commit: { commitRevision: 2, entryCount: 2, leafId: 'old' }, seed: old.bundle.seed, associations: old.associations }, nativeMoved,
+    result, readback: fault === 'unknown-read' || fault === 'sticky-failure' ? 'storage_read_failed' : read(f.session.sessionId, value => ({ ok: true, data: value })),
+    sqlHeader: f.store.db.query('SELECT * FROM session_native_history').all(), sqlEntries: f.store.db.query('SELECT * FROM session_native_entries').all(),
+    sqlInputs: f.store.db.query('SELECT * FROM session_inputs').all(), finalReceipt: saved.commit, moves, writes, retainedGate: f.service.isManaging(f.session.sessionId) }));
+});
+
+it('P9 T05 keeps chat and History cursors independent on mixed paths', async () => {
+  const entries = [user('user', null, 'visible user'),
+    { id: 'assistant', parentId: 'user', type: 'message', timestamp: at, message: historyAssistant([{ type: 'text', text: 'visible assistant' }]) },
+    { id: 'bash', parentId: 'assistant', type: 'message', timestamp: at, message: { role: 'bashExecution', command: 'cmd', output: 'output', cancelled: false, truncated: false, timestamp: 1 } },
+    { id: 'custom', parentId: 'bash', type: 'custom_message', timestamp: at, customType: 'private', display: false, content: 'derived', details: { password: 'private-secret' } },
+    { id: 'label', parentId: 'custom', type: 'label', timestamp: at, targetId: 'user', label: 'label' },
+    { id: 'name', parentId: 'label', type: 'session_info', timestamp: at, name: 'name' },
+    { id: 'model', parentId: 'name', type: 'model_change', timestamp: at, provider: 'fixture', modelId: 'fixture' },
+    { id: 'thinking', parentId: 'model', type: 'thinking_level_change', timestamp: at, thinkingLevel: 'off' },
+    { id: 'opaque', parentId: 'thinking', type: 'custom', timestamp: at, customType: 'private', data: { token: 'private-secret' } },
+    { id: 'compact', parentId: 'opaque', type: 'compaction', timestamp: at, summary: 'summary', firstKeptEntryId: 'user', tokensBefore: 1 },
+    { id: 'branch', parentId: 'compact', type: 'branch_summary', timestamp: at, fromId: 'user', summary: 'branch' },
+  ] as NativeSessionEntry[];
+  const f = historyFixture(entries); const before = f.store.db.query('SELECT * FROM session_native_entries').all();
+  const page = need(await f.service.querySessionHistory({ sessionId: f.session.sessionId }));
+  expect(new Set(page.items.map(item => item.type)).size).toBe(9);
+  const chat = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 1 }));
+  expect(chat.items.map(item => item.role)).toEqual(['assistant']); expect(chat.nextBeforeEntryId).toBe('assistant');
+  const earlier = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 1, beforeEntryId: 'assistant' }));
+  expect(earlier.items.map(item => item.role)).toEqual(['user']);
+  const empty = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 1, beforeEntryId: 'user' }));
+  expect(empty.items).toEqual([]); expect(need(await f.service.querySessionHistory({ sessionId: f.session.sessionId })).items).toHaveLength(11);
+  expect(JSON.stringify(page)).not.toContain('private-secret'); expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(before);
+  await f.agent.releaseSession(f.session.nativeSessionId);
+  const prepares = spyOn(f.agent, 'prepare');
+  expect(page.items.every(item => item.canSelect)).toBe(true);
+  for (const item of page.items) {
+    const prior = need(f.store.memory.load(f.session.sessionId))!;
+    expect(await f.service.branch({ sessionId: f.session.sessionId, targetEntryId: item.entryId,
+      expectedCommitRevision: prior.commit.commitRevision, expectedEntryCount: prior.commit.entryCount, expectedLeafId: prior.commit.leafId }))
+      .toMatchObject({ ok: true, data: { leafId: item.entryId } });
+    expect(need(f.agent.exportSession(f.session.nativeSessionId)).leafId).toBe(item.entryId);
+    expect(need(f.store.memory.load(f.session.sessionId))!.commit).toEqual({ ...prior.commit, leafId: item.entryId,
+      commitRevision: prior.commit.commitRevision + (prior.commit.leafId === item.entryId ? 0 : 1) });
+  }
+  expect(prepares).not.toHaveBeenCalled(); expect(f.requests()).toBe(0);
+  expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(before);
+});
+
+it('P9 T05 projects all seven message roles through the closed display fields', async () => {
+  const secret = 'PRIVATE-PAYLOAD-SENTINEL'; const toolName = '工具'.repeat(1000);
+  const roles = [
+    { role: 'user', content: [{ type: 'text', text: 'user' }, { type: 'image', data: secret, mimeType: 'image/png' }], timestamp: 1 },
+    { ...historyAssistant([{ type: 'toolCall', id: 'pair', name: toolName, arguments: { secret } }]), stopReason: 'toolUse' },
+    { role: 'toolResult', content: [{ type: 'text', text: 'result' }, { type: 'image', data: secret, mimeType: 'image/png' }], toolCallId: 'pair', toolName, isError: false, details: { secret }, timestamp: 1 },
+    { role: 'bashExecution', command: 'command', output: 'output', cancelled: false, truncated: false, fullOutputPath: secret, timestamp: 1 },
+    { role: 'custom', customType: 'custom', display: false, content: 'custom', details: { secret }, timestamp: 1 },
+    { role: 'branchSummary', fromId: '0', summary: 'branch summary', timestamp: 1 },
+    { role: 'compactionSummary', summary: 'compaction summary', tokensBefore: 1, timestamp: 1 },
+  ];
+  const entries = roles.map((message, n) => ({ type: 'message', id: `${n}`, parentId: n ? `${n - 1}` : null,
+    timestamp: at, message, privateExtra: secret })) as NativeSessionEntry[];
+  const f = historyFixture([]), runId = historyRun(f), empty = need(f.store.memory.load(f.session.sessionId))!;
+  need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: empty.commit, header: empty.history.header,
+    appendEntries: entries, leafId: '6', unusable: false, contexts: [{ entryId: '1', runId }, { entryId: '2', runId }] }));
+  const original = f.store.db.query('SELECT * FROM session_native_entries').all();
+  for (let n = 0; n < roles.length; n++) {
+    const detail = need(await f.service.querySessionHistoryEntry({ sessionId: f.session.sessionId, entryId: `${n}`, expectedCommitRevision: 2 }));
+    expect(detail.fields).toMatchObject({ type: 'message', role: roles[n]!.role,
+      stopReason: n === 1 ? 'toolUse' : null, isError: n === 2 ? false : null, callId: n === 2 ? 'pair' : null });
+    if (n === 2) expect(detail.fields).toMatchObject({ toolName: { truncated: true }, hasImages: true, imageMimeTypes: ['image/png'] });
+    else expect(detail.fields).toMatchObject({ toolName: null });
+    expect(JSON.stringify(detail)).not.toContain(secret);
+  }
+  const chat = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 100 }));
+  expect(chat.items.map(item => item.role)).toEqual(['user', 'assistant', 'toolResult']);
+  expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(original);
+});
+
+it('P9 T05 preserves escape-expanded text and long label/name/summary/command/output with bounded Results', async () => {
+  const long = '\u0000'.repeat(70000) + '中文🙂'.repeat(12000);
+  const entries = [user('u', null, 'base'),
+    { id: 'a', parentId: 'u', type: 'message', timestamp: at, message: historyAssistant([{ type: 'thinking', thinking: long }, { type: 'text', text: long }]) },
+    { id: 'b', parentId: 'a', type: 'message', timestamp: at, message: { role: 'bashExecution', command: long, output: long, fullOutputPath: 'private-path', cancelled: false, truncated: false, timestamp: 1 } },
+    { id: 'l', parentId: 'b', type: 'label', timestamp: at, targetId: 'u', label: long },
+    { id: 'n', parentId: 'l', type: 'session_info', timestamp: at, name: long },
+    { id: 's', parentId: 'n', type: 'branch_summary', timestamp: at, fromId: 'u', summary: long },
+  ] as NativeSessionEntry[];
+  const f = historyFixture(entries);
+  const first = need(await f.service.querySessionHistoryEntry({ sessionId: f.session.sessionId, entryId: 'a', expectedCommitRevision: 1 }));
+  expect(Buffer.byteLength(first.part!.text)).toBeLessThan(65536);
+  expect(first.next).toEqual({ partIndex: 0, offset: Buffer.byteLength(first.part!.text) });
+  for (const [entryId, expected] of [['a', long + long], ['b', long + long], ['l', long], ['n', long], ['s', long]]) {
+    let next: { partIndex: number; offset: number } | null = { partIndex: 0, offset: 0 }; let text = '';
+    while (next) {
+      const result = await f.service.querySessionHistoryEntry({ sessionId: f.session.sessionId, entryId: entryId!, expectedCommitRevision: 1, ...next });
+      const part = need(result); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(131072);
+      expect(JSON.stringify(result)).not.toContain('private-path'); expect(Buffer.byteLength(part.summary.preview)).toBeLessThanOrEqual(1024);
+      text += part.part!.text; next = part.next;
+    }
+    expect(text).toBe(expected!);
+  }
+});
+
+it('P9 T05 rejects impossible text cursors and fixed display metadata overflow without leaking images', async () => {
+  const f = historyFixture([{ type: 'custom_message', id: 'image', parentId: null, timestamp: at, customType: 'image', display: true,
+    content: [{ type: 'image', data: 'private-base64', mimeType: 'image/png' }] }]);
+  const request = { sessionId: f.session.sessionId, entryId: 'image', expectedCommitRevision: 1 };
+  expect(await f.service.querySessionHistoryEntry(request)).toMatchObject({ ok: true, data: { part: null, partIndex: 0, offset: 0, next: null } });
+  expect(JSON.stringify(await f.service.querySessionHistoryEntry(request))).not.toContain('private-base64');
+  for (const positions of [{ offset: -1 }, { offset: 1 }, { partIndex: 1 }, { offset: 0.5 }, { partIndex: Number.MAX_SAFE_INTEGER + 1 }])
+    expect(await f.service.querySessionHistoryEntry({ ...request, ...positions })).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+  const images = Array.from({ length: 1200 }, (_, n) => ({ type: 'image' as const, data: 'private-base64', mimeType: `image/${n}${'x'.repeat(220)}` }));
+  const huge = historyFixture([{ type: 'custom_message', id: 'huge', parentId: null, timestamp: at, customType: 'image', display: true, content: images }]);
+  expect(await huge.service.querySessionHistoryEntry({ sessionId: huge.session.sessionId, entryId: 'huge', expectedCommitRevision: 1 }))
+    .toMatchObject({ ok: false, error: { code: 'context_evidence_too_large' } });
+});
+
+it.each([false, true])('P9 T05 confirms committed positions after lost changed and no-op responses: no-op=%s', async noOp => {
+  const f = historyFixture([user('old', null, 'old'), user('target', 'old', 'target')]);
+  await f.agent.releaseSession(f.session.nativeSessionId);
+  const before = need(f.store.sessions.loadHistoryForContext(f.session.sessionId));
+  const original = f.store.memory.commit; let commits = 0; let moves = 0;
+  const move = f.agent.moveSessionLeaf.bind(f.agent); f.agent.moveSessionLeaf = (...args) => { moves++; return move(...args); };
+  f.store.memory.commit = input => { commits++; need(original(input)); return fail(appError('storage_write_failed', 'storage', 'Lost receipt.')); };
+  const targetEntryId = noOp ? 'target' : 'old';
+  const selected = await f.service.branch({ sessionId: f.session.sessionId, expectedCommitRevision: 1, expectedEntryCount: 2, expectedLeafId: 'target', targetEntryId });
+  expect(selected).toMatchObject({ ok: true, data: { leafId: targetEntryId } });
+  const after = need(f.store.sessions.loadHistoryForContext(f.session.sessionId));
+  expect(after).toEqual({ ...before, history: { ...before.history!, leafId: targetEntryId }, commit: { commitRevision: noOp ? 1 : 2, entryCount: 2, leafId: targetEntryId } });
+  expect(need(f.agent.exportSession(f.session.nativeSessionId)).leafId).toBe(targetEntryId);
+  expect(commits).toBe(1); expect(moves).toBe(1); expect(f.requests()).toBe(0);
+  console.log('P9 T05 lost receipt evidence', JSON.stringify({ noOp, old: before,
+    intended: { ...before, history: { ...before.history!, leafId: targetEntryId },
+      commit: { commitRevision: noOp ? 1 : 2, entryCount: 2, leafId: targetEntryId } }, readback: after,
+    native: need(f.agent.exportSession(f.session.nativeSessionId)),
+    sqlHeader: f.store.db.query('SELECT * FROM session_native_history').all(),
+    sqlEntries: f.store.db.query('SELECT * FROM session_native_entries').all(), sqlInputs: f.store.db.query('SELECT * FROM session_inputs').all(),
+    moves, commits, http: f.requests() }));
+});
+
+it.each(['source-progress', 'result-association'] as const)('P9 T05 confirms exactly the frozen origin associations after a lost receipt: %s', async fault => {
+  const f = historyFixture([]), runId = historyRun(f);
+  const addInput = (sequence: number) => Number(f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,
+    request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
+    VALUES(?,?,'prompt','answer',?, ?,?,'queued','pending',?,?)`).run(f.session.sessionId, sequence, 'a'.repeat(64), runId,
+      JSON.stringify({ version: 2, text: 'source', promptText: 'source', workspaceContext: null, workspaceInput: null,
+        allowedDocumentIds: [], allowedArtifactIds: [] }), at, at).lastInsertRowid);
+  const inputId = addInput(1), empty = need(f.store.memory.load(f.session.sessionId))!;
+  const entries = [user('user', null, 'source'), { type: 'message', id: 'reply', parentId: 'user', timestamp: at,
+    message: historyAssistant([{ type: 'text', text: 'reply' }]) }] as NativeSessionEntry[];
+  need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: empty.commit, header: empty.history.header,
+    appendEntries: entries, leafId: 'reply', unusable: false,
+    contexts: [{ entryId: 'user', runId, inputId }, { entryId: 'reply', runId, resultInputIds: [inputId] }] }));
+  const source = need(f.store.memory.load(f.session.sessionId))!;
+  const native = need(f.agent.createSession()), targetHeader = need(f.agent.exportSession(native.nativeSessionId)).header;
+  const target = need(f.store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'Trusted copied prefix', at,
+    nativeHistory: { ...source.history, header: targetHeader } }));
+  // Existing trusted provenance in disposable SQLite, not a public fork implementation.
+  f.store.db.query(`INSERT INTO session_forks(target_session_id,source_session_id,source_commit_revision,source_entry_count,
+    source_leaf_id,selected_entry_id,inherited_entry_count,client_operation_id,request_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    .run(target.sessionId, f.session.sessionId, source.commit.commitRevision, 2, 'reply', 'reply', 2, native.nativeSessionId,
+      JSON.stringify({ selectedEntryId: 'reply' }), at);
+  const before = need(f.store.sessions.readHistorySnapshot(target.sessionId, value => ({ ok: true, data: value })));
+  const businessBefore = f.store.db.query('SELECT * FROM runs').all();
+  await f.agent.releaseSession(native.nativeSessionId);
+  const originalMove = f.agent.moveSessionLeaf.bind(f.agent), originalCommit = f.store.memory.commit;
+  let moves = 0, writes = 0;
+  f.agent.moveSessionLeaf = async (...args) => {
+    moves++; const moved = await originalMove(...args);
+    if (fault === 'source-progress') {
+      const laterInput = addInput(2), latest = need(f.store.memory.load(f.session.sessionId))!;
+      need(originalCommit({ sessionId: f.session.sessionId, expected: latest.commit, header: latest.history.header,
+        appendEntries: [user('later', 'reply', 'source')], leafId: 'later', unusable: false,
+        contexts: [{ entryId: 'later', runId, inputId: laterInput }] }));
+    }
+    return moved;
+  };
+  f.store.memory.commit = request => {
+    writes++; need(originalCommit(request));
+    if (fault === 'result-association') f.store.db.query('UPDATE session_inputs SET result_entry_id=NULL WHERE id=?').run(inputId);
+    const after = need(f.store.sessions.loadHistoryForContext(target.sessionId));
+    expect(after.seed).toEqual(before.bundle.seed);
+    expect(after.history).toEqual({ ...before.bundle.history!, leafId: 'user' });
+    expect(after.commit).toEqual({ commitRevision: 2, entryCount: 2, leafId: 'user' });
+    return fail(appError('storage_write_failed', 'storage', 'Lost receipt.'));
+  };
+  const result = await f.service.branch({ sessionId: target.sessionId, targetEntryId: 'user', expectedCommitRevision: 1,
+    expectedEntryCount: 2, expectedLeafId: 'reply' });
+  expect({ moves, result }).toMatchObject({ moves: 1 }); expect(writes).toBe(1);
+  expect(f.store.db.query('SELECT * FROM runs').all()).toEqual(businessBefore);
+  const after = need(f.store.memory.load(target.sessionId))!;
+  expect(after.history.header).toEqual(targetHeader); expect(after.history.entries).toEqual(entries);
+  console.log('P9 T05 origin association evidence', JSON.stringify({ fault, old: before, result,
+    readback: need(f.store.sessions.readHistorySnapshot(target.sessionId, value => ({ ok: true, data: value }))),
+    sqlHeaders: f.store.db.query('SELECT * FROM session_native_history ORDER BY session_id').all(),
+    sqlEntries: f.store.db.query('SELECT * FROM session_native_entries ORDER BY session_id,sequence').all(),
+    sqlInputs: f.store.db.query('SELECT * FROM session_inputs ORDER BY id').all(), moves, writes }));
+  if (fault === 'source-progress') {
+    expect(result).toMatchObject({ ok: true, data: { leafId: 'user' } });
+    expect(after.commit).toEqual({ commitRevision: 2, entryCount: 2, leafId: 'user' });
+    expect(after.history.unusable).toBe(false);
+  } else {
+    expect(result).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
+    expect(after.history.unusable).toBe(true); expect(after.commit.commitRevision).toBe(3);
+    expect(f.service.isManaging(target.sessionId)).toBe(true);
+    expect(await f.service.branch({ sessionId: target.sessionId, targetEntryId: 'user', expectedCommitRevision: 3,
+      expectedEntryCount: 2, expectedLeafId: 'user' })).toMatchObject({ ok: false, error: { code: 'session_busy' } });
+    expect(f.agent.inspect(native.nativeSessionId).availability).toBe('missing');
   }
 });

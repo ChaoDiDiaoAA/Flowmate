@@ -72,7 +72,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
         resourcePolicy: 'none', historyPolicy: 'memory-only', maxContextBytes: 524_288, maxOutputBytes: 262_144,
         maxAssistantContentBytes: 524_288, maxModelCalls: 12, sessionRetry: false,
       };
-      const snapshot: SafeConfigSnapshot & { agent: P5ChatAgentConfigFacts } = {
+      const snapshot: SafeConfigSnapshot & { agent: P5ChatAgentConfigFacts; historyPolicyVersion: 'p9-native-history-v1' } = { historyPolicyVersion: 'p9-native-history-v1',
         version: 1, name: receivedConfig.name, revision: receivedConfig.revision, requestedModel: receivedConfig.modelRef,
         resolvedModel: receivedConfig.modelRef, api: receivedConfig.connection?.api ?? null,
         endpoint: receivedConfig.connection?.baseUrl ?? null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
@@ -108,7 +108,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     async prepare() { return { ok: false, error: appError('unused', 'provider', 'unused', false) }; },
     async close() { return { stopped: true, closed: true, errors: [] }; },
   };
-  const runtime = new RuntimeService({ runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider,
+  const runtime = new RuntimeService({ memory: opened.data.memory, runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider,
     log: { write: () => undefined, close: async () => undefined }, now: () => '2026-09-24T00:00:00.000Z', monotonicNow: () => performance.now() });
   const sessionRepository: SessionRepository = options.failSessionInsert ? {
     ...opened.data.sessions,
@@ -121,7 +121,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     prepareDelete: (sessionId, at) => opened.data.sessions.prepareDelete(sessionId, at),
     delete: (sessionId, at) => opened.data.sessions.delete(sessionId, at),
   } : opened.data.sessions;
-  const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z', opened.data.runs,
+  const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z', opened.data.runs, opened.data.memory,
     opened.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
   const promptTrace: PromptTraceBuffer = {
     begin() {}, append() {}, end() {}, clearSession(sessionId) { clearedTraceSessions.push(sessionId); },

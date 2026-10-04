@@ -19,10 +19,7 @@ import { SessionService } from '../../packages/core/src/sessions/service.ts';
 import { checkPayload, checkWire, preparePayloadCodec } from '../../packages/runtime-pi/src/context-evidence.ts';
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
-function readRevision(path: string, sessionId: number): number {
-  const db = new Database(path, { readonly: true });
-  try { return db.query<{ commit_revision: number }, [number]>('SELECT commit_revision FROM session_native_history WHERE session_id=?').get(sessionId)!.commit_revision; } finally { db.close(); }
-}
+
 function barrier() { let release!: () => void; const ready = new Promise<void>(resolve => { release = resolve; }); return { ready, release }; }
 function reply(text = 'Controlled answer.') {
   const chunk = (delta: unknown, finish: string | null) => 'data: ' + JSON.stringify({ id: 'p8-context',
@@ -152,7 +149,7 @@ async function evidenceFixture(options: {
     };
     deferCleanup(() => { ModelRuntime.prototype.streamSimple = original; });
   }
-  const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent: adapter,
+  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent: adapter,
     contextService: new ContextService({ store, materials: { inspectParsed() { throw new Error('No chat material.'); } } }),
     contextRepository: { bindRequest: store.context.bindRequest, resolveToolResult: store.context.resolveToolResult,
       recordRequest(binding, update) { updates.push(update);
@@ -161,7 +158,7 @@ async function evidenceFixture(options: {
     provider: { async prepare() { throw new Error('No direct Provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: at, monotonicNow: () => performance.now() });
   deferCleanup(() => runtime.close());
-  const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.sessionInputs,
+  const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.memory, store.sessionInputs,
     (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
   const start = async (text = 'Text with \ud800 lone and 😀 paired', clientSequence = 1) => {
     let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
@@ -218,7 +215,10 @@ it('T10 F8-12 reopens a real Application and SQLite without query replay, then s
   const history = need(firstApp.adapter.exportSession(session.nativeSessionId));
   const target = history.entries.find(entry => entry.type === 'message' && typeof entry.message === 'object' && entry.message !== null
     && 'role' in entry.message && entry.message.role === 'assistant')!.id;
-  need(await firstApp.app.branchSession({ sessionId: session.sessionId, expectedLeafId: history.leafId, expectedEntryCount: history.entries.length, expectedCommitRevision: readRevision(paths.databaseFile, session.sessionId), targetEntryId: target }));
+  const committed = need(await firstApp.app.querySessionHistory({ sessionId: session.sessionId }));
+  expect(committed.session.sessionId).toBe(session.sessionId);
+  expect(committed.commit).toMatchObject({ leafId: history.leafId, entryCount: history.entries.length });
+  need(await firstApp.app.branchSession({ sessionId: session.sessionId, expectedLeafId: history.leafId, expectedEntryCount: history.entries.length, expectedCommitRevision: committed.commit.commitRevision, targetEntryId: target }));
   const branch = JSON.parse(JSON.stringify(need(firstApp.adapter.exportSession(session.nativeSessionId))));
   const oldInputs = [first, second].map(async run => need(await firstApp.app.querySessionInput({ sessionId: session.sessionId, inputId: run.accepted.inputId })).input!);
   const inputs = await Promise.all(oldInputs);
@@ -462,12 +462,12 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
       cleanup: { version: 1, stopped: true, stopReason: 'stop', errors: [], lateObservationRequired: false },
       endedAt: at(), stoppedAt: at(), durationMs: null }));
   }
-  const runtime = new RuntimeService({ runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent: adapter,
+  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent: adapter,
     contextService, ...(withRepository ? { contextRepository: store.context } : {}),
     provider: { async prepare() { throw new Error('No direct Provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: at, monotonicNow: () => performance.now() });
   deferCleanup(() => runtime.close());
-  const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.sessionInputs,
+  const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.memory, store.sessionInputs,
     (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
   const start = async (clientSequence: number) => {
     // This manual Runtime fixture owns its restoration boundary; full Application recovery remains T05.
@@ -862,8 +862,11 @@ describe('P8 actual Pi request context', () => {
     const history = need(f.adapter.exportSession(f.session.nativeSessionId));
     const target = history.entries.find(entry => entry.type === 'message' && typeof entry.message === 'object'
       && entry.message !== null && 'role' in entry.message && entry.message.role === 'assistant')!.id;
+    const committed = need(await f.app.querySessionHistory({ sessionId: f.session.sessionId }));
+    expect(committed.session.sessionId).toBe(f.session.sessionId);
+    expect(committed.commit).toMatchObject({ leafId: history.leafId, entryCount: history.entries.length });
     need(await f.app.branchSession({ sessionId: f.session.sessionId, expectedLeafId: history.leafId,
-      expectedEntryCount: history.entries.length, expectedCommitRevision: readRevision(f.paths.databaseFile, f.session.sessionId), targetEntryId: target }));
+      expectedEntryCount: history.entries.length, expectedCommitRevision: committed.commit.commitRevision, targetEntryId: target }));
     expect(f.payloads).toHaveLength(2);
     const third = await begin(f.app, f.prompt(3)); expect((await third.terminal).result.ok).toBe(true);
     expect((await f.adapter.releaseSession(f.session.nativeSessionId)).closed).toBe(true);

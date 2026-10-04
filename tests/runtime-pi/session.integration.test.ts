@@ -438,7 +438,10 @@ describe('PiAgentAdapter', () => {
     expect(await app.adapter.moveSessionLeaf(id, target)).toMatchObject({ ok: true, data: { leafId: target } });
     expect(restoreFixture(app.adapter, id, committed.data, true)).toEqual(ok(undefined));
     expect(app.adapter.exportSession(id)).toEqual(committed); expect(app.requests).toHaveLength(2);
-    expect(await app.adapter.moveSessionLeaf(id, committed.data.entries.find(entry => entry.type === 'message')!.id)).toMatchObject({ ok: false });
+    const userTarget = committed.data.entries.find(entry => entry.type === 'message')!.id;
+    expect(await app.adapter.moveSessionLeaf(id, userTarget)).toMatchObject({ ok: true, data: { leafId: userTarget,
+      header: committed.data.header, entries: committed.data.entries } });
+    expect(app.requests).toHaveLength(2);
     expect(await app.adapter.moveSessionLeaf(id, target)).toMatchObject({ ok: true });
     const rebuilt = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal);
     if (!rebuilt.ok) throw new Error(rebuilt.error.code);

@@ -580,16 +580,16 @@ export class PiAgentAdapter implements AgentPort {
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
     if (record.preparing || record.running || record.session && !record.session.isIdle)
       return fail(appError('agent_session_busy', 'session', 'Conversation is busy.'));
-    const target = record.manager.getBranch().find(entry => entry.id === targetEntryId);
-    if (!target || target.type !== 'message' || target.message.role !== 'assistant' || target.message.stopReason !== 'stop'
-      || target.message.content.some(part => part.type === 'toolCall'))
-      return fail(appError('input_invalid', 'input', 'Select a saved final assistant response on the current path.'));
+    const snapshot = this.exportSession(nativeSessionId);
+    if (!snapshot.ok) return snapshot;
+    if (!record.recoverySeed) return fail(appError('context_binding_unknown', 'runtime', 'Saved conversation sources are unavailable.'));
+    const inspected = inspectSessionHistory({ history: snapshot.data, seed: record.recoverySeed });
+    if (!inspected.ok) return inspected;
+    if (inspected.data.positions.find(position => position.entryId === targetEntryId)?.contextState !== 'complete')
+      return fail(appError('session_branch_unavailable', 'session', 'Select a complete saved native context.'));
     record.preparing = true;
     try {
-      if (record.session) {
-        const moved = await record.session.navigateTree(targetEntryId, { summarize: false });
-        if (moved.cancelled || record.manager.getLeafId() !== targetEntryId) throw new Error('branch_not_confirmed');
-      } else record.manager.branch(targetEntryId);
+      record.manager.branch(targetEntryId);
       const seeded = this.reseedContext(record);
       if (!seeded.ok) return seeded;
       return this.exportSession(nativeSessionId);
