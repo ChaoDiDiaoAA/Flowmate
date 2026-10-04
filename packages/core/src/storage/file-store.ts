@@ -151,11 +151,14 @@ export class FileStore {
 
   public read(artifact: StoredArtifact, fileName?: string): Result<Uint8Array> {
     let rootsVerified = false;
+    let verifiedRoots: Array<{ path: string; real: string; dev: number; ino: number; ctimeMs: number }> = [];
     try {
       const root = realpathSync(this.root);
       const managedArtifactRoot = realpathSync(this.artifactRoot);
       if (!within(root, managedArtifactRoot)) throw new Error('path_outside_root');
-      if (!lstatSync(root).isDirectory() || !lstatSync(managedArtifactRoot).isDirectory()) throw new Error('managed_root_unavailable');
+      const rootInfo = lstatSync(root), artifactRootInfo = lstatSync(managedArtifactRoot);
+      if (!rootInfo.isDirectory() || !artifactRootInfo.isDirectory()) throw new Error('managed_root_unavailable');
+      verifiedRoots = [{ path: this.root, real: root, ...rootInfo }, { path: this.artifactRoot, real: managedArtifactRoot, ...artifactRootInfo }];
       rootsVerified = true;
       const artifactDirectory = resolve(this.root, dirname(artifact.relativePath));
       const expectedDirectory = resolve(this.artifactRoot, String(artifact.artifactId));
@@ -174,7 +177,38 @@ export class FileStore {
       return ok(bytes);
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-      if (code === 'ENOENT' && rootsVerified || error instanceof Error && ['path_outside_root', 'artifact_file_not_registered', 'artifact_size_mismatch'].includes(error.message)) {
+      if (code === 'ENOENT' && rootsVerified) {
+        // An earlier root check cannot classify a later missing-path error: a
+        // mount may have disappeared or returned while this read was in flight.
+        // These probes are conservative evidence, not a filesystem snapshot.
+        try {
+          const rootsUnchanged = () => verifiedRoots.every(previous => {
+            const current = lstatSync(previous.path);
+            return current.isDirectory() && !current.isSymbolicLink() && realpathSync(previous.path) === previous.real
+              && current.dev === previous.dev && current.ino === previous.ino && current.ctimeMs === previous.ctimeMs;
+          });
+          if (!rootsUnchanged()) throw new Error('managed_root_changed');
+          const name = fileName ?? artifact.relativePath.slice(artifact.relativePath.lastIndexOf('/') + 1);
+          if (!validArtifactName(name) || !artifact.metadata.files.some(file => file.relativePath === name))
+            throw new Error('artifact_read_transient');
+          // ENOENT does not identify the absent path component. A successful
+          // parent listing must itself lack the expected child before absence
+          // can be durable; a temporarily absent parent only yields a retry.
+          const artifactName = String(artifact.artifactId);
+          if (readdirSync(this.artifactRoot).includes(artifactName)) {
+            const directory = join(this.artifactRoot, artifactName);
+            const info = lstatSync(directory);
+            if (!info.isDirectory() || info.isSymbolicLink() || !within(verifiedRoots[1]!.real, realpathSync(directory)))
+              throw new Error('artifact_read_transient');
+            if (readdirSync(directory).includes(name)) throw new Error('artifact_read_transient');
+          }
+          // Retain the root checks around the observation; this still does not
+          // promise a cross-process filesystem snapshot.
+          if (!rootsUnchanged()) throw new Error('managed_root_changed');
+          return fail(appError('artifact_unavailable', 'storage', '受管文件缺失或格式损坏。'));
+        } catch { return fail(appError('input_unavailable', 'input', '受管材料当前不可读取。', true)); }
+      }
+      if (error instanceof Error && ['path_outside_root', 'artifact_file_not_registered', 'artifact_size_mismatch'].includes(error.message)) {
         return fail(appError('artifact_unavailable', 'storage', '受管文件缺失或格式损坏。'));
       }
       return fail(appError('input_unavailable', 'input', '受管材料当前不可读取。', true));

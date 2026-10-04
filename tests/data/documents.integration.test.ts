@@ -785,3 +785,27 @@ describe('P7 Workspace material inspection', () => {
     expect(fixture.opened.db.query('SELECT * FROM documents').all()).toEqual(before);
   });
 });
+
+it('P9 T09 preserves Documents through unavailable artifact roots but marks a genuinely missing artifact directory', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-p9-root-classification-'));
+  const sourceDirectory = join(root, 'source', '000001'); writeSample(sourceDirectory);
+  const { opened, service, productPaths } = serviceFor(root);
+  const imported = await service.importVoxel51({ sourceDirectory }); if (!imported.ok) throw new Error(imported.error.code);
+  const documentId = imported.data.documentRef.id, before = opened.db.query('SELECT * FROM documents').all();
+  const heldRoot = join(root, 'temporarily-unmounted-artifacts');
+  renameSync(productPaths.artifactsDir, heldRoot);
+  try {
+    expect(service.readParsedForWorkspace(documentId)).toMatchObject({ ok: false, error: { code: 'input_unavailable', retryable: true } });
+    expect(opened.db.query('SELECT * FROM documents').all()).toEqual(before);
+  } finally { renameSync(heldRoot, productPaths.artifactsDir); }
+  expect(service.readParsedForWorkspace(documentId)).toMatchObject({ ok: true });
+  expect(opened.db.query('SELECT * FROM documents').all()).toEqual(before);
+  const directory = join(productPaths.artifactsDir, String(imported.data.parsedArtifactId)), heldArtifact = join(root, 'missing-artifact');
+  renameSync(directory, heldArtifact);
+  try {
+    expect(service.readParsedForWorkspace(documentId)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+    const after = opened.db.query('SELECT status,metadata_json FROM documents WHERE id=?').get(documentId) as { status: string; metadata_json: string };
+    expect(after.status).toBe('unavailable'); expect(JSON.parse(after.metadata_json).unavailableReason).toBe('parsed_artifact_missing_or_corrupt');
+  } finally { renameSync(heldArtifact, directory); }
+  expect(opened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+});

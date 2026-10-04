@@ -1,3 +1,10 @@
+import { Database } from 'bun:sqlite';
+import { createApplication } from '../../apps/composition.ts';
+import { openDatabase } from '@flowmate/core';
+import { CandidateDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
+import type { Application, ProviderConfig, Result, SessionInputRequest, AgentRunEvent } from '@flowmate/contracts';
+import { RuntimeService } from '../../packages/core/src/runtime/service.ts';
+import { deferCleanup, waitFor } from '../support/resources.ts';
 import { z } from 'zod';
 import { expect, it } from 'bun:test';
 import { SessionManager, sessionEntryToContextMessages } from '@earendil-works/pi-coding-agent';
@@ -5,7 +12,7 @@ import type { NativeSessionHistory, NativeHistoryRecoverySeed } from '@flowmate/
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import { referenceIds } from '../../packages/runtime-pi/src/memory/history.ts';
 import { appError, fail, ok } from '@flowmate/contracts';
-import { mkdtempSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readdirSync, mkdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
@@ -151,7 +158,7 @@ it('P9 T04 inspects all positions and builds a detached reference closure withou
   expect(history).toEqual(original); expect(adapter.inspect(history.header.id).availability).toBe('missing');
 });
 
-async function realFixture(api: 'openai-completions' | 'openai-responses' | 'google-generative-ai' = 'openai-completions', images = false, collision = false, imageCapability = true, extraDerived = 0) {
+async function realFixture(api: 'openai-completions' | 'openai-responses' | 'google-generative-ai' = 'openai-completions', images = false, collision = false, imageCapability = true, extraDerived = 0, storedModel = 'M1', reasoning = false) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p9-memory-')); const payloads: any[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     payloads.push(await request.json());
@@ -171,13 +178,13 @@ async function realFixture(api: 'openai-completions' | 'openai-responses' | 'goo
   } });
   const modelsPath = join(root, 'models.json');
   writeFileSync(modelsPath, JSON.stringify({ providers: { 'p9-fixture': { baseUrl: `http://127.0.0.1:${server.port}/v1`, api,
-    models: [{ id: 'M3', name: 'M3', reasoning: false, input: imageCapability ? ['text', 'image'] : ['text'], contextWindow: 64000, maxTokens: 16384,
+    models: [{ id: 'M3', name: 'M3', reasoning, input: imageCapability ? ['text', 'image'] : ['text'], contextWindow: 64000, maxTokens: 16384,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
   let session!: AgentSession; let actualTools = 0;
   const tool = { name: 'probe', version: '1', label: 'Probe', description: 'fixture', effect: 'READ' as const, executionMode: 'parallel' as const, inputSchema: z.object({}).strict(), outputSchema: z.object({}).strict(), execute: async () => { actualTools++; return {}; } };
   const adapter = new PiAgentAdapter({ cwd: root, agentDir: root, credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-fixture', tools: [tool], sessionSetup: s => { session = s; } });
   const manager = SessionManager.inMemory(root);
-  manager.appendModelChange('p9-fixture', 'M1'); manager.appendThinkingLevelChange('high');
+  manager.appendModelChange('p9-fixture', storedModel); manager.appendThinkingLevelChange('high');
   manager.appendMessage({ role: 'assistant', content: [{ type: 'text', text: 'prior' }], api, provider: 'p9-fixture', model: 'M2', usage, stopReason: 'stop', timestamp: 1 });
   if (collision) {
     manager.appendMessage({ role: 'assistant', content: [{ type: 'toolCall', id: 'inherited-call', name: 'probe', arguments: {} }], api, provider: 'p9-fixture', model: 'M2', usage, stopReason: 'toolUse', timestamp: 2 });
@@ -330,12 +337,13 @@ for (const count of [509, 510]) it(`P9 T04 budgets combined actual derived and i
 it('P9 T04 failed effective prepare keeps acknowledged history and prevents any prompt', async () => {
   const f = await realFixture();
   try {
-    const record = (f.adapter as any).sessions.get(f.history.header.id), saved = structuredClone(record.lastSavedHistory); let attempts = 0;
+    const record = (f.adapter as any).sessions.get(f.history.header.id);
+    const saved = structuredClone({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed }); let attempts = 0;
     expect(f.adapter.watchSession(f.history.header.id, record.receipt, record.recoverySeed, () => { attempts++; return fail(appError('storage_write_failed', 'storage', 'controlled metadata failure')); }).ok).toBe(true);
     const prepare = () => f.adapter.prepare(f.history.header.id, f.config, { timeoutMs: 3000, stopGraceMs: 100 }, new AbortController().signal);
     expect(await prepare()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(await prepare()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
-    expect(attempts).toBe(1); expect(record.lastSavedHistory).toEqual(saved); expect(f.payloads).toHaveLength(0);
+    expect(attempts).toBe(1); expect({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed }).toEqual(saved); expect(f.payloads).toHaveLength(0);
   } finally { await f.close(); }
 });
 
@@ -393,4 +401,443 @@ it('P9 T04 fix1 retains real root label and compaction references in fork and ac
     expect(outcome.error).toBeNull(); expect(f.payloads).toHaveLength(1);
     expect(bindings[0].includedNativeContexts).toContainEqual(expect.objectContaining({ nativeEntryId: 'compact', referenceEntryIds: ['root'] }));
   } finally { await f.close(); }
+});
+
+it('P9 T09 observes effective model and same-process thinking metadata with exact acknowledged failure state', async () => {
+  const f = await realFixture('openai-completions', false, false, true, 0, 'M3', true);
+  try {
+    const record = (f.adapter as any).sessions.get(f.history.header.id);
+    const prepare = () => f.adapter.prepare(f.history.header.id, f.config, { timeoutMs: 3000, stopGraceMs: 100 }, new AbortController().signal);
+    // The installed SDK resolves the later assistant's effective M2 over stored M3 metadata.
+    expect(record.manager.buildSessionContext().model).toEqual({ provider: 'p9-fixture', modelId: 'M2' });
+    expect(await prepare()).toMatchObject({ ok: true });
+    expect(f.session().model?.id).toBe('M3');
+    expect(record.lastSavedHistory.entries.slice(f.history.entries.length).map((e: any) => e.type)).toEqual(['model_change', 'thinking_level_change']);
+    expect(record.receipt.commitRevision).toBe(7);
+    const afterPrepare = structuredClone({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed });
+    expect(await prepare()).toMatchObject({ ok: true });
+    expect({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed }).toEqual(afterPrepare);
+    // Use the actual SDK setter; append/dedupe is observed through the installed _persist shim.
+    f.session().setThinkingLevel('low');
+    const afterThinking = structuredClone({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed });
+    expect(afterThinking.receipt.commitRevision).toBe(8);
+    expect(afterThinking.history.entries.at(-1)).toMatchObject({ type: 'thinking_level_change', thinkingLevel: 'low' });
+    f.session().setThinkingLevel('low');
+    expect(await prepare()).toMatchObject({ ok: true });
+    expect({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed }).toEqual(afterThinking);
+    const prepared = need(await prepare());
+    const outcome = await prepared.execute({ runId: 9, sessionId: 7, inputId: 50, contextSnapshotId: 60, text: 'T09 explicit model edge',
+      promptText: 'T09 explicit model edge', goal: 'test', messageTimestamp: 4,
+      verifyModelUse: () => ok(undefined), verifyInputUse: () => ok(undefined), completeInputResult: () => ok(undefined),
+      contextHooks: { bind: () => ok(undefined), record: () => ok(undefined), resolveToolResult: () => fail(appError('context_binding_unknown', 'runtime', 'No tool expected')) }
+    }, new AbortController().signal, () => {});
+    expect(outcome.error).toBeNull(); expect(f.payloads).toHaveLength(1); expect(f.payloads[0].model).toBe('M3');
+    const beforeFailure = structuredClone({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed });
+    let attempts = 0;
+    expect(f.adapter.watchSession(f.history.header.id, record.receipt, record.recoverySeed, () => {
+      attempts++; return fail(appError('storage_write_failed', 'storage', 'T09 controlled required save failure'));
+    }).ok).toBe(true);
+    expect(() => f.session().setThinkingLevel('high')).toThrow();
+    expect(await prepare()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(await prepare()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+    expect(attempts).toBe(1);
+    expect({ history: record.lastSavedHistory, receipt: record.receipt, seed: record.recoverySeed }).toEqual(beforeFailure);
+    expect(f.payloads).toHaveLength(1);
+    console.log('T09 installed SDK metadata', JSON.stringify({ effectiveBefore: 'M2', effectiveAfter: 'M3', afterPrepare, afterThinking, attempts, http: f.payloads.length }));
+  } finally { await f.close(); }
+});
+
+function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
+function reply(text = 'T09 controlled answer') {
+  return new Response('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: 'stop' }] })
+    + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+}
+async function begin(app: Application, input: SessionInputRequest) {
+  let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+  const terminal = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finish = resolve; });
+  const accepted = need(await app.submitInput(input, { onEvent(event) { if (event.type === 'run_finished') finish(event); } }));
+  return { accepted, terminal };
+}
+async function t09Fixture(ownedRoot?: string) {
+  const root = ownedRoot ?? mkdtempSync(join(tmpdir(), 'flowmate-p9-t09-app-'));
+  if (!ownedRoot) deferCleanup(() => rmSync(root, { recursive: true, force: true }));
+  const api = 'openai-completions', imageCapability = true;
+  const paths = { root: join(root, 'product'), databaseFile: join(root, 'product/data/app.sqlite'), logsDir: join(root, 'product/logs'), artifactsDir: join(root, 'product/artifacts'),
+    outputsDir: join(root, 'product/outputs'), runtimeDir: join(root, 'product/runtime') };
+  const payloads: any[] = [];
+  let failSave: ((write: any) => boolean) | undefined;
+  let replyTool: unknown, responseHook: (() => Response | Promise<Response>) | undefined;
+  const calls = { http: 0, base: 0, observe: 0, execute: 0, enqueue: 0 };
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    payloads.push(await request.json()); calls.http++;
+    if (responseHook) return responseHook();
+    if (replyTool) {
+      const tool = replyTool; replyTool = undefined;
+      return new Response('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0,
+        id: 't07-original-call', type: 'function', function: { name: 'save_invoice_candidate', arguments: JSON.stringify(tool) } }] },
+        finish_reason: 'tool_calls' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    }
+    return reply('T09 controlled answer');
+  } });
+  deferCleanup(() => server.stop(true));
+  const modelsPath = join(root, 'models.json');
+  writeFileSync(modelsPath, JSON.stringify({ providers: { 't07-loopback': { baseUrl: `http://127.0.0.1:${server.port}/v1`, api,
+    models: ['M1', 'M2', 'M3'].map(id => ({ id, name: id, reasoning: false, input: imageCapability ? ['text', 'image'] : ['text'],
+      contextWindow: 128000, maxTokens: 16384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) } } }));
+  const config = (model = 'M1', retries: 0 | 1 = 0): ProviderConfig => ({ version: 1, name: 'T07', revision: 1,
+    modelRef: { provider: 't07-loopback', model }, native: { authPath: join(root, 'unused.json'), modelsPath },
+    parameters: { maxRetries: retries, maxRetryDelayMs: 100 } });
+  let ownedStore: any;
+  let app!: Application, adapter!: PiAgentAdapter, sdk!: AgentSession, ownedDb!: Database;
+  const runtimeState = RuntimeService.prototype.state;
+  RuntimeService.prototype.state = function (...args) {
+    ownedStore = (this as any).dependencies.contextService.options.store; ownedDb = ownedStore.db; return runtimeState.apply(this, args);
+  };
+  deferCleanup(() => { RuntimeService.prototype.state = runtimeState; });
+  const sql = <T>(fn: (db: Database) => T): T => fn(ownedDb);
+  const open = async () => {
+    app = need(await createApplication({ paths, invoiceSourceRoot: join(root, 'source'), logger: { write() {}, async close() {} }, agentFactory: tools => {
+      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-t07',
+        fetch: (input, init) => { calls.base++; return globalThis.fetch(input, init); }, sessionSetup(session) {
+          sdk = session;
+        } });
+      const prepare = adapter.prepare.bind(adapter);
+      adapter.prepare = async (...args) => {
+        const prepared = await prepare(...args); if (!prepared.ok) return prepared;
+        const execute = prepared.data.execute;
+        return { ...prepared, data: { ...prepared.data, async execute(input, signal, observe) {
+          const binding = input.toolBinding;
+          return execute({ ...input,
+            ...(binding ? { toolBinding: { ...binding,
+              observeRequest(...call) { calls.observe++; return binding.observeRequest(...call); },
+              execute(...call) { calls.execute++; return binding.execute(...call); } } } : {}) }, signal, observe);
+        } } };
+      };
+      const enqueue = adapter.enqueueInput.bind(adapter); adapter.enqueueInput = (...args) => { calls.enqueue++; return enqueue(...args); };
+      const watch = adapter.watchSession.bind(adapter);
+      adapter.watchSession = (id, receipt, seed, write) => watch(id, receipt, seed, value =>
+        failSave?.(value)
+          ? fail(appError('storage_write_failed', 'storage', 'Controlled T09 native commit failure.')) : write(value));
+      return adapter;
+    } }));
+    await app.queryRuntimeState();
+    const opened = app; deferCleanup(() => opened.close()); return app;
+  };
+  await open();
+  const session = need(await app.createSession({ title: 'T07 source', expectedRevision: need(await app.readWorkspace()).revision }));
+  const input = async (sessionId: number, sequence: number, text: string, model = 'M1', material = false, retries: 0 | 1 = 0) => {
+    const workspace = need(await app.readWorkspace());
+    return begin(app, { sessionId, clientSequence: sequence, mode: 'prompt', text, config: config(model, retries), timeoutMs: 7000, stopGraceMs: 500,
+      ...(material ? { goalMode: 'save-candidate' as const, workspace: { revision: workspace.revision, documentRef: workspace.documentRef,
+        jobId: workspace.jobId, candidateRef: workspace.candidateRef, sessionId } } : {}) });
+  };
+  const fork = async (sourceSessionId: number, targetEntryId?: string) => {
+    const page = need(await app.querySessionHistory({ sessionId: sourceSessionId }));
+    return need(await app.forkSession({ sourceSessionId, expected: page.commit, targetEntryId: targetEntryId ?? page.commit.leafId!,
+      title: 'T07 fork', clientOperationId: crypto.randomUUID() }));
+  };
+  const branch = async (sessionId: number, targetEntryId: string) => {
+    const page = need(await app.querySessionHistory({ sessionId }));
+    return need(await app.branchSession({ sessionId, targetEntryId, expectedCommitRevision: page.commit.commitRevision,
+      expectedEntryCount: page.commit.entryCount, expectedLeafId: page.commit.leafId }));
+  };
+  const counts = () => sql(db => Object.fromEntries(['runs', 'session_inputs', 'context_snapshots', 'tool_calls', 'invoice_candidates'].map(t => [t,
+    (db.query(`SELECT COUNT(*) n FROM ${t}`).get() as { n: number }).n])));
+  const facts = (sessionId: number) => sql(db => ({ runs: db.query('SELECT * FROM runs WHERE session_id=? ORDER BY id').all(sessionId),
+    inputs: db.query('SELECT * FROM session_inputs WHERE session_id=? ORDER BY id').all(sessionId),
+    tools: db.query('SELECT * FROM tool_calls WHERE run_id IN (SELECT id FROM runs WHERE session_id=?) ORDER BY id').all(sessionId),
+    snapshots: db.query('SELECT * FROM context_snapshots WHERE session_id=? ORDER BY id').all(sessionId),
+    jobs: db.query('SELECT * FROM jobs ORDER BY id').all(),
+    candidates: db.query('SELECT * FROM invoice_candidates ORDER BY id').all() }));
+  const journal = (runId: number) => sql(db => JSON.parse((db.query('SELECT context_observations_json FROM runs WHERE id=?').get(runId) as any).context_observations_json));
+  const material = async () => {
+    const source = join(root, 'source/000001'); mkdirSync(source, { recursive: true });
+    const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64'), content = JSON.stringify([{ type: 'text', text: 'T07 invoice 113.00', bbox: [0, 0, 1, 1], page_idx: 0 }]);
+    const pages = JSON.stringify([{ pageNumber: 1, text: 'T07 invoice 113.00', blockCount: 1 }]);
+    writeFileSync(join(source, 'original.png'), original); writeFileSync(join(source, 'content.json'), content); writeFileSync(join(source, 'pages.json'), pages);
+    writeFileSync(join(source, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId: '000001', datasetId: 'voxel51-hq-invoice-ocr',
+      sourceRecordId: 'synthetic-t07', datasetRevision: 'fixture', qualityStatus: 'complete', allowedUsesClaim: ['local test'], licenseVerification: 'not_verified',
+      files: [{ path: 'original.png', bytes: original.length }, { path: 'content.json', bytes: Buffer.byteLength(content) }, { path: 'pages.json', bytes: Buffer.byteLength(pages) }] }));
+    const document = need(await app.importInvoiceMaterial(source)), documentId = document.documentRef.id;
+    const selected = need(await app.updateWorkspace({ expectedRevision: need(await app.readWorkspace()).revision, change: { kind: 'document', documentId } }));
+    const task = need(await app.startTask({ clientSequence: 1, expectedRevision: selected.revision, documentRef: document.documentRef, goal: 'T07 save actual candidate' }));
+    const page = need(await app.readDocumentPage({ documentId, page: 1, afterBlockId: null, limit: 50 }));
+    const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
+    const candidate = CandidateDraftSchema.parse({ fields: { ...Object.fromEntries(invoiceHeaderFields.map(name => [name, missing])),
+      totalAmount: { raw: '113.00', normalized: '113.00', state: 'present', alternatives: [], sources: [{ documentId, version: document.documentRef.version,
+        artifactId: document.parsedArtifactId, page: 1, blockId: page.blocks[0]!.id, quote: '113.00' }] } }, lines: [], notes: [] });
+    replyTool = { documentId, candidate };
+    const run = await input(session.sessionId, 1, 'Original invoice request', 'M1', true);
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(calls).toMatchObject({ http: 2, base: 2, observe: 1, execute: 1 });
+    const saved = need(await app.listJobCandidates({ jobId: task.job.jobId })).items;
+    expect(saved).toHaveLength(1); expect(saved[0]!.context).toMatchObject({ snapshotId: expect.any(Number), requestSequence: 1 });
+    return { run, tool: { documentId, candidate }, saved: saved[0]! };
+  };
+  const durable = (sessionId: number) => ({
+    header: ownedDb.query('SELECT * FROM session_native_history WHERE session_id=?').get(sessionId),
+    entries: ownedDb.query('SELECT * FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(sessionId),
+    stored: need(ownedStore.memory.load(sessionId)), bundle: need(ownedStore.sessions.loadHistoryForContext(sessionId)),
+    facts: facts(sessionId), fk: ownedDb.query('PRAGMA foreign_key_check').all(),
+  });
+  return { durable, paths, session, config, input, fork, branch, counts, facts, journal, material, open, sql, calls, payloads,
+    get app() { return app; }, get adapter() { return adapter; }, get sdk() { return sdk; },
+    failSave(fn: typeof failSave) { failSave = fn; },
+    committed(fn: (refs: unknown) => void) { return ownedStore.runtimeEventStore.onCommitted(fn); },
+    respond(fn: typeof responseHook) { responseHook = fn; } };
+}
+
+
+it('P9 T09 reopens a corrected nested fork and sends one explicit run through the public chain', async () => {
+  const f = await t09Fixture(), original = await f.material(), a = f.session.sessionId;
+  const base = need(await f.app.querySessionHistory({ sessionId: a })).commit.leafId!;
+  const abandoned = await f.input(a, 2, 'ABANDONED amount 999', 'M2'); expect((await abandoned.terminal).result.ok).toBe(true);
+  await f.branch(a, base);
+  const corrected = await f.input(a, 3, 'CORRECTED amount 113', 'M2'); expect((await corrected.terminal).result.ok).toBe(true);
+  const b = await f.fork(a);
+  const parentRun = await f.input(b.session.sessionId, 1, 'PARENT local correction 113', 'M2');
+  expect((await parentRun.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const before = f.facts(a), count = f.counts(), effects = { ...f.calls };
+  const c = await f.fork(b.session.sessionId);
+  const durable = [a, b.session.sessionId, c.session.sessionId].map(id => f.durable(id));
+  expect(f.counts()).toEqual(count); expect(f.calls).toEqual(effects);
+  need(await f.app.close()); await f.open();
+  for (const [index, id] of [a, b.session.sessionId, c.session.sessionId].entries()) {
+    need(await f.app.querySessionHistory({ sessionId: id }));
+    expect(f.durable(id)).toEqual(durable[index]);
+  }
+  need(await f.app.queryRun(parentRun.accepted.runId));
+  need(await f.app.querySessionInput({ sessionId: b.session.sessionId, inputId: parentRun.accepted.inputId }));
+  need(await f.app.listContextRequests({ sessionId: b.session.sessionId, runId: parentRun.accepted.runId }));
+  need(await f.app.queryRun(original.run.accepted.runId));
+  need(await f.app.querySessionInput({ sessionId: a, inputId: original.run.accepted.inputId }));
+  need(await f.app.listContextRequests({ sessionId: a, runId: original.run.accepted.runId }));
+  expect(f.facts(a)).toEqual(before); expect(f.counts()).toEqual(count); expect(f.calls).toEqual(effects);
+  const next = await f.input(c.session.sessionId, 1, 'Use selected correction', 'M3');
+  expect((await next.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect(f.counts()).toEqual({ ...count, runs: count.runs! + 1, session_inputs: count.session_inputs! + 1, context_snapshots: count.context_snapshots! + 1 });
+  expect(f.calls).toMatchObject({ http: effects.http + 1, base: effects.base + 1, execute: 1, observe: 1 });
+  const wire = JSON.stringify(f.payloads.at(-1)); expect(wire).toContain('CORRECTED amount 113'); expect(wire).not.toContain('ABANDONED amount 999');
+  expect(wire).toContain('t07-original-call'); expect(wire).toContain('113.00'); expect(f.payloads.at(-1).model).toBe('M3');
+  const input = need(await f.app.querySessionInput({ sessionId: c.session.sessionId, inputId: next.accepted.inputId })).input!;
+  const request = f.journal(next.accepted.runId).requests[0];
+  expect(request.binding).toMatchObject({ sessionId: c.session.sessionId, inputId: next.accepted.inputId, snapshotId: input.contextSnapshotId,
+    includedNativeContexts: [] });
+  expect(request.binding.includedBindings.map((v: any) => v.inputId)).toEqual([original.run.accepted.inputId, corrected.accepted.inputId, parentRun.accepted.inputId, next.accepted.inputId]);
+  expect(request.sdkPayload.inclusion).toBe('confirmed'); expect(request.attempts[0].wireInclusion).toBe('confirmed');
+  const originalTool = request.binding.includedToolResults[0];
+  expect(originalTool).toMatchObject({ originRunId: original.run.accepted.runId, nativeToolCallId: 't07-original-call' });
+  const toolView = need(await f.app.queryRunToolCall({ sessionId: a, runId: original.run.accepted.runId, toolCallId: originalTool.toolCallId }));
+  expect(toolView).toMatchObject({ toolCallId: originalTool.toolCallId, status: 'succeeded' });
+  const originalSnapshot = need(await f.app.queryContextSnapshot({ sessionId: a, runId: original.run.accepted.runId, snapshotId: originalTool.context.snapshotId }));
+  expect(originalSnapshot.snapshot.id).toBe(originalTool.context.snapshotId);
+  const targetSnapshot = need(await f.app.queryContextSnapshot({ sessionId: c.session.sessionId, runId: next.accepted.runId, snapshotId: input.contextSnapshotId! }));
+  expect(targetSnapshot.snapshot.id).not.toBe(originalSnapshot.snapshot.id);
+  expect(f.facts(a)).toEqual(before);
+  expect(f.durable(a)).toEqual(durable[0]); expect(f.durable(b.session.sessionId)).toEqual(durable[1]);
+  expect(wire).toContain('PARENT local correction 113');
+  console.log('T09 selected real effects', JSON.stringify({ before: effects, after: f.calls, counts: f.counts() }));
+});
+
+
+// This case exists only in the positively owned subprocess. The parent receives
+// the last acknowledged snapshot over IPC and kills it while the SDK awaits HTTP.
+if (process.env.FLOWMATE_T09_CHILD_ROOT) it('P9 T09 child fixture', async () => {
+  const f = await t09Fixture(process.env.FLOWMATE_T09_CHILD_ROOT), original = await f.material();
+  let entered!: () => void;
+  const held = new Promise<void>(resolve => { entered = resolve; });
+  f.respond(async () => { entered(); await new Promise(() => {}); return reply(); });
+  const active = await f.input(f.session.sessionId, 2, 'T09 consumed primary before process death');
+  await held;
+  const queued = need(await f.app.submitInput({ sessionId: f.session.sessionId, runId: active.accepted.runId,
+    clientSequence: 3, mode: 'followUp', text: 'T09 QUEUED NEVER CONSUMED' }));
+  const consumed = need(await f.app.querySessionInput({ sessionId: f.session.sessionId, inputId: active.accepted.inputId })).input!;
+  const followUp = need(await f.app.querySessionInput({ sessionId: f.session.sessionId, inputId: queued.inputId })).input!;
+  expect(consumed.status).toBe('consumed'); expect(typeof consumed.nativeEntryId).toBe('string');
+  expect(followUp).toMatchObject({ status: 'queued', nativeEntryId: null });
+  process.send!(JSON.stringify({ phase: 'durable-active', pid: process.pid, paths: f.paths, session: f.session, original: original.run.accepted,
+    active: active.accepted, queued, consumed, followUp, durable: f.durable(f.session.sessionId), calls: { ...f.calls } }));
+  await new Promise(() => {});
+});
+
+it('P9 T09 first cold opener preserves the exact acknowledged native prefix after active process death', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-p9-t09-kill-'));
+  deferCleanup(() => rmSync(root, { recursive: true, force: true }));
+  let acknowledged: any;
+  const child = Bun.spawn([process.execPath, '--no-env-file', 'test', '--isolate', '--timeout', '15000', import.meta.path,
+    '--test-name-pattern', '^P9 T09 child fixture$'], { cwd: process.cwd(), env: { ...process.env, FLOWMATE_T09_CHILD_ROOT: root },
+    stdout: 'pipe', stderr: 'pipe', ipc(message) { acknowledged = JSON.parse(String(message)); } });
+  const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
+  try {
+    await waitFor(async () => acknowledged?.phase === 'durable-active', 7000);
+    expect(acknowledged.pid).toBe(child.pid);
+    expect(acknowledged.calls).toMatchObject({ http: 3, base: 3, execute: 1, observe: 1, enqueue: 1 });
+    expect(acknowledged.durable.fk).toEqual([]);
+    const killedAt = Date.now(); child.kill(); const exit = await child.exited;
+    expect(exit).toBe(143); expect(child.signalCode).toBe('SIGTERM');
+    console.log('T09 child process death', JSON.stringify({ pid: child.pid, exit, signal: child.signalCode,
+      stdout: await stdout, stderr: await stderr, acknowledged }));
+    // No raw reader precedes this open: this is the very first post-death SQLite
+    // opener and executes the product's actual original boot repair transaction.
+    const first = need(openDatabase(acknowledged.paths));
+    const capture = (store: typeof first) => ({
+      header: store.db.query('SELECT * FROM session_native_history WHERE session_id=?').get(acknowledged.session.sessionId),
+      entries: store.db.query('SELECT * FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(acknowledged.session.sessionId),
+      stored: need(store.memory.load(acknowledged.session.sessionId)),
+      bundle: need(store.sessions.loadHistoryForContext(acknowledged.session.sessionId)),
+      runs: store.db.query('SELECT * FROM runs ORDER BY id').all(), inputs: store.db.query('SELECT * FROM session_inputs ORDER BY id').all(),
+      tools: store.db.query('SELECT * FROM tool_calls ORDER BY id').all(), candidates: store.db.query('SELECT * FROM invoice_candidates ORDER BY id').all(),
+      jobs: store.db.query('SELECT * FROM jobs ORDER BY id').all(), snapshots: store.db.query('SELECT * FROM context_snapshots ORDER BY id').all(),
+      events: store.db.query('SELECT * FROM runtime_events ORDER BY id').all(), fk: store.db.query('PRAGMA foreign_key_check').all(),
+    });
+    let repaired: ReturnType<typeof capture>;
+    try {
+      repaired = capture(first);
+      const before = acknowledged.durable;
+      expect(repaired.header).toEqual({ ...before.header, unusable: 1, commit_revision: before.header.commit_revision + 1 });
+      expect(repaired.entries).toEqual(before.entries);
+      expect(repaired.stored).toEqual({ history: { ...before.stored.history, unusable: true },
+        commit: { ...before.stored.commit, commitRevision: before.stored.commit.commitRevision + 1 } });
+      expect(repaired.bundle.seed).toEqual(before.bundle.seed);
+      expect(repaired.bundle.commit).toEqual(repaired.stored!.commit);
+      expect(repaired.bundle.seed.origins).toHaveLength(before.entries.length);
+      expect(new Set(repaired.bundle.seed.origins.map(o => o.nativeEntryId)).size).toBe(before.entries.length);
+      expect(repaired.bundle.seed.inputs.some(i => i.inputId === acknowledged.queued.inputId)).toBe(false);
+      expect(repaired.inputs.find((i: any) => i.id === acknowledged.active.inputId)).toMatchObject({ status: 'consumed',
+        native_entry_id: acknowledged.consumed.nativeEntryId, processing_status: 'failed' });
+      expect(repaired.inputs.find((i: any) => i.id === acknowledged.queued.inputId)).toMatchObject({ status: 'delivery_unknown', native_entry_id: null,
+        processing_status: 'failed' });
+      expect(repaired.runs.find((r: any) => r.id === acknowledged.original.runId)).toEqual(before.facts.runs.find((r: any) => r.id === acknowledged.original.runId));
+      expect(repaired.runs.find((r: any) => r.id === acknowledged.active.runId)).toMatchObject({ status: 'failed', stopped_at: null });
+      expect(repaired.inputs.find((i: any) => i.id === acknowledged.original.inputId)).toEqual(before.facts.inputs.find((i: any) => i.id === acknowledged.original.inputId));
+      expect(repaired.tools).toEqual(before.facts.tools); expect(repaired.candidates).toEqual(before.facts.candidates); expect(repaired.fk).toEqual([]);
+      expect(repaired.jobs).toEqual(before.facts.jobs); expect(repaired.snapshots).toEqual(before.facts.snapshots);
+      console.log('T09 first cold repair', JSON.stringify(repaired));
+    } finally { first.close(); }
+    const second = need(openDatabase(acknowledged.paths));
+    try { expect(capture(second)).toEqual(repaired!); } finally { second.close(); }
+    // Actual Application ownership is a 15s stale lease; do not delete its lock.
+    await waitFor(async () => {
+      try { return Date.now() - statSync(acknowledged.paths.databaseFile + '.lock').mtimeMs > 15_000; }
+      catch { return true; }
+    }, 20_000);
+    console.log('T09 actual lease condition', JSON.stringify({ killedAt, readyAt: Date.now(),
+      lockMtimeMs: statSync(acknowledged.paths.databaseFile + '.lock').mtimeMs }));
+    let http = 0, prepares = 0, enqueues = 0;
+    const app = need(await createApplication({ paths: acknowledged.paths, invoiceSourceRoot: join(root, 'source'),
+      logger: { write() {}, async close() {} }, agentFactory: tools => {
+        const adapter = new PiAgentAdapter({ cwd: acknowledged.paths.runtimeDir, agentDir: acknowledged.paths.runtimeDir, tools,
+          credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-t09-cold', fetch: (input, init) => { http++; return fetch(input, init); } });
+        const prepare = adapter.prepare.bind(adapter), enqueue = adapter.enqueueInput.bind(adapter);
+        adapter.prepare = (...args) => { prepares++; return prepare(...args); };
+        adapter.enqueueInput = (...args) => { enqueues++; return enqueue(...args); }; return adapter;
+      } }));
+    try {
+      need(await app.querySessionHistory({ sessionId: acknowledged.session.sessionId }));
+      need(await app.queryRun(acknowledged.original.runId));
+      need(await app.listContextRequests({ sessionId: acknowledged.session.sessionId, runId: acknowledged.original.runId }));
+      expect(need(await app.querySessionInput({ sessionId: acknowledged.session.sessionId, inputId: acknowledged.queued.inputId })).input)
+        .toMatchObject({ status: 'delivery_unknown', nativeEntryId: null });
+      expect(need(await app.querySessionInput({ sessionId: acknowledged.session.sessionId, inputId: acknowledged.active.inputId })).input)
+        .toMatchObject({ status: 'consumed', nativeEntryId: acknowledged.consumed.nativeEntryId });
+      expect({ http, prepares, enqueues }).toEqual({ http: 0, prepares: 0, enqueues: 0 });
+    } finally { need(await app.close()); }
+    console.log('T09 no recovery effects', JSON.stringify({ http, prepares, enqueues, childExit: exit, fk: repaired!.fk }));
+  } finally {
+    if (child.exitCode === null) { child.kill(); await child.exited; }
+    console.log('T09 child final transport', JSON.stringify({ exit: child.exitCode, signal: child.signalCode, stdout: await stdout, stderr: await stderr }));
+  }
+}, 30_000);
+
+for (const fault of ['saved-block', 'ignored-block', 'exhausted-block', 'already-sticky-max'] as const)
+  it(`P9 T09 all legacy unusable writers advance revision in original recovery transactions: W6 actual failed finish ${fault}`, async () => {
+    const f = await t09Fixture(), original = await f.material(), sessionId = f.session.sessionId;
+    f.sql(db => {
+      db.exec("CREATE TRIGGER t09_finish_fail BEFORE UPDATE ON runs WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'T09 finish rollback'); END");
+      if (fault === 'ignored-block') db.exec('CREATE TRIGGER t09_block_ignore BEFORE UPDATE OF unusable ON session_native_history WHEN NEW.unusable=1 BEGIN SELECT RAISE(IGNORE); END');
+    });
+    let failedPrefix: any, fullBefore: any, notifications: unknown[] = [];
+    const all = () => f.sql(db => Object.fromEntries(['runs', 'jobs', 'tool_calls', 'session_inputs', 'session_native_entries', 'runtime_events']
+      .map(table => [table, db.query(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+    f.failSave(write => {
+      const last = write.history.entries.at(-1);
+      if (last?.type !== 'message' || last.message.role !== 'assistant') return false;
+      if (fault === 'exhausted-block' || fault === 'already-sticky-max') f.sql(db =>
+        db.query('UPDATE session_native_history SET commit_revision=?,unusable=? WHERE session_id=?')
+          .run(Number.MAX_SAFE_INTEGER, fault === 'already-sticky-max' ? 1 : 0, sessionId));
+      failedPrefix = f.sql(db => ({ header: db.query('SELECT * FROM session_native_history WHERE session_id=?').get(sessionId),
+        entries: db.query('SELECT * FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(sessionId) }));
+      fullBefore = all(); f.committed(refs => notifications.push(refs));
+      return true;
+    });
+    const failed = await f.input(sessionId, 2, 'T09 actual SDK save failure');
+    const terminal = await failed.terminal;
+    expect(failedPrefix).toBeDefined();
+    expect(terminal.result).toMatchObject({ ok: false, error: { code: fault === 'ignored-block' ? 'state_conflict' : 'storage_write_failed' } });
+    const head = f.sql(db => db.query('SELECT * FROM session_native_history WHERE session_id=?').get(sessionId));
+    expect(head).toEqual(fault === 'saved-block' ? { ...failedPrefix.header, unusable: 1, commit_revision: failedPrefix.header.commit_revision + 1 } : failedPrefix.header);
+    expect(all()).toEqual(fullBefore); expect(notifications).toEqual([]);
+    expect(need(await f.app.queryRun(failed.accepted.runId))).toMatchObject({ status: 'running', endedAt: null, stoppedAt: null });
+    expect(need(await f.app.queryRun(original.run.accepted.runId))).toMatchObject({ status: 'completed' });
+    expect(await f.app.submitInput({ sessionId, clientSequence: 3, mode: 'prompt', text: 'Never replay', config: f.config() }))
+      .toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
+    expect(f.calls).toMatchObject({ http: 3, base: 3, execute: 1, observe: 1 });
+    expect(f.sql(db => db.query('PRAGMA foreign_key_check').all())).toEqual([]);
+    console.log('T09 W6 actual SDK', JSON.stringify({ fault, terminal, before: failedPrefix.header, after: head,
+      notifications: notifications.length, calls: f.calls }));
+  });
+
+it('P9 T09 measures a long legal tree and exact detached fork without speculative caching', () => {
+  const manager = SessionManager.inMemory(cwd), adapter = new PiAgentAdapter({ cwd });
+  const start = performance.now();
+  for (let n = 0; n < 1200; n++) manager.appendMessage({ role: 'user', content: `legal ${n}`, timestamp: n });
+  const selected = manager.getLeafId()!, first = manager.getEntries()[0]!.id;
+  for (let n = 0; n < 300; n++) { manager.branch(first); manager.appendMessage({ role: 'user', content: `other branch ${n}`, timestamp: 1200 + n }); }
+  const history = snapshot(manager), builtMs = performance.now() - start, before = JSON.stringify(history);
+  const inspectStart = performance.now(); expect(validateNativeHistory(history).ok).toBe(true); const validationMs = performance.now() - inspectStart;
+  const forkStart = performance.now(), fork = need(adapter.buildForkSessionHistory({ source: history, targetEntryId: selected }));
+  const forkMs = performance.now() - forkStart;
+  expect(fork.entries).toEqual(history.entries.slice(0, 1200)); expect(fork.leafId).toBe(selected);
+  expect(fork.header.id).not.toBe(history.header.id); expect(JSON.stringify(history)).toBe(before);
+  console.log('T09 long legal tree', JSON.stringify({ entries: history.entries.length, forkEntries: fork.entries.length, builtMs, validationMs, forkMs }));
+});
+
+
+it('P9 T09 preserves Document rows during real concurrent artifact root rename and public read', async () => {
+  const f = await t09Fixture(), original = await f.material();
+  const before = f.sql(db => db.query('SELECT * FROM documents ORDER BY id').all());
+  const artifactRoot = f.paths.artifactsDir, held = artifactRoot + '.t09-held';
+  const child = Bun.spawn([process.execPath, '--no-env-file', '--eval', `
+    const fs = require('node:fs'), p = require('node:path');
+    const [owner, original, held] = process.argv.slice(1);
+    for (const value of [original, held]) { const rel = p.relative(p.resolve(owner), p.resolve(value));
+      if (!rel || rel.startsWith('..') || p.isAbsolute(rel)) throw new Error('not owned'); }
+    const startedAt = Date.now(), deadline = startedAt + 3500; let moves = 0;
+    process.send('ready'); await Bun.sleep(100);
+    try { while (Date.now() < deadline) { try { fs.renameSync(original, held); moves++; } catch {} try { fs.renameSync(held, original); } catch {} } }
+    finally { if (fs.existsSync(held) && !fs.existsSync(original)) fs.renameSync(held, original); }
+    process.send(JSON.stringify({ moves, startedAt, endedAt: Date.now() }));
+  `, f.paths.root, artifactRoot, held], { env: { ...process.env }, stdout: 'pipe', stderr: 'pipe', ipc(message) { messages.push(String(message)); } });
+  const messages: string[] = [], stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
+  let observed: unknown, reads = 0;
+  try {
+    await waitFor(async () => messages.includes('ready'), 2000);
+    const deadline = Date.now() + 4500;
+    for (let n = 0; n < 20000 && Date.now() < deadline; n++) {
+      if (n % 16 === 0) await Bun.sleep(0);
+      const result = await f.app.readDocumentPage({ documentId: original.tool.documentId, page: 1, afterBlockId: null, limit: 50 });
+      reads++;
+      const after = f.sql(db => db.query('SELECT * FROM documents ORDER BY id').all());
+      if (JSON.stringify(after) !== JSON.stringify(before)) { observed = { n, result, before, after }; break; }
+      if (child.exitCode !== null) break;
+    }
+    const exit = await child.exited;
+    expect(observed).toBeUndefined(); expect(exit).toBe(0);
+    expect(f.sql(db => db.query('SELECT * FROM documents ORDER BY id').all())).toEqual(before);
+    expect(await f.app.readDocumentPage({ documentId: original.tool.documentId, page: 1, afterBlockId: null, limit: 50 })).toMatchObject({ ok: true });
+    console.log('T09 workspace real rename diagnostic', JSON.stringify({ exit, reads, messages, stdout: await stdout, stderr: await stderr, observed,
+      restoredRoot: statSync(artifactRoot).isDirectory(), readAfter: await f.app.readDocumentPage({ documentId: original.tool.documentId, page: 1, afterBlockId: null, limit: 50 }) }));
+  } finally { if (child.exitCode === null && child.signalCode === null) { child.kill(); await child.exited; }
+    console.log('T09 rename transport', JSON.stringify({ messages, stdout: await stdout, stderr: await stderr })); }
 });

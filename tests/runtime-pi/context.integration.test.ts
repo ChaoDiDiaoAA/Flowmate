@@ -1395,7 +1395,10 @@ for (const fault of ['no-capability', 'unsupported-codec', 'changed-payload-imag
     if (fault === 'changed-object-image') f.transform(messages => messages.map(m => m.role === 'custom' ? { ...m, content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] } : m));
     const run = await f.input(f.session.sessionId, 1, 'Explicit image request', 'M3');
     const terminal = await run.terminal;
-    expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed' } }); expect(f.calls).toMatchObject({ http: 0, base: 0, observe: 0, execute: 0 });
+    expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed', error: { code:
+      fault === 'no-capability' ? 'agent_model_image_unsupported' : fault === 'unsupported-codec' ? 'agent_image_history_blocked'
+        : fault === 'changed-payload-image' ? 'context_payload_mismatch' : 'context_binding_unknown' } } });
+    expect(f.calls).toMatchObject({ http: 0, base: 0, observe: 0, execute: 0 });
     expect(f.counts()).toMatchObject({ tool_calls: 0, invoice_candidates: 0 });
     expect(JSON.stringify(f.journal(run.accepted.runId))).not.toContain(t07Png);
     console.log('T07 image refusal', fault, JSON.stringify({ terminal, calls: f.calls }));
@@ -1435,7 +1438,7 @@ for (const unknown of [false, true]) it(`P9 T07 restores without replaying queue
   expect(messages.items.some(item => item.role === 'user')).toBe(true);
   expect(need(await f.app.listSessionInputs({ sessionId: a })).items.find(i => i.inputId === queued.inputId)?.status).toBe(unknown ? 'delivery_unknown' : 'cancelled');
   expect(f.counts()).toEqual(counts); expect(f.calls).toEqual(effects); expect(f.facts(a)).toEqual(before);
-  expect(await f.app.submitInput({ sessionId: a, clientSequence: 3, mode: 'prompt', text: 'Blocked original Session', config: f.config('M3') })).toMatchObject({ ok: false });
+  expect(await f.app.submitInput({ sessionId: a, clientSequence: 3, mode: 'prompt', text: 'Blocked original Session', config: f.config('M3') })).toMatchObject({ ok: false, error: { code: 'agent_session_unusable' } });
   expect(f.counts()).toEqual(counts); expect(f.calls).toEqual(effects);
   const fresh = need(await f.app.createSession({ title: 'Explicit safe new Session', expectedRevision: need(await f.app.readWorkspace()).revision }));
   const next = await f.input(fresh.sessionId, 1, 'Explicit new prompt only', 'M3');

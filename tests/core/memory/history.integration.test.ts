@@ -21,12 +21,12 @@ function paths() {
   return { root, databaseFile: join(root, 'data', 'test.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
 }
-function fixture() {
+function fixture(legacy = false) {
   const p = paths(), store = need(core.openDatabase(p));
   deferCleanup(() => store.close());
   const history: NativeSessionHistory = { storageVersion: 1, header: { type: 'session', version: 3, id: 'p9-native', timestamp: at, cwd: p.root },
     entries: [], leafId: null, unusable: false };
-  const session = need(store.sessions.create({ nativeSessionId: history.header.id, title: 'P9', at, nativeHistory: history }));
+  const session = need(store.sessions.create({ nativeSessionId: history.header.id, title: 'P9', at, ...(legacy ? {} : { nativeHistory: history }) }));
   const memory = Reflect.get(store, 'memory') as Pick<MemoryStore, 'load' | 'commit'>;
   expect(memory).toBeDefined();
   const load = () => need(memory.load(session.sessionId))!;
@@ -754,4 +754,174 @@ it.each(['source-progress', 'result-association'] as const)('P9 T05 confirms exa
       expectedEntryCount: 2, expectedLeafId: 'user' })).toMatchObject({ ok: false, error: { code: 'session_busy' } });
     expect(f.agent.inspect(native.nativeSessionId).availability).toBe('missing');
   }
+});
+
+// Every case invokes the original repository transaction; no helper-only stand-in.
+const t09Terminal = {
+  status: 'failed' as const, output: null, error: appError('agent_failed', 'runtime', 'T09 terminal'),
+  usage: { version: 1 as const, source: 'unknown' as const, reason: 'fixture', sdkValues: null, attempts: null,
+    attemptsComplete: false, costSource: null, updatedAt: at },
+  tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+  cleanup: { version: 1 as const, stopped: true, stopReason: 'fixture', errors: [], lateObservationRequired: false },
+  endedAt: at, stoppedAt: at, durationMs: 1, nativeHistoryUnusable: true,
+};
+function t09Facts(db: Database) {
+  return Object.fromEntries(['sessions', 'runs', 'jobs', 'tool_calls', 'session_inputs', 'session_native_history',
+    'session_native_entries', 'runtime_events'].map(table => [table, db.query(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+}
+function t09Writer(writer: 'W1' | 'W2' | 'W3' | 'W4' | 'W5', legacy = false) {
+  const f = fixture(legacy), { runId, inputId } = agentInput(f), db = f.store.db;
+  const entries = [entry('a'), assistant()];
+  if (!legacy) need(f.commit({ appendEntries: entries, leafId: 'b', contexts: [{ entryId: 'a', runId, inputId },
+    { entryId: 'b', runId, ...(writer === 'W4' ? { resultInputIds: [inputId] } : {}) }] }));
+  if (writer === 'W2' || writer === 'W3') {
+    const call = need(f.store.toolCalls.request({ context: null, runId, sessionId: f.session.sessionId,
+      nativeToolCallId: 't09-required-result', toolName: 'powershell', toolVersion: '0.85.1', effect: 'LOCAL_WRITE', rawArguments: {}, requestedAt: at }));
+    need(f.store.toolCalls.fixArguments({ toolCallId: call.toolCallId, finalArguments: {} }));
+    need(f.store.toolCalls.start({ toolCallId: call.toolCallId, startedAt: at }));
+    if (writer === 'W3') need(f.store.toolCalls.finish({ toolCallId: call.toolCallId, result: { version: 1, committedCandidateId: null,
+      status: 'succeeded', data: { content: [{ type: 'text', text: 'saved' }] } },
+      cleanup: { version: 1, stopped: true, stopReason: 'tool-settled', errors: [] }, endedAt: at, stoppedAt: at }));
+    if (writer === 'W3') db.query("UPDATE tool_calls SET result_json='{\"version\":999}' WHERE id=?").run(call.toolCallId);
+  }
+  if (writer === 'W3' || writer === 'W4' || writer === 'W5') {
+    db.query("UPDATE runs SET status='completed',ended_at=?,stopped_at=?,output_json='{}' WHERE id=?").run(at, at, runId);
+    // W3 must be selected by the Tool result catch, not pending-input recovery.
+    if (writer === 'W3') db.query("UPDATE session_inputs SET processing_status='failed' WHERE id=?").run(inputId);
+    if (writer === 'W4') db.query("UPDATE session_inputs SET processing_status='completed' WHERE id=?").run(inputId);
+  }
+  return { ...f, runId, inputId, invoke: () => writer === 'W1' ? f.store.runs.finish(runId, t09Terminal) : f.store.runs.failInterrupted(at) };
+}
+for (const writer of ['W1', 'W2', 'W3', 'W4', 'W5'] as const)
+  it(`P9 T09 all legacy unusable writers advance revision in original recovery transactions: ${writer}`, () => {
+    // Completed W4 Input requires consumed -> native Entry -> Header FKs, so
+    // a missing Header is structurally impossible with foreign_keys=ON.
+    for (const mode of (['first', 'missing-header', 'sticky-max', 'first-max', 'marker-ignore', 'later-fault'] as const)
+      .filter(mode => writer !== 'W4' || mode !== 'missing-header')) {
+      const f = t09Writer(writer, mode === 'missing-header'), db = f.store.db;
+      if (mode === 'sticky-max' || mode === 'first-max') db.query('UPDATE session_native_history SET commit_revision=?,unusable=?')
+        .run(Number.MAX_SAFE_INTEGER, mode === 'sticky-max' ? 1 : 0);
+      const before = t09Facts(db), receipt = mode === 'missing-header' ? null : f.load().commit;
+      const notifications: unknown[] = [];
+      f.store.runtimeEventStore.onCommitted(refs => { expect(db.inTransaction).toBe(false); notifications.push(refs); });
+      if (mode === 'marker-ignore') db.exec('CREATE TRIGGER t09_reject BEFORE UPDATE OF unusable ON session_native_history BEGIN SELECT RAISE(IGNORE); END');
+      if (mode === 'later-fault') {
+        // W3 needs a later active Run P6; W4/W5 use a later pending Input
+        // closure so the injected fault follows the selected sticky marker.
+        if (writer === 'W3') {
+          const later = need(f.store.sessions.create({ nativeSessionId: 't09-later', title: 'Later', at,
+            nativeHistory: { ...f.history, header: { ...f.history.header, id: 't09-later' } } }));
+          db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+            VALUES('agent',?,'{}','running','later','{}','{}','{}','{}',?)`).run(later.sessionId, at);
+          Object.assign(before, t09Facts(db));
+        }
+        let laterInput: number | undefined;
+        if (writer === 'W4' || writer === 'W5') {
+          const later = agentInput(f, undefined, 2); laterInput = later.inputId;
+          db.query("UPDATE runs SET status='completed',ended_at=?,stopped_at=?,output_json='{}' WHERE id=?").run(at, at, later.runId);
+          Object.assign(before, t09Facts(db));
+        }
+        db.exec(laterInput !== undefined
+          ? `CREATE TRIGGER t09_late BEFORE UPDATE ON session_inputs WHEN OLD.id=${laterInput} BEGIN SELECT RAISE(ABORT,'T09 later batch Input fault'); END`
+          : writer === 'W1'
+          ? "CREATE TRIGGER t09_late BEFORE UPDATE ON session_inputs BEGIN SELECT RAISE(ABORT,'T09 later Input fault'); END"
+          : "CREATE TRIGGER t09_late BEFORE INSERT ON runtime_events BEGIN SELECT RAISE(ABORT,'T09 later P6 fault'); END");
+      }
+      const result = f.invoke();
+      if (mode === 'first-max' || mode === 'marker-ignore' || mode === 'later-fault') {
+        expect(result).toMatchObject({ ok: false, error: { code: mode === 'marker-ignore' ? 'state_conflict' : 'storage_write_failed' } });
+        if (mode === 'first-max') expect(result).toMatchObject({ ok: false, error: { retryable: false,
+          message: 'Conversation history commit revision is exhausted. Further changes cannot be saved.' } });
+        expect(t09Facts(db)).toEqual(before); expect(notifications).toEqual([]);
+      } else {
+        expect(result).toMatchObject({ ok: true });
+        const saved = need(f.store.memory.load(f.session.sessionId));
+        if (mode === 'missing-header') expect(saved).toBeNull();
+        else {
+          expect(saved!.commit).toEqual({ ...receipt!, commitRevision: mode === 'sticky-max' ? Number.MAX_SAFE_INTEGER : receipt!.commitRevision + 1 });
+          expect(saved!.history.unusable).toBe(true);
+          expect(db.query('SELECT * FROM session_native_entries ORDER BY rowid').all()).toEqual(before.session_native_entries);
+          const originalHead = (before.session_native_history as any[])[0];
+          expect(db.query('SELECT header_json,leaf_id,entry_count FROM session_native_history').get()).toEqual({ header_json: originalHead.header_json,
+            leaf_id: originalHead.leaf_id, entry_count: originalHead.entry_count });
+        }
+        const after = t09Facts(db), published = notifications.length;
+        const repeated = f.invoke();
+        expect(repeated).toMatchObject({ ok: true });
+        if (writer === 'W1' && mode === 'missing-header') expect(repeated).toEqual({ ok: true, data: false });
+        expect(t09Facts(db)).toEqual(after); expect(notifications.length).toBe(published);
+      }
+      expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
+      expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+      console.log('T09 legacy transaction', JSON.stringify({ writer, mode, result, beforeRevision: receipt?.commitRevision,
+        afterRevision: (db.query('SELECT commit_revision FROM session_native_history').get() as any)?.commit_revision,
+        notifications: notifications.length }));
+    }
+  });
+
+it('P9 T09 all legacy unusable writers advance revision in original recovery transactions: overlapping batch and provider', () => {
+  const f = t09Writer('W4'), db = f.store.db;
+  // W2 + W4 overlap in the same Session, and a second Session receives one mark.
+  const other = need(f.store.sessions.create({ nativeSessionId: 't09-other', title: 'Other', at,
+    nativeHistory: { ...f.history, header: { ...f.history.header, id: 't09-other' } } }));
+  const otherRun = Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+    VALUES('agent',?,'{}','running','other','{}','{}','{}','{}',?)`).run(other.sessionId, at).lastInsertRowid);
+  const otherTool = need(f.store.toolCalls.request({ context: null, runId: otherRun, sessionId: other.sessionId, nativeToolCallId: 'other-active',
+    toolName: 'powershell', toolVersion: '0.85.1', effect: 'LOCAL_WRITE', rawArguments: {}, requestedAt: at }));
+  expect(otherTool.toolCallId).toBeGreaterThan(0);
+  db.query("UPDATE runs SET status='completed',ended_at=?,stopped_at=?,output_json='{}' WHERE id=?").run(at, at, otherRun);
+  agentInput(f, undefined, 2);
+  const before = t09Facts(db), published: unknown[] = [];
+  f.store.runtimeEventStore.onCommitted(refs => published.push(refs));
+  db.exec(`CREATE TRIGGER t09_second BEFORE UPDATE OF unusable ON session_native_history WHEN OLD.session_id=${other.sessionId} BEGIN SELECT RAISE(ABORT,'second session'); END`);
+  expect(f.store.runs.failInterrupted(at)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+  expect(t09Facts(db)).toEqual(before); expect(published).toEqual([]);
+  db.exec('DROP TRIGGER t09_second');
+  expect(f.store.runs.failInterrupted(at)).toMatchObject({ ok: true });
+  expect(f.load().commit.commitRevision).toBe(3);
+  expect(need(f.store.memory.load(other.sessionId))!.commit.commitRevision).toBe(2);
+  const after = t09Facts(db); need(f.store.runs.failInterrupted(at)); expect(t09Facts(db)).toEqual(after);
+  const provider = Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+    VALUES('provider',NULL,NULL,'running','provider','{}','{}','{}','{}',?)`).run(at).lastInsertRowid);
+  const providerBefore = t09Facts(db);
+  expect(f.store.runs.finish(provider, t09Terminal)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+  expect(t09Facts(db)).toEqual(providerBefore); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+});
+
+it('P9 T09 all legacy unusable writers advance revision in original recovery transactions: W2 rolls back an already changed Job after later Run P6 failure', () => {
+  const f = t09Writer('W2'), db = f.store.db;
+  // Minimal trusted legacy business rows; existing native/Input associations
+  // remain exact and no P8 snapshot or model execution is fabricated.
+  db.query("INSERT INTO artifacts(id,kind,relative_path,bytes,mime_type,metadata_json,created_at) VALUES(1,'original','a',1,'image/png','{}',?),(2,'parsed','b',1,'application/json','{}',?)").run(at, at);
+  db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,status,metadata_json,created_at,updated_at)
+    VALUES(1,'t09','fixture','v1',1,2,'available','{}',?,?)`).run(at, at);
+  db.query("INSERT INTO jobs(id,document_id,goal,input_json,status,created_at,updated_at) VALUES(1,1,'T09 recovery','{}','running',?,?)").run(at, at);
+  db.query('UPDATE runs SET job_id=1 WHERE id=?').run(f.runId);
+  const before = t09Facts(db), notifications: unknown[] = [];
+  let inside: ReturnType<typeof t09Facts> | undefined;
+  const append = f.store.runtimeEventStore.appendInTransaction.bind(f.store.runtimeEventStore);
+  f.store.runtimeEventStore.appendInTransaction = event => {
+    if (event.type === 'run_failed') { expect(db.inTransaction).toBe(true); inside = t09Facts(db); }
+    return append(event);
+  };
+  f.store.runtimeEventStore.onCommitted(refs => { expect(db.inTransaction).toBe(false); notifications.push(refs); });
+  db.exec("CREATE TRIGGER t09_after_job BEFORE INSERT ON runtime_events WHEN NEW.type='run_failed' BEGIN SELECT RAISE(ABORT,'T09 later Run P6 fault'); END");
+  expect(f.invoke()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+  expect(inside).toBeDefined();
+  expect(inside!.jobs).toMatchObject([{ id: 1, status: 'failed', status_reason: 'runtime_interrupted' }]);
+  expect(inside!.runs).toMatchObject([{ id: f.runId, status: 'failed' }]);
+  expect(inside!.tool_calls).toMatchObject([{ status: 'failed' }]);
+  expect(inside!.session_native_history).toMatchObject([{ unusable: 1, commit_revision: 3 }]);
+  expect(inside!.session_inputs).toEqual(before.session_inputs);
+  expect(t09Facts(db)).toEqual(before); expect(notifications).toEqual([]);
+  const aborted = inside;
+  db.exec('DROP TRIGGER t09_after_job');
+  expect(f.invoke()).toMatchObject({ ok: true });
+  expect(db.query('SELECT status,status_reason FROM jobs WHERE id=1').get()).toEqual({ status: 'failed', status_reason: 'runtime_interrupted' });
+  expect(f.load().commit.commitRevision).toBe(3);
+  const repaired = t09Facts(db); expect(notifications).toHaveLength(1);
+  expect(f.invoke()).toMatchObject({ ok: true }); expect(t09Facts(db)).toEqual(repaired); expect(notifications).toHaveLength(1);
+  expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
+  expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  console.log('T09 W2 post-Job rollback', JSON.stringify({ before, insideAbortedTransaction: aborted, afterSuccessfulRepair: repaired, notifications: notifications.length }));
 });

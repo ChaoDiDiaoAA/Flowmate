@@ -212,19 +212,7 @@ async function denseFixture() {
     import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
     import { resolveProductPaths } from '@flowmate/shared';
     import { invoiceHeaderFields, invoiceFieldDisplayValue } from '@flowmate/contracts';
-    import * as contracts from '@flowmate/contracts';
     import { join } from 'node:path';
-    const validationProfile={};
-    for(const name of ['ContextObservationsSchema','ContextSnapshotJsonSchema','NativeSessionHistorySchema','NativeHistoryRecoveryBundleSchema']) {
-      const schema=contracts[name];
-      for(const method of ['parse','safeParse']) {
-        const original=schema[method].bind(schema), key=name+'.'+method;
-        validationProfile[key]={count:0,ms:0,firstStack:null};
-        schema[method]=(...args)=>{const start=performance.now();try{return original(...args);}finally{
-          const item=validationProfile[key];item.count++;item.ms+=performance.now()-start;
-          item.firstStack??=new Error().stack;}};
-      }
-    }
     const need=value=>{if(!value.ok)throw new Error(value.error.code+': '+value.error.message);return value.data;};
     const input=JSON.parse(await Bun.stdin.text()); const paths=need(resolveProductPaths(input.userData));
     let enter;const entered=new Promise(resolve=>enter=resolve);let release;const barrier=new Promise(resolve=>release=resolve);
@@ -260,7 +248,7 @@ async function denseFixture() {
       workspace=need(await app.updateWorkspace({expectedRevision:workspace.revision,change:{kind:'document',documentId:secondDocument.documentRef.id}}));
       need(await app.hideJob(task.job.jobId)); console.error('Dense seed: ready for desktop');
       console.log(JSON.stringify({sessionId:session.sessionId,runId:accepted.runId,otherSessionId:b.sessionId,otherRunId:br.runId,jobId:task.job.jobId,candidateId:model.candidateId,humanId:human.candidate.candidateId,originalContext:original.context}));
-    } finally {release();need(await app.close());console.error('T08 dense validation profile '+JSON.stringify(validationProfile));}
+    } finally {release();need(await app.close());}
   `;
   let stdout = '', stderr = '';
   const child = spawn(process.env.FLOWMATE_BUN_EXECUTABLE || 'bun', ['--no-env-file', '--eval', script], { cwd: repository, env: cleanEnvironment(), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });

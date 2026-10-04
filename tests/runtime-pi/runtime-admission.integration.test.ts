@@ -124,9 +124,6 @@ describe('Runtime final admission after the real SDK before hook awaits', () => 
       text: 'Calculate with one admitted tool call.', config: f.config, workspace: expected(workspace), goalMode: 'answer',
       budget: { maxToolCalls: 1, maxModelCalls: 4 }, timeoutMs: 5000, stopGraceMs: 500 }, terminal));
     const ended = await terminal.ready;
-    console.error('T08 budget native terminal', JSON.stringify({ result: ended.result,
-      entries: nativeSession.sessionManager.getEntries(), leafId: nativeSession.sessionManager.getLeafId(),
-      saved: f.store.db.query('SELECT entry_id,run_id,entry_json FROM session_native_entries ORDER BY sequence').all() }));
     expect(ended.result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true,
       error: { code: 'tool_budget_exceeded' } } });
     expect(f.payloads).toHaveLength(2); expect(f.business()).toBe(1);
