@@ -344,3 +344,12 @@ describe('P6 strict DTOs at the desktop protocol boundary', () => {
       input: { ...input, cursor: { runId: 21, lastPersistedSequence: -1 } } })).not.toBeNull();
   });
 });
+
+it('P9 T08 fix1 projects bounded Context errors and retains only registered matching facts', () => {
+  for (const type of ['list_context_snapshots', 'query_context_snapshot', 'list_context_requests']) {
+    const error = { code: 'internal_error', category: 'internal', retryable: false, message: 'PRIVATE-CONTEXT'.repeat(4096), sessionId: 1, runId: 2 } as const;
+    expect(historyProtocol.parseContextHostResult(type, { ok: false, error, runId: 2 }))
+      .toEqual({ ok: false, error: { ...error, message: 'Context query could not be completed.' }, runId: 2 });
+    expect(historyProtocol.parseContextHostResult(type, { ok: false, error: { ...error, secret: 'PRIVATE-CONTEXT' } })).toBeNull();
+  }
+});

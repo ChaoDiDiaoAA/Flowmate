@@ -36,6 +36,10 @@ describe('P9 T08 History state', () => {
     const loaded = h.acceptHistoryRead(pending, lease, 'verified A');
     const failed = h.failHistoryRead(loaded, lease, 'unavailable');
     expect(failed).toMatchObject({ data: 'verified A', error: 'unavailable', pending: false });
+    const invalidated = h.invalidateHistoryRead(failed, 2);
+    expect(invalidated).toMatchObject({ data: 'verified A', error: 'unavailable', pending: false });
+    expect(h.acceptHistoryRead(invalidated, lease, 'late detail')).toBe(invalidated);
+    expect(h.finishHistoryRead(invalidated, lease)).toBe(invalidated);
     for (const patch of [{ sessionId: 2 }, { hostEpoch: 4 }, { navigationToken: 6 }, { entryId: 'B' }]) {
       const other = h.beginHistoryRead(h.createHistoryRead({ ...identity, ...patch }), 1, 'page:7:0');
       expect(h.acceptHistoryRead(other, lease, 'late A')).toBe(other);

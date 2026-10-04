@@ -117,7 +117,7 @@ async function installReadGate(app: ElectronApplication, userData: string) {
         try { const packet = JSON.parse(line.toString());
           if (closeGate && packet.type === 'response' && kinds.get(packet.requestId) === 'close') { closeReplies.push(Buffer.from(line)); continue; }
           if (packet.type === 'response' && kinds.get(packet.requestId) === heldType) {
-            if (fault) { packet.value = { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'Context query could not be completed.' } };
+            if (fault) { packet.value = { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'PRIVATE-CONTEXT sdk credential token', sessionId: packet.value.data?.snapshot?.sessionId, runId: packet.value.data?.snapshot?.runId } };
               line = Buffer.from(JSON.stringify(packet) + '\n'); fault = false; }
             if (remaining > 0) { held.push(Buffer.from(line)); remaining--; continue; }
           }
@@ -161,6 +161,7 @@ it('rejects late original Host replies without clearing the new Run and retains 
     await f.app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').fail());
     await panel.getByRole('button', { name: 'Refresh', exact: true }).click();
     await expect(panel.getByRole('alert')).toContainText('Context query could not be completed');
+    await expect(panel).not.toContainText('PRIVATE-CONTEXT');
     await expect(panel.getByTestId('context-snapshot-detail')).toContainText('Original user context');
     await f.app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').fail());
     await panel.getByLabel('Historical Run', { exact: true }).selectOption(String(second.data.runId));

@@ -134,7 +134,7 @@ async function installHistoryGate(app: ElectronApplication, root: string) {
       && value.spawnargs.includes(root) && value.spawnargs.includes('apps/host/main.ts')) as import('node:child_process').ChildProcessWithoutNullStreams;
     if (!child) throw new Error('Owned Host missing');
     const write = child.stdin.write, emit = child.stdout.emit, commands: unknown[] = [], kinds = new Map<string, string>();
-    const held: Buffer[] = [], writes: Parameters<typeof write>[] = []; let kind = '', count = 0, writeKind = '', writeCount = 0, buffer = Buffer.alloc(0);
+    const held: Buffer[] = [], writes: Parameters<typeof write>[] = [], failures = new Set<string>(); let kind = '', count = 0, writeKind = '', writeCount = 0, buffer = Buffer.alloc(0);
     child.stdin.write = function (this: typeof child.stdin, ...args: Parameters<typeof write>) {
       try { const command = JSON.parse(String(args[0])); commands.push(command); kinds.set(command.requestId, command.type);
         if (command.type === writeKind && writeCount > 0) { writeCount--; writes.push(args); return true; }
@@ -145,13 +145,16 @@ async function installHistoryGate(app: ElectronApplication, root: string) {
       if (event !== 'data' || !Buffer.isBuffer(args[0])) return Reflect.apply(emit, this, [event, ...args]);
       buffer = Buffer.concat([buffer, args[0]]); const forward: Buffer[] = [];
       for (let newline = buffer.indexOf(10); newline !== -1; newline = buffer.indexOf(10)) {
-        const line = buffer.subarray(0, newline + 1); buffer = buffer.subarray(newline + 1);
-        try { const packet = JSON.parse(String(line)); if (packet.type === 'response' && kinds.get(packet.requestId) === kind && count > 0) { count--; held.push(Buffer.from(line)); continue; } } catch {}
+        let line = buffer.subarray(0, newline + 1); buffer = buffer.subarray(newline + 1);
+        try { const packet = JSON.parse(String(line)); const type = kinds.get(packet.requestId);
+          if (packet.type === 'response' && failures.delete(type!)) { packet.value = { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'Controlled history read failure' } }; line = Buffer.from(JSON.stringify(packet) + '\n'); }
+          if (packet.type === 'response' && type === kind && count > 0) { count--; held.push(Buffer.from(line)); continue; } } catch {}
         forward.push(line);
       }
       return forward.length ? Reflect.apply(emit, this, ['data', Buffer.concat(forward)]) : true;
     };
     Reflect.set(globalThis, 'historyGate', { commands, held, hold(type: string, amount = 1) { kind = type; count = amount; },
+      fail(type: string) { failures.add(type); },
       writes, holdWrite(type: string) { writeKind = type; writeCount = 1; },
       releaseWrite() { const args = writes.shift(); if (args) Reflect.apply(write, child.stdin, args); },
       packet(index: number) { return JSON.parse(String(held[index])); },
@@ -186,6 +189,13 @@ test('P9 T08 retries the whole frozen fork body after the source revision title 
     expect(created).toMatchObject({ ok: true, data: { sourceSessionId: f.seed.sessionId, selectedEntryId: assistant.entryId } });
     await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').release(0, true));
     await expect(panel.getByRole('status')).toContainText('receipt is unknown');
+    await panel.getByRole('button', { name: 'Hide history' }).click();
+    await panel.getByRole('button', { name: 'Browse history' }).click();
+    await expect(panel.getByRole('button', { name: 'Retry same fork' })).toBeVisible();
+    await f.page.keyboard.press('Escape');
+    await f.page.getByRole('button', { name: 'Session details', exact: true }).click();
+    await panel.getByRole('button', { name: 'Browse history' }).click();
+    await expect(panel.getByRole('button', { name: 'Retry same fork' })).toBeVisible();
     const sourceMoved = await f.page.evaluate(input => window.flowmate.branchSession(input), { sessionId: f.seed.sessionId, expectedCommitRevision: history.data.commit.commitRevision,
       expectedLeafId: history.data.commit.leafId, expectedEntryCount: history.data.commit.entryCount, targetEntryId: user.entryId }); expect(sourceMoved.ok).toBe(true);
     const targetMoved = await f.page.evaluate(input => window.flowmate.branchSession(input), { sessionId: created.data.session.sessionId, expectedCommitRevision: created.data.commit.commitRevision,
@@ -210,6 +220,9 @@ test('P9 T08 retries the whole frozen fork body after the source revision title 
     await f.page.locator(`.sidebar-chat[data-session-id="${f.seed.sessionId}"]`).click(); await expect(composer).toHaveValue('Source draft stays here');
   } catch (error) { failure = error as Error; throw error; }
   finally { await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate')?.restore()).catch(() => {}); await f.provider.stop(); await closeDesktopFixture(f.app, f.userData, failure); }
+  const db = new Database(join(f.userData, 'data/app.sqlite'), { readonly: true });
+  try { expect(db.query('SELECT COUNT(*) count FROM sessions').get()).toEqual({ count: 2 });
+    expect(db.query('SELECT COUNT(*) count FROM session_forks').get()).toEqual({ count: 1 }); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); } finally { db.close(); }
 });
 
 test('P9 T08 ignores late real pages details and branch replies without changing the newer selection', async () => {
@@ -274,7 +287,8 @@ test('P9 T08 preserves a durable fork across late navigation and a real Workspac
     expect(await f.page.evaluate(() => window.flowmate.readWorkspace())).toEqual(beforeLate); await expect(composer).toHaveValue('Other draft');
     expect(await f.page.evaluate(id => window.flowmate.querySession(id), late.data.session.sessionId)).toMatchObject({ ok: true });
     await f.page.locator(`.sidebar-chat[data-session-id="${f.seed.sessionId}"]`).click(); await expect(composer).toHaveValue('Unmoved source draft');
-    await openFork(); await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').holdWrite('update_workspace'));
+    await openFork(); await panel.getByRole('button', { name: 'Start new fork', exact: true }).click();
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').holdWrite('update_workspace'));
     await panel.getByRole('button', { name: 'Confirm fork' }).click(); await expect.poll(() => f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').writes.length)).toBe(1);
     const changed = await f.page.evaluate(async id => { const current = await window.flowmate.readWorkspace(); if (!current.ok) return current;
       return window.flowmate.updateWorkspace({ expectedRevision: current.data.revision, change: { kind: 'session', sessionId: id } }); }, other.data.sessionId);
@@ -474,4 +488,134 @@ test('P9 T08 returns explicit safe fork save failure revocation and tombstone fe
   finally { if (activeChild.exitCode === null && activeChild.signalCode === null) await closeDesktopFixture(active, f.userData, failure); }
   const db = new Database(join(f.userData, 'data/app.sqlite'), { readonly: true });
   try { expect(db.query('SELECT COUNT(*) count FROM runs').get()).toEqual({ count: 0 }); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); } finally { db.close(); }
+});
+
+test('P9 T08 fix1 retains verified complete detail on same-object page and detail reload errors', async () => {
+  const f = await treeFixture(); let failure: Error | undefined;
+  try {
+    await installHistoryGate(f.app, f.userData);
+    await f.page.getByRole('button', { name: 'Session details', exact: true }).click();
+    const panel = f.page.getByRole('dialog', { name: 'Session details', exact: true });
+    await panel.getByRole('button', { name: 'Browse history' }).click();
+    await panel.getByTestId('history-entry-assistant').click();
+    await expect(panel.getByTestId('history-text')).toBeVisible();
+    while (await panel.getByRole('button', { name: 'More text' }).count()) {
+      await panel.getByRole('button', { name: 'More text' }).click();
+      await expect(panel.getByText('Loading entry…', { exact: true })).toHaveCount(0);
+    }
+    const complete = '界'.repeat(46000);
+    await expect(panel.getByTestId('history-text')).toHaveText(complete);
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').fail('query_session_history'));
+    await panel.getByRole('button', { name: 'Reload history' }).click();
+    await expect(panel.getByRole('alert').first()).toHaveText('History is unavailable.');
+    await expect(panel.getByTestId('history-text')).toHaveText(complete);
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').fail('query_session_history_entry'));
+    await panel.getByRole('button', { name: 'Reload history' }).click();
+    await expect(panel.getByText('Loading entry…', { exact: true })).toHaveCount(0);
+    await expect(panel.getByRole('alert')).toHaveText('History is unavailable.');
+    await expect(panel.getByTestId('history-text')).toHaveText(complete);
+    const changed = await f.page.evaluate(async sessionId => {
+      const page = await window.flowmate.querySessionHistory({ sessionId }); if (!page.ok) return page;
+      return window.flowmate.branchSession({ sessionId, expectedCommitRevision: page.data.commit.commitRevision,
+        expectedEntryCount: page.data.commit.entryCount, expectedLeafId: page.data.commit.leafId, targetEntryId: 'user' });
+    }, f.seed.sessionId); expect(changed.ok).toBe(true);
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').hold('query_session_history_entry'));
+    await panel.getByRole('button', { name: 'Reload history' }).click();
+    await expect.poll(() => f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').held.length)).toBe(1);
+    await expect(panel.getByTestId('history-text')).toHaveCount(0);
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').release(0));
+    await expect(panel.getByTestId('history-text')).toBeVisible();
+    await panel.getByTestId('history-entry-user').click();
+    await expect(panel.getByTestId('history-text')).toHaveText('Original tree user');
+    await test.info().attach('same-object-detail-failure', { body: Buffer.from(JSON.stringify(await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').commands))), contentType: 'application/json' });
+  } catch (error) { failure = error as Error; throw error; }
+  finally { await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate')?.restore()).catch(() => {}); await closeDesktopFixture(f.app, f.userData, failure); }
+});
+
+test('P9 T08 fix1 rejects a late fork selection after real pending Workspace restore switches chat with details mounted', async () => {
+  const f = await fixture(); let failure: Error | undefined;
+  try {
+    const other = await f.page.evaluate(() => window.flowmate.createSession({ title: 'Restored other chat' })); if (!other.ok) throw new Error(other.error.code);
+    await f.page.reload();
+    const composer = f.page.getByRole('textbox', { name: 'Message to model' });
+    await f.page.locator(`.sidebar-chat[data-session-id="${other.data.sessionId}"]`).click(); await composer.fill('Other preserved draft');
+    await f.page.locator(`.sidebar-chat[data-session-id="${f.seed.sessionId}"]`).click(); await composer.fill('Original preserved draft');
+    await f.page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
+    const changed = await f.page.evaluate(async sessionId => { const current = await window.flowmate.readWorkspace(); if (!current.ok) return current;
+      return window.flowmate.updateWorkspace({ expectedRevision: current.data.revision, change: { kind: 'session', sessionId } }); }, other.data.sessionId);
+    expect(changed.ok).toBe(true);
+    await installHistoryGate(f.app, f.userData); await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').hold('restore_workspace'));
+    await f.page.getByRole('button', { name: 'Refresh workspace', exact: true }).click();
+    await expect.poll(() => f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').held.length)).toBe(1);
+    await f.page.getByRole('button', { name: 'Session details', exact: true }).click();
+    const panel = f.page.getByRole('dialog', { name: 'Session details', exact: true }); await panel.getByRole('button', { name: 'Browse history' }).click();
+    const history = await f.page.evaluate(sessionId => window.flowmate.querySessionHistory({ sessionId }), f.seed.sessionId); if (!history.ok) throw new Error(history.error.code);
+    const entry = history.data.items.find(item => item.preview === 'Saved original user')!;
+    await panel.getByTestId(`history-entry-${entry.entryId}`).click(); await panel.getByRole('button', { name: 'Fork chat', exact: true }).click();
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').hold('fork_session'));
+    await panel.getByRole('button', { name: 'Confirm fork' }).click();
+    await expect.poll(() => f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').held.length)).toBe(2);
+    const fork = await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').packet(1).value); expect(fork.ok).toBe(true);
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').release(0));
+    await expect(composer).toHaveValue('Other preserved draft'); await expect(panel).toContainText(`Session ${f.seed.sessionId} · Recorded facts`);
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').release(1));
+    await expect(panel).toBeVisible();
+    await expect(composer).toHaveValue('Other preserved draft');
+    expect(await f.page.evaluate(() => window.flowmate.readWorkspace())).toEqual(changed);
+    expect(await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').commands.filter((command: { type: string }) => command.type === 'update_workspace'))).toEqual([]);
+    expect(await f.page.evaluate(id => window.flowmate.querySession(id), fork.data.session.sessionId)).toMatchObject({ ok: true });
+    // A fresh explicit retry may select A's saved target while B is active.
+    await panel.getByRole('button', { name: 'Retry same fork' }).click();
+    await expect(panel).toHaveCount(0);
+    expect(await f.page.evaluate(() => window.flowmate.readWorkspace())).toMatchObject({ ok: true, data: { sessionId: fork.data.session.sessionId } });
+    const forks = await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').commands.filter((command: { type: string }) => command.type === 'fork_session'));
+    expect(forks).toHaveLength(2); expect(forks[1].input).toEqual(forks[0].input);
+    expect(f.requests()).toBe(1);
+    await test.info().attach('mounted-details-active-selection-lease', { body: Buffer.from(JSON.stringify(await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').commands))), contentType: 'application/json' });
+  } catch (error) { failure = error as Error; throw error; }
+  finally { await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate')?.restore()).catch(() => {}); await f.provider.stop(); await closeDesktopFixture(f.app, f.userData, failure); }
+});
+
+test('P9 T08 fix1 retains ambiguous intent in the surviving Renderer after actual Host exit and blocks retry', async () => {
+  const f = await treeFixture(); let failure: Error | undefined, hostExited = false;
+  try {
+    await installHistoryGate(f.app, f.userData);
+    await f.page.getByRole('button', { name: 'Session details', exact: true }).click();
+    const panel = f.page.getByRole('dialog', { name: 'Session details', exact: true }); await panel.getByRole('button', { name: 'Browse history' }).click();
+    await panel.getByTestId('history-entry-user').click(); await panel.getByRole('button', { name: 'Fork chat', exact: true }).click();
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').hold('fork_session'));
+    await panel.getByRole('button', { name: 'Confirm fork' }).click();
+    await expect.poll(() => f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').held.length)).toBe(1);
+    const created = await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').packet(0).value); expect(created.ok).toBe(true);
+    const exit = await f.app.evaluate(async (_electron, root) => {
+      const child = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles().find(value => value && typeof value === 'object'
+        && 'spawnargs' in value && Array.isArray(value.spawnargs) && value.spawnargs.includes(root) && value.spawnargs.includes('apps/host/main.ts')) as import('node:child_process').ChildProcess;
+      if (!child) throw new Error('Owned Host not found');
+      const pid = child.pid; const outcome = await new Promise<{ code: number | null; signal: string | null }>(resolveExit => {
+        child.once('exit', (code, signal) => resolveExit({ code, signal })); child.kill('SIGKILL');
+      }); return { root, pid, ...outcome };
+    }, f.userData); hostExited = true;
+    await expect(panel.getByRole('button', { name: 'Retry same fork' })).toBeDisabled();
+    await panel.getByRole('button', { name: 'Hide history' }).click(); await panel.getByRole('button', { name: 'Browse history' }).click();
+    await expect(panel.getByRole('button', { name: 'Retry same fork' })).toBeDisabled();
+    await f.page.keyboard.press('Escape'); await f.page.getByRole('button', { name: 'Session details', exact: true }).click();
+    await panel.getByRole('button', { name: 'Browse history' }).click();
+    await expect(panel.getByRole('button', { name: 'Retry same fork' })).toBeDisabled();
+    await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').release(0));
+    await expect(panel).toContainText(`Session ${f.seed.sessionId} · Recorded facts`);
+    const commands = await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate').commands);
+    expect(commands.filter((command: { type: string }) => command.type === 'fork_session')).toHaveLength(1);
+    expect(commands.filter((command: { type: string }) => ['update_workspace', 'start_run', 'submit_session_input'].includes(command.type))).toEqual([]);
+    await test.info().attach('actual-host-exit-retained-intent', { body: Buffer.from(JSON.stringify({ exit, commands })), contentType: 'application/json' });
+    await test.info().attach('host-exit-blocked-same-fork', { body: await panel.screenshot(), contentType: 'image/png' });
+  } catch (error) { failure = error as Error; throw error; }
+  finally {
+    if (hostExited) {
+      const exited = new Promise<void>(resolveExit => f.app.process().once('exit', () => resolveExit()));
+      await f.app.evaluate(({ app }) => { setImmediate(() => app.exit(0)); }).catch(() => {}); await exited; await f.app.close();
+    } else { await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate')?.restore()).catch(() => {}); await closeDesktopFixture(f.app, f.userData, failure); }
+  }
+  const db = new Database(join(f.userData, 'data/app.sqlite'), { readonly: true });
+  try { expect(db.query('SELECT COUNT(*) count FROM sessions').get()).toEqual({ count: 2 }); expect(db.query('SELECT COUNT(*) count FROM session_forks').get()).toEqual({ count: 1 });
+    expect(db.query('SELECT COUNT(*) count FROM runs').get()).toEqual({ count: 0 }); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); } finally { db.close(); }
 });

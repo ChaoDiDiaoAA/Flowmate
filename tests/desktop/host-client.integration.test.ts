@@ -1345,7 +1345,7 @@ describe('T08 Context actual HostClient pipe', () => {
       'error-session':{ok:false,error:{...error,sessionId:9}}, 'no-filter-run':{ok:false,error,runId:2},
       'unknown-code':{ok:false,error:{...error,code:'private_provider_secret'}},
       'unknown-fact':{ok:false,error:{...error,private:'private/raw/path'}},
-      'registered-facts':{ok:false,error},
+      'registered-facts':{ok:false,error:{...error,message:'PRIVATE-CONTEXT sdk credentials',sessionId:1,runId:2}},
     };
     const root=await contextProtocolFixture(overrides),client=new HostClient();
     expect(await client.start(root,'0.1.0',root)).toMatchObject({ok:true});const child=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;
@@ -1353,7 +1353,8 @@ describe('T08 Context actual HostClient pipe', () => {
       for(const requestId of ['outer-run','error-run','error-session','unknown-code','unknown-fact'])
         expect(await client.request({type:'list_context_requests',requestId,input:{sessionId:1,runId:2}},500).then(()=> 'resolved',error=>error.message)).toBe('host_protocol_invalid');
       expect(await client.request({type:'list_context_snapshots',requestId:'no-filter-run',input:{sessionId:1}},500).then(()=> 'resolved',error=>error.message)).toBe('host_protocol_invalid');
-      expect(await client.request({type:'list_context_requests',requestId:'registered-facts',input:{sessionId:1,runId:2}})).toEqual({ok:false,error});
+      expect(await client.request({type:'list_context_requests',requestId:'registered-facts',input:{sessionId:1,runId:2}}))
+        .toEqual({ok:false,error:{...error,message:'The saved context changed. Refresh to read it again.',sessionId:1,runId:2}});
     } finally { await finishProtocolChild(child); }
   });
   it('rejects successful pages over the original limit and whole Result byte budget', async () => {
@@ -1395,3 +1396,69 @@ describe('T08 Context actual HostClient pipe', () => {
     }finally{await finishProtocolChild(old);if(next)await finishProtocolChild(next);}
   });
 });
+
+it('P9 T08 fix1 retries the identical fork after actual Host replacement against the same saved SQLite target', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-p9-fork-replacement-'));
+  const paths = resolveProductPaths(root); if (!paths.ok) throw new Error(paths.error.code);
+  const opened = openDatabase(paths.data); if (!opened.ok) throw new Error(opened.error.code);
+  const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+  const header = SessionManager.inMemory(paths.data.runtimeDir).getHeader()!;
+  const seeded = opened.data.sessions.create({ nativeSessionId: header.id, title: 'Original replacement source', at: contextAt,
+    nativeHistory: { storageVersion: 1, header, entries: [{ id: 'user', parentId: null, timestamp: contextAt, type: 'message',
+      message: { role: 'user', content: 'Replacement source', timestamp: 1 } }], leafId: 'user', unusable: false } });
+  expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]); opened.data.close();
+  if (!seeded.ok) throw new Error(seeded.error.code);
+  const client = new HostClient(); let first: ChildProcessWithoutNullStreams | null = null;
+  const sent: unknown[] = [];
+  const recordForkWrites = (child: ChildProcessWithoutNullStreams) => {
+    const write = child.stdin.write;
+    child.stdin.write = function (this: typeof child.stdin, ...args: Parameters<typeof write>) {
+      const command = JSON.parse(String(args[0])); if (command.type === 'fork_session') sent.push(command.input);
+      return Reflect.apply(write, this, args);
+    } as typeof write;
+  };
+  try {
+    expect(await client.start(root, '0.1.0', resolve(import.meta.dirname, '../..'))).toMatchObject({ ok: true });
+    first = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    recordForkWrites(first);
+    const page = await client.request({ type: 'query_session_history', input: { sessionId: seeded.data.sessionId } }) as Result<import('@flowmate/contracts').NativeHistoryPage>;
+    if (!page.ok) throw new Error(page.error.code);
+    const canonical = Object.freeze({ sourceSessionId: seeded.data.sessionId, expected: Object.freeze({ ...page.data.commit }), targetEntryId: 'user', title: 'Replacement child', clientOperationId: randomUUID() });
+    const emit = first.stdout.emit; let buffer = Buffer.alloc(0), packet: { value: Result<import('@flowmate/contracts').ForkSessionResult> } | null = null;
+    let observed!: () => void; const committed = new Promise<void>(resolveCommit => { observed = resolveCommit; });
+    first.stdout.emit = function(event: string | symbol, ...args: unknown[]) {
+      if (event !== 'data' || !Buffer.isBuffer(args[0])) return Reflect.apply(emit, this, [event, ...args]);
+      buffer = Buffer.concat([buffer, args[0]]); const forward: Buffer[] = [];
+      for (let newline = buffer.indexOf(10); newline !== -1; newline = buffer.indexOf(10)) {
+        const line = buffer.subarray(0, newline + 1); buffer = buffer.subarray(newline + 1);
+        const parsed = JSON.parse(String(line));
+        if (parsed.type === 'response' && parsed.requestId === 'lost-fork') { packet = parsed; observed(); continue; }
+        forward.push(line);
+      }
+      return forward.length ? Reflect.apply(emit, this, ['data', Buffer.concat(forward)]) : true;
+    };
+    const pending = client.request({ type: 'fork_session', requestId: 'lost-fork', input: canonical }).then(() => 'unexpected-success', error => error.message);
+    await committed;
+    const actual = packet as unknown as { value: Result<import('@flowmate/contracts').ForkSessionResult> };
+    expect(actual.value.ok).toBe(true); if (!actual.value.ok) throw new Error(actual.value.error.code);
+    first.stdout.emit = emit;
+    expect(await client.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } });
+    expect(first.exitCode !== null || first.signalCode !== null).toBe(true);
+    expect(await pending).not.toBe('unexpected-success'); const oldEpoch = client.connectionEpoch;
+    expect(await client.start(root, '0.1.0', resolve(import.meta.dirname, '../..'))).toMatchObject({ ok: true });
+    expect(client.connectionEpoch).toBeGreaterThan(oldEpoch);
+    const replacement = (client as unknown as { child: ChildProcessWithoutNullStreams }).child; recordForkWrites(replacement);
+    const retry = await client.request({ type: 'fork_session', input: canonical });
+    expect(retry).toEqual(actual.value);
+    expect(sent).toEqual([canonical, canonical]);
+    expect(await client.request({ type: 'query_session_history', input: { sessionId: seeded.data.sessionId } })).toEqual(page);
+    expect(await client.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } });
+    expect(replacement.exitCode !== null || replacement.signalCode !== null).toBe(true);
+    console.log('T08 fix1 actual replacement proof', JSON.stringify({ root, originalPid: first.pid, replacementPid: replacement.pid,
+      originalExited: first.exitCode ?? first.signalCode, replacementExited: replacement.exitCode ?? replacement.signalCode, oldEpoch, currentEpoch: client.connectionEpoch, sent }));
+    const db = new Database(paths.data.databaseFile, { readonly: true });
+    try { expect(db.query('SELECT COUNT(*) count FROM sessions').get()).toEqual({ count: 2 });
+      expect(db.query('SELECT COUNT(*) count FROM session_forks').get()).toEqual({ count: 1 });
+      expect(db.query('SELECT COUNT(*) count FROM runs').get()).toEqual({ count: 0 }); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); } finally { db.close(); }
+  } finally { await client.close(); }
+}, 15_000);

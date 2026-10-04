@@ -293,7 +293,18 @@ export function isContextHostCommand(type: string): type is keyof typeof context
 export function parseContextHostResult(type: string, value: unknown) {
   if (!isContextHostCommand(type)) return null;
   const parsed = contextResultSchemas[type].safeParse(value);
-  return parsed.success ? parsed.data : null;
+  if (!parsed.success) return null;
+  const result = parsed.data;
+  if (result.ok) return result;
+  const messages: Partial<Record<typeof result.error.code, string>> = {
+    input_invalid: 'Context query is invalid.',
+    state_conflict: 'The saved context changed. Refresh to read it again.',
+    session_not_found: 'The original chat no longer exists.',
+    session_scope_revoked: 'The original context is no longer authorized.',
+    context_binding_unknown: 'The original context could not be verified.',
+    storage_corrupt: 'The saved context is unavailable.',
+  };
+  return { ...result, error: { ...result.error, message: messages[result.error.code] ?? 'Context query could not be completed.' } };
 }
 export function contextHostFailure() {
   return { ok: false as const, error: { code: 'internal_error' as const, category: 'internal' as const,

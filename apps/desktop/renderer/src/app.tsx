@@ -4,7 +4,7 @@ import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidat
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
 import { RuntimeBudgetOverridesSchema, RuntimeRequestOverridesSchema } from '../../../../packages/contracts/src/runtime.ts';
 import { RUNTIME_CONFIG } from '../../../../packages/contracts/src/runtime-config.ts';
-import type { ForkSessionResult, HistoryCommitState, RuntimeRequestOverrides, Result, SourceRef, WorkspaceSelection, WorkspaceView } from '@flowmate/contracts';
+import type { ForkSessionRequest, ForkSessionResult, HistoryCommitState, RuntimeRequestOverrides, Result, SourceRef, WorkspaceSelection, WorkspaceView } from '@flowmate/contracts';
 import { WorkspaceContextSchema } from '../../../../packages/contracts/src/workspace.ts';
 import type { DesktopInvoiceFormRunRequest, DesktopSessionInputRequest, InvoiceCandidateOperationQuery, InvoiceFormApplicationReceipt, InvoiceFormDraft, SaveInvoiceCandidateResponse, SessionInputSnapshot } from '@flowmate/contracts';
 import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoiceFormState, editInvoiceForm, invalidateInvoiceForm,
@@ -278,6 +278,7 @@ export function App() {
   const unknownInputs = useRef(new Map<number, DesktopSessionInputRequest & { submittedDraft?: string }>());
   const inputSubmittingRef = useRef(false);
   const historyPositions = useRef(new Map<number, HistoryCommitState>());
+  const historyForkRequests = useRef(new Map<number, ForkSessionRequest>());
   const nativeSessionIds = useRef(new Map<number, string>());
   const knownRunSessions = useRef(new Map<number, number>());
   const historyQueries = useRef(new Map<number, { inFlight: boolean; refreshPending: boolean; beforeEntryId?: string }>());
@@ -1522,13 +1523,22 @@ export function App() {
     }
   }
 
+  function publishSelectedSession(sessionId: number | null) {
+    sessionLoadSequence.current++;
+    selectedSessionIdRef.current = sessionId;
+    setSelectedSessionId(sessionId);
+  }
+
+  function captureHistorySelection() {
+    const epoch = workspaceHostEpoch.current, selection = sessionLoadSequence.current, sessionId = selectedSessionIdRef.current;
+    return () => epoch === workspaceHostEpoch.current && selection === sessionLoadSequence.current && sessionId === selectedSessionIdRef.current;
+  }
+
   function selectSession(sessionId: number | null, focusComposer = false) {
     chatDrafts.current.set(draftKey(selectedSessionIdRef.current), chatInputRef.current);
     setSessionMutating(false);
     focusComposerWhenReady.current = focusComposer;
-    selectedSessionIdRef.current = sessionId;
-    sessionLoadSequence.current += 1;
-    setSelectedSessionId(sessionId);
+    publishSelectedSession(sessionId);
     chatInputRef.current = chatDrafts.current.get(draftKey(sessionId)) ?? '';
     setChatInput(chatInputRef.current);
     setSelectedSession(null);
@@ -1608,11 +1618,9 @@ export function App() {
       void loadSessionList();
       return session;
     }
-    sessionLoadSequence.current += 1;
     chatInputRef.current = createdDraft;
     setChatInput(chatInputRef.current);
-    selectedSessionIdRef.current = session.sessionId;
-    setSelectedSessionId(session.sessionId);
+    publishSelectedSession(session.sessionId);
     setSelectedSession(session);
     setChatTurns([]);
     const newMessages = emptyMessageState(session.sessionId);
@@ -1689,10 +1697,8 @@ export function App() {
     const next = wasSelected ? remaining.find((item) => item.status === 'active' && item.availability === 'ready'
       && item.historyState === 'recoverable' && !item.modelUseBlocked) ?? null : null;
     if (wasSelected) {
-      sessionLoadSequence.current += 1;
       allowInitialSessionSelection.current = false;
-      selectedSessionIdRef.current = next?.sessionId ?? null;
-      setSelectedSessionId(next?.sessionId ?? null);
+      publishSelectedSession(next?.sessionId ?? null);
       setSelectedSession(null);
       updateChatInput(chatDrafts.current.get(draftKey(next?.sessionId ?? null)) ?? '');
       setChatTurns([]);
@@ -2379,8 +2385,7 @@ export function App() {
 
   async function selectFork(result: ForkSessionResult, current: () => boolean): Promise<boolean> {
     if (!current() || !await confirmFormLeave() || !current()) return false;
-    const epoch = workspaceHostEpoch.current, selection = sessionLoadSequence.current;
-    const valid = () => current() && epoch === workspaceHostEpoch.current && selection === sessionLoadSequence.current;
+    const valid = current;
     const saved = await mutateWorkspace(async workspace => {
       if (!valid()) return { ok: false, error: { code: 'state_conflict', category: 'runtime', retryable: false, message: 'Chat selection changed.' } };
       const update = await window.flowmate.updateWorkspace({ expectedRevision: workspace.revision, change: { kind: 'session', sessionId: result.session.sessionId } });
@@ -2900,6 +2905,9 @@ export function App() {
       />
       {contextSourceError && !sessionDetails && <p className="notice bad context-source-error" role="alert">{contextSourceError}</p>}
       {sessionDetails && <SessionDetails key={sessionDetails.token} sessionId={sessionDetails.sessionId} basis={sessionDetails.basis}
+        initialForkRequest={historyForkRequests.current.get(sessionDetails.sessionId) ?? null}
+        onForkRequest={request => { if (request) historyForkRequests.current.set(sessionDetails.sessionId, request); else historyForkRequests.current.delete(sessionDetails.sessionId); }}
+        captureHistorySelection={captureHistorySelection} historySelectionToken={sessionLoadSequence.current}
         initialRunId={sessionDetails.initialRunId} initialSnapshotId={sessionDetails.initialSnapshotId}
         onHistoryBranch={historyBranchSaved} onHistoryFork={selectFork}
         onOpenOwner={(sessionId, runId, context, snapshotId) => openSessionDetails(sessionId, context && runId !== null ? { sessionId, runId, context } : null, runId, snapshotId)}

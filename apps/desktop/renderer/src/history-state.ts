@@ -13,6 +13,9 @@ export function createHistoryRead<T>(identity: HistoryIdentity): HistoryRead<T> 
 export function beginHistoryRead<T>(state: HistoryRead<T>, token: number, key: string): HistoryRead<T> {
   return { ...state, token, key, pending: true, error: null };
 }
+export function invalidateHistoryRead<T>(state: HistoryRead<T>, token: number): HistoryRead<T> {
+  return { ...state, token, pending: false };
+}
 export function historyLease<T>(state: HistoryRead<T>): HistoryLease {
   return { identity: state.identity, token: state.token, key: state.key };
 }

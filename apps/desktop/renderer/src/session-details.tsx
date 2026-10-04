@@ -4,10 +4,12 @@ import type { CandidateJobDetail, ContextReference, ContextSnapshotDetail, Conte
 import { acceptContextRead, beginContextRead, contextReadLease, createContextRead, failContextRead, finishContextRead,
   matchesContextRead, sameContextIdentity, type ContextIdentity } from './context-state.ts';
 import { SessionHistory } from './session-history.tsx';
-import type { ForkSessionResult } from '@flowmate/contracts';
+import type { ForkSessionRequest, ForkSessionResult } from '@flowmate/contracts';
 
 export type ContextBasis = Readonly<{ sessionId: number; runId: number; context: ContextReference }>;
 type Props = { sessionId: number; hostEpoch: number; hostReady: boolean; navigationToken: number;
+  initialForkRequest: ForkSessionRequest | null; onForkRequest(request: ForkSessionRequest | null): void;
+  historySelectionToken: number; captureHistorySelection(): () => boolean;
   initialRunId?: number | null;
   initialSnapshotId?: number | null;
   onHistoryBranch(sessionId: number): void;
@@ -228,6 +230,7 @@ export function SessionDetails(props: Props) {
     <div className="panel-head"><div><h2>Session details</h2><p>Session {props.sessionId} · Recorded facts</p></div>
       <button ref={closeButton} className="secondary-button" onClick={props.onClose}>Close details</button></div>
     <SessionHistory sessionId={props.sessionId} hostEpoch={props.hostEpoch} navigationToken={props.navigationToken} hostReady={props.hostReady}
+      initialForkRequest={props.initialForkRequest} onForkRequest={props.onForkRequest} captureSelection={props.captureHistorySelection} selectionToken={props.historySelectionToken}
       onBranch={props.onHistoryBranch} onFork={props.onHistoryFork} onOwner={(sessionId, runId) => void openOwner(sessionId, runId)} />
     {ownerError && <p role="alert">{ownerError}</p>}
     <h3>Context</h3><p className="config-note">Saved context and request evidence are separate from the model's answer.</p>
