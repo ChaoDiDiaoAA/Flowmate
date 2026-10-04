@@ -115,6 +115,37 @@ describe('P9 T01', () => {
     expect(validator.safeParse({ ...history, commitRevision: 1 }).success).toBe(false);
   });
 
+  // A required identity disappearing from persisted JSON must fail before a write is accepted.
+  it('rejects non-enumerable native fields that disappear during serialization', () => {
+    const hiddenId = Object.defineProperty({ ...user }, 'id', { value: 'user', enumerable: false });
+    expect(JSON.parse(JSON.stringify(hiddenId)).id).toBeUndefined();
+    expect(schema('NativeSessionEntrySchema').safeParse(hiddenId).success).toBe(false);
+    expect(schema('NativeSessionHistorySchema').safeParse({ ...history, entries: [hiddenId] }).success).toBe(false);
+    const hiddenHeaderId = Object.defineProperty({ ...history.header }, 'id', { value: 'native', enumerable: false });
+    expect(schema('NativeSessionHeaderSchema').safeParse(hiddenHeaderId).success).toBe(false);
+    const hiddenRole = Object.defineProperty({ ...user.message }, 'role', { value: 'user', enumerable: false });
+    expect(schema('NativeAgentMessageSchema').safeParse(hiddenRole).success).toBe(false);
+    const hiddenData = Object.defineProperty({}, 'opaque', { value: 'must not vanish', enumerable: false });
+    expect(schema('NativeSessionEntrySchema').safeParse({ ...user, type: 'custom', customType: 'fixture', data: hiddenData }).success).toBe(false);
+    const optional = Object.defineProperty({ ...user, type: 'label', targetId: 'user' }, 'label', { value: undefined, enumerable: false });
+    expect(JSON.stringify(schema('NativeSessionEntrySchema').parse(optional))).toBe(JSON.stringify(optional));
+    expect(schema('NativeSessionHistorySchema').safeParse(JSON.parse(JSON.stringify(history))).success).toBe(true);
+  });
+
+  // Numeric-looking properties outside array indices cannot conceal unsupported native values.
+  it('rejects array own properties outside canonical in-range slots', () => {
+    for (const key of ['4294967295', '9007199254740991', '01', '-1', '1.0', 'extra']) {
+      const data: unknown[] = ['kept'];
+      Object.defineProperty(data, key, { value: Infinity, enumerable: true });
+      expect(JSON.stringify(data)).toBe('["kept"]');
+      expect(schema('NativeSessionEntrySchema').safeParse({ ...user, type: 'custom', customType: 'fixture', data }).success).toBe(false);
+    }
+    const valid: unknown[] = ['kept'];
+    Object.defineProperty(valid, '0', { value: 'kept', enumerable: false });
+    const entry = { ...user, type: 'custom', customType: 'fixture', data: valid };
+    expect(JSON.stringify(schema('NativeSessionEntrySchema').parse(entry))).toBe(JSON.stringify(entry));
+  });
+
   it('enforces public whitelist identity and UTF8 display budgets', () => {
     const summary = { sequence: 0, entryId: 'user', parentId: null, type: 'message', timestamp: at,
       isCurrentPath: true, isLeaf: true, preview: 'Hello', truncated: false,

@@ -40,8 +40,8 @@ function isNativeJson(value: unknown, ancestors = new Set<object>(), allowUndefi
     }
     for (const [key, descriptor] of Object.entries(descriptors)) {
       if (!('value' in descriptor)) return false;
-      if (array && key !== 'length' && !/^(0|[1-9][0-9]*)$/.test(key)) return false;
-      if (!array && !isNativeJson(descriptor.value, ancestors)) return false;
+      if (array && key !== 'length' && (!/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= value.length)) return false;
+      if (!array && (!descriptor.enumerable && descriptor.value !== undefined || !isNativeJson(descriptor.value, ancestors))) return false;
     }
     ancestors.delete(value);
     return true;
@@ -50,7 +50,7 @@ function isNativeJson(value: unknown, ancestors = new Set<object>(), allowUndefi
 const nativeJson = z.custom<unknown>(value => isNativeJson(value), 'Native history must contain safe JSON values.');
 function preserveNative<T extends z.ZodTypeAny>(shape: T) {
   return nativeJson.pipe(z.unknown().superRefine((value, context) => {
-    const parsed = shape.safeParse(value);
+    const parsed = shape.safeParse(value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
     if (!parsed.success) for (const error of parsed.error.issues) context.addIssue(error);
   }).transform(value => value as z.output<T>));
 }
