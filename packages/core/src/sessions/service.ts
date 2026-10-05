@@ -60,7 +60,7 @@ export class SessionService {
     return createHistoryReader({ repository: this.repository, agent: this.agent, project: row => this.project(row),
       managementReason: row => {
         const state = this.runtimeState();
-        if (this.managing.has(row.sessionId) || state.active?.kind === 'agent' && state.active.sessionId === row.sessionId) return 'busy';
+        if (this.managing.has(row.sessionId) || state.active && state.active.kind !== 'provider' && state.active.sessionId === row.sessionId) return 'busy';
         const eligibility = this.verifyMutation?.(row.sessionId);
         if (state.blocked || eligibility && !eligibility.ok || row.status !== 'active' || row.deletePending) return 'session-unavailable';
         try {
@@ -111,7 +111,7 @@ export class SessionService {
     if (eligible && !eligible.ok) return eligible;
     const state = this.runtimeState();
     if (state.blocked) return fail(state.error ?? appError('runtime_unusable', 'runtime', 'Runtime is unavailable.', true));
-    if (state.active?.kind === 'agent' && state.active.sessionId === sessionId)
+    if (state.active && state.active.kind !== 'provider' && state.active.sessionId === sessionId)
       return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
     this.managing.add(sessionId);
     return ok(undefined);
@@ -204,7 +204,7 @@ export class SessionService {
       const qualify = ({ row, bundle, blocked }: SessionHistorySnapshot): Result<void> => {
         const state = this.runtimeState();
         if (state.blocked) return fail(state.error ?? appError('runtime_unusable', 'runtime', 'Runtime is unavailable.', true));
-        if (state.active?.kind === 'agent' && state.active.sessionId === row.sessionId)
+        if (state.active && state.active.kind !== 'provider' && state.active.sessionId === row.sessionId)
           return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
         if (row.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
         if (row.status !== 'active') return fail(appError('session_archived', 'session', 'Session is archived.'));
@@ -362,6 +362,7 @@ export class SessionService {
   private project(row: SessionRow): SessionSnapshot {
     const activeRun = this.runtimeState().active;
     const activeRunId = activeRun?.kind === 'agent' && activeRun.sessionId === row.sessionId ? activeRun.runId : null;
+    const activeOperation = activeRun && activeRun.kind !== 'provider' && activeRun.sessionId === row.sessionId;
     let availability: SessionAvailability;
     if (row.status === 'archived') availability = 'archived';
     else {
@@ -369,7 +370,7 @@ export class SessionService {
         const inspected = this.agent.inspect(row.nativeSessionId);
         availability = row.nativeUnusable ? 'unusable'
           : row.historyState !== 'recoverable' ? 'history-unavailable'
-          : activeRunId !== null || inspected.availability === 'busy' ? 'busy'
+          : activeOperation || inspected.availability === 'busy' ? 'busy'
           : inspected.availability === 'ready' ? 'ready'
             : inspected.availability === 'unusable' ? 'unusable'
               : row.historyState === 'recoverable' ? 'ready' : 'history-unavailable';

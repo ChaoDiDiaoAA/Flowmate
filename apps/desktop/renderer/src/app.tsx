@@ -419,7 +419,8 @@ export function App() {
   function reconcileEventObservations() {
     const wanted = new Map<number, number | null>();
     if (hostReadyRef.current && eventCoordinatorAlive.current) {
-      if (observedActiveRef.current) wanted.set(observedActiveRef.current.runId, observedActiveRef.current.sessionId);
+      if (observedActiveRef.current && observedActiveRef.current.kind !== 'compaction')
+        wanted.set(observedActiveRef.current.runId, observedActiveRef.current.sessionId);
       if (activityVisibleRef.current && activityFocusedRef.current && activityTargetRef.current)
         wanted.set(activityTargetRef.current.runId, activityTargetRef.current.sessionId);
     }
@@ -1769,6 +1770,11 @@ export function App() {
     void refresh();
     const unsubscribe = window.flowmate.subscribe((event) => {
       if (!alive) return;
+      if (event.type === 'compaction_observation') {
+        // Reuse the window's single subscription; a panel must not unsubscribe the chat's transport.
+        if (event.observation.sessionId === contextTarget.current?.sessionId) setContextRefresh(value => value + 1);
+        return;
+      }
       if (event.type === 'runtime_events_available') {
         const observation = eventObservations.current.get(event.runId);
         if (!observation?.wanted) return;
@@ -2905,6 +2911,8 @@ export function App() {
       />
       {contextSourceError && !sessionDetails && <p className="notice bad context-source-error" role="alert">{contextSourceError}</p>}
       {sessionDetails && <SessionDetails key={sessionDetails.token} sessionId={sessionDetails.sessionId} basis={sessionDetails.basis}
+        modelId={selectedModelId} models={(state?.settings.models ?? []).filter(model => model.kind !== 'legacy'
+          && state?.modelCredentials[model.id] === 'configured')} onModelChange={selectModel}
         initialForkRequest={historyForkRequests.current.get(sessionDetails.sessionId) ?? null}
         onForkRequest={request => { if (request) historyForkRequests.current.set(sessionDetails.sessionId, request); else historyForkRequests.current.delete(sessionDetails.sessionId); }}
         captureHistorySelection={captureHistorySelection} historySelectionToken={sessionLoadSequence.current}

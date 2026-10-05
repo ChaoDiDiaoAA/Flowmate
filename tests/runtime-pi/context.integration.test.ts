@@ -8,9 +8,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { openDatabase } from '@flowmate/core';
-import { CandidateDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
+import { CandidateDraftSchema, invoiceHeaderFields, RUNTIME_CONFIG } from '@flowmate/contracts';
 import { ContextObservationsSchema, SessionInputContentV2Schema, appError, fail, ok } from '@flowmate/contracts';
-import type { AgentRunEvent, Application, ProviderConfig, Result, SessionInputRequest, AgentToolBinding, ToolDefinition, RequestContextBinding, ContextEvidenceUpdate } from '@flowmate/contracts';
+import type { AgentRunEvent, Application, ProviderConfig, Result, SessionInputRequest, PromptInputRequest, AgentToolBinding, ToolDefinition, RequestContextBinding, ContextEvidenceUpdate } from '@flowmate/contracts';
 import { z } from 'zod';
 import { createApplication } from '../../apps/composition.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
@@ -354,10 +354,110 @@ async function fixture(onRequest: (ordinal: number) => Promise<Response> | Respo
       ('SELECT context_observations_json FROM runs WHERE id=?').get(runId)!.context_observations_json)); }
     finally { db.close(); }
   };
-  const prompt = (clientSequence: number, text = 'same text'): SessionInputRequest => ({ sessionId: session.sessionId,
+  const prompt = (clientSequence: number, text = 'same text'): PromptInputRequest => ({ sessionId: session.sessionId,
     clientSequence, mode: 'prompt', text, config, timeoutMs: 5000, stopGraceMs: 500 });
-  return { app, adapter, paths, session, payloads, journal, prompt, executions: () => executions };
+  return { app, adapter, paths, session, payloads, journal, prompt, config, executions: () => executions };
 }
+it.each([false, true])('P10 manual summary retains the committed workspace byte ceiling after native release (fork=%s)', async fork => {
+  const f = await fixture(async ordinal => {
+    const response = reply(ordinal > 3 ? 'Workspace native summary.' : 'Saved workspace answer. ' + 'y'.repeat(250000));
+    // Deliberately low Provider usage holds automatic threshold; this case measures the separate byte guard.
+    return new Response((await response.text()).replace('data: [DONE]', 'data: ' + JSON.stringify({ choices: [],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }) + '\n\ndata: [DONE]'), { headers: response.headers });
+  });
+  for (let index = 1; index <= 3; index++) {
+    const workspace = need(await f.app.readWorkspace());
+    const run = await begin(f.app, { ...f.prompt(index, `Invoice ${index} ` + 'x'.repeat(64000)),
+      workspace: { revision: workspace.revision, sessionId: f.session.sessionId, documentRef: null, jobId: null, candidateRef: null } });
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  }
+  expect(new TextEncoder().encode(JSON.stringify(f.payloads.at(-1))).length).toBeGreaterThan(RUNTIME_CONFIG.llmPayload.maxChatContextBytes);
+  const before = need(await f.app.querySessionCompaction({ sessionId: f.session.sessionId }));
+  expect((await f.adapter.releaseSession(f.session.nativeSessionId)).closed).toBe(true);
+  const target = fork ? need(await f.app.forkSession({ sourceSessionId: f.session.sessionId, expected: before.commit,
+    targetEntryId: before.commit.leafId!, title: 'Workspace byte ceiling fork', clientOperationId: crypto.randomUUID() })).session : f.session;
+  const expected = fork ? need(await f.app.querySessionCompaction({ sessionId: target.sessionId })).commit : before.commit;
+  const operationId = crypto.randomUUID();
+  need(await f.app.compactSession({ sessionId: target.sessionId, operationId, expected, config: f.config }));
+  await waitFor(async () => {
+    const query = need(await f.app.querySessionCompaction({ sessionId: target.sessionId, operationId }));
+    return query.operation?.stopped === true;
+  });
+  const after = need(await f.app.querySessionCompaction({ sessionId: target.sessionId, operationId }));
+  // The retained huge assistant exceeds this model's token reserve even though the summary byte ceiling is valid.
+  expect(after.operation).toMatchObject({ nativeOutcome: 'succeeded', generated: true, stopped: true, mayContinue: false,
+    capacity: { fitsEstimate: false } });
+  expect(after.operation!.saved).not.toBeNull(); expect(f.payloads).toHaveLength(5);
+  const summaryBytes = new TextEncoder().encode(JSON.stringify(f.payloads[3])).length;
+  expect(summaryBytes).toBeGreaterThan(RUNTIME_CONFIG.llmPayload.maxChatContextBytes);
+  expect(summaryBytes).toBeLessThan(RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes);
+  expect(f.executions()).toBe(0);
+}, 30_000);
+it('P10 overflow continuation then tool-loop threshold refuses the exhausted budget at the native compaction boundary', async () => {
+  const f = await fixture(async ordinal => {
+    if (ordinal === 5) return Response.json({ error: { message: 'maximum context length exceeded', type: 'invalid_request_error' } }, { status: 400 });
+    if (ordinal === 7) {
+      const chunk = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
+      return new Response(chunk({ choices: [{ index: 0, delta: { role: 'assistant', content: 'x'.repeat(100000),
+        tool_calls: [{ index: 0, id: 'p10-recovered-tool', type: 'function', function: {
+          name: 'calculate_invoice_amounts', arguments: JSON.stringify({ operation: 'sum', values: ['0.1', '0.2'], scale: 2 }) } }] }, finish_reason: null }] })
+        + chunk({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+        + chunk({ choices: [], usage: { prompt_tokens: 50000, completion_tokens: 1, total_tokens: 50001 } }) + 'data: [DONE]\n\n',
+        { headers: { 'content-type': 'text/event-stream' } });
+    }
+    const response = reply(ordinal <= 4 ? 'Seed answer.' : 'Native compaction checkpoint.');
+    return new Response((await response.text()).replace('data: [DONE]', 'data: ' + JSON.stringify({ choices: [],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }) + '\n\ndata: [DONE]'), { headers: response.headers });
+  });
+  for (let index = 1; index <= 4; index++) {
+    const seed = await begin(f.app, f.prompt(index, 'Seed invoice ' + 'y'.repeat(45000)));
+    expect((await seed.terminal).result.ok).toBe(true);
+  }
+  const workspace = need(await f.app.readWorkspace());
+  const active = await begin(f.app, { ...f.prompt(5, 'Original explicit invoice question'), budget: { maxModelCalls: 5 },
+    workspace: { revision: workspace.revision, sessionId: f.session.sessionId, documentRef: null, jobId: null, candidateRef: null } });
+  expect((await active.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'agent_model_call_budget' } } });
+  expect(f.payloads).toHaveLength(9); expect(f.executions()).toBe(1);
+  const view = need(await f.app.querySessionCompaction({ sessionId: f.session.sessionId, runId: active.accepted.runId }));
+  expect(view.operation).toMatchObject({ reason: 'threshold', generated: true, stopped: true, mayContinue: false,
+    nativeOutcome: 'succeeded', error: { code: 'agent_model_call_budget' } });
+  expect(view.operation!.saved).not.toBeNull();
+  expect(f.adapter.inspect(f.session.nativeSessionId).availability).toBe('ready');
+}, 30_000);
+it('P10 threshold before next assistant retains the real tool pair and generating Context', async () => {
+  const f = await fixture(ordinal => {
+    if (ordinal !== 1) return reply(ordinal === 2 ? 'Native tool-turn summary.' : 'Final tool answer.');
+    const chunk = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
+    return new Response(chunk({ choices: [{ index: 0, delta: { role: 'assistant', content: 'x'.repeat(100000),
+      tool_calls: [{ index: 0, id: 'p10-threshold-tool', type: 'function', function: {
+        name: 'calculate_invoice_amounts', arguments: JSON.stringify({ operation: 'sum', values: ['0.1', '0.2'], scale: 2 }) } }] }, finish_reason: null }] })
+      + chunk({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
+      + chunk({ choices: [], usage: { prompt_tokens: 50000, completion_tokens: 1, total_tokens: 50001 } })
+      + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const workspace = need(await f.app.readWorkspace());
+  const first = await begin(f.app, { ...f.prompt(1), workspace: { revision: workspace.revision, sessionId: f.session.sessionId,
+    documentRef: null, jobId: null, candidateRef: null } });
+  expect((await first.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect(f.executions()).toBe(1);
+  expect(f.payloads).toHaveLength(3);
+  const tools = need(await f.app.listRunToolCalls({ sessionId: f.session.sessionId, runId: first.accepted.runId })).items;
+  const history = need(await f.app.querySessionHistory({ sessionId: f.session.sessionId }));
+  need(await f.app.close());
+  const journal = f.journal(first.accepted.runId);
+  expect(journal.compactions).toHaveLength(1);
+  expect(journal.compactions![0]).toMatchObject({ reason: 'threshold', runId: first.accepted.runId,
+    observation: { generated: true, saved: { leafId: expect.any(String) }, stopped: true },
+    calls: [{ modelCallIndex: 2, purpose: 'turn-prefix' }] });
+  expect(journal.requests.map(request => request.binding.requestSequence)).toEqual([1, 2]);
+  expect(tools).toHaveLength(1);
+  expect(journal.requests[1]!.binding.includedToolResults).toEqual([{
+    nativeToolCallId: 'p10-threshold-tool', toolCallId: tools[0]!.toolCallId, originRunId: first.accepted.runId,
+    context: { snapshotId: journal.requests[0]!.binding.snapshotId, requestSequence: 1 },
+  }]);
+  expect(JSON.stringify(f.payloads[2])).toContain('p10-threshold-tool');
+  expect(history.commit.entryCount).toBeGreaterThan(5);
+});
 
 async function storedFixture(withRepository = true, toolOrigin: false | 'legacy' | 'p8' = false, extraToolResults = 0, preledgerUsers = 0) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p8-context-store-'));
@@ -624,7 +724,7 @@ describe('T06 actual payload and transport evidence', () => {
         headers: { 'content-type': 'application/json', 'retry-after-ms': '400' } }),
       afterRecord: update => {
         if (update.kind !== 'response' || update.status !== 503) return;
-        if (cause === 'cancel') need(f.runtime.cancel(f.runtime.state().active!.runId));
+        if (cause === 'cancel') { const active = f.runtime.state().active; if (!active || active.kind === 'compaction') throw new Error('Missing active Run'); need(f.runtime.cancel(active.runId)); }
         if (cause === 'revoke') f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
           .run(JSON.stringify({ documentIds: [1], at: new Date().toISOString(), reason: 'document_use_revoked' }), f.session.sessionId);
       } });

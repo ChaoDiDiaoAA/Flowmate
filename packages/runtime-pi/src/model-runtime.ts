@@ -57,7 +57,7 @@ export function modelRuntimeSnapshot(
 }
 
 export function normalizeUsage(
-  message: AssistantMessage,
+  message: Pick<AssistantMessage, 'usage'>,
   facts: { attempts: number; complete: boolean },
   canVerifyCost: boolean,
 ): { usage: UsageRecord; tokens: TokenColumns } {

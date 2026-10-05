@@ -156,7 +156,7 @@ export type NativeHistoryWrite = { expected: HistoryCommitState; history: Native
 export const NativeHistoryOriginSeedSchema = z.object({ nativeEntryId: NativeEntryIdSchema, originSessionId: id,
   originRunId: id.nullable() }).strict().readonly();
 export type NativeHistoryOriginSeed = z.infer<typeof NativeHistoryOriginSeedSchema>;
-export const NativeHistoryRecoverySeedSchema = z.object({ sessionId: id, inputs: z.array(NativeInputContextBindingSchema).readonly(),
+export const NativeHistoryRecoverySeedSchema = z.object({ sessionId: id, inputs: z.array(z.lazy(() => NativeInputContextBindingSchema)).readonly(),
   origins: z.array(NativeHistoryOriginSeedSchema).readonly() }).strict().superRefine((seed, context) => {
   if (new Set(seed.origins.map(origin => origin.nativeEntryId)).size !== seed.origins.length
     || new Set(seed.inputs.map(input => input.nativeEntryId)).size !== seed.inputs.length) issue(context, 'Recovery identities must be unique.');
@@ -274,7 +274,7 @@ export const normalizeSessionHistoryEntryRequest = (raw: unknown) => normalize(S
 export const normalizeForkSessionRequest = (raw: unknown) => normalize(ForkSessionRequestSchema, raw);
 function resultSchema<T extends z.ZodTypeAny>(data: T, maximumBytes: number) {
   return z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data }).strict(),
-    z.object({ ok: z.literal(false), error: ContextErrorSchema, runId: id.optional() }).strict()])
+    z.object({ ok: z.literal(false), error: z.lazy(() => ContextErrorSchema), runId: id.optional() }).strict()])
     .refine(value => jsonBytes(value) <= maximumBytes, 'Complete History Result exceeds its UTF-8 budget.');
 }
 export const NativeHistoryPageResultSchema = resultSchema(NativeHistoryPageSchema, 1048576);

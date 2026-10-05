@@ -14,3 +14,4 @@ export * from './session-inputs.ts';
 export * from './events.ts';
 export * from './context.ts';
 export * from './memory.ts';
+export * from './compaction.ts';

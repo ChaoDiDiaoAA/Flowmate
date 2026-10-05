@@ -34,6 +34,14 @@ async function workspaceProtocolFixture(revision = 0) {
     input.on('line', line => {
       const command = JSON.parse(line);
       if (command.type === 'get_state') { if (held) response(held,{ok:true,data:workspace}); response(command.requestId,{released:!!held}); return; }
+      if (command.type === 'compact_session' || command.type === 'cancel_session_compaction') {
+        const value = {ok:true,data:{sessionId:command.input.sessionId,operationId:command.input.operationId,
+          ...(command.type === 'cancel_session_compaction' ? {accepted:true} : {})}};
+        if(command.requestId === 'wrong-compaction-owner') value.data.sessionId++;
+        if(command.requestId === 'wrong-compaction-op') value.data.operationId='00000000-0000-4000-8000-000000000000';
+        if(command.requestId === 'extra-compaction-data') value.data.nativeSessionId='forged';
+        response(command.requestId,value); return;
+      }
       if (command.requestId === 'held-workspace') { held=command.requestId; return; }
       const value = command.type==='restore_workspace' ? {ok:true,data:{workspace,clearedReferences:[]}} : {ok:true,data:workspace};
       switch(command.requestId) {
@@ -75,6 +83,23 @@ it('P7 HostClient validates Workspace envelopes and restore shape on a real chil
       .then(() => 'resolved', error => error instanceof Error ? error.message : String(error));
     expect(identityOutcome).toBe('host_request_timeout');
     expect(await client.request({ type: 'read_workspace' })).toEqual({ ok: true, data: emptyWorkspace });
+  } finally { await finishProtocolChild(child); }
+}, 5_000);
+
+it('P10 HostClient checks compaction identity and strict result on a real child pipe', async () => {
+  const root = await workspaceProtocolFixture(), client = new HostClient();
+  expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: true });
+  const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  const input = { sessionId: 7, operationId: randomUUID(), expected: { commitRevision: 1, entryCount: 2, leafId: 'leaf' }, modelId: 'configured' };
+  try {
+    const command = { type: 'compact_session' as const, input, expectedSettingsRevision: 1, expectedCredentialRef: 'fixture_key_p10_16' };
+    expect(await client.request(command)).toEqual({ ok: true, data: { sessionId: 7, operationId: input.operationId } });
+    expect(await client.request({ type: 'cancel_session_compaction', input: { sessionId: 7, operationId: input.operationId } }))
+      .toEqual({ ok: true, data: { sessionId: 7, operationId: input.operationId, accepted: true } });
+    for (const requestId of ['wrong-compaction-owner', 'wrong-compaction-op', 'extra-compaction-data'])
+      expect(await client.request({ ...command, requestId }, 500).then(() => 'resolved', error => error.message)).toBe('host_protocol_invalid');
+    expect(await client.request({ ...command, input: { ...input, config: {} } } as never, 500).then(() => 'resolved', error => error.message))
+      .toBe('host_protocol_invalid');
   } finally { await finishProtocolChild(child); }
 }, 5_000);
 

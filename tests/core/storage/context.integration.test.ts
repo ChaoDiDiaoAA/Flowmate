@@ -14,8 +14,8 @@ import { SessionService } from '../../../packages/core/src/sessions/service.ts';
 import { projectSessionMessages } from '../../../packages/runtime-pi/src/messages.ts';
 import { createNativeOriginReader, resolveNativeEntryOrigin } from '../../../packages/core/src/memory/origins.ts';
 import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, ContextObservationsSchema,
-  NativeContextObservationsSchema, PublicContextObservationsSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok } from '@flowmate/contracts';
-import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result, ToolRuntimeObservation } from '@flowmate/contracts';
+  NativeContextObservationsSchema, PublicContextObservationsSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok, RUNTIME_CONFIG } from '@flowmate/contracts';
+import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result, ToolRuntimeObservation, RunCompactionEvidence } from '@flowmate/contracts';
 
 const at = '2026-10-03T00:00:00.000Z';
 const later = '2026-10-03T00:00:01.000Z';
@@ -138,6 +138,91 @@ function fixture() {
   }
   return { store, session, runId, config, append, consume, binding, productPaths };
 }
+
+function compactionEvidence(f: ReturnType<typeof fixture>): RunCompactionEvidence {
+  f.store.db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify({
+    ...f.config, historyPolicyVersion: 'p9-native-history-v1', compactionPolicy: RUNTIME_CONFIG.compaction,
+  }), f.runId);
+  const baseline = need(f.store.memory.load(f.session.sessionId))!.commit;
+  return { operationId: 'ae6ec812-c44f-4382-9ff6-641461f779e7', runId: f.runId, sessionId: f.session.sessionId,
+    nativeSessionId: f.session.nativeSessionId, reason: 'threshold', baseline, firstKeptEntryId: null, splitTurn: null,
+    calls: [], observation: { operationId: 'ae6ec812-c44f-4382-9ff6-641461f779e7', runId: f.runId,
+      sessionId: f.session.sessionId, nativeSessionId: f.session.nativeSessionId, reason: 'threshold', observationSequence: 1,
+      phase: 'preparing', generated: false, nativeOutcome: 'pending', entryId: null, saved: null, error: null,
+      stopRequested: false, stopped: false, continuation: 'current-run', mayContinue: false,
+      capacity: { tokens: null, source: 'unknown', contextWindow: null, thresholdTokens: null, fitsEstimate: null },
+      usage: { version: 1, source: 'not-requested', reason: 'not-started', sdkValues: null, attempts: 0,
+        attemptsComplete: true, costSource: null, updatedAt: at },
+      tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } } };
+}
+it('P10 automatic journal preserves ordinary requests and rejects conflicting facts', () => {
+  const f = fixture(), saved = f.append(); f.consume(saved.inputId, saved.content.text);
+  const evidence = compactionEvidence(f), repository = f.store.context;
+  need(repository.recordCompactionEvidence(evidence));
+  need(repository.recordCompactionEvidence(evidence)); // identical payload is idempotent
+  const binding = f.binding(saved.inputId, saved.snapshot.id);
+  need(repository.bindRequest({ binding, api: 'openai-responses', transport: 'observed-fetch', at }));
+  need(repository.recordRequest(binding, { kind: 'sdk-payload', at, inclusion: 'confirmed', reason: null }));
+  expect(need(repository.readCompactionEvidence({ sessionId: f.session.sessionId, runId: f.runId }))).toEqual([evidence]);
+  const next = { ...evidence, firstKeptEntryId: 'p8-user', splitTurn: false,
+    observation: { ...evidence.observation, observationSequence: 2, phase: 'compacting' as const } };
+  need(repository.recordCompactionEvidence(next));
+  const raw = JSON.parse((f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId) as {context_observations_json:string}).context_observations_json);
+  expect(raw.requests[0].sdkPayload).toEqual({ observedAt: at, inclusion: 'confirmed', reason: null });
+  expect(raw.compactions).toEqual([next]);
+  for (const value of [evidence, { ...next, splitTurn: true },
+    { ...next, baseline: { ...next.baseline, commitRevision: next.baseline.commitRevision + 1 } }])
+    expect(repository.recordCompactionEvidence(value)).toMatchObject({ ok: false, error: { code: 'context_binding_conflict' } });
+  expect(repository.recordCompactionEvidence({ ...next, nativeSessionId: 'foreign',
+    observation: { ...next.observation, nativeSessionId: 'foreign' } })).toMatchObject({ ok: false });
+});
+it('P10 journal accepts only real compaction receipts and retains historical prefixes', () => {
+  const f = fixture(), saved = f.append(); f.consume(saved.inputId, saved.content.text);
+  const initial = compactionEvidence(f), repository = f.store.context;
+  need(repository.recordCompactionEvidence(initial));
+  const history = need(f.store.memory.load(f.session.sessionId))!.history;
+  const entry = { type: 'compaction' as const, id: 'p10-summary', parentId: history.leafId, timestamp: at,
+    summary: 'fixture summary', firstKeptEntryId: 'p8-user', tokensBefore: 100 };
+  const receipt = need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: initial.baseline, header: history.header,
+    appendEntries: [entry], leafId: entry.id, contexts: [], unusable: false }));
+  const completed: RunCompactionEvidence = { ...initial, firstKeptEntryId: entry.firstKeptEntryId, splitTurn: false,
+    observation: { ...initial.observation, observationSequence: 2, phase: 'ended', generated: true,
+      nativeOutcome: 'succeeded', stopped: true, entryId: entry.id, saved: receipt } };
+  expect(repository.recordCompactionEvidence({ ...completed, observation: { ...completed.observation,
+    saved: { ...receipt, commitRevision: receipt.commitRevision + 1 } } })).toMatchObject({ ok: false });
+  need(repository.recordCompactionEvidence(completed));
+  need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: receipt, header: history.header,
+    appendEntries: [{ type: 'session_info', id: 'later', parentId: entry.id, timestamp: at, name: 'later' }],
+    leafId: 'later', contexts: [], unusable: false }));
+  expect(need(repository.readCompactionEvidence({ sessionId: f.session.sessionId, runId: f.runId,
+    operationId: completed.operationId }))).toEqual([completed]);
+  f.store.db.query("UPDATE session_native_entries SET entry_json=replace(entry_json,'p8-user','missing-cut') WHERE entry_id=?").run(entry.id);
+  expect(repository.readCompactionEvidence({ sessionId: f.session.sessionId, runId: f.runId })).toMatchObject({ ok: false });
+});
+it('P10 journal refuses an uncommitted baseline and storage write failure before recording', () => {
+  const f = fixture(), saved = f.append(); f.consume(saved.inputId, saved.content.text);
+  const evidence = compactionEvidence(f);
+  expect(f.store.context.recordCompactionEvidence({ ...evidence, baseline: { ...evidence.baseline,
+    commitRevision: evidence.baseline.commitRevision + 1 } })).toMatchObject({ ok: false });
+  f.store.db.exec("CREATE TRIGGER p10_reject_context BEFORE UPDATE OF context_observations_json ON runs BEGIN SELECT RAISE(ABORT,'fixture'); END");
+  expect(f.store.context.recordCompactionEvidence(evidence)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+  f.store.db.exec('DROP TRIGGER p10_reject_context');
+  expect(need(f.store.context.readCompactionEvidence({ sessionId: f.session.sessionId, runId: f.runId }))).toEqual([]);
+});
+it('P10 derived summary cannot claim an Input that lies at or after its retained cut', () => {
+  const f = fixture(), saved = f.append(); const history = f.consume(saved.inputId, saved.content.text);
+  const entry = { type: 'compaction' as const, id: 'not-covering-input', parentId: history.leafId, timestamp: at,
+    summary: 'summary before retained input', firstKeptEntryId: history.leafId!, tokensBefore: 10 };
+  need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: need(f.store.memory.load(f.session.sessionId))!.commit,
+    header: history.header, appendEntries: [entry], leafId: entry.id, contexts: [], unusable: false }));
+  const binding: RequestContextBinding = { ...f.binding(saved.inputId, saved.snapshot.id), includedBindings: [],
+    includedNativeContexts: [{ nativeEntryId: entry.id, originSessionId: f.session.sessionId, entryType: 'compaction',
+      messageRole: 'compactionSummary', contextMessageIndex: 0, referenceEntryIds: [entry.firstKeptEntryId] }] };
+  expect(f.store.context.bindRequest({ binding, api: 'openai-responses', transport: 'observed-fetch', at }))
+    .toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
+  expect(JSON.parse((f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId) as {context_observations_json:string})
+    .context_observations_json).requests).toEqual([]);
+});
 
 // Represents already trusted T06 provenance in disposable SQLite; not a public fork implementation.
 function frozenFork(f: ReturnType<typeof fixture>, source: number, nativeId: string, ids?: string[]) {

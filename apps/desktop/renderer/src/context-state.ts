@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from 'react';
+import type { Result } from '@flowmate/contracts';
 import type { EventViewState } from './event-state.ts';
 
 export type ContextIdentity = Readonly<{ hostEpoch: number; sessionId: number; runId: number | null; selectionToken: number }>;
@@ -37,4 +39,34 @@ export function hasNewContextEvents(before: EventViewState, after: EventViewStat
   const priorIds = new Set([...before.events.values()].map(event => event.eventId));
   return [...after.events.values()].some(event => !priorIds.has(event.eventId) && event.runId === target.runId
     && event.sessionId === target.sessionId && refreshFacts.has(event.type));
+}
+
+export function useRead<T>(identity: ContextIdentity, scope = '') {
+  const state = useRef(createContextRead<T>(identity)), scopeRef = useRef(scope), sequence = useRef(0), alive = useRef(true);
+  const [, render] = useState(0);
+  if (!sameContextIdentity(state.current.identity, identity) || scopeRef.current !== scope) {
+    state.current = createContextRead<T>(identity); scopeRef.current = scope;
+  }
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+  async function read(key: string, query: () => Promise<Result<T>>, verify: (data: T) => boolean,
+    merge?: (previous: T | null, next: T) => T): Promise<T | null> {
+    state.current = beginContextRead(state.current, ++sequence.current, key);
+    const lease = contextReadLease(state.current); render(value => value + 1);
+    try {
+      const result = await query();
+      if (!alive.current || !matchesContextRead(state.current, lease)) return null;
+      if (!result.ok) state.current = failContextRead(state.current, lease, result.error.message);
+      else if (!verify(result.data)) state.current = failContextRead(state.current, lease, 'The saved context could not be verified.');
+      else { state.current = acceptContextRead(state.current, lease, merge ? merge(state.current.data, result.data) : result.data); return result.data; }
+      return null;
+    } catch {
+      if (alive.current) state.current = failContextRead(state.current, lease, 'Context could not be loaded. Refresh to try again.');
+      return null;
+    } finally {
+      if (alive.current && matchesContextRead(state.current, lease)) {
+        state.current = finishContextRead(state.current, lease); render(value => value + 1);
+      }
+    }
+  }
+  return { state: state.current, read };
 }

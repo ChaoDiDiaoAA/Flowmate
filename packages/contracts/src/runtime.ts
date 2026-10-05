@@ -170,6 +170,8 @@ const tokenColumnsSchema = z.object({
   cost: z.string().nullable(),
   usageComplete: z.boolean(),
 }).strict();
+export const UsageRecordV1Schema = usageRecordV1Schema;
+export const TokenColumnsSchema = tokenColumnsSchema;
 export const UsageRecordV2Schema = z.object({
   version: z.literal(2),
   source: z.enum(['sdk', 'unknown', 'not-requested']),
@@ -185,6 +187,7 @@ export const UsageRecordV2Schema = z.object({
     tokens: tokenColumnsSchema,
   }).strict()).max(64),
 }).strict();
+export const UsageRecordSchema = z.union([UsageRecordV1Schema, UsageRecordV2Schema]);
 
 export type SdkUsageValues = {
   input: number | null;
@@ -442,7 +445,8 @@ export type RunAccepted = { runId: DbId; sessionId: DbId; inputId?: DbId };
 export type AgentOutcome = ProviderOutcome & { sessionId: DbId; nativeSessionId: string };
 
 export type RuntimeState = {
-  active: { runId: DbId; sessionId: DbId | null; kind: 'provider' | 'agent' } | null;
+  active: { runId: DbId; sessionId: DbId | null; kind: 'provider' | 'agent' }
+    | { kind: 'compaction'; runId: null; sessionId: DbId; operationId: string } | null;
   blocked: boolean;
   error: AppError | null;
 };
@@ -572,5 +576,8 @@ export interface Application {
   revokeDocumentUse(documentId: DbId): Promise<Result<{ affectedSessionIds: DbId[]; stopRequested: boolean }>>;
   cancelRun(runId: DbId): Promise<Result<{ accepted: boolean; runId: DbId }>>;
   queryRuntimeState(): Promise<Result<RuntimeState>>;
+  compactSession(request: import('./compaction.ts').SessionCompactionRequest): Promise<Result<import('./compaction.ts').CompactionAccepted>>;
+  querySessionCompaction(request: import('./compaction.ts').SessionCompactionQuery): Promise<Result<import('./compaction.ts').SessionCompactionSnapshot>>;
+  cancelSessionCompaction(request: import('./compaction.ts').SessionCompactionCancel): Promise<Result<{ sessionId: DbId; operationId: string; accepted: boolean }>>;
   close(): Promise<Result<CloseReport>>;
 }

@@ -2,6 +2,9 @@ import type { AppError, ErrorCategory, Result } from './runtime.ts';
 import type { ContextSafeErrorCode } from './context.ts';
 
 export const CONTEXT_ERROR_FACTS: Readonly<Partial<Record<ContextSafeErrorCode, readonly [AppError['category'], boolean]>>> = {
+  compaction_unavailable: ['runtime', false], compaction_not_needed: ['runtime', false],
+  compaction_failed: ['runtime', false], compaction_cancelled: ['runtime', false],
+  compaction_timeout: ['runtime', false], compaction_capacity_exceeded: ['runtime', false],
   context_evidence_too_large: ['runtime', false], context_binding_unknown: ['runtime', false],
   context_binding_conflict: ['runtime', false], context_payload_mismatch: ['runtime', false],
   context_snapshot_not_found: ['input', false], provider_transport_error: ['provider', false], internal_error: ['internal', false],

@@ -803,14 +803,14 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     await expect.poll(() => requests.length).toBe(1);
     expect(await page.evaluate(async () => {
       const active = await window.flowmate.queryRuntimeState();
-      if (!active.ok || !active.data.active) throw new Error('Missing active Run');
+      if (!active.ok || !active.data.active || active.data.active.kind === 'compaction') throw new Error('Missing active Run');
       return window.flowmate.queryRun(active.data.active.runId);
     })).toMatchObject({ ok: true, data: { config: { version: 2,
       runtimeBudget: { maxModelCalls: 64, maxToolCalls: 50, toolTimeoutMs: 20000 },
       limits: { timeoutMs: 120000, stopGraceMs: 5000 } } } });
     const active = await page.evaluate(() => window.flowmate.queryRuntimeState());
     expect(active).toMatchObject({ ok: true, data: { active: { runId: expect.any(Number), sessionId: expect.any(Number) } } });
-    if (!active.ok || !active.data.active || active.data.active.sessionId === null) throw new Error('P5 Run did not start');
+    if (!active.ok || !active.data.active || active.data.active.kind === 'compaction' || active.data.active.sessionId === null) throw new Error('P5 Run did not start');
     const { runId, sessionId } = active.data.active;
     const crossSession = await page.evaluate(async ({ sessionId, runId }) => {
       const other = await window.flowmate.createSession({ title: 'Other P5 chat' });
@@ -1064,7 +1064,7 @@ it('desktop discloses the active Run and frozen invoice after the viewed invoice
     await expect.poll(() => requests.length).toBe(1);
     const original = await page.evaluate(async () => {
       const state = await window.flowmate.queryRuntimeState();
-      if (!state.ok || !state.data.active) throw new Error('Missing active Run');
+      if (!state.ok || !state.data.active || state.data.active.kind === 'compaction') throw new Error('Missing active Run');
       const run = await window.flowmate.queryRun(state.data.active.runId); if (!run.ok) throw new Error('Missing frozen Run');
       return run.data;
     });

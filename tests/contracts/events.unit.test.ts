@@ -274,6 +274,7 @@ describe('P6 persistent Runtime event contracts', () => {
     let calls = 0;
     const unexpected = (): never => { calls++; throw new Error('Observation invoked execution or a repository.'); };
     const runtime: RuntimeServicePort = { callProvider: unexpected, start: unexpected, cancel: unexpected,
+      compactSession: unexpected, querySessionCompaction: unexpected, cancelSessionCompaction: unexpected,
       revokeDocumentUse: unexpected, state: unexpected, close: unexpected };
     const app = makeApplication(runtime, { get: unexpected }, async () => ({ stopped: true, closed: true, errors: [] }));
     expect(await app.queryRuntimeEvents(query)).toMatchObject({ ok: false, context: null, error: { category: 'runtime' } });
@@ -342,6 +343,8 @@ it('T08 RuntimeToolView exposes only a nullable strict ContextReference with equ
 it('T08 portable Context error facts keep the original export binding and exact registered facts', () => {
   expect(portableFacts).toBe(originalFacts); expect(contracts.CONTEXT_ERROR_FACTS).toBe(originalFacts);
   expect(portableFacts).toEqual({ context_evidence_too_large:['runtime',false],context_binding_unknown:['runtime',false],
+    compaction_unavailable:['runtime',false],compaction_not_needed:['runtime',false],compaction_failed:['runtime',false],
+    compaction_cancelled:['runtime',false],compaction_timeout:['runtime',false],compaction_capacity_exceeded:['runtime',false],
     context_binding_conflict:['runtime',false],context_payload_mismatch:['runtime',false],context_snapshot_not_found:['input',false],
     provider_transport_error:['provider',false],internal_error:['internal',false] });
   for (const [code,[category,retryable]] of Object.entries(portableFacts)) {

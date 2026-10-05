@@ -56,6 +56,8 @@ const providerConfigSchema = z
   })
   .strict();
 
+export const ProviderConfigSchema = providerConfigSchema;
+
 const providerRequestSchema = z
   .object({
     goal: z.string().min(1),

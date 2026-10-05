@@ -1,5 +1,11 @@
 /** 当前 LLM／Run 默认值与请求范围；历史政策字面量留在对应读取契约。 */
 export const RUNTIME_CONFIG = {
+  compaction: {
+    version: 'p10-native-compaction-v1',
+    autoEnabled: true,
+    reserveTokens: 16_384,
+    keepRecentTokens: 20_000,
+  },
   runBudget: {
     // 一个新 Run 默认允许的工具调用次数。
     maxToolCalls: 24,

@@ -7,17 +7,19 @@ import { appError, fail, ok, ContextSnapshotSchema, ContextSnapshotJsonSchema, C
   ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema,
   ContextRequestsRequestSchema, ContextSnapshotDetailSchema, ContextInputErrorSchema,
   ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema,
-  SessionInputSnapshotSchema } from '@flowmate/contracts';
+  SessionInputSnapshotSchema, CompactionPolicySchema, RunCompactionEvidenceSchema } from '@flowmate/contracts';
 import type { AppError, Result, ContextSnapshot, ContextSnapshotJson, ContextReference, ContextHooks,
   RequestContextBinding, ContextEvidenceUpdate, ContextObservations, ContextRequestEvidence,
   NativeToolResultContextBinding, NativeSessionHistory, ContextSnapshotsRequest, ContextSnapshotsPage,
   ContextSnapshotRequest, ContextSnapshotDetail, ContextRequestsRequest, ContextRequestsPage,
-  ContextSnapshotSummary, SessionInputSnapshot } from '@flowmate/contracts';
+  ContextSnapshotSummary, SessionInputSnapshot, RunCompactionEvidence, DbId } from '@flowmate/contracts';
 
 export interface ContextRepository {
   appendInTransaction(input: { runId: number; sessionId: number; jobId: number | null; json: ContextSnapshotJson; at: string }): Result<ContextSnapshot>;
   bindRequest(input: Parameters<ContextHooks['bind']>[0]): Result<void>;
   recordRequest(binding: RequestContextBinding, update: ContextEvidenceUpdate): Result<void>;
+  recordCompactionEvidence(value: RunCompactionEvidence): Result<void>;
+  readCompactionEvidence(request: { sessionId: DbId; runId: DbId; operationId?: string }): Result<readonly RunCompactionEvidence[]>;
   resolveToolResult(input: Parameters<ContextHooks['resolveToolResult']>[0]): Result<NativeToolResultContextBinding>;
   listContextSnapshots(request: ContextSnapshotsRequest): Result<ContextSnapshotsPage>;
   queryContextSnapshot(request: ContextSnapshotRequest): Result<ContextSnapshotDetail>;
@@ -81,6 +83,12 @@ export function readRunContext(row: { id: number; kind: string; session_id: numb
     const agent = z.object({ nativeSessionId: z.string().min(1).max(256) }).parse(config.agent);
     if (observations.requests.some(request => request.binding.runId !== row.id || request.binding.sessionId !== row.session_id
       || request.binding.nativeSessionId !== agent.nativeSessionId)) throw new Error('invalid_context_journal_identity');
+    if (observations.compactions?.length) {
+      CompactionPolicySchema.parse(config.compactionPolicy);
+      if (config.historyPolicyVersion !== 'p9-native-history-v1' || observations.compactions.some(value =>
+        value.runId !== row.id || value.sessionId !== row.session_id || value.nativeSessionId !== agent.nativeSessionId))
+        throw new Error('invalid_compaction_journal_identity');
+    }
   }
   if (!enabled && pointer !== null) throw new Error('unexpected_legacy_context_pointer');
   return { pointer, observations };
@@ -104,7 +112,10 @@ export function readRunContextOwner(db: Database, row: Parameters<typeof readRun
     const saved = z.object({ id, run_id: id, session_id: id, context_snapshot_id: id, status: z.literal('consumed'), native_entry_id: z.string().min(1) })
       .parse(db.query('SELECT id,run_id,session_id,context_snapshot_id,status,native_entry_id FROM session_inputs WHERE id=?').get(request.binding.inputId));
     if (saved.run_id !== row.id || saved.session_id !== row.session_id || saved.context_snapshot_id !== request.binding.snapshotId
-      || saved.native_entry_id !== primary?.nativeEntryId) throw new Error('invalid_context_request_input');
+      || (primary ? saved.native_entry_id !== primary.nativeEntryId
+        : !('includedNativeContexts' in request.binding && request.binding.includedNativeContexts.some(source => source.entryType === 'compaction'
+          && createNativeOriginReader(db).compactionCoversEntry(saved.session_id, source.nativeEntryId, saved.native_entry_id)))))
+      throw new Error('invalid_context_request_input');
   }
   if (context.observations !== null) verifySavedSources(db, context.observations);
   return context;
@@ -160,6 +171,52 @@ function verifySavedSources(db: Database, journal: ContextObservations) {
       if (!same(reader.tool(sessionId,source.nativeToolCallId,true),source)) unknownBinding();
     if ('includedNativeContexts' in request.binding)
       for (const source of request.binding.includedNativeContexts) reader.derived(sessionId,source);
+  }
+  for (const value of journal.compactions ?? []) verifyCompactionSources(db, value);
+}
+
+/** Validate a historical prefix without equating its receipt with today's leaf. */
+function verifyCompactionSources(db: Database, value: RunCompactionEvidence) {
+  const reader = createNativeOriginReader(db), stored = reader.history(value.sessionId);
+  if (!stored || stored.history.header.id !== value.nativeSessionId
+    || value.baseline.commitRevision > stored.commit.commitRevision || value.baseline.entryCount > stored.commit.entryCount)
+    unknownBinding();
+  const prefix = stored.history.entries.slice(0, value.baseline.entryCount);
+  if (value.baseline.leafId !== null && !prefix.some(entry => entry.id === value.baseline.leafId)) unknownBinding();
+  if (value.firstKeptEntryId !== null && !reader.path(value.sessionId, value.baseline.leafId).some(entry =>
+    entry.id === value.firstKeptEntryId && prefix.some(saved => saved.id === entry.id))) unknownBinding();
+  // The complete P9 closure checks Input, Tool and ancestor provenance, not only the cut entry.
+  reader.bundle(value.sessionId);
+  const receipt = value.observation.saved;
+  if (receipt !== null) {
+    const entry = stored.history.entries[value.baseline.entryCount];
+    if (receipt.commitRevision !== value.baseline.commitRevision + 1 || receipt.entryCount !== value.baseline.entryCount + 1
+      || receipt.commitRevision > stored.commit.commitRevision || entry?.type !== 'compaction'
+      || entry.id !== value.observation.entryId || entry.parentId !== value.baseline.leafId
+      || entry.firstKeptEntryId !== value.firstKeptEntryId) unknownBinding();
+    if (reader.resolve(value.sessionId, entry.id).originRunId !== null) unknownBinding();
+  } else if (value.observation.entryId !== null) unknownBinding();
+}
+
+/** A newer observation may add facts; it cannot revise an already collected fact. */
+function verifyCompactionUpdate(previous: RunCompactionEvidence, next: RunCompactionEvidence) {
+  const { observation: old, calls: oldCalls, firstKeptEntryId: oldCut, splitTurn: oldSplit, ...oldIdentity } = previous;
+  const { observation: observed, calls, firstKeptEntryId: cut, splitTurn, ...identity } = next;
+  if (!same(oldIdentity, identity) || observed.observationSequence <= old.observationSequence
+    || oldCut !== null && oldCut !== cut || oldSplit !== null && oldSplit !== splitTurn
+    || old.generated && !observed.generated || old.stopRequested && !observed.stopRequested || old.stopped && !observed.stopped
+    || old.nativeOutcome !== 'pending' && old.nativeOutcome !== observed.nativeOutcome
+    || old.entryId !== null && old.entryId !== observed.entryId || old.saved !== null && !same(old.saved, observed.saved)
+    || ['preparing', 'compacting', 'stopping', 'ended'].indexOf(observed.phase) < ['preparing', 'compacting', 'stopping', 'ended'].indexOf(old.phase)
+    || calls.length < oldCalls.length) conflict();
+  for (let index = 0; index < oldCalls.length; index++) {
+    const oldCall = oldCalls[index]!, call = calls[index]!;
+    if (oldCall.modelCallIndex !== call.modelCallIndex || oldCall.purpose !== call.purpose || !same(oldCall.model, call.model)
+      || oldCall.transport !== call.transport || oldCall.sdkPayload !== null && !same(oldCall.sdkPayload, call.sdkPayload)
+      || oldCall.attempts.length > call.attempts.length || oldCall.tokens?.usageComplete && !same(oldCall.usage, call.usage)) conflict();
+    for (let attempt = 0; attempt < oldCall.attempts.length; attempt++)
+      for (const [key, fact] of Object.entries(oldCall.attempts[attempt]!))
+        if (fact !== null && !same(fact, Reflect.get(call.attempts[attempt]!, key))) conflict();
   }
 }
 
@@ -266,6 +323,9 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     const primary = snapshotInput(snapshot(saved.snapshotId, owner.row));
     if (primary.inputId !== saved.inputId || primary.sessionId !== saved.sessionId || primary.runId !== saved.runId
       || primary.status !== 'consumed') unknownBinding();
+    if (!saved.includedBindings.some(source => source.originRunId === saved.runId && source.inputId === saved.inputId)
+      && (primary.nativeEntryId === null || !saved.includedNativeContexts.some(source => source.entryType === 'compaction'
+        && reader.compactionCoversEntry(saved.sessionId, source.nativeEntryId, primary.nativeEntryId!)))) unknownBinding();
     snapshot(saved.snapshotId, owner.row);
     return { binding: saved, owner };
   }
@@ -315,7 +375,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
         }
         if (binding.requestSequence !== observations.requests.length + 1) return conflict();
         if (observations.requests.length === 64) reject('context_evidence_too_large');
-        persist(owner.row, { version: 1, requests: [...observations.requests, request] });
+        persist(owner.row, { ...observations, requests: [...observations.requests, request] });
       });
     },
     recordRequest(rawBinding, rawUpdate) {
@@ -362,7 +422,36 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
           }
         }
         const requests = observations!.requests.map(item => item.binding.requestSequence === binding.requestSequence ? request : item);
-        if (!same(request, original)) persist(owner.row, { version: 1, requests });
+        if (!same(request, original)) persist(owner.row, { ...observations!, requests });
+      });
+    },
+    recordCompactionEvidence(raw) {
+      return write(() => {
+        const value = RunCompactionEvidenceSchema.parse(raw), owner = run(value.runId, value.sessionId);
+        const config = json(owner.row.config_json) as Record<string, unknown>;
+        if (owner.observations === null || config.historyPolicyVersion !== 'p9-native-history-v1'
+          || !CompactionPolicySchema.safeParse(config.compactionPolicy).success
+          || session(value.sessionId).native_session_id !== value.nativeSessionId) unknownBinding();
+        const existing = owner.observations.compactions ?? [], index = existing.findIndex(item => item.operationId === value.operationId);
+        if (index >= 0 && same(existing[index], value)) return;
+        if (index >= 0) verifyCompactionUpdate(existing[index]!, value);
+        else {
+          const stored = createNativeOriginReader(db).history(value.sessionId);
+          if (!stored || !same(stored.commit, value.baseline)) unknownBinding();
+          if (existing.length === 64) reject('context_evidence_too_large');
+          if (value.observation.generated || value.observation.entryId !== null || value.observation.saved !== null || value.calls.length) unknownBinding();
+        }
+        verifyCompactionSources(db, value);
+        const compactions = index < 0 ? [...existing, value] : existing.map((item, offset) => offset === index ? value : item);
+        persist(owner.row, { ...owner.observations, compactions });
+      });
+    },
+    readCompactionEvidence(value) {
+      return read(() => {
+        const request = z.object({ sessionId: id, runId: id, operationId: z.string().uuid().optional() }).strict().parse(value);
+        session(request.sessionId);
+        const owner = run(request.runId, request.sessionId);
+        return (owner.observations?.compactions ?? []).filter(item => request.operationId === undefined || item.operationId === request.operationId);
       });
     },
     resolveToolResult(value) { return read(() => toolResult(value)); },

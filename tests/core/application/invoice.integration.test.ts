@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
-import { appError, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, ok } from '@flowmate/contracts';
+import { appError, fail, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, ok } from '@flowmate/contracts';
 import type { RunAgentConfigFacts, AgentNativeOutcome, AgentPort, P3AgentConfigFacts, PreparedAgent, ProviderConfig, ProviderPort, SafeConfigSnapshot } from '@flowmate/contracts';
 import { createToolExecutor, createToolRecorder, JobService, makeApplication, RuntimeService, SessionService, WorkspaceService } from '@flowmate/core';
 import type { RuntimeServicePort } from '@flowmate/core';
@@ -90,6 +90,9 @@ describe('P3 Workspace and Run admission', () => {
     const workspace = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
     const jobs = new JobService(opened.data.jobs, now);
     const stubRuntime: RuntimeServicePort = {
+      compactSession: async () => fail(appError('compaction_unavailable', 'runtime', 'Unused in invoice reads.')),
+      querySessionCompaction: async () => fail(appError('compaction_unavailable', 'runtime', 'Unused in invoice reads.')),
+      cancelSessionCompaction: async () => fail(appError('compaction_unavailable', 'runtime', 'Unused in invoice reads.')),
       callProvider: async () => ({ ok: false, error: appError('unused', 'provider', 'unused', false) }),
       start: async () => ({ ok: false, error: appError('unused', 'runtime', 'unused', false) }),
       cancel: (runId) => ok({ runId, accepted: false }), state: () => ({ active: null, blocked: false, error: null }),
