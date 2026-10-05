@@ -8,6 +8,9 @@ export type PromptTraceEvent =
   | `agent:${import('./ports.ts').AgentNativeEventName}`;
 
 export type PromptTraceReference = {
+  purpose?: 'answer' | 'summary-history' | 'summary-turn-prefix';
+  answerRequestSequence?: number | null;
+  operationId?: string;
   runId: number;
   sessionId: number;
   nativeSessionId: string;

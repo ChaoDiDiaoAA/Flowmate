@@ -12,6 +12,7 @@ import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
+import { parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from './protocol.ts';
 import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand, isContextHostCommand,
   parseContextHostResult, matchesContextResponse, contextHostFailure,
   isHistoryHostCommand, parseHistoryHostResult, matchesHistoryResponse, historyHostFailure } from './protocol.ts';
@@ -154,6 +155,10 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace, tools }),
     promptTrace,
     runtimeDefaults: () => ok(currentSettings.runtime ?? {}),
+    observeCompaction: observation => {
+      const value = parseCompactionNotification({ type: 'compaction_observation', observation });
+      if (value) void send({ version: 1, type: 'event', event: value });
+    },
     invoiceFormBridge,
   });
   if (!created.ok) {
@@ -209,6 +214,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     const checked = parseHistoryHostResult(command.type, value);
     return send({ version: 1, type: 'response', requestId: command.requestId,
       value: checked !== null && matchesHistoryResponse(command, checked) ? checked : historyHostFailure() });
+  };
+  const compactionReply = (command: HostCommand, value: unknown) => {
+    const checked = parseCompactionHostResult(command.type, value);
+    return send({ version: 1, type: 'response', requestId: command.requestId,
+      value: checked !== null && matchesCompactionResponse(command, checked) ? checked : compactionHostFailure() });
   };
   const catalog = await createPiModelCatalog();
   const requireDesktopPiKey = async (profile: ModelProfile): Promise<Result<void>> => {
@@ -324,6 +334,8 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     if (command.type === 'list_context_snapshots') { await contextReply(command, await application.listContextSnapshots(command.input)); return; }
     if (command.type === 'query_context_snapshot') { await contextReply(command, await application.queryContextSnapshot(command.input)); return; }
     if (command.type === 'list_context_requests') { await contextReply(command, await application.listContextRequests(command.input)); return; }
+    if (command.type === 'query_session_compaction') { await compactionReply(command, await application.querySessionCompaction(command.input)); return; }
+    if (command.type === 'cancel_session_compaction') { await compactionReply(command, await application.cancelSessionCompaction(command.input)); return; }
     if (command.type === 'invoice_form_response') {
       const pending = pendingForms.get(command.requestId);
       if (!pending) return;
@@ -650,7 +662,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       }
       return;
     }
-    if (command.type === 'start_run' || command.type === 'submit_invoice_form_input' || command.type === 'submit_session_input') {
+    if (command.type === 'start_run' || command.type === 'submit_invoice_form_input' || command.type === 'submit_session_input' || command.type === 'compact_session') {
       if (!claimRequestId(command.requestId)) {
         send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('request_duplicate', 'input', '该请求身份已使用，未重复执行。')) });
         return;
@@ -722,6 +734,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
           contextWindow: profile.contextWindow!, maxTokens: profile.maxTokens!, reasoning: profile.reasoning } } : {}),
         parameters: { ...RUNTIME_CONFIG.provider },
       };
+      if (command.type === 'compact_session') {
+        const { modelId: _modelId, ...request } = command.input;
+        await compactionReply(command, await application.compactSession({ ...request, config }));
+        return;
+      }
       const normalized = command.type === 'start_run' ? normalizeAgentRunRequest({
         sessionId: command.input.sessionId,
         text: command.input.text,

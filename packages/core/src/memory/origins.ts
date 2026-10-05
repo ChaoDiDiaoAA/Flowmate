@@ -146,8 +146,10 @@ export function createNativeOriginReader(db: Database) {
       const primary = db.query('SELECT session_id,run_id,context_snapshot_id,status,native_entry_id,content_json,goal_mode FROM session_inputs WHERE id=?')
         .get(request.binding.inputId) as { session_id: number; run_id: number; context_snapshot_id: number; status: string; native_entry_id: string; content_json: string; goal_mode: string } | null;
       if (!primary || primary.session_id !== sessionId || primary.run_id !== runId || primary.context_snapshot_id !== snapshot.id
-        || primary.status !== 'consumed' || !request.binding.includedBindings.some(binding => binding.nativeEntryId === primary.native_entry_id
-          && binding.inputId === request.binding.inputId && binding.originRunId === runId && binding.snapshotId === snapshot.id)) unknown();
+        || primary.status !== 'consumed' || (!request.binding.includedBindings.some(binding => binding.nativeEntryId === primary.native_entry_id
+          && binding.inputId === request.binding.inputId && binding.originRunId === runId && binding.snapshotId === snapshot.id)
+          && !('includedNativeContexts' in request.binding && request.binding.includedNativeContexts.some(source => source.entryType === 'compaction'
+            && compactionCoversEntry(sessionId, source.nativeEntryId, primary.native_entry_id))))) unknown();
       const content=SessionInputContentSchema.parse(JSON.parse(primary.content_json));
       if(content.version!==2 || snapshot.json.text!==content.text || snapshot.json.goalMode!==primary.goal_mode
         || !isDeepStrictEqual(snapshot.json.workspaceContext,content.workspaceContext)
@@ -211,6 +213,14 @@ export function createNativeOriginReader(db: Database) {
     while (cursor !== null) { const entry=entries.get(cursor); if (!entry || visited.has(cursor)) unknown();
       visited.add(cursor); selected.push(entry); cursor=entry.parentId; }
     return selected.reverse();
+  }
+  function compactionCoversEntry(sessionId: number, compactionId: string, entryId: string): boolean {
+    const entry = nativeEntryAt(sessionId, compactionId);
+    if (entry?.type !== 'compaction') return false;
+    const prefix = path(sessionId, entry.parentId);
+    const original = prefix.findIndex(value => value.id === entryId);
+    const cut = prefix.findIndex(value => value.id === entry.firstKeptEntryId);
+    return original >= 0 && cut > original;
   }
   function tool(sessionId: number, nativeToolCallId: string, saved = false): NativeToolResultContextBinding {
     const key = JSON.stringify([sessionId, nativeToolCallId, saved]);
@@ -294,7 +304,7 @@ export function createNativeOriginReader(db: Database) {
       return unknown();
     } };
   }
-  return {history:checked(history),entry:checked(nativeEntryAt),resolve:checked(resolveEntry),path:checked(path),tool:checked(tool),derived:checked(derived),bundle:checked(bundle),ancestors:checked(ancestors)};
+  return {history:checked(history),entry:checked(nativeEntryAt),resolve:checked(resolveEntry),path:checked(path),tool:checked(tool),derived:checked(derived),bundle:checked(bundle),ancestors:checked(ancestors),compactionCoversEntry:checked(compactionCoversEntry)};
 }
 
 export function resolveNativeEntryOrigin(db: Database, input: { targetSessionId: DbId; nativeEntryId: string }): Result<NativeEntryOrigin> {

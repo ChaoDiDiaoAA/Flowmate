@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { parseHostCommand, parseWorkspaceHostResult } from '../../apps/host/protocol.ts';
 import * as historyProtocol from '../../apps/host/protocol.ts';
+import { randomUUID } from 'node:crypto';
 import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeEventsReadResultSchema,
   RuntimeEventsWakeSchema, RuntimeSubscriptionResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema } from '@flowmate/contracts';
@@ -351,5 +352,31 @@ it('P9 T08 fix1 projects bounded Context errors and retains only registered matc
     expect(historyProtocol.parseContextHostResult(type, { ok: false, error, runId: 2 }))
       .toEqual({ ok: false, error: { ...error, message: 'Context query could not be completed.' }, runId: 2 });
     expect(historyProtocol.parseContextHostResult(type, { ok: false, error: { ...error, secret: 'PRIVATE-CONTEXT' } })).toBeNull();
+  }
+});
+it('P10 Host commands retain compaction identity and refuse renderer-supplied native facts', () => {
+  const operationId = randomUUID();
+  const inputs = {
+    compact_session: { sessionId: 7, operationId, expected: { commitRevision: 3, entryCount: 4, leafId: 'entry' }, modelId: 'invoice' },
+    query_session_compaction: { sessionId: 7, operationId, runId: 11 },
+    cancel_session_compaction: { sessionId: 7, operationId },
+  };
+  for (const [type, input] of Object.entries(inputs)) {
+    const command = { version: 1, requestId: randomUUID(), type, input,
+      ...(type === 'compact_session' ? { expectedSettingsRevision: 2, expectedCredentialRef: 'a'.repeat(16) } : {}) };
+    expect(JSON.stringify(parseHostCommand(command))).toBe(JSON.stringify(command));
+    for (const patch of [{ config: {} }, { nativeSessionId: 'forged' }, { saved: {} }, { operationId: 'invalid' }])
+      expect(parseHostCommand({ ...command, input: { ...input, ...patch } })).toBeNull();
+    const parsed = parseHostCommand(command)!;
+    const result = { ok: true, data: { sessionId: 7, operationId, ...(type === 'cancel_session_compaction' ? { accepted: true } : {}) } };
+    if (type !== 'query_session_compaction') {
+      expect(historyProtocol.matchesCompactionResponse(parsed, result)).toBe(true);
+      expect(historyProtocol.matchesCompactionResponse(parsed, { ...result, data: { ...result.data, sessionId: 8 } })).toBe(false);
+      expect(historyProtocol.matchesCompactionResponse(parsed, { ...result, data: { ...result.data, operationId: randomUUID() } })).toBe(false);
+    }
+    const failure = historyProtocol.parseCompactionHostResult(type, { ok: false, error: {
+      code: 'storage_write_failed', category: 'storage', retryable: true, message: 'PRIVATE_PROVIDER_TEXT' } });
+    expect(JSON.stringify(failure)).not.toContain('PRIVATE_PROVIDER_TEXT');
+    expect(failure).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
   }
 });

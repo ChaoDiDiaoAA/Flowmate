@@ -485,7 +485,7 @@ it('P7 real Workspace selects every saved field and line, pages sources, freezes
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect.poll(() => requests.length).toBe(countBeforeRestore + 1);
     const currentRun = await page.evaluate(async () => { const state = await window.flowmate.queryRuntimeState(); return state.ok ? state.data.active : null; });
-    expect(currentRun).not.toBeNull(); if (!currentRun || currentRun.sessionId === null) throw new Error('Missing active Agent request');
+    expect(currentRun).not.toBeNull(); if (!currentRun || currentRun.kind === 'compaction' || currentRun.sessionId === null) throw new Error('Missing active Agent request');
     expect(await page.evaluate(runId => window.flowmate.queryRun(runId), currentRun.runId)).toMatchObject({ ok: true,
       data: { config: { workspaceContext: { selection: { kind: 'field', fieldPath: 'fields.taxAmount' } } } } });
     expect(JSON.stringify(requests.at(-1))).toContain('fields.taxAmount');

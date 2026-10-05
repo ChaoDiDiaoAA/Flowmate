@@ -14,6 +14,9 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   NativeHistoryPageRequestSchema, SessionHistoryEntryRequestSchema, ForkSessionRequestSchema,
   NativeHistoryPageResultSchema, SessionHistoryEntryResultSchema, ForkSessionResponseSchema, BranchSessionResponseSchema } from '@flowmate/contracts';
 import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
+import { DesktopSessionCompactionRequestSchema, SessionCompactionQuerySchema, SessionCompactionCancelSchema,
+  CompactionAcceptedResultSchema, SessionCompactionSnapshotResultSchema, CompactionCancelAcceptedResultSchema,
+  CompactionNotificationSchema } from '@flowmate/contracts';
 
 const requestId = z.string().min(1).max(128);
 const ownerToken = z.string().min(1).max(256);
@@ -49,6 +52,10 @@ const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
+  z.object({ version: z.literal(1), requestId, type: z.literal('compact_session'), input: DesktopSessionCompactionRequestSchema,
+    expectedSettingsRevision: dbId, expectedCredentialRef: credentialRef }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_session_compaction'), input: SessionCompactionQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('cancel_session_compaction'), input: SessionCompactionCancelSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_history'), input: NativeHistoryPageRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_history_entry'), input: SessionHistoryEntryRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('fork_session'), input: ForkSessionRequestSchema }).strict(),
@@ -201,7 +208,8 @@ export type HostEvent = {
     | { type: 'model_auth_notice'; requestId: string; notice: ModelAuthNotice }
     | { type: 'model_auth_prompt'; requestId: string; promptId: string; prompt: ModelAuthPrompt }
     | { type: 'agent_run_event'; requestId: string; value: AgentRunEvent }
-    | import('@flowmate/contracts').RuntimeEventsWake;
+    | import('@flowmate/contracts').RuntimeEventsWake
+    | z.infer<typeof CompactionNotificationSchema>;
 };
 
 export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest | HostInvoiceFormRequest;
@@ -209,6 +217,55 @@ export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRe
 export function parseHostCommand(value: unknown): HostCommand | null {
   const parsed = hostCommandSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
+}
+const compactionResultSchemas = { compact_session: CompactionAcceptedResultSchema,
+  query_session_compaction: SessionCompactionSnapshotResultSchema, cancel_session_compaction: CompactionCancelAcceptedResultSchema };
+export function isCompactionHostCommand(type: string): type is keyof typeof compactionResultSchemas {
+  return Object.hasOwn(compactionResultSchemas, type);
+}
+export function compactionHostFailure() {
+  return { ok: false as const, error: { code: 'compaction_unavailable' as const, category: 'runtime' as const,
+    retryable: false, message: 'Compaction facts could not be confirmed. Refresh before trying again.' } };
+}
+function compactionError<T extends import('@flowmate/contracts').AppError>(error: T) {
+  return { ...error, message: error.code === 'storage_write_failed' ? 'History could not be saved. Do not continue from the unsaved result.'
+    : error.code === 'compaction_cancelled' ? 'Compaction was cancelled.'
+    : error.code === 'stop_unconfirmed' ? 'Stopping is not confirmed. Wait for actual completion.'
+    : error.code === 'compaction_capacity_exceeded' ? 'The context still exceeds this model capacity.'
+    : error.code === 'compaction_not_needed' ? 'There is no eligible history to compact.'
+    : error.code === 'session_scope_revoked' ? 'Material access has been revoked.'
+    : error.code === 'state_conflict' ? 'History or model settings changed. Refresh before trying again.'
+    : 'Compaction could not be completed or confirmed.' };
+}
+export function parseCompactionHostResult(type: string, raw: unknown) {
+  if (!isCompactionHostCommand(type)) return null;
+  const parsed = compactionResultSchemas[type].safeParse(raw);
+  if (!parsed.success) return null;
+  const result = parsed.data;
+  if (!result.ok) return { ...result, error: compactionError(result.error) };
+  if ('operation' in result.data && result.data.operation?.error)
+    return { ...result, data: { ...result.data, operation: { ...result.data.operation, error: compactionError(result.data.operation.error) } } };
+  return result;
+}
+export function matchesCompactionResponse(command: HostCommand, raw: unknown): boolean {
+  if (!isCompactionHostCommand(command.type)) return false;
+  const parsed = parseCompactionHostResult(command.type, raw);
+  if (!parsed) return false;
+  const input = (command as Extract<HostCommand, { type: keyof typeof compactionResultSchemas }>).input;
+  if (!parsed.ok) return (parsed.error.sessionId === undefined || parsed.error.sessionId === input.sessionId)
+    && (parsed.error.runId === undefined || 'runId' in input && parsed.error.runId === input.runId)
+    && (parsed.runId === undefined || 'runId' in input && parsed.runId === input.runId);
+  if (parsed.data.sessionId !== input.sessionId) return false;
+  if ('operationId' in parsed.data) return 'operationId' in input && parsed.data.operationId === input.operationId;
+  const operation = 'operation' in parsed.data ? parsed.data.operation : null;
+  return operation === null || (!('operationId' in input) || input.operationId === undefined || operation.operationId === input.operationId)
+    && (!('runId' in input) || input.runId === undefined || operation.runId === input.runId);
+}
+export function parseCompactionNotification(raw: unknown) {
+  const parsed = CompactionNotificationSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  return { ...parsed.data, observation: { ...parsed.data.observation,
+    error: parsed.data.observation.error ? compactionError(parsed.data.observation.error) : null } };
 }
 
 const historyResultSchemas = {

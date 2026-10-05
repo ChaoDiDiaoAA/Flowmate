@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { RunCompactionEvidenceSchema } from './compaction.ts';
+import type { RunCompactionEvidence } from './compaction.ts';
 import { AppErrorSchema } from './runtime.ts';
 import type { AppError, Result } from './runtime.ts';
 import { CONTEXT_ERROR_FACTS } from './errors.ts';
@@ -52,6 +54,8 @@ export const CONTEXT_SAFE_ERROR_CODES = [
   'provider_timeout', 'stop_not_confirmed', 'stop_unconfirmed', 'tool_access_denied', 'tool_execution_failed',
   'tool_execution_not_started', 'tool_execution_unconfirmed', 'tool_feedback_conflict', 'tool_invalid_input',
   'tool_not_found', 'tool_result_too_large', 'tool_runtime_unavailable', 'tool_sdk_after_failed', 'config_settings_invalid',
+  'compaction_unavailable', 'compaction_not_needed', 'compaction_failed', 'compaction_cancelled',
+  'compaction_timeout', 'compaction_capacity_exceeded',
 ] as const;
 export const ContextSafeErrorCodeSchema = z.enum(CONTEXT_SAFE_ERROR_CODES);
 export type ContextSafeErrorCode = z.infer<typeof ContextSafeErrorCodeSchema>;
@@ -190,7 +194,9 @@ const requestBindingShape = { runId: id, sessionId: id, nativeSessionId: opaqueI
 function checkRequestBinding(value: z.infer<z.ZodObject<typeof requestBindingShape>> & {
   includedNativeContexts?: readonly NativeDerivedContextBinding[] | null }, context: z.RefinementCtx) {
   const primary = [...value.includedBindings].reverse().find(item => item.originRunId === value.runId && item.snapshotId !== null);
-  if (primary?.inputId !== value.inputId || primary.snapshotId !== value.snapshotId) report(context, 'Primary binding must be the last current Run source.');
+  if (primary ? primary.inputId !== value.inputId || primary.snapshotId !== value.snapshotId
+    : !value.includedNativeContexts?.some(source => source.entryType === 'compaction'))
+    report(context, 'Primary binding requires the last current Run source or a committed compaction proof.');
   if (value.callSequence !== value.requestSequence) report(context, 'Call and logical request sequences disagree.');
   if (value.includedBindings.length + value.includedToolResults.length + (value.includedNativeContexts?.length ?? 0) > 512)
     report(context, 'Combined request provenance exceeds 512 entries.');
@@ -244,26 +250,40 @@ export const LegacyContextRequestEvidenceSchema = z.object({ binding: LegacyRequ
 export const PublicContextRequestEvidenceSchema = z.object({ binding: PublicRequestContextBindingSchema, ...requestEvidenceShape })
   .strict().superRefine(checkRequestEvidence).readonly();
 export type PublicContextRequestEvidence = z.infer<typeof PublicContextRequestEvidenceSchema>;
-function checkObservations(value: { requests: readonly { binding: { requestSequence: number; runId: number; sessionId: number; nativeSessionId: string } }[] }, context: z.RefinementCtx) {
+function checkObservations(value: { requests: readonly { binding: { requestSequence: number; runId: number; sessionId: number; nativeSessionId: string } }[];
+  compactions?: readonly RunCompactionEvidence[] }, context: z.RefinementCtx) {
   if (value.requests.some((item, index) => item.binding.requestSequence !== index + 1)) report(context, 'Journal requests must start at one and be continuous.');
   const first = value.requests[0]?.binding;
   if (first && value.requests.some(item => item.binding.runId !== first.runId || item.binding.sessionId !== first.sessionId
     || item.binding.nativeSessionId !== first.nativeSessionId)) report(context, 'Journal requests must belong to one native Run and Session.');
+  const summaryOwner = value.compactions?.[0];
+  const owner = first ?? summaryOwner;
+  if (owner && value.compactions?.some(item => item.runId !== owner.runId || item.sessionId !== owner.sessionId
+    || item.nativeSessionId !== owner.nativeSessionId)) report(context, 'Summary evidence must retain the journal owner.');
+  if (value.compactions && !unique(value.compactions.map(item => item.operationId)))
+    report(context, 'Compaction operations must be unique within the journal.');
+  const callIndices = value.compactions?.flatMap(item => item.calls.map(call => call.modelCallIndex));
+  if (callIndices && !unique(callIndices)) report(context, 'Summary model calls cannot be counted twice.');
   if (jsonBytes(value) > 4194304) report(context, 'Journal exceeds 4 MiB.');
 }
 // Legacy storage parsing preserves field omission and original serialization; it never backfills proof.
 const storedObservations = z.object({ version: z.literal(1), requests: z.array(z.union([
   ContextRequestEvidenceSchema, LegacyContextRequestEvidenceSchema,
-])).max(64).readonly() }).strict().superRefine(checkObservations).readonly();
+])).max(64).readonly(), compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional()
+}).strict().superRefine(checkObservations).readonly();
 export const ContextObservationsSchema = z.unknown().superRefine((raw, context) => {
   const parsed = storedObservations.safeParse(raw);
   if (!parsed.success) for (const error of parsed.error.issues) context.addIssue(error);
 }).transform(raw => raw as z.output<typeof storedObservations>);
 export type ContextObservations = z.infer<typeof ContextObservationsSchema>;
 export const NativeContextObservationsSchema = z.object({ version: z.literal(1),
-  requests: z.array(ContextRequestEvidenceSchema).max(64).readonly() }).strict().superRefine(checkObservations).readonly();
+  requests: z.array(ContextRequestEvidenceSchema).max(64).readonly(),
+  compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional()
+}).strict().superRefine(checkObservations).readonly();
 export const PublicContextObservationsSchema = z.object({ version: z.literal(1),
-  requests: z.array(PublicContextRequestEvidenceSchema).max(64).readonly() }).strict().superRefine(checkObservations).readonly();
+  requests: z.array(PublicContextRequestEvidenceSchema).max(64).readonly(),
+  compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional()
+}).strict().superRefine(checkObservations).readonly();
 export type PublicContextObservations = z.infer<typeof PublicContextObservationsSchema>;
 export function readContextObservations(raw: unknown, historyPolicyVersion?: 'p9-native-history-v1'): Result<PublicContextObservations> {
   const parsed = (historyPolicyVersion === 'p9-native-history-v1' ? NativeContextObservationsSchema : ContextObservationsSchema).safeParse(raw);
@@ -286,6 +306,7 @@ export const ContextEvidenceUpdateSchema = z.discriminatedUnion('kind', [
 ]).superRefine((value, context) => { if (value.kind === 'sdk-payload') checkInclusion(value, context); }).readonly();
 export type ContextEvidenceUpdate = z.infer<typeof ContextEvidenceUpdateSchema>;
 export type ContextHooks = {
+  compaction?: (value: RunCompactionEvidence) => Result<void>;
   resolveToolResult(input: Readonly<{ sessionId: number; nativeToolCallId: string }>): Result<NativeToolResultContextBinding>;
   bind(input: Readonly<{ binding: RequestContextBinding; api: string; transport: ContextRequestEvidence['transport']; at: string }>): Result<void>;
   record(binding: RequestContextBinding, update: ContextEvidenceUpdate): Result<void>;

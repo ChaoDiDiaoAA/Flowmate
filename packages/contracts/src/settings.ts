@@ -67,6 +67,7 @@ export type DesktopEvent =
   | { type: 'provider_finished'; requestId: string; runId: number; result: import('./runtime.ts').Result<import('./runtime.ts').ProviderOutcome> }
   | { type: 'host_state'; state: DesktopState }
   | import('./events.ts').RuntimeEventsWake
+  | { type: 'compaction_observation'; observation: import('./compaction.ts').CompactionObservation }
   | import('./runtime.ts').AgentRunEvent;
 
 export type DesktopAgentRunRequest = {
@@ -194,6 +195,9 @@ export type DesktopBridge = {
   listContextSnapshots(input: import('./context.ts').ContextSnapshotsRequest): Promise<import('./runtime.ts').Result<import('./context.ts').ContextSnapshotsPage>>;
   queryContextSnapshot(input: import('./context.ts').ContextSnapshotRequest): Promise<import('./runtime.ts').Result<import('./context.ts').ContextSnapshotDetail>>;
   listContextRequests(input: import('./context.ts').ContextRequestsRequest): Promise<import('./runtime.ts').Result<import('./context.ts').ContextRequestsPage>>;
+  compactSession(input: import('./compaction.ts').DesktopSessionCompactionRequest): Promise<import('./runtime.ts').Result<import('./compaction.ts').CompactionAccepted>>;
+  querySessionCompaction(input: import('./compaction.ts').SessionCompactionQuery): Promise<import('./runtime.ts').Result<import('./compaction.ts').SessionCompactionSnapshot>>;
+  cancelSessionCompaction(input: import('./compaction.ts').SessionCompactionCancel): Promise<import('./runtime.ts').Result<{ sessionId: number; operationId: string; accepted: boolean }>>;
   readWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
   updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceSnapshot>>;
   restoreWorkspace(): Promise<import('./runtime.ts').Result<import('./workspace.ts').WorkspaceRestoreResult>>;

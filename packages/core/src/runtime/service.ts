@@ -1,5 +1,7 @@
 import { appError, fail, ok, RuntimeRequestOverridesSchema, normalizeSessionInputRequest, formatExecutionPrompt, WorkspaceContextSchema, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES, RUNTIME_CONFIG } from '@flowmate/contracts';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { CompactionObservationSchema, SessionCompactionSnapshotSchema, CompactionPolicySchema } from '@flowmate/contracts';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import type {
   AgentConfigFacts,
@@ -45,6 +47,8 @@ import type {
   RuntimeStrategyPolicy,
   ContextHooks,
   MemoryStore,
+  CompactionObservation, CompactionAccepted, SessionCompactionRequest, SessionCompactionQuery,
+  SessionCompactionCancel, SessionCompactionSnapshot, NativeCompactionOutcome,
 } from '@flowmate/contracts';
 import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
 import { ensureNativeSession } from '../sessions/service.ts';
@@ -69,12 +73,14 @@ export type RuntimeDependencies = {
   sessionInputs?: SessionInputLedger;
   workspaceVerifier?: WorkspaceVerifier;
   contextService?: Pick<ContextService, 'build'>;
-  contextRepository?: Pick<ContextRepository, 'bindRequest' | 'recordRequest' | 'resolveToolResult'>;
+  contextRepository?: Pick<ContextRepository, 'bindRequest' | 'recordRequest' | 'resolveToolResult'>
+    & Partial<Pick<ContextRepository, 'recordCompactionEvidence' | 'readCompactionEvidence'>>;
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
   runtimePolicy?: RuntimeStrategyPolicy;
   sampleSource?: 'production' | 'test' | 'evaluation';
+  observeCompaction?: (value: CompactionObservation) => void;
   nativeTools?: {
     runtimeDir: string;
     availability: readonly NativeToolAvailability[];
@@ -104,6 +110,15 @@ type ActiveCall = {
   inputAdmissionClosed?: boolean;
   inputStreamingStarted?: boolean;
   observe: (type: ProviderObservation['type'], data?: Readonly<Record<string, unknown>>) => void;
+};
+
+type ActiveCompaction = {
+  kind: 'compaction'; runId: null; sessionId: number; nativeSessionId: string;
+  request: SessionCompactionRequest; controller: AbortController; startedAt: number;
+  observation: CompactionObservation; stopIntent?: StopIntent;
+  nativeObservationSequence?: number;
+  stopTimer?: ReturnType<typeof setTimeout>; baseline?: import('@flowmate/contracts').HistoryCommitState;
+  stop: (reason: StopReason) => boolean; completion: Promise<Result<NativeCompactionOutcome>>;
 };
 
 type AgentEventPayload =
@@ -268,7 +283,9 @@ function withinGrace<T>(promise: Promise<T>, graceMs: number): Promise<{ kind: '
 
 export class RuntimeService {
   private readonly dependencies: RuntimeDependencies;
-  private active: ActiveCall | null = null;
+  private active: ActiveCall | ActiveCompaction | null = null;
+  private readonly compactions = new Map<string, ActiveCompaction>();
+  private readonly lastManualCompaction = new Map<number, string>();
   private closing = false;
   private closed = false;
   private poisoned = false;
@@ -283,11 +300,286 @@ export class RuntimeService {
 
   public state(): RuntimeState {
     return {
-      active: this.active ? { runId: this.active.runId, sessionId: this.active.sessionId, kind: this.active.kind } : null,
+      active: this.active?.kind === 'compaction' ? { kind: 'compaction', runId: null, sessionId: this.active.sessionId,
+        operationId: this.active.request.operationId }
+        : this.active ? { runId: this.active.runId, sessionId: this.active.sessionId, kind: this.active.kind } : null,
       blocked: this.poisoned,
       error: this.poisoned ? this.dependencies.recoveryError
         ?? appError('runtime_unusable', 'runtime', 'Runtime 暂不可复用，需要重启。') : null,
     };
+  }
+  private notifyCompaction(value: CompactionObservation): void {
+    try { this.dependencies.observeCompaction?.(structuredClone(value)); }
+    catch { /* Transient notifications are repaired by readonly queries. */ }
+  }
+
+  private compactionHistory(sessionId: number) {
+    const sessions = this.dependencies.sessions;
+    if (!sessions) return fail<import('../storage/repositories.ts').SessionHistorySnapshot>(
+      appError('compaction_unavailable', 'runtime', 'Session history is unavailable.'));
+    return sessions.readHistorySnapshot(sessionId, value => value.bundle.history && value.bundle.commit
+      ? ok(value) : fail(appError('session_history_unavailable', 'session', 'Committed history is unavailable.')));
+  }
+
+  private compactionEligibility(value: import('../storage/repositories.ts').SessionHistorySnapshot): Result<void> {
+    if (this.poisoned || this.closing || this.closed)
+      return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot compact this Session.'));
+    if (value.row.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Complete Session deletion first.', true));
+    if (value.row.status !== 'active') return fail(appError('session_archived', 'session', 'Archived Sessions cannot be compacted.'));
+    if (value.blocked) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
+    if (value.row.nativeUnusable || value.bundle.history?.unusable)
+      return fail(appError('agent_session_unusable', 'session', 'Committed history is unusable.'));
+    if (value.bundle.commit?.commitRevision === Number.MAX_SAFE_INTEGER)
+      return fail(appError('storage_write_failed', 'storage', 'Conversation history commit revision is exhausted.', false));
+    if (this.dependencies.isSessionManaging?.(value.row.sessionId))
+      return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+    return ok(undefined);
+  }
+
+  public async compactSession(request: SessionCompactionRequest): Promise<Result<CompactionAccepted>> {
+    const prior = this.compactions.get(request.operationId);
+    if (prior) {
+      if (!isDeepStrictEqual(prior.request, request))
+        return fail(appError('state_conflict', 'session', 'Operation identity has different content.', true));
+      return this.active === prior
+        ? ok({ sessionId: request.sessionId, operationId: request.operationId })
+        : fail(appError('operation_result_unknown', 'runtime', 'The operation is no longer available.'));
+    }
+    const { agent } = this.dependencies;
+    if (!agent?.compactSession || !agent.inspectSessionCompaction)
+      return fail(appError('compaction_unavailable', 'runtime', 'Native compaction is unavailable.'));
+    if (this.active) return fail(appError('runtime_busy', 'runtime', 'A native operation is active.'));
+    const current = this.compactionHistory(request.sessionId);
+    if (!current.ok) return current;
+    const eligible = this.compactionEligibility(current.data);
+    if (!eligible.ok) return eligible;
+    if (!isDeepStrictEqual(current.data.bundle.commit, request.expected))
+      return fail(appError('state_conflict', 'session', 'Conversation history has changed.', true));
+    try {
+      const availability = agent.inspect(current.data.row.nativeSessionId).availability;
+      if (availability === 'busy') return fail(appError('session_busy', 'session', 'Native Session is active.', true));
+      if (availability === 'unusable') return fail(appError('agent_session_unusable', 'session', 'Native Session is unusable.'));
+    } catch { return fail(appError('agent_session_unavailable', 'session', 'Native Session state cannot be confirmed.')); }
+    const inspected = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed, commit: current.data.bundle.commit! });
+    if (!inspected.ok) return inspected;
+    const frozen = structuredClone(request);
+    const controller = new AbortController();
+    let resolveCompletion!: (value: Result<NativeCompactionOutcome>) => void;
+    const completion = new Promise<Result<NativeCompactionOutcome>>(resolve => { resolveCompletion = resolve; });
+    const active: ActiveCompaction = {
+      kind: 'compaction', runId: null, sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId,
+      request: frozen, controller, startedAt: this.dependencies.monotonicNow(), completion,
+      observation: { sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId, operationId: request.operationId,
+        runId: null, reason: 'manual', observationSequence: 1, phase: 'preparing', generated: false, nativeOutcome: 'pending',
+        entryId: null, saved: null, error: null, stopRequested: false, stopped: false, continuation: 'next-run', mayContinue: false,
+        capacity: inspected.data.capacity, usage: { version: 1, source: 'not-requested', reason: 'not-started', sdkValues: null,
+          attempts: 0, attemptsComplete: true, costSource: null, updatedAt: this.dependencies.now() },
+        tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } },
+      stop: reason => {
+        if (active.stopIntent || active.observation.stopped) return false;
+        active.stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
+        active.observation = { ...active.observation, observationSequence: active.observation.observationSequence + 1,
+          phase: 'stopping', stopRequested: true, mayContinue: false };
+        controller.abort();
+        this.notifyCompaction(active.observation);
+        active.stopTimer = setTimeout(() => {
+          if (this.active !== active || active.observation.stopped) return;
+          this.poisoned = true;
+          active.observation = { ...active.observation, observationSequence: active.observation.observationSequence + 1,
+            phase: 'stopping', stopped: false, mayContinue: false,
+            error: appError('stop_unconfirmed', 'runtime', 'Native compaction stop was not confirmed within grace.', true) };
+          this.notifyCompaction(active.observation);
+        }, RUNTIME_CONFIG.request.stopGraceMs);
+        return true;
+      },
+    };
+    // The shared Runtime slot is claimed before ensure/prepare can yield.
+    this.active = active;
+    this.compactions.set(request.operationId, active);
+    this.lastManualCompaction.set(request.sessionId, request.operationId);
+    this.notifyCompaction(active.observation);
+    void this.executeManualCompaction(active).then(resolveCompletion, () => {
+      this.poisoned = true;
+      active.observation = { ...active.observation, phase: 'stopping', mayContinue: false,
+        error: appError('stop_unconfirmed', 'runtime', 'Native operation stop cannot be confirmed.', true) };
+      resolveCompletion(ok({ observation: active.observation, stopped: false, cleanupErrors: [] }));
+    });
+    return ok({ sessionId: request.sessionId, operationId: request.operationId });
+  }
+
+  private verifyCompactionUse(active: ActiveCompaction): Result<void> {
+    if (this.active !== active) return fail(appError('compaction_unavailable', 'runtime', 'Operation ownership was lost.'));
+    if (active.stopIntent || active.controller.signal.aborted) return fail(appError(
+      active.stopIntent?.reason === 'timeout' ? 'compaction_timeout' : active.stopIntent?.reason === 'shutdown' ? 'runtime_shutdown' : 'compaction_cancelled',
+      'runtime', 'Compaction was stopped.'));
+    if (this.dependencies.monotonicNow() - active.startedAt >= RUNTIME_CONFIG.request.timeoutMs) {
+      active.stop('timeout'); return fail(appError('compaction_timeout', 'runtime', 'Compaction deadline expired.'));
+    }
+    const current = this.compactionHistory(active.sessionId);
+    if (!current.ok) return current;
+    const eligible = this.compactionEligibility(current.data);
+    if (!eligible.ok) return eligible;
+    if (current.data.row.nativeSessionId !== active.nativeSessionId)
+      return fail(appError('session_history_invalid', 'session', 'Native Session identity changed.'));
+    const native = this.dependencies.agent?.exportSession?.(active.nativeSessionId);
+    if (!native?.ok || !isDeepStrictEqual(JSON.parse(JSON.stringify(native.data)), current.data.bundle.history))
+      return fail(appError('session_history_invalid', 'session', 'Native history is not the committed prefix.'));
+    return ok(undefined);
+  }
+
+  private async executeManualCompaction(active: ActiveCompaction): Promise<Result<NativeCompactionOutcome>> {
+    const agent = this.dependencies.agent!, sessions = this.dependencies.sessions!;
+    const timer = setTimeout(() => active.stop('timeout'), RUNTIME_CONFIG.request.timeoutMs);
+    let stopped = true;
+    let cleanupErrors: readonly AppError[] = [];
+    let baseline: import('@flowmate/contracts').HistoryCommitState | null = null;
+    try {
+      const current = this.compactionHistory(active.sessionId);
+      if (!current.ok) throw current.error;
+      const installed = ensureNativeSession(sessions, agent, current.data.row, this.dependencies.memory);
+      if (!installed.ok) throw installed.error;
+      const verified = this.verifyCompactionUse(active);
+      if (!verified.ok) throw verified.error;
+      // Summary inherits the committed history's trusted scope, including fork origins.
+      // It receives no tool permission and does not depend on the current desktop workspace.
+      let workspaceHistory = false;
+      for (const runId of new Set(current.data.bundle.seed.origins.flatMap(origin => origin.originRunId === null ? [] : [origin.originRunId]))) {
+        const run = this.dependencies.runs.get(runId);
+        if (!run.ok) throw run.error;
+        if (run.data.kind !== 'agent') throw appError('session_history_invalid', 'session', 'Native history has an invalid Run origin.');
+        if (run.data.scope.version === 2) workspaceHistory = true;
+      }
+      stopped = false;
+      const prepared = await agent.prepare(active.nativeSessionId, active.request.config,
+        { timeoutMs: RUNTIME_CONFIG.request.timeoutMs, stopGraceMs: RUNTIME_CONFIG.request.stopGraceMs },
+        active.controller.signal, { compactionPolicy: RUNTIME_CONFIG.compaction,
+          ...(workspaceHistory ? { activeToolNames: [] } : {}),
+          runtimeBudget: { maxModelCalls: 2, maxToolCalls: 0, toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs } });
+      if (!prepared.ok) {
+        stopped = prepared.error.code !== 'stop_unconfirmed';
+        throw prepared.error;
+      }
+      stopped = true;
+      const valid = this.verifyCompactionUse(active);
+      if (!valid.ok) throw valid.error;
+      if (!isDeepStrictEqual(prepared.data.snapshot.compactionPolicy, RUNTIME_CONFIG.compaction))
+        throw appError('compaction_unavailable', 'runtime', 'Prepared compaction policy differs from frozen policy.');
+      const afterPrepare = this.compactionHistory(active.sessionId);
+      if (!afterPrepare.ok) throw afterPrepare.error;
+      baseline = afterPrepare.data.bundle.commit!;
+      active.baseline = baseline;
+      stopped = false;
+      const outcome = await agent.compactSession!(active.nativeSessionId, {
+        sessionId: active.sessionId, operationId: active.request.operationId, signal: active.controller.signal, maxModelCalls: 2,
+        remainingMs: () => Math.max(0, RUNTIME_CONFIG.request.timeoutMs - (this.dependencies.monotonicNow() - active.startedAt)),
+        verifyUse: () => this.verifyCompactionUse(active),
+        observe: value => {
+          if (this.active !== active || value.observationSequence <= (active.nativeObservationSequence ?? 0)) return;
+          const parsed = CompactionObservationSchema.safeParse(value);
+          if (!parsed.success || value.sessionId !== active.sessionId || value.nativeSessionId !== active.nativeSessionId
+            || value.operationId !== active.request.operationId || value.reason !== 'manual' || value.runId !== null)
+            throw appError('compaction_failed', 'runtime', 'Native compaction observation is invalid.');
+          active.nativeObservationSequence = value.observationSequence;
+          active.observation = { ...parsed.data, observationSequence: active.observation.observationSequence + 1,
+            stopRequested: active.stopIntent !== undefined || value.stopRequested, mayContinue: false,
+            phase: active.stopIntent && !value.stopped ? 'stopping' : value.phase };
+          this.notifyCompaction(active.observation);
+        },
+      });
+      stopped = outcome.stopped; cleanupErrors = outcome.cleanupErrors;
+      const parsed = CompactionObservationSchema.safeParse(outcome.observation);
+      if (!parsed.success || parsed.data.operationId !== active.request.operationId || parsed.data.sessionId !== active.sessionId
+        || parsed.data.nativeSessionId !== active.nativeSessionId || parsed.data.reason !== 'manual' || parsed.data.runId !== null
+        || parsed.data.stopped !== stopped) throw appError('compaction_failed', 'runtime', 'Native compaction outcome is invalid.');
+      active.observation = { ...parsed.data, observationSequence: active.observation.observationSequence + 1,
+        stopRequested: active.stopIntent !== undefined || parsed.data.stopRequested, mayContinue: false };
+    } catch (error) {
+      const known = typeof error === 'object' && error !== null && 'code' in error ? error as AppError
+        : appError('compaction_failed', 'runtime', 'Native compaction failed.');
+      active.observation = { ...active.observation, observationSequence: active.observation.observationSequence + 1,
+        phase: stopped ? 'ended' : 'stopping', nativeOutcome: active.stopIntent ? 'cancelled' : 'failed',
+        stopped, stopRequested: active.stopIntent !== undefined, mayContinue: false, error: known };
+    } finally { clearTimeout(timer); clearTimeout(active.stopTimer); }
+    const current = this.compactionHistory(active.sessionId);
+    const valid = this.verifyCompactionUse(active);
+    const observed = active.observation;
+    const committed = current.ok && (observed.generated ? observed.saved !== null
+      && isDeepStrictEqual(current.data.bundle.commit, observed.saved)
+      && current.data.bundle.history!.entries.some(entry => entry.id === observed.entryId && entry.type === 'compaction')
+      : baseline !== null && isDeepStrictEqual(current.data.bundle.commit, baseline));
+    const mayContinue = stopped && !active.stopIntent && observed.nativeOutcome !== 'cancelled'
+      && observed.capacity.fitsEstimate === true && committed && valid.ok;
+    active.observation = { ...observed, observationSequence: observed.observationSequence + 1,
+      phase: stopped ? 'ended' : 'stopping', stopped, mayContinue, stopRequested: active.stopIntent !== undefined || observed.stopRequested,
+      error: !valid.ok && !observed.error ? valid.error : observed.error };
+    if (!stopped) this.poisoned = true;
+    else if (this.active === active) this.active = null;
+    this.notifyCompaction(active.observation);
+    return ok({ observation: active.observation, stopped, cleanupErrors });
+  }
+
+  public async querySessionCompaction(request: SessionCompactionQuery): Promise<Result<SessionCompactionSnapshot>> {
+    const current = this.compactionHistory(request.sessionId);
+    if (!current.ok) return current;
+    const agent = this.dependencies.agent;
+    if (!agent?.inspectSessionCompaction) return fail(appError('compaction_unavailable', 'runtime', 'Native compaction inspection is unavailable.'));
+    const inspected = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed, commit: current.data.bundle.commit! });
+    if (!inspected.ok) return inspected;
+    const operationId = request.operationId ?? (request.runId === undefined && !inspected.data.operation
+      ? this.lastManualCompaction.get(request.sessionId) : undefined);
+    const manual = operationId === undefined ? undefined : this.compactions.get(operationId);
+    if (manual && (manual.sessionId !== request.sessionId || request.runId !== undefined))
+      return fail(appError('state_conflict', 'runtime', 'Compaction identity does not belong to this query.'));
+    if (request.runId !== undefined) {
+      const run = this.dependencies.runs.get(request.runId);
+      if (!run.ok) return run;
+      if (run.data.kind !== 'agent' || run.data.sessionId !== request.sessionId)
+        return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.'));
+    }
+    const eligible = this.compactionEligibility(current.data);
+    let blockCode = eligible.ok ? null : eligible.error.code;
+    if (blockCode === null && this.active) blockCode = 'runtime_busy';
+    if (blockCode === null) {
+      try {
+        const availability = agent.inspect(current.data.row.nativeSessionId).availability;
+        if (availability === 'busy') blockCode = 'session_busy';
+        else if (availability === 'unusable') blockCode = 'agent_session_unusable';
+      }
+      catch { blockCode = 'agent_session_unavailable'; }
+    }
+    let recorded: CompactionObservation | null = null;
+    const native = inspected.data.operation;
+    const liveMatches = native && (request.operationId === undefined || native.operationId === request.operationId)
+      && (request.runId === undefined || native.runId === request.runId);
+    if (!manual && !liveMatches && request.runId !== undefined && this.dependencies.contextRepository?.readCompactionEvidence) {
+      const evidence = this.dependencies.contextRepository.readCompactionEvidence({ ...request, runId: request.runId });
+      if (!evidence.ok) return evidence;
+      recorded = evidence.data.at(-1)?.observation ?? null;
+    }
+    const candidate = manual?.observation ?? (liveMatches ? native : recorded);
+    const currentOwner = candidate?.runId === null ? this.active === null
+      : this.active?.kind === 'agent' && this.active.runId === candidate?.runId && !this.active.stopIntent && !this.active.terminalCommitted;
+    const samePosition = candidate?.saved !== null && candidate?.saved !== undefined
+      ? isDeepStrictEqual(candidate.saved, current.data.bundle.commit)
+      : manual !== undefined && isDeepStrictEqual(manual.baseline ?? manual.request.expected, current.data.bundle.commit);
+    const operation = candidate && (request.operationId === undefined || request.operationId === candidate.operationId)
+      && (request.runId === undefined || request.runId === candidate.runId)
+      ? { ...candidate, mayContinue: candidate.mayContinue && eligible.ok && currentOwner && samePosition
+        && inspected.data.capacity.fitsEstimate === true } : null;
+    const snapshot = SessionCompactionSnapshotSchema.safeParse({
+      sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId, commit: current.data.bundle.commit,
+      policy: RUNTIME_CONFIG.compaction, capacity: inspected.data.capacity, lastSaved: inspected.data.lastSaved,
+      operation, operationAvailability: operation ? recorded ? 'recorded' : 'live' : request.operationId || request.runId ? 'unknown' : 'none',
+      manualAllowed: blockCode === null, blockCode,
+    });
+    return snapshot.success ? ok(snapshot.data) : fail(appError('session_history_invalid', 'session', 'Compaction projection is invalid.'));
+  }
+
+  public async cancelSessionCompaction(request: SessionCompactionCancel): Promise<Result<{ sessionId: number; operationId: string; accepted: boolean }>> {
+    const operation = this.compactions.get(request.operationId);
+    if (!operation || operation.sessionId !== request.sessionId)
+      return fail(appError('operation_result_unknown', 'runtime', 'The operation is no longer available.'));
+    return ok({ ...request, accepted: this.active === operation && operation.stop('user') });
   }
 
   public queryNativeTools(): Result<readonly NativeToolAvailability[]> {
@@ -300,7 +592,7 @@ export class RuntimeService {
   }
 
   public cancel(runId: number): Result<{ runId: number; accepted: boolean }> {
-    if (this.active?.runId === runId) {
+    if (this.active && this.active.kind !== 'compaction' && this.active.runId === runId) {
       const active = this.active;
       const accepted = active.stop('user');
       return active.storageError ? fail(active.storageError, runId) : ok({ runId, accepted });
@@ -311,7 +603,7 @@ export class RuntimeService {
 
   public verifySessionMutation(sessionId: number): Result<void> {
     if (this.poisoned || this.closing || this.closed) return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot manage Sessions.', true));
-    if (this.active?.kind === 'agent' && this.active.sessionId === sessionId)
+    if (this.active && this.active.kind !== 'provider' && this.active.sessionId === sessionId)
       return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
     return ok(undefined);
   }
@@ -331,6 +623,15 @@ export class RuntimeService {
     if (!agent?.enqueueInput || !active.nativeSessionId) return fail(appError('agent_input_unavailable', 'runtime', 'Active input dispatch is unavailable.'));
     try {
       if (agent.inspect(active.nativeSessionId).availability !== 'busy') return fail(appError('input_admission_closed', 'session', 'The native Run is not streaming.', true));
+      if (agent.inspectSessionCompaction) {
+        const current = this.compactionHistory(request.sessionId);
+        if (!current.ok) return current;
+        const view = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed,
+          commit: current.data.bundle.commit! });
+        if (!view.ok) return view;
+        if (view.data.operation && !view.data.operation.stopped && view.data.operation.runId === active.runId)
+          return fail(appError('session_busy', 'session', 'Compaction is not accepting new input.', true));
+      }
     } catch { return fail(appError('agent_session_unavailable', 'session', 'Native state cannot be confirmed.', true)); }
     const at = this.dependencies.now();
     const admitted = ledger.admit(request, () => {
@@ -473,11 +774,11 @@ export class RuntimeService {
     if (!persisted.ok) {
       if (persisted.error.code === 'document_not_found') return persisted;
       this.poisoned = true;
-      if (this.active?.kind === 'agent') this.active.stop('user');
+      if (this.active && this.active.kind !== 'provider') this.active.stop('user');
       return fail(appError('model_access_revocation_failed', 'storage', '模型使用权限未能持久撤回；当前 Runtime 已停止接纳新请求。', true));
     }
     const active = this.active;
-    const affected = active?.kind === 'agent' && active.sessionId !== null
+    const affected = active && active.kind !== 'provider' && active.sessionId !== null
       && persisted.data.affectedSessionIds.includes(active.sessionId);
     const stopRequested = affected ? active!.stop('user') : false;
     return ok({ ...persisted.data, stopRequested });
@@ -573,7 +874,9 @@ export class RuntimeService {
           expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
           messageTimestamp: input.messageTimestamp, goal: INVOICE_CHAT_GOAL,
           config: { ...initialP3AgentSnapshot(request, session.nativeSessionId),
-            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}) }, usage: initialUsage(createdAt),
+            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
+            ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
+              ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
           cleanup: initialCleanup(), createdAt,
           ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
           ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
@@ -588,7 +891,9 @@ export class RuntimeService {
       } else {
         const created = this.dependencies.runs.createAgent({ goal: INVOICE_CHAT_GOAL, input,
           config: { ...initialAgentSnapshot(request, session.nativeSessionId),
-            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}) }, usage: initialUsage(createdAt),
+            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
+            ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
+              ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
           cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: chatScope });
         if (!created.ok) return created;
         runId = created.data;
@@ -811,10 +1116,22 @@ export class RuntimeService {
     const savedRun = this.dependencies.runs.get(active.runId);
     if (!savedRun.ok) return this.finishAgent(context, null, savedRun.error, true);
     const p8 = savedRun.data.config.contextPolicyVersion === 'p8-context-v1';
+    const compactionPolicy = savedRun.data.config.compactionPolicy === undefined ? undefined
+      : CompactionPolicySchema.safeParse(savedRun.data.config.compactionPolicy);
+    if (compactionPolicy && !compactionPolicy.success)
+      return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Frozen compaction policy is invalid.', false, active.runId), true);
+    const frozenCompactionPolicy = compactionPolicy?.success ? compactionPolicy.data : undefined;
     const repository = this.dependencies.contextRepository;
     if (p8 && (!repository || context.contextSnapshotId === undefined))
       return this.finishAgent(context, null, appError('context_binding_unknown', 'runtime', 'Context persistence is unavailable.', false, active.runId), true);
     const contextHooks: ContextHooks | undefined = p8 && repository ? {
+      ...(repository.recordCompactionEvidence ? { compaction: (value: Parameters<ContextRepository['recordCompactionEvidence']>[0]) => {
+        if (value.runId !== active.runId || value.sessionId !== request.sessionId || value.nativeSessionId !== session.nativeSessionId)
+          return fail(appError('context_binding_unknown', 'runtime', 'Compaction does not belong to this Run.'));
+        const saved = repository.recordCompactionEvidence!(value);
+        if (saved.ok) this.notifyCompaction(value.observation);
+        return saved;
+      } } : {}),
       resolveToolResult: source => source.sessionId === request.sessionId
         ? repository.resolveToolResult(source)
         : fail(appError('context_binding_unknown', 'runtime', 'Tool result does not belong to this Session.')),
@@ -845,8 +1162,10 @@ export class RuntimeService {
       { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
       active.controller.signal,
       context.scope ? { activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,
+        ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}),
         sessionInputs: true, ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) }
-        : { sessionInputs: true, runtimeBudget: request.budget },
+        : { sessionInputs: true, runtimeBudget: request.budget,
+          ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}) },
     )).then(
       (result) => ({ ok: true as const, result }),
       () => ({ ok: false as const }),
@@ -886,6 +1205,8 @@ export class RuntimeService {
       return this.finishAgent(context, null, error, !unconfirmed, unconfirmed);
     }
     const prepared = first.value.result.data;
+    if (frozenCompactionPolicy && !isDeepStrictEqual(prepared.snapshot.compactionPolicy, frozenCompactionPolicy))
+      return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared compaction policy differs from Run admission.', false, active.runId), true);
     const stopBeforeStart = this.agentStop(context);
     if (stopBeforeStart) {
       return this.finishAgent(context, null, errorForStop(stopBeforeStart.reason, active.runId, 'agent'), true);
@@ -1449,11 +1770,17 @@ export class RuntimeService {
     if (this.closed) return { stopped: true, closed: true, errors: [...this.closeErrors.values()] };
     this.closing = true;
     const active = this.active;
+    let activeStopped = true;
     if (active) {
       active.stop('shutdown');
-      const result = await active.completion;
+      const awaited = active.kind === 'compaction'
+        ? await withinGrace(active.completion, RUNTIME_CONFIG.request.stopGraceMs)
+        : { kind: 'settled' as const, value: await active.completion };
+      const result = awaited.kind === 'settled' ? awaited.value
+        : ok({ stopped: false });
       if (!result.ok || !result.data.stopped) {
-        const error = result.ok ? appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId) : result.error;
+        activeStopped = false;
+        const error = result.ok ? appError('stop_unconfirmed', 'runtime', 'Native operation stop was not confirmed.', true, active.runId ?? undefined) : result.error;
         this.closeErrors.set(error.code, error);
       }
     }
@@ -1467,8 +1794,8 @@ export class RuntimeService {
     }
     try {
       const providerReport = await this.dependencies.provider.close();
-      this.closed = agentReport.closed && providerReport.closed;
-      const stopped = agentReport.stopped && providerReport.stopped;
+      this.closed = activeStopped && agentReport.closed && providerReport.closed;
+      const stopped = activeStopped && agentReport.stopped && providerReport.stopped;
       this.poisoned ||= !stopped;
       for (const error of providerReport.errors) this.closeErrors.set(error.code, error);
       return { stopped, closed: this.closed, errors: [...this.closeErrors.values()] };

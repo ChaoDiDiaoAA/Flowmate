@@ -9,6 +9,7 @@ import type { HostCommand, HostCredentialRequest, HostEvent, HostOutput } from '
 import { isRuntimeHostCommand, isWorkspaceHostCommand, isContextHostCommand, matchesContextResponse, parseContextHostResult,
   isHistoryHostCommand, matchesHistoryResponse, parseHistoryHostResult,
   parseHostCommand, parseRuntimeHostResult, parseWorkspaceHostResult } from '../../host/protocol.ts';
+import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, parseCompactionNotification } from '../../host/protocol.ts';
 
 type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
 type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; command: HostCommand };
@@ -128,7 +129,7 @@ export class HostClient {
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
     const rawMessage = { ...command, version: 1, requestId };
-    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type)
+    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type)
       ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
     if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
@@ -223,7 +224,12 @@ export class HostClient {
         if (!pending) return;
         clearTimeout(pending.timer);
         this.pending.delete(output.requestId);
-        if (isRuntimeHostCommand(pending.command.type)) {
+        if (isCompactionHostCommand(pending.command.type)) {
+          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
+          const value = validEnvelope ? parseCompactionHostResult(pending.command.type, output.value) : null;
+          if (value === null || !matchesCompactionResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(value);
+        } else if (isRuntimeHostCommand(pending.command.type)) {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
           const value = validEnvelope ? parseRuntimeHostResult(pending.command.type, output.value) : null;
           if (value === null || !matchesRuntimeResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
@@ -246,6 +252,12 @@ export class HostClient {
         } else pending.resolve(output.value);
       } else if (output.type === 'event') {
         if (!output.event || typeof output.event !== 'object') return;
+        if (output.event.type === 'compaction_observation') {
+          if (!Object.keys(output).every(key => ['version', 'type', 'event'].includes(key))) return;
+          const value = parseCompactionNotification(output.event);
+          if (value) this.emit(value);
+          return;
+        }
         if (output.event.type === 'runtime_events_available') {
           if (!Object.keys(output).every(key => ['version', 'type', 'event'].includes(key))) return;
           const wake = RuntimeEventsWakeSchema.safeParse(output.event);

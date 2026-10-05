@@ -3,6 +3,8 @@ import {
   type AssistantMessage,
 } from '@earendil-works/pi-ai';
 import { isAbsolute } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { isContextOverflow } from '@earendil-works/pi-ai/utils/overflow';
 import { isDeepStrictEqual } from 'node:util';
 import {
   createAgentSession,
@@ -12,11 +14,13 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
+  estimateTokens,
+  calculateContextTokens,
   type AgentSession,
   type AgentToolResult,
   type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
-import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
   AgentObservation,
@@ -58,6 +62,12 @@ import type {
   SessionMessagesPage,
   SessionMessageView,
   GoalMode,
+  CompactionCapacity,
+  SavedCompactionView,
+  CompactionObservation,
+  NativeCompactionControl,
+  NativeCompactionOutcome,
+  SummaryCallEvidence,
 } from '@flowmate/contracts';
 import type { ProviderConfig } from '@flowmate/contracts';
 import { INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NativeToolOutputSchema, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
@@ -71,6 +81,7 @@ import { formatExecutionPrompt, validateNativeHistory, validateModelMessages, pr
 
 import { managerFor, validateRecovery, validateAgentContext, validateLlmMessages, referenceIds, inspectSessionHistory, buildForkSessionHistory } from './memory/history.ts';
 import { PiMemoryAdapter } from './memory/persistence.ts';
+import { installNativeCompactionBridge, type NativeSummaryScope } from './memory/compaction.ts';
 
 const maxContextBytes = RUNTIME_CONFIG.llmPayload.maxChatContextBytes;
 const maxOutputBytes = RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
@@ -122,6 +133,7 @@ type ActiveExecution = {
   totalOutputBytes: number;
   finalAssistantMessage?: AssistantMessage;
   callSequence: number;
+  modelCallIndex: number;
   turnOrdinal: number;
   attempts: number;
   responseStatus: number | null;
@@ -139,6 +151,12 @@ type ActiveExecution = {
 };
 
 type SessionRecord = {
+  compactionBridge?: { dispose(): void };
+  compacting?: boolean;
+  compaction?: { control: NativeCompactionControl; observation: CompactionObservation; baseline: HistoryCommitState;
+    scope?: NativeSummaryScope; failure?: ReturnType<typeof appError>; purposes: ('history' | 'turn-prefix')[];
+    calls: SummaryCallEvidence[]; usages: ModelCallUsage[]; streams: Set<Promise<void>>;
+    firstKeptEntryId: string | null; splitTurn: boolean | null };
   manager: SessionManager;
   session?: AgentSession;
   runtime?: ModelRuntime;
@@ -187,7 +205,7 @@ function emptyResourceLoader(systemPrompt: string): ResourceLoader {
 
 function inMemorySettings(): SettingsManager {
   return SettingsManager.inMemory({
-    compaction: { enabled: false },
+    compaction: { enabled: false, reserveTokens: RUNTIME_CONFIG.compaction.reserveTokens, keepRecentTokens: RUNTIME_CONFIG.compaction.keepRecentTokens },
     retry: { enabled: false, maxRetries: 0, baseDelayMs: 1, provider: { maxRetries: 0, maxRetryDelayMs: 0 } },
     transport: 'sse',
     enableSkillCommands: false,
@@ -386,7 +404,7 @@ export class PiAgentAdapter implements AgentPort {
     } catch { return fail(appError('session_history_invalid', 'session', 'Saved conversation history could not be restored.')); }
   }
 
-  private reseedContext(record: SessionRecord, bindings?: readonly NativeContextBindingSeed[]): Result<void> {
+  private reseedContext(record: SessionRecord, bindings?: readonly NativeContextBindingSeed[], projection?: AgentSession['messages']): Result<void> {
     const entries = bindings === undefined ? new Map(record.contextEntries) : new Map<string, NativeInputContextBinding>();
     if (bindings !== undefined) {
       const inputs = new Map<number, string>();
@@ -412,7 +430,11 @@ export class PiAgentAdapter implements AgentPort {
     const nativeObjects = new WeakMap<object, { entryId: string; original: unknown }>();
     const assembled: AgentSession['messages'] = [];
     for (const entry of record.manager.buildContextEntries()) {
-      for (const message of sessionEntryToContextMessages(entry)) {
+      for (const canonical of sessionEntryToContextMessages(entry)) {
+        if (projection && assembled.length >= projection.length) continue;
+        const message = projection?.[assembled.length] ?? canonical;
+        if (!isDeepStrictEqual(message, canonical))
+          return fail(appError('session_history_invalid', 'session', 'Native context projection differs from the saved history.'));
         assembled.push(message); nativeObjects.set(message, { entryId: entry.id, original: structuredClone(message) });
         if (message.role === 'user') {
           const source = entries.get(entry.id);
@@ -422,7 +444,7 @@ export class PiAgentAdapter implements AgentPort {
       }
     }
     // Install this exact array: helper-created derived objects are never interchangeable.
-    if (record.session) record.session.agent.state.messages = assembled;
+    if (record.session && !projection) record.session.agent.state.messages = assembled;
     record.nativeObjects = nativeObjects;
     const origins = new Map(record.recoverySeed?.origins.map(o => [o.nativeEntryId, o]));
     record.inheritedToolIds = new Set(record.manager.getEntries().flatMap(entry => entry.type === 'message'
@@ -571,14 +593,47 @@ export class PiAgentAdapter implements AgentPort {
     const record = this.sessions.get(nativeSessionId);
     const availability: AgentPortAvailability = !record ? 'missing'
       : record.unusable ? 'unusable'
-        : record.preparing || record.running ? 'busy' : 'ready';
+        : record.preparing || record.running || record.compacting || record.session?.isCompacting ? 'busy' : 'ready';
     return { availability };
+  }
+
+  public inspectSessionCompaction(input: Parameters<NonNullable<AgentPort['inspectSessionCompaction']>>[0]):
+    Result<{ capacity: CompactionCapacity; lastSaved: SavedCompactionView | null; operation: CompactionObservation | null }> {
+    const valid = validateRecovery(input.history, input.seed, input.commit);
+    if (!valid.ok) return valid;
+    try {
+      const manager = managerFor(input.history), messages = manager.buildSessionContext().messages;
+      const record = this.sessions.get(input.history.header.id);
+      const current = record?.session;
+      const sameCommitted = record?.lastSavedHistory && isDeepStrictEqual(record.lastSavedHistory, input.history)
+        && isDeepStrictEqual(record.receipt, input.commit) && current && isDeepStrictEqual(current.messages, messages);
+      const modelWindow = current?.model?.contextWindow;
+      const contextWindow = Number.isSafeInteger(modelWindow) && modelWindow! > 0 ? modelWindow! : null;
+      const reserve = record?.snapshot?.compactionPolicy?.reserveTokens ?? RUNTIME_CONFIG.compaction.reserveTokens;
+      const thresholdTokens = contextWindow !== null && contextWindow > reserve ? contextWindow - reserve : null;
+      const sdkUsage = sameCommitted ? current.getContextUsage() : undefined;
+      const estimate = messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+      const rawTokens = sdkUsage?.tokens ?? estimate;
+      const tokens = Number.isSafeInteger(rawTokens) && rawTokens >= 0 ? rawTokens : null;
+      const path = manager.getBranch();
+      const entry = [...path].reverse().find(value => value.type === 'compaction');
+      const source: CompactionCapacity['source'] = tokens === null ? 'unknown' : sdkUsage?.tokens !== null && sdkUsage?.tokens !== undefined
+        ? 'sdk-usage-estimate' : sameCommitted && entry ? 'sdk-post-compaction-estimate' : 'message-estimate';
+      const capacity: CompactionCapacity = { tokens, source, contextWindow, thresholdTokens,
+        fitsEstimate: tokens !== null && thresholdTokens !== null ? tokens <= thresholdTokens : null };
+      const origin = entry && input.seed.origins.find(value => value.nativeEntryId === entry.id);
+      if (entry && !origin) return fail(appError('context_binding_unknown', 'runtime', 'Compaction origin is unavailable.'));
+      const lastSaved: SavedCompactionView | null = entry && origin ? { entryId: entry.id,
+        firstKeptEntryId: entry.firstKeptEntryId, tokensBefore: entry.tokensBefore, originSessionId: origin.originSessionId,
+        usage: entry.usage ? normalizeUsage({ usage: entry.usage }, { attempts: 0, complete: false }, false).usage : null } : null;
+      return ok({ capacity, lastSaved, operation: record?.compaction?.observation ?? null });
+    } catch { return fail(appError('session_history_invalid', 'session', 'Committed compaction facts are invalid.')); }
   }
 
   public async moveSessionLeaf(nativeSessionId: string, targetEntryId: string): Promise<Result<NativeSessionHistory>> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
-    if (record.preparing || record.running || record.session && !record.session.isIdle)
+    if (record.preparing || record.running || record.compacting || record.session && !record.session.isIdle)
       return fail(appError('agent_session_busy', 'session', 'Conversation is busy.'));
     const snapshot = this.exportSession(nativeSessionId);
     if (!snapshot.ok) return snapshot;
@@ -600,7 +655,7 @@ export class PiAgentAdapter implements AgentPort {
   public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
-    if (record.preparing || record.running || record.session && !record.session.isIdle)
+    if (record.preparing || record.running || record.compacting || record.session && !record.session.isIdle)
       return fail(appError('agent_session_busy', 'session', 'Conversation is busy.'));
     try {
       const current = this.exportSession(nativeSessionId);
@@ -627,6 +682,8 @@ export class PiAgentAdapter implements AgentPort {
 
   public async enqueueInput(nativeSessionId: string, input: AgentInputDispatch): Promise<Result<void>> {
     const record = this.sessions.get(nativeSessionId); const active = record?.active;
+    if (record?.compacting)
+      return fail(appError('session_busy', 'session', 'Wait for compaction to stop before delivering another input.'));
     if (!record || !active || active.input.inputId === undefined || !record.session)
       return fail(appError('input_admission_closed', 'runtime', 'The Run is no longer accepting inputs.'));
     if (input.runId !== active.runId || input.sessionId !== active.sessionId || !Number.isSafeInteger(input.inputId) || input.inputId <= 0
@@ -727,8 +784,12 @@ export class PiAgentAdapter implements AgentPort {
     if (this.closed) return fail(appError('agent_port_closed', 'runtime', 'Agent Runtime 已关闭。'));
     if (!record) return fail(appError('agent_session_missing', 'session', 'Agent Session 不存在。'));
     if (record.unusable) return fail(record.historyFailure ?? appError('agent_session_unusable', 'session', 'This session cannot continue after an interrupted run. Start a new session.'));
-    if (record.preparing || record.running) return fail(appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
+    if (record.preparing || record.running || record.compacting) return fail(appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
     if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
+
+    if (options?.compactionPolicy !== undefined && (!CompactionPolicySchema.safeParse(options.compactionPolicy).success
+      || !isDeepStrictEqual(options.compactionPolicy, RUNTIME_CONFIG.compaction)))
+      return fail(appError('compaction_unavailable', 'runtime', 'Compaction policy does not match the fixed product policy.'));
 
     if (options?.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form'].includes(options.goalMode))
       return fail(appError('input_invalid', 'input', 'The goal mode is invalid.'));
@@ -773,6 +834,7 @@ export class PiAgentAdapter implements AgentPort {
 
       let session = record.session;
       if (session && (runtime !== record.runtime || record.policy !== policy || record.workingDirectory !== cwd)) {
+        record.compactionBridge?.dispose(); record.compactionBridge = undefined;
         session.dispose();
         record.session = undefined;
         session = undefined;
@@ -974,7 +1036,13 @@ export class PiAgentAdapter implements AgentPort {
       };
       const agent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts = options?.runtimeBudget
         ? { ...taskAgent, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : taskAgent;
-      record.snapshot = { ...snapshot, historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent };
+      record.snapshot = { ...snapshot, historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent,
+        ...(options?.compactionPolicy ? { compactionPolicy: Object.freeze(structuredClone(options.compactionPolicy)) } : {}) };
+      if (options?.compactionPolicy && !record.compactionBridge) {
+        const bridge = this.installCompaction(record, session);
+        if (!bridge.ok) return bridge;
+        record.compactionBridge = bridge.data;
+      }
       return ok({
         snapshot: record.snapshot,
         execute: (input, executionSignal, observe) => this.execute(record, nativeSessionId, input, executionSignal, observe),
@@ -988,8 +1056,424 @@ export class PiAgentAdapter implements AgentPort {
     }
   }
 
+  private publishCompaction(record: SessionRecord, update: Partial<CompactionObservation>): Result<void> {
+    const operation = record.compaction;
+    if (!operation) return fail(appError('compaction_unavailable', 'runtime', 'No compaction operation is bound.'));
+    operation.observation = { ...operation.observation, ...update,
+      observationSequence: operation.observation.observationSequence + 1 };
+    if (operation.observation.runId !== null) {
+      const save = record.active?.input.contextHooks?.compaction;
+      let saved: Result<void>;
+      try { saved = save ? save({ operationId: operation.observation.operationId, runId: operation.observation.runId,
+        sessionId: operation.control.sessionId, nativeSessionId: operation.observation.nativeSessionId,
+        reason: operation.observation.reason as 'threshold' | 'overflow', baseline: operation.baseline,
+        firstKeptEntryId: operation.firstKeptEntryId, splitTurn: operation.splitTurn,
+        observation: structuredClone(operation.observation), calls: structuredClone(operation.calls) })
+        : fail(appError('context_binding_unknown', 'runtime', 'Automatic compaction evidence cannot be saved.')); }
+      catch { saved = fail(appError('storage_write_failed', 'storage', 'Compaction evidence could not be saved.', true)); }
+      if (!saved.ok) {
+        operation.failure = saved.error;
+        operation.observation = { ...operation.observation, error: saved.error, mayContinue: false };
+        if (record.active) this.failToolRun(record, record.active, saved.error);
+        return saved;
+      }
+    }
+    try { operation.control.observe(structuredClone(operation.observation)); }
+    catch { /* Readonly query retains facts when temporary observation delivery fails. */ }
+    return ok(undefined);
+  }
+
+  private verifyNativeCompaction(record: SessionRecord): Result<void> {
+    const operation = record.compaction;
+    if (!operation || !record.compacting) return fail(appError('compaction_unavailable', 'runtime', 'No trusted compaction operation is active.'));
+    if (record.historyFailure || record.unusable) return fail(record.historyFailure ?? appError('agent_session_unusable', 'session', 'Native history is unusable.'));
+    if (record.receipt?.commitRevision === Number.MAX_SAFE_INTEGER)
+      return fail(appError('storage_write_failed', 'storage', 'Conversation history commit revision is exhausted.', false));
+    if (operation.control.signal.aborted || operation.scope?.signal.aborted)
+      return fail(appError('compaction_cancelled', 'runtime', 'Compaction was cancelled.'));
+    if (operation.control.remainingMs() <= 0) return fail(appError('compaction_timeout', 'runtime', 'Compaction deadline expired.'));
+    const permission = operation.control.verifyUse();
+    if (!permission.ok) return permission;
+    const window = record.session?.model?.contextWindow;
+    if (!Number.isSafeInteger(window) || window! <= RUNTIME_CONFIG.compaction.reserveTokens)
+      return fail(appError('compaction_capacity_exceeded', 'runtime', 'The model window cannot provide required summary headroom.'));
+    const snapshot = this.exportSession(operation.observation.nativeSessionId);
+    if (!snapshot.ok || !record.lastSavedHistory || !isDeepStrictEqual(snapshot.data, record.lastSavedHistory))
+      return fail(appError('session_history_invalid', 'session', 'Native history is not the committed prefix.'));
+    return ok(undefined);
+  }
+
+  private installCompaction(record: SessionRecord, session: AgentSession) {
+    return installNativeCompactionBridge(session, {
+      beforeAuto: ({ reason }) => {
+        const active = record.active, policy = record.snapshot?.compactionPolicy;
+        if (!active || record.compacting || !policy?.autoEnabled || !active.input.contextHooks?.compaction
+          || !record.receipt || !record.lastSavedHistory || !record.recoverySeed)
+          return fail(appError('compaction_unavailable', 'runtime', 'Automatic compaction has no qualified Run binding.'));
+        const valid = this.verifyModelUse(record);
+        if (!valid.ok) { this.failToolRun(record, active, valid.error); return valid; }
+        const inspected = this.inspectSessionCompaction({ history: record.lastSavedHistory, seed: record.recoverySeed, commit: record.receipt });
+        if (!inspected.ok) return inspected;
+        const operationId = randomUUID();
+        const observation: CompactionObservation = { sessionId: active.sessionId, nativeSessionId: active.nativeSessionId,
+          operationId, runId: active.runId, reason, observationSequence: 1, phase: 'preparing', generated: false,
+          nativeOutcome: 'pending', entryId: null, saved: null, error: null, stopRequested: active.signal.aborted,
+          stopped: false, continuation: 'current-run', mayContinue: false, capacity: inspected.data.capacity,
+          usage: { version: 1, source: 'not-requested', reason: 'not-started', sdkValues: null, attempts: 0,
+            attemptsComplete: true, costSource: null, updatedAt: now().at },
+          tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } };
+        record.compaction = { control: { sessionId: active.sessionId, operationId, signal: active.signal,
+          remainingMs: () => active.input.remainingRunMs?.() ?? 0,
+          maxModelCalls: Math.max(0, record.snapshot!.agent.maxModelCalls - active.modelCallIndex),
+          verifyUse: () => this.verifyModelUse(record), observe: () => {} },
+          observation, baseline: structuredClone(record.receipt), purposes: [], calls: [], usages: [],
+          streams: new Set(), firstKeptEntryId: null, splitTurn: null };
+        record.compacting = true;
+        const saved = this.publishCompaction(record, {});
+        if (!saved.ok) record.compacting = false;
+        return saved;
+      },
+      withSummary: async (scope, run) => {
+        const operation = record.compaction;
+        const valid = this.verifyNativeCompaction(record);
+        if (!valid.ok || !operation || scope.reason !== operation.observation.reason
+          || !isDeepStrictEqual(record.receipt, operation.baseline)) {
+          const error = !valid.ok ? valid.error : appError('compaction_unavailable', 'runtime', 'Summary is outside its trusted operation.');
+          if (operation) operation.failure = error;
+          throw error;
+        }
+        operation.scope = scope;
+        const split = scope.preparation.isSplitTurn && scope.preparation.turnPrefixMessages.length > 0;
+        operation.firstKeptEntryId = scope.preparation.firstKeptEntryId;
+        operation.splitTurn = scope.preparation.isSplitTurn;
+        operation.purposes = split ? [...(scope.preparation.messagesToSummarize.length ? ['history' as const] : []), 'turn-prefix'] : ['history'];
+        if (operation.calls.length + operation.purposes.length > operation.control.maxModelCalls) {
+          operation.scope = undefined;
+          operation.failure = appError('agent_model_call_budget', 'runtime', 'The remaining model budget cannot complete this native summary.');
+          throw operation.failure;
+        }
+        const saved = this.publishCompaction(record, {});
+        if (!saved.ok) { operation.scope = undefined; throw saved.error; }
+        try { return await run(); }
+        finally { operation.scope = undefined; }
+      },
+      onGenerated: result => {
+        const operation = record.compaction!;
+        const recorded = this.publishCompaction(record, { generated: true });
+        if (!recorded.ok) throw recorded.error;
+        const valid = this.verifyNativeCompaction(record);
+        if (!valid.ok) { operation.failure = valid.error; throw valid.error; }
+        if (!operation.scope || result.firstKeptEntryId !== operation.scope.preparation.firstKeptEntryId
+          || !Number.isSafeInteger(result.tokensBefore) || result.tokensBefore < 0 || !result.summary.trim()
+          || !record.manager.getBranch().some(entry => entry.id === result.firstKeptEntryId)) {
+          operation.failure = appError('session_history_invalid', 'session', 'Native summary does not identify a legal saved cut.');
+          throw operation.failure;
+        }
+      },
+      onAppend: entryId => {
+        const operation = record.compaction;
+        const entry = record.manager.getEntry(entryId);
+        if (!operation || !operation.observation.generated || !entry || entry.type !== 'compaction'
+          || record.receipt?.leafId !== entryId || record.receipt.entryCount !== operation.baseline.entryCount + 1
+          || record.receipt.commitRevision !== operation.baseline.commitRevision + 1
+          || entry.parentId !== operation.baseline.leafId || !record.lastSavedHistory?.entries.some(value => value.id === entryId)) {
+          const error = record.historyFailure ?? appError('storage_write_failed', 'storage', 'Native compaction commit is not confirmed.', true);
+          if (operation) operation.failure = error;
+          record.unusable = true;
+          throw error;
+        }
+        const recorded = this.publishCompaction(record, { entryId, saved: structuredClone(record.receipt) });
+        if (!recorded.ok) throw recorded.error;
+      },
+      afterAuto: ({ willRetry, sdkWantsContinue }) => {
+        const operation = record.compaction, active = record.active;
+        if (!operation || !active || operation.observation.runId !== active.runId || !record.compacting)
+          return fail(appError('compaction_unavailable', 'runtime', 'Automatic compaction operation is unavailable.'));
+        const valid = this.verifyNativeCompaction(record);
+        if (!valid.ok) operation.failure ??= valid.error;
+        const canonical = record.manager.buildSessionContext().messages;
+        const last = canonical.at(-1);
+        const expected = willRetry && last?.role === 'assistant' && (last.stopReason === 'error' || last.stopReason === 'length')
+          ? canonical.slice(0, -1) : canonical;
+        if (!isDeepStrictEqual(session.messages, expected))
+          operation.failure ??= appError('session_history_invalid', 'session', 'Automatic compaction left an unverified native message projection.');
+        else {
+          const seeded = this.reseedContext(record, undefined, session.messages);
+          if (!seeded.ok) operation.failure ??= seeded.error;
+        }
+        const view = record.lastSavedHistory && record.recoverySeed && record.receipt
+          ? this.inspectSessionCompaction({ history: record.lastSavedHistory, seed: record.recoverySeed, commit: record.receipt }) : null;
+        const capacity = view?.ok ? view.data.capacity : operation.observation.capacity;
+        const stopped = !session.isCompacting && operation.streams.size === 0;
+        const confirmed = operation.observation.generated ? operation.observation.saved !== null
+          : isDeepStrictEqual(operation.baseline, record.receipt);
+        const budgetAvailable = active.modelCallIndex < record.snapshot!.agent.maxModelCalls;
+        // Input admission stays closed after overflow's first agent_end. Core streaming proves a resumed next-assistant loop.
+        // Post-agent without queues may finish at the limit; AgentSession.isStreaming spans that post-run work as well.
+        const needsModelCall = session.agent.state.isStreaming || !active.admissionClosed || willRetry || sdkWantsContinue;
+        if (needsModelCall && !budgetAvailable)
+          operation.failure ??= appError('agent_model_call_budget', 'runtime', 'Compaction exhausted the Run model-call budget.');
+        if (operation.observation.nativeOutcome === 'pending')
+          operation.failure ??= appError('compaction_unavailable', 'runtime', 'Native compaction ended without a completion event; its cause is unknown.');
+        const qualified = stopped && confirmed && valid.ok && !active.signal.aborted && capacity.fitsEstimate === true
+          && operation.observation.nativeOutcome !== 'cancelled' && (!operation.failure || !operation.observation.generated);
+        const mayContinue = qualified && budgetAvailable;
+        if (!qualified) operation.failure ??= appError('compaction_capacity_exceeded', 'runtime', 'The Run cannot continue from this compaction result.');
+        const saved = this.publishCompaction(record, { phase: stopped ? 'ended' : 'stopping', stopped, capacity, mayContinue,
+          nativeOutcome: operation.observation.nativeOutcome === 'pending' ? 'failed' : operation.observation.nativeOutcome,
+          stopRequested: active.signal.aborted || operation.observation.stopRequested, error: operation.failure ?? null });
+        if (stopped) record.compacting = false;
+        if (!saved.ok || !qualified || needsModelCall && !budgetAvailable) {
+          const error = !saved.ok ? saved.error : operation.failure!;
+          this.failToolRun(record, active, error);
+          return fail(error);
+        }
+        return ok(undefined);
+      },
+      onEvent: event => {
+        if (!record.compacting || !record.compaction || (event.type !== 'compaction_start' && event.type !== 'compaction_end')) return;
+        if (event.type === 'compaction_start') this.publishCompaction(record, { phase: 'compacting' });
+        else {
+          this.publishCompaction(record, { nativeOutcome: event.result ? 'succeeded' : event.aborted ? 'cancelled' : 'failed' });
+          if (event.result && record.compaction.observation.saved && record.compaction.observation.runId === null) {
+            const seeded = this.reseedContext(record);
+            if (!seeded.ok) { record.compaction.failure = seeded.error; record.unusable = true; }
+          }
+        }
+      },
+    });
+  }
+
+  public async compactSession(nativeSessionId: string, control: NativeCompactionControl): Promise<NativeCompactionOutcome> {
+    const record = this.sessions.get(nativeSessionId);
+    const emptyCapacity: CompactionCapacity = { tokens: null, source: 'unknown', contextWindow: null, thresholdTokens: null, fitsEstimate: null };
+    const inspected = record?.lastSavedHistory && record.recoverySeed && record.receipt
+      ? this.inspectSessionCompaction({ history: record.lastSavedHistory, seed: record.recoverySeed, commit: record.receipt }) : null;
+    const initial: CompactionObservation = { sessionId: control.sessionId, nativeSessionId, operationId: control.operationId, runId: null,
+      reason: 'manual', observationSequence: 1, phase: 'preparing', generated: false, nativeOutcome: 'pending', entryId: null, saved: null,
+      error: null, stopRequested: control.signal.aborted, stopped: false, continuation: 'next-run', mayContinue: false,
+      capacity: inspected?.ok ? inspected.data.capacity : emptyCapacity,
+      usage: { version: 1, source: 'not-requested', reason: 'not-started', sdkValues: null, attempts: 0, attemptsComplete: true,
+        costSource: null, updatedAt: new Date().toISOString() },
+      tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } };
+    if (!record || record.unusable || record.preparing || record.running || record.compacting || !record.session?.isIdle
+      || !record.compactionBridge || !record.receipt || record.recoverySeed?.sessionId !== control.sessionId || this.closed) {
+      const error = appError('compaction_unavailable', 'runtime', 'The prepared idle native Session cannot compact.');
+      return { observation: { ...initial, phase: 'ended', nativeOutcome: 'failed', stopped: true, error }, stopped: true, cleanupErrors: [] };
+    }
+    const operation: NonNullable<SessionRecord['compaction']> = { control, observation: initial, baseline: structuredClone(record.receipt),
+      purposes: [], calls: [], usages: [], streams: new Set(), firstKeptEntryId: null, splitTurn: null };
+    record.compaction = operation; record.compacting = true;
+    const session = record.session;
+    const cancel = () => {
+      this.publishCompaction(record, { phase: 'stopping', stopRequested: true, mayContinue: false });
+      session.abortCompaction();
+    };
+    control.signal.addEventListener('abort', cancel, { once: true });
+    try {
+      const allowed = this.verifyNativeCompaction(record);
+      if (!allowed.ok) { operation.failure = allowed.error; throw allowed.error; }
+      await session.compact();
+    } catch (error) {
+      operation.failure ??= record.historyFailure ?? (control.signal.aborted
+        ? appError('compaction_cancelled', 'runtime', 'Compaction was cancelled.')
+        : error instanceof Error && (error.message === 'Already compacted' || error.message === 'Nothing to compact (session too small)')
+          ? appError('compaction_not_needed', 'runtime', 'There is no eligible history to compact.')
+          : appError('compaction_failed', 'runtime', 'Native compaction failed.'));
+    } finally {
+      control.signal.removeEventListener('abort', cancel);
+    }
+    await Promise.allSettled([...operation.streams]);
+    const stopped = session.isIdle && !session.isCompacting && operation.streams.size === 0;
+    let capacity = operation.observation.capacity;
+    if (record.lastSavedHistory && record.recoverySeed && record.receipt) {
+      const view = this.inspectSessionCompaction({ history: record.lastSavedHistory, seed: record.recoverySeed, commit: record.receipt });
+      if (view.ok) capacity = view.data.capacity;
+      else operation.failure ??= view.error;
+    }
+    const qualified = this.verifyNativeCompaction(record);
+    if (!qualified.ok) operation.failure ??= qualified.error;
+    const unchanged = isDeepStrictEqual(record.receipt, operation.baseline);
+    const saved = operation.observation.generated ? operation.observation.saved !== null : unchanged;
+    const mayContinue = stopped && saved && capacity.fitsEstimate === true && qualified.ok
+      && !control.signal.aborted && operation.observation.nativeOutcome !== 'cancelled';
+    if (capacity.fitsEstimate !== true && !operation.failure)
+      operation.failure = appError('compaction_capacity_exceeded', 'runtime', 'The compacted context still cannot fit this model window.');
+    this.publishCompaction(record, { phase: stopped ? 'ended' : 'stopping', stopped, capacity, mayContinue,
+      stopRequested: control.signal.aborted || operation.observation.stopRequested,
+      nativeOutcome: operation.observation.nativeOutcome === 'pending' ? control.signal.aborted ? 'cancelled' : 'failed' : operation.observation.nativeOutcome,
+      error: operation.failure ?? null });
+    if (stopped) record.compacting = false;
+    else record.unusable = true;
+    return { observation: structuredClone(operation.observation), stopped, cleanupErrors: [] };
+  }
+
+  private async forwardSummaryStream(
+    record: SessionRecord, session: AgentSession, scope: NativeSummaryScope, nativeStream: AgentStream,
+    model: StreamModel, context: StreamContext, options: StreamOptions,
+    output: ReturnType<typeof createAssistantMessageEventStream>,
+  ): Promise<void> {
+    const operation = record.compaction!;
+    const callIndex = operation.calls.length;
+    const active = operation.observation.runId !== null ? record.active : undefined;
+    const callStartedAt = performance.now();
+    let trace: PromptTraceReference | undefined;
+    let attempt = 0, complete = false;
+    let finalMessage: AssistantMessage | undefined;
+    let call: SummaryCallEvidence | undefined;
+    const signal = AbortSignal.any([operation.control.signal, scope.signal, ...(options?.signal ? [options.signal] : [])]);
+    const reject: (error: ReturnType<typeof appError>) => never = error => {
+      operation.failure ??= error;
+      session.abortCompaction();
+      throw error;
+    };
+    const verify = () => {
+      const valid = this.verifyNativeCompaction(record);
+      if (!valid.ok) reject(valid.error);
+      if (record.compaction !== operation || operation.scope !== scope || !sameModel(record.model, model)
+        || context.tools?.length || context.messages.length !== 1 || context.messages[0]?.role !== 'user')
+        reject(appError('compaction_unavailable', 'runtime', 'Summary request is outside its trusted native scope.'));
+    };
+    try {
+      verify();
+      const purpose = operation.purposes[callIndex];
+      if (!purpose || callIndex >= operation.control.maxModelCalls)
+        reject(appError('agent_model_call_budget', 'runtime', 'Native summary exceeded its reserved model budget.'));
+      const limit = record.snapshot?.agent.maxContextBytes ?? maxContextBytes;
+      if (encoder.encode(JSON.stringify(context)).byteLength > limit)
+        reject(appError('agent_context_limit', 'runtime', 'Summary request exceeds the configured context byte limit.'));
+      const codecResult = preparePayloadCodec(model.api, context, model.input.includes('image'));
+      if (!codecResult.ok) reject(codecResult.error);
+      const codec = codecResult.data;
+      const observed = observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch) !== undefined;
+      const modelCallIndex = active ? ++active.modelCallIndex : callIndex + 1;
+      call = { modelCallIndex, purpose: purpose!,
+        model: { provider: model.provider, model: model.id, api: model.api, contextWindow: model.contextWindow },
+        transport: observed ? 'observed-fetch' : 'not-observable', sdkPayload: null, attempts: [], usage: null, tokens: null };
+      operation.calls.push(call);
+      if (active) {
+        trace = { runId: active.runId, sessionId: active.sessionId, nativeSessionId: active.nativeSessionId,
+          callSequence: modelCallIndex, purpose: purpose === 'history' ? 'summary-history' : 'summary-turn-prefix',
+          answerRequestSequence: null, operationId: operation.observation.operationId };
+        try { this.dependencies.promptTrace?.begin(trace); } catch { /* Diagnostics are optional. */ }
+      }
+      const prepared = this.publishCompaction(record, {});
+      if (!prepared.ok) reject(prepared.error);
+      const update = (value: Partial<SummaryCallEvidence>) => {
+        call = { ...call!, ...value };
+        operation.calls[callIndex] = call;
+        const saved = this.publishCompaction(record, {});
+        if (!saved.ok) reject(saved.error);
+      };
+      const baseFetch: FetchLike = options?.fetch as FetchLike | undefined ?? this.dependencies.fetch
+        ?? ((request, init) => globalThis.fetch(request, init));
+      const fetch: FetchLike = async (request, init) => {
+        verify();
+        const wire = await checkWire(codec, request, init);
+        if (!wire.ok) reject(wire.error);
+        verify();
+        attempt++;
+        if (active) active.attempts++;
+        if (attempt > 2) reject(appError('compaction_failed', 'runtime', 'Summary HTTP retry exceeded the frozen provider configuration.'));
+        const evidence = { attempt, preparedAt: now().at, enteredAt: null as string | null, responseAt: null as string | null,
+          responseStatus: null as number | null, transportErrorCode: null as 'provider_transport_error' | null,
+          nativeRequestId: null as string | null, wireInclusion: wire.data.inclusion, wireReason: wire.data.reason };
+        update({ attempts: [...call!.attempts, evidence] });
+        let pending: Promise<Response>;
+        try { pending = baseFetch(request, init); } catch (error) { pending = Promise.reject(error); }
+        const enteredAt = now().at;
+        update({ attempts: call!.attempts.map(value => value.attempt === attempt ? { ...value, enteredAt } : value) });
+        try {
+          const response = await pending;
+          const responseAt = now().at;
+          update({ attempts: call!.attempts.map(value => value.attempt === attempt
+            ? { ...value, responseAt, responseStatus: response.status } : value) });
+          return response;
+        } catch (error) {
+          update({ attempts: call!.attempts.map(value => value.attempt === attempt
+            ? { ...value, transportErrorCode: 'provider_transport_error' } : value) });
+          throw error;
+        }
+      };
+      const onPayload = async (payload: unknown, requestedModel: StreamModel) => {
+        verify();
+        if (!sameModel(model, requestedModel)) reject(appError('context_binding_conflict', 'runtime', 'Summary payload model changed.'));
+        const replacement = await options?.onPayload?.(payload, requestedModel);
+        verify();
+        const fact = checkPayload(codec, replacement === undefined ? payload : replacement);
+        if (!fact.ok) reject(fact.error);
+        const sdkPayload = { observedAt: call!.sdkPayload?.observedAt ?? now().at, ...fact.data };
+        if (call!.sdkPayload && !isDeepStrictEqual(call!.sdkPayload, sdkPayload))
+          reject(appError('context_payload_mismatch', 'runtime', 'Summary payload identity changed.'));
+        update({ sdkPayload });
+        return replacement;
+      };
+      const onResponse = async (response: { status: number; headers: Record<string, string> }, requestedModel: StreamModel) => {
+        if (!sameModel(model, requestedModel)) reject(appError('context_binding_conflict', 'runtime', 'Summary response model changed.'));
+        await options?.onResponse?.(response, requestedModel);
+        if (observed) {
+          const slot = call!.attempts.at(-1);
+          if (!slot || slot.responseStatus !== response.status)
+            reject(appError('context_binding_conflict', 'runtime', 'Summary SDK response has no observed HTTP request.'));
+          const nativeRequestId = sdkRequestId(response.headers);
+          update({ attempts: call!.attempts.map(value => value.attempt === slot!.attempt ? { ...value, nativeRequestId } : value) });
+        }
+      };
+      const timeoutMs = Math.floor(Math.min(record.snapshot!.limits.timeoutMs, operation.control.remainingMs()));
+      if (timeoutMs <= 0) reject(appError('compaction_timeout', 'runtime', 'Summary deadline elapsed before dispatch.'));
+      const stream = await nativeStream(model, context, { ...options, signal, timeoutMs,
+        fetch: observedFetch(model.api, fetch), maxRetries: record.config!.parameters.maxRetries,
+        maxRetryDelayMs: record.config!.parameters.maxRetryDelayMs, onPayload, onResponse });
+      for await (const event of stream) {
+        const message = event.type === 'done' ? event.message : event.type === 'error' ? event.error : 'partial' in event ? event.partial : undefined;
+        if (message && (contentBytes(message) > maxAssistantContentBytes || encoder.encode(textFrom(message)).byteLength > maxOutputBytes)) {
+          operation.failure ??= appError('agent_content_limit', 'runtime', 'Native summary output exceeds the configured byte limit.');
+          session.abortCompaction();
+        }
+        if (event.type === 'done' || event.type === 'error') finalMessage = message;
+        else if (!operation.failure) output.push(event);
+      }
+      finalMessage ??= await stream.result();
+      complete = !signal.aborted && finalMessage.stopReason === 'stop';
+      const normalized = normalizeUsage(finalMessage, { attempts: attempt, complete }, record.config!.connection === undefined);
+      if (normalized.usage.version !== 1) reject(appError('compaction_failed', 'runtime', 'Summary usage format is incompatible.'));
+      update({ usage: normalized.usage, tokens: normalized.tokens });
+      const callUsage = { callSequence: call.modelCallIndex, usage: normalized.usage, tokens: normalized.tokens, complete };
+      operation.usages.push(callUsage);
+      if (active) active.modelCallUsages.push(callUsage);
+      const totals = aggregateUsage(operation.usages, operation.calls.reduce((sum, value) => sum + value.attempts.length, 0),
+        operation.usages.every(value => value.complete), now().at);
+      this.publishCompaction(record, totals);
+      if (!complete) operation.failure ??= appError(signal.aborted ? 'compaction_cancelled' : 'compaction_failed',
+        'runtime', 'Native summary did not complete safely.');
+      if (finalMessage.content.some(part => part.type === 'toolCall'))
+        operation.failure ??= appError('compaction_failed', 'runtime', 'Native summary attempted a tool call.');
+      if (operation.failure) throw operation.failure;
+      verify();
+      output.push({ type: 'done', reason: 'stop', message: finalMessage });
+      output.end(finalMessage);
+    } catch {
+      operation.failure ??= appError(signal.aborted ? 'compaction_cancelled' : 'compaction_failed', 'runtime', 'Native summary request failed.');
+      const message = systemError(operation.failure, model, signal.aborted ? 'aborted' : 'error');
+      output.push({ type: 'error', reason: message.stopReason as 'aborted' | 'error', error: message });
+      output.end(message);
+    } finally {
+      if (active && call) active.modelCalls.push({ callSequence: call.modelCallIndex,
+        durationMs: Math.max(0, performance.now() - callStartedAt), complete });
+      if (trace) try { this.dependencies.promptTrace?.end(trace); } catch { /* Diagnostics are optional. */ }
+    }
+  }
+
   private wrapStream(record: SessionRecord, session: AgentSession, nativeStream: AgentStream): AgentStream {
     return (model, context, options) => {
+      const scope = record.compacting ? record.compaction?.scope : undefined;
+      if (scope) {
+        const output = createAssistantMessageEventStream();
+        const worker = this.forwardSummaryStream(record, session, scope, nativeStream, model, context, options, output);
+        record.compaction!.streams.add(worker);
+        void worker.then(() => record.compaction!.streams.delete(worker), () => record.compaction!.streams.delete(worker));
+        return output;
+      }
       const active = record.active;
       if (!active) return errorStream(model, appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
       if (active.signal.aborted) return errorStream(model, appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'), 'aborted');
@@ -1003,7 +1487,7 @@ export class PiAgentAdapter implements AgentPort {
         return errorStream(model, error);
       }
       const modelCallLimit = record.snapshot?.agent.maxModelCalls ?? 1;
-      if (active.callSequence >= modelCallLimit) {
+      if (active.modelCallIndex >= modelCallLimit) {
         this.stop(record, active);
         active.failure ??= appError(active.multiCall ? 'agent_model_call_budget' : 'agent_unexpected_continuation', 'runtime',
           active.multiCall ? 'Run 已达到模型调用次数上限。' : 'P2 Agent 请求次数超过限制。');
@@ -1034,6 +1518,7 @@ export class PiAgentAdapter implements AgentPort {
       }
 
       active.callSequence += 1;
+      active.modelCallIndex += 1;
       let requestBinding: RequestContextBinding | undefined;
       if (active.input.contextHooks) {
         const binding = this.bindContext(record, active, context, model);
@@ -1087,7 +1572,22 @@ export class PiAgentAdapter implements AgentPort {
         if (includedBindings.length + includedToolResults.length + includedNativeContexts.length > 512)
           return fail(appError('context_evidence_too_large', 'runtime', 'Request provenance exceeds its budget.'));
       }
-      const primary = [...includedBindings].reverse().find(source => source.originRunId === active.runId && source.snapshotId !== null);
+      let primary = [...includedBindings].reverse().find(source => source.originRunId === active.runId && source.snapshotId !== null);
+      if (!primary) {
+        const compacted = includedNativeContexts.filter(source => source.entryType === 'compaction');
+        for (const entry of [...record.manager.getBranch()].reverse()) {
+          const source = record.contextEntries.get(entry.id);
+          if (!source || source.originRunId !== active.runId || source.inputId === null || source.snapshotId === null
+            || !active.inputs.get(source.inputId)?.started) continue;
+          if (compacted.some(value => {
+            const summary = record.manager.getEntry(value.nativeEntryId);
+            if (summary?.type !== 'compaction') return false;
+            const prefix = record.manager.getBranch(summary.parentId ?? undefined);
+            const original = prefix.findIndex(value => value.id === entry.id), cut = prefix.findIndex(value => value.id === summary.firstKeptEntryId);
+            return original >= 0 && cut > original;
+          })) { primary = source; break; }
+        }
+      }
       if (!primary || primary.inputId === null)
         return fail(appError('context_binding_unknown', 'runtime', 'The current request has no saved input context.'));
       const parsed = RequestContextBindingSchema.safeParse({ runId: active.runId, sessionId: active.sessionId,
@@ -1120,7 +1620,7 @@ export class PiAgentAdapter implements AgentPort {
         missingEvidence: observation.afterDomain === 'unknown' || observation.afterDomain === 'invalid' }];
     });
     const facts = {
-      remainingModelCalls: Math.max(0, maxModelCalls - active.callSequence),
+      remainingModelCalls: Math.max(0, maxModelCalls - active.modelCallIndex),
       remainingToolCalls: Math.max(0, budget.maxToolCalls - active.toolRequests.size),
       remainingRunMs: remainingMs === undefined ? null : Math.max(0, Math.floor(remainingMs)),
       tools: allowed.map(name => { const group = strategy?.calibration.groups.find(item => item.toolName === name);
@@ -1142,12 +1642,12 @@ export class PiAgentAdapter implements AgentPort {
     return { content: [{ type: 'text' as const, text: error.message }], details: {}, isError: true };
   }
 
-  private verifyModelUse(record: SessionRecord): Result<void> {
+  private verifyModelUse(record: SessionRecord, settledCompactionFailure = false): Result<void> {
     const active = record.active;
     if (!active) return fail(appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
     if (record.historyFailure) return fail(record.historyFailure);
     if (record.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
-    if (active.failure) return fail(active.failure);
+    if (active.failure && !settledCompactionFailure) return fail(active.failure);
     if (active.signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'));
     try {
       const allowed = active.input.verifyModelUse();
@@ -1202,8 +1702,8 @@ export class PiAgentAdapter implements AgentPort {
       const normalized = normalizeUsage(event.message, { attempts: Math.max(0, active.attempts - active.attemptsAtCallStart),
         complete: active.complete && event.message.stopReason !== 'error' && event.message.stopReason !== 'aborted' }, record.config?.connection === undefined);
       if (normalized.usage.version === 1) {
-        const prior = active.modelCallUsages.findIndex(item => item.callSequence === active.callSequence);
-        const usage: ModelCallUsage = { callSequence: active.callSequence, usage: normalized.usage, tokens: normalized.tokens,
+        const prior = active.modelCallUsages.findIndex(item => item.callSequence === active.modelCallIndex);
+        const usage: ModelCallUsage = { callSequence: active.modelCallIndex, usage: normalized.usage, tokens: normalized.tokens,
           complete: normalized.usage.attemptsComplete };
         if (prior < 0) active.modelCallUsages.push(usage); else active.modelCallUsages[prior] = usage;
       }
@@ -1421,7 +1921,7 @@ export class PiAgentAdapter implements AgentPort {
     output: ReturnType<typeof createAssistantMessageEventStream>,
     requestBinding?: RequestContextBinding,
   ): Promise<void> {
-    const callSequence = active.callSequence;
+    const callSequence = active.modelCallIndex;
     const callStartedAt = performance.now();
     let outputEnded = false;
     let finalMessage: AssistantMessage | undefined;
@@ -1614,10 +2114,16 @@ export class PiAgentAdapter implements AgentPort {
         }
         if (event.type === 'error') {
           finalMessage = event.error;
-          active.failure ??= event.error.stopReason === 'length'
-            ? appError('agent_incomplete_response', 'runtime', 'Agent 回复因输出限制提前结束。')
-            : this.providerError(active, event.error);
-          active.stopReason = active.failure.code;
+          // Fixed SDK owns its one compact-and-continue recovery; defer only this actual native overflow.
+          const recoverable = session.autoCompactionEnabled && !active.signal.aborted && !active.failure
+            && event.error.provider === model.provider && event.error.model === model.id
+            && isContextOverflow(event.error, model.contextWindow);
+          if (!recoverable) {
+            active.failure ??= event.error.stopReason === 'length'
+              ? appError('agent_incomplete_response', 'runtime', 'Agent 回复因输出限制提前结束。')
+              : this.providerError(active, event.error);
+            active.stopReason = active.failure.code;
+          }
         }
         if (event.type === 'done') {
           finalMessage = event.message;
@@ -1671,6 +2177,12 @@ export class PiAgentAdapter implements AgentPort {
     if (!active.responseStarted && (active.signal.aborted || streamFailed)) active.complete = false;
     active.modelCalls.push({ callSequence, durationMs: Math.max(0, performance.now() - callStartedAt),
       complete: active.complete && !streamFailed && !active.signal.aborted });
+    try {
+      const reference = { runId: active.runId, sessionId: active.sessionId, nativeSessionId: active.nativeSessionId, callSequence };
+      this.dependencies.promptTrace?.append(reference, { at: now().at, event: 'native_terminal',
+        summary: `Native model stream settled · stop=${safeTraceStopReason(finalMessage?.stopReason) ?? 'other'}`, truncated: false });
+      this.dependencies.promptTrace?.end(reference);
+    } catch { /* Diagnostics are optional. */ }
   }
 
   private observe(
@@ -1698,7 +2210,7 @@ export class PiAgentAdapter implements AgentPort {
       runId: active.runId,
       sessionId: active.sessionId,
       nativeSessionId: active.nativeSessionId,
-      callSequence: active.callSequence,
+      callSequence: active.modelCallIndex, purpose: 'answer', answerRequestSequence: active.callSequence,
     };
     try {
       if (type === 'model_request') buffer.begin(reference);
@@ -1778,7 +2290,8 @@ export class PiAgentAdapter implements AgentPort {
     if (!session || !model || !record.snapshot || !record.config || record.unusable) {
       return this.notStarted(nativeSessionId, appError('agent_session_unusable', 'session', 'Agent Session 不能继续执行。'));
     }
-    if (record.running || !session.isIdle) return this.notStarted(nativeSessionId, appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
+    if (record.preparing || record.running || record.compacting || !session.isIdle)
+      return this.notStarted(nativeSessionId, appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
     if (!Number.isSafeInteger(input.runId) || input.runId <= 0 || !Number.isSafeInteger(input.sessionId) || input.sessionId <= 0) {
       return this.notStarted(nativeSessionId, appError('agent_execution_invalid', 'input', 'Agent Run 身份无效。'));
     }
@@ -1811,13 +2324,15 @@ export class PiAgentAdapter implements AgentPort {
       goalMode: input.goalMode ?? 'answer',
       ...(input.toolBinding ? { toolBinding: input.toolBinding } : {}),
       toolRequests: new Map(), assistantBindings: new WeakMap(), modelCallUsages: [], modelCalls: [], attemptsAtCallStart: 0, totalOutputBytes: 0,
-      callSequence: 0, turnOrdinal: 0, attempts: 0, responseStatus: null,
+      callSequence: 0, modelCallIndex: 0, turnOrdinal: 0, attempts: 0, responseStatus: null,
       responseStarted: false, complete: false, wireMaxTokens: null,
       text: '', textBytes: 0, assistantContentBytes: 0, failure: null,
       promptEntered: true, streams: new Set(), abortPromise: null, stopReason: 'pending',
     };
     record.running = true;
     record.active = active;
+    session.setAutoCompactionEnabled(!!record.compactionBridge && record.snapshot.compactionPolicy?.autoEnabled === true
+      && !!input.contextHooks?.compaction && !!record.memory && !!record.receipt && !!record.recoverySeed);
     const unsubscribe = session.subscribe((event) => {
       if (event.type === 'message_end' && event.message.role === 'assistant')
         for (const block of event.message.content) if (block.type === 'toolCall' && !this.guardInheritedTool(record, block.id).ok) return;
@@ -1896,6 +2411,7 @@ export class PiAgentAdapter implements AgentPort {
         : appError('agent_execution_failed', 'runtime', 'Agent 执行失败。', true);
       active.stopReason = active.failure.code;
     } finally {
+      session.setAutoCompactionEnabled(false);
       this.closeInputAdmission(active);
       await record.dispatchTail;
       if (session.isIdle) {
@@ -1946,7 +2462,31 @@ export class PiAgentAdapter implements AgentPort {
 
       const stopped = promptSettled && session.isIdle && active.streams.size === 0;
       if (!stopped) active.failure ??= appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true);
-      if (active.promptEntered && active.failure) record.unusable = true;
+      const compaction = record.compaction;
+      // A next-assistant preparation failure makes fixed AgentCore append one observed empty terminal.
+      // Keep that committed entry; it is not an unsubmitted tail or a new Provider response.
+      const savedCompaction = compaction?.observation.saved;
+      const failureTail = savedCompaction ? record.manager.getEntries().slice(savedCompaction.entryCount) : [];
+      const terminal = failureTail.length === 1 && failureTail[0]?.type === 'message' ? failureTail[0] : null;
+      const terminalMessage = terminal?.message;
+      const committedNativeFailure = savedCompaction && terminal && terminalMessage?.role === 'assistant'
+        && terminal.parentId === savedCompaction.leafId && record.receipt?.leafId === terminal.id
+        && record.receipt.entryCount === savedCompaction.entryCount + 1 && record.receipt.commitRevision === savedCompaction.commitRevision + 1
+        && terminalMessage === session.messages.at(-1) && active.liveOrdinals.has(terminalMessage)
+        && !active.assistantBindings.has(terminalMessage) && (terminalMessage.stopReason === 'error' || terminalMessage.stopReason === 'aborted')
+        && terminalMessage.content.length === 1 && terminalMessage.content[0]?.type === 'text' && terminalMessage.content[0].text === ''
+        && calculateContextTokens(terminalMessage.usage) === 0
+        && record.recoverySeed?.origins.some(origin => origin.nativeEntryId === terminal.id && origin.originRunId === active.runId
+          && origin.originSessionId === active.sessionId);
+      const intactCompactionFailure = compaction?.observation.runId === active.runId
+        && compaction.failure === active.failure && compaction.observation.stopped && !compaction.observation.stopRequested
+        && ['compaction_failed', 'compaction_capacity_exceeded', 'agent_model_call_budget', 'agent_context_limit', 'agent_content_limit']
+          .includes(compaction.failure?.code ?? '')
+        && stopped && !signal.aborted && !record.historyFailure && !record.unusable
+        && (isDeepStrictEqual(record.receipt, compaction.observation.generated ? compaction.observation.saved : compaction.baseline)
+          || committedNativeFailure)
+        && this.verifyModelUse(record, true).ok && this.validateMessages(record, session.messages, true).ok;
+      if (active.promptEntered && active.failure && !intactCompactionFailure) record.unusable = true;
       if (record.memory && !record.historyFailure) {
         const snapshot = this.exportSession(nativeSessionId);
         const saved = snapshot.ok ? record.memory.save(snapshot.data, []) : snapshot;
@@ -1976,7 +2516,7 @@ export class PiAgentAdapter implements AgentPort {
         tokens: usage.tokens,
         stopped,
         cleanupErrors: active.failure?.code === 'agent_cleanup_failed' ? [active.failure] : stopped ? [] : [appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true)],
-        agent: { nativeSessionId, turnCount: active.turnOrdinal, modelCallCount: active.callSequence, modelCalls: active.modelCalls,
+        agent: { nativeSessionId, turnCount: active.turnOrdinal, modelCallCount: active.modelCallIndex, modelCalls: active.modelCalls,
           ...(input.inputId !== undefined && stopped && active.queueCleared && !record.historyFailure
             ? { confirmedUnconsumedInputIds: [...active.inputs.values()].filter(value => !value.started).map(value => value.inputId) } : {}) },
       };
@@ -2000,10 +2540,10 @@ export class PiAgentAdapter implements AgentPort {
   public async releaseSession(nativeSessionId: string): Promise<CloseReport> {
     const record = this.sessions.get(nativeSessionId);
     if (!record) return { stopped: true, closed: true, errors: [] };
-    if (record.preparing || record.running || (record.session && !record.session.isIdle)) {
+    if (record.preparing || record.running || record.compacting || (record.session && !record.session.isIdle)) {
       return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Agent Session 仍在执行。', true)] };
     }
-    try { record.session?.dispose(); }
+    try { record.compactionBridge?.dispose(); record.session?.dispose(); }
     catch { return { stopped: true, closed: false, errors: [appError('agent_cleanup_failed', 'runtime', 'Agent Session 清理失败。', true)] }; }
     this.sessions.delete(nativeSessionId);
     return { stopped: true, closed: true, errors: [] };

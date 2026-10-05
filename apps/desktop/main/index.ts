@@ -88,6 +88,8 @@ import { DesktopSessionInputRequestSchema, InvoiceFormRunInputSchema } from '../
 import { contextHostFailure, matchesContextResponse, parseContextHostResult } from '../../host/protocol.ts';
 import { historyHostFailure, matchesHistoryResponse, parseHistoryHostResult, parseHostCommand, isHistoryHostCommand } from '../../host/protocol.ts';
 import type { HostCommand } from '../../host/protocol.ts';
+import { DesktopSessionCompactionRequestSchema } from '@flowmate/contracts';
+import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
 const channels = {
@@ -109,6 +111,9 @@ const channels = {
   listContextSnapshots: 'flowmate:list-context-snapshots',
   queryContextSnapshot: 'flowmate:query-context-snapshot',
   listContextRequests: 'flowmate:list-context-requests',
+  compactSession: 'flowmate:compact-session',
+  querySessionCompaction: 'flowmate:query-session-compaction',
+  cancelSessionCompaction: 'flowmate:cancel-session-compaction',
   createSession: 'flowmate:create-session',
   queryNativeTools: 'flowmate:query-native-tools',
   chooseWorkingDirectory: 'flowmate:choose-working-directory',
@@ -300,6 +305,7 @@ async function bootstrap(): Promise<void> {
       return;
     }
     const desktopEvent = event.type === 'agent_run_event' ? event.value : event as DesktopEvent;
+    if (desktopEvent.type === 'compaction_observation' && !parseCompactionNotification(desktopEvent)) return;
     if (desktopEvent.type === 'message_upsert' && !MessageUpsertEventSchema.safeParse(desktopEvent).success) return;
     for (const [webContentsId] of subscriptions) {
       const contents = BrowserWindow.getAllWindows().find((window) => window.webContents.id === webContentsId)?.webContents;
@@ -415,13 +421,27 @@ async function contextIpcQuery(command: Extract<HostCommand, { type: 'list_conte
     return checked !== null && matchesContextResponse(command, checked) ? checked : contextHostFailure();
   } catch { return contextHostFailure(); }
 }
+async function compactionIpcRequest(command: HostCommand) {
+  const epoch = host.connectionEpoch;
+  try {
+    const { version: _version, ...request } = command;
+    const checked = parseCompactionHostResult(command.type, await host.request(request));
+    return epoch === host.connectionEpoch && checked !== null && matchesCompactionResponse(command, checked)
+      ? checked : compactionHostFailure();
+  } catch {
+    return command.type === 'compact_session'
+      ? fail(appError('operation_result_unknown', 'runtime', 'The receipt is unknown. Query this operation before any new attempt.'))
+      : compactionHostFailure();
+  }
+}
 
 function registerIpc(): void {
   if (ipcRegistered) return;
   ipcRegistered = true;
   const handle = (channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>) => {
     ipcMain.handle(channel, async (event, ...args) => {
-      const failure = (error: import('@flowmate/contracts').AppError) => [channels.querySessionHistory, channels.querySessionHistoryEntry, channels.forkSession, channels.branchSession].some(value => value === channel)
+      const failure = (error: import('@flowmate/contracts').AppError) => [channels.compactSession, channels.querySessionCompaction, channels.cancelSessionCompaction].some(value => value === channel)
+        ? compactionHostFailure() : [channels.querySessionHistory, channels.querySessionHistoryEntry, channels.forkSession, channels.branchSession].some(value => value === channel)
         ? historyHostFailure() : channel === channels.queryRuntimeEvents
         ? { ok: false, error, context: null }
         : (channel === channels.listContextSnapshots || channel === channels.queryContextSnapshot || channel === channels.listContextRequests)
@@ -506,6 +526,26 @@ function registerIpc(): void {
     return contextIpcQuery({ version: 1, requestId: 'context-ipc', type: 'list_context_requests', input: input.data });
   });
   handle(channels.createSession, async (_event, inputRaw) => createSession(inputRaw));
+  for (const [channel, type] of [[channels.querySessionCompaction, 'query_session_compaction'],
+    [channels.cancelSessionCompaction, 'cancel_session_compaction']] as const) {
+    handle(channel, async (_event, raw) => {
+      const command = parseHostCommand({ version: 1, requestId: randomUUID(), type, input: raw });
+      if (!command || !isCompactionHostCommand(command.type)) return fail(appError('input_invalid', 'input', 'Compaction request is invalid.'));
+      return compactionIpcRequest(command);
+    });
+  }
+  handle(channels.compactSession, async (_event, raw) => {
+    const input = DesktopSessionCompactionRequestSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Compaction request is invalid.'));
+    const state = await readDesktopState();
+    if (!state.ok || !state.data.ready) return compactionHostFailure();
+    const profile = state.data.settings.models.find(value => value.id === input.data.modelId);
+    if (!profile || state.data.modelCredentials[profile.id] !== 'configured')
+      return fail(appError('compaction_unavailable', 'runtime', 'Choose a model with configured credentials.'));
+    const command = parseHostCommand({ version: 1, requestId: randomUUID(), type: 'compact_session', input: input.data,
+      expectedSettingsRevision: state.data.settings.revision, expectedCredentialRef: profile.credentialRef });
+    return command ? compactionIpcRequest(command) : compactionHostFailure();
+  });
   handle(channels.queryNativeTools, async () => productHostRequest({ type: 'query_native_tools' }, 'Native tool availability could not be loaded.'));
   handle(channels.chooseWorkingDirectory, async () => {
     if (!mainWindow || mainWindow.isDestroyed()) return fail(appError('desktop_not_ready', 'runtime', 'The directory picker is not ready.', true));

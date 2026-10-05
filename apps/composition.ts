@@ -24,6 +24,7 @@ export type ApplicationOptions = {
   sampleSource?: 'production' | 'test' | 'evaluation';
   toolDefinitions?: (definitions: readonly ToolDefinition<any, any>[]) => readonly ToolDefinition<any, any>[];
   invoiceFormBridge?: (request: InvoiceFormBridgeRequest, signal: AbortSignal) => Promise<InvoiceFormApplicationReceipt>;
+  observeCompaction?: (value: import('@flowmate/contracts').CompactionObservation) => void;
 };
 
 export async function createApplication(options: ApplicationOptions): Promise<Result<Application>> {
@@ -87,6 +88,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     provider,
     agent,
     runtimeDefaults: options.runtimeDefaults,
+    observeCompaction: options.observeCompaction,
     runtimePolicy: options.runtimePolicy, sampleSource: options.sampleSource,
     log: logger,
     now,

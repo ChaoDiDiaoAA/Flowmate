@@ -22,6 +22,8 @@ import type { CandidateSnapshot } from './activity.ts';
 import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput } from './invoice.ts';
 import type { ContextHooks } from './context.ts';
 import type { HistoryCommitState, HistoryCommitReceipt, NativeHistoryRecoverySeed, NativeHistoryWrite, NativeHistoryInspection } from './memory.ts';
+import type { CompactionPolicy, CompactionCapacity, SavedCompactionView, CompactionObservation,
+  NativeCompactionControl, NativeCompactionOutcome } from './compaction.ts';
 
 export type SaveCandidateRecord = {
   runId: DbId;
@@ -42,6 +44,7 @@ export interface CandidateRepository {
 }
 
 export type SafeConfigSnapshot = {
+  compactionPolicy?: CompactionPolicy;
   version: 1 | 2;
   name: string;
   revision: number;
@@ -248,6 +251,10 @@ export interface PreparedAgent {
 }
 
 export interface AgentPort {
+  compactSession?(nativeSessionId: string, control: NativeCompactionControl): Promise<NativeCompactionOutcome>;
+  inspectSessionCompaction?(input: { history: import('./runtime.ts').NativeSessionHistory; seed: NativeHistoryRecoverySeed;
+    commit: HistoryCommitState }): Result<{ capacity: CompactionCapacity; lastSaved: SavedCompactionView | null;
+      operation: CompactionObservation | null }>;
   createSession(): Result<{ nativeSessionId: string }>;
   exportSession?(nativeSessionId: string): Result<import('./runtime.ts').NativeSessionHistory>;
   restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void>;
@@ -268,7 +275,7 @@ export interface AgentPort {
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
     options?: { activeToolNames?: readonly string[]; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
-      runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot },
+      runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot; compactionPolicy?: CompactionPolicy },
   ): Promise<Result<PreparedAgent>>;
   releaseSession(nativeSessionId: string): Promise<CloseReport>;
   close(): Promise<CloseReport>;

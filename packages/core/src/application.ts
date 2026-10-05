@@ -17,6 +17,9 @@ import {
   ContextSnapshotsResultSchema,
   ContextSnapshotResultSchema,
   ContextRequestsResultSchema,
+  normalizeSessionCompactionRequest,
+  normalizeSessionCompactionQuery,
+  normalizeSessionCompactionCancel,
   ok,
 } from '@flowmate/contracts';
 import type {
@@ -55,6 +58,9 @@ import type { ContextService } from './context/service.ts';
 import type { z } from 'zod';
 
 export interface RuntimeServicePort {
+  compactSession: Application['compactSession'];
+  querySessionCompaction: Application['querySessionCompaction'];
+  cancelSessionCompaction: Application['cancelSessionCompaction'];
   callProvider(
     request: ProviderRequest,
     control?: ProviderControl,
@@ -107,6 +113,18 @@ export function makeApplication(
   let finalCloseResult: Result<CloseReport> | null = null;
   const closeErrors = new Map<string, ReturnType<typeof appError>>();
   return {
+    compactSession: async raw => {
+      const request = normalizeSessionCompactionRequest(raw);
+      return request.ok ? runtime.compactSession(request.data) : request;
+    },
+    querySessionCompaction: async raw => {
+      const request = normalizeSessionCompactionQuery(raw);
+      return request.ok ? runtime.querySessionCompaction(request.data) : request;
+    },
+    cancelSessionCompaction: async raw => {
+      const request = normalizeSessionCompactionCancel(raw);
+      return request.ok ? runtime.cancelSessionCompaction(request.data) : request;
+    },
     callProvider: async (raw, control) => {
       const normalized = normalizeProviderRequest(raw);
       return normalized.ok ? runtime.callProvider(normalized.data, control) : normalized;

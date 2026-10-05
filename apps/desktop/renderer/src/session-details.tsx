@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CandidateJobDetail, ContextReference, ContextSnapshotDetail, ContextSnapshotsPage,
-  ContextRequestsPage, Result, SessionRunsPage } from '@flowmate/contracts';
-import { acceptContextRead, beginContextRead, contextReadLease, createContextRead, failContextRead, finishContextRead,
-  matchesContextRead, sameContextIdentity, type ContextIdentity } from './context-state.ts';
+  ContextRequestsPage, SessionRunsPage } from '@flowmate/contracts';
+import { useRead, type ContextIdentity } from './context-state.ts';
 import { SessionHistory } from './session-history.tsx';
+import { SessionCompaction } from './session-compaction.tsx';
 import type { ForkSessionRequest, ForkSessionResult } from '@flowmate/contracts';
 
 export type ContextBasis = Readonly<{ sessionId: number; runId: number; context: ContextReference }>;
 type Props = { sessionId: number; hostEpoch: number; hostReady: boolean; navigationToken: number;
+  modelId: string | null; models: readonly { id: string; name: string }[]; onModelChange(id: string): void;
   initialForkRequest: ForkSessionRequest | null; onForkRequest(request: ForkSessionRequest | null): void;
   historySelectionToken: number; captureHistorySelection(): () => boolean;
   initialRunId?: number | null;
@@ -18,35 +19,6 @@ type Props = { sessionId: number; hostEpoch: number; hostReady: boolean; navigat
   basis: ContextBasis | null; refreshToken: number; sourceError: string | null; onRunChange(runId: number | null): void; onClose(): void;
   onOpenCandidateBasis(candidate: CandidateJobDetail['candidate']): void };
 
-function useRead<T>(identity: ContextIdentity, scope = '') {
-  const state = useRef(createContextRead<T>(identity)), scopeRef = useRef(scope), sequence = useRef(0), alive = useRef(true);
-  const [, render] = useState(0);
-  if (!sameContextIdentity(state.current.identity, identity) || scopeRef.current !== scope) {
-    state.current = createContextRead<T>(identity); scopeRef.current = scope;
-  }
-  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
-  async function read(key: string, query: () => Promise<Result<T>>, verify: (data: T) => boolean,
-    merge?: (previous: T | null, next: T) => T): Promise<T | null> {
-    state.current = beginContextRead(state.current, ++sequence.current, key);
-    const lease = contextReadLease(state.current); render(value => value + 1);
-    try {
-      const result = await query();
-      if (!alive.current || !matchesContextRead(state.current, lease)) return null;
-      if (!result.ok) state.current = failContextRead(state.current, lease, result.error.message);
-      else if (!verify(result.data)) state.current = failContextRead(state.current, lease, 'The saved context could not be verified.');
-      else { state.current = acceptContextRead(state.current, lease, merge ? merge(state.current.data, result.data) : result.data); return result.data; }
-      return null;
-    } catch {
-      if (alive.current) state.current = failContextRead(state.current, lease, 'Context could not be loaded. Refresh to try again.');
-      return null;
-    } finally {
-      if (alive.current && matchesContextRead(state.current, lease)) {
-        state.current = finishContextRead(state.current, lease); render(value => value + 1);
-      }
-    }
-  }
-  return { state: state.current, read };
-}
 function ReadIssue({ error, pending }: { error: string | null; pending: boolean }) {
   return <>{error && <p className="notice bad" role="alert">{error}</p>}{pending && <p role="status">Loading context…</p>}</>;
 }
@@ -232,6 +204,8 @@ export function SessionDetails(props: Props) {
     <SessionHistory sessionId={props.sessionId} hostEpoch={props.hostEpoch} navigationToken={props.navigationToken} hostReady={props.hostReady}
       initialForkRequest={props.initialForkRequest} onForkRequest={props.onForkRequest} captureSelection={props.captureHistorySelection} selectionToken={props.historySelectionToken}
       onBranch={props.onHistoryBranch} onFork={props.onHistoryFork} onOwner={(sessionId, runId) => void openOwner(sessionId, runId)} />
+    <SessionCompaction identity={identity} hostReady={props.hostReady} refreshToken={props.refreshToken}
+      models={props.models} modelId={props.modelId} onModelChange={props.onModelChange} />
     {ownerError && <p role="alert">{ownerError}</p>}
     <h3>Context</h3><p className="config-note">Saved context and request evidence are separate from the model's answer.</p>
     {props.sourceError && <p className="notice bad" role="alert">{props.sourceError}</p>}
