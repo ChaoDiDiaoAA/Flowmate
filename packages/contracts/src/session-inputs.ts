@@ -7,6 +7,8 @@ import type { InvoiceFormTarget } from './invoice.ts';
 import { LegacyWorkspaceContextSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema } from './workspace.ts';
 import type { GoalMode, WorkspaceContext, WorkspaceExpectation, WorkspaceInput } from './workspace.ts';
 import { normalizeProviderConfig, WorkingDirectorySchema } from './schemas.ts';
+import { ResourceRefSchema, ResourceBindingSchema } from './resources.ts';
+import type { ResourceRef } from './resources.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const text = z.string().refine(value => value.trim().length > 0 && new TextEncoder().encode(value).length <= 65_000);
@@ -29,6 +31,7 @@ export const LegacySessionInputRequestSchema = z.object({
 'Fill requires the selected candidate in the same Session.');
 const promptSchema = z.object({
   sessionId: id, clientSequence: id, mode: z.literal('prompt'), goalMode: z.enum(['answer', 'save-candidate']).default('answer'), text,
+  requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional(),
   config: providerConfig, workspace: WorkspaceExpectationSchema.optional(),
   workingDirectory: WorkingDirectorySchema.optional(), ...RuntimeRequestOverridesSchema.shape,
 }).strict().refine(value => (!value.workspace || value.workspace.sessionId === value.sessionId)
@@ -36,17 +39,19 @@ const promptSchema = z.object({
   && (value.goalMode !== 'save-candidate' || !!value.workspace?.documentRef && !!value.workspace.jobId),
 'Prompt requires a compatible Workspace and business target.');
 const activeSchema = z.object({ sessionId: id, clientSequence: id, mode: z.enum(['steer', 'followUp']),
-  runId: id, text, workspace: WorkspaceExpectationSchema.optional() }).strict()
+  runId: id, text, workspace: WorkspaceExpectationSchema.optional(),
+  requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional() }).strict()
   .refine(value => !value.workspace || value.workspace.sessionId === value.sessionId, 'Input belongs to a different Session.');
 const fillSchema = z.object({
   sessionId: id, clientSequence: id, mode: z.literal('prompt'), goalMode: z.literal('fill-form'), text,
+  requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional(),
   config: providerConfig, workspace: WorkspaceExpectationSchema, formTarget: InvoiceFormTargetSchema,
   ...RuntimeRequestOverridesSchema.shape,
 }).strict().refine(value => value.workspace.sessionId === value.sessionId
   && value.workspace.documentRef !== null && value.workspace.jobId !== null && value.workspace.candidateRef !== null,
 'Fill requires the selected candidate in the same Session.');
 export const SessionInputRequestSchema = z.union([fillSchema, promptSchema, activeSchema]);
-type InputBase = { sessionId: DbId; clientSequence: DbId; text: string };
+type InputBase = { sessionId: DbId; clientSequence: DbId; text: string; requiredSkill?: ResourceRef };
 export type PromptInputRequest = InputBase & { mode: 'prompt'; config: ProviderConfig; workspace?: WorkspaceExpectation;
   goalMode?: 'answer' | 'save-candidate'; workingDirectory?: string; budget?: RuntimeBudgetOverrides; timeoutMs?: number; stopGraceMs?: number };
 export type FillInputRequest = InputBase & { mode: 'prompt'; goalMode: 'fill-form'; config: ProviderConfig;
@@ -78,6 +83,7 @@ export type SessionInputContentV1 = z.infer<typeof LegacySessionInputContentSche
 export const SessionInputContentV2Schema = z.object({ version: z.literal(2), text: z.string(),
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id), promptText: z.string().min(1),
+  resourceBinding: ResourceBindingSchema.optional(),
   desktopRequestHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   requestIdentityVersion: z.literal(1).optional(), originalBudgetOverrides: RuntimeRequestOverridesSchema.optional(),
 }).strict().refine(value => (value.requestIdentityVersion !== undefined) === (value.originalBudgetOverrides !== undefined),

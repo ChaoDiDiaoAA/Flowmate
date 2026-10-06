@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
-import { appError, fail, ok, RuntimeRequestOverridesSchema } from '@flowmate/contracts';
+import { appError, fail, ok, RuntimeRequestOverridesSchema, ResourceSelectionSchema, EMPTY_RESOURCE_SELECTION } from '@flowmate/contracts';
 import type { ProductSettings, Result } from '@flowmate/contracts';
 
 const modelSchema = z.object({
@@ -30,7 +30,7 @@ const modelSchema = z.object({
 }, 'baseUrl must be a credential-free HTTP URL');
 
 const settingsSchema = z.object({
-  version: z.literal(3),
+  version: z.literal(4),
   revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   profile: z.object({
     displayName: z.string().trim().min(1).max(80),
@@ -39,6 +39,7 @@ const settingsSchema = z.object({
   models: z.array(modelSchema).max(32),
   defaultModelId: z.string().min(1).nullable(),
   runtime: RuntimeRequestOverridesSchema,
+  resources: ResourceSelectionSchema,
   updatedAt: z.string().datetime({ offset: true }),
 }).strict().refine((settings) => {
   const ids = new Set(settings.models.map((model) => model.id));
@@ -48,7 +49,8 @@ const settingsSchema = z.object({
 }, 'model IDs must be unique and the default must exist');
 
 export function defaultProductSettings(now = new Date().toISOString()): ProductSettings {
-  return { version: 3, revision: 0, profile: { displayName: 'Local user', theme: 'system' }, models: [], defaultModelId: null, runtime: {}, updatedAt: now };
+  return { version: 4, revision: 0, profile: { displayName: 'Local user', theme: 'system' }, models: [], defaultModelId: null,
+    runtime: {}, resources: EMPTY_RESOURCE_SELECTION, updatedAt: now };
 }
 
 export function validateProductSettings(value: unknown): Result<ProductSettings> {
@@ -58,7 +60,10 @@ export function validateProductSettings(value: unknown): Result<ProductSettings>
   const normalized = old !== null && typeof old === 'object' && !Array.isArray(old)
     && (old as { version?: unknown }).version === 2 && !('runtime' in old)
     ? { ...old, version: 3, runtime: {} } : old;
-  const parsed = settingsSchema.safeParse(normalized);
+  const upgraded = normalized !== null && typeof normalized === 'object' && !Array.isArray(normalized)
+    && (normalized as { version?: unknown }).version === 3 && !('resources' in normalized)
+    ? { ...normalized, version: 4, resources: EMPTY_RESOURCE_SELECTION } : normalized;
+  const parsed = settingsSchema.safeParse(upgraded);
   return parsed.success
     ? ok(parsed.data)
     : fail(appError('config_settings_invalid', 'input', 'Model/Profile 配置无效。'));

@@ -10,7 +10,7 @@ import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, mk
 
 it.afterEach(cleanupResources);
 
-it('P7 Workspace is the seventh shared navigation destination and preserves a null saved chat', async () => {
+it('P7 Workspace remains in shared navigation and preserves a null saved chat', async () => {
   it.setTimeout(45_000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p7-empty-workspace-'));
   const env: Record<string, string> = { FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData };
@@ -22,7 +22,7 @@ it('P7 Workspace is the seventh shared navigation destination and preserves a nu
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
-    await expect(page.locator('.rail .nav-item')).toHaveCount(7, { timeout: 3000 });
+    await expect(page.locator('.rail .nav-item')).toHaveCount(9, { timeout: 3000 });
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
     await expect(page.getByTestId('workspace-page')).toBeVisible();
     await expect(page.getByTestId('workspace-summary')).toContainText('No invoice selected');
@@ -350,7 +350,7 @@ it('P7 real Workspace selects every saved field and line, pages sources, freezes
     await waitFor(() => page.evaluate(async () => { const value = await window.flowmate.getState(); return value.ok && value.data.ready; }));
     const prepared = await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error('Missing settings');
-      const settings = await window.flowmate.saveSettings({ ...state.data.settings, version: 3,
+      const settings = await window.flowmate.saveSettings({ ...state.data.settings,
         runtime: { timeoutMs: 90_000, stopGraceMs: 500 }, models: [{ id: 'p7-model', credentialRef: 'p7_fixture_credential',
           name: 'Controlled P7', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'p7-fixture', api: 'openai-completions',
           contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p7-model' }, { modelId: 'p7-model', apiKey: 'synthetic-p7-key' });

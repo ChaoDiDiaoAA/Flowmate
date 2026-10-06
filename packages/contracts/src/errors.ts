@@ -2,6 +2,13 @@ import type { AppError, ErrorCategory, Result } from './runtime.ts';
 import type { ContextSafeErrorCode } from './context.ts';
 
 export const CONTEXT_ERROR_FACTS: Readonly<Partial<Record<ContextSafeErrorCode, readonly [AppError['category'], boolean]>>> = {
+  resource_manifest_invalid: ['input', false], resource_name_conflict: ['input', false],
+  resource_version_changed: ['input', false], resource_dependency_missing: ['input', false],
+  resource_required_unavailable: ['input', false], resource_content_too_large: ['input', false],
+  resource_file_unavailable: ['input', false], resource_bundle_unavailable: ['storage', true],
+  resource_expansion_mismatch: ['runtime', false], resource_evidence_conflict: ['runtime', false],
+  resource_evidence_write_failed: ['storage', true], config_revision_conflict: ['input', true],
+  config_settings_write_failed: ['storage', true],
   compaction_unavailable: ['runtime', false], compaction_not_needed: ['runtime', false],
   compaction_failed: ['runtime', false], compaction_cancelled: ['runtime', false],
   compaction_timeout: ['runtime', false], compaction_capacity_exceeded: ['runtime', false],

@@ -4,13 +4,14 @@ import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidat
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
 import { RuntimeBudgetOverridesSchema, RuntimeRequestOverridesSchema } from '../../../../packages/contracts/src/runtime.ts';
 import { RUNTIME_CONFIG } from '../../../../packages/contracts/src/runtime-config.ts';
-import type { ForkSessionRequest, ForkSessionResult, HistoryCommitState, RuntimeRequestOverrides, Result, SourceRef, WorkspaceSelection, WorkspaceView } from '@flowmate/contracts';
+import type { ResourceRef, ForkSessionRequest, ForkSessionResult, HistoryCommitState, RuntimeRequestOverrides, Result, SourceRef, WorkspaceSelection, WorkspaceView } from '@flowmate/contracts';
 import { WorkspaceContextSchema } from '../../../../packages/contracts/src/workspace.ts';
 import type { DesktopInvoiceFormRunRequest, DesktopSessionInputRequest, InvoiceCandidateOperationQuery, InvoiceFormApplicationReceipt, InvoiceFormDraft, SaveInvoiceCandidateResponse, SessionInputSnapshot } from '@flowmate/contracts';
 import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoiceFormState, editInvoiceForm, invalidateInvoiceForm,
   invoiceHeaderFields, invoiceLineFields, queryInvoiceFormApplication, type InvoiceFormState } from './invoice-form.ts';
 import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, NativeToolAvailability, ProductSettings, RunSnapshot, RuntimeState, SessionCursor, SessionMessageView, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
 import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type MessageViewState } from './message-state.ts';
+import { RequiredSkillPicker, ResourcePage } from './prompt.tsx';
 import { ActivityPage } from './activity.tsx';
 import { WorkspacePage } from './workspace.tsx';
 import { SessionDetails, type ContextBasis } from './session-details.tsx';
@@ -21,10 +22,10 @@ import { createEventView, bindEventSubscription, applyEventWake, applyEventRead,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings';
+type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings' | 'prompts' | 'skills';
 const pageLabels: Record<Page, string> = {
   workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats',
-  activity: 'Activity', models: 'Models', settings: 'Settings',
+  activity: 'Activity', models: 'Models', settings: 'Settings', prompts: 'Prompts', skills: 'Skills',
 };
 type EventObservation = { view: EventViewState; wanted: boolean; opening: boolean; through?: number;
   pendingWake: RuntimeEventsWake | null; snapshot: RunSnapshot | null; tools: readonly RuntimeToolView[];
@@ -150,6 +151,7 @@ export function App() {
   const [apiKey, setApiKey] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [workingDirectory, setWorkingDirectory] = useState('');
+  const [requiredSkill, setRequiredSkill] = useState<ResourceRef | null>(null);
   const [nativeTools, setNativeTools] = useState<readonly NativeToolAvailability[]>([]);
   const [nativeToolsError, setNativeToolsError] = useState<string | null>(null);
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
@@ -678,6 +680,7 @@ export function App() {
   }
 
   async function fillInvoiceForm() {
+    const chosenSkill = requiredSkill;
     if (!persistedModel || !modelReady || busy || !workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
     const limits = parseRuntimeLimits(nextRuntimeDraft);
     if (!limits.success) { setFormFeedback('Run limits must be within the displayed ranges.'); return; }
@@ -691,7 +694,7 @@ export function App() {
         setFormFeedback('Fill input could not be confirmed. Check status before trying again.'); return;
       }
       nativeSessionIds.current.set(session.data.sessionId, session.data.nativeSessionId);
-      const input: DesktopInvoiceFormRunRequest = { target: { formInstanceId: next.formInstanceId, expectedRevision: next.revision },
+      const input: DesktopInvoiceFormRunRequest = { ...(chosenSkill ? { requiredSkill: chosenSkill } : {}), target: { formInstanceId: next.formInstanceId, expectedRevision: next.revision },
         ...limits.data,
         clientSequence: ledger.data.nextClientSequence, modelId: persistedModel.id,
         workspace: { revision: current.revision, sessionId: current.sessionId, documentRef: current.documentRef, jobId: current.jobId, candidateRef: current.candidateRef } };
@@ -2118,7 +2121,7 @@ export function App() {
     const limits = parseRuntimeLimits(runtimeDefaultsDraft);
     if (!limits.success) { setNotice({ tone: 'bad', message: 'Run limits must be within the displayed ranges.' }); return; }
     setSaving(true);
-    const saved = await window.flowmate.saveSettings({ ...state.settings, version: 3, runtime: limits.data });
+    const saved = await window.flowmate.saveSettings({ ...state.settings, runtime: limits.data });
     setSaving(false);
     if (!saved.ok) { setNotice({ tone: 'bad', message: errorMessage(saved) }); return; }
     const refreshed = await window.flowmate.getState();
@@ -2161,6 +2164,7 @@ export function App() {
   }
 
   async function sendChatMessage(override?: { sessionId: number; prompt: string; scene: WorkspaceSnapshot; hostEpoch: number; detached: boolean }) {
+    const chosenSkill = requiredSkill;
     if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
     const sendEpoch = override?.hostEpoch ?? workspaceHostEpoch.current;
     const submittedDraft = override?.prompt ?? chatInputRef.current;
@@ -2234,6 +2238,7 @@ export function App() {
     setCancelPending(false);
     setNotice(null);
     const request: DesktopSessionInputRequest = {
+      ...(chosenSkill ? { requiredSkill: chosenSkill } : {}),
       ...limits.data,
       sessionId,
       clientSequence,
@@ -2316,6 +2321,7 @@ export function App() {
   }
 
   async function appendChatInput(mode: 'steer' | 'followUp') {
+    const chosenSkill = requiredSkill;
     if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
     const sessionId = selectedSessionIdRef.current;
     const runId = activeAgentRunIdRef.current;
@@ -2343,6 +2349,7 @@ export function App() {
         setNotice({ tone: 'bad', message: 'Select this Run’s invoice context before adding an input. Your draft is preserved.' }); return;
       }
       const request: DesktopSessionInputRequest = { sessionId, clientSequence, mode, runId, text: prompt,
+        ...(chosenSkill ? { requiredSkill: chosenSkill } : {}),
         ...(hasWorkspace && current ? { workspace: { revision: current.revision, documentRef: current.documentRef,
           jobId: current.jobId, candidateRef: current.candidateRef, sessionId } } : {}),
       };
@@ -2591,6 +2598,8 @@ export function App() {
           <span className="rail-caption setup-caption">SETUP</span>
           {([
             ['models', 'Models', '◇'],
+            ['prompts', 'Prompts', '≡'],
+            ['skills', 'Skills', '✧'],
           ] as const).map(([target, label, glyph]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
             aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
@@ -2723,6 +2732,9 @@ export function App() {
             onRetryPrefix={() => chooseActivitySegment(null)}
             onOpenInvoice={id => { void navigate('workspace').then(moved => { if (moved) void selectWorkspaceDocument(id); }); }}
             onOpenProcessing={id => { void navigate('tasks').then(moved => { if (moved) void openJob(id); }); }} />
+        ) : page === 'prompts' || page === 'skills' ? (
+          <ResourcePage key={`${page}:${workspaceHostEpoch.current}`} kind={page === 'prompts' ? 'prompt' : 'skill'} hostEpoch={workspaceHostEpoch.current}
+            ready={Boolean(state?.ready)} revision={state?.settings.revision ?? 0} onSaved={async () => { const next = await window.flowmate.getState(); if (next.ok) receiveDesktopState(next.data); }} />
         ) : (
           <section className="page-content">
             <div className="page-heading">
@@ -2859,6 +2871,9 @@ export function App() {
         onSessionDetails={() => { if (selectedSessionIdRef.current !== null) openSessionDetails(selectedSessionIdRef.current); }}
         transcriptRef={chatTranscriptRef}
         input={chatInput}
+        skillPicker={<RequiredSkillPicker key={`${workspaceHostEpoch.current}:${selectedSessionId}:${canAppend ? activeAgentRunId : 'next'}`}
+          identity={{ hostEpoch: workspaceHostEpoch.current, sessionId: selectedSessionId ?? 0, runId: canAppend ? activeAgentRunId : null, selectionToken: 0 }}
+          ready={Boolean(state?.ready)} revision={state?.settings.revision ?? 0} value={requiredSkill} onChange={setRequiredSkill} />}
         runtimeLimits={<details className="next-run-limits"><summary>Next Run limits</summary>
           <p>Leave empty to use Settings. Applies once to Send or Fill with Agent.</p>
           <RuntimeLimitFields value={nextRuntimeDraft} onChange={setNextRuntimeDraft} prefix="Next Run" disabled={busy} />
@@ -3250,6 +3265,7 @@ function AgentChatPanel({
   transcriptRef,
   input,
   runtimeLimits,
+  skillPicker,
   composerRef,
   onInputChange,
   onSend,
@@ -3299,6 +3315,7 @@ function AgentChatPanel({
   transcriptRef: RefObject<HTMLDivElement | null>;
   input: string;
   runtimeLimits: ReactNode;
+  skillPicker: ReactNode;
   composerRef: RefObject<HTMLTextAreaElement | null>;
   onInputChange(value: string): void;
   onSend(): void;
@@ -3417,6 +3434,7 @@ function AgentChatPanel({
       {sessionHint && <p className="chat-config-hint">{sessionHint}</p>}
       {(selectedSession?.historyState === 'legacy-read-only' || selectedSession?.historyState === 'invalid') && input.trim() && <button className="secondary-button" type="button" disabled={!canNewChatAndSend} onClick={onNewChatAndSend}>New chat and send</button>}
       {canGenerate && <button className={`generate-toggle ${goalMode === 'save-candidate' ? 'selected' : ''}`} type="button" aria-pressed={goalMode === 'save-candidate'} onClick={() => onGoalModeChange(goalMode === 'save-candidate' ? 'answer' : 'save-candidate')}>Generate result {goalMode === 'save-candidate' ? 'for next message' : ''}</button>}
+      {skillPicker}
       {runtimeLimits}
       <label className="sr-only" htmlFor="agent-chat-input">Message to model</label>
       <textarea ref={composerRef} id="agent-chat-input" aria-label="Message to model" value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => {

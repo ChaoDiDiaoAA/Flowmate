@@ -137,7 +137,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     expect((await page.evaluate(() => window.flowmate.chooseAndImportInvoice())).ok).toBe(true);
     const prepared = await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error('Settings unavailable');
-      const saved = await window.flowmate.saveSettings({ ...state.data.settings, version: 3,
+      const saved = await window.flowmate.saveSettings({ ...state.data.settings,
         runtime: { budget: { maxModelCalls: 32, maxToolCalls: 40, toolTimeoutMs: 20_000 }, timeoutMs: 90_000, stopGraceMs: 500 },
         models: [{ id: 'form-model', credentialRef: 'form_fixture_credential',
         name: 'Form fixture', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'form-fixture', api: 'openai-completions',

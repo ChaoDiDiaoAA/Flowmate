@@ -6,6 +6,27 @@ import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, Runti
   RuntimeEventsWakeSchema, RuntimeSubscriptionResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema } from '@flowmate/contracts';
 
+it('P11 validates all five resource commands, results and original owner identity', () => {
+  const ref = { kind: 'prompt', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) }, owner = { sessionId: 1, runId: 2 };
+  const file = { ref, path: 'prompt.md' }, commands = [
+    { type: 'list_resources' }, { type: 'read_resource_file', input: file },
+    { type: 'update_resource_selection', input: { expectedRevision: 1, selection: { prompt: ref, enabledSkills: [] } } },
+    { type: 'query_run_resources', input: owner }, { type: 'read_run_resource_file', input: { ...owner, ...file } },
+  ];
+  for (const command of commands) {
+    expect(parseHostCommand({ version: 1, requestId: 'p11', ...command })).not.toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'p11', ...command, extra: 'private' })).toBeNull();
+  }
+  const parse = Reflect.get(historyProtocol, 'parseResourceHostResult'), matches = Reflect.get(historyProtocol, 'matchesResourceResponse');
+  expect(typeof parse).toBe('function'); expect(typeof matches).toBe('function');
+  if (typeof parse !== 'function' || typeof matches !== 'function') throw new Error('Resource boundary is missing.');
+  const command = parseHostCommand({ version: 1, requestId: 'p11', type: 'query_run_resources', input: owner })!;
+  const result = { ok: true, data: { ...owner, frozen: null, evidence: null, gap: 'legacy-not-collected' } } as const;
+  expect(parse(command.type, result)).toEqual(result); expect(matches(command, result)).toBe(true);
+  expect(matches(command, { ...result, data: { ...result.data, runId: 3 } })).toBe(false);
+  expect(parse(command.type, { ...result, data: { ...result.data, sdk: 'private' } })).toBeNull();
+});
+
 describe('P7 Workspace protocol', () => {
   it('accepts only the parameterless restore command and registered selections', () => {
     const envelope = { version: 1, requestId: 'p7-restore', type: 'restore_workspace' } as const;
@@ -378,5 +399,24 @@ it('P10 Host commands retain compaction identity and refuse renderer-supplied na
       code: 'storage_write_failed', category: 'storage', retryable: true, message: 'PRIVATE_PROVIDER_TEXT' } });
     expect(JSON.stringify(failure)).not.toContain('PRIVATE_PROVIDER_TEXT');
     expect(failure).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+  }
+});
+
+
+it('P11 necessary Skill references cross every input command without allowing a Prompt reference or native facts', () => {
+  const requiredSkill = { kind: 'skill', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) } as const;
+  const workspace = { revision: 1, documentRef: { id: 3, version: 'v1' }, jobId: 4, candidateRef: { id: 5, sequence: 1 }, sessionId: 7 };
+  const inputs = [
+    { type: 'start_run', input: { sessionId: 7, text: 'invoice', modelId: 'invoice', goalMode: 'answer', requiredSkill } },
+    { type: 'submit_invoice_form_input', input: { modelId: 'invoice', clientSequence: 1, target: { formInstanceId: randomUUID(), expectedRevision: 0 }, workspace, requiredSkill } },
+    ...['prompt', 'steer', 'followUp'].map(mode => ({ type: 'submit_session_input', input: { sessionId: 7, clientSequence: 1, mode, text: 'invoice', requiredSkill,
+      ...(mode === 'prompt' ? { modelId: 'invoice', goalMode: 'answer' } : { runId: 11 }) } })),
+  ];
+  for (const value of inputs) {
+    const command = { version: 1, requestId: randomUUID(), ...value, ...(value.type === 'submit_session_input' && 'mode' in value.input && value.input.mode !== 'prompt' ? {}
+      : { expectedSettingsRevision: 2, expectedCredentialRef: 'a'.repeat(16) }) };
+    expect(parseHostCommand(command)).toMatchObject({ input: { requiredSkill } });
+    expect(parseHostCommand({ ...command, input: { ...command.input, requiredSkill: { ...requiredSkill, kind: 'prompt' } } })).toBeNull();
+    expect(parseHostCommand({ ...command, input: { ...command.input, resourceExpansion: {} } })).toBeNull();
   }
 });

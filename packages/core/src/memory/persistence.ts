@@ -4,6 +4,7 @@ import type { AppError, DbId, HistoryCommitInput, HistoryCommitReceipt, MemorySt
 import type { RuntimeEventStore } from '../events/store.ts';
 import { associateInputResult, markInputConsumed, verifyNativeCommitContexts } from '../sessions/input-ledger.ts';
 import { NativeOriginFault } from './origins.ts';
+import { appendResourceExpansionInTransaction } from '../context/repository.ts';
 
 /** Thrown through transaction boundaries; convert only after SQLite and pending events roll back. */
 export class MemoryCommitFault extends Error {
@@ -136,6 +137,10 @@ export function commitInTransaction(db: Database, input: HistoryCommitInput, eve
     WHERE session_id=? AND commit_revision=? AND entry_count=? AND leaf_id IS ?`)
     .run(input.leafId, entries.length, unusable ? 1 : 0, revision, input.sessionId, old.commitRevision, old.entryCount, old.leafId).changes;
   if (changes !== 1) conflict();
+  for (const context of input.contexts) if (context.resourceExpansion) {
+    try { appendResourceExpansionInTransaction(db, { sessionId: input.sessionId, runId: context.runId }, context.resourceExpansion); }
+    catch { throw new MemoryCommitFault(appError('resource_evidence_write_failed', 'storage', 'Native Skill expansion evidence could not be saved.', true)); }
+  }
   return { commitRevision: revision, entryCount: entries.length, leafId: input.leafId };
 }
 

@@ -34,12 +34,13 @@ export type ModelProfile = {
 };
 
 export type ProductSettings = {
-  version: 2 | 3;
+  version: 2 | 3 | 4;
   revision: number;
   profile: { displayName: string; theme: 'system' | 'light' | 'dark' };
   models: readonly ModelProfile[];
   defaultModelId: string | null;
   runtime?: import('./runtime.ts').RuntimeRequestOverrides;
+  resources?: import('./resources.ts').ResourceSelection;
   updatedAt: string;
 };
 
@@ -71,6 +72,7 @@ export type DesktopEvent =
   | import('./runtime.ts').AgentRunEvent;
 
 export type DesktopAgentRunRequest = {
+  requiredSkill?: import('./resources.ts').ResourceRef;
   sessionId: import('./runtime.ts').DbId;
   text: string;
   modelId: string;
@@ -83,6 +85,7 @@ export type DesktopAgentRunRequest = {
 };
 
 export type DesktopInvoiceFormRunRequest = {
+  requiredSkill?: import('./resources.ts').ResourceRef;
   workspace: import('./workspace.ts').WorkspaceExpectation;
   target: import('./invoice.ts').InvoiceFormTarget;
   clientSequence: import('./runtime.ts').DbId;
@@ -94,6 +97,8 @@ export type DesktopInvoiceFormRunRequest = {
 export function serializeDesktopInvoiceFormRequest(input: DesktopInvoiceFormRunRequest): string {
   const workspace = input.workspace;
   return JSON.stringify({ requestIdentityVersion: 1, clientSequence: input.clientSequence, modelId: input.modelId,
+    ...(input.requiredSkill === undefined ? {} : { requiredSkill: { kind: input.requiredSkill.kind, id: input.requiredSkill.id,
+      version: input.requiredSkill.version, contentHash: input.requiredSkill.contentHash } }),
     target: { formInstanceId: input.target.formInstanceId, expectedRevision: input.target.expectedRevision },
     workspace: { revision: workspace.revision, sessionId: workspace.sessionId,
       documentRef: workspace.documentRef === null ? null : { id: workspace.documentRef.id, version: workspace.documentRef.version },
@@ -118,6 +123,8 @@ export function serializeDesktopPromptRequest(input: Extract<DesktopSessionInput
   };
   return JSON.stringify({ sessionId: input.sessionId, clientSequence: input.clientSequence, mode: input.mode,
     text: input.text, modelId: input.modelId, goalMode: input.goalMode ?? 'answer',
+    ...(input.requiredSkill === undefined ? {} : { requiredSkill: { kind: input.requiredSkill.kind, id: input.requiredSkill.id,
+      version: input.requiredSkill.version, contentHash: input.requiredSkill.contentHash } }),
     ...(workspace === undefined ? {} : { workspace: { revision: workspace.revision,
       documentRef: workspace.documentRef === null ? null : { id: workspace.documentRef.id, version: workspace.documentRef.version },
       jobId: workspace.jobId, candidateRef: workspace.candidateRef === null ? null : { id: workspace.candidateRef.id, sequence: workspace.candidateRef.sequence },
@@ -141,6 +148,11 @@ export type DesktopInvoiceFormInspection = {
 };
 
 export type DesktopBridge = {
+  listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
+  readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
+  updateResourceSelection(input: import('./resources.ts').ResourceSelectionRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceSelectionResult>>;
+  queryRunResources(input: import('./resources.ts').RunResourceQuery): Promise<import('./runtime.ts').Result<import('./resources.ts').RunResourceView>>;
+  readRunResourceFile(input: import('./resources.ts').RunResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
   getState(): Promise<import('./runtime.ts').Result<DesktopState>>;
   listModelCatalog(providerId?: string, refresh?: boolean): Promise<import('./runtime.ts').Result<readonly ModelCatalogProvider[]>>;
   loginModel(modelId: string, authType: 'api_key' | 'oauth', requestId: string): Promise<import('./runtime.ts').Result<{ configured: true }>>;

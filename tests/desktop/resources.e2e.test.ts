@@ -1,0 +1,171 @@
+import { _electron as electron } from 'playwright';
+import { expect, test as it } from '@playwright/test';
+import { join, resolve } from 'node:path';
+import { writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { cleanupResources, closeDesktopFixture, installReadGate, createHttpProvider, mkdtemp, Database } from '../support/resources.ts';
+
+it.afterEach(cleanupResources);
+const repository = resolve(import.meta.dirname, '../..');
+it('manages fixed Prompt and Skill versions through real IPC without model or tool execution', async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p11-resources-ui-'));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
+    args: [join(repository, 'out/main/index.js')], env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    const original = await page.evaluate(() => window.flowmate.readWorkspace());
+    await expect(page.getByRole('button', { name: 'Prompts', exact: true })).toHaveCount(1, { timeout: 3000 });
+    await page.getByRole('button', { name: 'Prompts', exact: true }).focus(); await page.keyboard.press('Enter');
+    await expect(page.getByRole('heading', { name: 'Prompts', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'View invoice v1', exact: true }).click();
+    await expect(page.getByTestId('resource-file')).toContainText('缺失');
+    await page.getByRole('button', { name: 'Use invoice v1', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Saved');
+    expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { prompt: { id: 'invoice', version: 'v1' } } } });
+    await page.getByRole('button', { name: 'Skills', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toBeVisible();
+    await page.getByLabel('Search skills').fill('invoice');
+    await page.getByLabel('Skill status').selectOption('available');
+    await expect(page.getByRole('button', { name: 'Enable invoice v1', exact: true })).toBeVisible();
+    await page.getByLabel('Skill status').selectOption('unavailable');
+    await expect(page.getByText('No matching resources.', { exact: true })).toBeVisible();
+    await page.getByLabel('Skill status').selectOption('all');
+    await page.getByRole('button', { name: 'Enable invoice v1', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Saved');
+    await page.getByLabel('Skill status').selectOption('enabled');
+    await page.getByRole('button', { name: 'View invoice v1', exact: true }).click();
+    await expect(page.getByTestId('resource-file')).toContainText('发票');
+    await page.getByRole('button', { name: 'Disable invoice v1', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Saved');
+    await page.getByRole('button', { name: 'Refresh resources', exact: true }).click();
+    expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { enabledSkills: [] } } });
+    await installReadGate(app, userData);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'read_resource_file'));
+    await page.getByRole('button', { name: 'Prompts', exact: true }).click(); await page.getByRole('button', { name: 'View invoice v1', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
+    await page.getByRole('button', { name: 'Skills', exact: true }).click(); await page.getByRole('button', { name: 'View invoice v1', exact: true }).click();
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
+    await expect(page.getByTestId('resource-file')).toHaveCount(0); await expect(page.getByText('Enable this Skill to read its files.', { exact: true })).toBeVisible();
+    await app.evaluate(() => { const gate = Reflect.get(globalThis, 'contextReadGate'); gate.hold(0, 'update_resource_selection'); gate.fail(); });
+    await page.getByRole('button', { name: 'Enable invoice v1', exact: true }).click();
+    await expect(page.getByText('Refresh resources to confirm the saved selection before trying again.', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Enable invoice v1', exact: true })).toBeDisabled();
+    expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { enabledSkills: [{ id: 'invoice', version: 'v1' }] } } });
+    await page.getByRole('button', { name: 'Refresh resources', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Disable invoice v1', exact: true })).toBeEnabled();
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').commands.filter((command: { type: string }) => command.type === 'update_resource_selection').length)).toBe(1);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
+    expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(original);
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+  const db = new Database(join(userData, 'data/app.sqlite'), { readonly: true });
+  try { for (const table of ['runs', 'tool_calls', 'session_inputs']) expect(db.query(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 }); }
+  finally { db.close(); }
+});
+
+it('atomically clears multiple unavailable selected resources through visible controls without a Run or model request', async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p11-resource-recovery-'));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  const launch = () => electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
+    env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
+  let app = await launch(), failure: Error | undefined;
+  try {
+    let page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    const saved = await page.evaluate(async () => {
+      const state = await window.flowmate.getState(), catalog = await window.flowmate.listResources();
+      if (!state.ok || !catalog.ok) throw new Error('Fixture settings unavailable');
+      const prompt = catalog.data.items.find(item => item.ref.kind === 'prompt')!.ref, skill = catalog.data.items.find(item => item.ref.kind === 'skill')!.ref;
+      return { ...state.data.settings, revision: state.data.settings.revision + 1,
+        resources: { prompt: { ...prompt, version: 'missing-prompt' }, enabledSkills: [{ ...skill, version: 'missing-skill' }] } };
+    });
+    await app.close();
+    // Seed an isolated restart whose previously saved author versions are now unavailable. Recovery uses only real controls/IPC.
+    await writeFile(join(userData, 'data', 'settings.json'), JSON.stringify(saved)); app = await launch();
+    page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    await page.getByRole('button', { name: 'Prompts', exact: true }).click();
+    await expect(page.getByText('Missing enabled version: invoice missing-skill', { exact: false })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Clear all resource selections', exact: true })).toHaveCount(1, { timeout: 3000 });
+    await page.getByRole('button', { name: 'Use no business Prompt', exact: true }).click();
+    await expect(page.getByText('Refresh resources to confirm the saved selection before trying again.', { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: saved.resources } });
+    await page.getByRole('button', { name: 'Refresh resources', exact: true }).click();
+    await page.getByRole('button', { name: 'Clear all resource selections', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Saved');
+    expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { prompt: null, enabledSkills: [] } } });
+    expect(await page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { settings: { models: saved.models, revision: saved.revision + 1 } } });
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+  const db = new Database(join(userData, 'data/app.sqlite'), { readonly: true });
+  try { for (const table of ['runs', 'tool_calls', 'session_inputs']) expect(db.query(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 }); }
+  finally { db.close(); }
+});
+
+
+it('uses the desktop Prompt in real SDK and HTTP requests, rejects unavailable necessary Skill without losing the draft, and queries fixed history without replay', async () => {
+  it.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p11-request-ui-'));
+  const payloads: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+  const provider = await createHttpProvider(async request => {
+    payloads.push(await request.json());
+    const chunk = (delta: unknown, finish: string | null) => 'data: ' + JSON.stringify({ id: 'p11-ui', choices: [{ index: 0, delta, finish_reason: finish }] }) + '\n\n';
+    return new Response(chunk({ role: 'assistant', content: 'P11 controlled answer' }, null) + chunk({}, 'stop') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
+    args: [join(repository, 'out/main/index.js')], env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    const sessionId = await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
+      const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p11-ui', credentialRef: 'p11_ui_controlled_key', name: 'P11 UI',
+        kind: 'custom', providerId: null, baseUrl, model: 'p11-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }],
+        defaultModelId: 'p11-ui' }, { modelId: 'p11-ui', apiKey: 'synthetic-p11-ui-key' });
+      if (!settings.ok) throw new Error(settings.error.code);
+      const session = await window.flowmate.createSession({ title: 'P11 real desktop request' }); if (!session.ok) throw new Error(session.error.code);
+      const current = await window.flowmate.readWorkspace(); if (!current.ok) throw new Error(current.error.code);
+      const selected = await window.flowmate.updateWorkspace({ expectedRevision: current.data.revision, change: { kind: 'session', sessionId: session.data.sessionId } });
+      if (!selected.ok) throw new Error(selected.error.code); return session.data.sessionId;
+    }, `http://127.0.0.1:${provider.port}/v1`);
+    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Prompts', exact: true }).click(); await page.getByRole('button', { name: 'Use invoice v1', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Saved');
+    await page.getByRole('button', { name: 'Skills', exact: true }).click(); await page.getByRole('button', { name: 'Enable invoice v1', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Saved');
+    const picker = page.getByLabel('Required Skill for next input', { exact: true });
+    await expect(picker.locator('option')).toHaveCount(2); await picker.selectOption({ label: 'invoice v1' });
+    const message = page.getByRole('textbox', { name: 'Message to model', exact: true }); await message.fill('Keep my original P11 input');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(message).toHaveValue('Keep my original P11 input');
+    await expect.poll(() => page.evaluate(sessionId => window.flowmate.listSessionRuns({ sessionId }), sessionId)).toMatchObject({ ok: true, data: { items: [] } });
+    expect(payloads).toHaveLength(0);
+    await picker.selectOption(''); await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect.poll(() => payloads.length).toBe(1);
+    await expect.poll(() => page.evaluate(() => window.flowmate.queryRuntimeState())).toMatchObject({ ok: true, data: { active: null } });
+    const runs = await page.evaluate(sessionId => window.flowmate.listSessionRuns({ sessionId }), sessionId);
+    if (!runs.ok || !runs.data.items[0]) throw new Error('No saved Run'); const runId = runs.data.items[0].runId;
+    expect(payloads[0].messages.find(item => item.role === 'system')?.content).toContain('缺失');
+    expect(await page.evaluate(owner => window.flowmate.queryRunResources(owner), { sessionId, runId }))
+      .toMatchObject({ ok: true, data: { frozen: { prompt: { id: 'invoice', version: 'v1' }, discoveredSkills: [] }, evidence: { requests: [
+        { contentChecks: [{ scope: 'business-prompt', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }] }] } } });
+    await page.getByRole('button', { name: 'Session details', exact: true }).click();
+    const panel = page.getByRole('dialog', { name: 'Session details', exact: true });
+    await expect(panel.getByRole('heading', { name: 'Run resources', exact: true })).toBeVisible();
+    await panel.getByRole('button', { name: 'View fixed invoice v1', exact: true }).click(); await expect(panel.getByTestId('resource-file')).toContainText('缺失');
+    await panel.getByRole('button', { name: 'Refresh Run resources', exact: true }).click(); expect(payloads).toHaveLength(1);
+    expect(await page.evaluate(() => window.flowmate.queryRunResources({ sessionId: 1, runId: 1, secret: 'forged' } as never)))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(payloads).toHaveLength(1);
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await closeDesktopFixture(app, userData, failure); await provider.stop(); }
+});

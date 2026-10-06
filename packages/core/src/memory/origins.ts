@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { appError, fail, ok, NativeSessionHistorySchema, NativeHistoryRecoveryBundleSchema, SessionInputContentSchema } from '@flowmate/contracts';
 import type { AppError, DbId, NativeSessionEntry, NativeSessionHistory, NativeHistoryRecoveryBundle, NativeToolResultContextBinding, NativeDerivedContextBinding, Result } from '@flowmate/contracts';
 import { loadNativeHistoryInTransaction } from './persistence.ts';
-import { readRunContext, readContextSnapshotOwner, contextReferenceFromColumns } from '../context/repository.ts';
+import { readRunContext, readContextSnapshotOwner, contextReferenceFromColumns, readResourceExpansion, readResourceReads } from '../context/repository.ts';
 
 export class NativeOriginFault extends Error {
   constructor(readonly error: AppError = appError('context_binding_unknown', 'runtime', 'Native history origins could not be verified.')) { super(error.code); }
@@ -152,6 +152,7 @@ export function createNativeOriginReader(db: Database) {
             && compactionCoversEntry(sessionId, source.nativeEntryId, primary.native_entry_id))))) unknown();
       const content=SessionInputContentSchema.parse(JSON.parse(primary.content_json));
       if(content.version!==2 || snapshot.json.text!==content.text || snapshot.json.goalMode!==primary.goal_mode
+        || !isDeepStrictEqual(snapshot.json.resourceBinding,content.resourceBinding)
         || !isDeepStrictEqual(snapshot.json.workspaceContext,content.workspaceContext)
         || !isDeepStrictEqual(snapshot.json.allowedDocumentIds,content.allowedDocumentIds)
         || !isDeepStrictEqual(snapshot.json.allowedArtifactIds,content.allowedArtifactIds)) unknown();
@@ -195,6 +196,7 @@ export function createNativeOriginReader(db: Database) {
       if (input.context_snapshot_id !== null) {
         const snapshot = contextSnapshot(input.context_snapshot_id,owner.row);
         if (content.version !== 2 || snapshot.json.text !== content.text || snapshot.json.goalMode !== input.goal_mode
+          || !isDeepStrictEqual(snapshot.json.resourceBinding,content.resourceBinding)
           || !isDeepStrictEqual(snapshot.json.workspaceContext,content.workspaceContext)
           || !isDeepStrictEqual(snapshot.json.allowedDocumentIds,content.allowedDocumentIds)
           || !isDeepStrictEqual(snapshot.json.allowedArtifactIds,content.allowedArtifactIds)
@@ -280,7 +282,26 @@ export function createNativeOriginReader(db: Database) {
     const localIds=new Set(stored?.history.entries.map(entry=>entry.id));
     for(const raw of db.query('SELECT native_entry_id FROM session_inputs WHERE session_id=? AND native_entry_id IS NOT NULL').all(sessionId))
       if(!localIds.has(z.object({native_entry_id:z.string()}).parse(raw).native_entry_id)) unknown();
+    const resourceExpansions = all.flatMap(origin => {
+      if (origin.inputId === null || origin.originRunId === null) return [];
+      const content = SessionInputContentSchema.parse(JSON.parse(z.object({ content_json: z.string() }).parse(
+        db.query('SELECT content_json FROM session_inputs WHERE id=?').get(origin.inputId)).content_json));
+      if (content.version !== 2) return [];
+      const journal = run(origin.originRunId, origin.originSessionId).context.observations?.resources;
+      if (!content.resourceBinding?.requiredSkill && !journal?.expansions.some(receipt => receipt.inputId === origin.inputId || receipt.nativeEntryId === origin.nativeEntryId)) return [];
+      const receipt = readResourceExpansion(db, { sessionId: origin.originSessionId, runId: origin.originRunId }, origin.inputId, origin.nativeEntryId);
+      if (content.resourceBinding?.requiredSkill && !receipt) unknown();
+      return receipt ? [receipt] : [];
+    });
+    const toolEntryIds = new Set(stored?.history.entries.filter(entry => entry.type === 'message' && entry.message.role === 'toolResult').map(entry => entry.id));
+    const readOwners = new Map(all.flatMap(origin => origin.originRunId === null || !toolEntryIds.has(origin.nativeEntryId) ? []
+      : [[origin.originRunId, { sessionId: origin.originSessionId, runId: origin.originRunId }] as const]));
+    const resourceReads = [...readOwners.values()].flatMap(owner => run(owner.runId, owner.sessionId).context.observations?.resources?.reads.length
+      ? readResourceReads(db, owner) : [])
+      .filter(read => read.nativeEntryId !== null && all.some(origin => origin.nativeEntryId === read.nativeEntryId));
     return NativeHistoryRecoveryBundleSchema.parse({history:stored?.history??null,commit:stored?.commit??null,seed:{sessionId,inputs,
+      ...(resourceExpansions.length ? { resourceExpansions } : {}),
+      ...(resourceReads.length ? { resourceReads } : {}),
       origins:all.map(({inputId:_,snapshotId:__,...origin})=>origin)}});
   }
   function ancestors(sessionId: number): number[] {

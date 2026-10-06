@@ -135,3 +135,47 @@ export async function cleanupResources() {
   if (errors.length) throw new AggregateError(errors, 'Test resource cleanup failed');
 }
 if (process.versions.bun) (await import('bun:test')).afterEach(cleanupResources);
+
+export async function installReadGate(app: ElectronApplication, userData: string) {
+  await app.evaluate((_electron, root) => {
+    const handles = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles();
+    const child = handles.find(value => value && typeof value === 'object' && 'spawnargs' in value && Array.isArray(value.spawnargs)
+      && value.spawnargs.includes(root) && value.spawnargs.includes('apps/host/main.ts')) as import('node:child_process').ChildProcessWithoutNullStreams | undefined;
+    if (!child?.stdin || !child.stdout) throw new Error('Actual owned Host pipe is missing.');
+    const input = child.stdin, output = child.stdout, write = input.write, emit = output.emit;
+    const commands: Array<{ type: string; requestId: string; input?: { runId?: number; snapshotId?: number } }> = [];
+    const kinds = new Map<string, string>(); let buffer = Buffer.alloc(0), remaining = 0, fault = false, heldType = 'query_context_snapshot', closeGate = false;
+    const held: Buffer[] = [], closeReplies: Buffer[] = []; let heldEnd: unknown[] | null = null;
+    child.stdin.write = function (this: typeof input, ...args: Parameters<typeof write>) {
+      try { const command = JSON.parse(String(args[0])); commands.push(command); kinds.set(command.requestId, command.type); } catch { /* Forward unchanged. */ }
+      return Reflect.apply(write, this, args);
+    } as typeof write;
+    child.stdout.emit = function (this: typeof output, event: string | symbol, ...args: unknown[]) {
+      if (closeGate && event === 'end') { heldEnd = args; return true; }
+      if (event !== 'data' || !Buffer.isBuffer(args[0])) return Reflect.apply(emit, this, [event, ...args]);
+      buffer = Buffer.concat([buffer, args[0]]); const forward: Buffer[] = [];
+      for (let newline = buffer.indexOf(10); newline !== -1; newline = buffer.indexOf(10)) {
+        let line = buffer.subarray(0, newline + 1); buffer = buffer.subarray(newline + 1);
+        try { const packet = JSON.parse(line.toString());
+          if (closeGate && packet.type === 'response' && kinds.get(packet.requestId) === 'close') { closeReplies.push(Buffer.from(line)); continue; }
+          if (packet.type === 'response' && kinds.get(packet.requestId) === heldType) {
+            if (fault) { packet.value = heldType === 'update_resource_selection'
+              ? { ok: false, error: { code: 'operation_result_unknown', category: 'runtime', retryable: true, message: 'Synthetic lost receipt after actual save.' } }
+              : { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'PRIVATE-CONTEXT sdk credential token', sessionId: packet.value.data?.snapshot?.sessionId, runId: packet.value.data?.snapshot?.runId } };
+              line = Buffer.from(JSON.stringify(packet) + '\n'); fault = false; }
+            if (remaining > 0) { held.push(Buffer.from(line)); remaining--; continue; }
+          }
+        } catch { /* Production parser receives original malformed bytes. */ }
+        forward.push(line);
+      }
+      return forward.length ? Reflect.apply(emit, this, [event, Buffer.concat(forward), ...args.slice(1)]) : true;
+    };
+    function finishClose() { closeGate = false; for (const line of closeReplies.splice(0)) Reflect.apply(emit, output, ['data', line]);
+      if (heldEnd) { Reflect.apply(emit, output, ['end', ...heldEnd]); heldEnd = null; } }
+    Reflect.set(globalThis, 'contextReadGate', { commands, held, closeReplies,
+      hold(count: number, type = 'query_context_snapshot') { remaining = count; heldType = type; }, fail() { fault = true; },
+      holdHostClose() { closeGate = true; }, finishClose,
+      release(index: number) { const line = held[index]; if (line) { Reflect.apply(emit, child.stdout, ['data', line]); held[index] = Buffer.alloc(0); } },
+      restore() { for (const line of held) if (line.length) Reflect.apply(emit, child.stdout, ['data', line]); finishClose(); child.stdin.write = write; child.stdout.emit = emit; } });
+  }, userData);
+}

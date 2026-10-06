@@ -48,7 +48,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
       return runs.ok && runs.data.items[0] ? { runId: runs.data.items[0].runId, sessionId } : null;
     });
     expect(identity).not.toBeNull(); if (!identity) return;
-    expect(await page.locator('.rail .nav-item').count()).toBe(7);
+    expect(await page.locator('.rail .nav-item').count()).toBe(9);
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
     await expect(page.getByTestId('activity-page')).toBeVisible();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
@@ -985,7 +985,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     })).toMatchObject({ ok: true });
     expect(await page.evaluate(request => window.flowmate.submitInput(request), originalPrompt)).toMatchObject(originalReceipt);
     expect(requests).toHaveLength(callsAfterStop);
-    expect(await page.locator('.rail .nav-item').count()).toBe(7);
+    expect(await page.locator('.rail .nav-item').count()).toBe(9);
     const closingApp = electronApp;
     electronApp = null;
     await closeDesktopFixture(closingApp, userData);

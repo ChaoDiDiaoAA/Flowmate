@@ -2,8 +2,9 @@ import { mkdtemp } from '../../support/resources.ts';
 import { readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'bun:test';
-import { defaultProductSettings, readProductSettings, saveProductSettings } from '../../../packages/core/src/configuration/settings.ts';
+import * as fs from 'node:fs/promises';
+import { describe, expect, it, spyOn } from 'bun:test';
+import { defaultProductSettings, readProductSettings, saveProductSettings, validateProductSettings } from '../../../packages/core/src/configuration/settings.ts';
 
 const model = {
   id: 'model-main',
@@ -25,9 +26,10 @@ describe('desktop settings', () => {
     const file = join(root, 'settings.json');
     const legacy = { ...defaultProductSettings(), version: 2 };
     delete (legacy as Record<string, unknown>).runtime;
+    delete (legacy as Record<string, unknown>).resources;
     await writeFile(file, JSON.stringify(legacy));
     const loaded = await readProductSettings(file);
-    expect(loaded).toMatchObject({ ok: true, data: { version: 3, runtime: {} } });
+    expect(loaded).toMatchObject({ ok: true, data: { version: 4, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
     if (!loaded.ok) return;
     const runtime = { budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 },
       timeoutMs: 1_800_000, stopGraceMs: 10_000 };
@@ -55,6 +57,26 @@ describe('desktop settings', () => {
     expect(current.ok && current.data.revision).toBe(1);
   });
 
+  it('settings-v1-v2-v3-to-v4-empty preserves saved bytes and revisions until an explicit save', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
+    const file = join(root, 'settings.json');
+    const { runtime: _runtime, ...base } = defaultProductSettings('2026-09-23T00:00:00.000Z');
+    delete (base as Record<string, unknown>).resources;
+    for (const version of [1, 2, 3]) {
+      const original = JSON.stringify({ ...base, version, revision: 7, ...(version === 3 ? { runtime: {} } : {}) });
+      await writeFile(file, original);
+      const loaded = await readProductSettings(file);
+      expect(loaded).toMatchObject({ ok: true, data: { version: 4, revision: 7, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
+      expect(await readFile(file, 'utf8')).toBe(original);
+    }
+    const current = defaultProductSettings();
+    const ref = { kind: 'skill', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) };
+    expect(validateProductSettings({ ...current, resources: { prompt: null, enabledSkills: [ref] } }).ok).toBe(true);
+    for (const change of [{ version: 5 }, { resources: undefined }, { resources: { prompt: null, enabledSkills: [ref, ref] } },
+      { resources: { prompt: null, enabledSkills: [], inferredRead: true } }])
+      expect(validateProductSettings({ ...current, ...change }).ok).toBe(false);
+  });
+
   it('returns defaults for a missing file but rejects malformed existing settings', async () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
     const file = join(root, 'settings.json');
@@ -77,6 +99,7 @@ describe('desktop settings', () => {
       defaultModelId: model.id,
     };
     delete (legacy as Record<string, unknown>).runtime;
+    delete (legacy as Record<string, unknown>).resources;
     await writeFile(file, JSON.stringify(legacy), 'utf8');
 
     const loaded = await readProductSettings(file);
@@ -95,13 +118,14 @@ describe('desktop settings', () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
     const file = join(root, 'settings.json');
     const { runtime: _runtime, ...legacyDefaults } = defaultProductSettings();
+    delete (legacyDefaults as Record<string, unknown>).resources;
     await writeFile(file, JSON.stringify({ ...legacyDefaults, version: 1,
       models: [{ id: 'old-deepseek', credentialRef: 'old-deepseek-credential', name: 'Old',
         baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash', api: 'openai-responses' },
       { id: 'other', credentialRef: 'other-credential-ref', name: 'Other', baseUrl: 'https://other.example/v1',
         model: 'other-model', api: 'openai-completions' }], defaultModelId: 'old-deepseek' }), 'utf8');
     const loaded = await readProductSettings(file);
-    expect(loaded).toMatchObject({ ok: true, data: { version: 3, defaultModelId: null,
+    expect(loaded).toMatchObject({ ok: true, data: { version: 4, defaultModelId: null,
       models: [{ id: 'other', kind: 'legacy' }] } });
   });
 
@@ -116,4 +140,28 @@ describe('desktop settings', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe('config_settings_invalid');
   });
+});
+
+
+it.each(['write', 'sync', 'rename'] as const)('P11 selection save keeps the prior committed bytes when %s fails', async window => {
+  const root = await mkdtemp(join(tmpdir(), 'flowmate-p11-settings-fault-')), file = join(root, 'settings.json');
+  const base = defaultProductSettings(); await writeFile(file, JSON.stringify(base)); const before = await readFile(file, 'utf8');
+  const next = { ...base, resources: { prompt: { kind: 'prompt', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) }, enabledSkills: [] } };
+  let hits = 0;
+  const originalOpen = fs.open, originalRename = fs.rename;
+  const injected = window === 'rename' ? spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (String(to) === file) { hits++; throw new Error('P11 rename fault'); } return originalRename(from, to);
+  }) : spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    const handle = await originalOpen(...args);
+    if (String(args[0]).startsWith(`${file}.`)) {
+      if (window === 'write') handle.writeFile = async () => { hits++; throw new Error('P11 write fault'); };
+      else handle.sync = async () => { hits++; throw new Error('P11 sync fault'); };
+    }
+    return handle;
+  });
+  try { expect(await saveProductSettings(file, next)).toMatchObject({ ok: false, error: { code: 'config_settings_write_failed' } }); }
+  finally { injected.mockRestore(); }
+  expect(hits).toBe(1); expect(await readFile(file, 'utf8')).toBe(before);
+  expect(await readProductSettings(file)).toMatchObject({ ok: true, data: { revision: 0, resources: base.resources } });
+  expect(await fs.readdir(root)).toEqual(['settings.json']);
 });

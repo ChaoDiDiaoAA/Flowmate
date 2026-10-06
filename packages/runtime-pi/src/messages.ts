@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import type { Message } from '@earendil-works/pi-ai';
 import { type SessionEntry } from '@earendil-works/pi-coding-agent';
+import { createHash } from 'node:crypto';
+import { ResourceBindingSchema, ResourceExpansionEvidenceSchema, resourceRefKey } from '@flowmate/contracts';
+import type { ResourceBinding, ResourceExpansionEvidence } from '@flowmate/contracts';
 import { appError, fail, ok, InputRecordV2Schema, invoiceToolSchemas, INVOICE_TOOL_NAMES,
   SessionMessageViewSchema, FillInvoiceFormOutputSchema, SessionInputContentSchema, formatExecutionPrompt, WorkspaceContextSchema } from '@flowmate/contracts';
 import type { DbId, MessageDisplayBlock, MessageRunInput, NativeMessageProjectionInput,
@@ -75,7 +78,7 @@ export const validateModelMessages = validateLlmMessages;
 export type MessageViewContext = {
   entryId: string | null; runId: DbId | null; liveOrdinal: number | null;
   persistence: SessionMessageView['persistence']; phase: SessionMessageView['phase']; runInput?: MessageRunInput;
-  productInput?: { text: string; promptText: string };
+  productInput?: { text: string; promptText: string; inputId?: number; resourceBinding?: ResourceBinding; resourceExpansion?: ResourceExpansionEvidence };
 };
 function limitedBlocks(blocks: MessageDisplayBlock[]): { blocks: MessageDisplayBlock[]; truncated: boolean } {
   let remaining = textLimit; let truncated = blocks.length > 256;
@@ -139,8 +142,16 @@ export function projectMessageView(message: unknown, context: MessageViewContext
       let visible = nativeUserText(source.content as string | { type: 'text'; text: string }[]);
       let origin: 'product-input' | 'native-content' = 'native-content';
       if (context.productInput !== undefined) {
-        const product = z.object({ text: z.string(), promptText: z.string().min(1) }).strict().safeParse(context.productInput);
-        if (!product.success || context.runId === null || product.data.promptText !== visible) return invalid();
+        const product = z.object({ text: z.string(), promptText: z.string().min(1), inputId: dbId.optional(),
+          resourceBinding: ResourceBindingSchema.optional(), resourceExpansion: ResourceExpansionEvidenceSchema.optional() }).strict().safeParse(context.productInput);
+        if (!product.success || context.runId === null) return invalid();
+        const required = product.data.resourceBinding?.requiredSkill, receipt = product.data.resourceExpansion;
+        if (required) {
+          if (!receipt || context.persistence !== 'saved' || context.entryId !== receipt.nativeEntryId
+            || receipt.inputId !== product.data.inputId || receipt.bundleHash !== product.data.resourceBinding?.bundleHash
+            || resourceRefKey(receipt.skill) !== resourceRefKey(required)
+            || receipt.expandedTextHash !== createHash('sha256').update(visible).digest('hex')) return invalid();
+        } else if (receipt || product.data.promptText !== visible) return invalid();
         visible = product.data.text; origin = 'product-input';
       } else if (context.runInput !== undefined) {
         const run = runInputSchema.safeParse(context.runInput);
@@ -201,7 +212,9 @@ export function projectSessionMessages(input: NativeMessageProjectionInput): Res
     }
     const userContext = (entryId: string, runId: number) => {
       const product = productInputs.get(entryId);
-      if (product?.content.version === 2) return { productInput: { text: product.content.text, promptText: product.content.promptText } };
+      if (product?.content.version === 2) return { productInput: { text: product.content.text, promptText: product.content.promptText, inputId: product.inputId,
+        ...(product.content.resourceBinding ? { resourceBinding: product.content.resourceBinding } : {}),
+        ...(product.resourceExpansion ? { resourceExpansion: product.resourceExpansion } : {}) } };
       if (product && product.content.text !== runs.get(runId)!.input.text) throw new Error('legacy_input_mismatch');
       return { runInput: runs.get(runId)! };
     };

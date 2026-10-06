@@ -14,6 +14,7 @@ import type {
 import { WorkspaceContextSchema } from './workspace.ts';
 import { RuntimeRequestOverridesSchema } from './runtime.ts';
 import { RUNTIME_CONFIG } from './runtime-config.ts';
+import { ResourceRefSchema } from './resources.ts';
 
 const modelRefSchema = z
   .object({
@@ -94,6 +95,7 @@ export const INVOICE_FILL_FORM_SYSTEM_PROMPT = `You are Flowmate's invoice form 
 export const WorkingDirectorySchema = z.string().min(1).max(4096).refine(value => isAbsolute(value)
   && value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value), 'Invalid working directory.');
 const agentRunRequestSchema = z.object({
+  requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional(),
   sessionId: dbIdSchema,
   text: z.string(),
   config: providerConfigSchema,

@@ -29,6 +29,9 @@ export class PiMemoryAdapter {
       if (contexts.some(c => !addedIds.has(c.entryId)) || new Set(contexts.map(c => c.entryId)).size !== contexts.length)
         return reject(appError('session_history_invalid', 'session', 'Append associations do not identify new entries.'));
       const nextSeed: NativeHistoryRecoverySeed = { sessionId: this.seed.sessionId, inputs: [...this.seed.inputs, ...inputs],
+        ...(this.seed.resourceReads === undefined ? {} : { resourceReads: this.seed.resourceReads }),
+        ...(this.seed.resourceExpansions !== undefined || contexts.some(context => context.resourceExpansion !== undefined)
+          ? { resourceExpansions: [...(this.seed.resourceExpansions ?? []), ...contexts.flatMap(context => context.resourceExpansion ? [context.resourceExpansion] : [])] } : {}),
         origins: [...this.seed.origins, ...added.map(e => ({ nativeEntryId: e.id, originSessionId: this.seed.sessionId,
           originRunId: contexts.find(c => c.entryId === e.id)?.runId ?? null }))] };
       const changed = !isDeepStrictEqual(json(previous), json(history));

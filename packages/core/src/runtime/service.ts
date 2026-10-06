@@ -3,6 +3,10 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { CompactionObservationSchema, SessionCompactionSnapshotSchema, CompactionPolicySchema } from '@flowmate/contracts';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
+import { FrozenResourcesSchema, ResourceSelectionResultSchema, EMPTY_RESOURCE_SELECTION, resourceRefKey } from '@flowmate/contracts';
+import type { FrozenResources, ResourceBinding, ResourceSelectionResult } from '@flowmate/contracts';
+import { invoiceToolNamesForRun } from '../storage/repositories.ts';
+import { resolveRequiredSkill, type createResourceService } from '../resources/service.ts';
 import type {
   AgentConfigFacts,
   P3AgentConfigFacts,
@@ -74,10 +78,12 @@ export type RuntimeDependencies = {
   workspaceVerifier?: WorkspaceVerifier;
   contextService?: Pick<ContextService, 'build'>;
   contextRepository?: Pick<ContextRepository, 'bindRequest' | 'recordRequest' | 'resolveToolResult'>
-    & Partial<Pick<ContextRepository, 'recordCompactionEvidence' | 'readCompactionEvidence'>>;
+    & Partial<Pick<ContextRepository, 'recordCompactionEvidence' | 'readCompactionEvidence' | 'recordResourceRead' | 'recordResourceRequest'>>;
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  resources?: ReturnType<typeof createResourceService>;
+  resourceDefaults?: () => Result<ResourceSelectionResult>;
   runtimePolicy?: RuntimeStrategyPolicy;
   sampleSource?: 'production' | 'test' | 'evaluation';
   observeCompaction?: (value: CompactionObservation) => void;
@@ -90,7 +96,7 @@ export type RuntimeDependencies = {
   monotonicNow: () => number;
 };
 
-type StopReason = 'user' | 'timeout' | 'shutdown';
+type StopReason = 'user' | 'timeout' | 'shutdown' | 'input-failure';
 type StopIntent = { reason: StopReason; at: string; monotonicMs: number };
 
 type ActiveCall = {
@@ -104,6 +110,7 @@ type ActiveCall = {
   stop: (reason: StopReason) => boolean;
   stopIntent?: StopIntent;
   storageError?: AppError;
+  inputFailure?: AppError;
   providerFailureBeforeStop?: boolean;
   completion: Promise<Result<ProviderOutcome>>;
   poisoned: boolean;
@@ -141,6 +148,8 @@ type AgentExecutionContext = {
   inputId?: number;
   contextSnapshotId?: number;
   promptText: string;
+  resources: FrozenResources | null;
+  resourceBinding?: ResourceBinding;
   control: AgentControl;
   stopPromise: Promise<StopIntent>;
   readStop: () => StopIntent | undefined;
@@ -265,6 +274,7 @@ function outputRecord(outcome: NativeOutcome): OutputRecord {
 function errorForStop(reason: StopReason, runId: number, kind: ActiveCall['kind'] = 'provider') {
   if (reason === 'user') return appError(kind === 'agent' ? 'agent_cancelled' : 'provider_cancelled', kind === 'agent' ? 'runtime' : 'provider', kind === 'agent' ? 'Agent Run 已取消。' : 'Provider 请求已取消。', false, runId);
   if (reason === 'timeout') return appError(kind === 'agent' ? 'agent_timeout' : 'provider_timeout', kind === 'agent' ? 'runtime' : 'provider', kind === 'agent' ? 'Agent Run 超时。' : 'Provider 请求超时。', true, runId);
+  if (reason === 'input-failure') return appError('input_delivery_unknown', 'session', 'Native input delivery failed.', true, runId);
   return appError('runtime_shutdown', 'runtime', '运行实例正在关闭。', true, runId);
 }
 
@@ -633,24 +643,38 @@ export class RuntimeService {
           return fail(appError('session_busy', 'session', 'Compaction is not accepting new input.', true));
       }
     } catch { return fail(appError('agent_session_unavailable', 'session', 'Native state cannot be confirmed.', true)); }
+    const savedRun = runs.get(request.runId);
+    if (!savedRun.ok) return savedRun;
+    const resources = savedRun.data.config.resources === undefined ? null : FrozenResourcesSchema.safeParse(savedRun.data.config.resources);
+    if (resources && !resources.success) return fail(appError('storage_corrupt', 'storage', 'Saved resource binding is invalid.'));
+    const fixed = resources?.success ? resources.data : null;
+    const required = resolveRequiredSkill(request.text, request.requiredSkill, fixed?.discoveredSkills ?? []);
+    if (!required.ok) return required;
+    if (fixed) {
+      const verified = this.dependencies.resources?.verifyFrozen(fixed);
+      if (!verified || !verified.ok) return verified ?? fail(appError('resource_bundle_unavailable', 'storage', 'Frozen resource verification is unavailable.', true));
+    }
+    const resourceBinding: ResourceBinding | undefined = fixed ? { bundleHash: fixed.bundleHash, requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
     const at = this.dependencies.now();
     const admitted = ledger.admit(request, () => {
       const frozen = runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
         text: request.text, expected: request.workspace, at }, this.dependencies.workspaceVerifier);
-      return frozen.ok ? this.buildInput(frozen.data.runId, request.sessionId, frozen.data.content, at) : frozen;
+      return frozen.ok ? this.buildInput(frozen.data.runId, request.sessionId, { ...frozen.data.content,
+        ...(resourceBinding ? { resourceBinding } : {}) }, at) : frozen;
     }, at);
     if (!admitted.ok) return admitted;
     const input = admitted.data.input;
     if (!admitted.data.created) return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
     if (input.content.version !== 2) return fail(appError('input_processing_unconfirmed', 'runtime', 'Frozen input is invalid.'));
     const dispatched = ledger.dispatch(input.inputId, this.dependencies.now());
-    if (!dispatched.ok) { active.stop('user'); return dispatched; }
+    if (!dispatched.ok) { active.inputFailure = dispatched.error; active.stop('input-failure'); return dispatched; }
     let enqueued: Result<void>;
     try { enqueued = await agent.enqueueInput(active.nativeSessionId, { inputId: input.inputId, runId: request.runId,
       sessionId: request.sessionId, mode: request.mode, text: input.content.text, promptText: input.content.promptText,
+      ...(input.content.resourceBinding ? { resourceBinding: input.content.resourceBinding } : {}),
       ...(input.contextSnapshotId === null ? {} : { contextSnapshotId: input.contextSnapshotId }) }); }
     catch { enqueued = fail(appError('input_delivery_unknown', 'session', 'Native input delivery could not be confirmed.', true, request.runId)); }
-    if (!enqueued.ok) { active.stop('user'); return enqueued; }
+    if (!enqueued.ok) { active.inputFailure = enqueued.error; active.stop('input-failure'); return enqueued; }
     return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
   }
 
@@ -665,6 +689,7 @@ export class RuntimeService {
       return fail(appError('storage_corrupt', 'storage', 'Saved Context goal is invalid.'));
     const built = contextService.build({ runId, sessionId, jobId: run.data.jobId, text: content.text,
       goalMode, workspaceContext: content.workspaceContext, workspaceInput: content.workspaceInput,
+      ...(content.resourceBinding ? { resourceBinding: content.resourceBinding } : {}),
       allowedDocumentIds: content.allowedDocumentIds, allowedArtifactIds: content.allowedArtifactIds,
       workingDirectory: typeof run.data.config.workingDirectory === 'string' ? run.data.config.workingDirectory : null, createdAt: at });
     return built.ok ? ok({ runId, content: { ...content, promptText: built.data.promptText },
@@ -692,6 +717,15 @@ export class RuntimeService {
     const content = stored.data.content;
     const corrupt = () => fail(appError('storage_corrupt', 'storage', 'Saved input does not match its fixed Run scope.', false, active.runId));
     if (run.data.kind !== 'agent') return corrupt();
+    const frozenResources = run.data.config.resources === undefined ? null : FrozenResourcesSchema.safeParse(run.data.config.resources);
+    if (frozenResources && !frozenResources.success || Boolean(frozenResources) !== Boolean(content.resourceBinding)) return corrupt();
+    if (frozenResources?.success) {
+      const binding = content.resourceBinding!;
+      if (binding.bundleHash !== frozenResources.data.bundleHash || binding.requiredSkill && !frozenResources.data.discoveredSkills.some(ref =>
+        resourceRefKey(ref) === resourceRefKey(binding.requiredSkill!))) return corrupt();
+      const verified = this.dependencies.resources?.verifyFrozen(frozenResources.data);
+      if (!verified || !verified.ok) return verified ?? fail(appError('resource_bundle_unavailable', 'storage', 'Frozen resource verification is unavailable.', true));
+    }
     if (run.data.scope.version === 1) {
       if (content.workspaceContext !== null || content.workspaceInput !== null
         || content.allowedDocumentIds.length !== 0 || content.allowedArtifactIds.length !== 0) return corrupt();
@@ -857,6 +891,29 @@ export class RuntimeService {
         : inspected.availability === 'unusable' ? 'Agent Session 已不可继续使用，请新建会话。' : '此会话的原生历史不可用，请新建会话。';
       return fail(appError(code, 'session', message, false));
     }
+    const hub = this.dependencies.resources;
+    if (hub && !this.dependencies.contextService) return fail(appError('resource_evidence_write_failed', 'storage', 'Resource admission requires Context persistence.', true));
+    let selected: ResourceSelectionResult;
+    try {
+      const value = this.dependencies.resourceDefaults?.() ?? ok({ revision: 0, selection: EMPTY_RESOURCE_SELECTION });
+      if (!value.ok) return value;
+      const parsed = ResourceSelectionResultSchema.safeParse(value.data);
+      if (!parsed.success) return fail(appError('config_settings_invalid', 'input', 'Resource defaults are invalid.'));
+      selected = parsed.data;
+    } catch { return fail(appError('config_settings_invalid', 'input', 'Resource defaults could not be read.')); }
+    const required = resolveRequiredSkill(request.text, request.requiredSkill, selected.selection.enabledSkills);
+    if (!required.ok) return required;
+    const activeToolNames = request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
+      request.workspace.documentRef !== null, request.workspace.jobId !== null), ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
+    const fixed = hub?.freeze({ selection: selected.selection, settingsRevision: selected.revision, activeToolNames, requiredSkill: required.data }) ?? ok(null);
+    if (!fixed.ok) return fixed;
+    if (!hub && (selected.selection.prompt || selected.selection.enabledSkills.length || required.data))
+      return fail(appError('resource_required_unavailable', 'input', 'Managed resources are unavailable.'));
+    const resources = fixed.data;
+    const resourceBinding: ResourceBinding | undefined = resources ? { bundleHash: resources.bundleHash,
+      requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
+    const freezeConfig = (config: ReturnType<typeof initialAgentSnapshot>) => ({ ...config,
+      ...(resources ? { resources, agent: { ...config.agent, resourcePolicy: 'p11-resources-v1' as const } } : {}) });
     const createdAt = this.dependencies.now();
     const input: InputRecord = { version: 1, goal: INVOICE_CHAT_GOAL,
       text: request.text, messageTimestamp: Date.now() };
@@ -873,11 +930,12 @@ export class RuntimeService {
         const created = this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
           expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
           messageTimestamp: input.messageTimestamp, goal: INVOICE_CHAT_GOAL,
-          config: { ...initialP3AgentSnapshot(request, session.nativeSessionId),
+          config: { ...freezeConfig(initialP3AgentSnapshot(request, session.nativeSessionId)),
             ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
             ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
               ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
           cleanup: initialCleanup(), createdAt,
+          ...(hub ? { collectResourceEvidence: true as const } : {}),
           ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
           ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
             runtimeDir: this.dependencies.nativeTools.runtimeDir, allowedTools: nativeNames,
@@ -890,15 +948,17 @@ export class RuntimeService {
           workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(runId), 'work');
       } else {
         const created = this.dependencies.runs.createAgent({ goal: INVOICE_CHAT_GOAL, input,
-          config: { ...initialAgentSnapshot(request, session.nativeSessionId),
+          config: { ...freezeConfig(initialAgentSnapshot(request, session.nativeSessionId)),
             ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
             ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
               ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
-          cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: chatScope });
+          cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: chatScope,
+          ...(hub ? { collectResourceEvidence: true as const } : {}) });
         if (!created.ok) return created;
         runId = created.data;
       }
       const content: SessionInputContentV2 = { version: 2, text: request.text,
+        ...(resourceBinding ? { resourceBinding } : {}),
         requestIdentityVersion: 1, originalBudgetOverrides: originalOverrides(rawRequest),
         workspaceContext: admission?.workspaceContext ?? null, workspaceInput: admission?.workspaceInput ?? null,
         allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : [],
@@ -975,6 +1035,7 @@ export class RuntimeService {
     active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
     this.active = active;
     const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: frozenContent.promptText,
+      resources, ...(resourceBinding ? { resourceBinding } : {}),
       ...(inputId === undefined ? {} : { inputId }),
       ...(accepted.data.input.contextSnapshotId === null ? {} : { contextSnapshotId: accepted.data.input.contextSnapshotId }),
       control, stopPromise, readStop: () => stopIntent, emit };
@@ -1124,7 +1185,13 @@ export class RuntimeService {
     const repository = this.dependencies.contextRepository;
     if (p8 && (!repository || context.contextSnapshotId === undefined))
       return this.finishAgent(context, null, appError('context_binding_unknown', 'runtime', 'Context persistence is unavailable.', false, active.runId), true);
+    if (this.dependencies.resources && (!p8 || !repository?.recordResourceRead || !repository.recordResourceRequest))
+      return this.finishAgent(context, null, appError('resource_evidence_write_failed', 'storage', 'Resource evidence persistence is unavailable.', true, active.runId), true);
     const contextHooks: ContextHooks | undefined = p8 && repository ? {
+      ...(this.dependencies.resources && repository.recordResourceRead ? { recordResourceRead: value => repository.recordResourceRead!(value,
+        { runId: active.runId, sessionId: request.sessionId }) } : {}),
+      ...(this.dependencies.resources && repository.recordResourceRequest ? { recordResourceRequest: value => repository.recordResourceRequest!(value,
+        { runId: active.runId, sessionId: request.sessionId }) } : {}),
       ...(repository.recordCompactionEvidence ? { compaction: (value: Parameters<ContextRepository['recordCompactionEvidence']>[0]) => {
         if (value.runId !== active.runId || value.sessionId !== request.sessionId || value.nativeSessionId !== session.nativeSessionId)
           return fail(appError('context_binding_unknown', 'runtime', 'Compaction does not belong to this Run.'));
@@ -1162,9 +1229,11 @@ export class RuntimeService {
       { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
       active.controller.signal,
       context.scope ? { activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,
+        ...(context.resources ? { resources: context.resources } : {}),
         ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}),
         sessionInputs: true, ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) }
         : { sessionInputs: true, runtimeBudget: request.budget,
+          ...(context.resources ? { resources: context.resources } : {}),
           ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}) },
     )).then(
       (result) => ({ ok: true as const, result }),
@@ -1205,6 +1274,9 @@ export class RuntimeService {
       return this.finishAgent(context, null, error, !unconfirmed, unconfirmed);
     }
     const prepared = first.value.result.data;
+    if (!isDeepStrictEqual(prepared.snapshot.resources ?? null, context.resources)
+      || prepared.snapshot.agent.resourcePolicy !== (context.resources ? 'p11-resources-v1' : 'none'))
+      return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared resources differ from Run admission.', false, active.runId), true);
     if (frozenCompactionPolicy && !isDeepStrictEqual(prepared.snapshot.compactionPolicy, frozenCompactionPolicy))
       return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared compaction policy differs from Run admission.', false, active.runId), true);
     const stopBeforeStart = this.agentStop(context);
@@ -1236,6 +1308,7 @@ export class RuntimeService {
         maxToolCalls: 'maxToolCalls' in actualAgent ? actualAgent.maxToolCalls : 0,
         toolTimeoutMs: 'toolTimeoutMs' in actualAgent ? actualAgent.toolTimeoutMs : 10_000 };
       if (actualAgent.nativeSessionId !== frozenFacts.nativeSessionId || !compatiblePolicy
+        || context.resources && !actualAgent.systemPrompt.startsWith(`${frozenFacts.systemPrompt}\n`)
         || actualAgent.maxContextBytes !== frozenFacts.maxContextBytes
         || actualBudget.maxModelCalls !== request.budget.maxModelCalls || actualBudget.maxToolCalls !== request.budget.maxToolCalls
         || actualBudget.toolTimeoutMs !== request.budget.toolTimeoutMs)
@@ -1283,6 +1356,8 @@ export class RuntimeService {
       contextSnapshotId: context.contextSnapshotId,
       ...(contextHooks ? { contextHooks } : {}),
       promptText: context.promptText,
+      ...(context.resources ? { resources: context.resources } : {}),
+      ...(context.resourceBinding ? { resourceBinding: context.resourceBinding } : {}),
       runtimeBudget: request.budget, runtimeStrategy: context.runtimeStrategy,
       budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
       remainingRunMs: () => Math.max(0, active.startedAt + request.timeoutMs - this.dependencies.monotonicNow()),
@@ -1300,6 +1375,7 @@ export class RuntimeService {
         if (!permission.ok) return permission;
         if (permission.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
         if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', '会话历史不可继续使用。', false, active.runId, request.sessionId));
+        if (context.resources) return this.dependencies.resources!.verifyFrozen(context.resources);
         return ok(undefined);
       },
       ...(context.admission ? { workspaceInput: context.admission.workspaceInput, workspaceContext: context.admission.workspaceContext,
@@ -1392,7 +1468,8 @@ export class RuntimeService {
     const intent = this.agentStop(context);
     let cleanupFailure = outcome?.cleanupErrors[0];
     let finalError: AppError | null = cleanupFailure ? { ...cleanupFailure, runId: active.runId }
-      : intent ? errorForStop(intent.reason, active.runId, 'agent')
+      : intent?.reason === 'input-failure' ? { ...(active.inputFailure ?? errorForStop(intent.reason, active.runId, 'agent')), runId: active.runId }
+        : intent ? errorForStop(intent.reason, active.runId, 'agent')
         : error ? { ...error, runId: active.runId } : null;
     let inputUnconfirmed = false;
     let unresolvedDispatched: number[] = [];

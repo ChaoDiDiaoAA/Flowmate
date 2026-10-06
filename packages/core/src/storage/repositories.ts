@@ -4,6 +4,7 @@ import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction,
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { join, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
+import { verifyFrozenResourceMetadata } from '../resources/service.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { completeSessionInputs, createSessionInputLedger, finishSessionInputs, recoverSessionInputs } from '../sessions/input-ledger.ts';
@@ -11,9 +12,10 @@ import type { InputResultBatch, FrozenSessionInputAdmission } from '../sessions/
 import type { RuntimeEventStore } from '../events/store.ts';
 import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/verification.ts';
 import { contextReferenceFromColumns, readRunContextOwner, readContextSnapshotOwner, readToolContext } from '../context/repository.ts';
+import type { ContextOwnerCache } from '../context/repository.ts';
 import { formatContextPrompt } from '../context/service.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema } from '@flowmate/contracts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, emptyResourceJournal } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -129,6 +131,7 @@ export type NewAgentRun = Omit<NewProviderRun, 'config'> & {
   config: SafeConfigSnapshot & { agent: RunAgentConfigFacts };
   sessionId: DbId;
   scope: ChatScope | RunScope;
+  collectResourceEvidence?: true;
 };
 
 export type NewWorkspaceAgentRun = {
@@ -144,7 +147,14 @@ export type NewWorkspaceAgentRun = {
   createdAt: string;
   nativeTools?: { runtimeDir: string; allowedTools: readonly string[]; workingDirectory?: string };
   formTarget?: InvoiceFormTarget;
+  collectResourceEvidence?: true;
 };
+
+export function invoiceToolNamesForRun(goalMode: GoalMode, hasDocument: boolean, hasJob: boolean): readonly string[] {
+  return goalMode === 'fill-form' ? ['fill_invoice_form'] : !hasDocument ? [INVOICE_REVIEW_TOOL_NAMES[6]!, INVOICE_REVIEW_TOOL_NAMES[7]!]
+    : !hasJob ? INVOICE_REVIEW_TOOL_NAMES.slice(0, 9)
+      : goalMode === 'save-candidate' ? [...INVOICE_REVIEW_TOOL_NAMES] : INVOICE_REVIEW_TOOL_NAMES.slice(0, 12);
+}
 
 export type WorkspaceRunAdmission = {
   runId: DbId;
@@ -433,7 +443,7 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
     || agent.nativeSessionId.length < 1 || agent.nativeSessionId.length > 128
     || typeof agent.systemPrompt !== 'string'
     || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(String(agent.thinkingLevel))
-    || agent.resourcePolicy !== 'none'
+    || !['none', 'p11-resources-v1'].includes(String(agent.resourcePolicy))
     || agent.historyPolicy !== 'memory-only'
     || agent.sessionRetry !== false;
   const p2Invalid = agent.policyVersion === 'p2-invoice-chat-v1'
@@ -478,6 +488,9 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
   if (record.outputBudget !== undefined) versioned(record.outputBudget, 'outputBudget', ['policy', 'selectedMaxTokens', 'source']);
   if (kind === 'agent') {
     const agent = validatedAgentConfig(record.agent);
+    if ((agent.resourcePolicy === 'p11-resources-v1') !== Object.hasOwn(record, 'resources')) throw new Error('invalid_resource_policy');
+    if (Object.hasOwn(record, 'resources') && !verifyFrozenResourceMetadata(FrozenResourcesSchema.parse(record.resources)).ok)
+      throw new Error('invalid_resource_metadata');
     if ((raw.version === 2) !== (agent.policyVersion === 'runtime-v1')) throw new Error('invalid_runtime_config_version');
     if (raw.version === 2 && record.runtimeBudget === undefined) throw new Error('missing_runtime_budget');
     if (record.runtimeBudget !== undefined) {
@@ -486,7 +499,7 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
         || budget.toolTimeoutMs !== agent.toolTimeoutMs) throw new Error('invalid_runtime_config_budget');
     }
   }
-  else if (record.agent !== undefined) throw new Error('unexpected_provider_agent_config');
+  else if (record.agent !== undefined || Object.hasOwn(record, 'resources')) throw new Error('unexpected_provider_agent_config');
   if (record.runtimeStrategy !== undefined) RuntimeStrategySnapshotSchema.parse(record.runtimeStrategy);
   if (record.workspaceContext !== undefined) WorkspaceContextSchema.parse(record.workspaceContext);
   if (record.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form', 'local-task'].includes(String(record.goalMode))) throw new Error('invalid_goal_mode');
@@ -840,7 +853,7 @@ function toolResultCore(result: StoredToolResult): Omit<StoredToolResult, 'formA
   return core;
 }
 
-function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
+function toolCallSnapshot(db: Database, value: unknown, owners?: ContextOwnerCache): ToolCallSnapshot {
   const row = value as {
     id: number; run_id: number; session_id: number; native_tool_call_id: string; tool_name: string;
     tool_version: string | null; effect: string | null; status: string; args_json: string; result_json: string | null;
@@ -886,7 +899,7 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
   }, formApplication);
   return {
     toolCallId: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
-    context: readToolContext(db, row),
+    context: readToolContext(db, row, owners),
     toolName: row.tool_name, toolVersion: row.tool_version, effect: row.effect as ToolCallSnapshot['effect'],
     status: row.status as ToolCallStatus, args: args as unknown as ToolCallSnapshot['args'], result,
     ...(formApplication === undefined ? {} : { formApplication }),
@@ -897,6 +910,10 @@ function toolCallSnapshot(db: Database, value: unknown): ToolCallSnapshot {
     cleanup, runtimeObservation,
     requestedAt: row.requested_at, startedAt: row.started_at, endedAt: row.ended_at, stoppedAt: row.stopped_at,
   };
+}
+function toolCallSnapshots(db: Database, rows: unknown[]): ToolCallSnapshot[] {
+  const owners: ContextOwnerCache = new Map();
+  return rows.map(row => toolCallSnapshot(db, row, owners));
 }
 
 function businessEventSnapshot(value: unknown): BusinessEventSnapshot {
@@ -1765,7 +1782,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
               WHERE json_extract(strategy.value,'$.groupKey')=? AND json_extract(strategy.value,'$.toolName')=tool.tool_name
               AND json_extract(strategy.value,'$.toolVersion')=tool.tool_version))
           ORDER BY tool.id DESC LIMIT ?`).all(input.cutoff, input.groupKey, input.groupKey, TOOL_CONFIG.statistics.maxAttempts);
-        return ok(rows.map(row => toolCallSnapshot(db, row)));
+        return ok(toolCallSnapshots(db, rows));
         });
       } catch (error) { return evidenceReadFailure(error, 'Runtime observations could not be read.'); }
     },
@@ -1773,9 +1790,9 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
     recentObservations(input) {
       try {
         return readTransaction(db, () => {
-        return ok(db.query(`SELECT * FROM tool_calls WHERE runtime_observation_json IS NOT NULL
+        return ok(toolCallSnapshots(db, db.query(`SELECT * FROM tool_calls WHERE runtime_observation_json IS NOT NULL
           AND json_extract(runtime_observation_json,'$.groupKey')=? AND id<=? ORDER BY id DESC LIMIT ?`)
-          .all(input.groupKey, input.cutoff, TOOL_CONFIG.statistics.maxAttempts).map(row => toolCallSnapshot(db, row)));
+          .all(input.groupKey, input.cutoff, TOOL_CONFIG.statistics.maxAttempts)));
         });
       } catch (error) { return evidenceReadFailure(error, 'Runtime experience could not be read.'); }
     },
@@ -1860,7 +1877,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         const rows = input.beforeId === undefined
           ? db.query('SELECT * FROM tool_calls WHERE run_id=? ORDER BY id DESC LIMIT ?').all(input.runId, input.limit + 1)
           : db.query('SELECT * FROM tool_calls WHERE run_id=? AND id<? ORDER BY id DESC LIMIT ?').all(input.runId, input.beforeId, input.limit + 1);
-        const calls = (rows as unknown[]).map((row) => toolCallSnapshot(db, row));
+        const calls = toolCallSnapshots(db, rows);
         const hasMore = calls.length > input.limit;
         const items = hasMore ? calls.slice(0, input.limit) : calls;
         return ok({ items, nextBeforeId: hasMore ? items.at(-1)?.toolCallId ?? null : null });
@@ -2875,6 +2892,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
             if (binding.inputId === null || binding.originRunId === null) return [];
             const row = db.query('SELECT content_json FROM session_inputs WHERE id=?').get(binding.inputId) as { content_json: string };
             return [{ inputId: binding.inputId, runId: binding.originRunId, nativeEntryId: binding.nativeEntryId,
+              ...(bundle.seed.resourceExpansions?.find(value => value.inputId === binding.inputId && value.nativeEntryId === binding.nativeEntryId)
+                ? { resourceExpansion: bundle.seed.resourceExpansions.find(value => value.inputId === binding.inputId && value.nativeEntryId === binding.nativeEntryId)! } : {}),
               content: SessionInputContentSchema.parse(JSON.parse(row.content_json)) }];
           });
           return { history: bundle.history, bindings, sessionInputs, origins: bundle.seed.origins };
@@ -3125,7 +3144,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           (kind,session_id,scope_json,status,goal,input_json,config_json${p8 ? ',context_observations_json' : ''},cleanup_json,usage_json,created_at)
           VALUES ('agent',?,?,'created',?,?,?${p8 ? ',?' : ''},?,?,?)`)
           .run(input.sessionId, asJson(input.scope), input.goal, asJson(input.input), asJson(input.config),
-            ...(p8 ? [asJson({ version: 1, requests: [] })] : []),
+            ...(p8 ? [asJson({ version: 1, requests: [], ...(input.collectResourceEvidence ? { resources: emptyResourceJournal() } : {}) })] : []),
             asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const id = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_run_id');
@@ -3156,9 +3175,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const frozen = freezeWorkspaceInput(db, input, verify);
         if (!frozen.ok) return frozen;
         const { document, job, workspaceContext, workspaceInput } = frozen.data;
-        const allowedTools = fill ? ['fill_invoice_form'] : !document ? [INVOICE_REVIEW_TOOL_NAMES[6]!, INVOICE_REVIEW_TOOL_NAMES[7]!]
-          : !job ? INVOICE_REVIEW_TOOL_NAMES.slice(0, 9)
-            : input.goalMode === 'save-candidate' ? [...INVOICE_REVIEW_TOOL_NAMES] : INVOICE_REVIEW_TOOL_NAMES.slice(0, 12);
+        const allowedTools = invoiceToolNamesForRun(input.goalMode, document !== null, job !== null);
         const nativeNames = fill ? [] : input.nativeTools?.allowedTools ?? [];
         const scope = RunScopeSchema.parse({ version: 2, allowedTools: [...allowedTools, ...nativeNames],
           allowedDocumentIds: document ? [document.id] : [],
@@ -3174,7 +3191,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const inserted = db.query(`INSERT INTO runs(kind,session_id,job_id,scope_json,status,goal,input_json,config_json${p8 ? ',context_observations_json' : ''},cleanup_json,usage_json,created_at)
           VALUES ('agent',?,?,?,?,?,?,?${p8 ? ',?' : ''},?,?,?)`)
           .run(input.sessionId, job?.jobId ?? null, asJson(scope), 'created', input.goal, asJson(inputRecord), asJson(config),
-            ...(p8 ? [asJson({ version: 1, requests: [] })] : []),
+            ...(p8 ? [asJson({ version: 1, requests: [], ...(input.collectResourceEvidence ? { resources: emptyResourceJournal() } : {}) })] : []),
             asJson(input.cleanup), asJson(input.usage), input.createdAt);
         const runId = Number(inserted.lastInsertRowid);
         if (!Number.isSafeInteger(runId) || runId <= 0) throw new Error('unsafe_run_id');
@@ -3254,6 +3271,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
                 policyVersion: snapshot.json.policyVersion, projectionMode: 'fill-reference', gaps: snapshot.json.modelProjection.gaps })}`
               : formatContextPrompt(snapshot);
             if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
+              || !isDeepStrictEqual(snapshot.json.resourceBinding, content.resourceBinding)
               || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
               || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds) || content.promptText !== expectedPrompt) return corruptWorkspace();
           }
@@ -3579,7 +3597,7 @@ function qualifyRecoveredInputResult(db: Database, runId: DbId, inputIds: readon
     const evidence = createSessionInputLedger(db).resultEvidence(runId, inputIds, resultEntryId);
     if (!evidence.ok) return false;
     const all = db.query('SELECT * FROM tool_calls WHERE run_id=?').all(runId);
-    const calls = all.map(row => toolCallSnapshot(db, row)).filter(call => evidence.data.toolCallIds.includes(call.nativeToolCallId));
+    const calls = toolCallSnapshots(db, all).filter(call => evidence.data.toolCallIds.includes(call.nativeToolCallId));
     if (calls.length !== new Set(evidence.data.toolCallIds).size || calls.some(call => !call.cleanup.stopped || call.cleanup.errors.length
       || call.cleanup.nativeProcesses?.some(process => !process.stopped))) return false;
     if (config.goalMode === 'save-candidate' && evidence.data.inputs.some(input => input.mode === 'prompt')) {

@@ -1,17 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
 import { RUNTIME_CONFIG, appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest,
-  RuntimeEventsAvailableSchema } from '@flowmate/contracts';
+  RuntimeEventsAvailableSchema, EMPTY_RESOURCE_SELECTION, ResourceSelectionSchema,
+  } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
-import { defaultProductSettings, readProductSettings, saveProductSettings } from '@flowmate/core';
+import { defaultProductSettings, readProductSettings, saveProductSettings, validateProductSettings } from '@flowmate/core';
 import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
+import { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from './protocol.ts';
 import { parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from './protocol.ts';
 import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand, isContextHostCommand,
   parseContextHostResult, matchesContextResponse, contextHostFailure,
@@ -72,20 +73,22 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     process.exitCode = 2;
     return;
   }
-  try {
-    const raw = JSON.parse(await readFile(settingsFile, 'utf8')) as { version?: unknown };
-    if (raw.version === 1) settings = await saveProductSettings(settingsFile, settings.data);
-  } catch { /* A missing settings file already has safe defaults. */ }
-  if (!settings.ok) {
-    send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> });
-    process.exitCode = 2;
-    return;
-  }
   let currentSettings: ProductSettings = settings.data ?? defaultProductSettings();
   const active = new Map<string, { controller: AbortController; runId: number | null }>();
   const recentlySeen = new Set<string>();
   const seenOrder: string[] = [];
   let application: Application;
+  let settingsWriteQueue = Promise.resolve();
+  const enqueueSettingsWrite = <T>(action: () => Promise<T>): Promise<T> => {
+    const result = settingsWriteQueue.then(action);
+    settingsWriteQueue = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  const publishSettings = (saved: ProductSettings) => {
+    currentSettings = saved;
+    void send({ version: 1, type: 'event', event: { type: 'host_state', state: state() } });
+  };
+  const selectionKey = (settings: ProductSettings) => JSON.stringify(ResourceSelectionSchema.parse(settings.resources ?? EMPTY_RESOURCE_SELECTION));
   const pendingCredentials = new Map<string, (value: { ok: boolean; credential?: unknown }) => void>();
   const pendingForms = new Map<string, { request: InvoiceFormBridgeRequest; resolve(receipt: InvoiceFormApplicationReceipt): void }>();
   const invoiceFormBridge = (request: InvoiceFormBridgeRequest, signal: AbortSignal): Promise<InvoiceFormApplicationReceipt> => {
@@ -152,9 +155,21 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     paths,
     invoiceSourceRoot,
     provider: new PiProviderAdapter({ credentialsFor }),
-    agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, promptTrace, tools }),
+    agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir,
+      resourceBundleRoot: join(paths.runtimeDir, 'resource-bundles'), promptTrace, tools }),
     promptTrace,
     runtimeDefaults: () => ok(currentSettings.runtime ?? {}),
+    resourceDefaults: () => ok({ revision: currentSettings.revision, selection: currentSettings.resources ?? EMPTY_RESOURCE_SELECTION }),
+    saveResourceSelection: input => enqueueSettingsWrite(async () => {
+      if (input.expectedRevision !== currentSettings.revision)
+        return fail(appError('config_revision_conflict', 'input', 'Reload current resource selection before saving.', true));
+      const valid = application.validateResourceSelection(input.selection);
+      if (!valid.ok) return valid;
+      const saved = await saveProductSettings(settingsFile, { ...currentSettings, resources: input.selection });
+      if (!saved.ok) return saved;
+      publishSettings(saved.data);
+      return ok({ revision: saved.data.revision, selection: saved.data.resources! });
+    }),
     observeCompaction: observation => {
       const value = parseCompactionNotification({ type: 'compaction_observation', observation });
       if (value) void send({ version: 1, type: 'event', event: value });
@@ -250,7 +265,6 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     userDataPath: paths.root,
   });
   send({ version: 1, type: 'ready', state: state() });
-  let settingsWriteQueue = Promise.resolve();
   const claimRequestId = (requestId: string) => {
     if (recentlySeen.has(requestId)) return false;
     recentlySeen.add(requestId);
@@ -488,19 +502,31 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       return;
     }
     if (command.type === 'save_settings') {
-      let resolveQueue!: () => void;
-      const previous = settingsWriteQueue;
-      settingsWriteQueue = new Promise<void>((resolve) => { resolveQueue = resolve; });
-      await previous;
-      let saved;
-      try { saved = await saveProductSettings(settingsFile, command.settings); }
-      finally { resolveQueue(); }
-      if (saved.ok) {
-        currentSettings = saved.data;
-        send({ version: 1, type: 'event', event: { type: 'host_state', state: state() } });
-      }
+      const saved = await enqueueSettingsWrite(async () => {
+        const validated = validateProductSettings(command.settings);
+        if (!validated.ok) return validated;
+        if (validated.data.revision !== currentSettings.revision)
+          return fail(appError('config_revision_conflict', 'input', 'Reload current configuration before saving.', true));
+        if (selectionKey(validated.data) !== selectionKey(currentSettings)) {
+          const resources = application.validateResourceSelection(validated.data.resources!);
+          if (!resources.ok) return resources;
+        }
+        const written = await saveProductSettings(settingsFile, validated.data);
+        if (written.ok) publishSettings(written.data);
+        return written;
+      });
       send({ version: 1, type: 'response', requestId: command.requestId, value: saved });
       return;
+    }
+    if (isResourceHostCommand(command.type)) {
+      const value = command.type === 'list_resources' ? await application.listResources()
+        : command.type === 'read_resource_file' ? await application.readResourceFile(command.input)
+        : command.type === 'update_resource_selection' ? await application.updateResourceSelection(command.input)
+        : command.type === 'query_run_resources' ? await application.queryRunResources(command.input)
+        : command.type === 'read_run_resource_file' ? await application.readRunResourceFile(command.input) : null;
+      const result = parseResourceHostResult(command.type, value);
+      send({ version: 1, type: 'response', requestId: command.requestId, value: result && matchesResourceResponse(command, result) ? result
+        : fail(appError('host_protocol_invalid', 'runtime', 'Resource response could not be verified.')) }); return;
     }
     if (command.type === 'query_run') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryRun(command.runId) });
@@ -742,6 +768,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       const normalized = command.type === 'start_run' ? normalizeAgentRunRequest({
         sessionId: command.input.sessionId,
         text: command.input.text,
+        ...(command.input.requiredSkill === undefined ? {} : { requiredSkill: command.input.requiredSkill }),
         config,
         ...(command.input.workspace === undefined ? {} : { workspace: command.input.workspace }),
         ...(command.input.workingDirectory === undefined ? {} : { workingDirectory: command.input.workingDirectory }),
@@ -762,6 +789,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
         if (command.type === 'submit_invoice_form_input') accepted = await application.submitInput({
           sessionId: command.input.workspace.sessionId, clientSequence: command.input.clientSequence, mode: 'prompt', goalMode: 'fill-form',
           text: '将当前已选候选录入发票表单，保留供人工检查。', config,
+          ...(command.input.requiredSkill === undefined ? {} : { requiredSkill: command.input.requiredSkill }),
           workspace: command.input.workspace, formTarget: command.input.target,
           ...(command.input.budget === undefined ? {} : { budget: command.input.budget }),
           ...(command.input.timeoutMs === undefined ? {} : { timeoutMs: command.input.timeoutMs }),

@@ -21,6 +21,7 @@ import type { ToolCallDelivery } from './activity.ts';
 import type { CandidateSnapshot } from './activity.ts';
 import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput } from './invoice.ts';
 import type { ContextHooks } from './context.ts';
+import type { FrozenResources, ResourceBinding } from './resources.ts';
 import type { HistoryCommitState, HistoryCommitReceipt, NativeHistoryRecoverySeed, NativeHistoryWrite, NativeHistoryInspection } from './memory.ts';
 import type { CompactionPolicy, CompactionCapacity, SavedCompactionView, CompactionObservation,
   NativeCompactionControl, NativeCompactionOutcome } from './compaction.ts';
@@ -44,6 +45,7 @@ export interface CandidateRepository {
 }
 
 export type SafeConfigSnapshot = {
+  resources?: FrozenResources;
   compactionPolicy?: CompactionPolicy;
   version: 1 | 2;
   name: string;
@@ -73,7 +75,7 @@ export type AgentConfigFacts = {
   nativeSessionId: string;
   systemPrompt: string;
   thinkingLevel: string;
-  resourcePolicy: 'none';
+  resourcePolicy: 'none' | 'p11-resources-v1';
   historyPolicy: 'memory-only';
   maxContextBytes: 524_288;
   maxOutputBytes: 262_144;
@@ -87,7 +89,7 @@ export type P3AgentConfigFacts = {
   nativeSessionId: string;
   systemPrompt: string;
   thinkingLevel: string;
-  resourcePolicy: 'none';
+  resourcePolicy: 'none' | 'p11-resources-v1';
   historyPolicy: 'memory-only';
   maxContextBytes: 8_388_608;
   maxOutputBytes: 262_144;
@@ -158,6 +160,8 @@ export type AgentToolBinding = {
 };
 
 export type AgentExecutionInput = NativeInput & {
+  resources?: FrozenResources;
+  resourceBinding?: ResourceBinding;
   runId: DbId;
   sessionId: DbId;
   contextSnapshotId?: DbId;
@@ -275,12 +279,14 @@ export interface AgentPort {
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
     options?: { activeToolNames?: readonly string[]; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
-      runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot; compactionPolicy?: CompactionPolicy },
+      runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot; compactionPolicy?: CompactionPolicy;
+      resources?: FrozenResources },
   ): Promise<Result<PreparedAgent>>;
   releaseSession(nativeSessionId: string): Promise<CloseReport>;
   close(): Promise<CloseReport>;
 }
 
 export type AgentInputDispatch = { inputId: DbId; runId: DbId; sessionId: DbId;
+  resourceBinding?: ResourceBinding;
   contextSnapshotId?: DbId;
   mode: 'steer' | 'followUp'; text: string; promptText: string };

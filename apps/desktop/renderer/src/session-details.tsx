@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { CandidateJobDetail, ContextReference, ContextSnapshotDetail, ContextSnapshotsPage,
   ContextRequestsPage, SessionRunsPage } from '@flowmate/contracts';
 import { useRead, type ContextIdentity } from './context-state.ts';
+import { RunResources } from './prompt.tsx';
 import { SessionHistory } from './session-history.tsx';
 import { SessionCompaction } from './session-compaction.tsx';
 import type { ForkSessionRequest, ForkSessionResult } from '@flowmate/contracts';
@@ -230,6 +231,7 @@ export function SessionDetails(props: Props) {
       <p>{candidate.state.data.candidate.origin ?? 'model'} · {candidate.state.data.candidate.status}</p>
       {Object.entries(candidate.state.data.candidate.fields).map(([name, value]) => <p key={name}>{name} · {value.normalized ?? value.raw ?? '—'}</p>)}
       <button className="text-button" onClick={() => props.onOpenCandidateBasis(candidate.state.data!.candidate)}>View original context basis</button></section>}
+    <RunResources identity={identity} ready={props.hostReady} refreshToken={props.refreshToken} />
     <h3>Requests</h3><p className="config-note">Recorded for this Run. Each request lists its own input and tool result bases.</p>
     <ReadIssue error={requests.state.error} pending={requests.state.pending} />
     {requests.state.data && <ContextCollectionNotice page={requests.state.data} />}

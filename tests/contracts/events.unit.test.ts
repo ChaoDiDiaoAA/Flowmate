@@ -346,7 +346,12 @@ it('T08 portable Context error facts keep the original export binding and exact 
     compaction_unavailable:['runtime',false],compaction_not_needed:['runtime',false],compaction_failed:['runtime',false],
     compaction_cancelled:['runtime',false],compaction_timeout:['runtime',false],compaction_capacity_exceeded:['runtime',false],
     context_binding_conflict:['runtime',false],context_payload_mismatch:['runtime',false],context_snapshot_not_found:['input',false],
-    provider_transport_error:['provider',false],internal_error:['internal',false] });
+    provider_transport_error:['provider',false],internal_error:['internal',false],
+    resource_manifest_invalid:['input',false],resource_name_conflict:['input',false],resource_version_changed:['input',false],
+    resource_dependency_missing:['input',false],resource_required_unavailable:['input',false],resource_content_too_large:['input',false],
+    resource_file_unavailable:['input',false],resource_bundle_unavailable:['storage',true],resource_expansion_mismatch:['runtime',false],
+    resource_evidence_conflict:['runtime',false],resource_evidence_write_failed:['storage',true],
+    config_revision_conflict:['input',true],config_settings_write_failed:['storage',true] });
   for (const [code,[category,retryable]] of Object.entries(portableFacts)) {
     const error={code,category,retryable,message:'Controlled product failure.'};
     expect(contracts.ContextErrorSchema.safeParse(error).success).toBe(true);

@@ -1,4 +1,7 @@
 import { z } from 'zod';
+export { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../packages/contracts/src/resources.ts';
+import { ResourceRefSchema, ResourceCatalogResultSchema, ResourceFileResultSchema, ResourceSelectionResponseSchema, RunResourceResultSchema,
+  RunResourceQuerySchema, RunResourceFileRequestSchema, resourceRefKey } from '@flowmate/contracts';
 import type { AgentRunEvent, DesktopState, ModelAuthNotice, ModelAuthPrompt } from '@flowmate/contracts';
 import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionInputQuerySchema,
   SessionInputsRequestSchema, SetSessionStatusRequestSchema, BranchSessionRequestSchema,
@@ -6,6 +9,7 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   AcceptInvoiceCandidateRequestSchema, RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema,
   InvoiceCandidateOperationQuerySchema, RuntimeRequestOverridesSchema, RUNTIME_CONFIG,
   RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeSubscriptionIdSchema,
+  ResourceFileRequestSchema, ResourceSelectionRequestSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema, RuntimeEventsReadResultSchema, RuntimeSubscriptionResultSchema,
   RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   WorkspaceUpdateRequestSchema, WorkspaceSnapshotSchema, WorkspaceRestoreResultSchema, AppErrorSchema, invoiceToolSchemas,
@@ -26,15 +30,16 @@ const pageLimit = z.number().int().min(1).max(100);
 const sessionTitle = z.string().trim().min(1).refine((value) => [...value].length <= 120 && new TextEncoder().encode(value).byteLength <= 480);
 const credentialRef = z.string().regex(/^[a-zA-Z0-9_-]{16,80}$/);
 const boundedText = z.string().refine((value) => new TextEncoder().encode(value).byteLength <= 65_536);
+const requiredSkill = ResourceRefSchema.refine(ref => ref.kind === 'skill').optional();
 const inputText = z.string().refine(value => value.trim().length > 0 && new TextEncoder().encode(value).byteLength <= 65_000);
 export const DesktopSessionInputRequestSchema = z.discriminatedUnion('mode', [
-  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('prompt'), text: inputText, modelId,
+  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('prompt'), text: inputText, modelId, requiredSkill,
     goalMode: z.enum(['answer', 'save-candidate']).default('answer'), workspace: WorkspaceExpectationSchema.optional(),
     workingDirectory: WorkingDirectorySchema.optional(), ...RuntimeRequestOverridesSchema.shape,
   }).strict(),
-  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('steer'), runId: dbId, text: inputText,
+  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('steer'), runId: dbId, text: inputText, requiredSkill,
     workspace: WorkspaceExpectationSchema.optional() }).strict(),
-  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('followUp'), runId: dbId, text: inputText,
+  z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('followUp'), runId: dbId, text: inputText, requiredSkill,
     workspace: WorkspaceExpectationSchema.optional() }).strict(),
 ]).superRefine((input, ctx) => {
   if (input.workspace && input.workspace.sessionId !== input.sessionId)
@@ -44,7 +49,7 @@ export const DesktopSessionInputRequestSchema = z.discriminatedUnion('mode', [
   if (input.mode === 'prompt' && input.goalMode === 'save-candidate' && (!input.workspace?.documentRef || !input.workspace.jobId))
     ctx.addIssue({ code: 'custom', message: 'Invoice context and processing task are required.' });
 });
-export const InvoiceFormRunInputSchema = z.object({ modelId, clientSequence: dbId,
+export const InvoiceFormRunInputSchema = z.object({ modelId, clientSequence: dbId, requiredSkill,
   target: InvoiceFormTargetSchema, workspace: WorkspaceExpectationSchema, ...RuntimeRequestOverridesSchema.shape,
 }).strict().refine(value => value.workspace.documentRef !== null && value.workspace.jobId !== null
   && value.workspace.candidateRef !== null, 'Fill requires a selected candidate.');
@@ -97,6 +102,11 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     promptId: requestId, value: z.string().max(8192).nullable() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_login'), loginRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('save_settings'), settings: z.unknown() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_resources') }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_run_resources'), input: RunResourceQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('read_run_resource_file'), input: RunResourceFileRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('read_resource_file'), input: ResourceFileRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('update_resource_selection'), input: ResourceSelectionRequestSchema }).strict(),
   z.object({
     version: z.literal(1), requestId, type: z.literal('call_provider'),
     input: z.object({
@@ -157,7 +167,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     input: z.object({
       sessionId: dbId,
       text: boundedText,
-      modelId,
+      modelId, requiredSkill,
       workspace: z.object({
         revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), documentRef: documentRef.nullable(), jobId: dbId.nullable(),
         candidateRef: z.object({ id: dbId, sequence: dbId }).strict().nullable(), sessionId: dbId,
@@ -344,6 +354,7 @@ const contextResultSchemas = {
   query_context_snapshot: ContextSnapshotResultSchema,
   list_context_requests: ContextRequestsResultSchema,
 };
+
 export function isContextHostCommand(type: string): type is keyof typeof contextResultSchemas {
   return Object.hasOwn(contextResultSchemas, type);
 }

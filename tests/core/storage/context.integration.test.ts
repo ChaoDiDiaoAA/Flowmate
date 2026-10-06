@@ -14,7 +14,7 @@ import { SessionService } from '../../../packages/core/src/sessions/service.ts';
 import { projectSessionMessages } from '../../../packages/runtime-pi/src/messages.ts';
 import { createNativeOriginReader, resolveNativeEntryOrigin } from '../../../packages/core/src/memory/origins.ts';
 import { ContextSnapshotJsonSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema, ContextObservationsSchema,
-  NativeContextObservationsSchema, PublicContextObservationsSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok, RUNTIME_CONFIG } from '@flowmate/contracts';
+  NativeContextObservationsSchema, PublicContextObservationsSchema, invoiceHeaderFields, normalizeSessionInputRequest, ok, RUNTIME_CONFIG, emptyResourceJournal } from '@flowmate/contracts';
 import type { ContextSnapshotJson, RequestContextBinding, NativeSessionHistory, Result, ToolRuntimeObservation, RunCompactionEvidence } from '@flowmate/contracts';
 
 const at = '2026-10-03T00:00:00.000Z';
@@ -686,6 +686,36 @@ it.each(['fork-cycle','reference-cycle','missing-summary-reference','missing-lab
   expect(f.store.sessions.isModelUseBlocked(target.sessionId)).toMatchObject({ok:false,error:{code:'context_binding_unknown'}});
 });
 describe('P8 Context storage', () => {
+  it('keeps missing P11 evidence absent and commits request duplicates with original identity and failure rollback', () => {
+    const f = fixture(), owner = { sessionId: f.session.sessionId, runId: f.runId };
+    const reader = Reflect.get(f.store.context, 'readResourceEvidence');
+    const writer = Reflect.get(f.store.context, 'recordResourceRequest');
+    expect(typeof reader).toBe('function'); expect(typeof writer).toBe('function');
+    if (typeof reader !== 'function' || typeof writer !== 'function') throw new Error('P11 resource journal is not connected');
+    expect(reader(owner)).toEqual(ok(null));
+    f.store.db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify({ version: 1, requests: [], resources: emptyResourceJournal() }), f.runId);
+    const input = f.append(); f.consume(input.inputId, input.content.promptText);
+    need(f.store.context.bindRequest({ binding: f.binding(input.inputId, input.snapshot.id), api: 'openai-responses', at, transport: 'observed-fetch' }));
+    const value = { purpose: 'answer' as const, callSequence: 1, compactionOperationId: null, bundleHash: null,
+      referencedBundleHashes: [], systemPromptHash: createHash('sha256').update('fixture').digest('hex'),
+      inputIds: [input.inputId], toolCallIds: [], contentChecks: [], at };
+    expect(writer(value, owner)).toEqual(ok(undefined));
+    expect(writer({ ...value, at: later }, owner)).toEqual(ok(undefined));
+    expect(reader(owner)).toMatchObject({ ok: true, data: { requests: [{ ...value, at }] } });
+    const before = f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId);
+    expect(writer({ ...value, systemPromptHash: 'b'.repeat(64) }, owner)).toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
+    expect(writer(value, { ...owner, sessionId: owner.sessionId + 1 }).ok).toBe(false);
+    expect(writer({ ...value, inputIds: [input.inputId + 1] }, owner).ok).toBe(false);
+    expect(f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId)).toEqual(before);
+    const second = { ...f.binding(input.inputId, input.snapshot.id), requestSequence: 2, callSequence: 2 };
+    need(f.store.context.bindRequest({ binding: second, api: 'openai-responses', at: later, transport: 'observed-fetch' }));
+    const saved = f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId);
+    f.store.db.exec("CREATE TRIGGER p11_fail_evidence BEFORE UPDATE OF context_observations_json ON runs BEGIN SELECT RAISE(ABORT,'P11 evidence fault'); END;");
+    expect(writer({ ...value, callSequence: 2, at: later }, owner)).toMatchObject({ ok: false, error: { code: 'resource_evidence_write_failed' } });
+    expect(f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId)).toEqual(saved);
+    f.store.db.exec('DROP TRIGGER p11_fail_evidence');
+    expect(writer({ ...value, callSequence: 2, at: later }, owner)).toEqual(ok(undefined));
+  });
   it('migrates real 014 without rewriting legacy evidence and installs all guards', () => {
     const productPaths = paths(), old = schema14(productPaths);
     seedOldInputs(old);

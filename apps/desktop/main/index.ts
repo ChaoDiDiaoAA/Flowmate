@@ -1,3 +1,4 @@
+import { ResourceRefSchema } from '@flowmate/contracts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -89,6 +90,7 @@ import { contextHostFailure, matchesContextResponse, parseContextHostResult } fr
 import { historyHostFailure, matchesHistoryResponse, parseHistoryHostResult, parseHostCommand, isHistoryHostCommand } from '../../host/protocol.ts';
 import type { HostCommand } from '../../host/protocol.ts';
 import { DesktopSessionCompactionRequestSchema } from '@flowmate/contracts';
+import { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../host/protocol.ts';
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
@@ -421,6 +423,17 @@ async function contextIpcQuery(command: Extract<HostCommand, { type: 'list_conte
     return checked !== null && matchesContextResponse(command, checked) ? checked : contextHostFailure();
   } catch { return contextHostFailure(); }
 }
+
+async function resourceIpcQuery(type: string, input?: unknown) {
+  const command = parseHostCommand({ version: 1, requestId: randomUUID(), type, ...(input === undefined ? {} : { input }) });
+  if (!command || !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
+  const epoch = host.connectionEpoch;
+  try {
+    const { version: _version, requestId: _requestId, ...request } = command;
+    const checked = parseResourceHostResult(type, await host.request(request));
+    return epoch === host.connectionEpoch && checked !== null && matchesResourceResponse(command, checked) ? checked : resourceHostFailure(type);
+  } catch { return resourceHostFailure(type); }
+}
 async function compactionIpcRequest(command: HostCommand) {
   const epoch = host.connectionEpoch;
   try {
@@ -510,6 +523,8 @@ function registerIpc(): void {
     try { return RuntimeToolResultSchema.parse(await host.request({ type: 'query_run_tool_call', input: input.data })); }
     catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool could not be confirmed.', true)); }
   });
+  for (const type of ['list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file'] as const)
+    handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => resourceIpcQuery(type, raw));
   handle(channels.listContextSnapshots, async (_event, raw) => {
     const input = ContextSnapshotsRequestSchema.safeParse(raw);
     if (!input.success) return fail(appError('input_invalid', 'input', 'Context snapshot list request is invalid.'));
@@ -1234,7 +1249,7 @@ async function queryRuntimeState(): Promise<Result<RuntimeState>> {
 
 function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some((key) => !['sessionId', 'text', 'modelId', 'workspace', 'goalMode', 'workingDirectory', 'budget', 'timeoutMs', 'stopGraceMs'].includes(key))) return false;
+    || Object.keys(value).some((key) => !['sessionId', 'text', 'modelId', 'workspace', 'goalMode', 'workingDirectory', 'budget', 'timeoutMs', 'stopGraceMs', 'requiredSkill'].includes(key))) return false;
   const request = value as Partial<DesktopAgentRunRequest>;
   const workspace = request.workspace === undefined ? null : WorkspaceExpectationSchema.safeParse(request.workspace);
   return Number.isSafeInteger(request.sessionId) && Number(request.sessionId) > 0
@@ -1243,6 +1258,7 @@ function isDesktopAgentRunRequest(value: unknown): value is DesktopAgentRunReque
     && typeof request.modelId === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(request.modelId)
     && (workspace === null || workspace.success && workspace.data.sessionId === request.sessionId)
     && (request.goalMode === 'answer' || request.goalMode === 'save-candidate')
+    && (request.requiredSkill === undefined || ResourceRefSchema.safeParse(request.requiredSkill).success && request.requiredSkill.kind === 'skill')
     && (request.workingDirectory === undefined || WorkingDirectorySchema.safeParse(request.workingDirectory).success)
     && (request.workingDirectory === undefined || workspace?.success === true)
     && (request.goalMode !== 'save-candidate' || workspace?.success === true

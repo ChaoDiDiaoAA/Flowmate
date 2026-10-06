@@ -317,7 +317,8 @@ export type SessionMessagesPage = {
 };
 export type NativeEntryRunBinding = { entryId: string; runId: DbId };
 export type NativeEntryLiveBinding = NativeEntryRunBinding & { liveOrdinal: number };
-export type NativeHistoryAppendContext = NativeEntryRunBinding & { inputId?: DbId; resultInputIds?: DbId[] };
+export type NativeHistoryAppendContext = NativeEntryRunBinding & { inputId?: DbId; resultInputIds?: DbId[];
+  resourceExpansion?: import('./resources.ts').ResourceExpansionEvidence };
 export type NativeHistoryDisplayRecord = { history: NativeSessionHistory | null; bindings: NativeEntryRunBinding[] };
 export type MessageRunInput = {
   runId: DbId; input: Readonly<InputRecord>; goalMode: import('./workspace.ts').GoalMode | null;
@@ -330,6 +331,7 @@ export type NativeMessageProjectionInput = {
   beforeEntryId?: string; limit: number; liveBindings?: readonly NativeEntryLiveBinding[];
 };
 export type MessageSessionInput = { inputId: DbId; runId: DbId; nativeEntryId: string;
+  resourceExpansion?: import('./resources.ts').ResourceExpansionEvidence;
   content: import('./session-inputs.ts').SessionInputContent };
 export type SetSessionStatusRequest = { sessionId: DbId; expectedStatus: SessionStatus; status: SessionStatus };
 export type BranchSessionRequest = { sessionId: DbId; expectedLeafId: string | null; expectedEntryCount: number; expectedCommitRevision: number; targetEntryId: string };
@@ -427,6 +429,7 @@ export type NormalizedListSessionsRequest = { limit: number; before?: SessionCur
 export type SessionPage = { items: SessionSnapshot[]; next: SessionCursor | null };
 
 export type AgentRunRequest = {
+  requiredSkill?: import('./resources.ts').ResourceRef;
   sessionId: DbId;
   text: string;
   config: ProviderConfig;
@@ -517,6 +520,13 @@ export type CloseReport = {
 };
 
 export interface Application {
+  listResources(): Promise<Result<import('./resources.ts').ResourceCatalog>>;
+  readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<Result<import('./resources.ts').ResourceFilePage>>;
+  updateResourceSelection(input: import('./resources.ts').ResourceSelectionRequest): Promise<Result<import('./resources.ts').ResourceSelectionResult>>;
+  queryRunResources(input: import('./resources.ts').RunResourceQuery): Promise<Result<import('./resources.ts').RunResourceView>>;
+  readRunResourceFile(input: import('./resources.ts').RunResourceFileRequest): Promise<Result<import('./resources.ts').ResourceFilePage>>;
+  /** Host configuration validation only; never exposed to Renderer/IPC. */
+  validateResourceSelection(selection: import('./resources.ts').ResourceSelection): Result<void>;
   callProvider(
     request: ProviderRequest,
     control?: ProviderControl,

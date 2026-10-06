@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ResourceExpansionEvidenceSchema, ResourceReadEvidenceSchema } from './resources.ts';
 import { SessionSnapshotSchema } from './runtime.ts';
 import type { DbId, NativeHistoryAppendContext, NativeSessionHistory, Result } from './runtime.ts';
 import { ContextErrorSchema, NativeInputContextBindingSchema } from './context.ts';
@@ -140,7 +141,10 @@ export const HistoryCommitStateSchema = z.object({ commitRevision: HistorySafeIn
 export type HistoryCommitState = z.infer<typeof HistoryCommitStateSchema>;
 export const HistoryCommitReceiptSchema = HistoryCommitStateSchema;
 export type HistoryCommitReceipt = HistoryCommitState;
-const appendContext = z.object({ entryId: NativeEntryIdSchema, runId: id, inputId: id.optional(), resultInputIds: z.array(id).optional() }).strict();
+const appendContext = z.object({ entryId: NativeEntryIdSchema, runId: id, inputId: id.optional(), resultInputIds: z.array(id).optional(),
+  resourceExpansion: ResourceExpansionEvidenceSchema.optional() }).strict().refine(value => value.resourceExpansion === undefined
+    || value.resourceExpansion.inputId === value.inputId && value.resourceExpansion.nativeEntryId === value.entryId,
+  'Expansion receipt must identify the same committed user Input.');
 export const StoredNativeHistorySchema = z.object({ history: NativeSessionHistorySchema, commit: HistoryCommitStateSchema }).strict()
   .refine(value => value.history.entries.length === value.commit.entryCount && value.history.leafId === value.commit.leafId,
     'Committed count and leaf must agree with native history.');
@@ -157,16 +161,27 @@ export const NativeHistoryOriginSeedSchema = z.object({ nativeEntryId: NativeEnt
   originRunId: id.nullable() }).strict().readonly();
 export type NativeHistoryOriginSeed = z.infer<typeof NativeHistoryOriginSeedSchema>;
 export const NativeHistoryRecoverySeedSchema = z.object({ sessionId: id, inputs: z.array(z.lazy(() => NativeInputContextBindingSchema)).readonly(),
-  origins: z.array(NativeHistoryOriginSeedSchema).readonly() }).strict().superRefine((seed, context) => {
+  origins: z.array(NativeHistoryOriginSeedSchema).readonly(),
+  resourceExpansions: z.array(ResourceExpansionEvidenceSchema).readonly().optional(),
+  resourceReads: z.array(ResourceReadEvidenceSchema).readonly().optional() }).strict().superRefine((seed, context) => {
   if (new Set(seed.origins.map(origin => origin.nativeEntryId)).size !== seed.origins.length
     || new Set(seed.inputs.map(input => input.nativeEntryId)).size !== seed.inputs.length) issue(context, 'Recovery identities must be unique.');
+  const receipts = seed.resourceExpansions ?? [];
+  if (new Set(receipts.map(item => item.inputId)).size !== receipts.length
+    || new Set(receipts.map(item => item.nativeEntryId)).size !== receipts.length
+    || receipts.some(receipt => !seed.inputs.some(input => input.inputId === receipt.inputId && input.nativeEntryId === receipt.nativeEntryId)))
+    issue(context, 'Expansion recovery requires the original unique Input binding.');
+  const reads = seed.resourceReads ?? [];
+  if (new Set(reads.map(read => JSON.stringify([read.toolCallId, read.operation, read.path]))).size !== reads.length
+    || reads.some(read => read.nativeEntryId === null || !seed.origins.some(origin => origin.nativeEntryId === read.nativeEntryId)))
+    issue(context, 'Read recovery requires the original unique tool-result Entry.');
 }).readonly();
 export type NativeHistoryRecoverySeed = z.infer<typeof NativeHistoryRecoverySeedSchema>;
 export const NativeHistoryRecoveryBundleSchema = z.object({ history: NativeSessionHistorySchema.nullable(),
   commit: HistoryCommitStateSchema.nullable(), seed: NativeHistoryRecoverySeedSchema }).strict().superRefine((bundle, context) => {
   const { history, commit, seed } = bundle;
   if (history === null || commit === null) {
-    if (history !== null || commit !== null || seed.origins.length !== 0 || seed.inputs.length !== 0)
+    if (history !== null || commit !== null || seed.origins.length !== 0 || seed.inputs.length !== 0 || (seed.resourceExpansions?.length ?? 0) !== 0 || (seed.resourceReads?.length ?? 0) !== 0)
       issue(context, 'Legacy history requires an empty recovery seed and absent commit.');
     return;
   }
@@ -178,6 +193,11 @@ export const NativeHistoryRecoveryBundleSchema = z.object({ history: NativeSessi
     const entry = entries.get(input.nativeEntryId);
     if (entry?.type !== 'message' || entry.message.role !== 'user' || origins.get(input.nativeEntryId)?.originRunId !== input.originRunId)
       issue(context, 'Input seed requires its actual user entry and origin Run.');
+  }
+  for (const read of seed.resourceReads ?? []) {
+    const entry = entries.get(read.nativeEntryId!);
+    if (entry?.type !== 'message' || entry.message.role !== 'toolResult' || entry.message.toolCallId !== read.nativeToolCallId)
+      issue(context, 'Read recovery requires its actual native ToolResult.');
   }
 }).readonly();
 export type NativeHistoryRecoveryBundle = { history: NativeSessionHistory | null; commit: HistoryCommitState | null; seed: NativeHistoryRecoverySeed };

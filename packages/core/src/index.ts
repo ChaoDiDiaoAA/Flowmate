@@ -20,3 +20,4 @@ export * from './invoice-edit/service.ts';
 export * from './tools/recorder.ts';
 export * from './tools/invoice-form.ts';
 export * from './tools/executor.ts';
+export * from './resources/service.ts';

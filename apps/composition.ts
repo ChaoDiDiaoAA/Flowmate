@@ -1,10 +1,11 @@
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
-  ContextService, RuntimeService, SessionService, openDatabase } from '@flowmate/core';
+  ContextService, RuntimeService, SessionService, openDatabase, createResourceService } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
-import { PiAgentAdapter, PiProviderAdapter, createNativeTools } from '@flowmate/runtime-pi';
+import { PiAgentAdapter, PiProviderAdapter, createNativeTools, inspectNativeResources } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
 import type { Application, MemoryStore, ProductPaths, PromptTraceBuffer, Result, RuntimeRequestOverrides, RuntimeStrategyPolicy } from '@flowmate/contracts';
@@ -12,6 +13,9 @@ import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest
 import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
+  resourceRoot?: string;
+  resourceDefaults?: () => Result<import('@flowmate/contracts').ResourceSelectionResult>;
+  saveResourceSelection?: (request: import('@flowmate/contracts').ResourceSelectionRequest) => Promise<Result<import('@flowmate/contracts').ResourceSelectionResult>>;
   paths: ProductPaths;
   invoiceSourceRoot?: string;
   provider?: ProviderPort;
@@ -66,12 +70,17 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const assembled = [...createInvoiceTools({ documents, documentRepository: database.data.documents,
     candidates: database.data.candidates, now }), ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), ...native.definitions];
   const definitions = Object.freeze([...(options.toolDefinitions?.(assembled) ?? assembled)]);
+  const unavailableTools = new Set(native.availability.filter(item => !item.available).map(item => item.name as string));
+  const resources = createResourceService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
+    bundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
+    registeredToolNames: definitions.filter(tool => !unavailableTools.has(tool.name)).map(tool => tool.name), inspectNativeResources });
   const toolExecutor = createToolExecutor({ definitions, recorder,
     strategyPolicy: options.runtimePolicy, sampleSource: options.sampleSource,
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
     monotonicNow: () => performance.now() });
   const provider = options.provider ?? new PiProviderAdapter();
   const agent = options.agentFactory?.(definitions) ?? options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace,
+    resourceBundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
     tools: definitions });
   let sessionService: SessionService;
   const memory: MemoryStore = Object.assign(database.data.memory, { list: (input: Parameters<MemoryStore['list']>[0]) => sessionService.listHistory(input) });
@@ -84,6 +93,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     workspaceVerifier,
     contextService,
     contextRepository: database.data.context,
+    resources,
+    resourceDefaults: options.resourceDefaults,
     isSessionManaging: sessionId => sessionService?.isManaging(sessionId) ?? false,
     provider,
     agent,
@@ -118,6 +129,9 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     }
     return { stopped: true, closed: loggerClosed && databaseClosed && lockReleased, errors };
   }, sessionService, promptTrace, workspaceService, jobService, {
+    resources,
+    resourceDefaults: options.resourceDefaults,
+    saveResourceSelection: options.saveResourceSelection,
     documents: database.data.documents,
     jobs: database.data.jobs,
     candidates: database.data.candidates,
@@ -125,6 +139,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     runtimeEvents: database.data.runtimeEvents,
     toolCalls: database.data.toolCalls,
     contextService,
+    contextRepository: database.data.context,
     ...(invoiceForms ? { invoiceForms } : {}),
     invoiceEdits,
     importInvoiceMaterial: (sourceDirectory) => documents.importVoxel51({ sourceDirectory }),

@@ -10,6 +10,7 @@ import { isRuntimeHostCommand, isWorkspaceHostCommand, isContextHostCommand, mat
   isHistoryHostCommand, matchesHistoryResponse, parseHistoryHostResult,
   parseHostCommand, parseRuntimeHostResult, parseWorkspaceHostResult } from '../../host/protocol.ts';
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, parseCompactionNotification } from '../../host/protocol.ts';
+import { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from '../../host/protocol.ts';
 
 type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
 type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; command: HostCommand };
@@ -243,6 +244,11 @@ export class HostClient {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
           const value = validEnvelope ? parseContextHostResult(pending.command.type, output.value) : null;
           if (value === null || !matchesContextResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(value);
+        } else if (isResourceHostCommand(pending.command.type)) {
+          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
+          const value = validEnvelope ? parseResourceHostResult(pending.command.type, output.value) : null;
+          if (value === null || !matchesResourceResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
           else pending.resolve(value);
         } else if (isWorkspaceHostCommand(pending.command.type)) {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));

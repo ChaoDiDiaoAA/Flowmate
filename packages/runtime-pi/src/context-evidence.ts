@@ -110,3 +110,35 @@ export function sdkRequestId(headers: Record<string, string>): string | null {
   const value = headers['x-request-id'] ?? headers['request-id'];
   return typeof value === 'string' && value.length > 0 && value.length <= 256 ? value : null;
 }
+
+export type ResourcePayloadText = { role: 'system' | 'user' | 'tool'; text: string | null; toolCallId?: string; contains?: boolean };
+export type ResourceInclusion = { inclusion: 'confirmed' | 'not-included' | 'unknown'; reason: string | null };
+/** Compare only the declared carrier; an assistant quoting a Skill is not input evidence. */
+export function checkResourcePayload(api: string, payload: unknown, expected: readonly ResourcePayloadText[]): ResourceInclusion[] {
+  const unknown = (reason: string) => expected.map(() => ({ inclusion: 'unknown' as const, reason }));
+  if (api !== 'openai-completions' && api !== 'openai-responses') return unknown('payload_codec_unavailable');
+  const body = record(payload), messages = body?.[api === 'openai-responses' ? 'input' : 'messages'];
+  if (!Array.isArray(messages)) return unknown('payload_shape_unavailable');
+  const carriers = messages.flatMap(raw => {
+    const message = record(raw); if (!message) return [];
+    const role = message.type === 'function_call_output' ? 'tool' : message.role === 'developer' ? 'system' : message.role;
+    const content = message.type === 'function_call_output' ? message.output : message.content;
+    const texts = typeof content === 'string' ? [content] : Array.isArray(content)
+      ? content.flatMap(block => typeof record(block)?.text === 'string' ? [record(block)!.text as string] : []) : [];
+    return [{ role, text: texts.join('\n'), toolCallId: message.tool_call_id ?? message.call_id }];
+  });
+  return expected.map(item => item.text === null ? { inclusion: 'unknown', reason: 'derived-source-only' }
+    : { inclusion: carriers.some(carrier => carrier.role === item.role
+      && (item.toolCallId === undefined || carrier.toolCallId === item.toolCallId.split('|')[0])
+      && (item.role === 'system' || item.contains ? carrier.text.includes(sanitizeSurrogates(item.text!)) : carrier.text === sanitizeSurrogates(item.text!)))
+      ? 'confirmed' : 'not-included', reason: null });
+}
+
+export async function checkResourceWire(api: string, request: RequestInfo | URL, init: RequestInit | undefined,
+  expected: readonly ResourcePayloadText[]): Promise<ResourceInclusion[]> {
+  try {
+    const body = typeof init?.body === 'string' ? init.body : init?.body === undefined && request instanceof Request ? await request.clone().text() : null;
+    return body === null ? expected.map(() => ({ inclusion: 'unknown', reason: 'body_unavailable' }))
+      : checkResourcePayload(api, JSON.parse(body), expected);
+  } catch { return expected.map(() => ({ inclusion: 'unknown', reason: 'body_unavailable' })); }
+}

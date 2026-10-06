@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { appError, fail, ok, ContextBuildRequestSchema, ContextSnapshotJsonSchema, ContextSnapshotSchema,
-  ContextParsedMaterialSchema, WorkspaceContextSchema, formatExecutionPrompt } from '@flowmate/contracts';
+  ContextParsedMaterialSchema, WorkspaceContextSchema, formatExecutionPrompt, FrozenResourcesSchema, matchesResourceBinding } from '@flowmate/contracts';
 import type { AppError, CandidateSnapshot, ContextBuildRequest, ContextBuildResult, ContextMaterialPort,
   ContextParsedMaterial, ContextSnapshot, ContextSnapshotJson, Result } from '@flowmate/contracts';
 import type { DbHandle } from '../storage/database.ts';
@@ -20,7 +20,7 @@ const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.st
 const visibleRow = z.object({ hidden_at: z.null() });
 const buildConfig = z.object({ contextPolicyVersion: z.literal('p8-context-v1'),
   goalMode: z.enum(['answer', 'save-candidate', 'fill-form']).optional(), workingDirectory: z.string().optional(),
-  workspaceContext: WorkspaceContextSchema.optional() }).passthrough();
+  workspaceContext: WorkspaceContextSchema.optional(), resources: FrozenResourcesSchema.optional() }).passthrough();
 
 export class ContextService {
   constructor(private readonly options: ContextServiceOptions) {}
@@ -49,6 +49,7 @@ export class ContextService {
       const configResult = buildConfig.safeParse(run.config);
       if (!configResult.success) reject('context_binding_unknown', 'runtime');
       const config = configResult.data;
+      if (!matchesResourceBinding(config.resources ?? null, request.resourceBinding)) reject('resource_evidence_conflict', 'runtime');
       if (request.goalMode !== (config.goalMode ?? 'answer') || request.workingDirectory !== (config.workingDirectory ?? null)) reject('state_conflict');
       const originalDocuments = run.scope.version === 1 ? [] : run.scope.allowedDocumentIds;
       const originalArtifacts = run.scope.version === 1 ? [] : run.scope.allowedArtifactIds;
@@ -102,7 +103,8 @@ export class ContextService {
       const projection = requireResult(selectContextProjection({ taskGoal, goalMode: request.goalMode, workspaceContext: workspace, candidate, material }));
       const json: ContextSnapshotJson = { version: 1, policyVersion: CONTEXT_POLICY.version, text: request.text, goalMode: request.goalMode,
         workingDirectory: request.workingDirectory, workspaceContext: workspace, allowedDocumentIds: originalDocuments,
-        allowedArtifactIds: originalArtifacts, resourcePolicy: 'none', modelProjection: projection, budgets: CONTEXT_POLICY.budgets };
+        allowedArtifactIds: originalArtifacts, resourcePolicy: request.resourceBinding ? 'p11-resources-v1' : 'none',
+        ...(request.resourceBinding ? { resourceBinding: request.resourceBinding } : {}), modelProjection: projection, budgets: CONTEXT_POLICY.budgets };
       if (contextJsonBytes(json) > CONTEXT_POLICY.budgets.snapshotBytes) reject('input_too_large');
       const checkedJson = ContextSnapshotJsonSchema.parse(json);
       const fillPrompt = request.goalMode === 'fill-form' ? formatExecutionPrompt({ text: request.text, goalMode: 'fill-form', business: true,

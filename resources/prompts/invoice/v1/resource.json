@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "prompt",
+  "id": "invoice",
+  "version": "v1",
+  "bodyFile": "prompt.md",
+  "keywords": [
+    "发票",
+    "字段",
+    "缺失",
+    "冲突"
+  ],
+  "requires": [],
+  "files": [
+    {
+      "path": "prompt.md",
+      "bytes": 414,
+      "sha256": "625a5f7e0e5bc9f017583b407ab67d7f5b9f09b850bc62be2f4a1aaacc030a03"
+    }
+  ]
+}

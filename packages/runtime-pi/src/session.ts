@@ -1,26 +1,29 @@
+import { nativeFileResultIncludes } from '@flowmate/shared';
 import {
   createAssistantMessageEventStream,
   type AssistantMessage,
 } from '@earendil-works/pi-ai';
-import { isAbsolute } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { isAbsolute, join } from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
 import { isContextOverflow } from '@earendil-works/pi-ai/utils/overflow';
 import { isDeepStrictEqual } from 'node:util';
 import {
   createAgentSession,
   sessionEntryToContextMessages,
   convertToLlm,
-  createExtensionRuntime,
   ModelRuntime,
   SessionManager,
   SettingsManager,
   estimateTokens,
   calculateContextTokens,
+  formatSkillsForPrompt,
   type AgentSession,
   type AgentToolResult,
-  type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
 import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema } from '@flowmate/contracts';
+import { createRunResourceLoader, verifySkillExpansion, verifyManagedReadOutput } from './resources/loader.ts';
+import { matchesResourceBinding, resourceContentKey, ResourceRequestEvidenceSchema } from '@flowmate/contracts';
+import type { ResourceRef, ResourceBinding, ResourceExpansionEvidence, ResourceRequestEvidence, ResourceContentEvidence, ResourceReadEvidence } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
   AgentObservation,
@@ -76,7 +79,8 @@ import type { FetchLike, PiProviderDependencies } from './model-runtime.ts';
 import { toPiTool } from './tools.ts';
 import { getNativeToolParameters } from './native-tools.ts';
 import { projectSessionEvent } from './events.ts';
-import { checkPayload, checkWire, preparePayloadCodec, sdkRequestId } from './context-evidence.ts';
+import { checkPayload, checkWire, preparePayloadCodec, sdkRequestId, checkResourcePayload, checkResourceWire,
+  type ResourcePayloadText, type ResourceInclusion } from './context-evidence.ts';
 import { formatExecutionPrompt, validateNativeHistory, validateModelMessages, projectSessionMessages, projectMessageView } from './messages.ts';
 
 import { managerFor, validateRecovery, validateAgentContext, validateLlmMessages, referenceIds, inspectSessionHistory, buildForkSessionHistory } from './memory/history.ts';
@@ -87,6 +91,14 @@ const maxContextBytes = RUNTIME_CONFIG.llmPayload.maxChatContextBytes;
 const maxOutputBytes = RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
 const maxAssistantContentBytes = RUNTIME_CONFIG.llmPayload.maxAssistantContentBytes;
 const encoder = new TextEncoder();
+const resourceTextHash = (text: string) => createHash('sha256').update(text).digest('hex');
+function refineResourceEvidence(value: ResourceRequestEvidence, layer: 'sdk' | 'wire', facts: readonly ResourceInclusion[]): ResourceRequestEvidence {
+  return { ...value, contentChecks: value.contentChecks.map((item, index) => {
+    const fact = facts[index]!;
+    const next = { ...item, [layer === 'sdk' ? 'sdkInclusion' : 'wireInclusion']: fact.inclusion };
+    return { ...next, reason: next.sdkInclusion === 'unknown' || next.wireInclusion === 'unknown' ? fact.reason ?? item.reason : null };
+  }) };
+}
 
 type AgentStream = AgentSession['agent']['streamFunction'];
 type AgentStreamArguments = Parameters<AgentStream>;
@@ -100,8 +112,9 @@ type ModelCallUsage = { callSequence: number; usage: UsageRecordV1; tokens: Toke
 type ToolRequestState = { name: string; raw: unknown; sdkRaw: unknown; invoked: boolean; terminal: boolean; messageObserved: boolean; messageObservedAt: string | null; requestObservedAtSequence: number | null;
   requestBinding?: RequestContextBinding;
   failureStage?: 'sdk_arguments' | 'sdk_before' | 'unknown'; sdkBlocked?: boolean;
-  feedback?: AgentToolResult<unknown>; feedbackIsError?: boolean };
-type InputDispatchState = { inputId: number; text: string; promptText: string; contextSnapshotId?: number; started: boolean; message?: object };
+  feedback?: AgentToolResult<unknown>; feedbackIsError?: boolean; resourceReads?: ResourceReadEvidence[] };
+type InputDispatchState = { inputId: number; text: string; promptText: string; contextSnapshotId?: number; resourceBinding?: ResourceBinding;
+  expansion?: Omit<ResourceExpansionEvidence, 'inputId' | 'nativeEntryId'>; started: boolean; message?: object };
 
 type ActiveExecution = {
   input: AgentExecutionInput;
@@ -165,6 +178,8 @@ type SessionRecord = {
   snapshot?: PreparedAgent['snapshot'];
   policy?: 'p2' | 'p3' | 'fill';
   workingDirectory?: string;
+  resourceKey?: string | null;
+  resourceLoader?: Extract<ReturnType<typeof createRunResourceLoader>, { ok: true }>['data'];
   sessionInputs?: boolean;
   dispatchTail?: Promise<void>;
   preparing: boolean;
@@ -186,22 +201,6 @@ type SessionRecord = {
   historyFailure?: ReturnType<typeof appError>;
   active?: ActiveExecution;
 };
-
-function emptyResourceLoader(systemPrompt: string): ResourceLoader {
-  return {
-    getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
-    getSkills: () => ({ skills: [], diagnostics: [] }),
-    getPrompts: () => ({ prompts: [], diagnostics: [] }),
-    getThemes: () => ({ themes: [], diagnostics: [] }),
-    getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => systemPrompt,
-    getSystemPromptSource: () => undefined,
-    getAppendSystemPrompt: () => [],
-    getAppendSystemPromptSources: () => [],
-    extendResources: () => { throw new Error('agent_resources_disabled'); },
-    reload: async () => {},
-  };
-}
 
 function inMemorySettings(): SettingsManager {
   return SettingsManager.inMemory({
@@ -349,11 +348,13 @@ function safeTraceStopReason(value: unknown): 'stop' | 'length' | 'error' | 'abo
 export class PiAgentAdapter implements AgentPort {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
+    resourceBundleRoot?: string;
     sessionSetup?: (session: AgentSession) => void };
   private readonly toolsByName: ReadonlyMap<string, ToolDefinition<any, any>>;
   private closed = false;
 
   public constructor(dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
+    resourceBundleRoot?: string;
     sessionSetup?: (session: AgentSession) => void } = {}) {
     this.dependencies = dependencies;
     this.toolsByName = new Map((dependencies.tools ?? []).map((tool) => [tool.name, tool]));
@@ -487,6 +488,8 @@ export class PiAgentAdapter implements AgentPort {
         ? [...active.openInputIds] : undefined;
       const context = !acknowledged && entry.type === 'message' && active && ordinal !== undefined
         ? { entryId: entry.id, runId: active.runId, ...(inputId === undefined ? {} : { inputId }),
+          ...(inputId !== undefined && active.inputs.get(inputId)?.expansion ? { resourceExpansion: {
+            ...active.inputs.get(inputId)!.expansion!, inputId, nativeEntryId: entry.id } } : {}),
           ...(resultInputIds?.length ? { resultInputIds } : {}) } : undefined;
       const snapshot = this.exportSession(nativeSessionId);
       let saved: Result<HistoryCommitReceipt>;
@@ -533,6 +536,15 @@ export class PiAgentAdapter implements AgentPort {
       record.lastSavedHistory = structuredClone(record.memory!.lastSavedHistory);
       record.receipt = structuredClone(record.memory!.commit); record.recoverySeed = structuredClone(record.memory!.seed);
       if (acknowledged) return;
+      if (active && entry.type === 'message' && entry.message.role === 'toolResult') {
+        const request = active.toolRequests.get(entry.message.toolCallId);
+        for (const read of request?.resourceReads ?? []) {
+          const receipt = { ...read, nativeEntryId: entry.id };
+          const result = active.input.contextHooks!.recordResourceRead!(receipt);
+          if (!result.ok) { this.failToolRun(record, active, result.error); throw new Error(result.error.code); }
+          Object.assign(read, receipt);
+        }
+      }
       if (entry.type === 'message') record.nativeObjects?.set(entry.message, { entryId: entry.id, original: structuredClone(entry.message) });
       if (entry.type === 'custom_message' && record.session?.isIdle) {
         // Fixed 0.85.1 idle custom push precedes this append: its actual array tail is the source object.
@@ -577,8 +589,12 @@ export class PiAgentAdapter implements AgentPort {
     phase: SessionMessageView['phase'], entryId: string | null = null): void {
     const inputId = message && typeof message === 'object' ? active.inputMessages.get(message) : undefined;
     const productInput = inputId === undefined ? undefined : active.inputs.get(inputId);
+    if (productInput?.resourceBinding?.requiredSkill && persistence !== 'saved') return;
+    const resourceExpansion = productInput && record.recoverySeed?.resourceExpansions?.find(value => value.inputId === productInput.inputId && value.nativeEntryId === entryId);
     const view = projectMessageView(message, { entryId, runId: active.runId, liveOrdinal: ordinal, persistence, phase,
-      ...(productInput ? { productInput: { text: productInput.text, promptText: productInput.promptText } } : { runInput: { runId: active.runId, input: {
+      ...(productInput ? { productInput: { text: productInput.text, promptText: productInput.promptText, inputId: productInput.inputId,
+        ...(productInput.resourceBinding ? { resourceBinding: productInput.resourceBinding } : {}),
+        ...(resourceExpansion ? { resourceExpansion } : {}) } } : { runInput: { runId: active.runId, input: {
         ...(active.input.workspaceInput ? { version: 2 as const, workspaceInput: active.input.workspaceInput } : { version: 1 as const }),
         goal: active.input.goal, text: active.input.text, messageTimestamp: active.input.messageTimestamp },
         goalMode: active.input.toolBinding ? active.goalMode : null,
@@ -696,7 +712,7 @@ export class PiAgentAdapter implements AgentPort {
       return fail(appError('context_binding_unknown', 'runtime', 'Input context association is unavailable.'));
     try {
       const dispatched = await this.dispatchInput(record, active, input, () => input.mode === 'steer'
-        ? record.session!.steer(input.promptText) : record.session!.followUp(input.promptText), true);
+        ? record.session!.steer(this.nativeInputText(input)) : record.session!.followUp(this.nativeInputText(input)), true);
       await dispatched.execution;
       return ok(undefined);
     } catch (error) {
@@ -730,6 +746,20 @@ export class PiAgentAdapter implements AgentPort {
         const error = !allowed.ok ? allowed.error : appError('agent_cancelled', 'runtime', 'Agent execution was cancelled.');
         this.failToolRun(record, active, error); throw error;
       }
+      if (!matchesResourceBinding(active.input.resources ?? null, state.resourceBinding)) {
+        const error = appError('resource_evidence_conflict', 'runtime', 'Input resources do not match the active Run.');
+        this.failToolRun(record, active, error); throw error;
+      }
+      const required = state.resourceBinding?.requiredSkill;
+      if (required) {
+        const skill = session.resourceLoader.getSkills().skills.find(value => value.name === required.id);
+        const body = record.resourceLoader?.bodyFor(required);
+        const user = users[0]!, text = typeof user.content === 'string' ? user.content : user.content.map(part => part.type === 'text' ? part.text : '').join('');
+        const expanded = skill && body !== null && body !== undefined ? verifySkillExpansion({ text, skill,
+          expectedBody: body, expectedUserMessage: state.promptText }) : fail(appError('resource_expansion_mismatch', 'runtime', 'Required native Skill is unavailable.'));
+        if (!expanded.ok) { this.failToolRun(record, active, expanded.error); throw expanded.error; }
+        state.expansion = { skill: required, bundleHash: state.resourceBinding!.bundleHash, expandedTextHash: expanded.data.expandedTextHash, at: now().at };
+      }
       state.message = users[0]!;
       active.inputMessages.set(users[0]!, slot.inputId);
       slot.captured();
@@ -749,7 +779,11 @@ export class PiAgentAdapter implements AgentPort {
     session.agent.followUp = message => { capture([message]); followUp(message); };
   }
 
-  private dispatchInput(record: SessionRecord, active: ActiveExecution, input: Pick<AgentInputDispatch, 'inputId' | 'text' | 'promptText' | 'contextSnapshotId'>,
+  private nativeInputText(input: Pick<AgentInputDispatch, 'promptText' | 'resourceBinding'>): string {
+    return input.resourceBinding?.requiredSkill ? `/skill:${input.resourceBinding.requiredSkill.id} ${input.promptText}` : input.promptText;
+  }
+
+  private dispatchInput(record: SessionRecord, active: ActiveExecution, input: Pick<AgentInputDispatch, 'inputId' | 'text' | 'promptText' | 'contextSnapshotId' | 'resourceBinding'>,
     invoke: () => Promise<void>, streaming: boolean): Promise<{ execution: Promise<void> }> {
     const dispatched = (record.dispatchTail ?? Promise.resolve()).then(async () => {
       if (record.active !== active || active.admissionClosed || active.signal.aborted || active.failure
@@ -809,6 +843,12 @@ export class PiAgentAdapter implements AgentPort {
       || activeToolNames.some((name) => !this.toolsByName.has(name))) {
       return fail(appError('tool_runtime_unavailable', 'runtime', 'Run 获准的工具未在 Pi Runtime 注册。', true));
     }
+    const resources = options?.resources ?? null, resourceKey = resources?.bundleHash ?? null;
+    const loader = createRunResourceLoader({ fixedSystemPrompt: policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
+      : policy === 'p3' ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT, frozen: resources,
+      bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resourceKey ?? '') });
+    if (!loader.ok) return loader;
+    if (record.session && !record.session.isIdle) return fail(appError('agent_session_busy', 'session', 'The native Session has not stopped.'));
 
     const previousSettings = record.manager.buildSessionContext();
     const prepareStartCount = record.manager.getEntries().length;
@@ -833,7 +873,7 @@ export class PiAgentAdapter implements AgentPort {
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
       let session = record.session;
-      if (session && (runtime !== record.runtime || record.policy !== policy || record.workingDirectory !== cwd)) {
+      if (session && (runtime !== record.runtime || record.policy !== policy || record.workingDirectory !== cwd || record.resourceKey !== resourceKey)) {
         record.compactionBridge?.dispose(); record.compactionBridge = undefined;
         session.dispose();
         record.session = undefined;
@@ -849,8 +889,7 @@ export class PiAgentAdapter implements AgentPort {
           model,
           sessionManager: record.manager,
           settingsManager: inMemorySettings(),
-          resourceLoader: emptyResourceLoader(policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
-            : policy === 'p3' ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT),
+          resourceLoader: loader.data,
           noTools: 'all', tools: policy === 'p2' ? [] : [...this.toolsByName.keys()],
           customTools: policy !== 'p2' ? [...this.toolsByName.values()].map((definition) => toPiTool(
             definition,
@@ -928,7 +967,7 @@ export class PiAgentAdapter implements AgentPort {
           }
         };
         session.agent.toolExecution = 'parallel';
-        // The controlled resourcePolicy=none has no context handlers. Pi's empty
+        // The controlled resource loader has no context handlers. Pi's empty
         // ExtensionRunner still clones messages; preserve the saved native identities.
         session.agent.transformContext = async messages => messages;
         session.setActiveToolsByName(activeToolNames);
@@ -1019,24 +1058,27 @@ export class PiAgentAdapter implements AgentPort {
       record.config = structuredClone(config);
       record.policy = policy;
       record.workingDirectory = cwd;
+      record.resourceKey = resourceKey;
+      record.resourceLoader = loader.data;
       record.sessionInputs = options?.sessionInputs === true;
       replacingSession = false;
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
       const taskAgent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts = policy !== 'p2' ? {
         policyVersion: 'p3-invoice-tools-v1', nativeSessionId, systemPrompt: session.systemPrompt,
-        thinkingLevel: session.thinkingLevel, resourcePolicy: 'none', historyPolicy: 'memory-only',
+        thinkingLevel: session.thinkingLevel, resourcePolicy: resources ? 'p11-resources-v1' : 'none', historyPolicy: 'memory-only',
         maxContextBytes: RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes, maxOutputBytes, maxAssistantContentBytes,
         maxModelCalls: RUNTIME_CONFIG.runBudget.maxModelCalls.workspace,
         maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs, sessionRetry: false,
       } : {
         ...(record.sessionInputs ? { policyVersion: 'p5-session-inputs-v1' as const, maxModelCalls: RUNTIME_CONFIG.runBudget.maxModelCalls.chat }
           : { policyVersion: 'p2-invoice-chat-v1' as const, maxModelCalls: 1 as const }), nativeSessionId, systemPrompt: session.systemPrompt,
-        thinkingLevel: session.thinkingLevel, resourcePolicy: 'none', historyPolicy: 'memory-only',
+        thinkingLevel: session.thinkingLevel, resourcePolicy: resources ? 'p11-resources-v1' : 'none', historyPolicy: 'memory-only',
         maxContextBytes, maxOutputBytes, maxAssistantContentBytes, sessionRetry: false,
       };
       const agent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts = options?.runtimeBudget
         ? { ...taskAgent, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : taskAgent;
       record.snapshot = { ...snapshot, historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent,
+        ...(resources ? { resources: Object.freeze(structuredClone(resources)) } : {}),
         ...(options?.compactionPolicy ? { compactionPolicy: Object.freeze(structuredClone(options.compactionPolicy)) } : {}) };
       if (options?.compactionPolicy && !record.compactionBridge) {
         const bridge = this.installCompaction(record, session);
@@ -1359,6 +1401,38 @@ export class PiAgentAdapter implements AgentPort {
       }
       const prepared = this.publishCompaction(record, {});
       if (!prepared.ok) reject(prepared.error);
+      let resources: ReturnType<PiAgentAdapter['resourceRequest']> | undefined;
+      const saveResources = (layer?: 'sdk' | 'wire', facts?: ResourceInclusion[]) => {
+        const save = active?.input.contextHooks?.recordResourceRequest;
+        if (!save || !resources) return;
+        if (layer && facts) resources.evidence = refineResourceEvidence(resources.evidence, layer, facts);
+        const saved = save(resources.evidence); if (!saved.ok) reject(saved.error);
+      };
+      if (active?.input.contextHooks?.recordResourceRequest) {
+        const sources = purpose === 'history' ? scope.preparation.messagesToSummarize : scope.preparation.turnPrefixMessages;
+        const includedBindings: NativeInputContextBinding[] = [], includedToolResults: NativeToolResultContextBinding[] = [];
+        const includedNativeContexts: NativeDerivedContextBinding[] = [];
+        for (const message of sources) {
+          const entry = record.manager.getEntries().find(entry => entry.type === 'message' && entry.message === message);
+          if (entry && message.role === 'user') {
+            const source = record.contextEntries.get(entry.id);
+            if (!source) reject(appError('resource_evidence_conflict', 'runtime', 'Summary input provenance is unavailable.'));
+            includedBindings.push(source!);
+          } else if (entry && message.role === 'toolResult') {
+            const source = active.input.contextHooks!.resolveToolResult({ sessionId: active.sessionId, nativeToolCallId: message.toolCallId });
+            if (!source.ok) reject(source.error); else includedToolResults.push(source.data);
+          }
+        }
+        const previous = purpose === 'history' && scope.preparation.previousSummary !== undefined
+          ? [...record.manager.getBranch(operation.baseline.leafId ?? undefined)].reverse().find(entry => entry.type === 'compaction' && entry.summary === scope.preparation.previousSummary) : undefined;
+        if (purpose === 'history' && scope.preparation.previousSummary !== undefined && !previous)
+          reject(appError('resource_evidence_conflict', 'runtime', 'Previous summary provenance is unavailable.'));
+        try { resources = this.resourceRequest(record, context, { callSequence: modelCallIndex, includedBindings,
+          includedToolResults, includedNativeContexts }, operation.observation.operationId, previous?.id ?? null);
+          if (resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleHashes.length === 0) resources = undefined;
+          saveResources(); }
+        catch { reject(operation.failure ?? appError('resource_evidence_conflict', 'runtime', 'Actual summary resource provenance is unavailable.')); }
+      }
       const update = (value: Partial<SummaryCallEvidence>) => {
         call = { ...call!, ...value };
         operation.calls[callIndex] = call;
@@ -1372,6 +1446,7 @@ export class PiAgentAdapter implements AgentPort {
         const wire = await checkWire(codec, request, init);
         if (!wire.ok) reject(wire.error);
         verify();
+        if (resources) saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
         attempt++;
         if (active) active.attempts++;
         if (attempt > 2) reject(appError('compaction_failed', 'runtime', 'Summary HTTP retry exceeded the frozen provider configuration.'));
@@ -1406,6 +1481,7 @@ export class PiAgentAdapter implements AgentPort {
         if (call!.sdkPayload && !isDeepStrictEqual(call!.sdkPayload, sdkPayload))
           reject(appError('context_payload_mismatch', 'runtime', 'Summary payload identity changed.'));
         update({ sdkPayload });
+        if (resources) saveResources('sdk', checkResourcePayload(model.api, replacement === undefined ? payload : replacement, resources.texts));
         return replacement;
       };
       const onResponse = async (response: { status: number; headers: Record<string, string> }, requestedModel: StreamModel) => {
@@ -1842,6 +1918,14 @@ export class PiAgentAdapter implements AgentPort {
       ? AbortSignal.any([active.signal, toolSignal]) : active.signal,
       ...(request.requestBinding ? { requestBinding: request.requestBinding } : {}) });
     request.invoked = true;
+    const operation = ['read', 'grep', 'find', 'ls'].includes(definition.name) ? definition.name as ResourceReadEvidence['operation'] : null;
+    const args = input && typeof input === 'object' ? input as Record<string, unknown> : {};
+    let managed: import('./resources/loader.ts').ManagedReadFile[] = [];
+    if (operation && active.input.contextHooks?.recordResourceRead) {
+      try { managed = record.resourceLoader?.filesForOperation(typeof args.path === 'string' ? args.path : '.', record.workingDirectory!, operation) ?? []; }
+      catch { const error = appError('resource_bundle_unavailable', 'storage', 'The managed tool target changed.', true);
+        this.failToolRun(record, active, error); throw error; }
+    }
     let invocation;
     try {
       invocation = await binding.execute(definition.name, input, toolCall, request.raw);
@@ -1869,6 +1953,35 @@ export class PiAgentAdapter implements AgentPort {
       if (native.success) {
         if (result.status !== 'succeeded') active.nativeFailures.add(nativeToolCallId);
         request.feedback = { content: native.data.content, details: native.data.details };
+        if (result.status === 'succeeded' && operation && managed.length) {
+          const owner = binding.queryCall?.(nativeToolCallId);
+          if (!owner?.ok || !request.requestBinding) {
+            const error = appError('resource_evidence_conflict', 'runtime', 'Original managed read identity is unavailable.');
+            this.failToolRun(record, active, error); throw error;
+          }
+          try {
+            record.resourceLoader!.filesForOperation(typeof args.path === 'string' ? args.path : '.', record.workingDirectory!, operation);
+            const text = native.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+            if (operation === 'read') for (const file of managed) {
+              const verified = verifyManagedReadOutput(file, args, text);
+              if (!verified.ok) { this.failToolRun(record, active, verified.error); throw verified.error; }
+            }
+            const deliveredHash = resourceTextHash(JSON.stringify(native.data.content));
+            request.resourceReads = managed.filter(file => nativeFileResultIncludes(operation, file.relativePath, text)).map(file => ({
+              toolCallId: owner.data.toolCallId, nativeToolCallId, requestSequence: request.requestBinding!.requestSequence,
+              ref: file.ref, bundleHash: active.input.resources!.bundleHash, path: file.path, fileHash: file.fileHash, deliveredHash, operation,
+              fullBody: operation !== 'read' ? false : file.text === null ? null : text === file.text,
+              nativeEntryId: null, at: now().at,
+            }));
+            for (const receipt of request.resourceReads) {
+              const saved = active.input.contextHooks!.recordResourceRead!(receipt);
+              if (!saved.ok) { this.failToolRun(record, active, saved.error); throw saved.error; }
+            }
+          } catch (error) {
+            if (!active.failure) this.failToolRun(record, active, appError('resource_bundle_unavailable', 'storage', 'Managed content could not be verified after reading.', true));
+            throw error;
+          }
+        }
         return request.feedback;
       }
       if (result.status === 'succeeded') throw new Error('The native tool returned an invalid result.');
@@ -1908,6 +2021,76 @@ export class PiAgentAdapter implements AgentPort {
       request.requestObservedAtSequence = active.callSequence;
     }
     return true;
+  }
+
+  private resourceRequest(record: SessionRecord, context: StreamContext,
+    binding: Pick<RequestContextBinding, 'callSequence' | 'includedBindings' | 'includedToolResults' | 'includedNativeContexts'>,
+    compactionOperationId: string | null = null, previousSummaryEntryId: string | null = null): {
+    evidence: ResourceRequestEvidence; texts: ResourcePayloadText[];
+  } {
+    const checks: ResourceContentEvidence[] = [], texts: ResourcePayloadText[] = [], bundles = new Set<string>();
+    const add = (check: Omit<ResourceContentEvidence, 'expectedTextHash' | 'sdkInclusion' | 'wireInclusion' | 'reason'>,
+      expected: ResourcePayloadText) => {
+      if (checks.some(item => resourceContentKey(item) === resourceContentKey(check))) return;
+      checks.push({ ...check, expectedTextHash: expected.text === null ? null : resourceTextHash(expected.text),
+        sdkInclusion: 'unknown', wireInclusion: 'unknown', reason: expected.text === null ? 'derived-source-only' : 'awaiting_sdk_payload' });
+      texts.push(expected);
+    };
+    const derivedIds = [...binding.includedNativeContexts.map(source => source.nativeEntryId), ...(previousSummaryEntryId ? [previousSummaryEntryId] : [])];
+    const compacted = derivedIds.flatMap(nativeEntryId => {
+      const entry = record.manager.getEntry(nativeEntryId); if (entry?.type !== 'compaction') return [];
+      const prefix = record.manager.getBranch(entry.parentId ?? undefined), cut = prefix.findIndex(item => item.id === entry.firstKeptEntryId);
+      return cut > 0 ? [{ nativeEntryId, covered: new Set(prefix.slice(0, cut).map(item => item.id)) }] : [];
+    });
+    const addDerived = (ref: ResourceRef, bundleHash: string, path: string, originalEntryId: string) => {
+      for (const source of compacted) if (source.covered.has(originalEntryId)) {
+        bundles.add(bundleHash);
+        add({ ref, scope: 'derived-source', path, nativeEntryId: source.nativeEntryId }, { role: 'user', text: null });
+      }
+    };
+    const frozen = record.active?.input.resources;
+    if (frozen?.prompt && compactionOperationId === null) {
+      const text = record.resourceLoader?.bodyFor(frozen.prompt);
+      if (text === undefined || text === null) throw new Error('Fixed business Prompt is unavailable.');
+      add({ ref: frozen.prompt, scope: 'business-prompt', path: 'prompt.md', nativeEntryId: null }, { role: 'system', text });
+    }
+    for (const skill of record.resourceLoader?.getSkills().skills ?? []) {
+      const ref = frozen?.discoveredSkills.find(ref => ref.id === skill.name);
+      if (!ref || skill.disableModelInvocation || compactionOperationId !== null) continue;
+      const text = formatSkillsForPrompt([skill], 'read').match(/  <skill>[\s\S]*?  <\/skill>/)?.[0];
+      if (!text) throw new Error('Native Skill index is unavailable.');
+      add({ ref, scope: 'skill-index', path: 'SKILL.md', nativeEntryId: null }, { role: 'system', text });
+    }
+    for (const receipt of record.recoverySeed?.resourceExpansions ?? []) {
+      const source = binding.includedBindings.find(source => source.nativeEntryId === receipt.nativeEntryId && source.inputId === receipt.inputId);
+      if (source) {
+        const entry = record.manager.getEntry(receipt.nativeEntryId);
+        const text = entry?.type === 'message' && entry.message.role === 'user' ? typeof entry.message.content === 'string'
+          ? entry.message.content : entry.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') : null;
+        if (text === null || resourceTextHash(text) !== receipt.expandedTextHash) throw new Error('Original expanded input is unavailable.');
+        bundles.add(receipt.bundleHash);
+        add({ ref: receipt.skill, scope: 'expanded-body', path: 'SKILL.md', nativeEntryId: receipt.nativeEntryId }, { role: 'user', text, contains: compactionOperationId !== null });
+      } else addDerived(receipt.skill, receipt.bundleHash, 'SKILL.md', receipt.nativeEntryId);
+    }
+    const reads = [...(record.recoverySeed?.resourceReads ?? []),
+      ...[...(record.active?.toolRequests.values() ?? [])].flatMap(request => request.resourceReads ?? [])];
+    for (const receipt of reads) {
+      if (receipt.nativeEntryId === null) continue;
+      if (!binding.includedToolResults.some(source => source.toolCallId === receipt.toolCallId && source.nativeToolCallId === receipt.nativeToolCallId)) {
+        addDerived(receipt.ref, receipt.bundleHash, receipt.path, receipt.nativeEntryId); continue;
+      }
+      const entry = record.manager.getEntry(receipt.nativeEntryId);
+      if (entry?.type !== 'message' || entry.message.role !== 'toolResult'
+        || resourceTextHash(JSON.stringify(entry.message.content)) !== receipt.deliveredHash) throw new Error('Original resource output is unavailable.');
+      const text = entry.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+      bundles.add(receipt.bundleHash);
+      add({ ref: receipt.ref, scope: 'tool-output', path: receipt.path, nativeEntryId: receipt.nativeEntryId },
+        compactionOperationId === null ? { role: 'tool', text, toolCallId: receipt.nativeToolCallId } : { role: 'user', text, contains: true });
+    }
+    return { texts, evidence: ResourceRequestEvidenceSchema.parse({ purpose: compactionOperationId === null ? 'answer' : 'compaction', callSequence: binding.callSequence,
+      compactionOperationId, bundleHash: compactionOperationId === null ? frozen?.bundleHash ?? null : null, referencedBundleHashes: [...bundles],
+      systemPromptHash: resourceTextHash(context.systemPrompt ?? ''), inputIds: binding.includedBindings.flatMap(source => source.inputId === null ? [] : [source.inputId]),
+      toolCallIds: binding.includedToolResults.map(source => source.toolCallId), contentChecks: checks, at: now().at }) };
   }
 
   private async forwardStream(
@@ -1954,6 +2137,20 @@ export class PiAgentAdapter implements AgentPort {
     const requireEvidence = (update: ContextEvidenceUpdate) => {
       const saved = recordEvidence(update); if (!saved.ok) throw new Error(saved.error.code);
     };
+    let resources: ReturnType<PiAgentAdapter['resourceRequest']> | undefined;
+    const saveResources = (layer?: 'sdk' | 'wire', facts?: ResourceInclusion[]) => {
+      const save = active.input.contextHooks?.recordResourceRequest;
+      if (!resources || !save) return;
+      if (layer && facts) resources.evidence = refineResourceEvidence(resources.evidence, layer, facts);
+      const saved = save(resources.evidence);
+      if (!saved.ok) { failStream(saved.error); throw new Error(saved.error.code); }
+    };
+    if (requestBinding && active.input.contextHooks?.recordResourceRequest) {
+      try { resources = this.resourceRequest(record, context, requestBinding);
+        if (resources.evidence.bundleHash === null && resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleHashes.length === 0) resources = undefined;
+        saveResources(); }
+      catch { if (!active.failure) failStream(appError('resource_evidence_conflict', 'runtime', 'Actual resource request provenance is unavailable.')); return; }
+    }
     let localAttempt = 0;
     let sdkPayloadFact: Extract<ContextEvidenceUpdate, { kind: 'sdk-payload' }> | undefined;
     let sdkSuccessSlot: { attempt: number; status: number; responseAt: string } | undefined;
@@ -1978,6 +2175,7 @@ export class PiAgentAdapter implements AgentPort {
         throw new Error(allowed.error.code);
       }
       if (!this.observeOutgoingToolResults(record, active, context)) throw new Error('tool_result_delivery_failed');
+      if (resources) saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
       const attempt = ++localAttempt;
       if (requestBinding) requireEvidence({ kind: 'attempt-prepared', evidence: { attempt, preparedAt: now().at,
         enteredAt: null, responseAt: null, responseStatus: null, transportErrorCode: null, nativeRequestId: null,
@@ -2024,6 +2222,7 @@ export class PiAgentAdapter implements AgentPort {
         const fact = { kind: 'sdk-payload' as const, at: sdkPayloadFact?.at ?? now().at, ...inclusion.data };
         requireEvidence(fact); sdkPayloadFact ??= fact;
       }
+      if (resources) saveResources('sdk', checkResourcePayload(model.api, outgoing, resources.texts));
       if (outgoing && typeof outgoing === 'object') {
         const body = outgoing as Record<string, unknown>;
         const generation = body.generationConfig as Record<string, unknown> | undefined;
@@ -2396,8 +2595,10 @@ export class PiAgentAdapter implements AgentPort {
     try {
       try {
         if (input.inputId !== undefined) {
-          const dispatched = await this.dispatchInput(record, active, { inputId: input.inputId, text: input.text, promptText: input.promptText!, contextSnapshotId: input.contextSnapshotId },
-            () => session.prompt(input.promptText!, { expandPromptTemplates: false }), false);
+          const dispatchedInput = { inputId: input.inputId, text: input.text, promptText: input.promptText!, contextSnapshotId: input.contextSnapshotId,
+            ...(input.resourceBinding ? { resourceBinding: input.resourceBinding } : {}) };
+          const dispatched = await this.dispatchInput(record, active, dispatchedInput,
+            () => session.prompt(this.nativeInputText(dispatchedInput), { expandPromptTemplates: input.resourceBinding?.requiredSkill != null }), false);
           await dispatched.execution;
         } else await session.prompt(formatExecutionPrompt({ ...input, business: input.toolBinding !== undefined }), { expandPromptTemplates: false });
       } finally { promptSettled = true; }

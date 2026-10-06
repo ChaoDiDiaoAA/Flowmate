@@ -1,7 +1,34 @@
 import { lstatSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { ProductPaths, Result } from '@flowmate/contracts';
+
+/** Pi 0.85.1's accepted native path spellings; no filesystem authorization or private SDK import. */
+export function resolveNativeFilePath(input: string, cwd: string): string {
+  let path = input.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, ' ');
+  if (path.startsWith('@')) path = path.slice(1);
+  if (process.platform === 'win32' && path.startsWith('/') && !path.startsWith('//') && !path.includes('\\')) {
+    const drive = path.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+    if (drive) path = `${drive[1]!.toUpperCase()}:\\${drive[2]?.replaceAll('/', '\\') ?? ''}`;
+  }
+  if (path === '~') path = homedir();
+  else if (path.startsWith('~/') || process.platform === 'win32' && path.startsWith('~\\')) path = join(homedir(), path.slice(2));
+  if (path.startsWith('file://')) path = fileURLToPath(path);
+  return resolve(cwd, path);
+}
+
+/** Match only the installed native tool's returned path field, never matched file content. */
+export function nativeFileResultIncludes(operation: string, relativePath: string, text: string): boolean {
+  if (operation === 'read' || relativePath === '') return true;
+  const path = relativePath.replaceAll('\\', '/');
+  return text.split(/\r?\n/).some(raw => {
+    const line = raw.replaceAll('\\', '/');
+    if (operation === 'find' || operation === 'ls') return line === path;
+    return operation === 'grep' && line.startsWith(path) && /^[:\-]\d+[:\-]/.test(line.slice(path.length));
+  });
+}
 
 function isWithin(root: string, target: string): boolean {
   const relation = relative(resolve(root), resolve(target));

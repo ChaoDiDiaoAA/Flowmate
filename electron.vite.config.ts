@@ -12,7 +12,7 @@ export default defineConfig({
     build: { rollupOptions: { input: { index: resolve(root, 'apps/desktop/main/index.ts') } } },
   },
   preload: {
-    plugins: [externalizeDepsPlugin({ exclude: workspacePackages })],
+    plugins: [externalizeDepsPlugin({ exclude: [...workspacePackages, 'zod'] })],
     build: {
       rollupOptions: {
         input: { index: resolve(root, 'apps/desktop/preload/index.ts') },

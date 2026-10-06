@@ -9,6 +9,8 @@ import { DocumentRefSchema, InvoiceIssueSchema, ParsedBlockSchema, SourceRefSche
   invoiceHeaderFields, invoiceLineFields, MAX_INVOICE_BLOCKS_PER_PAGE, MAX_INVOICE_LINES, MAX_INVOICE_PAGES } from './invoice.ts';
 import { WorkspaceContextSchema, WorkspaceInputSchema, WorkspaceSelectionSchema } from './workspace.ts';
 import { WorkingDirectorySchema } from './schemas.ts';
+import { RESOURCE_ERROR_CODES, ResourceBindingSchema, ResourceEvidenceJournalSchema } from './resources.ts';
+import type { ResourceReadEvidence, ResourceRequestEvidence } from './resources.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const nonnegative = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -56,6 +58,8 @@ export const CONTEXT_SAFE_ERROR_CODES = [
   'tool_not_found', 'tool_result_too_large', 'tool_runtime_unavailable', 'tool_sdk_after_failed', 'config_settings_invalid',
   'compaction_unavailable', 'compaction_not_needed', 'compaction_failed', 'compaction_cancelled',
   'compaction_timeout', 'compaction_capacity_exceeded',
+  ...RESOURCE_ERROR_CODES,
+  'config_revision_conflict', 'config_settings_write_failed',
 ] as const;
 export const ContextSafeErrorCodeSchema = z.enum(CONTEXT_SAFE_ERROR_CODES);
 export type ContextSafeErrorCode = z.infer<typeof ContextSafeErrorCodeSchema>;
@@ -115,8 +119,13 @@ export type ContextProjection = z.infer<typeof ContextProjectionSchema>;
 export const ContextBudgetsSchema = z.object({ projectionBytes: z.literal(65536), fragmentBytes: z.literal(4096),
   fragments: z.literal(32), issueCount: z.literal(20), snapshotBytes: z.literal(262144) }).strict();
 const publicJsonShape = { version: z.literal(1), policyVersion: z.literal('p8-context-v1'), text: userText, goalMode,
-  workspaceContext: WorkspaceContextSchema.nullable(), resourcePolicy: z.literal('none'),
+  workspaceContext: WorkspaceContextSchema.nullable(), resourcePolicy: z.enum(['none', 'p11-resources-v1']),
+  resourceBinding: ResourceBindingSchema.optional(),
   modelProjection: ContextProjectionSchema, budgets: ContextBudgetsSchema };
+function checkResourcePolicy(value: { resourcePolicy: string; resourceBinding?: unknown }, context: z.RefinementCtx) {
+  if ((value.resourcePolicy === 'p11-resources-v1') !== (value.resourceBinding !== undefined))
+    report(context, 'Resource policy requires its fixed binding; legacy none cannot invent one.');
+}
 function checkProjectionMode(value: { goalMode: string; modelProjection: ContextProjection }, context: z.RefinementCtx) {
   if (value.goalMode === 'fill-form' && (value.modelProjection.candidate === null
     || value.modelProjection.candidate.values.length !== 0 || value.modelProjection.fragments.length !== 0))
@@ -126,6 +135,7 @@ export const ContextSnapshotJsonSchema = z.object({ ...publicJsonShape, workingD
   allowedDocumentIds: z.array(id).max(64).readonly(), allowedArtifactIds: z.array(id).max(128).readonly(),
 }).strict().superRefine((value, context) => {
   checkProjectionMode(value, context);
+  checkResourcePolicy(value, context);
   if (!unique(value.allowedDocumentIds) || !unique(value.allowedArtifactIds)) report(context, 'Context allowlists must be unique.');
   if (jsonBytes(value) > 262144) report(context, 'Snapshot JSON exceeds 262144 UTF-8 bytes.');
 }).readonly();
@@ -138,7 +148,7 @@ export type ContextSnapshot = z.infer<typeof ContextSnapshotSchema>;
 export const ContextBuildRequestSchema = z.object({ runId: id, sessionId: id, jobId: id.nullable(), text: userText, goalMode,
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id).max(64).readonly(), allowedArtifactIds: z.array(id).max(128).readonly(),
-  workingDirectory: WorkingDirectorySchema.nullable(), createdAt: time,
+  workingDirectory: WorkingDirectorySchema.nullable(), createdAt: time, resourceBinding: ResourceBindingSchema.optional(),
 }).strict().superRefine((value, context) => {
   if (value.workspaceContext && (value.workspaceContext.sessionId !== value.sessionId || value.workspaceContext.jobId !== value.jobId))
     report(context, 'Build and frozen Workspace identity disagree.');
@@ -269,7 +279,8 @@ function checkObservations(value: { requests: readonly { binding: { requestSeque
 // Legacy storage parsing preserves field omission and original serialization; it never backfills proof.
 const storedObservations = z.object({ version: z.literal(1), requests: z.array(z.union([
   ContextRequestEvidenceSchema, LegacyContextRequestEvidenceSchema,
-])).max(64).readonly(), compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional()
+])).max(64).readonly(), compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional(),
+  resources: ResourceEvidenceJournalSchema.optional(),
 }).strict().superRefine(checkObservations).readonly();
 export const ContextObservationsSchema = z.unknown().superRefine((raw, context) => {
   const parsed = storedObservations.safeParse(raw);
@@ -278,11 +289,13 @@ export const ContextObservationsSchema = z.unknown().superRefine((raw, context) 
 export type ContextObservations = z.infer<typeof ContextObservationsSchema>;
 export const NativeContextObservationsSchema = z.object({ version: z.literal(1),
   requests: z.array(ContextRequestEvidenceSchema).max(64).readonly(),
-  compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional()
+  compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional(),
+  resources: ResourceEvidenceJournalSchema.optional(),
 }).strict().superRefine(checkObservations).readonly();
 export const PublicContextObservationsSchema = z.object({ version: z.literal(1),
   requests: z.array(PublicContextRequestEvidenceSchema).max(64).readonly(),
-  compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional()
+  compactions: z.array(z.lazy(() => RunCompactionEvidenceSchema)).max(64).readonly().optional(),
+  resources: ResourceEvidenceJournalSchema.optional(),
 }).strict().superRefine(checkObservations).readonly();
 export type PublicContextObservations = z.infer<typeof PublicContextObservationsSchema>;
 export function readContextObservations(raw: unknown, historyPolicyVersion?: 'p9-native-history-v1'): Result<PublicContextObservations> {
@@ -307,6 +320,8 @@ export const ContextEvidenceUpdateSchema = z.discriminatedUnion('kind', [
 export type ContextEvidenceUpdate = z.infer<typeof ContextEvidenceUpdateSchema>;
 export type ContextHooks = {
   compaction?: (value: RunCompactionEvidence) => Result<void>;
+  recordResourceRead?: (value: ResourceReadEvidence) => Result<void>;
+  recordResourceRequest?: (value: ResourceRequestEvidence) => Result<void>;
   resolveToolResult(input: Readonly<{ sessionId: number; nativeToolCallId: string }>): Result<NativeToolResultContextBinding>;
   bind(input: Readonly<{ binding: RequestContextBinding; api: string; transport: ContextRequestEvidence['transport']; at: string }>): Result<void>;
   record(binding: RequestContextBinding, update: ContextEvidenceUpdate): Result<void>;
@@ -336,6 +351,7 @@ export type ContextSnapshotsPage = z.infer<typeof ContextSnapshotsPageSchema>;
 export const PublicContextSnapshotJsonSchema = z.object({ ...publicJsonShape, hasWorkingDirectory: z.boolean() }).strict()
   .superRefine((value, context) => {
     checkProjectionMode(value, context);
+    checkResourcePolicy(value, context);
     if (jsonBytes(value) > 262144) report(context, 'Public snapshot JSON exceeds 262144 UTF-8 bytes.');
   }).readonly();
 export type PublicContextSnapshotJson = z.infer<typeof PublicContextSnapshotJsonSchema>;

@@ -2,12 +2,22 @@ import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.t
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
+import { createHash } from 'node:crypto';
+import { join, relative, isAbsolute, sep } from 'node:path';
+import { resolveNativeFilePath, nativeFileResultIncludes } from '@flowmate/shared';
+import { verifyFrozenResourceMetadata } from '../resources/service.ts';
+import { ResourceEvidenceJournalSchema, ResourceExpansionEvidenceSchema, ResourceReadEvidenceSchema,
+  ResourceRequestEvidenceSchema, RunResourceQuerySchema, ResourceBindingSchema, SessionInputContentV2Schema,
+  resourceRefKey, resourceContentKey, NativeDerivedContextBindingSchema } from '@flowmate/contracts';
+import { NativeToolOutputSchema } from '@flowmate/contracts';
+import type { ResourceEvidenceJournal, ResourceExpansionEvidence, ResourceReadEvidence, ResourceRequestEvidence,
+  RunResourceQuery, FrozenResources, ResourceRef } from '@flowmate/contracts';
 import { appError, fail, ok, ContextSnapshotSchema, ContextSnapshotJsonSchema, ContextReferenceSchema,
   ContextObservationsSchema, NativeContextObservationsSchema, readContextObservations, RequestContextBindingSchema, ContextEvidenceUpdateSchema, ContextRequestEvidenceSchema,
   ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema,
   ContextRequestsRequestSchema, ContextSnapshotDetailSchema, ContextInputErrorSchema,
   ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema,
-  SessionInputSnapshotSchema, CompactionPolicySchema, RunCompactionEvidenceSchema } from '@flowmate/contracts';
+  SessionInputSnapshotSchema, CompactionPolicySchema, RunCompactionEvidenceSchema, FrozenResourcesSchema, matchesResourceBinding } from '@flowmate/contracts';
 import type { AppError, Result, ContextSnapshot, ContextSnapshotJson, ContextReference, ContextHooks,
   RequestContextBinding, ContextEvidenceUpdate, ContextObservations, ContextRequestEvidence,
   NativeToolResultContextBinding, NativeSessionHistory, ContextSnapshotsRequest, ContextSnapshotsPage,
@@ -20,6 +30,9 @@ export interface ContextRepository {
   recordRequest(binding: RequestContextBinding, update: ContextEvidenceUpdate): Result<void>;
   recordCompactionEvidence(value: RunCompactionEvidence): Result<void>;
   readCompactionEvidence(request: { sessionId: DbId; runId: DbId; operationId?: string }): Result<readonly RunCompactionEvidence[]>;
+  recordResourceRead(value: ResourceReadEvidence, owner: RunResourceQuery): Result<void>;
+  recordResourceRequest(value: ResourceRequestEvidence, owner: RunResourceQuery): Result<void>;
+  readResourceEvidence(owner: RunResourceQuery): Result<ResourceEvidenceJournal | null>;
   resolveToolResult(input: Parameters<ContextHooks['resolveToolResult']>[0]): Result<NativeToolResultContextBinding>;
   listContextSnapshots(request: ContextSnapshotsRequest): Result<ContextSnapshotsPage>;
   queryContextSnapshot(request: ContextSnapshotRequest): Result<ContextSnapshotDetail>;
@@ -42,6 +55,192 @@ function reject(code: string, category: AppError['category'] = 'runtime'): never
 function corrupt(): never { return reject('storage_corrupt', 'storage'); }
 function unknownBinding(): never { return reject('context_binding_unknown'); }
 function conflict(): never { return reject('context_binding_conflict'); }
+function resourceConflict(): never { return reject('resource_evidence_conflict'); }
+const hashText = (value: string) => createHash('sha256').update(value).digest('hex');
+function frozenResources(config: unknown): FrozenResources | null {
+  const frozen = z.object({ resources: FrozenResourcesSchema.optional() }).parse(config).resources ?? null;
+  if (frozen && !verifyFrozenResourceMetadata(frozen).ok) resourceConflict();
+  return frozen;
+}
+function includesResource(frozen: FrozenResources | null, ref: ResourceRef): boolean {
+  return [frozen?.prompt, ...(frozen?.discoveredSkills ?? [])].some(item => item && resourceRefKey(item) === resourceRefKey(ref));
+}
+
+function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: ResourceReadEvidence): void {
+  const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
+  const frozen = frozenResources(json(row.config_json));
+  if (row.kind !== 'agent' || row.session_id !== owner.sessionId || frozen?.bundleHash !== value.bundleHash || !includesResource(frozen, value.ref)) resourceConflict();
+  const tool = z.object({ id, run_id: id, session_id: id, native_tool_call_id: z.string(), tool_name: z.string(), request_sequence: id.nullable(), args_json: z.string(),
+    result_json: z.string() }).parse(db.query('SELECT * FROM tool_calls WHERE id=?').get(value.toolCallId));
+  if (tool.run_id !== owner.runId || tool.session_id !== owner.sessionId || tool.native_tool_call_id !== value.nativeToolCallId
+    || tool.tool_name !== value.operation || tool.request_sequence !== value.requestSequence) resourceConflict();
+  const result = z.object({ status: z.literal('succeeded'), data: NativeToolOutputSchema }).parse(json(tool.result_json));
+  const file = frozen.manifests.find(item => resourceRefKey(item.ref) === resourceRefKey(value.ref))?.manifest.files.find(item => item.path === value.path);
+  if (!file || file.sha256 !== value.fileHash) resourceConflict();
+  const config = z.object({ workingDirectory: z.string() }).parse(json(row.config_json));
+  const storedArgs = z.object({ version: z.literal(1), raw: z.unknown(), final: z.unknown() }).parse(json(tool.args_json));
+  const args = z.object({ path: z.string().optional() }).parse(storedArgs.final ?? storedArgs.raw);
+  if (value.operation === 'read' && args.path === undefined) resourceConflict();
+  const target = resolveNativeFilePath(args.path ?? '.', config.workingDirectory);
+  const filePath = join(frozen.bundleDirectory,
+    value.ref.kind === 'skill' ? 'skills' : 'prompts', value.ref.id, value.ref.version, value.path);
+  const rel = relative(target, filePath);
+  if (value.operation === 'read' ? rel !== '' : rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) resourceConflict();
+  const text = result.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+  if (!nativeFileResultIncludes(value.operation, rel, text)) resourceConflict();
+  if (hashText(JSON.stringify(result.data.content)) !== value.deliveredHash) resourceConflict();
+  if (value.fullBody === true && hashText(result.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n')) !== value.fileHash) resourceConflict();
+  if (value.nativeEntryId !== null) {
+    const reader = createNativeOriginReader(db), native = reader.entry(owner.sessionId, value.nativeEntryId);
+    if (native?.type !== 'message' || native.message.role !== 'toolResult' || native.message.toolCallId !== value.nativeToolCallId
+      || reader.tool(owner.sessionId, value.nativeToolCallId, true).toolCallId !== value.toolCallId
+      || reader.resolve(owner.sessionId, value.nativeEntryId).originRunId !== owner.runId
+      || hashText(JSON.stringify(native.message.content)) !== value.deliveredHash) resourceConflict();
+  }
+}
+
+export function readResourceReads(db: Database, owner: RunResourceQuery): readonly ResourceReadEvidence[] {
+  const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
+  if (row.session_id !== owner.sessionId) resourceConflict();
+  const reads = readRunContext(row).observations?.resources?.reads ?? [];
+  for (const value of reads) verifyResourceReadOwner(db, owner, value);
+  return reads;
+}
+
+function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence, row: RunRow, observations: ContextObservations) {
+  const owner = { row, observations, frozen: frozenResources(json(row.config_json)) };
+  if (!owner.observations?.resources) resourceConflict();
+  const reader = createNativeOriginReader(db);
+  const binding = value.purpose === 'answer' ? owner.observations.requests.find(item => item.binding.callSequence === value.callSequence)?.binding : null;
+  const operation = value.purpose === 'compaction' ? owner.observations.compactions?.find(item => item.operationId === value.compactionOperationId) : null;
+  const summary = operation?.calls.find(call => call.modelCallIndex === value.callSequence);
+  if (value.purpose === 'answer' && (!binding || value.bundleHash !== (owner.frozen?.bundleHash ?? null))
+    || value.purpose === 'compaction' && !summary) resourceConflict();
+  const prefix = operation ? reader.path(owner.row.session_id!, operation.baseline.leafId) : [];
+  const inputs = binding?.includedBindings ?? prefix.filter(entry => entry.type === 'message' && entry.message.role === 'user')
+    .map(entry => reader.resolve(owner.row.session_id!, entry.id));
+  const tools = binding?.includedToolResults ?? prefix.flatMap(entry => entry.type === 'message' && entry.message.role === 'toolResult'
+    ? [reader.tool(owner.row.session_id!, entry.message.toolCallId, true)] : []);
+  if (value.inputIds.some(inputId => !inputs.some(source => source.inputId === inputId))
+    || value.toolCallIds.some(toolCallId => !tools.some(source => source.toolCallId === toolCallId))) resourceConflict();
+  if (value.contentChecks.length === 0 && value.referencedBundleHashes.length === 0) return;
+  const available = new Map<string, FrozenResources>();
+  if (owner.frozen && value.purpose === 'answer') available.set(owner.frozen.bundleHash, owner.frozen);
+  for (const source of [...inputs, ...tools]) {
+    if (source.originRunId === null) continue;
+    const row = z.object({ config_json: z.string() }).parse(db.query('SELECT config_json FROM runs WHERE id=?').get(source.originRunId));
+    const frozen = frozenResources(json(row.config_json));
+    if (frozen) available.set(frozen.bundleHash, frozen);
+  }
+  const derived = binding && 'includedNativeContexts' in binding ? z.array(NativeDerivedContextBindingSchema).parse(binding.includedNativeContexts) : [];
+  const derivedIds = binding ? derived.map(source => source.nativeEntryId) : prefix.filter(entry => entry.type === 'compaction').map(entry => entry.id);
+  for (const source of derived) {
+    reader.derived(owner.row.session_id!, source);
+    const entry = reader.entry(owner.row.session_id!, source.nativeEntryId);
+    if (entry?.type !== 'compaction') continue;
+    for (const original of reader.path(owner.row.session_id!, entry.parentId)) {
+      const origin = reader.resolve(owner.row.session_id!, original.id);
+      if (origin.originRunId === null) continue;
+      const row = z.object({ config_json: z.string() }).parse(db.query('SELECT config_json FROM runs WHERE id=?').get(origin.originRunId));
+      const frozen = frozenResources(json(row.config_json));
+      if (frozen) available.set(frozen.bundleHash, frozen);
+    }
+  }
+  if (value.referencedBundleHashes.some(hash => !available.has(hash))) resourceConflict();
+  for (const check of value.contentChecks) {
+    if (![...available.values()].some(frozen => includesResource(frozen, check.ref))) resourceConflict();
+    if (check.scope === 'business-prompt' || check.scope === 'skill-index') {
+      if (value.purpose !== 'answer' || check.nativeEntryId !== null || !includesResource(owner.frozen, check.ref)) resourceConflict();
+    }
+    if (check.scope === 'expanded-body') {
+      const source = inputs.find(source => source.nativeEntryId === check.nativeEntryId);
+      if (!source || source.inputId === null || source.originRunId === null) resourceConflict();
+      const origin = reader.resolve(owner.row.session_id!, source.nativeEntryId);
+      const receipt = readResourceExpansion(db, { sessionId: origin.originSessionId, runId: source.originRunId }, source.inputId, source.nativeEntryId);
+      if (!receipt || !same(receipt.skill, check.ref) || receipt.expandedTextHash !== check.expectedTextHash || !value.referencedBundleHashes.includes(receipt.bundleHash)) resourceConflict();
+    }
+    if (check.scope === 'tool-output') {
+      if (check.nativeEntryId === null) resourceConflict();
+      const native = reader.entry(owner.row.session_id!, check.nativeEntryId!);
+      if (native?.type !== 'message' || native.message.role !== 'toolResult') resourceConflict();
+      const origin = reader.resolve(owner.row.session_id!, check.nativeEntryId!);
+      if (origin.originRunId === null) resourceConflict();
+      const receipts = readResourceReads(db, { sessionId: origin.originSessionId, runId: origin.originRunId });
+      if (!receipts.some(receipt => receipt.nativeEntryId === check.nativeEntryId && same(receipt.ref, check.ref) && receipt.path === check.path && value.referencedBundleHashes.includes(receipt.bundleHash))
+        || hashText(native.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')) !== check.expectedTextHash) resourceConflict();
+    }
+    if (check.scope === 'derived-source') {
+      if (check.nativeEntryId === null || !derivedIds.includes(check.nativeEntryId)) resourceConflict();
+      const summary = reader.entry(owner.row.session_id!, check.nativeEntryId!);
+      if (summary?.type !== 'compaction') resourceConflict();
+      const originals = reader.path(owner.row.session_id!, summary!.parentId);
+      const cut = originals.findIndex(entry => entry.id === summary!.firstKeptEntryId);
+      let found = false;
+      for (const entry of originals.slice(0, Math.max(0, cut))) {
+        if (entry.type !== 'message' || entry.message.role !== 'user' && entry.message.role !== 'toolResult') continue;
+        const origin = reader.resolve(owner.row.session_id!, entry.id); if (origin.originRunId === null) continue;
+        const originalOwner = { sessionId: origin.originSessionId, runId: origin.originRunId };
+        if (entry.message.role === 'user' && origin.inputId !== null) {
+          const receipt = readResourceExpansion(db, originalOwner, origin.inputId, entry.id);
+          if (receipt && same(receipt.skill, check.ref) && (check.path === null || check.path === 'SKILL.md')
+            && value.referencedBundleHashes.includes(receipt.bundleHash)) found = true;
+        } else if (entry.message.role === 'toolResult' && readResourceReads(db, originalOwner).some(receipt => receipt.nativeEntryId === entry.id
+          && same(receipt.ref, check.ref) && (check.path === null || check.path === receipt.path) && value.referencedBundleHashes.includes(receipt.bundleHash))) found = true;
+      }
+      if (!found) resourceConflict();
+    }
+    if (check.nativeEntryId !== null) {
+      const direct = inputs.some(source => source.nativeEntryId === check.nativeEntryId)
+        || derivedIds.includes(check.nativeEntryId);
+      const native = reader.entry(owner.row.session_id!, check.nativeEntryId!);
+      const tool = native?.type === 'message' && native.message.role === 'toolResult' && tools.some(source =>
+        source.nativeToolCallId === native.message.toolCallId && reader.resolve(owner.row.session_id!, check.nativeEntryId!).originRunId === source.originRunId);
+      if (!direct && !tool) resourceConflict();
+    }
+  }
+}
+
+function verifyResourceExpansionOwner(db: Database, owner: RunResourceQuery, value: ResourceExpansionEvidence): ContextObservations & { resources: ResourceEvidenceJournal } {
+  const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
+  if (row.kind !== 'agent' || row.session_id !== owner.sessionId) resourceConflict();
+  const config = json(row.config_json), frozen = frozenResources(config);
+  const observations = readRunContext(row).observations;
+  if (!observations?.resources || !frozen || value.bundleHash !== frozen.bundleHash || !includesResource(frozen, value.skill)) resourceConflict();
+  const input = z.object({ run_id: id, session_id: id, native_entry_id: z.literal(value.nativeEntryId),
+    status: z.literal('consumed'), content_json: z.string() }).parse(db.query('SELECT * FROM session_inputs WHERE id=?').get(value.inputId));
+  const content = SessionInputContentV2Schema.parse(json(input.content_json));
+  if (input.run_id !== owner.runId || input.session_id !== owner.sessionId
+    || !matchesResourceBinding(frozen, content.resourceBinding) || !same(content.resourceBinding?.requiredSkill, value.skill)) resourceConflict();
+  const entry = z.object({ run_id: id, entry_json: z.string() }).parse(db.query(
+    'SELECT run_id,entry_json FROM session_native_entries WHERE session_id=? AND entry_id=?').get(owner.sessionId, value.nativeEntryId));
+  const user = z.object({ type: z.literal('message'), message: z.object({ role: z.literal('user'),
+    content: z.union([z.string(), z.array(z.object({ type: z.literal('text'), text: z.string() }))]) }) }).parse(json(entry.entry_json));
+  const text = typeof user.message.content === 'string' ? user.message.content : user.message.content.map(item => item.text).join('');
+  if (entry.run_id !== owner.runId || hashText(text) !== value.expandedTextHash) resourceConflict();
+  return { ...observations, resources: observations.resources };
+}
+
+export function readResourceExpansion(db: Database, owner: RunResourceQuery, inputId: number, nativeEntryId: string): ResourceExpansionEvidence | null {
+  const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
+  const journal = readRunContext(row).observations?.resources;
+  const content = SessionInputContentV2Schema.parse(json(z.object({ content_json: z.string() }).parse(db.query('SELECT content_json FROM session_inputs WHERE id=?').get(inputId)).content_json));
+  const receipt = journal?.expansions.find(item => item.inputId === inputId || item.nativeEntryId === nativeEntryId) ?? null;
+  if (!receipt) { if (content.resourceBinding?.requiredSkill) resourceConflict(); return null; }
+  if (receipt.inputId !== inputId || receipt.nativeEntryId !== nativeEntryId) resourceConflict();
+  verifyResourceExpansionOwner(db, owner, receipt); return receipt;
+}
+
+/** This runs after the original native receipt CAS, inside that same transaction. */
+export function appendResourceExpansionInTransaction(db: Database, owner: RunResourceQuery, raw: ResourceExpansionEvidence): void {
+  if (!db.inTransaction) resourceConflict();
+  const value = ResourceExpansionEvidenceSchema.parse(raw), observations = verifyResourceExpansionOwner(db, owner, value);
+  const previous = observations.resources.expansions.find(item => item.inputId === value.inputId || item.nativeEntryId === value.nativeEntryId);
+  if (previous) { if (!same({ ...previous, at: value.at }, value)) resourceConflict(); return; }
+  const resources = ResourceEvidenceJournalSchema.parse({ ...observations.resources, expansions: [...observations.resources.expansions, value] });
+  const next = { ...observations, resources };
+  if (bytes(next) > 4194304) resourceConflict();
+  if (db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify(next), owner.runId).changes !== 1) resourceConflict();
+}
 
 /** Pre-015 rows have no columns. Their absent fields retain the same explicit NULL semantics. */
 export function contextReferenceFromColumns(row: { context_snapshot_id?: number | null; request_sequence?: number | null }): ContextReference | null {
@@ -100,10 +299,20 @@ export function readContextSnapshotOwner(db: Database, snapshotId: number, owner
   const snapshot = ContextSnapshotSchema.parse({ id: row.id, sessionId: row.session_id, runId: row.run_id, jobId: row.job_id,
     sequence: row.sequence, json: json(row.snapshot_json), createdAt: row.created_at });
   if (snapshot.runId !== owner.id || snapshot.sessionId !== owner.session_id || snapshot.jobId !== (owner.job_id ?? null)) throw new Error('invalid_context_owner');
+  const config = z.object({ config_json: z.string() }).parse(db.query('SELECT config_json FROM runs WHERE id=?').get(owner.id));
+  const resources = z.object({ resources: FrozenResourcesSchema.optional() }).parse(json(config.config_json)).resources ?? null;
+  if (!matchesResourceBinding(resources, snapshot.json.resourceBinding)) throw new Error('invalid_context_resource_binding');
   return snapshot;
 }
 
-export function readRunContextOwner(db: Database, row: Parameters<typeof readRunContext>[0] & { job_id?: number | null }) {
+type ContextOwnerRow = Parameters<typeof readRunContext>[0] & { job_id?: number | null };
+/** Allocate per immutable read batch; never carry proofs across a write or another transaction. */
+export type ContextOwnerCache = Map<number, { row: ContextOwnerRow; context: ReturnType<typeof readRunContext> }>;
+export function readRunContextOwner(db: Database, row: ContextOwnerRow, owners?: ContextOwnerCache) {
+  const cached = owners?.get(row.id);
+  if (cached && cached.row.kind === row.kind && cached.row.session_id === row.session_id && cached.row.job_id === row.job_id
+    && cached.row.config_json === row.config_json && cached.row.current_context_snapshot_id === row.current_context_snapshot_id
+    && cached.row.context_observations_json === row.context_observations_json) return cached.context;
   const context = readRunContext(row);
   if (context.pointer !== null) readContextSnapshotOwner(db, context.pointer, row);
   for (const request of context.observations?.requests ?? []) {
@@ -118,17 +327,24 @@ export function readRunContextOwner(db: Database, row: Parameters<typeof readRun
       throw new Error('invalid_context_request_input');
   }
   if (context.observations !== null) verifySavedSources(db, context.observations);
+  for (const value of context.observations?.resources?.expansions ?? [])
+    verifyResourceExpansionOwner(db, { sessionId: row.session_id!, runId: row.id }, value);
+  for (const value of context.observations?.resources?.reads ?? [])
+    verifyResourceReadOwner(db, { sessionId: row.session_id!, runId: row.id }, value);
+  for (const value of context.observations?.resources?.requests ?? [])
+    verifyResourceRequestOwner(db, value, runRowSchema.parse(row), context.observations!);
+  owners?.set(row.id, { row, context });
   return context;
 }
 
 /** Read the association against its original Run/request, including readers used on legacy schemas. */
-export function readToolContext(db: Database, row: { run_id: number; session_id: number; context_snapshot_id?: number | null; request_sequence?: number | null }): ContextReference | null {
+export function readToolContext(db: Database, row: { run_id: number; session_id: number; context_snapshot_id?: number | null; request_sequence?: number | null }, owners?: ContextOwnerCache): ContextReference | null {
   const reference = contextReferenceFromColumns(row);
   const owner = z.object({ id, kind: z.literal('agent'), session_id: id, job_id: id.nullable(), config_json: z.string(),
     current_context_snapshot_id: id.nullable().optional(), context_observations_json: z.string().nullable().optional() })
     .parse(db.query('SELECT * FROM runs WHERE id=?').get(row.run_id));
   if (owner.session_id !== row.session_id) throw new Error('invalid_context_tool_owner');
-  const context = readRunContextOwner(db, owner);
+  const context = readRunContextOwner(db, owner, owners);
   if ((reference === null) !== (context.observations === null)) throw new Error('invalid_context_tool_pair');
   if (reference !== null) {
     readContextSnapshotOwner(db, reference.snapshotId, owner);
@@ -137,7 +353,7 @@ export function readToolContext(db: Database, row: { run_id: number; session_id:
   return reference;
 }
 
-export function readInputContext(db: Database, row: { run_id: number | null; session_id: number; context_snapshot_id?: number | null }): number | null {
+export function readInputContext(db: Database, row: { run_id: number | null; session_id: number; context_snapshot_id?: number | null; content_json?: string }, owners?: ContextOwnerCache): number | null {
   const snapshotId = row.context_snapshot_id ?? null;
   if (row.run_id === null) {
     if (snapshotId !== null) throw new Error('invalid_context_input_owner');
@@ -147,9 +363,15 @@ export function readInputContext(db: Database, row: { run_id: number | null; ses
     current_context_snapshot_id: id.nullable().optional(), context_observations_json: z.string().nullable().optional() })
     .parse(db.query('SELECT * FROM runs WHERE id=?').get(row.run_id));
   if (owner.session_id !== row.session_id) throw new Error('invalid_context_input_session');
-  const context = readRunContextOwner(db, owner);
+  const context = readRunContextOwner(db, owner, owners);
   if ((snapshotId === null) !== (context.observations === null)) throw new Error('invalid_context_input_pair');
-  if (snapshotId !== null) readContextSnapshotOwner(db, snapshotId, owner);
+  if (snapshotId !== null) {
+    const snapshot = readContextSnapshotOwner(db, snapshotId, owner);
+    if (row.content_json !== undefined) {
+      const content = z.object({ resourceBinding: ResourceBindingSchema.optional() }).parse(json(row.content_json));
+      if (!same(content.resourceBinding, snapshot.json.resourceBinding)) throw new Error('invalid_input_resource_binding');
+    }
+  }
   return snapshotId;
 }
 
@@ -238,14 +460,14 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     if (!row) reject('session_not_found', 'session');
     return z.object({ id, native_session_id: z.string().min(1).max(256) }).parse(row);
   }
-  function run(runId: number, sessionId: number) {
+  function run(runId: number, sessionId: number, owners?: ContextOwnerCache) {
     id.parse(runId);
     const raw = db.query('SELECT id,kind,session_id,job_id,config_json,current_context_snapshot_id,context_observations_json FROM runs WHERE id=?').get(runId);
     if (!raw) reject('run_not_found', 'runtime');
     const row = runRowSchema.parse(raw);
     if (row.kind !== 'agent' || row.session_id !== sessionId) reject('state_conflict', 'runtime');
     let context: ReturnType<typeof readRunContext>;
-    try { context = readRunContextOwner(db, row); } catch (error) { if (error instanceof SQLiteError || error instanceof NativeOriginFault || error instanceof ContextFault) throw error; return corrupt(); }
+    try { context = readRunContextOwner(db, row, owners); } catch (error) { if (error instanceof SQLiteError || error instanceof NativeOriginFault || error instanceof ContextFault) throw error; return corrupt(); }
     return { row, ...context };
   }
   function snapshot(snapshotId: number, owner?: RunRow): ContextSnapshot {
@@ -256,6 +478,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     const value = ContextSnapshotSchema.parse({ id: row.id, sessionId: row.session_id, runId: row.run_id, jobId: row.job_id,
       sequence: row.sequence, json: json(row.snapshot_json), createdAt: row.created_at });
     if (owner && (value.runId !== owner.id || value.sessionId !== owner.session_id || value.jobId !== owner.job_id)) reject('state_conflict', 'runtime');
+    if (owner && !matchesResourceBinding(frozenResources(json(owner.config_json)), value.json.resourceBinding)) resourceConflict();
     return value;
   }
   function savedInput(raw: unknown): SessionInputSnapshot {
@@ -269,12 +492,13 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
       resultEntryId: row.result_entry_id, dispatchedAt: row.dispatched_at, error: row.error_json === null ? null : json(row.error_json),
       createdAt: row.created_at, updatedAt: row.updated_at });
   }
-  function snapshotInput(value: ContextSnapshot) {
+  function snapshotInput(value: ContextSnapshot, owners?: ContextOwnerCache) {
     const rows = db.query('SELECT * FROM session_inputs WHERE context_snapshot_id=?').all(value.id);
     if (rows.length !== 1) return corrupt();
     const saved = savedInput(rows[0]);
-    readInputContext(db, { run_id: saved.runId, session_id: saved.sessionId, context_snapshot_id: saved.contextSnapshotId });
+    readInputContext(db, { run_id: saved.runId, session_id: saved.sessionId, context_snapshot_id: saved.contextSnapshotId }, owners);
     if (saved.runId !== value.runId || saved.sessionId !== value.sessionId || saved.content.text !== value.json.text
+      || !same(saved.content.version === 2 ? saved.content.resourceBinding : undefined, value.json.resourceBinding)
       || saved.goalMode !== value.json.goalMode || !same(saved.content.workspaceContext, value.json.workspaceContext)
       || !same(saved.content.allowedDocumentIds, value.json.allowedDocumentIds)
       || !same(saved.content.allowedArtifactIds, value.json.allowedArtifactIds)) return corrupt();
@@ -335,14 +559,73 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     ContextObservationsSchema.parse(observations);
     if (db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify(observations), owner.id).changes !== 1) throw new Error('context_run_missing');
   }
-  function publicSummary(value: ContextSnapshot): ContextSnapshotSummary {
-    const saved = snapshotInput(value), workspace = value.json.workspaceContext;
+  function resourceOwner(raw: RunResourceQuery) {
+    const query = RunResourceQuerySchema.parse(raw), current = run(query.runId, query.sessionId);
+    const config = z.object({ agent: z.object({ nativeSessionId: z.string(), systemPrompt: z.string() }), resources: FrozenResourcesSchema.optional() }).parse(json(current.row.config_json));
+    if (config.agent.nativeSessionId !== session(query.sessionId).native_session_id) resourceConflict();
+    return { ...current, config, frozen: config.resources ?? null };
+  }
+  function resourceWrite(action: () => void): Result<void> {
+    const result = write(action);
+    return !result.ok && result.error.code === 'storage_write_failed' ? fail(appError('resource_evidence_write_failed', 'storage', 'Resource evidence could not be saved.', true)) : result;
+  }
+  function persistResources(owner: ReturnType<typeof resourceOwner>, resources: ResourceEvidenceJournal) {
+    if (!owner.observations?.resources) resourceConflict();
+    ResourceEvidenceJournalSchema.parse(resources);
+    const next = { ...owner.observations, resources };
+    if (bytes(next) > 4194304) resourceConflict();
+    if (!same(owner.observations.resources, resources)) persist(owner.row, next);
+  }
+  function publicSummary(value: ContextSnapshot, owners?: ContextOwnerCache): ContextSnapshotSummary {
+    const saved = snapshotInput(value, owners), workspace = value.json.workspaceContext;
     return { id: value.id, sessionId: value.sessionId, runId: value.runId, jobId: value.jobId, sequence: value.sequence,
       createdAt: value.createdAt, inputId: saved.inputId, mode: saved.mode, documentRef: workspace?.documentRef ?? null,
       candidateRef: workspace?.candidateRef ?? null, selection: workspace?.selection ?? null,
       fragmentCount: value.json.modelProjection.fragments.length, gapCount: value.json.modelProjection.gaps.length };
   }
   return {
+    readResourceEvidence(raw) { return read(() => resourceOwner(raw).observations?.resources ?? null); },
+    recordResourceRead(raw, query) {
+      const parsed = ResourceReadEvidenceSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('resource_evidence_conflict', 'runtime', 'Resource read evidence is invalid.'));
+      return resourceWrite(() => {
+        const value = parsed.data, owner = resourceOwner(query), journal = owner.observations?.resources;
+        if (!journal || !includesResource(owner.frozen, value.ref)) resourceConflict();
+        verifyResourceReadOwner(db, query, value);
+        const key = (item: ResourceReadEvidence) => JSON.stringify([item.toolCallId, item.operation, item.path]);
+        const previous = journal.reads.find(item => key(item) === key(value));
+        if (previous && (!same({ ...previous, at: value.at, nativeEntryId: value.nativeEntryId }, value)
+          || previous.nativeEntryId !== null && previous.nativeEntryId !== value.nativeEntryId)) resourceConflict();
+        const reads = previous ? journal.reads.map(item => item === previous ? { ...value, at: previous.at } : item) : [...journal.reads, value];
+        persistResources(owner, { ...journal, reads });
+      });
+    },
+    recordResourceRequest(raw, query) {
+      const parsed = ResourceRequestEvidenceSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('resource_evidence_conflict', 'runtime', 'Resource request evidence is invalid.'));
+      return resourceWrite(() => {
+        const value = parsed.data, owner = resourceOwner(query);
+        verifyResourceRequestOwner(db, value, owner.row, owner.observations!);
+        const journal = owner.observations!.resources!;
+        const previous = journal.requests.find(item => item.purpose === value.purpose && item.callSequence === value.callSequence
+          && item.compactionOperationId === value.compactionOperationId);
+        let next = value;
+        if (previous) {
+          if (!same({ ...previous, contentChecks: value.contentChecks, at: value.at }, value)
+            || previous.contentChecks.length !== value.contentChecks.length) resourceConflict();
+          const contentChecks = value.contentChecks.map(check => {
+            const original = previous.contentChecks.find(item => resourceContentKey(item) === resourceContentKey(check));
+            if (!original || !same({ ...original, sdkInclusion: check.sdkInclusion, wireInclusion: check.wireInclusion, reason: check.reason }, check)
+              || original.sdkInclusion !== 'unknown' && original.sdkInclusion !== check.sdkInclusion
+              || original.wireInclusion !== 'unknown' && original.wireInclusion !== check.wireInclusion) resourceConflict();
+            return check;
+          });
+          next = { ...value, contentChecks, at: previous.at };
+        }
+        const requests = previous ? journal.requests.map(item => item === previous ? next : item) : [...journal.requests, next];
+        persistResources(owner, { ...journal, requests });
+      });
+    },
     appendInTransaction(value) {
       if (!db.inTransaction) return fail(appError('state_conflict', 'input', 'Context append requires its admission transaction.'));
       return write(() => {
@@ -350,6 +633,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
         if (owner.row.job_id !== value.jobId || owner.observations === null) return unknownBinding();
         if (bytes(value.json) > 262144 || bytes(value.json.modelProjection) > 65536) reject('context_evidence_too_large');
         const parsed = ContextSnapshotJsonSchema.parse(value.json);
+        if (!matchesResourceBinding(frozenResources(json(owner.row.config_json)), parsed.resourceBinding)) resourceConflict();
         const latest = z.object({ sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) })
           .parse(db.query('SELECT COALESCE(MAX(sequence),0) AS sequence FROM context_snapshots WHERE run_id=?').get(value.runId));
         if (latest.sequence === Number.MAX_SAFE_INTEGER) reject('context_evidence_too_large');
@@ -459,9 +743,10 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
       const normalized = ContextSnapshotsRequestSchema.safeParse(value);
       if (!normalized.success) return fail(appError('input_invalid', 'input', 'Context query is invalid.'));
       return read(() => {
+        const owners: ContextOwnerCache = new Map();
         const request = normalized.data;
         session(request.sessionId);
-        if (request.runId !== undefined) run(request.runId, request.sessionId);
+        if (request.runId !== undefined) run(request.runId, request.sessionId, owners);
         const rows = db.query(`SELECT id FROM context_snapshots WHERE session_id=? AND (? IS NULL OR run_id=?)
           AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?`).all(request.sessionId, request.runId ?? null, request.runId ?? null,
           request.beforeId ?? null, request.beforeId ?? null, request.limit + 1);
@@ -469,9 +754,9 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
         for (const raw of rows) {
           if (page.items.length === request.limit) break;
           const value = snapshot(z.object({ id }).parse(raw).id);
-          const owner = run(value.runId, request.sessionId);
+          const owner = run(value.runId, request.sessionId, owners);
           if (value.jobId !== owner.row.job_id) return corrupt();
-          const item = publicSummary(value);
+          const item = publicSummary(value, owners);
           const candidate = { ...page, items: [...page.items, item], nextBeforeId: item.id };
           if (bytes(ok(candidate)) > 131072) { if (!page.items.length) reject('context_evidence_too_large'); break; }
           page.items = candidate.items;

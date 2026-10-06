@@ -21,6 +21,9 @@ import {
   normalizeSessionCompactionQuery,
   normalizeSessionCompactionCancel,
   ok,
+  EMPTY_RESOURCE_SELECTION, ResourceSelectionRequestSchema, ResourceFileRequestSchema,
+  ResourceSelectionResultSchema, ResourceCatalogResultSchema, ResourceFileResultSchema, ResourceSelectionResponseSchema,
+  RunResourceQuerySchema, RunResourceFileRequestSchema, RunResourceResultSchema, FrozenResourcesSchema,
 } from '@flowmate/contracts';
 import type {
   AgentControl,
@@ -55,7 +58,10 @@ import type { JobService } from './jobs/service.ts';
 import type { InvoiceFormService } from './tools/invoice-form.ts';
 import type { InvoiceEditService } from './invoice-edit/service.ts';
 import type { ContextService } from './context/service.ts';
+import type { ContextRepository } from './context/repository.ts';
 import type { z } from 'zod';
+import type { createResourceService } from './resources/service.ts';
+import type { ResourceSelectionRequest, ResourceSelectionResult } from '@flowmate/contracts';
 
 export interface RuntimeServicePort {
   compactSession: Application['compactSession'];
@@ -77,6 +83,9 @@ export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunReposito
 
 export type DisposeResources = () => Promise<CloseReport>;
 type ProductApplicationOptions = {
+  resources?: ReturnType<typeof createResourceService>;
+  resourceDefaults?: () => Result<ResourceSelectionResult>;
+  saveResourceSelection?: (input: ResourceSelectionRequest) => Promise<Result<ResourceSelectionResult>>;
   documents: DocumentRepository;
   jobs: JobRepository;
   candidates: CandidateRepository;
@@ -84,6 +93,7 @@ type ProductApplicationOptions = {
   runtimeEvents?: EventService;
   toolCalls?: Pick<ToolCallRepository, 'list' | 'getById'>;
   contextService?: Pick<ContextService, 'listContextSnapshots' | 'queryContextSnapshot' | 'listContextRequests'>;
+  contextRepository?: Pick<ContextRepository, 'readResourceEvidence'>;
   invoiceForms?: Pick<InvoiceFormService, 'query'>;
   invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'queryOperation'>;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
@@ -112,7 +122,67 @@ export function makeApplication(
   let closeInFlight: Promise<Result<CloseReport>> | null = null;
   let finalCloseResult: Result<CloseReport> | null = null;
   const closeErrors = new Map<string, ReturnType<typeof appError>>();
+  const resourceDefaults = (): Result<ResourceSelectionResult> => {
+    try {
+      const value = products?.resourceDefaults?.() ?? ok({ revision: 0, selection: EMPTY_RESOURCE_SELECTION });
+      if (!value.ok) return value;
+      const parsed = ResourceSelectionResultSchema.safeParse(value.data);
+      return parsed.success ? ok(parsed.data) : fail(appError('config_settings_invalid', 'input', 'Resource configuration is invalid.'));
+    } catch { return fail(appError('config_settings_invalid', 'input', 'Resource configuration is unavailable.')); }
+  };
   return {
+    queryRunResources: async raw => {
+      const parsed = RunResourceQuerySchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run resource query is invalid.'));
+      return contextRead(RunResourceResultSchema, () => {
+        const request = parsed.data, saved = runs.get(request.runId);
+        if (!saved.ok) return saved;
+        if (saved.data.kind !== 'agent' || saved.data.sessionId !== request.sessionId)
+          return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
+        const frozen = saved.data.config.resources === undefined ? null : FrozenResourcesSchema.parse(saved.data.config.resources);
+        const evidence = products?.contextRepository?.readResourceEvidence(request);
+        if (!evidence) return fail(appError('resource_evidence_write_failed', 'storage', 'Resource journal query is unavailable.', true));
+        if (!evidence.ok) return evidence;
+        const verified = frozen ? products?.resources?.verifyFrozen(frozen) : ok(undefined);
+        return ok({ ...request, frozen, evidence: evidence.data, gap: frozen && (!verified || !verified.ok)
+          ? 'bundle-unavailable' as const : evidence.data === null ? 'legacy-not-collected' as const : null });
+      });
+    },
+    readRunResourceFile: async raw => {
+      const parsed = RunResourceFileRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run resource file query is invalid.'));
+      return contextRead(ResourceFileResultSchema, () => {
+        const { sessionId, runId, ...file } = parsed.data, saved = runs.get(runId);
+        if (!saved.ok) return saved;
+        if (saved.data.kind !== 'agent' || saved.data.sessionId !== sessionId)
+          return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
+        if (saved.data.config.resources === undefined) return fail(appError('resource_required_unavailable', 'input', 'This Run has no fixed resource bundle.'));
+        return products?.resources?.readFrozenFile(FrozenResourcesSchema.parse(saved.data.config.resources), file);
+      });
+    },
+    listResources: async () => contextRead(ResourceCatalogResultSchema, () => {
+      const settings = resourceDefaults();
+      return settings.ok ? products?.resources?.catalog(settings.data) : settings;
+    }),
+    readResourceFile: async raw => {
+      const parsed = ResourceFileRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Resource file query is invalid.'));
+      return contextRead(ResourceFileResultSchema, () => {
+        const settings = resourceDefaults();
+        return settings.ok ? products?.resources?.readFile(parsed.data, settings.data.selection) : settings;
+      });
+    },
+    updateResourceSelection: async raw => {
+      const parsed = ResourceSelectionRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Resource selection is invalid.'));
+      if (!products?.saveResourceSelection) return fail(appError('config_settings_write_failed', 'storage', 'Resource selection is read-only in this application.', true));
+      try {
+        const saved = ResourceSelectionResponseSchema.safeParse(await products.saveResourceSelection(parsed.data));
+        return saved.success ? saved.data : fail(appError('config_settings_write_failed', 'storage', 'Resource save result could not be verified.', true));
+      } catch { return fail(appError('config_settings_write_failed', 'storage', 'Resource selection save could not be confirmed.', true)); }
+    },
+    validateResourceSelection: selection => products?.resources?.validateSelection(selection)
+      ?? fail(appError('resource_required_unavailable', 'input', 'Resource service is unavailable.')),
     compactSession: async raw => {
       const request = normalizeSessionCompactionRequest(raw);
       return request.ok ? runtime.compactSession(request.data) : request;
