@@ -12,6 +12,7 @@ import { applyInvoiceForm, bindInvoiceFormRun, cancelInvoiceFormRun, createInvoi
 import type { AgentRunEvent, AgentRunSnapshot, BusinessEventSnapshot, CandidateJobDetail, CandidateSummary, DesktopEvent, DesktopState, DocumentOriginalImage, DocumentSnapshot, InvoiceToolOutput, JobSnapshot, ModelCatalogProvider, ModelProfile, NativeToolAvailability, ProductSettings, RunSnapshot, RuntimeState, SessionCursor, SessionMessageView, SessionSnapshot, WorkspaceChange, WorkspaceSnapshot } from '@flowmate/contracts';
 import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type MessageViewState } from './message-state.ts';
 import { RequiredSkillPicker, ResourcePage } from './prompt.tsx';
+import { ExtensionsPage } from './extensions.tsx';
 import { ActivityPage } from './activity.tsx';
 import { WorkspacePage } from './workspace.tsx';
 import { SessionDetails, type ContextBasis } from './session-details.tsx';
@@ -22,10 +23,10 @@ import { createEventView, bindEventSubscription, applyEventWake, applyEventRead,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings' | 'prompts' | 'skills';
+type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings' | 'prompts' | 'skills' | 'extensions';
 const pageLabels: Record<Page, string> = {
   workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats',
-  activity: 'Activity', models: 'Models', settings: 'Settings', prompts: 'Prompts', skills: 'Skills',
+  activity: 'Activity', models: 'Models', settings: 'Settings', prompts: 'Prompts', skills: 'Skills', extensions: 'Extensions',
 };
 type EventObservation = { view: EventViewState; wanted: boolean; opening: boolean; through?: number;
   pendingWake: RuntimeEventsWake | null; snapshot: RunSnapshot | null; tools: readonly RuntimeToolView[];
@@ -2600,6 +2601,7 @@ export function App() {
             ['models', 'Models', '◇'],
             ['prompts', 'Prompts', '≡'],
             ['skills', 'Skills', '✧'],
+            ['extensions', 'Extensions', '⊞'],
           ] as const).map(([target, label, glyph]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
             aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
@@ -2732,6 +2734,10 @@ export function App() {
             onRetryPrefix={() => chooseActivitySegment(null)}
             onOpenInvoice={id => { void navigate('workspace').then(moved => { if (moved) void selectWorkspaceDocument(id); }); }}
             onOpenProcessing={id => { void navigate('tasks').then(moved => { if (moved) void openJob(id); }); }} />
+        ) : page === 'extensions' && state ? (
+          <ExtensionsPage key={`extensions:${workspaceHostEpoch.current}`} hostEpoch={workspaceHostEpoch.current} ready={state.ready}
+            settings={state.settings} selectedSessionId={selectedSessionId ?? workspace?.sessionId ?? null} refreshToken={contextRefresh}
+            onSaved={async () => { const next = await window.flowmate.getState(); if (next.ok) receiveDesktopState(next.data); }} />
         ) : page === 'prompts' || page === 'skills' ? (
           <ResourcePage key={`${page}:${workspaceHostEpoch.current}`} kind={page === 'prompts' ? 'prompt' : 'skill'} hostEpoch={workspaceHostEpoch.current}
             ready={Boolean(state?.ready)} revision={state?.settings.revision ?? 0} onSaved={async () => { const next = await window.flowmate.getState(); if (next.ok) receiveDesktopState(next.data); }} />

@@ -1,0 +1,64 @@
+import { createHash } from 'node:crypto';
+import { closeSync, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
+import { AppErrorSchema, ExtensionManifestSchema, ExtensionSelectionSchema, ExtensionCatalogItemSchema,
+  FrozenExtensionsSchema, canonicalExtensionManifest, extensionRefKey, appError, ok, fail } from '@flowmate/contracts';
+import type { ExtensionCatalogItem, ExtensionSelection, FrozenExtensions, Result, ToolDefinition } from '@flowmate/contracts';
+
+function checked<T>(action: () => T): Result<T> {
+  try { return ok(action()); }
+  catch (error) {
+    const parsed = AppErrorSchema.safeParse(error);
+    return fail(parsed.success ? parsed.data : appError('extension_config_invalid', 'input', 'The trusted extension manifest or selection is invalid.'));
+  }
+}
+export function createExtensionService(options: { resourceRoot: string; sdkVersion: string;
+  registeredTools: readonly Pick<ToolDefinition<any, any>, 'name' | 'version' | 'effect'>[] }) {
+  const root = resolve(options.resourceRoot), file = join(root, 'extensions', 'invoice-v1.json');
+  function read(): ExtensionCatalogItem {
+    const location = relative(realpathSync(root), realpathSync(file)).replaceAll('\\', '/');
+    if ((process.platform === 'win32' ? location.toLowerCase() : location) !== 'extensions/invoice-v1.json')
+      throw appError('extension_config_invalid', 'input', 'The extension manifest is outside its trusted fixed location.');
+    const fd = openSync(file, 'r');
+    let text: string;
+    try {
+      const stat = fstatSync(fd), data = Buffer.alloc(65537);
+      if (!stat.isFile() || stat.size > 65536) throw new Error('bounded manifest');
+      let size = 0, read = 0;
+      while (size < data.length && (read = readSync(fd, data, size, data.length - size, null)) > 0) size += read;
+      if (size > 65536) throw new Error('bounded manifest');
+      text = new TextDecoder('utf-8', { fatal: true }).decode(data.subarray(0, size));
+    } finally { closeSync(fd); }
+    const manifest = ExtensionManifestSchema.parse(JSON.parse(text));
+    const manifestHash = createHash('sha256').update(canonicalExtensionManifest(manifest)).digest('hex');
+    const tool = options.registeredTools.find(tool => tool.name === 'check_invoice_sources');
+    const code = options.sdkVersion !== manifest.sdkVersion ? 'sdk_version_mismatch' as const
+      : !tool || tool.version !== '1' || tool.effect !== 'READ' ? 'tool_definition_incompatible' as const : null;
+    return ExtensionCatalogItemSchema.parse({ ref: { id: manifest.id, version: manifest.version, manifestHash }, manifest,
+      compatibility: { available: code === null, code } });
+  }
+  function selected(input: ExtensionSelection): ExtensionCatalogItem | null {
+    const selection = ExtensionSelectionSchema.parse(input);
+    if (!selection.enabledExtensions.length) return null;
+    const item = read();
+    if (extensionRefKey(selection.enabledExtensions[0]) !== extensionRefKey(item.ref))
+      throw appError('extension_config_invalid', 'input', 'The selected extension differs from its trusted fixed identity.');
+    if (!item.compatibility.available) throw appError('extension_incompatible', 'extension', 'The extension is incompatible with the current SDK or business tool.');
+    return item;
+  }
+  return {
+    list(): Result<readonly ExtensionCatalogItem[]> { return checked(() => [read()]); },
+    validateSelection(selection: ExtensionSelection): Result<void> { return checked(() => { selected(selection); }); },
+    freeze(input: { selection: ExtensionSelection; settingsRevision: number; activeToolNames: readonly string[];
+      policy: 'p2' | 'p3' | 'fill' }): Result<FrozenExtensions> {
+      return checked(() => {
+        const selection = ExtensionSelectionSchema.parse(input.selection), item = selected(selection);
+        const included = item !== null && input.policy === 'p3' && input.activeToolNames.includes('check_invoice_sources');
+        return FrozenExtensionsSchema.parse({ version: 1, policyVersion: 'p12-managed-extensions-v1', settingsRevision: input.settingsRevision,
+          selected: selection.enabledExtensions, included: included ? [{ ref: item.ref, manifest: item.manifest }] : [],
+          excluded: item && !included ? [{ ref: item.ref, code: 'tool_not_active' }] : [] });
+      });
+    },
+  };
+}
+export type ExtensionService = ReturnType<typeof createExtensionService>;

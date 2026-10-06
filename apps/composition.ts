@@ -1,11 +1,11 @@
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
-  ContextService, RuntimeService, SessionService, openDatabase, createResourceService } from '@flowmate/core';
+  ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
-import { PiAgentAdapter, PiProviderAdapter, createNativeTools, inspectNativeResources } from '@flowmate/runtime-pi';
+import { PiAgentAdapter, PiProviderAdapter, createNativeTools, inspectNativeResources, PI_SDK_VERSION } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
 import { appError, ok } from '@flowmate/contracts';
 import type { Application, MemoryStore, ProductPaths, PromptTraceBuffer, Result, RuntimeRequestOverrides, RuntimeStrategyPolicy } from '@flowmate/contracts';
@@ -14,7 +14,8 @@ import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
   resourceRoot?: string;
-  resourceDefaults?: () => Result<import('@flowmate/contracts').ResourceSelectionResult>;
+  resourceDefaults?: () => Result<import('@flowmate/contracts').AssemblySelectionSnapshot | import('@flowmate/contracts').ResourceSelectionResult>;
+  saveExtensionSelection?: (request: import('@flowmate/contracts').ExtensionSelectionRequest) => Promise<Result<import('@flowmate/contracts').ExtensionSelectionResult>>;
   saveResourceSelection?: (request: import('@flowmate/contracts').ResourceSelectionRequest) => Promise<Result<import('@flowmate/contracts').ResourceSelectionResult>>;
   paths: ProductPaths;
   invoiceSourceRoot?: string;
@@ -74,6 +75,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const resources = createResourceService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
     bundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
     registeredToolNames: definitions.filter(tool => !unavailableTools.has(tool.name)).map(tool => tool.name), inspectNativeResources });
+  const extensions = createExtensionService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
+    sdkVersion: PI_SDK_VERSION, registeredTools: definitions });
   const toolExecutor = createToolExecutor({ definitions, recorder,
     strategyPolicy: options.runtimePolicy, sampleSource: options.sampleSource,
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
@@ -94,6 +97,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     contextService,
     contextRepository: database.data.context,
     resources,
+    extensions,
     resourceDefaults: options.resourceDefaults,
     isSessionManaging: sessionId => sessionService?.isManaging(sessionId) ?? false,
     provider,
@@ -110,7 +114,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   });
   sessionService = new SessionService(database.data.sessions, agent, () => runtime.state(), now, database.data.runs,
     memory, database.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission),
-    request => runtime.appendInput(request), sessionId => runtime.verifySessionMutation(sessionId));
+    request => runtime.appendInput(request), (sessionId, intent) => runtime.verifySessionMutation(sessionId, intent));
   const workspaceService = createWorkspaceService(database.data.workspace, now, workspaceVerifier);
   const jobService = createJobService(database.data.jobs, now);
   return ok(makeApplication(runtime, database.data.runs, async () => {
@@ -130,8 +134,10 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     return { stopped: true, closed: loggerClosed && databaseClosed && lockReleased, errors };
   }, sessionService, promptTrace, workspaceService, jobService, {
     resources,
+    extensions,
     resourceDefaults: options.resourceDefaults,
     saveResourceSelection: options.saveResourceSelection,
+    saveExtensionSelection: options.saveExtensionSelection,
     documents: database.data.documents,
     jobs: database.data.jobs,
     candidates: database.data.candidates,

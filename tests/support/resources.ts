@@ -144,7 +144,8 @@ export async function installReadGate(app: ElectronApplication, userData: string
     if (!child?.stdin || !child.stdout) throw new Error('Actual owned Host pipe is missing.');
     const input = child.stdin, output = child.stdout, write = input.write, emit = output.emit;
     const commands: Array<{ type: string; requestId: string; input?: { runId?: number; snapshotId?: number } }> = [];
-    const kinds = new Map<string, string>(); let buffer = Buffer.alloc(0), remaining = 0, fault = false, heldType = 'query_context_snapshot', closeGate = false;
+    const kinds = new Map<string, string>(), faults = new Map<string, number>();
+    let buffer = Buffer.alloc(0), remaining = 0, heldType = 'query_context_snapshot', closeGate = false;
     const held: Buffer[] = [], closeReplies: Buffer[] = []; let heldEnd: unknown[] | null = null;
     child.stdin.write = function (this: typeof input, ...args: Parameters<typeof write>) {
       try { const command = JSON.parse(String(args[0])); commands.push(command); kinds.set(command.requestId, command.type); } catch { /* Forward unchanged. */ }
@@ -158,12 +159,14 @@ export async function installReadGate(app: ElectronApplication, userData: string
         let line = buffer.subarray(0, newline + 1); buffer = buffer.subarray(newline + 1);
         try { const packet = JSON.parse(line.toString());
           if (closeGate && packet.type === 'response' && kinds.get(packet.requestId) === 'close') { closeReplies.push(Buffer.from(line)); continue; }
-          if (packet.type === 'response' && kinds.get(packet.requestId) === heldType) {
-            if (fault) { packet.value = heldType === 'update_resource_selection'
+          if (packet.type === 'response') {
+            const kind = kinds.get(packet.requestId)!;
+            if ((faults.get(kind) ?? 0) > 0) { packet.value = ['update_resource_selection', 'update_extension_selection'].includes(kind)
               ? { ok: false, error: { code: 'operation_result_unknown', category: 'runtime', retryable: true, message: 'Synthetic lost receipt after actual save.' } }
+              : kind === 'list_extensions' ? { ok: false, error: { code: 'extension_config_invalid', category: 'input', retryable: false, message: 'The trusted extension manifest is unavailable.' } }
               : { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'PRIVATE-CONTEXT sdk credential token', sessionId: packet.value.data?.snapshot?.sessionId, runId: packet.value.data?.snapshot?.runId } };
-              line = Buffer.from(JSON.stringify(packet) + '\n'); fault = false; }
-            if (remaining > 0) { held.push(Buffer.from(line)); remaining--; continue; }
+              line = Buffer.from(JSON.stringify(packet) + '\n'); faults.set(kind, faults.get(kind)! - 1); }
+            if (kind === heldType && remaining > 0) { held.push(Buffer.from(line)); remaining--; continue; }
           }
         } catch { /* Production parser receives original malformed bytes. */ }
         forward.push(line);
@@ -173,7 +176,7 @@ export async function installReadGate(app: ElectronApplication, userData: string
     function finishClose() { closeGate = false; for (const line of closeReplies.splice(0)) Reflect.apply(emit, output, ['data', line]);
       if (heldEnd) { Reflect.apply(emit, output, ['end', ...heldEnd]); heldEnd = null; } }
     Reflect.set(globalThis, 'contextReadGate', { commands, held, closeReplies,
-      hold(count: number, type = 'query_context_snapshot') { remaining = count; heldType = type; }, fail() { fault = true; },
+      hold(count: number, type = 'query_context_snapshot') { remaining = count; heldType = type; }, fail(count = 1, type = heldType) { faults.set(type, count); },
       holdHostClose() { closeGate = true; }, finishClose,
       release(index: number) { const line = held[index]; if (line) { Reflect.apply(emit, child.stdout, ['data', line]); held[index] = Buffer.alloc(0); } },
       restore() { for (const line of held) if (line.length) Reflect.apply(emit, child.stdout, ['data', line]); finishClose(); child.stdin.write = write; child.stdout.emit = emit; } });

@@ -18,9 +18,11 @@ import {
   calculateContextTokens,
   formatSkillsForPrompt,
   type AgentSession,
-  type AgentToolResult,
+  type AgentToolResult, type LoadExtensionsResult,
 } from '@earendil-works/pi-coding-agent';
 import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema } from '@flowmate/contracts';
+import { loadControlledExtensions, type LoadedExtensionSet } from './extensions/loader.ts';
+import { FrozenExtensionsSchema, matchesExtensionAssembly, type NativeExtensionView } from '@flowmate/contracts';
 import { createRunResourceLoader, verifySkillExpansion, verifyManagedReadOutput } from './resources/loader.ts';
 import { matchesResourceBinding, resourceContentKey, ResourceRequestEvidenceSchema } from '@flowmate/contracts';
 import type { ResourceRef, ResourceBinding, ResourceExpansionEvidence, ResourceRequestEvidence, ResourceContentEvidence, ResourceReadEvidence } from '@flowmate/contracts';
@@ -164,6 +166,10 @@ type ActiveExecution = {
 };
 
 type SessionRecord = {
+  extensions?: LoadedExtensionSet;
+  extensionKey?: string;
+  disposing?: Promise<CloseReport>;
+  commanding?: boolean;
   compactionBridge?: { dispose(): void };
   compacting?: boolean;
   compaction?: { control: NativeCompactionControl; observation: CompactionObservation; baseline: HistoryCommitState;
@@ -352,6 +358,7 @@ export class PiAgentAdapter implements AgentPort {
     sessionSetup?: (session: AgentSession) => void };
   private readonly toolsByName: ReadonlyMap<string, ToolDefinition<any, any>>;
   private closed = false;
+  private readonly recentExtensions = new Map<string, NativeExtensionView>();
 
   public constructor(dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
     resourceBundleRoot?: string;
@@ -818,7 +825,7 @@ export class PiAgentAdapter implements AgentPort {
     if (this.closed) return fail(appError('agent_port_closed', 'runtime', 'Agent Runtime 已关闭。'));
     if (!record) return fail(appError('agent_session_missing', 'session', 'Agent Session 不存在。'));
     if (record.unusable) return fail(record.historyFailure ?? appError('agent_session_unusable', 'session', 'This session cannot continue after an interrupted run. Start a new session.'));
-    if (record.preparing || record.running || record.compacting) return fail(appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
+    if (record.preparing || record.running || record.compacting || record.commanding || record.disposing) return fail(appError('agent_session_busy', 'session', 'Agent Session 正在执行。'));
     if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
     if (options?.compactionPolicy !== undefined && (!CompactionPolicySchema.safeParse(options.compactionPolicy).success
@@ -843,6 +850,12 @@ export class PiAgentAdapter implements AgentPort {
       || activeToolNames.some((name) => !this.toolsByName.has(name))) {
       return fail(appError('tool_runtime_unavailable', 'runtime', 'Run 获准的工具未在 Pi Runtime 注册。', true));
     }
+    const extensions = options?.extensions === undefined ? null : FrozenExtensionsSchema.safeParse(options.extensions);
+    if (extensions && !extensions.success) return fail(appError('extension_config_invalid', 'input', 'Frozen extensions are invalid.'));
+    const frozenExtensions = extensions?.success ? extensions.data : null;
+    const extensionKey = JSON.stringify(frozenExtensions?.included ?? []);
+    if (frozenExtensions?.included.length && (policy !== 'p3' || !activeToolNames.includes('check_invoice_sources')))
+      return fail(appError('extension_incompatible', 'extension', 'Extension is not eligible for this Run.'));
     const resources = options?.resources ?? null, resourceKey = resources?.bundleHash ?? null;
     const loader = createRunResourceLoader({ fixedSystemPrompt: policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
       : policy === 'p3' ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT, frozen: resources,
@@ -872,15 +885,47 @@ export class PiAgentAdapter implements AgentPort {
       if (authSource === 'unknown') return fail(appError('agent_auth_source_unknown', 'runtime', '无法确认 Agent 模型凭据来源。'));
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
+      const verifiedExtensions = options?.verifyExtensions?.();
+      if (verifiedExtensions && !verifiedExtensions.ok) return verifiedExtensions;
+
       let session = record.session;
-      if (session && (runtime !== record.runtime || record.policy !== policy || record.workingDirectory !== cwd || record.resourceKey !== resourceKey)) {
-        record.compactionBridge?.dispose(); record.compactionBridge = undefined;
-        session.dispose();
+      if (session && (runtime !== record.runtime || record.policy !== policy || record.workingDirectory !== cwd || record.resourceKey !== resourceKey || record.extensionKey !== extensionKey)) {
+        const disposed = await this.disposeManagedSession(record);
+        if (!disposed.closed) return fail(disposed.errors[0]!);
         record.session = undefined;
         session = undefined;
         replacingSession = true;
       }
       if (!session) {
+        if (record.extensions && record.extensions.scope.view.state !== 'disposed') {
+          const disposed = await this.disposeManagedSession(record); if (!disposed.closed) return fail(disposed.errors[0]!);
+        }
+        record.extensions = undefined;
+        let extensionResult: LoadExtensionsResult | undefined;
+        if (frozenExtensions?.included.length) {
+          const definition = this.toolsByName.get('check_invoice_sources')!;
+          const loaded = await loadControlledExtensions({ frozen: frozenExtensions, nativeSessionId, cwd, agentDir: this.dependencies.agentDir ?? cwd, signal,
+            sdkTool: toPiTool(definition, (id, input, toolSignal) => this.executePiTool(record, definition, id, input, toolSignal)),
+            onCreated: loaded => { record.extensions = loaded; },
+            assertCallOwner: (event, instanceId) => {
+              const active = record.active, request = active?.toolRequests.get(event.toolCallId);
+              if (!active || !request || request.name !== event.toolName || !request.requestBinding || !active.toolBinding
+                || record.extensions?.scope.view.instanceId !== instanceId || active.signal.aborted || active.failure)
+                return fail(appError('extension_hook_failed', 'extension', 'Extension call has no trusted active owner.'));
+              return ok({ instanceId, nativeSessionId, runId: active.runId, sessionId: active.sessionId,
+                nativeToolCallId: event.toolCallId, requestBinding: request.requestBinding, scope: active.toolBinding.context.scope });
+            },
+            onCriticalFailure: (error, instanceId) => { if (record.extensions?.scope.view.instanceId === instanceId && record.active) this.failToolRun(record, record.active, error); },
+          });
+          record.extensions = loaded;
+          if (loaded.error || !loaded.result) {
+            await this.disposeManagedSession(record); return fail(loaded.error ?? appError('extension_load_failed', 'extension', 'Extension registration failed.', true));
+          }
+          extensionResult = loaded.result;
+        }
+        const assembledLoader = createRunResourceLoader({ fixedSystemPrompt: loader.data.getSystemPrompt()!, frozen: resources,
+          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resourceKey ?? ''), extensionResult });
+        if (!assembledLoader.ok) return assembledLoader;
         sessionCreationStarted = true;
         const created = await createAgentSession({
           cwd,
@@ -889,9 +934,9 @@ export class PiAgentAdapter implements AgentPort {
           model,
           sessionManager: record.manager,
           settingsManager: inMemorySettings(),
-          resourceLoader: loader.data,
+          resourceLoader: assembledLoader.data,
           noTools: 'all', tools: policy === 'p2' ? [] : [...this.toolsByName.keys()],
-          customTools: policy !== 'p2' ? [...this.toolsByName.values()].map((definition) => toPiTool(
+          customTools: policy !== 'p2' ? [...this.toolsByName.values()].filter(definition => !extensionResult || definition.name !== 'check_invoice_sources').map((definition) => toPiTool(
             definition,
             (toolCallId, input, toolSignal) => this.executePiTool(record, definition, toolCallId, input, toolSignal),
             raw => {
@@ -901,15 +946,29 @@ export class PiAgentAdapter implements AgentPort {
           )) : [],
           thinkingLevel: 'off',
         });
-        session = created.session;
+        session = created.session; record.session = session;
+        record.resourceLoader = assembledLoader.data;
+        if (record.extensions) {
+          record.extensions.scope.view.cleanup.sdkSessionCreated = true;
+          record.extensions.scope.view.cleanup.shutdownRequired = true;
+        }
         const installed = session.getAllTools().map(tool => tool.name);
         const expected = policy === 'p2' ? [] : [...this.toolsByName.keys()];
         if (installed.length !== expected.length || new Set(installed).size !== installed.length
           || expected.some(name => !installed.includes(name))) {
-          session.dispose();
-          throw new Error('Controlled tool registry mismatch.');
+          throw appError('extension_registration_conflict', 'extension', 'Controlled tool registry mismatch.');
         }
         this.dependencies.sessionSetup?.(session);
+        if (record.extensions) {
+          const runner = session.extensionRunner, scope = record.extensions.scope;
+          if (runner.getAllRegisteredTools().length !== 1 || runner.getCommandDiagnostics().length || !runner.getCommand('invoice-assist'))
+            throw appError('extension_registration_conflict', 'extension', 'Controlled command or tool registration conflicts.');
+          await session.bindExtensions({ mode: 'print', onError: error => {
+            if (['tool_result', 'tool_execution_end'].includes(error.event)) scope.recordHook(error.event as 'tool_result' | 'tool_execution_end', 'sdk_observer_failed');
+          } });
+          if (signal.aborted) throw appError('agent_cancelled', 'runtime', 'Extension startup was cancelled.');
+          const activated = scope.activate(); if (!activated.ok) throw activated.error;
+        }
         const beforeToolCall = session.agent.beforeToolCall;
         session.agent.beforeToolCall = async (context, hookSignal) => {
           const toolCall = context.toolCall;
@@ -930,7 +989,14 @@ export class PiAgentAdapter implements AgentPort {
               if (request) request.sdkRaw = toolCall.arguments;
             }
           }
-          if (changed) result = { block: true, reason: 'The SDK before hook changed the original tool request.' };
+          if (changed) {
+            const error = appError('extension_hook_failed', 'extension', 'The SDK before hook changed the original tool request.');
+            if (record.extensions) {
+              record.extensions.scope.fail(error);
+              if (record.active) this.failToolRun(record, record.active, error);
+            }
+            result = { block: true, reason: error.message };
+          }
           if (request && result?.block) request.sdkBlocked = true;
           return result;
         };
@@ -1059,7 +1125,8 @@ export class PiAgentAdapter implements AgentPort {
       record.policy = policy;
       record.workingDirectory = cwd;
       record.resourceKey = resourceKey;
-      record.resourceLoader = loader.data;
+      record.extensionKey = extensionKey;
+      record.resourceLoader ??= loader.data;
       record.sessionInputs = options?.sessionInputs === true;
       replacingSession = false;
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
@@ -1075,10 +1142,12 @@ export class PiAgentAdapter implements AgentPort {
         thinkingLevel: session.thinkingLevel, resourcePolicy: resources ? 'p11-resources-v1' : 'none', historyPolicy: 'memory-only',
         maxContextBytes, maxOutputBytes, maxAssistantContentBytes, sessionRetry: false,
       };
+      const extensionFacts = frozenExtensions ? { extensionPolicy: frozenExtensions.included.length ? 'p12-managed-extensions-v1' as const : 'none' as const } : {};
       const agent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts = options?.runtimeBudget
-        ? { ...taskAgent, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : taskAgent;
+        ? { ...taskAgent, ...extensionFacts, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : { ...taskAgent, ...extensionFacts };
       record.snapshot = { ...snapshot, historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent,
         ...(resources ? { resources: Object.freeze(structuredClone(resources)) } : {}),
+        ...(frozenExtensions ? { extensions: structuredClone(frozenExtensions), extensionAssembly: record.extensions?.scope.evidence() ?? { version: 1 as const, sdkVersion: '0.85.1' as const, instances: [] } } : {}),
         ...(options?.compactionPolicy ? { compactionPolicy: Object.freeze(structuredClone(options.compactionPolicy)) } : {}) };
       if (options?.compactionPolicy && !record.compactionBridge) {
         const bridge = this.installCompaction(record, session);
@@ -1089,7 +1158,13 @@ export class PiAgentAdapter implements AgentPort {
         snapshot: record.snapshot,
         execute: (input, executionSignal, observe) => this.execute(record, nativeSessionId, input, executionSignal, observe),
       });
-    } catch {
+    } catch (error) {
+      if (record.extensions) {
+        const failure = error && typeof error === 'object' && 'code' in error ? error as ReturnType<typeof appError>
+          : appError('extension_load_failed', 'extension', 'Controlled Extension assembly failed.', true);
+        record.extensions.scope.fail(failure);
+        await this.disposeManagedSession(record); return fail(failure);
+      }
       // createAgentSession can append native model metadata before it throws; do not reuse an uncertain manager.
       if ((replacingSession || sessionCreationStarted) && !record.session) record.unusable = true;
       return fail(record.historyFailure ?? appError('agent_session_init_failed', 'session', 'Agent Session 初始化失败。', true));
@@ -1721,6 +1796,8 @@ export class PiAgentAdapter implements AgentPort {
   private verifyModelUse(record: SessionRecord, settledCompactionFailure = false): Result<void> {
     const active = record.active;
     if (!active) return fail(appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
+    if (record.extensions && (record.extensions.scope.view.state !== 'active' || record.extensions.scope.view.admission !== 'open'))
+      return fail(record.extensions.scope.view.lastError ?? appError('extension_hook_failed', 'extension', 'Extension execution admission is closed.'));
     if (record.historyFailure) return fail(record.historyFailure);
     if (record.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
     if (active.failure && !settledCompactionFailure) return fail(active.failure);
@@ -2738,16 +2815,89 @@ export class PiAgentAdapter implements AgentPort {
     };
   }
 
+  public inspectExtensions(nativeSessionId: string): Result<NativeExtensionView> {
+    const scope = this.sessions.get(nativeSessionId)?.extensions?.scope;
+    return ok(scope ? { nativeSessionId, instance: scope.snapshot() }
+      : structuredClone(this.recentExtensions.get(nativeSessionId) ?? { nativeSessionId, instance: null }));
+  }
+
+  private async disposeManagedSession(record: SessionRecord): Promise<CloseReport> {
+    if (record.disposing) return record.disposing;
+    const scope = record.extensions?.scope;
+    if (scope) scope.view.admission = 'closed';
+    if (record.running || record.compacting || record.commanding || record.session && !record.session.isIdle)
+      return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Agent Session has not stopped.', true)] };
+    if (scope && !scope.view.cleanup.ownedCallbacksSettled)
+      return { stopped: false, closed: false, errors: [appError('extension_cleanup_failed', 'runtime', 'Extension callbacks or factory have not settled.', true)] };
+    const disposing = (async (): Promise<CloseReport> => {
+      try {
+        if (scope?.view.cleanup.shutdownRequired && !scope.view.cleanup.shutdownAcknowledged) {
+          if (!record.session) throw new Error('No native shutdown owner.');
+          scope.clearPhaseError('session_shutdown');
+          await record.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+          if (scope.phaseError('session_shutdown') || !scope.view.cleanup.shutdownAcknowledged || !scope.view.cleanup.ownedCallbacksSettled)
+            throw new Error('Native shutdown was not acknowledged.');
+        }
+        record.compactionBridge?.dispose(); record.compactionBridge = undefined;
+        if (record.session && (!scope || !scope.view.cleanup.sdkDisposed)) {
+          record.session.dispose(); if (scope) scope.view.cleanup.sdkDisposed = true;
+        }
+        record.session = undefined; record.resourceLoader = undefined;
+        if (scope) {
+          scope.view.state = 'disposed'; scope.view.disposedAt = new Date().toISOString();
+          this.recentExtensions.set(scope.view.nativeSessionId, { nativeSessionId: scope.view.nativeSessionId, instance: scope.snapshot() });
+        }
+        return { stopped: true, closed: true, errors: [] };
+      } catch {
+        const error = scope
+          ? appError('extension_cleanup_failed', 'runtime', 'Extension Session cleanup could not be confirmed. Retry the original instance.', true)
+          : appError('agent_cleanup_failed', 'runtime', 'Agent Session cleanup could not be confirmed.', true);
+        if (scope) scope.view.lastError = error;
+        return { stopped: true, closed: false, errors: [error] };
+      }
+    })();
+    record.disposing = disposing;
+    try { return await disposing; } finally { record.disposing = undefined; }
+  }
+
+  public async executeExtensionCommand(nativeSessionId: string, request: import('@flowmate/contracts').NativeExtensionCommandRequest): Promise<Result<import('@flowmate/contracts').NativeExtensionCommandReceipt>> {
+    const record = this.sessions.get(nativeSessionId), scope = record?.extensions?.scope;
+    if (!record || !scope || !record.session || scope.view.state !== 'active' || scope.view.admission !== 'open')
+      return fail(appError('extension_not_loaded', 'extension', 'No active extension is loaded.'));
+    if (scope.view.instanceId !== request.expectedInstanceId) return fail(appError('extension_instance_conflict', 'session', 'Extension instance changed.', true));
+    if (record.preparing || record.running || record.compacting || record.commanding || record.disposing || !record.session.isIdle)
+      return fail(appError('session_busy', 'session', 'Session management or execution is active.', true));
+    record.commanding = true; scope.beginCommand();
+    try {
+      const runner = record.session.extensionRunner, command = runner.getCommand(request.name);
+      if (!command || request.arguments !== '') throw new Error('Command is unavailable.');
+      await command.handler(request.arguments, runner.createCommandContext());
+      const receipt = scope.finishCommand();
+      if (!receipt || scope.view.state !== 'active' || scope.view.admission !== 'open') throw new Error('Command has no current receipt.');
+      return ok(receipt);
+    } catch { return fail(appError('extension_command_failed', 'extension', 'Extension command could not be confirmed.', true)); }
+    finally { scope.finishCommand(); record.commanding = false; }
+  }
+
+  public async disposeExtensions(nativeSessionId: string, expectedInstanceId: string): Promise<Result<import('@flowmate/contracts').NativeExtensionDisposeReceipt>> {
+    const inspected = this.inspectExtensions(nativeSessionId); if (!inspected.ok) return inspected;
+    const instance = inspected.data.instance;
+    if (!instance) return fail(appError('extension_not_loaded', 'extension', 'No extension instance is known.'));
+    if (instance.instanceId !== expectedInstanceId) return fail(appError('extension_instance_conflict', 'session', 'Extension instance changed.', true));
+    if (instance.state === 'disposed') return ok({ nativeSessionId, instanceId: expectedInstanceId, state: 'disposed', report: { stopped: true, closed: true, errors: [] } });
+    const report = await this.releaseSession(nativeSessionId);
+    const current = this.inspectExtensions(nativeSessionId); if (!current.ok || !current.data.instance) return fail(appError('extension_cleanup_failed', 'runtime', 'Extension cleanup facts are unavailable.', true));
+    return ok({ nativeSessionId, instanceId: expectedInstanceId, state: current.data.instance.state, report });
+  }
+
   public async releaseSession(nativeSessionId: string): Promise<CloseReport> {
     const record = this.sessions.get(nativeSessionId);
     if (!record) return { stopped: true, closed: true, errors: [] };
-    if (record.preparing || record.running || record.compacting || (record.session && !record.session.isIdle)) {
-      return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Agent Session 仍在执行。', true)] };
-    }
-    try { record.compactionBridge?.dispose(); record.session?.dispose(); }
-    catch { return { stopped: true, closed: false, errors: [appError('agent_cleanup_failed', 'runtime', 'Agent Session 清理失败。', true)] }; }
-    this.sessions.delete(nativeSessionId);
-    return { stopped: true, closed: true, errors: [] };
+    if (record.preparing || record.running || record.compacting || record.commanding || (record.session && !record.session.isIdle))
+      return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Agent Session is still executing.', true)] };
+    const report = await this.disposeManagedSession(record);
+    if (report.closed) this.sessions.delete(nativeSessionId);
+    return report;
   }
 
   public async close(): Promise<CloseReport> {

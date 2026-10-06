@@ -45,6 +45,8 @@ export interface CandidateRepository {
 }
 
 export type SafeConfigSnapshot = {
+  extensions?: import('./extensions.ts').FrozenExtensions;
+  extensionAssembly?: import('./extensions.ts').ExtensionAssemblyEvidence;
   resources?: FrozenResources;
   compactionPolicy?: CompactionPolicy;
   version: 1 | 2;
@@ -71,6 +73,7 @@ export type NativeInput = {
 };
 
 export type AgentConfigFacts = {
+  extensionPolicy?: 'none' | 'p12-managed-extensions-v1';
   policyVersion: 'p2-invoice-chat-v1';
   nativeSessionId: string;
   systemPrompt: string;
@@ -85,6 +88,7 @@ export type AgentConfigFacts = {
 };
 
 export type P3AgentConfigFacts = {
+  extensionPolicy?: 'none' | 'p12-managed-extensions-v1';
   policyVersion: 'p3-invoice-tools-v1';
   nativeSessionId: string;
   systemPrompt: string;
@@ -160,6 +164,7 @@ export type AgentToolBinding = {
 };
 
 export type AgentExecutionInput = NativeInput & {
+  extensions?: import('./extensions.ts').FrozenExtensions;
   resources?: FrozenResources;
   resourceBinding?: ResourceBinding;
   runId: DbId;
@@ -255,6 +260,9 @@ export interface PreparedAgent {
 }
 
 export interface AgentPort {
+  inspectExtensions?(nativeSessionId: string): Result<import('./extensions.ts').NativeExtensionView>;
+  executeExtensionCommand?(nativeSessionId: string, request: import('./extensions.ts').NativeExtensionCommandRequest): Promise<Result<import('./extensions.ts').NativeExtensionCommandReceipt>>;
+  disposeExtensions?(nativeSessionId: string, expectedInstanceId: string): Promise<Result<import('./extensions.ts').NativeExtensionDisposeReceipt>>;
   compactSession?(nativeSessionId: string, control: NativeCompactionControl): Promise<NativeCompactionOutcome>;
   inspectSessionCompaction?(input: { history: import('./runtime.ts').NativeSessionHistory; seed: NativeHistoryRecoverySeed;
     commit: HistoryCommitState }): Result<{ capacity: CompactionCapacity; lastSaved: SavedCompactionView | null;
@@ -280,7 +288,7 @@ export interface AgentPort {
     signal: AbortSignal,
     options?: { activeToolNames?: readonly string[]; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
       runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot; compactionPolicy?: CompactionPolicy;
-      resources?: FrozenResources },
+      resources?: FrozenResources; extensions?: import('./extensions.ts').FrozenExtensions; verifyExtensions?: () => Result<void> },
   ): Promise<Result<PreparedAgent>>;
   releaseSession(nativeSessionId: string): Promise<CloseReport>;
   close(): Promise<CloseReport>;

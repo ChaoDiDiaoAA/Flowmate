@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "kind": "extension",
+  "id": "invoice-assist",
+  "version": "v1",
+  "sdkVersion": "0.85.1",
+  "entryId": "invoice-assist-v1",
+  "tools": [{ "name": "check_invoice_sources", "version": "1" }],
+  "commands": ["invoice-assist"],
+  "hooks": [
+    { "event": "session_start", "policy": "critical" },
+    { "event": "tool_call", "policy": "critical" },
+    { "event": "tool_result", "policy": "observer" },
+    { "event": "tool_execution_end", "policy": "observer" },
+    { "event": "session_shutdown", "policy": "critical" }
+  ]
+}

@@ -21,6 +21,10 @@ import {
   normalizeSessionCompactionQuery,
   normalizeSessionCompactionCancel,
   ok,
+  SessionExtensionQuerySchema, SessionExtensionResultSchema, RunExtensionQuerySchema, RunExtensionResultSchema,
+  ExtensionCommandRequestSchema, ExtensionCommandResultSchema, ExtensionDisposeRequestSchema, ExtensionDisposeResultSchema,
+  FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema,
+  AssemblySelectionSnapshotSchema, EMPTY_EXTENSION_SELECTION, ExtensionCatalogResultSchema, ExtensionSelectionRequestSchema, ExtensionSelectionResponseSchema,
   EMPTY_RESOURCE_SELECTION, ResourceSelectionRequestSchema, ResourceFileRequestSchema,
   ResourceSelectionResultSchema, ResourceCatalogResultSchema, ResourceFileResultSchema, ResourceSelectionResponseSchema,
   RunResourceQuerySchema, RunResourceFileRequestSchema, RunResourceResultSchema, FrozenResourcesSchema,
@@ -61,7 +65,8 @@ import type { ContextService } from './context/service.ts';
 import type { ContextRepository } from './context/repository.ts';
 import type { z } from 'zod';
 import type { createResourceService } from './resources/service.ts';
-import type { ResourceSelectionRequest, ResourceSelectionResult } from '@flowmate/contracts';
+import type { ResourceSelectionRequest, ResourceSelectionResult, AssemblySelectionSnapshot, ExtensionSelectionRequest, ExtensionSelectionResult } from '@flowmate/contracts';
+import type { ExtensionService } from './extensions/service.ts';
 
 export interface RuntimeServicePort {
   compactSession: Application['compactSession'];
@@ -84,7 +89,9 @@ export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunReposito
 export type DisposeResources = () => Promise<CloseReport>;
 type ProductApplicationOptions = {
   resources?: ReturnType<typeof createResourceService>;
-  resourceDefaults?: () => Result<ResourceSelectionResult>;
+  extensions?: ExtensionService;
+  resourceDefaults?: () => Result<AssemblySelectionSnapshot | ResourceSelectionResult>;
+  saveExtensionSelection?: (input: ExtensionSelectionRequest) => Promise<Result<ExtensionSelectionResult>>;
   saveResourceSelection?: (input: ResourceSelectionRequest) => Promise<Result<ResourceSelectionResult>>;
   documents: DocumentRepository;
   jobs: JobRepository;
@@ -122,15 +129,60 @@ export function makeApplication(
   let closeInFlight: Promise<Result<CloseReport>> | null = null;
   let finalCloseResult: Result<CloseReport> | null = null;
   const closeErrors = new Map<string, ReturnType<typeof appError>>();
-  const resourceDefaults = (): Result<ResourceSelectionResult> => {
+  const resourceDefaults = (): Result<AssemblySelectionSnapshot> => {
     try {
       const value = products?.resourceDefaults?.() ?? ok({ revision: 0, selection: EMPTY_RESOURCE_SELECTION });
       if (!value.ok) return value;
-      const parsed = ResourceSelectionResultSchema.safeParse(value.data);
+      const parsed = AssemblySelectionSnapshotSchema.safeParse(value.data);
       return parsed.success ? ok(parsed.data) : fail(appError('config_settings_invalid', 'input', 'Resource configuration is invalid.'));
     } catch { return fail(appError('config_settings_invalid', 'input', 'Resource configuration is unavailable.')); }
   };
   return {
+    querySessionExtensions: async raw => {
+      const parsed = SessionExtensionQuerySchema.safeParse(raw);
+      return parsed.success ? contextRead(SessionExtensionResultSchema, () => sessions?.queryExtensions(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Session extension query is invalid.'));
+    },
+    queryRunExtensions: async raw => {
+      const parsed = RunExtensionQuerySchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run extension query is invalid.'));
+      return contextRead(RunExtensionResultSchema, () => {
+        const saved = runs.get(parsed.data.runId); if (!saved.ok) return saved;
+        if (saved.data.kind !== 'agent' || saved.data.sessionId !== parsed.data.sessionId)
+          return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
+        const config = saved.data.config;
+        return ok({ ...parsed.data, frozen: config.extensions === undefined ? null : FrozenExtensionsSchema.parse(config.extensions),
+          assembly: config.extensionAssembly === undefined ? null : ExtensionAssemblyEvidenceSchema.parse(config.extensionAssembly) });
+      });
+    },
+    executeExtensionCommand: async raw => {
+      const parsed = ExtensionCommandRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Extension command is invalid.'));
+      const result = await sessions?.executeExtensionCommand(parsed.data);
+      return contextRead(ExtensionCommandResultSchema, () => result);
+    },
+    disposeSessionExtensions: async raw => {
+      const parsed = ExtensionDisposeRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Extension disposal request is invalid.'));
+      const result = await sessions?.disposeSessionExtensions(parsed.data);
+      return contextRead(ExtensionDisposeResultSchema, () => result);
+    },
+    listExtensions: async () => contextRead(ExtensionCatalogResultSchema, () => {
+      const settings = resourceDefaults(); if (!settings.ok) return settings;
+      const items = products?.extensions?.list(); if (!items) return fail(appError('extension_config_invalid', 'input', 'Extension directory is unavailable.'));
+      return items.ok ? ok({ revision: settings.data.revision, selection: settings.data.extensions, items: items.data }) : items;
+    }),
+    updateExtensionSelection: async raw => {
+      const parsed = ExtensionSelectionRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('extension_config_invalid', 'input', 'Extension selection is invalid.'));
+      if (!products?.saveExtensionSelection) return fail(appError('config_settings_write_failed', 'storage', 'Extension selection is read-only in this application.', true));
+      try {
+        const saved = ExtensionSelectionResponseSchema.safeParse(await products.saveExtensionSelection(parsed.data));
+        return saved.success ? saved.data : fail(appError('config_settings_write_failed', 'storage', 'Extension save result could not be verified.', true));
+      } catch { return fail(appError('config_settings_write_failed', 'storage', 'Extension save could not be confirmed.', true)); }
+    },
+    validateExtensionSelection: selection => products?.extensions?.validateSelection(selection)
+      ?? fail(appError('extension_config_invalid', 'input', 'Extension directory is unavailable.')),
     queryRunResources: async raw => {
       const parsed = RunResourceQuerySchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run resource query is invalid.'));
@@ -162,14 +214,14 @@ export function makeApplication(
     },
     listResources: async () => contextRead(ResourceCatalogResultSchema, () => {
       const settings = resourceDefaults();
-      return settings.ok ? products?.resources?.catalog(settings.data) : settings;
+      return settings.ok ? products?.resources?.catalog({ ...settings.data, availableExtensions: settings.data.extensions.enabledExtensions }) : settings;
     }),
     readResourceFile: async raw => {
       const parsed = ResourceFileRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Resource file query is invalid.'));
       return contextRead(ResourceFileResultSchema, () => {
         const settings = resourceDefaults();
-        return settings.ok ? products?.resources?.readFile(parsed.data, settings.data.selection) : settings;
+        return settings.ok ? products?.resources?.readFile(parsed.data, settings.data.selection, settings.data.extensions.enabledExtensions) : settings;
       });
     },
     updateResourceSelection: async raw => {
@@ -181,7 +233,7 @@ export function makeApplication(
         return saved.success ? saved.data : fail(appError('config_settings_write_failed', 'storage', 'Resource save result could not be verified.', true));
       } catch { return fail(appError('config_settings_write_failed', 'storage', 'Resource selection save could not be confirmed.', true)); }
     },
-    validateResourceSelection: selection => products?.resources?.validateSelection(selection)
+    validateResourceSelection: (selection, extensions = EMPTY_EXTENSION_SELECTION) => products?.resources?.validateSelection(selection, extensions.enabledExtensions)
       ?? fail(appError('resource_required_unavailable', 'input', 'Resource service is unavailable.')),
     compactSession: async raw => {
       const request = normalizeSessionCompactionRequest(raw);

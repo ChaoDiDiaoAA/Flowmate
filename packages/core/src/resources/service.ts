@@ -95,7 +95,8 @@ function writeSynced(path: string, content: string | Uint8Array) {
 }
 type Package = { ref: ResourceRef; manifest: ResourceManifest; directory: string; contents: Map<string, Buffer>;
   item: ResourceCatalog['items'][number] };
-type CatalogInput = { revision: number; selection: ResourceSelection };
+type AvailableExtensions = readonly { id: string; version: string }[];
+type CatalogInput = { revision: number; selection: ResourceSelection; availableExtensions?: AvailableExtensions };
 
 export function createResourceService(options: { resourceRoot: string; bundleRoot: string;
   registeredToolNames: readonly string[]; inspectNativeResources: InspectNativeResources }) {
@@ -175,19 +176,23 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
     }
     return pack;
   }
-  function dependencies(pack: Package, packages: Package[], selection: ResourceSelection, tools: ReadonlySet<string>, visiting = new Set<string>()) {
+  function dependencies(pack: Package, packages: Package[], selection: ResourceSelection, tools: ReadonlySet<string>,
+    availableExtensions: AvailableExtensions = [], visiting = new Set<string>()) {
     const key = resourceRefKey(pack.ref);
     if (visiting.has(key)) reject('resource_dependency_missing', 'Selected Skill dependencies contain a cycle.');
     visiting.add(key);
     for (const dependency of pack.manifest.requires) {
       if (dependency.kind === 'tool') {
         if (!tools.has(dependency.name)) reject('resource_dependency_missing', 'A declared tool is unavailable in this scope.');
-      } else if (dependency.kind === 'extension') reject('resource_dependency_missing', 'Extension dependencies are unavailable in P11.');
+      } else if (dependency.kind === 'extension') {
+        if (!availableExtensions.some(ref => ref.id === dependency.id && ref.version === dependency.version))
+          reject('resource_dependency_missing', 'A declared extension is not explicitly available at this version.');
+      }
       else {
         const ref: ResourceRef = { ...dependency, kind: 'skill' };
         if (!selection.enabledSkills.some(item => resourceRefKey(item) === resourceRefKey(ref)))
           reject('resource_dependency_missing', 'A declared Skill dependency is not explicitly enabled at its fixed version.');
-        dependencies(find(packages, ref), packages, selection, tools, visiting);
+        dependencies(find(packages, ref), packages, selection, tools, availableExtensions, visiting);
       }
     }
     visiting.delete(key);
@@ -260,7 +265,7 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
       const items = packages.map(pack => {
         const enabled = (pack.ref.kind === 'prompt' ? selection.prompt && resourceRefKey(selection.prompt) === resourceRefKey(pack.ref)
           : selection.enabledSkills.some(ref => resourceRefKey(ref) === resourceRefKey(pack.ref))) === true;
-        const validated = checked(() => { find(packages, pack.ref); dependencies(pack, packages, selection, registeredTools); });
+        const validated = checked(() => { find(packages, pack.ref); dependencies(pack, packages, selection, registeredTools, input.availableExtensions); });
         return { ...pack.item, enabled, available: validated.ok,
           diagnostics: validated.ok ? pack.item.diagnostics : pack.item.diagnostics.length ? pack.item.diagnostics : [{ code: validated.error.code, message: validated.error.message }] };
       });
@@ -270,24 +275,25 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
       }
       return ResourceCatalogSchema.parse({ settingsRevision: input.revision, selection, diagnostics, items });
     }); },
-    validateSelection(input: ResourceSelection): Result<void> { return checked(() => {
+    validateSelection(input: ResourceSelection, availableExtensions: AvailableExtensions = []): Result<void> { return checked(() => {
       const selection = ResourceSelectionSchema.parse(input);
       if (selection.prompt === null && selection.enabledSkills.length === 0) return;
       const { packages } = discover();
       for (const ref of [...(selection.prompt ? [selection.prompt] : []), ...selection.enabledSkills])
-        dependencies(find(packages, ref), packages, selection, registeredTools);
+        dependencies(find(packages, ref), packages, selection, registeredTools, availableExtensions);
     }); },
-    freeze(input: { selection: ResourceSelection; settingsRevision: number; activeToolNames: readonly string[]; requiredSkill: ResourceRef | null }): Result<FrozenResources | null> {
+    freeze(input: { selection: ResourceSelection; settingsRevision: number; activeToolNames: readonly string[];
+      requiredSkill: ResourceRef | null; availableExtensions?: AvailableExtensions }): Result<FrozenResources | null> {
       return checked(() => {
         const selection = ResourceSelectionSchema.parse(input.selection), required = input.requiredSkill === null ? null : ResourceRefSchema.parse(input.requiredSkill);
         if (required && (required.kind !== 'skill' || !selection.enabledSkills.some(ref => resourceRefKey(ref) === resourceRefKey(required))))
           reject('resource_required_unavailable', 'The required Skill is not explicitly enabled at this version.');
         if (selection.prompt === null && selection.enabledSkills.length === 0) return null;
         const { packages } = discover(), tools = new Set(input.activeToolNames.filter(name => registeredTools.has(name))), included: Package[] = [];
-        if (selection.prompt) { const prompt = find(packages, selection.prompt); dependencies(prompt, packages, selection, tools); included.push(prompt); }
+        if (selection.prompt) { const prompt = find(packages, selection.prompt); dependencies(prompt, packages, selection, tools, input.availableExtensions); included.push(prompt); }
         const discoveredSkills: ResourceRef[] = [], excludedSkills: Array<{ ref: ResourceRef; code: string }> = [];
         for (const ref of selection.enabledSkills) {
-          const selected = checked(() => { const pack = find(packages, ref); dependencies(pack, packages, selection, tools); return pack; });
+          const selected = checked(() => { const pack = find(packages, ref); dependencies(pack, packages, selection, tools, input.availableExtensions); return pack; });
           if (selected.ok) { included.push(selected.data); discoveredSkills.push(ref); }
           else if (required && resourceRefKey(required) === resourceRefKey(ref)) throw selected.error;
           else excludedSkills.push({ ref, code: selected.error.code });
@@ -303,11 +309,11 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
       const verified = checked(() => { frozenBundle(input); }, 'resource_bundle_unavailable');
       return verified.ok ? verified : fail(appError('resource_bundle_unavailable', ...errorFacts('resource_bundle_unavailable')));
     },
-    readFile(raw: ResourceFileRequest, input: ResourceSelection): Result<ResourceFilePage> { return checked(() => {
+    readFile(raw: ResourceFileRequest, input: ResourceSelection, availableExtensions: AvailableExtensions = []): Result<ResourceFilePage> { return checked(() => {
       const request = ResourceFileRequestSchema.parse(raw), selection = ResourceSelectionSchema.parse(input), { packages } = discover();
       if (request.ref.kind === 'skill' && !selection.enabledSkills.some(ref => resourceRefKey(ref) === resourceRefKey(request.ref)))
         reject('resource_required_unavailable', 'Enable this Skill version before requesting its content.');
-      const pack = find(packages, request.ref); dependencies(pack, packages, selection, registeredTools);
+      const pack = find(packages, request.ref); dependencies(pack, packages, selection, registeredTools, availableExtensions);
       const content = pack.contents.get(request.path);
       if (!content) reject('resource_file_unavailable', 'The requested file is not listed in this version manifest.');
       return page(request, pack.ref, content);

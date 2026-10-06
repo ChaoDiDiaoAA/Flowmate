@@ -1,25 +1,33 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import { appError, fail } from '../../../packages/contracts/src/errors.ts';
 import { parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../../packages/contracts/src/resources.ts';
+import { parseExtensionCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure, isExtensionHostCommand } from '../../../packages/contracts/src/extensions.ts';
 import type { Result } from '@flowmate/contracts';
 import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest } from '@flowmate/contracts';
 
-async function invokeResource<T>(type: string, input?: unknown): Promise<Result<T>> {
-  const command = parseResourceCommand({ type, ...(input === undefined ? {} : { input }) });
+async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<T>> {
+  const extension = isExtensionHostCommand(type);
+  const command = (extension ? parseExtensionCommand : parseResourceCommand)({ type, ...(input === undefined ? {} : { input }) });
   if (!command) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
   try {
-    const result = parseResourceHostResult(type, await ipcRenderer.invoke(`flowmate:${type.replaceAll('_', '-')}`, input));
-    if (!result || !matchesResourceResponse(command, result)) return fail(appError('host_protocol_invalid', 'runtime', 'Resource response could not be verified.'));
+    const result = (extension ? parseExtensionHostResult : parseResourceHostResult)(type, await ipcRenderer.invoke(`flowmate:${type.replaceAll('_', '-')}`, input));
+    if (!result || !(extension ? matchesExtensionResponse : matchesResourceResponse)(command, result)) return fail(appError('host_protocol_invalid', 'runtime', 'Resource response could not be verified.'));
     return result as Result<T>;
-  } catch { return resourceHostFailure(type) as Result<T>; }
+  } catch { return (extension ? extensionHostFailure : resourceHostFailure)(type) as Result<T>; }
 }
 
 const bridge: DesktopBridge = {
-  listResources: () => invokeResource('list_resources'),
-  readResourceFile: input => invokeResource('read_resource_file', input),
-  updateResourceSelection: input => invokeResource('update_resource_selection', input),
-  queryRunResources: input => invokeResource('query_run_resources', input),
-  readRunResourceFile: input => invokeResource('read_run_resource_file', input),
+  listExtensions: () => invokeAssembly('list_extensions'),
+  updateExtensionSelection: input => invokeAssembly('update_extension_selection', input),
+  querySessionExtensions: input => invokeAssembly('query_session_extensions', input),
+  queryRunExtensions: input => invokeAssembly('query_run_extensions', input),
+  executeExtensionCommand: input => invokeAssembly('execute_extension_command', input),
+  disposeSessionExtensions: input => invokeAssembly('dispose_session_extensions', input),
+  listResources: () => invokeAssembly('list_resources'),
+  readResourceFile: input => invokeAssembly('read_resource_file', input),
+  updateResourceSelection: input => invokeAssembly('update_resource_selection', input),
+  queryRunResources: input => invokeAssembly('query_run_resources', input),
+  readRunResourceFile: input => invokeAssembly('read_run_resource_file', input),
   getState: () => ipcRenderer.invoke('flowmate:get-state'),
   listModelCatalog: (providerId, refresh = false) => ipcRenderer.invoke('flowmate:list-model-catalog', providerId, refresh),
   loginModel: (modelId, authType, requestId) => ipcRenderer.invoke('flowmate:login-model', modelId, authType, requestId),

@@ -90,7 +90,7 @@ import { contextHostFailure, matchesContextResponse, parseContextHostResult } fr
 import { historyHostFailure, matchesHistoryResponse, parseHistoryHostResult, parseHostCommand, isHistoryHostCommand } from '../../host/protocol.ts';
 import type { HostCommand } from '../../host/protocol.ts';
 import { DesktopSessionCompactionRequestSchema } from '@flowmate/contracts';
-import { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../host/protocol.ts';
+import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../host/protocol.ts';
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
@@ -424,15 +424,16 @@ async function contextIpcQuery(command: Extract<HostCommand, { type: 'list_conte
   } catch { return contextHostFailure(); }
 }
 
-async function resourceIpcQuery(type: string, input?: unknown) {
+async function assemblyIpcQuery(type: string, input?: unknown) {
   const command = parseHostCommand({ version: 1, requestId: randomUUID(), type, ...(input === undefined ? {} : { input }) });
-  if (!command || !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
+  const extension = isExtensionHostCommand(type);
+  if (!command || !extension && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
   const epoch = host.connectionEpoch;
   try {
     const { version: _version, requestId: _requestId, ...request } = command;
-    const checked = parseResourceHostResult(type, await host.request(request));
-    return epoch === host.connectionEpoch && checked !== null && matchesResourceResponse(command, checked) ? checked : resourceHostFailure(type);
-  } catch { return resourceHostFailure(type); }
+    const checked = (extension ? parseExtensionHostResult : parseResourceHostResult)(type, await host.request(request));
+    return epoch === host.connectionEpoch && checked !== null && (extension ? matchesExtensionResponse : matchesResourceResponse)(command, checked) ? checked : (extension ? extensionHostFailure : resourceHostFailure)(type);
+  } catch { return (extension ? extensionHostFailure : resourceHostFailure)(type); }
 }
 async function compactionIpcRequest(command: HostCommand) {
   const epoch = host.connectionEpoch;
@@ -523,8 +524,9 @@ function registerIpc(): void {
     try { return RuntimeToolResultSchema.parse(await host.request({ type: 'query_run_tool_call', input: input.data })); }
     catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool could not be confirmed.', true)); }
   });
-  for (const type of ['list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file'] as const)
-    handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => resourceIpcQuery(type, raw));
+  for (const type of ['list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file',
+    'list_extensions', 'update_extension_selection', 'query_session_extensions', 'query_run_extensions', 'execute_extension_command', 'dispose_session_extensions'] as const)
+    handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => assemblyIpcQuery(type, raw));
   handle(channels.listContextSnapshots, async (_event, raw) => {
     const input = ContextSnapshotsRequestSchema.safeParse(raw);
     if (!input.success) return fail(appError('input_invalid', 'input', 'Context snapshot list request is invalid.'));

@@ -22,7 +22,7 @@ it('P7 Workspace remains in shared navigation and preserves a null saved chat', 
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
-    await expect(page.locator('.rail .nav-item')).toHaveCount(9, { timeout: 3000 });
+    await expect(page.locator('.rail .nav-item')).toHaveCount(10, { timeout: 3000 });
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
     await expect(page.getByTestId('workspace-page')).toBeVisible();
     await expect(page.getByTestId('workspace-summary')).toContainText('No invoice selected');

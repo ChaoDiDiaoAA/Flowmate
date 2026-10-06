@@ -1,3 +1,4 @@
+export { VERSION as PI_SDK_VERSION } from '@earendil-works/pi-coding-agent';
 export * from './provider.ts';
 export * from './catalog.ts';
 export * from './session.ts';

@@ -50,7 +50,8 @@ it('preserves an unchanged stale selection during unrelated settings saves and n
   mkdirSync(join(root, 'data'));
   const base = defaultProductSettings();
   const resources = { prompt: { kind: 'prompt', id: 'invoice', version: 'v1', contentHash: 'b'.repeat(64) }, enabledSkills: [] };
-  writeFileSync(file, JSON.stringify({ ...base, version: 4, resources }));
+  const { extensions: _extensions, ...legacyBase } = base;
+  writeFileSync(file, JSON.stringify({ ...legacyBase, version: 4, resources }));
   const client = new HostClient();
   expect(await client.start(root, '0.1.0', repo)).toMatchObject({ ok: true });
   try {
@@ -59,11 +60,11 @@ it('preserves an unchanged stale selection during unrelated settings saves and n
     expect(await client.request({ type: 'list_resources' })).toMatchObject({ ok: true, data: { selection: resources,
       diagnostics: [{ code: 'resource_version_changed' }] } });
   } finally { expect(await client.close()).toMatchObject({ ok: true, data: { closed: true } }); }
-  const legacy = { ...base, version: 1, revision: 9 };
+  const legacy = { ...legacyBase, version: 1, revision: 9 };
   delete (legacy as Record<string, unknown>).resources; delete (legacy as Record<string, unknown>).runtime;
   const original = JSON.stringify(legacy); writeFileSync(file, original);
   const restarted = new HostClient();
-  expect(await restarted.start(root, '0.1.0', repo)).toMatchObject({ ok: true, data: { settings: { version: 4, revision: 9 } } });
+  expect(await restarted.start(root, '0.1.0', repo)).toMatchObject({ ok: true, data: { settings: { version: 5, revision: 9 } } });
   try { expect(readFileSync(file, 'utf8')).toBe(original); }
   finally { expect(await restarted.close()).toMatchObject({ ok: true, data: { closed: true } }); }
 });

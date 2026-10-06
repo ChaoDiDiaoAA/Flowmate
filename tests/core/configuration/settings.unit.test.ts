@@ -27,9 +27,10 @@ describe('desktop settings', () => {
     const legacy = { ...defaultProductSettings(), version: 2 };
     delete (legacy as Record<string, unknown>).runtime;
     delete (legacy as Record<string, unknown>).resources;
+    delete (legacy as Record<string, unknown>).extensions;
     await writeFile(file, JSON.stringify(legacy));
     const loaded = await readProductSettings(file);
-    expect(loaded).toMatchObject({ ok: true, data: { version: 4, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
+    expect(loaded).toMatchObject({ ok: true, data: { version: 5, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
     if (!loaded.ok) return;
     const runtime = { budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 },
       timeoutMs: 1_800_000, stopGraceMs: 10_000 };
@@ -57,22 +58,23 @@ describe('desktop settings', () => {
     expect(current.ok && current.data.revision).toBe(1);
   });
 
-  it('settings-v1-v2-v3-to-v4-empty preserves saved bytes and revisions until an explicit save', async () => {
+  it('settings-v1-v2-v3-to-v5-empty preserves saved bytes and revisions until an explicit save', async () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
     const file = join(root, 'settings.json');
     const { runtime: _runtime, ...base } = defaultProductSettings('2026-09-23T00:00:00.000Z');
     delete (base as Record<string, unknown>).resources;
+    delete (base as Record<string, unknown>).extensions;
     for (const version of [1, 2, 3]) {
       const original = JSON.stringify({ ...base, version, revision: 7, ...(version === 3 ? { runtime: {} } : {}) });
       await writeFile(file, original);
       const loaded = await readProductSettings(file);
-      expect(loaded).toMatchObject({ ok: true, data: { version: 4, revision: 7, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
+      expect(loaded).toMatchObject({ ok: true, data: { version: 5, revision: 7, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
       expect(await readFile(file, 'utf8')).toBe(original);
     }
     const current = defaultProductSettings();
     const ref = { kind: 'skill', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) };
     expect(validateProductSettings({ ...current, resources: { prompt: null, enabledSkills: [ref] } }).ok).toBe(true);
-    for (const change of [{ version: 5 }, { resources: undefined }, { resources: { prompt: null, enabledSkills: [ref, ref] } },
+    for (const change of [{ version: 6 }, { resources: undefined }, { resources: { prompt: null, enabledSkills: [ref, ref] } },
       { resources: { prompt: null, enabledSkills: [], inferredRead: true } }])
       expect(validateProductSettings({ ...current, ...change }).ok).toBe(false);
   });
@@ -100,6 +102,7 @@ describe('desktop settings', () => {
     };
     delete (legacy as Record<string, unknown>).runtime;
     delete (legacy as Record<string, unknown>).resources;
+    delete (legacy as Record<string, unknown>).extensions;
     await writeFile(file, JSON.stringify(legacy), 'utf8');
 
     const loaded = await readProductSettings(file);
@@ -119,13 +122,14 @@ describe('desktop settings', () => {
     const file = join(root, 'settings.json');
     const { runtime: _runtime, ...legacyDefaults } = defaultProductSettings();
     delete (legacyDefaults as Record<string, unknown>).resources;
+    delete (legacyDefaults as Record<string, unknown>).extensions;
     await writeFile(file, JSON.stringify({ ...legacyDefaults, version: 1,
       models: [{ id: 'old-deepseek', credentialRef: 'old-deepseek-credential', name: 'Old',
         baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash', api: 'openai-responses' },
       { id: 'other', credentialRef: 'other-credential-ref', name: 'Other', baseUrl: 'https://other.example/v1',
         model: 'other-model', api: 'openai-completions' }], defaultModelId: 'old-deepseek' }), 'utf8');
     const loaded = await readProductSettings(file);
-    expect(loaded).toMatchObject({ ok: true, data: { version: 4, defaultModelId: null,
+    expect(loaded).toMatchObject({ ok: true, data: { version: 5, defaultModelId: null,
       models: [{ id: 'other', kind: 'legacy' }] } });
   });
 

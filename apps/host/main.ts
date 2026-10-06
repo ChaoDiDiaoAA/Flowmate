@@ -4,7 +4,7 @@ import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
 import { RUNTIME_CONFIG, appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest,
-  RuntimeEventsAvailableSchema, EMPTY_RESOURCE_SELECTION, ResourceSelectionSchema,
+  RuntimeEventsAvailableSchema, EMPTY_RESOURCE_SELECTION, ResourceSelectionSchema, EMPTY_EXTENSION_SELECTION, ExtensionSelectionSchema,
   } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings, validateProductSettings } from '@flowmate/core';
@@ -12,7 +12,7 @@ import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
-import { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from './protocol.ts';
+import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from './protocol.ts';
 import { parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from './protocol.ts';
 import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand, isContextHostCommand,
   parseContextHostResult, matchesContextResponse, contextHostFailure,
@@ -88,7 +88,8 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     currentSettings = saved;
     void send({ version: 1, type: 'event', event: { type: 'host_state', state: state() } });
   };
-  const selectionKey = (settings: ProductSettings) => JSON.stringify(ResourceSelectionSchema.parse(settings.resources ?? EMPTY_RESOURCE_SELECTION));
+  const selectionKey = (settings: ProductSettings) => JSON.stringify({ resources: ResourceSelectionSchema.parse(settings.resources ?? EMPTY_RESOURCE_SELECTION),
+    extensions: ExtensionSelectionSchema.parse(settings.extensions ?? EMPTY_EXTENSION_SELECTION) });
   const pendingCredentials = new Map<string, (value: { ok: boolean; credential?: unknown }) => void>();
   const pendingForms = new Map<string, { request: InvoiceFormBridgeRequest; resolve(receipt: InvoiceFormApplicationReceipt): void }>();
   const invoiceFormBridge = (request: InvoiceFormBridgeRequest, signal: AbortSignal): Promise<InvoiceFormApplicationReceipt> => {
@@ -159,16 +160,28 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       resourceBundleRoot: join(paths.runtimeDir, 'resource-bundles'), promptTrace, tools }),
     promptTrace,
     runtimeDefaults: () => ok(currentSettings.runtime ?? {}),
-    resourceDefaults: () => ok({ revision: currentSettings.revision, selection: currentSettings.resources ?? EMPTY_RESOURCE_SELECTION }),
+    resourceDefaults: () => ok({ revision: currentSettings.revision, selection: currentSettings.resources ?? EMPTY_RESOURCE_SELECTION,
+      extensions: currentSettings.extensions ?? EMPTY_EXTENSION_SELECTION }),
     saveResourceSelection: input => enqueueSettingsWrite(async () => {
       if (input.expectedRevision !== currentSettings.revision)
         return fail(appError('config_revision_conflict', 'input', 'Reload current resource selection before saving.', true));
-      const valid = application.validateResourceSelection(input.selection);
+      const valid = application.validateResourceSelection(input.selection, currentSettings.extensions);
       if (!valid.ok) return valid;
       const saved = await saveProductSettings(settingsFile, { ...currentSettings, resources: input.selection });
       if (!saved.ok) return saved;
       publishSettings(saved.data);
       return ok({ revision: saved.data.revision, selection: saved.data.resources! });
+    }),
+    saveExtensionSelection: input => enqueueSettingsWrite(async () => {
+      if (input.expectedRevision !== currentSettings.revision)
+        return fail(appError('config_revision_conflict', 'input', 'Reload current extension selection before saving.', true));
+      const extensions = application.validateExtensionSelection(input.selection); if (!extensions.ok) return extensions;
+      const resources = application.validateResourceSelection(currentSettings.resources ?? EMPTY_RESOURCE_SELECTION, input.selection);
+      if (!resources.ok) return resources;
+      const saved = await saveProductSettings(settingsFile, { ...currentSettings, extensions: input.selection });
+      if (!saved.ok) return saved;
+      publishSettings(saved.data);
+      return ok({ revision: saved.data.revision, selection: saved.data.extensions! });
     }),
     observeCompaction: observation => {
       const value = parseCompactionNotification({ type: 'compaction_observation', observation });
@@ -508,7 +521,9 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
         if (validated.data.revision !== currentSettings.revision)
           return fail(appError('config_revision_conflict', 'input', 'Reload current configuration before saving.', true));
         if (selectionKey(validated.data) !== selectionKey(currentSettings)) {
-          const resources = application.validateResourceSelection(validated.data.resources!);
+          const extensions = application.validateExtensionSelection(validated.data.extensions!);
+          if (!extensions.ok) return extensions;
+          const resources = application.validateResourceSelection(validated.data.resources!, validated.data.extensions);
           if (!resources.ok) return resources;
         }
         const written = await saveProductSettings(settingsFile, validated.data);
@@ -517,6 +532,17 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       });
       send({ version: 1, type: 'response', requestId: command.requestId, value: saved });
       return;
+    }
+    if (isExtensionHostCommand(command.type)) {
+      const value = command.type === 'list_extensions' ? await application.listExtensions()
+        : command.type === 'update_extension_selection' ? await application.updateExtensionSelection(command.input)
+        : command.type === 'query_session_extensions' ? await application.querySessionExtensions(command.input)
+        : command.type === 'query_run_extensions' ? await application.queryRunExtensions(command.input)
+        : command.type === 'execute_extension_command' ? await application.executeExtensionCommand(command.input)
+        : command.type === 'dispose_session_extensions' ? await application.disposeSessionExtensions(command.input) : null;
+      const result = parseExtensionHostResult(command.type, value);
+      send({ version: 1, type: 'response', requestId: command.requestId, value: result && matchesExtensionResponse(command, result) ? result
+        : fail(appError('host_protocol_invalid', 'runtime', 'Extension response could not be verified.')) }); return;
     }
     if (isResourceHostCommand(command.type)) {
       const value = command.type === 'list_resources' ? await application.listResources()

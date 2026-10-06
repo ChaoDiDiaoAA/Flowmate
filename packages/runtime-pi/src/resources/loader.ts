@@ -1,5 +1,5 @@
 import { loadSkillsFromDir, formatSkillsForPrompt, createExtensionRuntime, parseSkillBlock, stripFrontmatter,
-  truncateHead, DEFAULT_MAX_BYTES, formatSize, type ResourceLoader, type Skill } from '@earendil-works/pi-coding-agent';
+  truncateHead, DEFAULT_MAX_BYTES, formatSize, type ResourceLoader, type Skill, type LoadExtensionsResult } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok, ResourceNativeMetadataSchema, FrozenResourcesSchema, ResourceBundleManifestSchema, ResourceManifestSchema,
   RESOURCE_LIMITS, canonicalResourceManifest, resourceRefKey } from '@flowmate/contracts';
 import type { InspectNativeResources, FrozenResources, ResourceRef, Result } from '@flowmate/contracts';
@@ -53,7 +53,7 @@ function readFixed(root: string, path: string, limit: number): Buffer {
 
 /** No default discovery, configuration reload, extension loading, or PromptTemplate expansion. */
 export function createRunResourceLoader(input: { fixedSystemPrompt: string; frozen: FrozenResources | null;
-  bundleDirectory: string }): Result<ResourceLoader & { bodyFor(ref: ResourceRef): string | null;
+  bundleDirectory: string; extensionResult?: LoadExtensionsResult }): Result<ResourceLoader & { bodyFor(ref: ResourceRef): string | null;
     filesForOperation(path: string, cwd: string, operation: string): ManagedReadFile[] }> {
   try {
     const skills: Skill[] = [], appended: string[] = [], sources: Array<{ path: string }> = [];
@@ -112,7 +112,7 @@ export function createRunResourceLoader(input: { fixedSystemPrompt: string; froz
           return [{ ref: file.ref, path: file.path, fileHash: file.sha256, text, relativePath: rel }];
         });
       },
-      getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+      getExtensions: () => input.extensionResult ?? ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
       getSkills: () => ({ skills: [...skills], diagnostics: [] }),
       getPrompts: () => ({ prompts: [], diagnostics: [] }), getThemes: () => ({ themes: [], diagnostics: [] }),
       getAgentsFiles: () => ({ agentsFiles: [] }), getSystemPrompt: () => input.fixedSystemPrompt,

@@ -3,9 +3,10 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { CompactionObservationSchema, SessionCompactionSnapshotSchema, CompactionPolicySchema } from '@flowmate/contracts';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
-import { FrozenResourcesSchema, ResourceSelectionResultSchema, EMPTY_RESOURCE_SELECTION, resourceRefKey } from '@flowmate/contracts';
-import type { FrozenResources, ResourceBinding, ResourceSelectionResult } from '@flowmate/contracts';
+import { FrozenResourcesSchema, AssemblySelectionSnapshotSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, EMPTY_RESOURCE_SELECTION, resourceRefKey } from '@flowmate/contracts';
+import type { FrozenResources, ResourceBinding, ResourceSelectionResult, AssemblySelectionSnapshot, FrozenExtensions } from '@flowmate/contracts';
 import { invoiceToolNamesForRun } from '../storage/repositories.ts';
+import type { ExtensionService } from '../extensions/service.ts';
 import { resolveRequiredSkill, type createResourceService } from '../resources/service.ts';
 import type {
   AgentConfigFacts,
@@ -83,7 +84,8 @@ export type RuntimeDependencies = {
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
   resources?: ReturnType<typeof createResourceService>;
-  resourceDefaults?: () => Result<ResourceSelectionResult>;
+  extensions?: ExtensionService;
+  resourceDefaults?: () => Result<AssemblySelectionSnapshot | ResourceSelectionResult>;
   runtimePolicy?: RuntimeStrategyPolicy;
   sampleSource?: 'production' | 'test' | 'evaluation';
   observeCompaction?: (value: CompactionObservation) => void;
@@ -149,6 +151,7 @@ type AgentExecutionContext = {
   contextSnapshotId?: number;
   promptText: string;
   resources: FrozenResources | null;
+  extensions: FrozenExtensions | null;
   resourceBinding?: ResourceBinding;
   control: AgentControl;
   stopPromise: Promise<StopIntent>;
@@ -611,8 +614,8 @@ export class RuntimeService {
     return existing.ok ? ok({ runId, accepted: false }) : existing;
   }
 
-  public verifySessionMutation(sessionId: number): Result<void> {
-    if (this.poisoned || this.closing || this.closed) return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot manage Sessions.', true));
+  public verifySessionMutation(sessionId: number, intent?: 'cleanup'): Result<void> {
+    if (this.poisoned && intent !== 'cleanup' || this.closing || this.closed) return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot manage Sessions.', true));
     if (this.active && this.active.kind !== 'provider' && this.active.sessionId === sessionId)
       return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
     return ok(undefined);
@@ -893,11 +896,11 @@ export class RuntimeService {
     }
     const hub = this.dependencies.resources;
     if (hub && !this.dependencies.contextService) return fail(appError('resource_evidence_write_failed', 'storage', 'Resource admission requires Context persistence.', true));
-    let selected: ResourceSelectionResult;
+    let selected: AssemblySelectionSnapshot;
     try {
       const value = this.dependencies.resourceDefaults?.() ?? ok({ revision: 0, selection: EMPTY_RESOURCE_SELECTION });
       if (!value.ok) return value;
-      const parsed = ResourceSelectionResultSchema.safeParse(value.data);
+      const parsed = AssemblySelectionSnapshotSchema.safeParse(value.data);
       if (!parsed.success) return fail(appError('config_settings_invalid', 'input', 'Resource defaults are invalid.'));
       selected = parsed.data;
     } catch { return fail(appError('config_settings_invalid', 'input', 'Resource defaults could not be read.')); }
@@ -905,7 +908,14 @@ export class RuntimeService {
     if (!required.ok) return required;
     const activeToolNames = request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
       request.workspace.documentRef !== null, request.workspace.jobId !== null), ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
-    const fixed = hub?.freeze({ selection: selected.selection, settingsRevision: selected.revision, activeToolNames, requiredSkill: required.data }) ?? ok(null);
+    const extensionHub = this.dependencies.extensions;
+    const fixedExtensions = extensionHub?.freeze({ selection: selected.extensions, settingsRevision: selected.revision, activeToolNames,
+      policy: request.goalMode === 'fill-form' ? 'fill' : request.workspace ? 'p3' : 'p2' }) ?? ok(null);
+    if (!fixedExtensions.ok) return fixedExtensions;
+    if (!extensionHub && selected.extensions.enabledExtensions.length) return fail(appError('extension_config_invalid', 'input', 'Extension directory is unavailable.'));
+    const extensions = fixedExtensions.data;
+    const fixed = hub?.freeze({ selection: selected.selection, settingsRevision: selected.revision, activeToolNames, requiredSkill: required.data,
+      availableExtensions: extensions?.included.map(item => item.ref) ?? [] }) ?? ok(null);
     if (!fixed.ok) return fixed;
     if (!hub && (selected.selection.prompt || selected.selection.enabledSkills.length || required.data))
       return fail(appError('resource_required_unavailable', 'input', 'Managed resources are unavailable.'));
@@ -913,7 +923,9 @@ export class RuntimeService {
     const resourceBinding: ResourceBinding | undefined = resources ? { bundleHash: resources.bundleHash,
       requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
     const freezeConfig = (config: ReturnType<typeof initialAgentSnapshot>) => ({ ...config,
-      ...(resources ? { resources, agent: { ...config.agent, resourcePolicy: 'p11-resources-v1' as const } } : {}) });
+      ...(resources ? { resources } : {}), ...(extensions ? { extensions } : {}),
+      agent: { ...config.agent, ...(resources ? { resourcePolicy: 'p11-resources-v1' as const } : {}),
+        ...(extensions ? { extensionPolicy: extensions.included.length ? 'p12-managed-extensions-v1' as const : 'none' as const } : {}) } });
     const createdAt = this.dependencies.now();
     const input: InputRecord = { version: 1, goal: INVOICE_CHAT_GOAL,
       text: request.text, messageTimestamp: Date.now() };
@@ -1035,7 +1047,7 @@ export class RuntimeService {
     active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
     this.active = active;
     const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: frozenContent.promptText,
-      resources, ...(resourceBinding ? { resourceBinding } : {}),
+      resources, extensions, ...(resourceBinding ? { resourceBinding } : {}),
       ...(inputId === undefined ? {} : { inputId }),
       ...(accepted.data.input.contextSnapshotId === null ? {} : { contextSnapshotId: accepted.data.input.contextSnapshotId }),
       control, stopPromise, readStop: () => stopIntent, emit };
@@ -1223,6 +1235,8 @@ export class RuntimeService {
     const requestedStop = this.agentStop(context);
     if (requestedStop) return this.finishAgent(context, null, errorForStop(requestedStop.reason, active.runId, 'agent'), true);
 
+    const extensionPreparation = context.extensions ? { extensions: context.extensions,
+      verifyExtensions: () => this.dependencies.extensions?.validateSelection({ enabledExtensions: context.extensions!.selected }) ?? ok(undefined) } : {};
     const preparation = Promise.resolve().then(() => agent.prepare(
       session.nativeSessionId,
       request.config,
@@ -1230,10 +1244,12 @@ export class RuntimeService {
       active.controller.signal,
       context.scope ? { activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,
         ...(context.resources ? { resources: context.resources } : {}),
+        ...extensionPreparation,
         ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}),
         sessionInputs: true, ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) }
         : { sessionInputs: true, runtimeBudget: request.budget,
           ...(context.resources ? { resources: context.resources } : {}),
+        ...extensionPreparation,
           ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}) },
     )).then(
       (result) => ({ ok: true as const, result }),
@@ -1279,6 +1295,10 @@ export class RuntimeService {
       return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared resources differ from Run admission.', false, active.runId), true);
     if (frozenCompactionPolicy && !isDeepStrictEqual(prepared.snapshot.compactionPolicy, frozenCompactionPolicy))
       return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared compaction policy differs from Run admission.', false, active.runId), true);
+    if (context.extensions && (!isDeepStrictEqual(prepared.snapshot.extensions, context.extensions)
+      || !prepared.snapshot.extensionAssembly || !matchesExtensionAssembly(context.extensions, prepared.snapshot.extensionAssembly, session.nativeSessionId)
+      || prepared.snapshot.agent.extensionPolicy !== (context.extensions.included.length ? 'p12-managed-extensions-v1' : 'none')))
+      return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared Extensions differ from Run admission.', false, active.runId), true);
     const stopBeforeStart = this.agentStop(context);
     if (stopBeforeStart) {
       return this.finishAgent(context, null, errorForStop(stopBeforeStart.reason, active.runId, 'agent'), true);
@@ -1314,6 +1334,7 @@ export class RuntimeService {
         || actualBudget.toolTimeoutMs !== request.budget.toolTimeoutMs)
         return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Prepared Agent policy differs from Run admission.', false, active.runId), true);
       startedConfig = { ...frozenExtensions, ...preparedWithoutAgent, version: 2, runtimeBudget: request.budget,
+        ...(context.extensions ? { extensions: saved.extensions, extensionAssembly: prepared.snapshot.extensionAssembly } : {}),
         ...(savedContextPolicy === 'p8-context-v1' ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
         limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
         agent: { ...actualAgent, policyVersion: 'runtime-v1', taskPolicyVersion: frozenRuntime.taskPolicyVersion,
@@ -1357,6 +1378,7 @@ export class RuntimeService {
       ...(contextHooks ? { contextHooks } : {}),
       promptText: context.promptText,
       ...(context.resources ? { resources: context.resources } : {}),
+        ...(context.extensions ? { extensions: context.extensions } : {}),
       ...(context.resourceBinding ? { resourceBinding: context.resourceBinding } : {}),
       runtimeBudget: request.budget, runtimeStrategy: context.runtimeStrategy,
       budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
@@ -1375,6 +1397,13 @@ export class RuntimeService {
         if (!permission.ok) return permission;
         if (permission.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
         if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', '会话历史不可继续使用。', false, active.runId, request.sessionId));
+        if (context.extensions?.included.length) {
+          const instance = agent.inspectExtensions?.(session.nativeSessionId);
+          const expected = prepared.snapshot.extensionAssembly!.instances[0]!;
+          if (!instance?.ok || !instance.data.instance || instance.data.instance.instanceId !== expected.instanceId
+            || instance.data.instance.state !== 'active' || instance.data.instance.admission !== 'open')
+            return fail(appError('extension_hook_failed', 'extension', 'Run Extension instance is no longer active.'));
+        }
         if (context.resources) return this.dependencies.resources!.verifyFrozen(context.resources);
         return ok(undefined);
       },

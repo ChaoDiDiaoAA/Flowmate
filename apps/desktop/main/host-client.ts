@@ -10,7 +10,7 @@ import { isRuntimeHostCommand, isWorkspaceHostCommand, isContextHostCommand, mat
   isHistoryHostCommand, matchesHistoryResponse, parseHistoryHostResult,
   parseHostCommand, parseRuntimeHostResult, parseWorkspaceHostResult } from '../../host/protocol.ts';
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, parseCompactionNotification } from '../../host/protocol.ts';
-import { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from '../../host/protocol.ts';
+import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from '../../host/protocol.ts';
 
 type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
 type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; command: HostCommand };
@@ -130,7 +130,7 @@ export class HostClient {
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
     const rawMessage = { ...command, version: 1, requestId };
-    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type)
+    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type)
       ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
     if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
@@ -244,6 +244,11 @@ export class HostClient {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
           const value = validEnvelope ? parseContextHostResult(pending.command.type, output.value) : null;
           if (value === null || !matchesContextResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(value);
+        } else if (isExtensionHostCommand(pending.command.type)) {
+          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
+          const value = validEnvelope ? parseExtensionHostResult(pending.command.type, output.value) : null;
+          if (value === null || !matchesExtensionResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
           else pending.resolve(value);
         } else if (isResourceHostCommand(pending.command.type)) {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));

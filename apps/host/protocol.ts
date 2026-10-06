@@ -1,4 +1,5 @@
 import { z } from 'zod';
+export { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure } from '../../packages/contracts/src/extensions.ts';
 export { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../packages/contracts/src/resources.ts';
 import { ResourceRefSchema, ResourceCatalogResultSchema, ResourceFileResultSchema, ResourceSelectionResponseSchema, RunResourceResultSchema,
   RunResourceQuerySchema, RunResourceFileRequestSchema, resourceRefKey } from '@flowmate/contracts';
@@ -9,7 +10,7 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   AcceptInvoiceCandidateRequestSchema, RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema,
   InvoiceCandidateOperationQuerySchema, RuntimeRequestOverridesSchema, RUNTIME_CONFIG,
   RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeSubscriptionIdSchema,
-  ResourceFileRequestSchema, ResourceSelectionRequestSchema,
+  ResourceFileRequestSchema, ResourceSelectionRequestSchema, ExtensionSelectionRequestSchema, SessionExtensionQuerySchema, RunExtensionQuerySchema, ExtensionCommandRequestSchema, ExtensionDisposeRequestSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema, RuntimeEventsReadResultSchema, RuntimeSubscriptionResultSchema,
   RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   WorkspaceUpdateRequestSchema, WorkspaceSnapshotSchema, WorkspaceRestoreResultSchema, AppErrorSchema, invoiceToolSchemas,
@@ -102,6 +103,12 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     promptId: requestId, value: z.string().max(8192).nullable() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_login'), loginRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('save_settings'), settings: z.unknown() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_session_extensions'), input: SessionExtensionQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_run_extensions'), input: RunExtensionQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('execute_extension_command'), input: ExtensionCommandRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('dispose_session_extensions'), input: ExtensionDisposeRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_extensions') }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('update_extension_selection'), input: ExtensionSelectionRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_resources') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_run_resources'), input: RunResourceQuerySchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('read_run_resource_file'), input: RunResourceFileRequestSchema }).strict(),

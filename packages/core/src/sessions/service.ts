@@ -1,5 +1,5 @@
 import { appError, fail, normalizeSessionInputRequest, ok, SessionMessagesPageSchema, normalizeAgentRunRequest,
-  SetSessionStatusRequestSchema, BranchSessionRequestSchema, WorkspaceContextSchema, normalizeForkSessionRequest } from '@flowmate/contracts';
+  SetSessionStatusRequestSchema, BranchSessionRequestSchema, WorkspaceContextSchema, normalizeForkSessionRequest, ExtensionCommandReceiptSchema, ExtensionDisposeReceiptSchema, SessionExtensionViewSchema } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import type {
   AgentPort,
@@ -40,6 +40,7 @@ import type { SessionInputLedger } from './input-ledger.ts';
 
 export class SessionService {
   private readonly managing = new Set<DbId>();
+  private readonly extensionCleanup = new Map<DbId, { instanceId: string; inFlight: boolean }>();
 
   public constructor(
     private readonly repository: SessionRepository,
@@ -51,7 +52,7 @@ export class SessionService {
     private readonly inputs?: SessionInputLedger,
     private readonly startInput?: (request: NormalizedAgentRunRequest, submission: NormalizedSessionInputRequest, control?: AgentControl) => Promise<Result<RunAccepted>>,
     private readonly appendInput?: (request: NormalizedActiveInputRequest) => Promise<Result<SessionInputAccepted>>,
-    private readonly verifyMutation?: (sessionId: DbId) => Result<void>,
+    private readonly verifyMutation?: (sessionId: DbId, intent?: 'cleanup') => Result<void>,
   ) {}
 
   public isManaging(sessionId: DbId): boolean { return this.managing.has(sessionId); }
@@ -105,16 +106,72 @@ export class SessionService {
     return this.inputs?.list(request) ?? fail(appError('session_input_unavailable', 'session', 'Session input storage is unavailable.'));
   }
 
-  private acquireMutation(sessionId: DbId): Result<void> {
-    if (this.managing.has(sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
-    const eligible = this.verifyMutation?.(sessionId);
+  private acquireMutation(sessionId: DbId, cleanupInstanceId?: string): Result<void> {
+    const held = this.extensionCleanup.get(sessionId);
+    if (this.managing.has(sessionId) && (!cleanupInstanceId || held?.instanceId !== cleanupInstanceId || held.inFlight))
+      return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+    const eligible = this.verifyMutation?.(sessionId, cleanupInstanceId ? 'cleanup' : undefined);
     if (eligible && !eligible.ok) return eligible;
     const state = this.runtimeState();
-    if (state.blocked) return fail(state.error ?? appError('runtime_unusable', 'runtime', 'Runtime is unavailable.', true));
+    if (state.blocked && !cleanupInstanceId) return fail(state.error ?? appError('runtime_unusable', 'runtime', 'Runtime is unavailable.', true));
     if (state.active && state.active.kind !== 'provider' && state.active.sessionId === sessionId)
       return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
     this.managing.add(sessionId);
     return ok(undefined);
+  }
+
+  public queryExtensions(request: import('@flowmate/contracts').SessionExtensionQuery): Result<import('@flowmate/contracts').SessionExtensionView> {
+    const row = this.repository.get(request.sessionId); if (!row.ok) return row;
+    const inspected = this.agent.inspectExtensions?.(row.data.nativeSessionId);
+    if (!inspected) return fail(appError('extension_not_loaded', 'extension', 'Extension inspection is unavailable.'));
+    if (!inspected.ok) return inspected;
+    if (inspected.data.nativeSessionId !== row.data.nativeSessionId)
+      return fail(appError('extension_instance_conflict', 'session', 'Extension owner could not be verified.', true));
+    try { return ok(SessionExtensionViewSchema.parse({ ...inspected.data, sessionId: request.sessionId })); }
+    catch { return fail(appError('extension_instance_conflict', 'session', 'Extension owner could not be verified.', true)); }
+  }
+
+  public async executeExtensionCommand(request: import('@flowmate/contracts').ExtensionCommandRequest): Promise<Result<import('@flowmate/contracts').ExtensionCommandReceipt>> {
+    const acquired = this.acquireMutation(request.sessionId); if (!acquired.ok) return acquired;
+    try {
+      const row = this.repository.get(request.sessionId); if (!row.ok) return row;
+      if (row.data.status !== 'active' || row.data.deletePending) return fail(appError('session_archived', 'session', 'Session cannot execute commands.'));
+      if (!this.agent.executeExtensionCommand) return fail(appError('extension_not_loaded', 'extension', 'Extension commands are unavailable.'));
+      const { sessionId: _sessionId, ...native } = request;
+      const result = await this.agent.executeExtensionCommand(row.data.nativeSessionId, native); if (!result.ok) return result;
+      if (result.data.nativeSessionId !== row.data.nativeSessionId || result.data.instanceId !== request.expectedInstanceId)
+        return fail(appError('extension_instance_conflict', 'session', 'Extension command owner changed.', true));
+      const { nativeSessionId: _native, ...receipt } = result.data;
+      return ok(ExtensionCommandReceiptSchema.parse({ ...receipt, sessionId: request.sessionId }));
+    } catch { return fail(appError('extension_command_failed', 'extension', 'Extension command could not be confirmed.', true)); }
+    finally { this.managing.delete(request.sessionId); }
+  }
+
+  public async disposeSessionExtensions(request: import('@flowmate/contracts').ExtensionDisposeRequest): Promise<Result<import('@flowmate/contracts').ExtensionDisposeReceipt>> {
+    const row = this.repository.get(request.sessionId); if (!row.ok) return row;
+    const inspected = this.queryExtensions(request); if (!inspected.ok) return inspected;
+    const instance = inspected.data.instance;
+    if (!instance) return fail(appError('extension_not_loaded', 'extension', 'No Extension instance is known.'));
+    if (instance.instanceId !== request.expectedInstanceId) return fail(appError('extension_instance_conflict', 'session', 'Extension instance changed.', true));
+    if (instance.state === 'disposed') return ok(ExtensionDisposeReceiptSchema.parse({
+      sessionId: request.sessionId, instanceId: instance.instanceId, state: 'disposed', report: { stopped: true, closed: true, errors: [] } }));
+    const acquired = this.acquireMutation(request.sessionId, request.expectedInstanceId); if (!acquired.ok) return acquired;
+    if (!this.agent.disposeExtensions) { this.managing.delete(request.sessionId); return fail(appError('extension_not_loaded', 'extension', 'Extension disposal is unavailable.')); }
+    const held = { instanceId: request.expectedInstanceId, inFlight: true }; this.extensionCleanup.set(request.sessionId, held);
+    let retainBlocked = true;
+    try {
+      const result = await this.agent.disposeExtensions(row.data.nativeSessionId, request.expectedInstanceId);
+      if (!result.ok) return result;
+      if (result.data.nativeSessionId !== row.data.nativeSessionId || result.data.instanceId !== request.expectedInstanceId)
+        return fail(appError('extension_instance_conflict', 'session', 'Extension cleanup owner changed.', true));
+      const { nativeSessionId: _native, ...receipt } = result.data;
+      const checked = ExtensionDisposeReceiptSchema.parse({ ...receipt, sessionId: request.sessionId });
+      retainBlocked = !checked.report.closed; return ok(checked);
+    } catch { return fail(appError('extension_cleanup_failed', 'runtime', 'Extension cleanup could not be confirmed.', true)); }
+    finally {
+      held.inFlight = false;
+      if (!retainBlocked) { this.extensionCleanup.delete(request.sessionId); this.managing.delete(request.sessionId); }
+    }
   }
 
   public setStatus(raw: SetSessionStatusRequest): Result<SessionSnapshot> {

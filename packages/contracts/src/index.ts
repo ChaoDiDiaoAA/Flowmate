@@ -16,3 +16,4 @@ export * from './context.ts';
 export * from './memory.ts';
 export * from './compaction.ts';
 export * from './resources.ts';
+export * from './extensions.ts';

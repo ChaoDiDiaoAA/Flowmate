@@ -520,13 +520,20 @@ export type CloseReport = {
 };
 
 export interface Application {
+  querySessionExtensions(input: import('./extensions.ts').SessionExtensionQuery): Promise<Result<import('./extensions.ts').SessionExtensionView>>;
+  queryRunExtensions(input: import('./extensions.ts').RunExtensionQuery): Promise<Result<import('./extensions.ts').RunExtensionView>>;
+  executeExtensionCommand(input: import('./extensions.ts').ExtensionCommandRequest): Promise<Result<import('./extensions.ts').ExtensionCommandReceipt>>;
+  disposeSessionExtensions(input: import('./extensions.ts').ExtensionDisposeRequest): Promise<Result<import('./extensions.ts').ExtensionDisposeReceipt>>;
+  listExtensions(): Promise<Result<import('./extensions.ts').ExtensionCatalog>>;
+  updateExtensionSelection(input: import('./extensions.ts').ExtensionSelectionRequest): Promise<Result<import('./extensions.ts').ExtensionSelectionResult>>;
+  validateExtensionSelection(selection: import('./extensions.ts').ExtensionSelection): Result<void>;
   listResources(): Promise<Result<import('./resources.ts').ResourceCatalog>>;
   readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<Result<import('./resources.ts').ResourceFilePage>>;
   updateResourceSelection(input: import('./resources.ts').ResourceSelectionRequest): Promise<Result<import('./resources.ts').ResourceSelectionResult>>;
   queryRunResources(input: import('./resources.ts').RunResourceQuery): Promise<Result<import('./resources.ts').RunResourceView>>;
   readRunResourceFile(input: import('./resources.ts').RunResourceFileRequest): Promise<Result<import('./resources.ts').ResourceFilePage>>;
   /** Host configuration validation only; never exposed to Renderer/IPC. */
-  validateResourceSelection(selection: import('./resources.ts').ResourceSelection): Result<void>;
+  validateResourceSelection(selection: import('./resources.ts').ResourceSelection, extensions?: import('./extensions.ts').ExtensionSelection): Result<void>;
   callProvider(
     request: ProviderRequest,
     control?: ProviderControl,

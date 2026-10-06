@@ -15,7 +15,7 @@ import { contextReferenceFromColumns, readRunContextOwner, readContextSnapshotOw
 import type { ContextOwnerCache } from '../context/repository.ts';
 import { formatContextPrompt } from '../context/service.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, emptyResourceJournal } from '@flowmate/contracts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, emptyResourceJournal } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -444,6 +444,7 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
     || typeof agent.systemPrompt !== 'string'
     || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(String(agent.thinkingLevel))
     || !['none', 'p11-resources-v1'].includes(String(agent.resourcePolicy))
+    || Object.hasOwn(agent, 'extensionPolicy') && !['none', 'p12-managed-extensions-v1'].includes(String(agent.extensionPolicy))
     || agent.historyPolicy !== 'memory-only'
     || agent.sessionRetry !== false;
   const p2Invalid = agent.policyVersion === 'p2-invoice-chat-v1'
@@ -491,6 +492,12 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
     if ((agent.resourcePolicy === 'p11-resources-v1') !== Object.hasOwn(record, 'resources')) throw new Error('invalid_resource_policy');
     if (Object.hasOwn(record, 'resources') && !verifyFrozenResourceMetadata(FrozenResourcesSchema.parse(record.resources)).ok)
       throw new Error('invalid_resource_metadata');
+    if (Object.hasOwn(record, 'extensions')) {
+      const frozen = FrozenExtensionsSchema.parse(record.extensions);
+      if (agent.extensionPolicy !== (frozen.included.length ? 'p12-managed-extensions-v1' : 'none')) throw new Error('invalid_extension_policy');
+      if (Object.hasOwn(record, 'extensionAssembly') && !matchesExtensionAssembly(frozen, ExtensionAssemblyEvidenceSchema.parse(record.extensionAssembly), String(agent.nativeSessionId)))
+        throw new Error('invalid_extension_assembly');
+    } else if (Object.hasOwn(record, 'extensionAssembly') || Object.hasOwn(agent, 'extensionPolicy')) throw new Error('unexpected_extension_assembly');
     if ((raw.version === 2) !== (agent.policyVersion === 'runtime-v1')) throw new Error('invalid_runtime_config_version');
     if (raw.version === 2 && record.runtimeBudget === undefined) throw new Error('missing_runtime_budget');
     if (record.runtimeBudget !== undefined) {
@@ -499,7 +506,7 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
         || budget.toolTimeoutMs !== agent.toolTimeoutMs) throw new Error('invalid_runtime_config_budget');
     }
   }
-  else if (record.agent !== undefined || Object.hasOwn(record, 'resources')) throw new Error('unexpected_provider_agent_config');
+  else if (record.agent !== undefined || Object.hasOwn(record, 'resources') || Object.hasOwn(record, 'extensions') || Object.hasOwn(record, 'extensionAssembly')) throw new Error('unexpected_provider_agent_config');
   if (record.runtimeStrategy !== undefined) RuntimeStrategySnapshotSchema.parse(record.runtimeStrategy);
   if (record.workspaceContext !== undefined) WorkspaceContextSchema.parse(record.workspaceContext);
   if (record.goalMode !== undefined && !['answer', 'save-candidate', 'fill-form', 'local-task'].includes(String(record.goalMode))) throw new Error('invalid_goal_mode');
@@ -2575,6 +2582,7 @@ function snapshotFromRow(db: Database, row: RunRow): RunSnapshot {
   const error = validatedError(readJson(row.error_json ?? 'null', 'error'));
   const input = validatedInput(readJson(row.input_json, 'input'));
   const config = validatedConfig(readJson(row.config_json, 'config'), row.kind);
+  if (row.kind === 'agent' && row.status === 'running' && Object.hasOwn(config, 'extensions') && !Object.hasOwn(config, 'extensionAssembly')) throw new Error('missing_extension_assembly');
   const usage = validatedUsage(readJson(row.usage_json, 'usage'));
   const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
   const base = {
@@ -3326,6 +3334,10 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
 
     start(runId, config, startedAt) {
       try {
+        const owner = db.query('SELECT kind FROM runs WHERE id=?').get(runId) as { kind: RunRow['kind'] } | null;
+        if (!owner) return fail(appError('run_state_invalid', 'runtime', 'Run does not exist.', false, runId));
+        const checked = validatedConfig(config, owner.kind);
+        if (owner.kind === 'agent' && Object.hasOwn(checked, 'extensions') && !Object.hasOwn(checked, 'extensionAssembly')) throw new Error('missing_extension_assembly');
         const saved = writeTransaction(() => {
           const changed = db
             .query("UPDATE runs SET status='running', config_json=?, started_at=? WHERE id=? AND status='created'")

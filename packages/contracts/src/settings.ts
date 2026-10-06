@@ -34,13 +34,14 @@ export type ModelProfile = {
 };
 
 export type ProductSettings = {
-  version: 2 | 3 | 4;
+  version: 2 | 3 | 4 | 5;
   revision: number;
   profile: { displayName: string; theme: 'system' | 'light' | 'dark' };
   models: readonly ModelProfile[];
   defaultModelId: string | null;
   runtime?: import('./runtime.ts').RuntimeRequestOverrides;
   resources?: import('./resources.ts').ResourceSelection;
+  extensions?: import('./extensions.ts').ExtensionSelection;
   updatedAt: string;
 };
 
@@ -147,7 +148,8 @@ export type DesktopInvoiceFormInspection = {
   draft: import('./invoice.ts').InvoiceFormDraft;
 };
 
-export type DesktopBridge = {
+export type DesktopBridge = Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
+  | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions'> & {
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
   updateResourceSelection(input: import('./resources.ts').ResourceSelectionRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceSelectionResult>>;
