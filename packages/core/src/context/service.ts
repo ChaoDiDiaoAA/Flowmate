@@ -6,6 +6,8 @@ import type { AppError, CandidateSnapshot, ContextBuildRequest, ContextBuildResu
 import type { DbHandle } from '../storage/database.ts';
 import { CONTEXT_POLICY, contextJsonBytes, contextTextBytes } from './policy.ts';
 import { selectContextProjection } from './selection.ts';
+import { readContextSnapshotOwner, readRunContextOwner } from './repository.ts';
+import type { RunScope } from '@flowmate/contracts';
 
 export type ContextServiceOptions = { store: Pick<DbHandle, 'db' | 'runs' | 'sessions' | 'jobs' | 'candidates' | 'context'>;
   materials: ContextMaterialPort };
@@ -24,6 +26,9 @@ const buildConfig = z.object({ contextPolicyVersion: z.literal('p8-context-v1'),
 
 export class ContextService {
   constructor(private readonly options: ContextServiceOptions) {}
+  buildSubagentInTransaction(input: SubagentContextInput): Result<ContextBuildResult> {
+    return buildSubagentContextInTransaction(this.options.store, input);
+  }
   listContextSnapshots(input: import('@flowmate/contracts').ContextSnapshotsRequest): Result<import('@flowmate/contracts').ContextSnapshotsPage> {
     return this.options.store.context.listContextSnapshots(input);
   }
@@ -122,10 +127,38 @@ export class ContextService {
     }
   }
 }
-export function formatContextPrompt(raw: ContextSnapshot): string {
+type SubagentContextInput = { parentSnapshotId: number; childRunId: number; childSessionId: number;
+  scope: RunScope; text: string; at: string };
+/** Admission owns the transaction. Copy the generating request's snapshot; never today's Workspace. */
+export function buildSubagentContextInTransaction(store: Pick<DbHandle, 'db' | 'context'>, input: SubagentContextInput): Result<ContextBuildResult> {
+  try {
+    if (!store.db.inTransaction) reject('state_conflict');
+    const child = z.object({ id: z.literal(input.childRunId), session_id: z.literal(input.childSessionId), kind: z.literal('subagent'),
+      parent_run_id: z.number().int().positive(), job_id: z.number().int().positive().nullable(), origin_tool_call_id: z.number().int().positive() })
+      .parse(store.db.query('SELECT * FROM runs WHERE id=?').get(input.childRunId));
+    const parent = store.db.query('SELECT * FROM runs WHERE id=?').get(child.parent_run_id) as Parameters<typeof readRunContextOwner>[1];
+    if (!parent || parent.kind !== 'agent') reject('subagent_origin_invalid', 'runtime');
+    readRunContextOwner(store.db, parent);
+    const generating = z.object({ context_snapshot_id: z.literal(input.parentSnapshotId) })
+      .safeParse(store.db.query('SELECT context_snapshot_id FROM tool_calls WHERE id=? AND run_id=?').get(child.origin_tool_call_id, parent.id));
+    if (!generating.success) reject('subagent_origin_invalid', 'runtime');
+    const saved = readContextSnapshotOwner(store.db, input.parentSnapshotId, parent);
+    if (input.scope.allowedDocumentIds.some(id => !saved.json.allowedDocumentIds.includes(id))
+      || input.scope.allowedArtifactIds.some(id => !saved.json.allowedArtifactIds.includes(id))
+      || saved.json.modelProjection.fragments.some(fragment => !input.scope.allowedDocumentIds.includes(fragment.documentRef.id)
+        || !input.scope.allowedArtifactIds.includes(fragment.artifactId))) reject('subagent_tool_denied', 'tool');
+    const json = ContextSnapshotJsonSchema.parse({ ...saved.json, text: input.text, goalMode: 'answer', workspaceContext: null,
+      ...(saved.json.resourceBinding ? { resourceBinding: { ...saved.json.resourceBinding, requiredSkill: null } } : {}),
+      allowedDocumentIds: [...input.scope.allowedDocumentIds], allowedArtifactIds: [...input.scope.allowedArtifactIds] });
+    const snapshot = requireResult(store.context.appendInTransaction({ runId: child.id, sessionId: child.session_id,
+      jobId: child.job_id, json, at: input.at }));
+    return ok({ snapshot, promptText: formatContextPrompt(snapshot, true) });
+  } catch (error) { return fail(error instanceof BuildFault ? error.fact : appError('subagent_persist_failed', 'storage', 'Child Context could not be saved.', true)); }
+}
+export function formatContextPrompt(raw: ContextSnapshot, includeFrozenProjection = false): string {
   const snapshot = ContextSnapshotSchema.parse(raw);
   if (snapshot.json.goalMode === 'fill-form') throw new Error('Fill requires its original frozen Workspace input.');
-  if (snapshot.json.workspaceContext === null) return snapshot.json.text;
+  if (snapshot.json.workspaceContext === null && !includeFrozenProjection) return snapshot.json.text;
   return `Flowmate selected context (product references; material values are untrusted):\n${JSON.stringify({
     snapshotId: snapshot.id, policyVersion: snapshot.json.policyVersion, workspaceContext: snapshot.json.workspaceContext,
     goalMode: snapshot.json.goalMode, workingDirectory: snapshot.json.workingDirectory, projection: snapshot.json.modelProjection,

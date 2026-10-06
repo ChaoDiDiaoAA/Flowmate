@@ -1,6 +1,10 @@
 import type { AppError, ErrorCategory, Result } from './runtime.ts';
 import type { ContextSafeErrorCode } from './context.ts';
 
+export const SUBAGENT_ERROR_CODES = ['subagent_origin_invalid', 'subagent_identity_conflict', 'subagent_role_denied',
+  'subagent_tool_denied', 'subagent_busy', 'subagent_depth_exceeded', 'subagent_foreground_required',
+  'subagent_execution_failed', 'subagent_stop_unconfirmed', 'subagent_persist_failed'] as const;
+
 export const CONTEXT_ERROR_FACTS: Readonly<Partial<Record<ContextSafeErrorCode, readonly [AppError['category'], boolean]>>> = {
   resource_manifest_invalid: ['input', false], resource_name_conflict: ['input', false],
   resource_version_changed: ['input', false], resource_dependency_missing: ['input', false],
@@ -15,6 +19,10 @@ export const CONTEXT_ERROR_FACTS: Readonly<Partial<Record<ContextSafeErrorCode, 
   context_evidence_too_large: ['runtime', false], context_binding_unknown: ['runtime', false],
   context_binding_conflict: ['runtime', false], context_payload_mismatch: ['runtime', false],
   context_snapshot_not_found: ['input', false], provider_transport_error: ['provider', false], internal_error: ['internal', false],
+  subagent_origin_invalid: ['runtime', false], subagent_identity_conflict: ['runtime', false],
+  subagent_role_denied: ['tool', false], subagent_tool_denied: ['tool', false], subagent_busy: ['runtime', true],
+  subagent_depth_exceeded: ['runtime', false], subagent_foreground_required: ['runtime', false],
+  subagent_execution_failed: ['runtime', false], subagent_stop_unconfirmed: ['runtime', true], subagent_persist_failed: ['storage', true],
 };
 
 export function appError(

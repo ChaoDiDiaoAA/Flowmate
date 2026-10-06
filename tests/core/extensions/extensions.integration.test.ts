@@ -24,19 +24,20 @@ function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p12-catalog-')), resourceRoot = join(root, 'author');
   mkdirSync(join(resourceRoot, 'extensions'), { recursive: true });
   const file = join(resourceRoot, 'extensions', 'invoice-v1.json'); writeFileSync(file, JSON.stringify(manifest));
+  writeFileSync(join(resourceRoot, 'extensions', 'subagents-v1.json'), readFileSync(join(import.meta.dir, '../../../resources/extensions/subagents-v1.json')));
   return { root, resourceRoot, file };
 }
 function makeCatalog(resourceRoot: string, sdkVersion = '0.85.1') {
   const create = Reflect.get(core, 'createExtensionService');
   expect(typeof create).toBe('function');
-  return create?.({ resourceRoot, sdkVersion, registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }] });
+  return create?.({ resourceRoot, sdkVersion, registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }, { name: 'Agent', version: '0.19.0-p13.1', effect: 'READ' }] });
 }
 
 describe('P12 trusted extension selection', () => {
   it('[F12-02/04] freezes only eligible tools without enabling an excluded extension', () => {
     const f = fixture(), hub = makeCatalog(f.resourceRoot);
     if (!hub) return;
-    expect(hub.list()).toMatchObject({ ok: true, data: [{ ref, compatibility: { available: true, code: null } }] });
+    expect(hub.list()).toMatchObject({ ok: true, data: [{ ref, compatibility: { available: true, code: null } }, { ref: { id: 'subagents' }, compatibility: { available: true, code: null } }] });
     const input = { selection, settingsRevision: 7, activeToolNames: ['check_invoice_sources'], policy: 'p3' as const };
     expect(hub.freeze(input)).toMatchObject({ ok: true, data: { settingsRevision: 7, selected: [ref], included: [{ ref, manifest }], excluded: [] } });
     for (const change of [{ activeToolNames: [] }, { policy: 'p2' as const }, { policy: 'fill' as const }])
@@ -49,7 +50,7 @@ describe('P12 trusted extension selection', () => {
     const f = fixture(), hub = makeCatalog(f.resourceRoot);
     if (!hub) return;
     expect(hub.validateSelection(selection)).toMatchObject({ ok: true });
-    expect(makeCatalog(f.resourceRoot, '1.0.2')?.list()).toMatchObject({ ok: true, data: [{ compatibility: { available: false, code: 'sdk_version_mismatch' } }] });
+    expect(makeCatalog(f.resourceRoot, '1.0.2')?.list()).toMatchObject({ ok: true, data: [{ compatibility: { available: false, code: 'sdk_version_mismatch' } }, { compatibility: { available: false, code: 'sdk_version_mismatch' } }] });
     expect(makeCatalog(f.resourceRoot, '1.0.2')?.validateSelection(selection)).toMatchObject({ ok: false, error: { code: 'extension_incompatible' } });
     writeFileSync(f.file, JSON.stringify({ ...manifest, entryId: 'C:/untrusted.js' }));
     expect(hub.validateSelection(selection)).toMatchObject({ ok: false, error: { code: 'extension_config_invalid' } });

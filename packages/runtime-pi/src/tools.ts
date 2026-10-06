@@ -8,8 +8,9 @@ export function toPiTool(
   definition: ToolDefinition<any, any>,
   execute: (toolCallId: string, input: unknown, signal?: AbortSignal) => Promise<AgentToolResult<unknown>>,
   invalidArguments?: (raw: unknown) => void,
+  nativeParameters?: TSchema,
 ): PiToolDefinition {
-  const parameters = getNativeToolParameters(definition) ?? toPiParameters(definition.inputSchema) as TSchema;
+  const parameters = nativeParameters ?? getNativeToolParameters(definition) ?? toPiParameters(definition.inputSchema) as TSchema;
   return {
     name: definition.name,
     label: definition.label ?? definition.name,

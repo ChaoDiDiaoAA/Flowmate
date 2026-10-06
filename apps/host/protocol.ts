@@ -1,6 +1,8 @@
 import { z } from 'zod';
 export { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure } from '../../packages/contracts/src/extensions.ts';
 export { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../packages/contracts/src/resources.ts';
+export { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure } from '../../packages/contracts/src/subagents.ts';
+import { ListSubagentsRequestSchema, QuerySubagentRequestSchema, CancelSubagentRequestSchema } from '@flowmate/contracts';
 import { ResourceRefSchema, ResourceCatalogResultSchema, ResourceFileResultSchema, ResourceSelectionResponseSchema, RunResourceResultSchema,
   RunResourceQuerySchema, RunResourceFileRequestSchema, resourceRefKey } from '@flowmate/contracts';
 import type { AgentRunEvent, DesktopState, ModelAuthNotice, ModelAuthPrompt } from '@flowmate/contracts';
@@ -104,6 +106,9 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_login'), loginRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('save_settings'), settings: z.unknown() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_extensions'), input: SessionExtensionQuerySchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('list_subagents'), input: ListSubagentsRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_subagent'), input: QuerySubagentRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('cancel_subagent'), input: CancelSubagentRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_run_extensions'), input: RunExtensionQuerySchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('execute_extension_command'), input: ExtensionCommandRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('dispose_session_extensions'), input: ExtensionDisposeRequestSchema }).strict(),

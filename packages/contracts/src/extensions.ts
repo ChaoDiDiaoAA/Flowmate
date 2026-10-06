@@ -21,48 +21,70 @@ export const ExtensionRefSchema = z.object({ id: ResourceIdSchema, version: Reso
   manifestHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict().readonly();
 export type ExtensionRef = z.infer<typeof ExtensionRefSchema>;
 export function extensionRefKey(ref: ExtensionRef): string { return JSON.stringify([ref.id, ref.version, ref.manifestHash]); }
-export const ExtensionSelectionSchema = z.object({ enabledExtensions: z.array(ExtensionRefSchema).max(1).readonly() }).strict().readonly();
+export const ExtensionSelectionSchema = z.object({ enabledExtensions: z.array(ExtensionRefSchema).max(2).readonly() }).strict()
+  .refine(value => new Set(value.enabledExtensions.map(ref => ref.id)).size === value.enabledExtensions.length, 'Duplicate extension identity.').readonly();
 export type ExtensionSelection = z.infer<typeof ExtensionSelectionSchema>;
 export const EMPTY_EXTENSION_SELECTION: ExtensionSelection = ExtensionSelectionSchema.parse({ enabledExtensions: [] });
 export const AssemblySelectionSnapshotSchema = z.object({ revision: integer, selection: ResourceSelectionSchema,
   extensions: ExtensionSelectionSchema.default(EMPTY_EXTENSION_SELECTION) }).strict().readonly();
 export type AssemblySelectionSnapshot = z.infer<typeof AssemblySelectionSnapshotSchema>;
-export const ExtensionManifestSchema = z.object({ schemaVersion: z.literal(1), kind: z.literal('extension'),
+const manifestCommon = { schemaVersion: z.literal(1), kind: z.literal('extension'),
+  hooks: z.array(z.object({ event: ExtensionHookEventSchema, policy: z.enum(['critical', 'observer']) }).strict().readonly()).length(5).readonly() };
+export const ExtensionManifestSchema = z.discriminatedUnion('id', [z.object({ ...manifestCommon,
   id: z.literal('invoice-assist'), version: z.literal('v1'), sdkVersion: z.literal('0.85.1'), entryId: z.literal('invoice-assist-v1'),
   tools: z.tuple([z.object({ name: z.literal('check_invoice_sources'), version: z.literal('1') }).strict().readonly()]).readonly(),
   commands: z.tuple([z.literal('invoice-assist')]).readonly(),
-  hooks: z.array(z.object({ event: ExtensionHookEventSchema, policy: z.enum(['critical', 'observer']) }).strict().readonly()).length(5).readonly(),
-}).strict().superRefine((value, ctx) => {
+}).strict(), z.object({ ...manifestCommon, id: z.literal('subagents'), version: z.literal('v1'), sdkVersion: z.literal('0.85.1'),
+  entryId: z.literal('pi-subagents-managed-v1'), pluginVersion: z.literal('0.19.0'), patchVersion: z.literal('flowmate-p13.1'),
+  patchHash: z.literal('a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a'),
+  tools: z.tuple([z.object({ name: z.literal('Agent'), version: z.literal('0.19.0-p13.1') }).strict().readonly()]).readonly(),
+  commands: z.tuple([]).readonly(),
+}).strict()]).superRefine((value, ctx) => {
   if (value.hooks.some((hook, index) => hook.event !== EXTENSION_HOOKS[index].event || hook.policy !== EXTENSION_HOOKS[index].policy))
     report(ctx, 'Hook declarations must match the supported extension and their required policies.');
 }).readonly();
 export type ExtensionManifest = z.infer<typeof ExtensionManifestSchema>;
-export function canonicalExtensionManifest(value: ExtensionManifest): string { return JSON.stringify(ExtensionManifestSchema.parse(value)); }
+export function canonicalExtensionManifest(value: ExtensionManifest): string {
+  const { hooks, ...manifest } = ExtensionManifestSchema.parse(value);
+  return JSON.stringify({ ...manifest, hooks });
+}
 
-export const FrozenExtensionsSchema = z.object({ version: z.literal(1), policyVersion: z.literal('p12-managed-extensions-v1'),
-  settingsRevision: integer, selected: z.array(ExtensionRefSchema).max(1).readonly(),
-  included: z.array(z.object({ ref: ExtensionRefSchema, manifest: ExtensionManifestSchema }).strict().readonly()).max(1).readonly(),
-  excluded: z.array(z.object({ ref: ExtensionRefSchema, code: z.literal('tool_not_active') }).strict().readonly()).max(1).readonly(),
+export const FrozenExtensionsSchema = z.object({ version: z.literal(1), policyVersion: z.enum(['p12-managed-extensions-v1', 'p13-managed-extensions-v1']),
+  settingsRevision: integer, selected: z.array(ExtensionRefSchema).max(2).readonly(),
+  included: z.array(z.object({ ref: ExtensionRefSchema, manifest: ExtensionManifestSchema }).strict().readonly()).max(2).readonly(),
+  excluded: z.array(z.object({ ref: ExtensionRefSchema, code: z.literal('tool_not_active') }).strict().readonly()).max(2).readonly(),
 }).strict().superRefine((value, ctx) => {
   const selected = value.selected.map(extensionRefKey), partition = [...value.included, ...value.excluded].map(item => extensionRefKey(item.ref));
   if (selected.length !== partition.length || new Set(partition).size !== partition.length || partition.some(key => !selected.includes(key)))
     report(ctx, 'Included and excluded must partition the original selection exactly.');
   if (value.included.some(item => item.ref.id !== item.manifest.id || item.ref.version !== item.manifest.version))
     report(ctx, 'Manifest identity must match its reference.');
+  if (new Set(value.selected.map(ref => ref.id)).size !== value.selected.length
+    || value.policyVersion === 'p12-managed-extensions-v1' && (value.selected.length > 1 || value.selected.some(ref => ref.id !== 'invoice-assist')))
+    report(ctx, 'Historical P12 selection cannot expand.');
+  if (value.included.length === 2 && value.included[0].ref.id !== 'invoice-assist') report(ctx, 'Assembly order must be invoice-assist then subagents.');
 }).readonly();
 export type FrozenExtensions = z.infer<typeof FrozenExtensionsSchema>;
 const actualTools = z.tuple([z.literal('check_invoice_sources')]).readonly();
 const actualCommands = z.tuple([z.literal('invoice-assist')]).readonly();
+const registeredTools = z.array(z.enum(['check_invoice_sources', 'Agent'])).max(1).readonly();
+const registeredCommands = z.array(z.literal('invoice-assist')).max(1).readonly();
+function matchesRegistration(value: { ref: ExtensionRef; registeredTools: readonly string[]; registeredCommands: readonly string[] }): boolean {
+  return value.ref.id === 'invoice-assist' ? actualTools.safeParse(value.registeredTools).success && actualCommands.safeParse(value.registeredCommands).success
+    : value.ref.id === 'subagents' && value.registeredTools.length === 1 && value.registeredTools[0] === 'Agent' && value.registeredCommands.length === 0;
+}
 const actualHooks = z.array(ExtensionHookEventSchema).length(5).readonly().refine(
   values => values.every((value, index) => value === EXTENSION_HOOKS[index].event), 'Actual Hooks must match the required set.');
 export const ExtensionAssemblyEvidenceSchema = z.object({ version: z.literal(1), sdkVersion: z.literal('0.85.1'),
   instances: z.array(z.object({ instanceId, ref: ExtensionRefSchema, nativeSessionId: opaque, activatedAt: timestamp,
-    registeredTools: actualTools, registeredCommands: actualCommands, hookEvents: actualHooks }).strict().readonly()).max(1).readonly(),
-}).strict().readonly();
+    registeredTools, registeredCommands, hookEvents: actualHooks }).strict().refine(matchesRegistration, 'Wrong extension registrations.').readonly()).max(2).readonly(),
+}).strict().refine(value => new Set(value.instances.map(item => item.instanceId)).size === value.instances.length
+  && new Set(value.instances.map(item => item.ref.id)).size === value.instances.length, 'Duplicate assembly identity.').readonly();
 export type ExtensionAssemblyEvidence = z.infer<typeof ExtensionAssemblyEvidenceSchema>;
 export function matchesExtensionAssembly(frozen: FrozenExtensions, assembly: ExtensionAssemblyEvidence, nativeSessionId?: string): boolean {
   return frozen.included.length === assembly.instances.length && assembly.instances.every((item, index) =>
     extensionRefKey(item.ref) === extensionRefKey(frozen.included[index].ref)
+    && matchesRegistration(item)
     && (nativeSessionId === undefined || item.nativeSessionId === nativeSessionId));
 }
 export const ExtensionInstanceStateSchema = z.enum(['loading', 'active', 'load_failed', 'disposed']);
@@ -87,7 +109,7 @@ export const ExtensionInstanceViewSchema = z.object({ instanceId, ref: Extension
 }).strict().superRefine((value, ctx) => {
   if (value.state !== 'active' && value.admission !== 'closed') report(ctx, 'Only an active instance can admit calls.');
   if (value.state === 'active' && (value.activatedAt === null || value.disposedAt !== null
-    || !actualTools.safeParse(value.registeredTools).success || !actualCommands.safeParse(value.registeredCommands).success
+    || !matchesRegistration(value)
     || !actualHooks.safeParse(value.hookEvents).success)) report(ctx, 'Active requires actual registrations and activation evidence.');
   if (value.state === 'loading' && value.activatedAt !== null) report(ctx, 'Loading cannot already be activated.');
   if (value.state === 'disposed' ? value.disposedAt === null || !isExtensionCleanupComplete(value.cleanup) : value.disposedAt !== null)
@@ -102,7 +124,7 @@ export const ExtensionCatalogItemSchema = z.object({ ref: ExtensionRefSchema, ma
 }).readonly();
 export type ExtensionCatalogItem = z.infer<typeof ExtensionCatalogItemSchema>;
 export const ExtensionCatalogSchema = z.object({ revision: integer, selection: ExtensionSelectionSchema,
-  items: z.array(ExtensionCatalogItemSchema).max(1).readonly() }).strict().readonly();
+  items: z.array(ExtensionCatalogItemSchema).max(2).readonly() }).strict().readonly();
 export type ExtensionCatalog = z.infer<typeof ExtensionCatalogSchema>;
 export const ExtensionSelectionRequestSchema = z.object({ expectedRevision: integer, selection: ExtensionSelectionSchema }).strict();
 export type ExtensionSelectionRequest = z.infer<typeof ExtensionSelectionRequestSchema>;
@@ -110,12 +132,15 @@ export const ExtensionSelectionResultSchema = z.object({ revision: integer, sele
 export type ExtensionSelectionResult = z.infer<typeof ExtensionSelectionResultSchema>;
 export const SessionExtensionQuerySchema = z.object({ sessionId: id }).strict();
 export type SessionExtensionQuery = z.infer<typeof SessionExtensionQuerySchema>;
-export const NativeExtensionViewSchema = z.object({ nativeSessionId: opaque, instance: ExtensionInstanceViewSchema.nullable() }).strict().readonly();
+const instanceViews = z.array(ExtensionInstanceViewSchema).max(2).readonly();
+const validInstanceOwners = (value: { nativeSessionId: string; instances: readonly ExtensionInstanceView[] }) =>
+  value.instances.every(item => item.nativeSessionId === value.nativeSessionId)
+  && new Set(value.instances.map(item => item.instanceId)).size === value.instances.length
+  && new Set(value.instances.map(item => item.ref.id)).size === value.instances.length;
+export const NativeExtensionViewSchema = z.object({ nativeSessionId: opaque, instances: instanceViews }).strict().refine(validInstanceOwners, 'Wrong instance owner.').readonly();
 export type NativeExtensionView = z.infer<typeof NativeExtensionViewSchema>;
 export const SessionExtensionViewSchema = z.object({ sessionId: id, nativeSessionId: opaque,
-  instance: ExtensionInstanceViewSchema.nullable() }).strict().superRefine((value, ctx) => {
-  if (value.instance && value.nativeSessionId !== value.instance.nativeSessionId) report(ctx, 'Wrong native Session.');
-}).readonly();
+  instances: instanceViews }).strict().refine(validInstanceOwners, 'Wrong instance owner.').readonly();
 export type SessionExtensionView = z.infer<typeof SessionExtensionViewSchema>;
 export const RunExtensionQuerySchema = z.object({ sessionId: id, runId: id }).strict();
 export type RunExtensionQuery = z.infer<typeof RunExtensionQuerySchema>;
@@ -185,7 +210,7 @@ export function matchesExtensionResponse(command: { type: string; input?: unknow
   if (captured.type === 'list_extensions') return 'items' in data;
   if (!('sessionId' in data) || data.sessionId !== captured.input.sessionId) return false;
   if (captured.type === 'query_run_extensions') return 'runId' in data && data.runId === captured.input.runId;
-  if (captured.type === 'query_session_extensions') return 'instance' in data;
+  if (captured.type === 'query_session_extensions') return 'instances' in data;
   return 'instanceId' in data && data.instanceId === captured.input.expectedInstanceId
     && (captured.type !== 'execute_extension_command' || 'name' in data && data.name === captured.input.name);
 }

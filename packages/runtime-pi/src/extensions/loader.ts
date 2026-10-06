@@ -5,16 +5,20 @@ import { appError, NativeExtensionCommandReceiptSchema, ExtensionAssemblyEvidenc
 import type { AppError, ExtensionAssemblyEvidence, ExtensionHookEvent, ExtensionInstanceView, FrozenExtensions, NativeExtensionCommandReceipt,
   RequestContextBinding, Result, RunScope } from '@flowmate/contracts';
 import { createInvoiceAssistExtension } from './invoice.ts';
+import { createSubagentExtension } from './subagents.ts';
 
 export type CallTicket = { instanceId: string; nativeSessionId: string; runId: number; sessionId: number;
   nativeToolCallId: string; requestBinding: RequestContextBinding; scope: RunScope };
 type CommandTicket = { operationId: string; instanceId: string; nativeSessionId: string };
 export type ExtensionScope = ReturnType<typeof createScope>;
-export type LoadedExtensionSet = { result: LoadExtensionsResult | null; scope: ExtensionScope; error: AppError | null };
-function createScope(input: { frozen: FrozenExtensions; nativeSessionId: string;
+export type LoadedExtensionSet = { result: LoadExtensionsResult | null; scopes: ExtensionScope[]; error: AppError | null };
+export function extensionAssembly(loaded: LoadedExtensionSet): ExtensionAssemblyEvidence {
+  return ExtensionAssemblyEvidenceSchema.parse({ version: 1, sdkVersion: '0.85.1', instances: loaded.scopes.flatMap(scope => scope.evidence().instances) });
+}
+function createScope(input: { selected: FrozenExtensions['included'][number]; nativeSessionId: string;
   assertCallOwner: (event: { toolName: string; toolCallId: string }, instanceId: string) => Result<CallTicket>;
   onCriticalFailure: (error: AppError, instanceId: string) => void }) {
-  const selected = input.frozen.included[0]!, now = () => new Date().toISOString();
+  const selected = input.selected, now = () => new Date().toISOString();
   const view: Omit<{ -readonly [K in keyof ExtensionInstanceView]: ExtensionInstanceView[K] }, 'cleanup'> & {
     cleanup: { -readonly [K in keyof ExtensionInstanceView['cleanup']]: ExtensionInstanceView['cleanup'][K] }
   } = { instanceId: randomUUID(), ref: selected.ref, nativeSessionId: input.nativeSessionId,
@@ -84,32 +88,41 @@ function createScope(input: { frozen: FrozenExtensions; nativeSessionId: string;
 }
 
 /** Public SDK loader, with discovery disabled and a closed registration ledger. */
-export async function loadControlledExtensions(input: { frozen: FrozenExtensions; nativeSessionId: string; sdkTool: ToolDefinition;
+export async function loadControlledExtensions(input: { frozen: FrozenExtensions; nativeSessionId: string;
+  sdkToolFor: (name: string, nativeParameters?: ToolDefinition['parameters']) => ToolDefinition;
+  subagent: Omit<Parameters<typeof createSubagentExtension>[0], 'scope' | 'sdkTool'>;
   cwd: string; agentDir: string; signal: AbortSignal; onCreated: (loaded: LoadedExtensionSet) => void;
   assertCallOwner: Parameters<typeof createScope>[0]['assertCallOwner']; onCriticalFailure: (error: AppError, instanceId: string) => void }): Promise<LoadedExtensionSet> {
-  const frozen = FrozenExtensionsSchema.parse(input.frozen), scope = createScope({ ...input, frozen });
-  const loaded: LoadedExtensionSet = { result: null, scope, error: null }; input.onCreated(loaded);
-  let registrationOpen = true;
+  const frozen = FrozenExtensionsSchema.parse(input.frozen), scopes = frozen.included.map(selected => createScope({ ...input, selected }));
+  const loaded: LoadedExtensionSet = { result: null, scopes, error: null }; input.onCreated(loaded);
   let registrationFailure: AppError | null = null;
-  const conflict = () => { registrationFailure = appError('extension_registration_conflict', 'extension', 'Extension registration does not match the controlled manifest.'); throw registrationFailure; };
   try {
-    if (VERSION !== '0.85.1' || frozen.included.length !== 1 || input.sdkTool.name !== 'check_invoice_sources')
+    if (VERSION !== '0.85.1' || frozen.included.length < 1)
       throw appError('extension_incompatible', 'extension', 'Installed SDK or source tool is incompatible.');
-    const manifest = frozen.included[0]!.manifest;
-    const factory = createInvoiceAssistExtension({ sdkTool: input.sdkTool, scope });
-    const loader = new DefaultResourceLoader({ cwd: input.cwd, agentDir: input.agentDir,
-      settingsManager: SettingsManager.inMemory({ packages: [], extensions: [], skills: [], prompts: [], themes: [] }),
-      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      additionalExtensionPaths: [], additionalSkillPaths: [], additionalPromptTemplatePaths: [], additionalThemePaths: [],
-      systemPrompt: 'Controlled Flowmate extension assembly.', appendSystemPrompt: [],
-      extensionFactories: [{ name: extensionRefKey(frozen.included[0]!.ref), factory: async pi => {
+    const factories = frozen.included.map((selected, index) => {
+      const scope = scopes[index]!, manifest = selected.manifest;
+      const toolName = manifest.tools[0]!.name;
+      let sdkTool: ToolDefinition;
+      const factory = manifest.id === 'invoice-assist' ? createInvoiceAssistExtension({ sdkTool: sdkTool = input.sdkToolFor(toolName), scope })
+        : createSubagentExtension({ ...input.subagent, sdkTool: parameters => sdkTool = input.sdkToolFor(toolName, parameters), scope });
+      let registrationOpen = true;
+      const conflict = () => {
+        const error = registrationFailure ??= appError('extension_registration_conflict', 'extension', 'Extension registration does not match the controlled manifest.');
+        scope.fail(error); input.onCriticalFailure(error, scope.view.instanceId); throw error;
+      };
+      return { name: extensionRefKey(selected.ref), factory: async (pi: ExtensionAPI) => {
         const guarded = new Proxy(pi, { get(target, property) {
           if (property === 'registerTool') return (tool: ToolDefinition) => {
-            if (!registrationOpen || tool !== input.sdkTool || viewTools().includes(tool.name) || !manifest.tools.some(item => item.name === tool.name)) conflict();
-            Reflect.apply(target.registerTool, target, [tool]); scope.view.registeredTools = [...viewTools(), tool.name];
+            // The plugin's raw tool is captured inside its factory; only the product wrapper reaches this registry.
+            if (!registrationOpen || !sdkTool || tool.name !== sdkTool.name || manifest.id === 'invoice-assist' && tool !== sdkTool
+              || scopes.some(owner => owner.view.registeredTools.includes(tool.name))
+              || !manifest.tools.some(item => item.name === tool.name)
+              || JSON.stringify(tool.parameters) !== JSON.stringify(sdkTool.parameters)) conflict();
+            Reflect.apply(target.registerTool, target, [tool]); scope.view.registeredTools = [...scope.view.registeredTools, tool.name];
           };
           if (property === 'registerCommand') return (name: string, options: unknown) => {
-            if (!registrationOpen || !manifest.commands.includes(name as 'invoice-assist') || scope.view.registeredCommands.includes(name)) conflict();
+            if (!registrationOpen || !(manifest.commands as readonly string[]).includes(name)
+              || scopes.some(owner => owner.view.registeredCommands.includes(name))) conflict();
             Reflect.apply(target.registerCommand, target, [name, options]); scope.view.registeredCommands = [...scope.view.registeredCommands, name];
           };
           if (property === 'on') return (event: ExtensionHookEvent, handler: (...args: any[]) => unknown) => {
@@ -119,22 +132,31 @@ export async function loadControlledExtensions(input: { frozen: FrozenExtensions
           };
           return () => conflict();
         } }) as ExtensionAPI;
-        try { await factory(guarded); } finally { registrationOpen = false; }
-      } }],
+        try { await factory(guarded); } finally { registrationOpen = false; scope.factorySettled(); }
+      } };
     });
-    function viewTools() { return scope.view.registeredTools; }
+    const loader = new DefaultResourceLoader({ cwd: input.cwd, agentDir: input.agentDir,
+      settingsManager: SettingsManager.inMemory({ packages: [], extensions: [], skills: [], prompts: [], themes: [] }),
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      additionalExtensionPaths: [], additionalSkillPaths: [], additionalPromptTemplatePaths: [], additionalThemePaths: [],
+      systemPrompt: 'Controlled Flowmate extension assembly.', appendSystemPrompt: [],
+      extensionFactories: factories,
+    });
     await loader.reload(); loaded.result = loader.getExtensions();
     if (registrationFailure) throw registrationFailure;
-    if (loaded.result.errors.length || loaded.result.extensions.length !== 1
-      || JSON.stringify(scope.view.registeredTools) !== JSON.stringify(manifest.tools.map(item => item.name))
-      || JSON.stringify(scope.view.registeredCommands) !== JSON.stringify(manifest.commands)
-      || JSON.stringify(scope.view.hookEvents) !== JSON.stringify(manifest.hooks.map(item => item.event)))
+    if (loaded.result.errors.length || loaded.result.extensions.length !== scopes.length
+      || frozen.included.some(({ manifest }, index) => {
+        const scope = scopes[index]!;
+        return JSON.stringify(scope.view.registeredTools) !== JSON.stringify(manifest.tools.map(item => item.name))
+          || JSON.stringify(scope.view.registeredCommands) !== JSON.stringify(manifest.commands)
+          || JSON.stringify(scope.view.hookEvents) !== JSON.stringify(manifest.hooks.map(item => item.event));
+      }))
       throw appError('extension_load_failed', 'extension', 'Controlled Extension registration is incomplete.', true);
     if (input.signal.aborted) throw appError('agent_cancelled', 'runtime', 'Extension loading was cancelled.');
   } catch (error) {
     loaded.error = error && typeof error === 'object' && 'code' in error ? error as AppError
       : appError('extension_load_failed', 'extension', 'Controlled Extension could not be loaded.', true);
-    scope.fail(loaded.error);
-  } finally { registrationOpen = false; scope.factorySettled(); }
+    for (const scope of scopes) scope.fail(loaded.error);
+  } finally { for (const scope of scopes) scope.factorySettled(); }
   return loaded;
 }

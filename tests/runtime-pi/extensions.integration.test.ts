@@ -13,6 +13,7 @@ import { resolveProductPaths } from '../../packages/shared/src/paths.ts';
 import { createExtensionService } from '../../packages/core/src/extensions/service.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import * as invoiceExtension from '../../packages/runtime-pi/src/extensions/invoice.ts';
+import { createSubagentTool } from '../../packages/core/src/subagents.ts';
 import { DocumentService } from '../../packages/data/src/documents.ts';
 import { createHttpProvider, deferCleanup, mkdtempSync, waitFor } from '../support/resources.ts';
 
@@ -20,12 +21,16 @@ function need<T>(value: Result<T>): T { if (!value.ok) throw new Error(value.err
 const tool: ToolDefinition<any, any> = { name: 'check_invoice_sources', version: '1', effect: 'READ',
   description: 'Verify invoice sources', inputSchema: invoiceToolSchemas.check_invoice_sources.input,
   outputSchema: invoiceToolSchemas.check_invoice_sources.output, executionMode: 'parallel', execute: async () => { throw new Error('No model call expected'); } };
-function fixture() {
+function fixture(subagents = false) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p12-sdk-'));
-  const catalog = createExtensionService({ resourceRoot: resolve(import.meta.dir, '../../resources'), sdkVersion: '0.85.1', registeredTools: [tool] });
-  const ref = need(catalog.list())[0]!.ref;
+  const tools: ToolDefinition<any, any>[] = subagents ? [tool, createSubagentTool(() => adapter), ...(['read_invoice_document', 'read_invoice_evidence'] as const).map(name => ({
+    name, version: '1', description: name, effect: 'READ' as const, executionMode: 'parallel' as const,
+    inputSchema: invoiceToolSchemas[name].input, outputSchema: invoiceToolSchemas[name].output,
+    execute: async () => { throw new Error('Registry-only fixture must never execute business tools'); } }))] : [tool];
+  const catalog = createExtensionService({ resourceRoot: resolve(import.meta.dir, '../../resources'), sdkVersion: '0.85.1', registeredTools: tools });
+  const refs = need(catalog.list()).filter(item => subagents || item.ref.id === 'invoice-assist').map(item => item.ref);
   let native!: AgentSession;
-  const adapter = new PiAgentAdapter({ cwd: root, agentDir: root, tools: [tool], credentials: new InMemoryCredentialStore(),
+  const adapter = new PiAgentAdapter({ cwd: root, agentDir: root, tools, credentials: new InMemoryCredentialStore(),
     runtimeApiKey: 'p12-loopback-only', sessionSetup: session => { native = session; } });
   deferCleanup(() => adapter.close());
   const config: ProviderConfig = { version: 1, name: 'P12', revision: 1, modelRef: { provider: 'p12', model: 'p12' },
@@ -33,10 +38,26 @@ function fixture() {
     connection: { baseUrl: 'http://127.0.0.1:9/v1', api: 'openai-completions', contextWindow: 64000, maxTokens: 16000 },
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
   const sid = need(adapter.createSession()).nativeSessionId;
-  const freeze = (policy: 'p2' | 'p3' | 'fill', enabled = true) => need(catalog.freeze({ selection: { enabledExtensions: enabled ? [ref] : [] },
-    settingsRevision: 1, activeToolNames: ['check_invoice_sources'], policy }));
+  const freeze = (policy: 'p2' | 'p3' | 'fill', enabled = true) => need(catalog.freeze({ selection: { enabledExtensions: enabled ? refs : [] },
+    settingsRevision: 1, activeToolNames: tools.map(item => item.name), policy }));
   return { root, adapter, sid, config, freeze, native: () => native };
 }
+
+it('[F13-02/06/27] loads both actual controlled factories, keeps distinct owners and starts zero children', async () => {
+  const f = fixture(true), frozen = f.freeze('p3');
+  const prepared = need(await f.adapter.prepare(f.sid, f.config, { timeoutMs: 1000, stopGraceMs: 1000 }, new AbortController().signal,
+    { activeToolNames: ['Agent', 'check_invoice_sources', 'read_invoice_document', 'read_invoice_evidence'], extensions: frozen }));
+  const instances = prepared.snapshot.extensionAssembly!.instances;
+  expect(instances.map(item => item.ref.id)).toEqual(['invoice-assist', 'subagents']);
+  expect(new Set(instances.map(item => item.instanceId)).size).toBe(2);
+  expect(f.native().extensionRunner.getAllRegisteredTools().map(item => item.definition.name)).toEqual(['check_invoice_sources', 'Agent']);
+  expect(f.native().getActiveToolNames()).toEqual(['Agent', 'check_invoice_sources', 'read_invoice_document', 'read_invoice_evidence']);
+  expect(f.native().sessionManager.getEntries().filter(item => item.type === 'message')).toHaveLength(0);
+  expect(await f.adapter.releaseSession(f.sid)).toMatchObject({ stopped: true, closed: true });
+  expect(need(f.adapter.inspectExtensions(f.sid)).instances).toMatchObject([
+    { instanceId: instances[0]!.instanceId, state: 'disposed', cleanup: { shutdownAcknowledged: true, sdkDisposed: true } },
+    { instanceId: instances[1]!.instanceId, state: 'disposed', cleanup: { shutdownAcknowledged: true, sdkDisposed: true } }]);
+});
 
 it('[F12-01/05/08] uses the installed public SDK factory, real registration and acknowledged startup', async () => {
   const f = fixture(), frozen = f.freeze('p3');
@@ -50,10 +71,10 @@ it('[F12-01/05/08] uses the installed public SDK factory, real registration and 
   expect(f.native().extensionRunner.getCommand('invoice-assist')).toBeDefined();
   const inspect = Reflect.get(f.adapter, 'inspectExtensions'); expect(typeof inspect).toBe('function');
   expect(need(inspect.call(f.adapter, f.sid))).toMatchObject({ nativeSessionId: f.sid,
-    instance: { state: 'active', admission: 'open', instanceId: actual.instanceId, cleanup: { sdkSessionCreated: true, sdkDisposed: false } } });
+    instances: [{ state: 'active', admission: 'open', instanceId: actual.instanceId, cleanup: { sdkSessionCreated: true, sdkDisposed: false } }] });
   expect(await f.adapter.releaseSession(f.sid)).toMatchObject({ stopped: true, closed: true });
-  expect(need(inspect.call(f.adapter, f.sid))).toMatchObject({ instance: { state: 'disposed', cleanup: {
-    shutdownAcknowledged: true, sdkDisposed: true, ownedCallbacksSettled: true } } });
+  expect(need(inspect.call(f.adapter, f.sid))).toMatchObject({ instances: [{ state: 'disposed', cleanup: {
+    shutdownAcknowledged: true, sdkDisposed: true, ownedCallbacksSettled: true } }] });
 });
 
 it.each(['disabled', 'excluded'] as const)('[F12-04/05] %s retains the ordinary source tool without extension registrations', async mode => {
@@ -85,7 +106,7 @@ it.each(['partial', 'duplicate-tool', 'duplicate-command', 'duplicate-hook', 'mi
     const prepared = await f.adapter.prepare(f.sid, f.config, { timeoutMs: 1000, stopGraceMs: 1000 }, new AbortController().signal,
       { activeToolNames: ['check_invoice_sources'], extensions: f.freeze('p3') });
     expect(prepared.ok).toBe(false);
-    const instance = need(f.adapter.inspectExtensions(f.sid)).instance!;
+    const instance = need(f.adapter.inspectExtensions(f.sid)).instances[0]!;
     expect(instance).toMatchObject({ state: 'disposed', admission: 'closed', activatedAt: null,
       cleanup: { shutdownRequired: false, shutdownAcknowledged: false, sdkSessionCreated: false, sdkDisposed: false, ownedCallbacksSettled: true } });
     expect(instance.lastError?.code).toBe(fault === 'partial' || fault === 'missing-hook' ? 'extension_load_failed' : 'extension_registration_conflict');
@@ -105,10 +126,10 @@ it('[F12-14] keeps a cancelled loading factory owned until it actually settles a
     const preparation = f.adapter.prepare(f.sid, f.config, { timeoutMs: 1000, stopGraceMs: 1000 }, controller.signal,
       { activeToolNames: ['check_invoice_sources'], extensions: f.freeze('p3') });
     await started; controller.abort();
-    expect(need(f.adapter.inspectExtensions(f.sid)).instance).toMatchObject({ state: 'loading', admission: 'closed', cleanup: { ownedCallbacksSettled: false } });
+    expect(need(f.adapter.inspectExtensions(f.sid)).instances[0]).toMatchObject({ state: 'loading', admission: 'closed', cleanup: { ownedCallbacksSettled: false } });
     expect(await f.adapter.releaseSession(f.sid)).toMatchObject({ stopped: false, closed: false });
     finish(); expect(await preparation).toMatchObject({ ok: false, error: { code: 'agent_cancelled' } });
-    expect(need(f.adapter.inspectExtensions(f.sid)).instance).toMatchObject({ state: 'disposed', activatedAt: null });
+    expect(need(f.adapter.inspectExtensions(f.sid)).instances[0]).toMatchObject({ state: 'disposed', activatedAt: null });
     expect(f.native()).toBeUndefined();
   } finally { finish(); injected.mockRestore(); }
 });
@@ -127,11 +148,11 @@ it('[F12-14/16] preserves actual Runtime blocking beyond stop grace until the re
     await started; need(await f.app.cancelRun(accepted.runId));
     expect((await done).result).toMatchObject({ ok: true, data: { status: 'failed', stopped: false } });
     expect(need(await f.app.queryRuntimeState()).blocked).toBe(true);
-    const loading = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!;
+    const loading = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!;
     expect(loading).toMatchObject({ state: 'loading', admission: 'closed', activatedAt: null, cleanup: { ownedCallbacksSettled: false } });
     expect(f.payloads).toHaveLength(0); expect(await f.app.submitInput({ ...f.request, clientSequence: 2 })).toMatchObject({ ok: false });
-    finish(); await waitFor(async () => need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance?.state === 'disposed');
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance).toMatchObject({ instanceId: loading.instanceId, activatedAt: null });
+    finish(); await waitFor(async () => need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]?.state === 'disposed');
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]).toMatchObject({ instanceId: loading.instanceId, activatedAt: null });
     expect(f.payloads).toHaveLength(0);
   } finally { finish(); injected.mockRestore(); }
 });
@@ -139,7 +160,7 @@ it('[F12-14/16] preserves actual Runtime blocking beyond stop grace until the re
 it.each(['shutdown', 'sdk-dispose'] as const)('[F12-16/17] preserves %s failure and retries only unfinished phases on the same UUID', async fault => {
   const f = fixture(); need(await f.adapter.prepare(f.sid, f.config, { timeoutMs: 1000, stopGraceMs: 1000 }, new AbortController().signal,
     { activeToolNames: ['check_invoice_sources'], extensions: f.freeze('p3') }));
-  const runner = f.native().extensionRunner, id = need(f.adapter.inspectExtensions(f.sid)).instance!.instanceId;
+  const runner = f.native().extensionRunner, id = need(f.adapter.inspectExtensions(f.sid)).instances[0]!.instanceId;
   let shutdowns = 0, disposals = 0;
   const originalEmit = runner.emit.bind(runner), originalDispose = f.native().dispose.bind(f.native());
   const emit = spyOn(runner, 'emit').mockImplementation(async event => {
@@ -149,7 +170,7 @@ it.each(['shutdown', 'sdk-dispose'] as const)('[F12-16/17] preserves %s failure 
   const sdk = spyOn(f.native(), 'dispose').mockImplementation(() => { disposals++; if (fault === 'sdk-dispose' && disposals === 1) throw new Error('Controlled SDK failure'); originalDispose(); });
   try {
     expect(need(await f.adapter.disposeExtensions(f.sid, id))).toMatchObject({ state: 'active', report: { stopped: true, closed: false } });
-    expect(need(f.adapter.inspectExtensions(f.sid)).instance).toMatchObject({ admission: 'closed', cleanup: { sdkDisposed: false, shutdownAcknowledged: fault === 'sdk-dispose' } });
+    expect(need(f.adapter.inspectExtensions(f.sid)).instances[0]).toMatchObject({ admission: 'closed', cleanup: { sdkDisposed: false, shutdownAcknowledged: fault === 'sdk-dispose' } });
     expect(need(await f.adapter.disposeExtensions(f.sid, id))).toMatchObject({ state: 'disposed', report: { closed: true } });
     const counts = { shutdowns, disposals };
     expect(need(await f.adapter.disposeExtensions(f.sid, id))).toMatchObject({ state: 'disposed', report: { closed: true } });
@@ -172,6 +193,7 @@ async function businessFixture(options: { sessionSetup?: (session: AgentSession)
   let settings = { revision: 7, selection: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] as import('@flowmate/contracts').ExtensionRef[] } };
   const resourceRoot = join(root, 'author'); mkdirSync(join(resourceRoot, 'extensions'), { recursive: true });
   copyFileSync(resolve(import.meta.dir, '../../resources/extensions/invoice-v1.json'), join(resourceRoot, 'extensions/invoice-v1.json'));
+  copyFileSync(resolve(import.meta.dir, '../../resources/extensions/subagents-v1.json'), join(resourceRoot, 'extensions/subagents-v1.json'));
   if (options.trigger) { const seeded = need(openDatabase(paths)); seeded.db.exec(options.trigger); seeded.close(); }
   const server = await createHttpProvider(async request => {
     payloads.push(await request.json());
@@ -230,22 +252,22 @@ it('[F12-04/08/12/23] fixes the Run choice and actual registration before invoic
   expect(JSON.stringify(payloads[1])).toContain('check_invoice_sources');
   const history = need(adapter.exportSession(session.nativeSessionId));
   expect(history.entries.some(item => item.type === 'message' && item.message !== null && typeof item.message === 'object' && Reflect.get(item.message, 'role') === 'toolResult')).toBe(true);
-  expect(need(adapter.inspectExtensions(session.nativeSessionId)).instance?.state).toBe('active');
+  expect(need(adapter.inspectExtensions(session.nativeSessionId)).instances[0]?.state).toBe('active');
   const query = Reflect.get(app, 'querySessionExtensions'); expect(typeof query).toBe('function');
   const live = need(await query.call(app, { sessionId: session.sessionId })) as any;
-  expect(live.instance.state).toBe('active');
+  expect(live.instances[0].state).toBe('active');
   const historical = Reflect.get(app, 'queryRunExtensions'); expect(typeof historical).toBe('function');
   expect(need(await historical.call(app, { sessionId: session.sessionId, runId: accepted.runId }))).toMatchObject({
     frozen: saved.config.extensions, assembly: saved.config.extensionAssembly,
   });
   const command = Reflect.get(app, 'executeExtensionCommand'); expect(typeof command).toBe('function');
-  expect(need(await command.call(app, { sessionId: session.sessionId, expectedInstanceId: live.instance.instanceId,
-    name: 'invoice-assist', arguments: '' }))).toMatchObject({ instanceId: live.instance.instanceId, name: 'invoice-assist' });
+  expect(need(await command.call(app, { sessionId: session.sessionId, expectedInstanceId: live.instances[0].instanceId,
+    name: 'invoice-assist', arguments: '' }))).toMatchObject({ instanceId: live.instances[0].instanceId, name: 'invoice-assist' });
   const dispose = Reflect.get(app, 'disposeSessionExtensions'); expect(typeof dispose).toBe('function');
-  const disposed = need(await dispose.call(app, { sessionId: session.sessionId, expectedInstanceId: live.instance.instanceId }));
+  const disposed = need(await dispose.call(app, { sessionId: session.sessionId, expectedInstanceId: live.instances[0].instanceId }));
   expect(disposed).toMatchObject({ state: 'disposed', report: { stopped: true, closed: true } });
-  expect(need(await dispose.call(app, { sessionId: session.sessionId, expectedInstanceId: live.instance.instanceId }))).toEqual(disposed);
-  expect(need(await query.call(app, { sessionId: session.sessionId }))).toMatchObject({ instance: { state: 'disposed' } });
+  expect(need(await dispose.call(app, { sessionId: session.sessionId, expectedInstanceId: live.instances[0].instanceId }))).toEqual(disposed);
+  expect(need(await query.call(app, { sessionId: session.sessionId }))).toMatchObject({ instances: [{ state: 'disposed' }] });
   expect(await app.submitInput(request)).toEqual({ ok: true, data: accepted }); expect(payloads).toHaveLength(2);
   need(await app.close());
   const sql = new Database(paths.databaseFile, { readonly: true });
@@ -296,7 +318,7 @@ it.each(['schema', 'document', 'artifact', 'version', 'block', 'quote', 'raw-id'
     expect(reads).toBe(['version', 'block', 'quote'].includes(fault) ? 1 : 0);
     expect(f.payloads).toHaveLength(rawFault ? 1 : 2);
     if (['schema', 'document', 'artifact'].includes(fault))
-      expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!.diagnostics).toContainEqual(expect.objectContaining({
+      expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!.diagnostics).toContainEqual(expect.objectContaining({
         event: 'tool_call', code: fault === 'schema' ? 'input_invalid' : 'scope_invalid' }));
     need(await f.app.close());
     const sql = new Database(f.paths.databaseFile, { readonly: true });
@@ -315,7 +337,7 @@ it.each(['session_start', 'tool_call'] as const)('[F12-10] records a required %s
     const f = await businessFixture(), { terminal } = await f.run();
     expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true, error: { code: 'extension_hook_failed' } } });
     expect(f.payloads).toHaveLength(event === 'session_start' ? 0 : 1);
-    const view = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!;
+    const view = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!;
     expect(view.admission).toBe('closed'); expect(view.diagnostics).toContainEqual(expect.objectContaining({ event, code: 'handler_failed' }));
   } finally { injected.mockRestore(); }
 });
@@ -325,7 +347,7 @@ it.each(['tool_result', 'tool_execution_end'] as const)('[F12-11] contains a rea
   try {
     const f = await businessFixture(), { terminal } = await f.run();
     expect(terminal.result).toMatchObject({ ok: true, data: { status: 'completed' } }); expect(f.payloads).toHaveLength(2);
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance).toMatchObject({ state: 'active', admission: 'open',
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]).toMatchObject({ state: 'active', admission: 'open',
       diagnostics: expect.arrayContaining([expect.objectContaining({ event, code: 'handler_failed' })]) });
     const feedback = f.payloads[1].messages.find((message: any) => message.role === 'tool');
     expect(JSON.parse(feedback.content)).toMatchObject({ results: [{ status: 'valid' }] });
@@ -389,10 +411,10 @@ it('[F12-16/17/22] retains the product management gate after a swallowed shutdow
   });
   try {
     const f = await businessFixture(); await f.run();
-    const instance = need(await f.app.querySessionExtensions({ sessionId: f.session.sessionId })).instance!;
+    const instance = need(await f.app.querySessionExtensions({ sessionId: f.session.sessionId })).instances[0]!;
     const request = { sessionId: f.session.sessionId, expectedInstanceId: instance.instanceId };
     expect(need(await f.app.disposeSessionExtensions(request))).toMatchObject({ state: 'active', report: { stopped: true, closed: false } });
-    expect(need(await f.app.querySessionExtensions({ sessionId: f.session.sessionId })).instance).toMatchObject({
+    expect(need(await f.app.querySessionExtensions({ sessionId: f.session.sessionId })).instances[0]).toMatchObject({
       admission: 'closed', cleanup: { shutdownAcknowledged: false, sdkDisposed: false } });
     expect(await f.app.submitInput({ ...f.request, clientSequence: 2 })).toMatchObject({ ok: false, error: { code: 'session_busy' } });
     expect(need(await f.app.disposeSessionExtensions(request))).toMatchObject({ state: 'disposed', report: { closed: true } });
@@ -407,10 +429,10 @@ it('[F12-16] refuses cleanup while a real observer callback is pending and ackno
   const injected = changeHooks(async (name, handler, args) => { if (name === 'tool_execution_end') { entered(); await barrier; } return handler(...args); });
   try {
     const f = await businessFixture(), running = f.run(); await started;
-    const instance = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!;
+    const instance = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!;
     expect(instance.cleanup.ownedCallbacksSettled).toBe(false);
     expect(await f.adapter.releaseSession(f.session.nativeSessionId)).toMatchObject({ stopped: false, closed: false });
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance?.state).toBe('active');
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]?.state).toBe('active');
     finish(); expect((await running).terminal.result).toMatchObject({ ok: true, data: { status: 'completed' } });
     expect(need(await f.app.disposeSessionExtensions({ sessionId: f.session.sessionId, expectedInstanceId: instance.instanceId })))
       .toMatchObject({ state: 'disposed', report: { stopped: true, closed: true } });
@@ -431,13 +453,13 @@ it.each(['throws', 'missing-receipt', 'stale-receipt'] as const)('[F12-21] canno
   })));
   try {
     const f = await businessFixture(); await f.run();
-    const instanceId = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!.instanceId;
+    const instanceId = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!.instanceId;
     const request = { sessionId: f.session.sessionId, expectedInstanceId: instanceId, name: 'invoice-assist' as const, arguments: '' as const };
     if (fault === 'stale-receipt') expect((await f.app.executeExtensionCommand(request)).ok).toBe(true);
     expect(await f.app.executeExtensionCommand(request)).toMatchObject({ ok: false, error: { code: 'extension_command_failed' } });
     expect(calls).toBe(fault === 'stale-receipt' ? 2 : 1); expect(f.payloads).toHaveLength(2);
     expect(need(await f.app.listSessionRuns({ sessionId: f.session.sessionId })).items).toHaveLength(1);
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance).toMatchObject({ state: 'active', admission: 'open' });
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]).toMatchObject({ state: 'active', admission: 'open' });
   } finally { injected.mockRestore(); }
 });
 
@@ -450,11 +472,11 @@ it('[F12-21/22] shares the command management barrier with Send, branch, fork, d
   const command = spyOn(native.extensionRunner, 'getCommand').mockImplementation(name => {
     const registered = getCommand(name); return registered ? { ...registered, handler: async (...args) => { entered(); await barrier; return registered.handler(...args); } } : undefined;
   });
-  const instanceId = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!.instanceId, sessionId = f.session.sessionId;
+  const instanceId = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!.instanceId, sessionId = f.session.sessionId;
   const pending = f.app.executeExtensionCommand({ sessionId, expectedInstanceId: instanceId, name: 'invoice-assist', arguments: '' });
   try {
     await started;
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!.cleanup.ownedCallbacksSettled).toBe(false);
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!.cleanup.ownedCallbacksSettled).toBe(false);
     const expected = { commitRevision: 0, entryCount: 0, leafId: null };
     const blocked = await Promise.all([
       f.app.submitInput({ ...f.request, clientSequence: 2 }),
@@ -467,7 +489,7 @@ it('[F12-21/22] shares the command management barrier with Send, branch, fork, d
     for (const result of blocked) { expect(result.ok).toBe(false); if (!result.ok) expect(result.error.code).toMatch(/busy/); }
     expect(await f.adapter.close()).toMatchObject({ stopped: false, closed: false });
     finish(); expect(await pending).toMatchObject({ ok: true, data: { instanceId } }); expect(f.payloads).toHaveLength(2);
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!.cleanup.ownedCallbacksSettled).toBe(true);
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!.cleanup.ownedCallbacksSettled).toBe(true);
   } finally { finish(); command.mockRestore(); }
 });
 
@@ -479,11 +501,11 @@ it('[F12-15] changing future configuration during an actual Run never unloads it
   const terminal = new Promise<Extract<AgentRunEvent, { type: 'run_finished' }>>(resolve => { end = resolve; });
   const accepted = need(await f.app.submitInput(f.request, { onEvent(event) { if (event.type === 'run_finished') end(event); } }));
   try {
-    await started; const original = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!; f.changeSelection(false);
+    await started; const original = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!; f.changeSelection(false);
     expect(need(await f.app.queryRunExtensions({ sessionId: f.session.sessionId, runId: accepted.runId })).frozen?.selected).toEqual(f.selection.enabledExtensions);
     expect(await f.app.disposeSessionExtensions({ sessionId: f.session.sessionId, expectedInstanceId: original.instanceId }))
       .toMatchObject({ ok: false, error: { code: 'session_busy' } });
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance).toMatchObject({ instanceId: original.instanceId, state: 'active', admission: 'open' });
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]).toMatchObject({ instanceId: original.instanceId, state: 'active', admission: 'open' });
     const cancelling = f.app.cancelRun(accepted.runId); finish(); need(await cancelling);
     expect((await terminal).result).toMatchObject({ ok: true, data: { status: 'cancelled', stopped: true } });
     expect(need(await f.app.disposeSessionExtensions({ sessionId: f.session.sessionId, expectedInstanceId: original.instanceId })))
@@ -495,23 +517,23 @@ it('[F12-15] changing future configuration during an actual Run never unloads it
 it('[F12-18/20] rebuilds on fixed resource or selection changes and rejects old callbacks or UUIDs without replaying history', async () => {
   let native!: AgentSession;
   const f = await businessFixture({ sessionSetup(session) { native = session; } }); await f.run();
-  const old = native, first = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!;
+  const old = native, first = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!;
   const prefix = need(f.adapter.exportSession(f.session.nativeSessionId)).entries;
   expect((await f.run(2)).terminal.result).toMatchObject({ ok: true, data: { status: 'completed' } });
   // The business Context has new derived resource paths for this Run, so its bundle legitimately rebuilds the Session.
-  expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance?.instanceId).not.toBe(first.instanceId);
+  expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]?.instanceId).not.toBe(first.instanceId);
   f.changeSelection(false); expect((await f.run(3)).terminal.result).toMatchObject({ ok: true, data: { status: 'completed' } });
-  expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance?.state).toBe('disposed');
+  expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]?.state).toBe('disposed');
   expect(native.extensionRunner.getAllRegisteredTools()).toHaveLength(0);
   f.changeSelection(true); expect((await f.run(4)).terminal.result).toMatchObject({ ok: true, data: { status: 'completed' } });
-  const next = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance!;
+  const next = need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]!;
   expect(next.instanceId).not.toBe(first.instanceId);
   expect(need(f.adapter.exportSession(f.session.nativeSessionId)).entries.slice(0, prefix.length)).toEqual([...prefix]);
   expect(await f.app.disposeSessionExtensions({ sessionId: f.session.sessionId, expectedInstanceId: first.instanceId }))
     .toMatchObject({ ok: false, error: { code: 'extension_instance_conflict' } });
   await old.extensionRunner.emit({ type: 'tool_execution_end', toolCallId: 'p12-check', toolName: 'check_invoice_sources', result: {}, isError: false });
   await old.extensionRunner.emitToolCall({ type: 'tool_call', toolCallId: 'p12-check', toolName: 'check_invoice_sources', input: f.args() }).catch(() => {});
-  expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance).toEqual(next);
+  expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]).toEqual(next);
   expect(need(await f.app.listRunToolCalls({ sessionId: f.session.sessionId, runId: 1 })).items).toHaveLength(1);
   expect(f.payloads).toHaveLength(5);
 });
@@ -546,9 +568,9 @@ it('[F12-20] reuses the actual SDK instance when the fixed combination is identi
   const f = fixture(), frozen = f.freeze('p3');
   const prepare = (extensions: typeof frozen) => f.adapter.prepare(f.sid, f.config, { timeoutMs: 1000, stopGraceMs: 1000 }, new AbortController().signal,
     { activeToolNames: ['check_invoice_sources'], extensions });
-  need(await prepare(frozen)); const native = f.native(), first = need(f.adapter.inspectExtensions(f.sid)).instance!;
+  need(await prepare(frozen)); const native = f.native(), first = need(f.adapter.inspectExtensions(f.sid)).instances[0]!;
   need(await prepare({ ...frozen, settingsRevision: 2 }));
-  expect(f.native()).toBe(native); expect(need(f.adapter.inspectExtensions(f.sid)).instance).toEqual(first);
+  expect(f.native()).toBe(native); expect(need(f.adapter.inspectExtensions(f.sid)).instances[0]).toEqual(first);
 });
 
 it('[F12-10] requires an actual startup acknowledgement even when SDK emit returned normally', async () => {
@@ -556,7 +578,7 @@ it('[F12-10] requires an actual startup acknowledgement even when SDK emit retur
   try {
     const f = await businessFixture(), { terminal } = await f.run();
     expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'extension_load_failed' } } });
-    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance).toMatchObject({ state: 'disposed', activatedAt: null });
+    expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]).toMatchObject({ state: 'disposed', activatedAt: null });
     expect(f.payloads).toHaveLength(0);
   } finally { injected.mockRestore(); }
 });
@@ -597,7 +619,7 @@ it.each(['same-final', 'conflicting-final'] as const)('[F12-13/18] routes repeat
 it('[F12-23] rolls back Run and Input admission together when the actual SQL receipt insert fails', async () => {
   const f = await businessFixture({ trigger: "CREATE TRIGGER p12_admission_fault BEFORE INSERT ON session_inputs BEGIN SELECT RAISE(ABORT,'controlled admission failure'); END;" });
   expect(await f.app.submitInput(f.request)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
-  expect(f.payloads).toHaveLength(0); expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instance).toBeNull();
+  expect(f.payloads).toHaveLength(0); expect(need(f.adapter.inspectExtensions(f.session.nativeSessionId)).instances[0]).toBeUndefined();
   need(await f.app.close()); const sql = new Database(f.paths.databaseFile, { readonly: true });
   try { for (const table of ['runs', 'session_inputs']) expect(sql.query(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: 0 }); }
   finally { sql.close(); }

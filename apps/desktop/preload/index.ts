@@ -2,21 +2,29 @@ import { contextBridge, ipcRenderer } from 'electron';
 import { appError, fail } from '../../../packages/contracts/src/errors.ts';
 import { parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../../packages/contracts/src/resources.ts';
 import { parseExtensionCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure, isExtensionHostCommand } from '../../../packages/contracts/src/extensions.ts';
+import { parseSubagentCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure, isSubagentHostCommand } from '../../../packages/contracts/src/subagents.ts';
 import type { Result } from '@flowmate/contracts';
 import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest } from '@flowmate/contracts';
 
 async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<T>> {
   const extension = isExtensionHostCommand(type);
-  const command = (extension ? parseExtensionCommand : parseResourceCommand)({ type, ...(input === undefined ? {} : { input }) });
+  const [parse, result, matches, failure] = isSubagentHostCommand(type)
+    ? [parseSubagentCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
+    : extension ? [parseExtensionCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure]
+      : [parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure];
+  const command = parse({ type, ...(input === undefined ? {} : { input }) });
   if (!command) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
   try {
-    const result = (extension ? parseExtensionHostResult : parseResourceHostResult)(type, await ipcRenderer.invoke(`flowmate:${type.replaceAll('_', '-')}`, input));
-    if (!result || !(extension ? matchesExtensionResponse : matchesResourceResponse)(command, result)) return fail(appError('host_protocol_invalid', 'runtime', 'Resource response could not be verified.'));
-    return result as Result<T>;
-  } catch { return (extension ? extensionHostFailure : resourceHostFailure)(type) as Result<T>; }
+    const checked = result(type, await ipcRenderer.invoke(`flowmate:${type.replaceAll('_', '-')}`, input));
+    if (!checked || !matches(command, checked)) return fail(appError('host_protocol_invalid', 'runtime', 'Resource response could not be verified.'));
+    return checked as Result<T>;
+  } catch { return failure(type) as Result<T>; }
 }
 
 const bridge: DesktopBridge = {
+  listSubagents: input => invokeAssembly('list_subagents', input),
+  querySubagent: input => invokeAssembly('query_subagent', input),
+  cancelSubagent: input => invokeAssembly('cancel_subagent', input),
   listExtensions: () => invokeAssembly('list_extensions'),
   updateExtensionSelection: input => invokeAssembly('update_extension_selection', input),
   querySessionExtensions: input => invokeAssembly('query_session_extensions', input),

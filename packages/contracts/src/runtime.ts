@@ -511,7 +511,11 @@ export type AgentRunSnapshot = RunSnapshotBase & {
   scope: ChatScope | import('./tools.ts').RunScope | import('./tools.ts').LegacyRunScope;
 };
 
-export type RunSnapshot = ProviderRunSnapshot | AgentRunSnapshot;
+export type SubagentRunSnapshot = Omit<AgentRunSnapshot, 'kind' | 'scope'> & {
+  kind: 'subagent'; scope: import('./tools.ts').RunScope;
+  parentRunId: DbId; originToolCallId: DbId; pluginAgentId: string;
+};
+export type RunSnapshot = ProviderRunSnapshot | AgentRunSnapshot | SubagentRunSnapshot;
 
 export type CloseReport = {
   stopped: boolean;
@@ -592,6 +596,9 @@ export interface Application {
   readDocumentOriginal(documentId: DbId, page: number): Promise<Result<import('./workspace.ts').DocumentOriginalImage>>;
   revokeDocumentUse(documentId: DbId): Promise<Result<{ affectedSessionIds: DbId[]; stopRequested: boolean }>>;
   cancelRun(runId: DbId): Promise<Result<{ accepted: boolean; runId: DbId }>>;
+  cancelSubagent(request: import('./subagents.ts').CancelSubagentRequest): Promise<Result<import('./subagents.ts').SubagentCancelReceipt>>;
+  listSubagents(request: import('./subagents.ts').ListSubagentsRequest): Promise<Result<import('./subagents.ts').SubagentPage>>;
+  querySubagent(request: import('./subagents.ts').QuerySubagentRequest): Promise<Result<import('./subagents.ts').SubagentDetail>>;
   queryRuntimeState(): Promise<Result<RuntimeState>>;
   compactSession(request: import('./compaction.ts').SessionCompactionRequest): Promise<Result<import('./compaction.ts').CompactionAccepted>>;
   querySessionCompaction(request: import('./compaction.ts').SessionCompactionQuery): Promise<Result<import('./compaction.ts').SessionCompactionSnapshot>>;

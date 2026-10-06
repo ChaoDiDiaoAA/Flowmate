@@ -215,7 +215,7 @@ describe('Runtime fixed observations', () => {
       expect(reopened.ok).toBe(!registrationFails);
       const db = reopened.ok ? reopened.data.db : new Database(paths(root).databaseFile);
       deferCleanup(() => reopened.ok ? reopened.data.close() : db.close());
-      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 16 });
+      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 17 });
       const columns = db.query('PRAGMA table_info(tool_calls)').all() as Array<{ name: string }>;
       expect(columns.some(column => column.name === 'runtime_observation_json')).toBe(!registrationFails);
       expect(db.query('SELECT id,native_tool_call_id FROM tool_calls WHERE id=?').get(call.toolCallId))

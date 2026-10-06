@@ -37,6 +37,18 @@ function makeRuntime(names: string[], options: { maxToolCalls?: number; maxResul
 }
 
 describe('P3 Tool Executor', () => {
+  it('accepts the exact Agent plugin name through the existing Executor and rejects other capitalized definitions', async () => {
+    const store = makeRuntime(['Agent']);
+    expect(await store.executor.execute('Agent', { value: 42 }, store.context('delegate-name'))).toMatchObject({
+      result: { status: 'succeeded', data: { value: 42 } }, call: { toolName: 'Agent', sessionId: store.sessionId, runId: 1 },
+    });
+    expect(store.executor.freezeStrategy({ allowedTools: ['Agent'], configuredToolTimeoutMs: 10000,
+      sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, environment: 'fixture', sampleSource: 'test',
+      taskType: 'answer', modelKey: 'model-A', promptVersion: 'prompt-A' })).toMatchObject({ ok: true, data: {
+        calibration: { groups: [{ toolName: 'Agent', timeoutSource: 'configured', fallbackReason: 'ineligible_tool' }] },
+      } });
+    for (const name of ['AGENT', 'Read', 'subAgent']) expect(() => makeRuntime([name])).toThrow('tool_definition_invalid');
+  });
   it.each([['READ', false], ['LOCAL_WRITE', true]] as const)('uses monotonic timeout evidence and preserves %s recovery eligibility', async (effect, fatal) => {
     const store = makeRuntime(['read_fixture']);
     const clock = [100, 250, 300, 310];

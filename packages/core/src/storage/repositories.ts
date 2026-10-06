@@ -13,7 +13,8 @@ import type { RuntimeEventStore } from '../events/store.ts';
 import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/verification.ts';
 import { contextReferenceFromColumns, readRunContextOwner, readContextSnapshotOwner, readToolContext } from '../context/repository.ts';
 import type { ContextOwnerCache } from '../context/repository.ts';
-import { formatContextPrompt } from '../context/service.ts';
+import { buildSubagentContextInTransaction, formatContextPrompt } from '../context/service.ts';
+import { createContextRepository } from '../context/repository.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
 import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, emptyResourceJournal } from '@flowmate/contracts';
 import type {
@@ -97,6 +98,10 @@ import type {
   MessageSessionInput,
 } from '@flowmate/contracts';
 import type { RunAgentConfigFacts, RuntimeAgentConfigFacts, AgentFacts, RunScope, LegacyRunScope } from '@flowmate/contracts';
+import { DelegateArgsSchema, RequestContextBindingSchema, SubagentProvenanceSchema, SubagentSummarySchema, TokenColumnsSchema, SUBAGENT_TOOL_NAMES,
+  NativeSessionHistorySchema } from '@flowmate/contracts';
+import type { DelegateArgs, SubagentOrigin, SubagentConfig, SubagentPage, SubagentDetail, QuerySubagentRequest } from '@flowmate/contracts';
+import { SubagentDetailSchema } from '@flowmate/contracts';
 import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_REVIEW_TOOL_NAMES, NATIVE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, WorkspaceSelectionSchema, InvoiceFormTargetSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, FillInvoiceFormInputSchema } from '@flowmate/contracts';
 import { StoredCandidateDraftSchema, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandidateRequestSchema,
   RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields,
@@ -302,6 +307,7 @@ export interface BusinessEventRepository {
 export type SessionHistorySnapshot = { row: SessionRow; bundle: NativeHistoryRecoveryBundle; blocked: boolean;
   associations: { entries: { entry_id: string; run_id: number | null }[]; inputs: Record<string, unknown>[] } };
 export interface SessionRepository {
+  isSubagentSession(sessionId: DbId): Result<boolean>;
   findFork(request: ForkSessionRequest): Result<DbId | null>;
   createFork(input: { request: ForkSessionRequest; history: NativeSessionHistory; frozen: SessionHistorySnapshot; at: string;
     qualify: (snapshot: SessionHistorySnapshot) => Result<void> }): Result<DbId>;
@@ -340,6 +346,10 @@ export type TerminalWrite = {
 export interface RunRepository {
   create(input: NewProviderRun): Result<DbId>;
   createAgent(input: NewAgentRun): Result<DbId>;
+  createSubagent(input: NewSubagentRun): Result<{ runId: DbId; sessionId: DbId; contextSnapshotId: DbId; inputId: DbId }>;
+  getByOriginToolCall(originToolCallId: DbId): Result<RunSnapshot | null>;
+  listSubagents(input: { parentRunId: DbId; beforeRunId?: DbId; limit: number }): Result<SubagentPage>;
+  querySubagent(input: QuerySubagentRequest): Result<SubagentDetail>;
   createWorkspaceAgent(input: NewWorkspaceAgentRun, verify: WorkspaceVerifier): Result<WorkspaceRunAdmission>;
   freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }, verify: WorkspaceVerifier | undefined): Result<FrozenSessionInputAdmission>;
   verifyInputUse(content: SessionInputContentV2, verify: WorkspaceVerifier | undefined,
@@ -352,10 +362,14 @@ export interface RunRepository {
   supplementUsage(runId: DbId, usage: UsageRecord, tokens: TokenColumns): Result<boolean>;
   failInterrupted(endedAt: string): Result<number>;
 }
+export type NewSubagentRun = { origin: SubagentOrigin; pluginAgentId: string; nativeSessionId: string; args: DelegateArgs;
+  scope: RunScope; config: Omit<SubagentConfig, 'subagent'> & { subagent: Omit<SubagentConfig['subagent'], 'childInputId'> };
+  history: NativeSessionHistory; at: string };
 
 type RunRow = {
   id: number;
-  kind: 'provider' | 'agent';
+  kind: 'provider' | 'agent' | 'subagent';
+  parent_run_id: number | null; origin_tool_call_id: number | null; plugin_agent_id: string | null;
   session_id: number | null;
   job_id?: number | null;
   current_context_snapshot_id?: number | null;
@@ -444,7 +458,7 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
     || typeof agent.systemPrompt !== 'string'
     || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(String(agent.thinkingLevel))
     || !['none', 'p11-resources-v1'].includes(String(agent.resourcePolicy))
-    || Object.hasOwn(agent, 'extensionPolicy') && !['none', 'p12-managed-extensions-v1'].includes(String(agent.extensionPolicy))
+    || Object.hasOwn(agent, 'extensionPolicy') && !['none', 'p12-managed-extensions-v1', 'p13-managed-extensions-v1'].includes(String(agent.extensionPolicy))
     || agent.historyPolicy !== 'memory-only'
     || agent.sessionRetry !== false;
   const p2Invalid = agent.policyVersion === 'p2-invoice-chat-v1'
@@ -472,7 +486,7 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
 
 function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
   const raw = object(value, 'config');
-  if (Object.hasOwn(raw, 'contextPolicyVersion') && (raw.contextPolicyVersion !== 'p8-context-v1' || kind !== 'agent')) throw new Error('invalid_context_policy');
+  if (Object.hasOwn(raw, 'contextPolicyVersion') && (raw.contextPolicyVersion !== 'p8-context-v1' || kind === 'provider')) throw new Error('invalid_context_policy');
   const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
   if (typeof record.name !== 'string' || !Number.isSafeInteger(record.revision) || Number(record.revision) <= 0) throw new Error('invalid_config_shape');
   const model = (candidate: unknown, label: string) => {
@@ -487,14 +501,14 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
   object(record.limits, 'config_limits');
   object(record.native, 'config_native');
   if (record.outputBudget !== undefined) versioned(record.outputBudget, 'outputBudget', ['policy', 'selectedMaxTokens', 'source']);
-  if (kind === 'agent') {
+  if (kind !== 'provider') {
     const agent = validatedAgentConfig(record.agent);
     if ((agent.resourcePolicy === 'p11-resources-v1') !== Object.hasOwn(record, 'resources')) throw new Error('invalid_resource_policy');
     if (Object.hasOwn(record, 'resources') && !verifyFrozenResourceMetadata(FrozenResourcesSchema.parse(record.resources)).ok)
       throw new Error('invalid_resource_metadata');
     if (Object.hasOwn(record, 'extensions')) {
       const frozen = FrozenExtensionsSchema.parse(record.extensions);
-      if (agent.extensionPolicy !== (frozen.included.length ? 'p12-managed-extensions-v1' : 'none')) throw new Error('invalid_extension_policy');
+      if (agent.extensionPolicy !== (frozen.included.length ? frozen.policyVersion : 'none')) throw new Error('invalid_extension_policy');
       if (Object.hasOwn(record, 'extensionAssembly') && !matchesExtensionAssembly(frozen, ExtensionAssemblyEvidenceSchema.parse(record.extensionAssembly), String(agent.nativeSessionId)))
         throw new Error('invalid_extension_assembly');
     } else if (Object.hasOwn(record, 'extensionAssembly') || Object.hasOwn(agent, 'extensionPolicy')) throw new Error('unexpected_extension_assembly');
@@ -518,6 +532,14 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
     || !isAbsolute(record.workingDirectory) || /[\x00-\x1f\x7f]/.test(record.workingDirectory))) throw new Error('invalid_working_directory');
   if (record.goalMode === 'local-task' && (typeof record.workingDirectory !== 'string'
     || record.workspaceContext !== undefined)) throw new Error('invalid_local_task_config');
+  if (kind === 'subagent') {
+    SubagentProvenanceSchema.parse(record.subagent);
+    const agent = object(record.agent, 'subagent_config');
+    if (record.goalMode !== 'answer' || record.contextPolicyVersion !== 'p8-context-v1' || record.workspaceContext !== undefined
+      || agent.policyVersion !== 'runtime-v1' || agent.taskPolicyVersion !== 'p3-invoice-tools-v1'
+      || record.extensions !== undefined && FrozenExtensionsSchema.parse(record.extensions).selected.length !== 0)
+      throw new Error('invalid_subagent_config');
+  } else if (Object.hasOwn(record, 'subagent')) throw new Error('unexpected_subagent_config');
   return { ...record, version: raw.version };
 }
 
@@ -566,7 +588,7 @@ function validatedOutput(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
   const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'output', ['text', 'partial', 'stopReason', 'responseId', 'responseModel']);
   if (typeof record.text !== 'string' || typeof record.partial !== 'boolean' || typeof record.stopReason !== 'string'
     || (record.wireMaxTokens !== undefined && record.wireMaxTokens !== null && (!Number.isSafeInteger(record.wireMaxTokens) || Number(record.wireMaxTokens) < 1))) throw new Error('invalid_output_shape');
-  if (kind === 'agent') validatedAgentFacts(record.agent, raw.version === 2);
+  if (kind !== 'provider') validatedAgentFacts(record.agent, raw.version === 2);
   else if (record.agent !== undefined) throw new Error('unexpected_provider_agent_output');
   return { ...record, version: raw.version };
 }
@@ -655,7 +677,7 @@ function runUsesDocument(row: DocumentRunAssociation, documentId: DbId): boolean
 
 function sessionsUsingDocument(db: Database, documentId: DbId): DbId[] {
   const rows = db.query(`SELECT run.session_id,run.scope_json,run.config_json,job.document_id AS job_document_id
-    FROM runs run LEFT JOIN jobs job ON job.id=run.job_id WHERE run.kind='agent' AND run.session_id IS NOT NULL`).all() as DocumentRunAssociation[];
+    FROM runs run LEFT JOIN jobs job ON job.id=run.job_id WHERE run.kind IN ('agent','subagent') AND run.session_id IS NOT NULL`).all() as DocumentRunAssociation[];
   const affected = new Set(rows.filter((row) => runUsesDocument(row, documentId)).map((row) => row.session_id));
   for (const source of affected) {
     const children = db.query('SELECT target_session_id FROM session_forks WHERE source_session_id=? AND target_session_id IS NOT NULL')
@@ -1137,7 +1159,7 @@ export function createDocumentRepository(db: Database): DocumentRepository {
         if (row.hidden_at !== null) return ok({ documentId, affectedChatCount: 0 });
         const active = db.query(`SELECT run.session_id,run.scope_json,run.config_json,job.document_id AS job_document_id
           FROM runs run LEFT JOIN jobs job ON job.id=run.job_id
-          WHERE run.kind='agent' AND run.status IN ('created','running')`).all() as DocumentRunAssociation[];
+          WHERE run.kind IN ('agent','subagent') AND run.status IN ('created','running')`).all() as DocumentRunAssociation[];
         const materialSessions = new Set(sessionsUsingDocument(db, documentId));
         if (active.some((run) => materialSessions.has(run.session_id))) {
           return fail(appError('document_busy', 'runtime', 'Wait for the active response or stop it before removing this invoice.', true));
@@ -1235,7 +1257,8 @@ function workspaceSnapshot(db: Database, row: unknown, at: string): WorkspaceSna
   if (record.active_session_id !== null) {
     const session = db.query('SELECT * FROM sessions WHERE id=?').get(record.active_session_id);
     const facts = session ? readSessionRow(db, session) : null;
-    if (!facts || facts.status !== 'active' || (session as { hidden_at: string | null }).hidden_at !== null || facts.deletePending) {
+    if (!facts || facts.status !== 'active' || (session as { hidden_at: string | null }).hidden_at !== null || facts.deletePending
+      || db.query("SELECT 1 FROM runs WHERE kind='subagent' AND session_id=?").get(record.active_session_id)) {
       invalidReferences.push('session_unavailable');
       sessionId = null;
     }
@@ -1340,6 +1363,8 @@ export function createWorkspaceRepository(db: Database): WorkspaceRepository {
           }
         } else if (change.kind === 'session') {
           if (change.sessionId !== null) {
+            if (db.query("SELECT 1 FROM runs WHERE kind='subagent' AND session_id=?").get(change.sessionId))
+              return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot become the current chat.'));
             const session = db.query('SELECT * FROM sessions WHERE id=? AND hidden_at IS NULL').get(change.sessionId);
             const facts = session ? readSessionRow(db, session) : null;
             if (!facts || facts.status !== 'active' || facts.deletePending) return fail(appError('session_not_found', 'input', '可用 Session 不存在。'));
@@ -1642,6 +1667,21 @@ function appendToolState(db: Database, events: RuntimeEventStore | undefined, to
       errorCode: typeof error?.code === 'string' ? error.code : null } });
 }
 
+function verifyChildToolParent(db: Database, context: ProductToolContext): Result<void> {
+  const child = db.query("SELECT parent_run_id,origin_tool_call_id,session_id FROM runs WHERE id=? AND kind='subagent'")
+    .get(context.runId) as { parent_run_id: number; origin_tool_call_id: number; session_id: number } | null;
+  if (!child) return ok(undefined);
+  const parent = db.query(`SELECT p.kind,p.status,p.cancel_requested_at,s.status AS session_status,s.metadata_json,t.status AS tool_status,h.unusable
+    FROM runs p JOIN sessions s ON s.id=p.session_id JOIN tool_calls t ON t.id=? AND t.run_id=p.id
+    LEFT JOIN session_native_history h ON h.session_id=s.id WHERE p.id=?`)
+    .get(child.origin_tool_call_id, child.parent_run_id) as { kind: string; status: string; cancel_requested_at: string | null;
+      session_status: string; metadata_json: string; tool_status: string; unusable: number | null } | null;
+  if (child.session_id !== context.sessionId || !parent || parent.kind !== 'agent' || parent.status !== 'running'
+    || parent.cancel_requested_at !== null || parent.session_status !== 'active' || parent.tool_status !== 'running' || parent.unusable !== 0
+    || parseSessionModelUse(parent.metadata_json) || parseSessionMetadata(parent.metadata_json).delete_pending)
+    return fail(appError('subagent_origin_invalid', 'runtime', 'Parent admission closed before child tool execution.'));
+  return ok(undefined);
+}
 export function createToolCallRepository(db: Database, events?: RuntimeEventStore): ToolCallRepository {
   const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
   const byId = (toolCallId: DbId) => readTransaction(db, () => {
@@ -1650,17 +1690,18 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
     return ok(toolCallSnapshot(db, row));
   });
   const trustedContext = (context: ProductToolContext): Result<string> => {
+    const permitted = verifyChildToolParent(db, context); if (!permitted.ok) return permitted;
     const permission = createSessionRepository(db).isModelUseBlocked(context.sessionId);
     if (!permission.ok) return permission;
     if (permission.data) return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
-    const row = db.query(`SELECT run.session_id,run.scope_json,run.config_json,run.status,session.status AS session_status,session.metadata_json
-      FROM runs run JOIN sessions session ON session.id=run.session_id WHERE run.id=? AND run.kind='agent'`)
-      .get(context.runId) as { session_id: number; scope_json: string; config_json: string; status: string; session_status: string; metadata_json: string } | null;
+    const row = db.query(`SELECT run.kind,run.session_id,run.scope_json,run.config_json,run.status,session.status AS session_status,session.metadata_json
+      FROM runs run JOIN sessions session ON session.id=run.session_id WHERE run.id=? AND run.kind IN ('agent','subagent')`)
+      .get(context.runId) as { kind: RunRow['kind']; session_id: number; scope_json: string; config_json: string; status: string; session_status: string; metadata_json: string } | null;
     if (!row || row.session_id !== context.sessionId) return fail(appError('tool_access_denied', 'runtime', 'Native tool context does not match the Run.'));
     if (row.status !== 'running' || row.session_status !== 'active') return fail(appError('run_state_invalid', 'runtime', 'Native tools require an active Run.'));
     const scope = RunScopeSchema.parse(readJson(row.scope_json, 'run_scope'));
     if (stableJson(scope) !== stableJson(context.scope)) return fail(appError('tool_access_denied', 'runtime', 'Native context does not match the frozen Run.'));
-    const config = validatedConfig(readJson(row.config_json, 'run_config'), 'agent');
+    const config = validatedConfig(readJson(row.config_json, 'run_config'), row.kind);
     if (parseSessionModelUse(row.metadata_json)) return fail(appError('session_scope_revoked', 'session', 'Conversation material access has been revoked.'));
     if (typeof config.workingDirectory !== 'string') {
       return fail(appError('tool_access_denied', 'runtime', 'The Run has no trusted working directory.'));
@@ -1702,7 +1743,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           }
           return ok(call);
         }
-        const run = db.query("SELECT session_id,status FROM runs WHERE id=? AND kind='agent'").get(input.runId) as { session_id: number; status: string } | null;
+        const run = db.query("SELECT session_id,status FROM runs WHERE id=? AND kind IN ('agent','subagent')").get(input.runId) as { session_id: number; status: string } | null;
         if (!run || run.session_id !== input.sessionId) return fail(appError('tool_access_denied', 'runtime', 'ToolCall 与可信 Agent Run 不匹配.'));
         try { readToolContext(db, { run_id: input.runId, session_id: input.sessionId,
           context_snapshot_id: input.context?.snapshotId ?? null, request_sequence: input.context?.requestSequence ?? null }); }
@@ -1806,9 +1847,10 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
 
     verifyUse(context) {
       try {
+        const permitted = verifyChildToolParent(db, context); if (!permitted.ok) return permitted;
         const row = db.query(`SELECT run.session_id,run.scope_json,run.status,run.cancel_requested_at,
           session.status AS session_status,session.metadata_json FROM runs run JOIN sessions session ON session.id=run.session_id
-          WHERE run.id=? AND run.kind='agent'`).get(context.runId) as {
+          WHERE run.id=? AND run.kind IN ('agent','subagent')`).get(context.runId) as {
             session_id: number; scope_json: string; status: string; cancel_requested_at: string | null;
             session_status: string; metadata_json: string;
           } | null;
@@ -2617,6 +2659,31 @@ function snapshotFromRow(db: Database, row: RunRow): RunSnapshot {
   if (!Number.isSafeInteger(row.session_id) || Number(row.session_id) <= 0 || row.scope_json === null) {
     throw new Error('invalid_agent_session_reference');
   }
+  if (row.kind === 'subagent') {
+    const provenance = SubagentProvenanceSchema.parse(config.subagent), scope = RunScopeSchema.parse(readJson(row.scope_json, 'scope'));
+    if (!Number.isSafeInteger(row.parent_run_id) || !Number.isSafeInteger(row.origin_tool_call_id) || !row.plugin_agent_id
+      || scope.allowedTools.some(name => !(SUBAGENT_TOOL_NAMES as readonly string[]).includes(name))) throw new Error('invalid_subagent_origin');
+    const origin = db.query(`SELECT p.kind,p.session_id,s.native_session_id,t.run_id,t.session_id AS tool_session_id,
+      t.context_snapshot_id,t.request_sequence,t.tool_name FROM runs p JOIN sessions s ON s.id=p.session_id
+      JOIN tool_calls t ON t.id=? WHERE p.id=?`).get(row.origin_tool_call_id, row.parent_run_id) as {
+        kind: string; session_id: number; native_session_id: string; run_id: number; tool_session_id: number;
+        context_snapshot_id: number; request_sequence: number; tool_name: string } | null;
+    const input = db.query('SELECT run_id,session_id FROM session_inputs WHERE id=?').get(provenance.childInputId) as { run_id: number; session_id: number } | null;
+    const parentRow = db.query('SELECT * FROM runs WHERE id=?').get(row.parent_run_id) as RunRow | null;
+    const parentBinding = parentRow && readRunContextOwner(db, parentRow).observations?.requests
+      .find(request => request.binding.requestSequence === provenance.parentRequestSequence)?.binding;
+    const childSession = db.query('SELECT native_session_id FROM sessions WHERE id=?').get(row.session_id) as { native_session_id: string } | null;
+    if (!origin || origin.kind !== 'agent' || origin.session_id === row.session_id || origin.run_id !== row.parent_run_id
+      || origin.tool_session_id !== origin.session_id || origin.tool_name !== 'Agent'
+      || origin.native_session_id !== provenance.parentNativeSessionId || origin.context_snapshot_id !== provenance.parentContextSnapshotId
+      || origin.request_sequence !== provenance.parentRequestSequence || input?.run_id !== row.id || input.session_id !== row.session_id
+      || parentBinding?.inputId !== provenance.parentInputId || parentBinding.snapshotId !== provenance.parentContextSnapshotId
+      || parentBinding.nativeSessionId !== provenance.parentNativeSessionId
+      || (config.agent as RuntimeAgentConfigFacts).nativeSessionId !== childSession?.native_session_id)
+      throw new Error('invalid_subagent_origin');
+    return { ...base, kind: 'subagent', jobId: row.job_id ?? null, sessionId: Number(row.session_id), scope,
+      parentRunId: Number(row.parent_run_id), originToolCallId: Number(row.origin_tool_call_id), pluginAgentId: row.plugin_agent_id };
+  }
   return {
     ...base,
     jobId: row.job_id ?? null,
@@ -2754,6 +2821,10 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       : appError('storage_read_failed', 'storage', 'Session authorization could not be read.', true)); }
   };
   return {
+    isSubagentSession(sessionId) {
+      try { return ok(db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=? LIMIT 1").get(sessionId) !== null); }
+      catch { return fail(appError('storage_read_failed', 'storage', 'Child Session ownership could not be read.', true)); }
+    },
     findFork(request) {
       try {
         const row = db.query<{ target_session_id: number | null; request_json: string }, [number, string]>(
@@ -2769,6 +2840,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
     createFork({ request, history, frozen, qualify, at }) {
       const require = <T>(result: Result<T>): T => { if (!result.ok) throw new MemoryCommitFault(result.error); return result.data; };
       return writeTransaction(() => {
+        if (db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=?").get(request.sourceSessionId))
+          throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
         // Another writer can have committed this intent after detached preparation.
         const existing = require(this.findFork(request));
         if (existing !== null) return existing;
@@ -2913,10 +2986,11 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       try {
         const rows = request.before
           ? db.query(`SELECT * FROM sessions
-              WHERE hidden_at IS NULL AND (updated_at < ? OR (updated_at = ? AND id < ?))
+              WHERE hidden_at IS NULL AND NOT EXISTS(SELECT 1 FROM runs child WHERE child.kind='subagent' AND child.session_id=sessions.id)
+                AND (updated_at < ? OR (updated_at = ? AND id < ?))
               ORDER BY updated_at DESC,id DESC LIMIT ?`)
             .all(request.before.updatedAt, request.before.updatedAt, request.before.sessionId, request.limit + 1)
-          : db.query('SELECT * FROM sessions WHERE hidden_at IS NULL ORDER BY updated_at DESC,id DESC LIMIT ?').all(request.limit + 1);
+          : db.query("SELECT * FROM sessions WHERE hidden_at IS NULL AND NOT EXISTS(SELECT 1 FROM runs child WHERE child.kind='subagent' AND child.session_id=sessions.id) ORDER BY updated_at DESC,id DESC LIMIT ?").all(request.limit + 1);
         const mapped = (rows as unknown[]).map((row) => readSessionRow(db, row));
         const hasMore = mapped.length > request.limit;
         const items = hasMore ? mapped.slice(0, request.limit) : mapped;
@@ -2932,6 +3006,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
 
     rename(input) {
       const result = writeTransaction(() => {
+        if (db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=?").get(input.sessionId))
+          return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
         const changed = db.query('UPDATE sessions SET title=?,updated_at=? WHERE id=?')
           .run(input.title, input.at, input.sessionId).changes;
         return changed === 1
@@ -2955,6 +3031,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
 
     prepareDelete(sessionId, at) {
       const prepared = writeTransaction(() => {
+        if (db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=?").get(sessionId))
+          return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
         const row = db.query('SELECT * FROM sessions WHERE id=?').get(sessionId);
         if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
@@ -2970,6 +3048,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
 
     setStatus(input) {
       const changed = writeTransaction(() => {
+        if (db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=?").get(input.sessionId))
+          return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
         const raw = db.query('SELECT * FROM sessions WHERE id=?').get(input.sessionId) as { hidden_at: string | null } | null;
         if (!raw || raw.hidden_at !== null) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
         const row = readSessionRow(db, raw);
@@ -2990,6 +3070,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
 
     delete(sessionId, at) {
       const deleted = writeTransaction(() => {
+        if (db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=?").get(sessionId))
+          return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
         const row = db.query('SELECT status,hidden_at,metadata_json FROM sessions WHERE id=?').get(sessionId) as { status: string; hidden_at: string | null; metadata_json: string } | null;
         if (!row) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (row.status !== 'archived') {
@@ -3003,7 +3085,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
         if (!activeWorkspaceCanAdvance(db, 'active_session_id', sessionId)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         db.query('UPDATE workspace SET active_session_id=NULL,revision=revision+1,updated_at=? WHERE id=1 AND active_session_id=?')
           .run(at, sessionId);
-        if (hasBusinessHistory(db, sessionId) || db.query('SELECT 1 FROM session_forks WHERE source_session_id=? AND target_session_id IS NOT NULL LIMIT 1').get(sessionId)) {
+        if (hasBusinessHistory(db, sessionId) || db.query('SELECT 1 FROM session_forks WHERE source_session_id=? AND target_session_id IS NOT NULL LIMIT 1').get(sessionId)
+          || db.query('SELECT 1 FROM runs child JOIN runs parent ON parent.id=child.parent_run_id WHERE parent.session_id=? LIMIT 1').get(sessionId)) {
           db.query('UPDATE sessions SET hidden_at=?,metadata_json=?,updated_at=? WHERE id=?').run(at, asJson(completedMetadata), at, sessionId);
           return ok('hidden' as const);
         }
@@ -3118,7 +3201,152 @@ function appendRunState(db: Database, events: RuntimeEventStore | undefined, run
 
 export function createRunRepository(db: Database, events?: RuntimeEventStore): RunRepository {
   const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
+  const childFacts = (child: Extract<RunSnapshot, { kind: 'subagent' }>, parent: AgentRunSnapshot) => {
+    const original = createToolCallRepository(db).getById(child.originToolCallId);
+    const session = createSessionRepository(db).get(child.sessionId);
+    if (!original.ok) throw new MemoryCommitFault(original.error);
+    if (!session.ok) throw new MemoryCommitFault(session.error);
+    return { original: original.data, session: session.data, summary: SubagentSummarySchema.parse({
+      childRunId: child.runId, childSessionId: child.sessionId, childNativeSessionId: session.data.nativeSessionId,
+      parentRunId: parent.runId, parentSessionId: parent.sessionId, originToolCallId: child.originToolCallId,
+      parentNativeToolCallId: original.data.nativeToolCallId, pluginAgentId: child.pluginAgentId,
+      role: 'invoice-evidence-checker', description: child.input.goal, status: child.status, createdAt: child.createdAt,
+      startedAt: child.startedAt, endedAt: child.endedAt, cancelRequestedAt: child.cancelRequestedAt, stoppedAt: child.stoppedAt }) };
+  };
   return {
+    querySubagent(input) {
+      try { return readTransaction(db, () => {
+        const parent = this.get(input.parentRunId), child = this.get(input.childRunId);
+        if (!parent.ok) return parent;
+        if (!child.ok) return child;
+        if (parent.data.kind !== 'agent' || parent.data.sessionId !== input.parentSessionId
+          || child.data.kind !== 'subagent' || child.data.parentRunId !== parent.data.runId)
+          return fail(appError('subagent_identity_conflict', 'runtime', 'The child and parent identities do not match.'));
+        const facts = childFacts(child.data, parent.data);
+        const history = createSessionRepository(db).readHistoryForDisplay(child.data.sessionId);
+        if (!history.ok) return history;
+        return ok(SubagentDetailSchema.parse({ ...facts.summary, scope: child.data.scope, output: child.data.output,
+          error: child.data.error, usage: child.data.usage, tokens: child.data.tokens, cleanup: child.data.cleanup,
+          delivery: facts.original.delivery, historyUsable: !facts.session.nativeUnusable && facts.session.historyState === 'recoverable',
+          stopConfirmed: child.data.cleanup.stopped && child.data.stoppedAt !== null }));
+      }); } catch (error) { return evidenceReadFailure(error, 'Child detail could not be read.'); }
+    },
+    createSubagent(input) {
+      const require = <T>(result: Result<T>): T => { if (!result.ok) throw new MemoryCommitFault(result.error); return result.data; };
+      return writeTransaction(() => {
+        const args = DelegateArgsSchema.parse(input.args), binding = RequestContextBindingSchema.parse(input.origin.requestBinding), origin = input.origin;
+        const parentRow = db.query('SELECT * FROM runs WHERE id=?').get(origin.parentRunId) as RunRow | null;
+        if (!parentRow || parentRow.kind !== 'agent' || parentRow.session_id !== origin.parentSessionId || parentRow.status !== 'running'
+          || parentRow.cancel_requested_at !== null || binding.runId !== parentRow.id || binding.sessionId !== parentRow.session_id
+          || binding.nativeSessionId !== origin.parentNativeSessionId) throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Parent admission is closed or has a different identity.'));
+        const parent = snapshotFromRow(db, parentRow), parentScope = RunScopeSchema.parse(parent.scope);
+        const journal = readRunContextOwner(db, parentRow).observations;
+        if (!isDeepStrictEqual(journal?.requests.find(request => request.binding.requestSequence === binding.requestSequence)?.binding, binding))
+          throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Generating request could not be verified.'));
+        const parentSession = require(createSessionRepository(db).get(origin.parentSessionId));
+        if (parentSession.nativeSessionId !== origin.parentNativeSessionId || parentSession.status !== 'active'
+          || parentSession.modelUseBlocked || parentSession.deletePending || parentSession.nativeUnusable)
+          throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Parent Session is unavailable.'));
+        const call = require(createToolCallRepository(db).getById(origin.originToolCallId));
+        if (call.runId !== parentRow.id || call.sessionId !== parentRow.session_id || call.nativeToolCallId !== origin.parentNativeToolCallId
+          || call.toolName !== 'Agent' || call.status !== 'running' || call.context?.snapshotId !== binding.snapshotId
+          || call.context.requestSequence !== binding.requestSequence
+          || !isDeepStrictEqual(DelegateArgsSchema.parse(call.args.final), args))
+          throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Original running Agent call could not be verified.'));
+        if (db.query('SELECT id FROM runs WHERE origin_tool_call_id=?').get(call.toolCallId))
+          throw new MemoryCommitFault(appError('subagent_identity_conflict', 'runtime', 'The original call already owns a child.'));
+        if (db.query("SELECT id FROM runs WHERE parent_run_id=? AND status IN ('created','running')").get(parent.runId))
+          throw new MemoryCommitFault(appError('subagent_busy', 'runtime', 'A child is already active.', true));
+        const scope = RunScopeSchema.parse(input.scope);
+        const expectedTools = SUBAGENT_TOOL_NAMES.filter(name => parentScope.allowedTools.includes(name));
+        if (!isDeepStrictEqual(scope.allowedTools, expectedTools) || scope.allowedDocumentIds.length === 0
+          || ['read_invoice_document', 'read_invoice_evidence', 'check_invoice_sources'].some(name => !scope.allowedTools.includes(name))
+          || scope.allowedDocumentIds.some(id => !parentScope.allowedDocumentIds.includes(id))
+          || scope.allowedArtifactIds.some(id => !parentScope.allowedArtifactIds.includes(id))
+          || scope.allowedResourcePaths.some(path => !parentScope.allowedResourcePaths.includes(path)))
+          throw new MemoryCommitFault(appError('subagent_tool_denied', 'tool', 'Child tools or material would expand the parent scope.'));
+        nativeIdSchema.parse(input.pluginAgentId); nativeIdSchema.parse(input.nativeSessionId);
+        const { subagent, ...base } = input.config, config = { ...validatedConfig(base, 'agent'), subagent: SubagentProvenanceSchema.unwrap().omit({ childInputId: true }).parse(subagent) };
+        const parentAgent = parent.config.agent as RuntimeAgentConfigFacts, parentLimits = parent.config.limits as SubagentConfig['limits'];
+        if (subagent.extensionInstanceId !== origin.extensionInstanceId || subagent.parentNativeSessionId !== origin.parentNativeSessionId
+          || subagent.parentContextSnapshotId !== binding.snapshotId || subagent.parentInputId !== binding.inputId
+          || subagent.parentRequestSequence !== binding.requestSequence || input.config.agent.nativeSessionId !== input.nativeSessionId
+          || ['requestedModel', 'resolvedModel', 'sdk', 'native', 'parameters', 'endpoint', 'api', 'workingDirectory', 'resources']
+            .some(key => !isDeepStrictEqual(Reflect.get(base, key), parent.config[key]))
+          || base.compactionPolicy !== undefined
+          || ['maxModelCalls', 'maxToolCalls', 'toolTimeoutMs', 'maxContextBytes', 'maxOutputBytes', 'maxAssistantContentBytes'].some(key =>
+            !Number.isFinite(Reflect.get(base.agent, key)) || Reflect.get(base.agent, key) > Reflect.get(parentAgent, key))
+          || !Number.isFinite(base.limits.timeoutMs) || base.limits.timeoutMs <= 0 || base.limits.timeoutMs > parentLimits.timeoutMs
+          || base.limits.stopGraceMs !== parentLimits.stopGraceMs)
+          throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Frozen child provenance or model differs from the original parent.'));
+        const history = NativeSessionHistorySchema.parse(input.history);
+        if (history.header.id !== input.nativeSessionId || history.entries.length || history.leafId !== null || history.unusable)
+          throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Child requires its actual independent empty native history.'));
+        const session = require(createSessionRepository(db, events).create({ nativeSessionId: input.nativeSessionId, title: args.description.slice(0, 80), at: input.at }));
+        const inserted = db.query(`INSERT INTO runs(kind,session_id,job_id,scope_json,status,goal,input_json,config_json,
+          cleanup_json,usage_json,context_observations_json,created_at,parent_run_id,origin_tool_call_id,plugin_agent_id)
+          VALUES('subagent',?,?,?,'created',?,?,?,?,?,?,?,?,?,?)`)
+          .run(session.sessionId, parent.jobId, asJson(scope), args.description,
+            asJson({ version: 1, goal: args.description, text: args.prompt, messageTimestamp: Date.parse(input.at) }), asJson(config),
+            asJson({ version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false }),
+            asJson({ version: 2, source: 'not-requested', reason: 'agent-not-started', sdkValues: null, attempts: 0,
+              attemptsComplete: true, costSource: null, updatedAt: input.at, calls: [] }),
+            asJson({ version: 1, requests: [], ...(base.resources ? { resources: emptyResourceJournal() } : {}) }),
+            input.at, parent.runId, call.toolCallId, input.pluginAgentId);
+        const runId = Number(inserted.lastInsertRowid); appendRunState(db, events, runId, 'run_created');
+        const context = createContextRepository({ db, loadHistory: id => createSessionRepository(db).loadHistory(id) });
+        const built = require(buildSubagentContextInTransaction({ db, context }, { parentSnapshotId: binding.snapshotId,
+          childRunId: runId, childSessionId: session.sessionId, scope, text: args.prompt, at: input.at }));
+        const admitted = require(createSessionInputLedger(db, events).createSubagentInputInTransaction({ childRunId: runId,
+          childSessionId: session.sessionId, originToolCallId: call.toolCallId, contextSnapshotId: built.snapshot.id, at: input.at,
+          content: { version: 2, text: args.prompt, workspaceContext: null, workspaceInput: null, allowedDocumentIds: [...scope.allowedDocumentIds],
+            allowedArtifactIds: [...scope.allowedArtifactIds], promptText: built.promptText,
+            ...(built.snapshot.json.resourceBinding ? { resourceBinding: built.snapshot.json.resourceBinding } : {}) } }));
+        db.query('UPDATE runs SET config_json=? WHERE id=?').run(asJson(validatedConfig({ ...config,
+          subagent: { ...config.subagent, childInputId: admitted.inputId } }, 'subagent')), runId);
+        commitInTransaction(db, { sessionId: session.sessionId, expected: null, header: history.header,
+          appendEntries: [], contexts: [], leafId: null, unusable: false }, events);
+        return { runId, sessionId: session.sessionId, contextSnapshotId: built.snapshot.id, inputId: admitted.inputId };
+      });
+    },
+    getByOriginToolCall(originToolCallId) {
+      try { return readTransaction(db, () => {
+        const row = db.query("SELECT * FROM runs WHERE kind='subagent' AND origin_tool_call_id=?").get(originToolCallId) as RunRow | null;
+        return ok(row ? snapshotFromRow(db, row) : null);
+      }); } catch (error) { return evidenceReadFailure(error, 'Child origin could not be read.'); }
+    },
+    listSubagents(input) {
+      try { return readTransaction(db, () => {
+        const request = z.object({ parentRunId: z.number().int().positive(), beforeRunId: z.number().int().positive().optional(),
+          limit: z.number().int().min(1).max(100) }).strict().parse(input);
+        const parent = this.get(request.parentRunId);
+        if (!parent.ok) return parent;
+        if (parent.data.kind !== 'agent') return fail(appError('subagent_origin_invalid', 'runtime', 'Only a root Agent owns children.'));
+        const rows = db.query("SELECT * FROM runs WHERE kind='subagent' AND parent_run_id=? AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?")
+          .all(request.parentRunId, request.beforeRunId ?? null, request.beforeRunId ?? null, request.limit + 1) as RunRow[];
+        const items = rows.slice(0, request.limit).map(row => {
+          const child = snapshotFromRow(db, row); if (child.kind !== 'subagent') throw new Error('invalid_child');
+          return childFacts(child, parent.data as AgentRunSnapshot).summary;
+        });
+        const tokens = (db.query(`SELECT input_tokens AS inputTokens,output_tokens AS outputTokens,total_tokens AS totalTokens,
+          cost,usage_complete AS usageComplete FROM runs WHERE id=? OR (kind='subagent' AND parent_run_id=?)`)
+          .all(parent.data.runId, parent.data.runId) as (Omit<TokenColumns, 'usageComplete'> & { usageComplete: number })[])
+          .map(row => TokenColumnsSchema.parse({ ...row, usageComplete: row.usageComplete === 1 }));
+        const sum = (key: 'inputTokens' | 'outputTokens' | 'totalTokens') => {
+          if (tokens.some(row => row[key] === null)) return null;
+          const value = tokens.reduce((total, row) => total + row[key]!, 0);
+          return Number.isSafeInteger(value) ? value : null;
+        };
+        // Costs retain the existing SDK catalogue estimate; this is a read projection, not billing.
+        const cost = tokens.every(row => row.cost !== null && row.cost.trim() !== '' && Number.isFinite(Number(row.cost)) && Number(row.cost) >= 0)
+          ? tokens.reduce((total, row) => total + Number(row.cost), 0) : null;
+        const totals = { inputTokens: sum('inputTokens'), outputTokens: sum('outputTokens'), totalTokens: sum('totalTokens'),
+          cost: cost !== null && Number.isFinite(cost) ? String(cost) : null,
+          usageComplete: tokens.every(row => row.usageComplete) };
+        totals.usageComplete &&= Object.values(totals).every(value => value !== null);
+        return ok({ items, nextBeforeRunId: rows.length > request.limit ? items.at(-1)!.childRunId : null, totals });
+      }); } catch (error) { return evidenceReadFailure(error, 'Children could not be read.'); }
+    },
     create(input) {
       const result = writeTransaction(() => {
         const inserted = db
@@ -3138,6 +3366,8 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
 
     createAgent(input) {
       const created = writeTransaction(() => {
+        if (db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=?").get(input.sessionId))
+          return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot start root Runs.'));
         const session = db.query('SELECT status,metadata_json,native_session_id FROM sessions WHERE id=?').get(input.sessionId) as { status: string; metadata_json: string; native_session_id: string } | null;
         if (!session) return fail(appError('session_not_found', 'session', 'Session 不存在。'));
         if (parseSessionMetadata(session.metadata_json).delete_pending === true) return fail(appError('session_delete_incomplete', 'session', 'Session deletion is incomplete.', true));
@@ -3164,6 +3394,8 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
     },
 
     createWorkspaceAgent(input, verify) {
+      if (db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=?").get(input.sessionId))
+        return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot start root Runs.'));
       if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
       const created = writeTransaction(() => {
         const expected = WorkspaceExpectationSchema.safeParse(input.expected);
@@ -3183,8 +3415,9 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const frozen = freezeWorkspaceInput(db, input, verify);
         if (!frozen.ok) return frozen;
         const { document, job, workspaceContext, workspaceInput } = frozen.data;
-        const allowedTools = invoiceToolNamesForRun(input.goalMode, document !== null, job !== null);
+        const allowedTools = [...invoiceToolNamesForRun(input.goalMode, document !== null, job !== null)];
         const nativeNames = fill ? [] : input.nativeTools?.allowedTools ?? [];
+        if (!fill && document && job && input.config.extensions?.included.some(item => item.ref.id === 'subagents')) allowedTools.push('Agent');
         const scope = RunScopeSchema.parse({ version: 2, allowedTools: [...allowedTools, ...nativeNames],
           allowedDocumentIds: document ? [document.id] : [],
           allowedArtifactIds: document ? [document.parsed_artifact_id] : [],
@@ -3266,9 +3499,13 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
 
     verifyInputUse(content, verify, binding) {
       try {
+        let child: Extract<RunSnapshot, { kind: 'subagent' }> | undefined;
         if (binding) {
           const raw = db.query('SELECT * FROM runs WHERE id=?').get(binding.runId) as RunRow | null;
-          if (!raw || raw.kind !== 'agent' || raw.session_id !== binding.sessionId) return corruptWorkspace();
+          if (!raw || raw.kind === 'provider' || raw.session_id !== binding.sessionId) return corruptWorkspace();
+          if (raw.kind === 'subagent') {
+            const snapshot = snapshotFromRow(db, raw); if (snapshot.kind !== 'subagent') return corruptWorkspace(); child = snapshot;
+          }
           const original = readRunContextOwner(db, raw);
           if ((binding.contextSnapshotId === null) !== (original.observations === null)) return corruptWorkspace();
           if (binding.contextSnapshotId !== null) {
@@ -3277,12 +3514,29 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
               ? `${formatExecutionPrompt({ text: content.text, goalMode: 'fill-form', business: true,
                 workspaceInput: content.workspaceInput!, workspaceContext: content.workspaceContext! })}\n\nFlowmate Context reference:\n${JSON.stringify({ snapshotId: snapshot.id,
                 policyVersion: snapshot.json.policyVersion, projectionMode: 'fill-reference', gaps: snapshot.json.modelProjection.gaps })}`
-              : formatContextPrompt(snapshot);
+              : formatContextPrompt(snapshot, raw.kind === 'subagent');
             if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
               || !isDeepStrictEqual(snapshot.json.resourceBinding, content.resourceBinding)
               || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
               || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds) || content.promptText !== expectedPrompt) return corruptWorkspace();
           }
+        }
+        if (child) {
+          if (content.workspaceContext !== null || content.workspaceInput !== null
+            || !isDeepStrictEqual(content.allowedDocumentIds, child.scope.allowedDocumentIds)
+            || !isDeepStrictEqual(content.allowedArtifactIds, child.scope.allowedArtifactIds)) return corruptWorkspace();
+          const parent = verifyChildToolParent(db, { runId: child.runId, sessionId: child.sessionId, scope: child.scope });
+          if (!parent.ok) return parent;
+          if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Material verification is unavailable.', true));
+          for (const id of child.scope.allowedDocumentIds) {
+            const document = createDocumentRepository(db).get(id); if (!document.ok) return document;
+            if (document.data.status !== 'available' || document.data.isHidden || !child.scope.allowedArtifactIds.includes(document.data.parsedArtifactId))
+              return fail(appError('input_unavailable', 'input', 'Frozen child material is unavailable.', true));
+            const verified = verify({ documentRef: document.data.documentRef, jobId: null, candidateRef: null, candidate: null, selection: null });
+            if (!verified.ok) return verified;
+            const valid = requireValidWorkspace(verified.data); if (!valid.ok) return valid;
+          }
+          return ok(undefined);
         }
         const frozen = content.workspaceContext;
         if (frozen === null) return content.workspaceInput === null && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
@@ -3427,7 +3681,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           appendRunState(db, events, runId,
             terminal.status === 'completed' ? 'run_completed' : terminal.status === 'failed' ? 'run_failed' : 'run_cancelled');
         }
-        if (changed === 1 && active?.kind === 'agent' && active.session_id !== null) {
+        if (changed === 1 && active && active.kind !== 'provider' && active.session_id !== null) {
           if (terminal.nativeHistoryUnusable === true) markUnusableInTransaction(db, active.session_id);
           db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(terminal.endedAt, active.session_id);
         }
@@ -3532,11 +3786,11 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const error = asJson({ version: 1, ...appError('runtime_interrupted', 'runtime', '上一次进程退出，Run 未收口。') });
         const cleanup = asJson({ version: 1, stopped: false, stopReason: 'process-exit', errors: [], lateObservationRequired: true });
         const recovered = writeTransaction(() => {
-          const activeRuns = events ? db.query("SELECT id FROM runs WHERE status IN ('created','running') ORDER BY id").all() as { id: number }[] : [];
+          const activeRuns = events ? db.query("SELECT id FROM runs WHERE status IN ('created','running') ORDER BY CASE WHEN kind='subagent' THEN 0 ELSE 1 END,id").all() as { id: number }[] : [];
           const activeTools = events && hasTable(db, 'tool_calls')
             ? db.query("SELECT id FROM tool_calls WHERE status IN ('requested','running') ORDER BY id").all() as { id: number }[] : [];
           if (hasTable(db, 'session_native_history')) {
-            const affected = db.query(`SELECT DISTINCT session_id FROM runs WHERE kind='agent' AND status IN ('created','running')
+            const affected = db.query(`SELECT DISTINCT session_id FROM runs WHERE kind IN ('agent','subagent') AND status IN ('created','running')
               UNION SELECT DISTINCT session_id FROM tool_calls WHERE status IN ('requested','running')`).all() as { session_id: number }[];
             for (const row of affected) markUnusableInTransaction(db, row.session_id);
           }
@@ -3577,10 +3831,13 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           }
           if (hasTable(db, 'jobs')) db.query(`UPDATE jobs SET status='failed',status_reason='runtime_interrupted',updated_at=?
             WHERE status!='completed' AND id IN (
-              SELECT job_id FROM runs WHERE status IN ('created','running') AND job_id IS NOT NULL
+              SELECT job_id FROM runs WHERE kind='agent' AND status IN ('created','running') AND job_id IS NOT NULL
             )`).run(endedAt);
-          const changed = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE status IN ('created','running')")
+          const children = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE kind='subagent' AND status IN ('created','running')")
             .run(error, cleanup, endedAt).changes;
+          const roots = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE kind!='subagent' AND status IN ('created','running')")
+            .run(error, cleanup, endedAt).changes;
+          const changed = children + roots;
           for (const run of activeRuns) appendRunState(db, events, run.id, 'run_failed', 'recovery');
           if (hasTable(db, 'session_inputs')) recoverSessionInputs(db, endedAt,
             (runId, inputIds, resultEntryId, completed) => qualifyRecoveredInputResult(db, runId, inputIds, resultEntryId, completed), events);
@@ -3597,7 +3854,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
 function qualifyRecoveredInputResult(db: Database, runId: DbId, inputIds: readonly DbId[], resultEntryId: string, completed = false): boolean {
   try {
     const raw = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
-    if (!raw || raw.kind !== 'agent' || (completed ? !['completed', 'failed', 'cancelled'].includes(raw.status) : raw.status !== 'completed')
+    if (!raw || raw.kind === 'provider' || (completed ? !['completed', 'failed', 'cancelled'].includes(raw.status) : raw.status !== 'completed')
       || raw.session_id === null || raw.stopped_at === null) return false;
     const cleanup = validatedCleanup(readJson(raw.cleanup_json, 'cleanup'));
     if (!cleanup.stopped || cleanup.lateObservationRequired || !completed && cleanup.errors.length) return false;
@@ -3605,7 +3862,7 @@ function qualifyRecoveredInputResult(db: Database, runId: DbId, inputIds: readon
     if (!row) return false;
     const session = readSessionRow(db, row);
     if (session.historyState !== 'recoverable' || !completed && (session.deletePending || session.modelUseBlocked || session.nativeUnusable)) return false;
-    const config = validatedConfig(readJson(raw.config_json, 'config'), 'agent');
+    const config = validatedConfig(readJson(raw.config_json, 'config'), raw.kind);
     const evidence = createSessionInputLedger(db).resultEvidence(runId, inputIds, resultEntryId);
     if (!evidence.ok) return false;
     const all = db.query('SELECT * FROM tool_calls WHERE run_id=?').all(runId);

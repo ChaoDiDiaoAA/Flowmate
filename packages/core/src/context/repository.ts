@@ -40,7 +40,7 @@ export interface ContextRepository {
 }
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const runRowSchema = z.object({ id, kind: z.enum(['agent', 'provider']), session_id: id.nullable(), job_id: id.nullable(),
+const runRowSchema = z.object({ id, kind: z.enum(['agent', 'provider', 'subagent']), session_id: id.nullable(), job_id: id.nullable(),
   config_json: z.string(), current_context_snapshot_id: id.nullable(), context_observations_json: z.string().nullable() });
 type RunRow = z.infer<typeof runRowSchema>;
 const json = (value: string): unknown => JSON.parse(value);
@@ -69,7 +69,7 @@ function includesResource(frozen: FrozenResources | null, ref: ResourceRef): boo
 function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: ResourceReadEvidence): void {
   const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
   const frozen = frozenResources(json(row.config_json));
-  if (row.kind !== 'agent' || row.session_id !== owner.sessionId || frozen?.bundleHash !== value.bundleHash || !includesResource(frozen, value.ref)) resourceConflict();
+  if (!['agent', 'subagent'].includes(row.kind) || row.session_id !== owner.sessionId || frozen?.bundleHash !== value.bundleHash || !includesResource(frozen, value.ref)) resourceConflict();
   const tool = z.object({ id, run_id: id, session_id: id, native_tool_call_id: z.string(), tool_name: z.string(), request_sequence: id.nullable(), args_json: z.string(),
     result_json: z.string() }).parse(db.query('SELECT * FROM tool_calls WHERE id=?').get(value.toolCallId));
   if (tool.run_id !== owner.runId || tool.session_id !== owner.sessionId || tool.native_tool_call_id !== value.nativeToolCallId
@@ -202,7 +202,7 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
 
 function verifyResourceExpansionOwner(db: Database, owner: RunResourceQuery, value: ResourceExpansionEvidence): ContextObservations & { resources: ResourceEvidenceJournal } {
   const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
-  if (row.kind !== 'agent' || row.session_id !== owner.sessionId) resourceConflict();
+  if (!['agent', 'subagent'].includes(row.kind) || row.session_id !== owner.sessionId) resourceConflict();
   const config = json(row.config_json), frozen = frozenResources(config);
   const observations = readRunContext(row).observations;
   if (!observations?.resources || !frozen || value.bundleHash !== frozen.bundleHash || !includesResource(frozen, value.skill)) resourceConflict();
@@ -256,7 +256,7 @@ export function readRunContext(row: { id: number; kind: string; session_id: numb
   const pointer = row.current_context_snapshot_id ?? null;
   if (pointer !== null) id.parse(pointer);
   const raw = row.context_observations_json ?? null;
-  if (enabled !== (raw !== null) || row.kind !== 'agent' && (enabled || pointer !== null)) throw new Error('invalid_context_run_state');
+  if (enabled !== (raw !== null) || !['agent', 'subagent'].includes(row.kind) && (enabled || pointer !== null)) throw new Error('invalid_context_run_state');
   let observations: ContextObservations | null = null;
   if (raw !== null) {
     const decoded = json(raw);
@@ -340,7 +340,7 @@ export function readRunContextOwner(db: Database, row: ContextOwnerRow, owners?:
 /** Read the association against its original Run/request, including readers used on legacy schemas. */
 export function readToolContext(db: Database, row: { run_id: number; session_id: number; context_snapshot_id?: number | null; request_sequence?: number | null }, owners?: ContextOwnerCache): ContextReference | null {
   const reference = contextReferenceFromColumns(row);
-  const owner = z.object({ id, kind: z.literal('agent'), session_id: id, job_id: id.nullable(), config_json: z.string(),
+  const owner = z.object({ id, kind: z.enum(['agent', 'subagent']), session_id: id, job_id: id.nullable(), config_json: z.string(),
     current_context_snapshot_id: id.nullable().optional(), context_observations_json: z.string().nullable().optional() })
     .parse(db.query('SELECT * FROM runs WHERE id=?').get(row.run_id));
   if (owner.session_id !== row.session_id) throw new Error('invalid_context_tool_owner');
@@ -359,7 +359,7 @@ export function readInputContext(db: Database, row: { run_id: number | null; ses
     if (snapshotId !== null) throw new Error('invalid_context_input_owner');
     return null;
   }
-  const owner = z.object({ id, kind: z.literal('agent'), session_id: id, job_id: id.nullable(), config_json: z.string(),
+  const owner = z.object({ id, kind: z.enum(['agent', 'subagent']), session_id: id, job_id: id.nullable(), config_json: z.string(),
     current_context_snapshot_id: id.nullable().optional(), context_observations_json: z.string().nullable().optional() })
     .parse(db.query('SELECT * FROM runs WHERE id=?').get(row.run_id));
   if (owner.session_id !== row.session_id) throw new Error('invalid_context_input_session');
@@ -465,7 +465,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     const raw = db.query('SELECT id,kind,session_id,job_id,config_json,current_context_snapshot_id,context_observations_json FROM runs WHERE id=?').get(runId);
     if (!raw) reject('run_not_found', 'runtime');
     const row = runRowSchema.parse(raw);
-    if (row.kind !== 'agent' || row.session_id !== sessionId) reject('state_conflict', 'runtime');
+    if (!['agent', 'subagent'].includes(row.kind) || row.session_id !== sessionId) reject('state_conflict', 'runtime');
     let context: ReturnType<typeof readRunContext>;
     try { context = readRunContextOwner(db, row, owners); } catch (error) { if (error instanceof SQLiteError || error instanceof NativeOriginFault || error instanceof ContextFault) throw error; return corrupt(); }
     return { row, ...context };

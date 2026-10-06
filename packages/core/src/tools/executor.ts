@@ -1,13 +1,13 @@
 import { AppErrorSchema, FillInvoiceFormOutputSchema, NativeToolOutputSchema, RuntimeStrategySnapshotSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, ToolExecutionFailure, NATIVE_TOOL_NAMES, INVOICE_REVIEW_TOOL_NAMES, TOOL_CONFIG, RUNTIME_CONFIG, appError, fail, ok } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import type { AppError, DbId, Result, ToolCallDelivery, ToolDefinition, ToolExecutionContext, ToolResult, ToolCallSnapshot, ToolRuntimeObservation, RuntimeStrategySnapshot, ResolvedRuntimeBudget, RuntimeStrategyPolicy } from '@flowmate/contracts';
-import { MAX_TOOL_NAME_CHARS, MAX_TOOL_VERSION_CHARS } from '@flowmate/contracts';
+import { RegisteredToolNameSchema, MAX_TOOL_VERSION_CHARS } from '@flowmate/contracts';
 import { createToolRecorder } from './recorder.ts';
 type Recorder = ReturnType<typeof createToolRecorder>;
 export type ToolExecution = { call: ToolCallSnapshot; result: ToolResult<unknown>; fatal: boolean };
 export type ToolExecutor = ReturnType<typeof createToolExecutor>;
 type RunBudget = { ids: Set<string>; resultsBytes: number; closed: boolean; fatal: boolean; deadlineAt?: number;
-  limit?: ResolvedRuntimeBudget; strategy?: RuntimeStrategySnapshot };
+  limit?: ResolvedRuntimeBudget; strategy?: RuntimeStrategySnapshot; shared?: RunBudget };
 export type { RuntimeStrategyPolicy } from '@flowmate/contracts';
 type PreparedToolUse = { call: ToolCallSnapshot; definition: ToolDefinition<any, any>; arguments: unknown;
   native: boolean; timeoutMs: number; observation: ToolRuntimeObservation };
@@ -51,7 +51,8 @@ export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Recorde
       attemptCount: 0, eligibleCount: 0, p95Ms: null, selectedTimeoutMs: input.configuredToolTimeoutMs,
       timeoutSource: 'configured', fallbackReason: null };
     groups.push(group);
-    const statistical = ['PURE', 'READ'].includes(definition.effect) && !NATIVE_TOOL_NAMES.includes(name as (typeof NATIVE_TOOL_NAMES)[number]);
+    const statistical = name !== 'Agent' && ['PURE', 'READ'].includes(definition.effect)
+      && !NATIVE_TOOL_NAMES.includes(name as (typeof NATIVE_TOOL_NAMES)[number]);
     const supplied = input.policy?.frozenStrategy;
     if (supplied) {
       const frozen = supplied.calibration.groups.find(candidate => candidate.groupKey === groupKey);
@@ -123,10 +124,9 @@ export function createToolExecutor(input: {
 }) {
   const definitions = Object.freeze([...input.definitions]);
   const byName = new Map<string, ToolDefinition<any, any>>();
-  const namePattern = new RegExp(`^[a-z][a-z0-9_]{0,${MAX_TOOL_NAME_CHARS - 1}}$`);
   const versionPattern = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]{0,${MAX_TOOL_VERSION_CHARS - 1}}$`);
   for (const definition of definitions) {
-    if (!definition || typeof definition.name !== 'string' || !namePattern.test(definition.name)
+    if (!definition || !RegisteredToolNameSchema.safeParse(definition.name).success
       || typeof definition.version !== 'string' || !versionPattern.test(definition.version)
       || typeof definition.description !== 'string' || !definition.description.trim() || definition.description.length > 4096
       || !ToolEffectSchema.safeParse(definition.effect).success
@@ -153,7 +153,8 @@ export function createToolExecutor(input: {
     return budget;
   };
   function acceptFeedback(call: ToolCallSnapshot, budget: RunBudget, data?: unknown, error?: AppError): AppError | undefined {
-    const native = NATIVE_TOOL_NAMES.includes(call.toolName as (typeof NATIVE_TOOL_NAMES)[number])
+    budget = budget.shared ?? budget;
+    const native = (call.toolName === 'Agent' || NATIVE_TOOL_NAMES.includes(call.toolName as (typeof NATIVE_TOOL_NAMES)[number]))
       ? NativeToolOutputSchema.safeParse(data) : null;
     const bytes = encodedSize({ role: 'toolResult', toolCallId: call.nativeToolCallId, toolName: call.toolName,
       content: native?.success ? native.data.content : [{ type: 'text', text: error ? error.message : JSON.stringify(data) }],
@@ -190,12 +191,14 @@ export function createToolExecutor(input: {
     if (!parsed.success) return fail(appError('tool_access_denied', 'runtime', '工具缺少可信 Run 上下文。'));
     const bound = Object.freeze({ ...parsed.data, scope: parsed.data.scope });
     const budget = budgetFor(bound.runId);
+    const shared = budget.shared ?? budget;
     const prior = input.recorder.query({ runId: bound.runId, sessionId: bound.sessionId, nativeToolCallId: bound.nativeToolCallId });
     if (!prior.ok && prior.error.code !== 'tool_call_not_found') {
       budget.fatal = true;
       return prior;
     }
-    if (!prior.ok && (budget.closed || budget.fatal || bound.signal.aborted || budget.ids.size >= (budget.limit?.maxToolCalls ?? maxCalls))) {
+    if (!prior.ok && (budget.closed || budget.fatal || shared.closed || shared.fatal || bound.signal.aborted
+      || shared.ids.size >= (shared.limit?.maxToolCalls ?? maxCalls))) {
       budget.fatal ||= !bound.signal.aborted;
       return fail(appError(bound.signal.aborted ? 'agent_cancelled' : 'tool_budget_exceeded', 'runtime',
         bound.signal.aborted ? 'Run 已取消，工具未执行。' : 'Run 已停止接纳新的工具调用。', false,
@@ -205,7 +208,7 @@ export function createToolExecutor(input: {
       ...(bound.requestBinding ? { requestBinding: bound.requestBinding } : {}) },
       name, definition: byName.get(name), raw });
     if (!requested.ok) { budget.fatal = true; return requested; }
-    if (!prior.ok) budget.ids.add(bound.nativeToolCallId);
+    if (!prior.ok) shared.ids.add(`${bound.sessionId}:${bound.nativeToolCallId}`);
     return requested;
   }
 
@@ -257,7 +260,7 @@ export function createToolExecutor(input: {
       budget.fatal = true;
       return { call, result: { status: 'failed', error: failure }, fatal: true };
     }
-    if (!budget.ids.has(bound.nativeToolCallId)) return { call, result: { status: 'failed',
+    if (!(budget.shared ?? budget).ids.has(`${bound.sessionId}:${bound.nativeToolCallId}`)) return { call, result: { status: 'failed',
       error: appError('tool_call_in_progress', 'runtime', 'ToolCall has no reusable execution in this Runtime.') }, fatal: true };
     const task = runCall(definition, finalArguments, bound, call, budget);
     active.set(identity, task);
@@ -328,6 +331,7 @@ export function createToolExecutor(input: {
     let afterStructure: ToolRuntimeObservation['afterStructure'] = 'unknown';
     try {
       const call = Object.freeze({ nativeToolCallId: context.nativeToolCallId, signal,
+        deadlineAt: startedMs + use.timeoutMs,
         ...(context.requestBinding ? { requestBinding: context.requestBinding } : {}) });
       const product = Object.freeze({ runId: context.runId, sessionId: context.sessionId, scope: context.scope });
       data = await definition.execute(use.arguments, call, product);
@@ -360,7 +364,7 @@ export function createToolExecutor(input: {
       error = timedOut ? appError('tool_timeout', 'runtime', '工具执行超过时间上限。', false, context.runId, context.sessionId, context.nativeToolCallId)
         : context.signal.aborted ? appError('agent_cancelled', 'runtime', 'Run 已取消。', false, context.runId, context.sessionId, context.nativeToolCallId)
           : safeError(thrown instanceof ToolExecutionFailure ? thrown.error : thrown);
-      if (thrown instanceof ToolExecutionFailure && thrown.error.code === 'stop_not_confirmed') {
+      if (thrown instanceof ToolExecutionFailure && (thrown.error.code === 'stop_not_confirmed' || thrown.error.category === 'storage')) {
         error = thrown.error;
         budget.fatal = true;
         budget.closed = true;
@@ -377,6 +381,10 @@ export function createToolExecutor(input: {
     const { use, context, budget, data, startedMs, endedMs, timedOut, afterStructure } = settlement;
     let { status, error } = settlement;
     const observedCall = input.recorder.queryById(use.call.toolCallId);
+    if (observedCall.ok && observedCall.data.result?.status === 'failed'
+      && observedCall.data.result.error.code === 'stop_not_confirmed' && !observedCall.data.cleanup.stopped
+      && use.definition.name === 'Agent' && budget.closed && budget.fatal)
+      return { call: observedCall.data, result: observedCall.data.result, fatal: true };
     const stopped = error?.code !== 'stop_not_confirmed' && observedCall.ok
       && !observedCall.data.cleanup.nativeProcesses?.some(process => !process.stopped);
     const observation = { ...use.observation, afterStructure,
@@ -458,6 +466,19 @@ export function createToolExecutor(input: {
   }
 
   return {
+    failUnconfirmedDelegation(context: { runId: DbId; sessionId: DbId }, nativeToolCallId: string): Result<void> {
+      const call = input.recorder.query({ ...context, nativeToolCallId });
+      if (!call.ok) return call;
+      if (call.data.toolName === 'Agent' && call.data.result?.status === 'failed'
+        && call.data.result.error.code === 'stop_not_confirmed' && !call.data.cleanup.stopped) return ok(undefined);
+      if (call.data.toolName !== 'Agent' || !['requested', 'running'].includes(call.data.status))
+        return fail(appError('subagent_identity_conflict', 'runtime', 'No active original delegation is available.'));
+      const budget = budgetFor(context.runId); budget.closed = budget.fatal = true;
+      const error = appError('stop_not_confirmed', 'runtime', 'The managed child has not confirmed termination.', true, context.runId);
+      const saved = input.recorder.finish({ toolCallId: call.data.toolCallId, status: 'failed', error,
+        committedCandidateId: null, cleanup: { version: 1, stopReason: 'stop-grace-exhausted', stopped: false, errors: [error] }, stoppedAt: null });
+      return saved.ok ? ok(undefined) : saved;
+    },
     observeRequest,
     rejectRequest,
     recordDelivery,
@@ -476,6 +497,12 @@ export function createToolExecutor(input: {
       budget.limit = Object.freeze({ ...config.budget });
       budget.strategy = RuntimeStrategySnapshotSchema.parse(structuredClone(config.strategy));
       if (config.deadlineAt !== undefined) budget.deadlineAt = config.deadlineAt;
+    },
+    attachChildBudget(childRunId: DbId, parentRunId: DbId) {
+      const parent = budgets.get(parentRunId), child = budgets.get(childRunId);
+      if (!parent?.limit || !child?.limit || childRunId === parentRunId || child.shared || parent.shared
+        || child.ids.size || parent.closed || parent.fatal) throw new Error('subagent_budget_binding_invalid');
+      child.shared = parent;
     },
     setRunDeadline(runId: DbId, deadlineAt: number) {
       const budget = budgets.get(runId) ?? { ids: new Set<string>(), resultsBytes: 0, closed: false, fatal: false };

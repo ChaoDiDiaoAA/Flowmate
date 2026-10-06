@@ -13,6 +13,7 @@ import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvide
 import { resolveProductPaths } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
 import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from './protocol.ts';
+import { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse } from './protocol.ts';
 import { parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from './protocol.ts';
 import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand, isContextHostCommand,
   parseContextHostResult, matchesContextResponse, contextHostFailure,
@@ -532,6 +533,14 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       });
       send({ version: 1, type: 'response', requestId: command.requestId, value: saved });
       return;
+    }
+    if (isSubagentHostCommand(command.type)) {
+      const value = command.type === 'list_subagents' ? await application.listSubagents(command.input)
+        : command.type === 'query_subagent' ? await application.querySubagent(command.input)
+          : command.type === 'cancel_subagent' ? await application.cancelSubagent(command.input) : null;
+      const result = parseSubagentHostResult(command.type, value);
+      send({ version: 1, type: 'response', requestId: command.requestId, value: result && matchesSubagentResponse(command, result) ? result
+        : fail(appError('host_protocol_invalid', 'runtime', 'Child response could not be verified.')) }); return;
     }
     if (isExtensionHostCommand(command.type)) {
       const value = command.type === 'list_extensions' ? await application.listExtensions()

@@ -28,6 +28,8 @@ import {
   EMPTY_RESOURCE_SELECTION, ResourceSelectionRequestSchema, ResourceFileRequestSchema,
   ResourceSelectionResultSchema, ResourceCatalogResultSchema, ResourceFileResultSchema, ResourceSelectionResponseSchema,
   RunResourceQuerySchema, RunResourceFileRequestSchema, RunResourceResultSchema, FrozenResourcesSchema,
+  CancelSubagentRequestSchema, SubagentCancelReceiptSchema, ListSubagentsRequestSchema, QuerySubagentRequestSchema,
+  SubagentPageResultSchema, SubagentDetailResultSchema,
 } from '@flowmate/contracts';
 import type {
   AgentControl,
@@ -79,12 +81,13 @@ export interface RuntimeServicePort {
   start(request: NormalizedAgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
   queryNativeTools?(): Result<readonly NativeToolAvailability[]>;
   cancel(runId: DbId): Result<{ runId: DbId; accepted: boolean }>;
+  cancelSubagent?(request: import('@flowmate/contracts').CancelSubagentRequest): Result<import('@flowmate/contracts').SubagentCancelReceipt>;
   revokeDocumentUse(documentId: DbId): Promise<Result<{ affectedSessionIds: DbId[]; stopRequested: boolean }>>;
   state(): RuntimeState;
   close(): Promise<CloseReport>;
 }
 
-export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunRepository, 'listBySession'>>;
+export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunRepository, 'listBySession' | 'listSubagents' | 'querySubagent'>>;
 
 export type DisposeResources = () => Promise<CloseReport>;
 type ProductApplicationOptions = {
@@ -138,6 +141,23 @@ export function makeApplication(
     } catch { return fail(appError('config_settings_invalid', 'input', 'Resource configuration is unavailable.')); }
   };
   return {
+    listSubagents: async raw => {
+      const parsed = ListSubagentsRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Child list parameters are invalid.'));
+      const parent = runs.get(parsed.data.parentRunId); if (!parent.ok) return parent;
+      if (parent.data.kind !== 'agent' || parent.data.sessionId !== parsed.data.parentSessionId)
+        return fail(appError('subagent_identity_conflict', 'runtime', 'The parent does not belong to this Session.'));
+      return contextRead(SubagentPageResultSchema, () => runs.listSubagents?.({ parentRunId: parsed.data.parentRunId,
+        ...(parsed.data.beforeRunId === undefined ? {} : { beforeRunId: parsed.data.beforeRunId }), limit: parsed.data.limit }));
+    },
+    querySubagent: async raw => {
+      const parsed = QuerySubagentRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Child detail parameters are invalid.'));
+      const parent = runs.get(parsed.data.parentRunId); if (!parent.ok) return parent;
+      if (parent.data.kind !== 'agent' || parent.data.sessionId !== parsed.data.parentSessionId)
+        return fail(appError('subagent_identity_conflict', 'runtime', 'The parent does not belong to this Session.'));
+      return contextRead(SubagentDetailResultSchema, () => runs.querySubagent?.(parsed.data));
+    },
     querySessionExtensions: async raw => {
       const parsed = SessionExtensionQuerySchema.safeParse(raw);
       return parsed.success ? contextRead(SessionExtensionResultSchema, () => sessions?.queryExtensions(parsed.data))
@@ -148,7 +168,7 @@ export function makeApplication(
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run extension query is invalid.'));
       return contextRead(RunExtensionResultSchema, () => {
         const saved = runs.get(parsed.data.runId); if (!saved.ok) return saved;
-        if (saved.data.kind !== 'agent' || saved.data.sessionId !== parsed.data.sessionId)
+        if (saved.data.kind === 'provider' || saved.data.sessionId !== parsed.data.sessionId)
           return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
         const config = saved.data.config;
         return ok({ ...parsed.data, frozen: config.extensions === undefined ? null : FrozenExtensionsSchema.parse(config.extensions),
@@ -189,7 +209,7 @@ export function makeApplication(
       return contextRead(RunResourceResultSchema, () => {
         const request = parsed.data, saved = runs.get(request.runId);
         if (!saved.ok) return saved;
-        if (saved.data.kind !== 'agent' || saved.data.sessionId !== request.sessionId)
+        if (saved.data.kind === 'provider' || saved.data.sessionId !== request.sessionId)
           return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
         const frozen = saved.data.config.resources === undefined ? null : FrozenResourcesSchema.parse(saved.data.config.resources);
         const evidence = products?.contextRepository?.readResourceEvidence(request);
@@ -206,7 +226,7 @@ export function makeApplication(
       return contextRead(ResourceFileResultSchema, () => {
         const { sessionId, runId, ...file } = parsed.data, saved = runs.get(runId);
         if (!saved.ok) return saved;
-        if (saved.data.kind !== 'agent' || saved.data.sessionId !== sessionId)
+        if (saved.data.kind === 'provider' || saved.data.sessionId !== sessionId)
           return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
         if (saved.data.config.resources === undefined) return fail(appError('resource_required_unavailable', 'input', 'This Run has no fixed resource bundle.'));
         return products?.resources?.readFrozenFile(FrozenResourcesSchema.parse(saved.data.config.resources), file);
@@ -283,7 +303,7 @@ export function makeApplication(
       const { runId, sessionId, toolCallId } = parsed.data;
       const run = runs.get(runId);
       if (!run.ok) return run;
-      if (run.data.kind !== 'agent' || run.data.sessionId !== sessionId)
+      if (run.data.kind === 'provider' || run.data.sessionId !== sessionId)
         return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.', false, runId));
       const call = products.toolCalls.getById(toolCallId);
       if (!call.ok) return call;
@@ -470,6 +490,15 @@ export function makeApplication(
     cancelRun: async (runId) => {
       if (!isDbId(runId)) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
       return runtime.cancel(runId);
+    },
+    cancelSubagent: async (request) => {
+      const input = CancelSubagentRequestSchema.safeParse(request);
+      if (!input.success) return fail(appError('input_invalid', 'input', 'Child cancellation parameters are invalid.'));
+      const result = runtime.cancelSubagent?.(input.data)
+        ?? fail(appError('subagent_origin_invalid', 'runtime', 'Child execution management is unavailable.'));
+      if (!result.ok) return result;
+      const receipt = SubagentCancelReceiptSchema.safeParse(result.data);
+      return receipt.success ? ok(receipt.data) : fail(appError('internal_error', 'internal', 'Child cancellation receipt is invalid.'));
     },
     queryRuntimeState: async () => {
       try { return ok(runtime.state()); }

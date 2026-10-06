@@ -367,7 +367,10 @@ it('P9 T02 migrates 015 atomically without rewriting original facts', () => {
     } finally { db.close(); }
     const opened = need(core.openDatabase(p));
     expect(opened.db.query('SELECT commit_revision FROM session_native_history').get()).toEqual({ commit_revision: 0 });
-    expect(['session_native_entries', 'session_inputs', 'context_snapshots', 'runs'].map(table => opened.db.query(`SELECT * FROM ${table}`).all())).toEqual(before.original);
+    expect(['session_native_entries', 'session_inputs', 'context_snapshots', 'runs'].map((table, index) =>
+      opened.db.query(`SELECT ${table === 'runs' ? Object.keys((before.original[index] as Record<string, unknown>[])[0]!).join(',') : '*'} FROM ${table}`).all())).toEqual(before.original);
+    expect(opened.db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs').get())
+      .toEqual({ parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null });
     expect(opened.db.query('SELECT header_json,leaf_id,entry_count,unusable FROM session_native_history').all()).toEqual(before.oldHeader);
     expect(opened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(opened.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });

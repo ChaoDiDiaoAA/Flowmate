@@ -12,7 +12,7 @@ export class NativeOriginFault extends Error {
 function unknown(): never { throw new NativeOriginFault(); }
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const ownerSchema = z.object({ id, kind: z.literal('agent'), session_id: id, job_id: id.nullable(), config_json: z.string(),
+const ownerSchema = z.object({ id, kind: z.enum(['agent', 'subagent']), session_id: id, job_id: id.nullable(), config_json: z.string(),
   current_context_snapshot_id: id.nullable(), context_observations_json: z.string().nullable() });
 export type NativeEntryOrigin = { originSessionId: DbId; nativeEntryId: string; originRunId: DbId | null; inputId: DbId | null; snapshotId: DbId | null };
 

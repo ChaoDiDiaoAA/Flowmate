@@ -11,6 +11,7 @@ import { WorkspaceContextSchema, WorkspaceInputSchema, WorkspaceSelectionSchema 
 import { WorkingDirectorySchema } from './schemas.ts';
 import { RESOURCE_ERROR_CODES, ResourceBindingSchema, ResourceEvidenceJournalSchema } from './resources.ts';
 import type { ResourceReadEvidence, ResourceRequestEvidence } from './resources.ts';
+import { SUBAGENT_ERROR_CODES } from './errors.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const nonnegative = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -59,6 +60,7 @@ export const CONTEXT_SAFE_ERROR_CODES = [
   'compaction_unavailable', 'compaction_not_needed', 'compaction_failed', 'compaction_cancelled',
   'compaction_timeout', 'compaction_capacity_exceeded',
   ...RESOURCE_ERROR_CODES,
+  ...SUBAGENT_ERROR_CODES,
   'config_revision_conflict', 'config_settings_write_failed',
 ] as const;
 export const ContextSafeErrorCodeSchema = z.enum(CONTEXT_SAFE_ERROR_CODES);

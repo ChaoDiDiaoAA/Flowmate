@@ -27,6 +27,31 @@ const assembly = { version: 1, sdkVersion: '0.85.1', instances: [{ instanceId, r
   hookEvents: hooks.map(hook => hook.event) }] };
 
 describe('P12 controlled extension contracts', () => {
+  it('[F13-27] keeps two fixed extension ledgers and rejects crossed registration or legacy expansion', () => {
+    const subagentRef = { id: 'subagents', version: 'v1', manifestHash: 'b'.repeat(64) };
+    const subagentManifest = { ...manifest, id: 'subagents', entryId: 'pi-subagents-managed-v1',
+      pluginVersion: '0.19.0', patchVersion: 'flowmate-p13.1',
+      patchHash: 'a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a',
+      tools: [{ name: 'Agent', version: '0.19.0-p13.1' }], commands: [] };
+    const dual = { ...frozen, policyVersion: 'p13-managed-extensions-v1', selected: [ref, subagentRef],
+      included: [{ ref, manifest }, { ref: subagentRef, manifest: subagentManifest }] };
+    expect(contracts.ExtensionSelectionSchema.safeParse({ enabledExtensions: dual.selected }).success).toBe(true);
+    expect(contracts.FrozenExtensionsSchema.safeParse(dual).success).toBe(true);
+    expect(contracts.FrozenExtensionsSchema.safeParse({ ...dual, policyVersion: frozen.policyVersion }).success).toBe(false);
+    expect(contracts.ExtensionManifestSchema.safeParse({ ...subagentManifest, patchHash: 'a'.repeat(64) }).success).toBe(false);
+    const childExtension = { ...instance, instanceId: otherInstance, ref: subagentRef, registeredTools: ['Agent'], registeredCommands: [] };
+    expect(contracts.SessionExtensionViewSchema.safeParse({ sessionId: 1, nativeSessionId: 'native-1', instances: [instance, childExtension] }).success).toBe(true);
+    expect(contracts.ExtensionInstanceViewSchema.safeParse({ ...childExtension, registeredTools: ['check_invoice_sources'] }).success).toBe(false);
+    expect(contracts.ExtensionInstanceViewSchema.safeParse({ ...childExtension, registeredCommands: ['invoice-assist'] }).success).toBe(false);
+    expect(contracts.SessionExtensionViewSchema.safeParse({ sessionId: 1, nativeSessionId: 'native-1',
+      instances: [instance, { ...childExtension, nativeSessionId: 'other' }] }).success).toBe(false);
+    const dualAssembly = { ...assembly, instances: [...assembly.instances, { ...assembly.instances[0],
+      instanceId: otherInstance, ref: subagentRef, registeredTools: ['Agent'], registeredCommands: [] }] };
+    const parsed = contracts.FrozenExtensionsSchema.parse(dual);
+    expect(contracts.matchesExtensionAssembly(parsed, contracts.ExtensionAssemblyEvidenceSchema.parse(dualAssembly))).toBe(true);
+    expect(contracts.matchesExtensionAssembly(parsed, contracts.ExtensionAssemblyEvidenceSchema.parse({ ...dualAssembly,
+      instances: [...dualAssembly.instances].reverse() }))).toBe(false);
+  });
   it('[F12-02/07] refuses executable paths, duplicate or unsupported declarations', () => {
     expect(schema('ExtensionRefSchema')?.safeParse(ref).success).toBe(true);
     for (const change of [{ id: '..' }, { version: 'CON' }, { manifestHash: 'A'.repeat(64) }, { entry: 'C:/secret.js' }])

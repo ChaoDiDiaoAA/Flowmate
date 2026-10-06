@@ -2724,7 +2724,8 @@ export function App() {
             mutating={sessionMutating} notice={notice} onSelect={openChat}
             onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onLoadMore={() => void loadMoreSessions()} />
         ) : page === 'activity' ? (
-          <ActivityPage sessions={sessions} selectedSessionId={selectedSessionId} jobs={jobs} documents={documents}
+          <ActivityPage key={`activity:${workspaceHostEpoch.current}`} hostEpoch={workspaceHostEpoch.current} ready={Boolean(state?.ready)}
+            sessions={sessions} selectedSessionId={selectedSessionId} jobs={jobs} documents={documents}
             onOpenContextBasis={basis => openSessionDetails(basis.sessionId, basis)}
             currentRun={run} runtime={runtimeState} view={activityView} snapshot={activitySnapshot} tools={activityTools}
             snapshotError={activitySnapshotError} toolsError={activityToolsError} toolsVerified={activityToolsVerified}
