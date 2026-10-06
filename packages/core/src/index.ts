@@ -22,3 +22,4 @@ export * from './tools/invoice-form.ts';
 export * from './tools/executor.ts';
 export * from './resources/service.ts';
 export * from './extensions/service.ts';
+export { createSubagentTool } from './subagents.ts';

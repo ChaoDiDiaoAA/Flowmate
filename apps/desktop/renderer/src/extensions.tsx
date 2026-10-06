@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ExtensionCatalog, ExtensionSelection, ExtensionSelectionResult, SessionExtensionView, RunExtensionView,
-  ExtensionCommandReceipt, ExtensionDisposeReceipt, ProductSettings, RuntimeState, SessionPage, SessionRunsPage } from '@flowmate/contracts';
+  ExtensionCommandReceipt, ExtensionDisposeReceipt, ExtensionInstanceView, ProductSettings, RuntimeState, SessionPage, SessionRunsPage } from '@flowmate/contracts';
 import { EMPTY_EXTENSION_SELECTION, extensionRefKey } from '../../../../packages/contracts/src/extensions.ts';
 import { useRead, type ContextIdentity } from './context-state.ts';
 
@@ -62,7 +62,7 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
     if (!result) { setRefreshRequired(true); return; }
     setNotice('Saved. This selection applies to later Runs.'); await onSaved(); await refreshCatalog();
   }
-  const instance = live.state.data?.instance, active = runtime.state.data?.active;
+  const instances = live.state.data?.instances ?? [], active = runtime.state.data?.active;
   const executing = active?.kind !== 'provider' && active?.sessionId === sessionId;
   const actionPending = command.state.pending || releasing.state.pending;
   const managementBusy = !ready || !sessionId || live.state.pending || runtime.state.pending || !runtime.state.data || Boolean(executing) || actionPending;
@@ -71,23 +71,23 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
     : { revision: savedSettings.revision, selection: savedSettings.extensions ?? EMPTY_EXTENSION_SELECTION };
   const selected = configuration.selection;
   const configurationBusy = !ready || saving.state.pending || refreshRequired;
-  async function diagnose() {
-    if (!instance || managementBusy) return;
+  async function diagnose(instance: ExtensionInstanceView) {
+    if (managementBusy || instance.ref.id !== 'invoice-assist') return;
     const result = await command.read(`command:${instance.instanceId}`, () => window.flowmate.executeExtensionCommand({ sessionId,
       expectedInstanceId: instance.instanceId, name: 'invoice-assist', arguments: '' }),
     value => value.sessionId === sessionId && value.instanceId === instance.instanceId);
     if (result) setNotice(`Diagnostic confirmed for ${result.instanceId}.`);
     await refreshSession();
   }
-  async function release() {
-    if (!instance || managementBusy) return;
+  async function release(instance: ExtensionInstanceView) {
+    if (managementBusy) return;
     const result = await releasing.read(`release:${instance.instanceId}`, () => window.flowmate.disposeSessionExtensions({ sessionId,
       expectedInstanceId: instance.instanceId }), value => value.sessionId === sessionId && value.instanceId === instance.instanceId);
     if (result) setNotice(result.report.closed ? 'Session resources released.' : 'Cleanup remains incomplete. Retry this instance.');
     await refreshSession();
   }
   return <section className="page-content"><div className="page-heading"><div><h1>Extensions</h1>
-    <p>Choose invoice assistance for later Runs and inspect the Session that actually loaded it.</p></div>
+    <p>Choose extensions for later Runs and inspect the Session that actually loaded them.</p></div>
     <button className="secondary-button" disabled={!ready || saving.state.pending || actionPending}
       onClick={() => { void refreshCatalog(); void refreshSession(); }}>Refresh extensions</button></div>
     {notice && <p role="status">{notice}</p>}{!ready && <p role="alert">The Host is unavailable.</p>}
@@ -101,12 +101,13 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
         const enabled = selected.enabledExtensions.some(ref => extensionRefKey(ref) === extensionRefKey(item.ref));
         return <article key={extensionRefKey(item.ref)}><h3>{item.ref.id} {item.ref.version}</h3>
           <p>{item.compatibility.available ? 'Compatible' : item.compatibility.code} · Pi {item.manifest.sdkVersion}</p>
-          <p>Requires check_invoice_sources 1 (READ). Only eligible invoice Runs include this extension.</p>
+          <p>{item.ref.id === 'invoice-assist' ? 'Requires check_invoice_sources 1 (READ).' : 'Delegates on an actual Agent call to one foreground, read-only child.'} Only eligible invoice Runs include this extension.</p>
           <p>Tools: {item.manifest.tools.map(tool => tool.name).join(', ')} · Command: {item.manifest.commands.join(', ')}</p>
           <p>Hooks: {item.manifest.hooks.map(hook => `${hook.event} (${hook.policy})`).join(', ')}</p>
           <p>Manifest SHA-256 {item.ref.manifestHash}</p>
           <button className="secondary-button" disabled={configurationBusy || !enabled && !item.compatibility.available}
-            onClick={() => void save(enabled ? EMPTY_EXTENSION_SELECTION : { enabledExtensions: [item.ref] })}>{enabled ? 'Disable' : 'Enable'} invoice-assist v1</button></article>;
+            onClick={() => void save({ enabledExtensions: enabled ? selected.enabledExtensions.filter(ref => ref.id !== item.ref.id)
+              : [...selected.enabledExtensions, item.ref].sort((a, b) => Number(a.id === 'subagents') - Number(b.id === 'subagents')) })}>{enabled ? 'Disable' : 'Enable'} {item.ref.id} {item.ref.version}</button></article>;
       })}
       {selected.enabledExtensions.some(ref => !catalog.state.data?.items.some(item => extensionRefKey(item.ref) === extensionRefKey(ref)))
         && <p role="alert">The saved extension version is unavailable. Clear the selection or select a verified version.</p>}
@@ -117,16 +118,17 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
         onChange={event => setSessionId(Number(event.target.value))}><option value={0}>Choose a Session</option>
         {sessions.state.data?.items.map(item => <option key={item.sessionId} value={item.sessionId}>{item.title} ({item.sessionId})</option>)}</select></label>
       {live.state.pending && <p data-testid="extension-session-pending">Checking Session extensions…</p>}
-      {!instance && <p>No instance recorded in this Host. A selected extension loads only when an eligible Run prepares.</p>}
-      {instance && <><p data-testid="extension-instance">{instance.state} · {instance.admission} · {instance.instanceId}</p>
+      {!instances.length && <p>No instance recorded in this Host. A selected extension loads only when an eligible Run prepares.</p>}
+      {instances.map(instance => <article key={instance.instanceId}><p>{instance.ref.id} {instance.ref.version}</p>
+        <p data-testid="extension-instance">{instance.state} · {instance.admission} · {instance.instanceId}</p>
         <p>Actual tools: {instance.registeredTools.join(', ') || 'None'} · Actual commands: {instance.registeredCommands.join(', ') || 'None'}</p>
         <p>Actual Hooks: {instance.hookEvents.join(', ') || 'None'}</p>
         <p>Shutdown: {instance.cleanup.shutdownRequired ? instance.cleanup.shutdownAcknowledged ? 'acknowledged' : 'pending' : 'not required'} · SDK: {instance.cleanup.sdkSessionCreated ? instance.cleanup.sdkDisposed ? 'disposed' : 'retained' : 'not created'} · Callbacks: {instance.cleanup.ownedCallbacksSettled ? 'settled' : 'pending'}</p>
         {instance.lastError && <p role="alert">{instance.lastError.code} · {instance.lastError.message}</p>}
-        <button className="secondary-button" disabled={managementBusy || runtime.state.data?.blocked || instance.state !== 'active' || instance.admission !== 'open'} onClick={() => void diagnose()}>Run invoice-assist diagnostic</button>{' '}
-        <button className="secondary-button" disabled={managementBusy || instance.state === 'disposed'} onClick={() => void release()}>Release Session extensions</button>
+        {instance.ref.id === 'invoice-assist' && <button className="secondary-button" disabled={managementBusy || runtime.state.data?.blocked || instance.state !== 'active' || instance.admission !== 'open'} onClick={() => void diagnose(instance)}>Run invoice-assist diagnostic</button>}{' '}
+        <button className="secondary-button" disabled={managementBusy || instance.state === 'disposed'} onClick={() => void release(instance)}>Release Session extensions</button>
         {instance.diagnostics.map((item, index) => <p key={index}>{item.event} · {item.code} · {item.at}</p>)}
-      </>}
+      </article>)}
       {executing && <p>Session execution is active. Wait for actual stop before diagnostics or release.</p>}
       {executing && active?.runId && <button className="secondary-button" disabled={!ready || actionPending}
         onClick={async () => { await window.flowmate.cancelRun(active.runId!); await refreshSession(); }}>Stop current Run</button>}

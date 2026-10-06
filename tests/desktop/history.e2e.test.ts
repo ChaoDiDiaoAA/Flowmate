@@ -74,6 +74,7 @@ async function fixture(withQueued = false) {
     }
     await expect.poll(() => page.evaluate(() => window.flowmate.queryRuntimeState())).toMatchObject({ ok: true, data: { active: null } });
     await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await expect(page.locator('.chat-current-title')).toHaveText('History original');
     return { app, page, seed, userData, provider, queuedInputId, consumedPrimary, requests: () => requests };
   } catch (error) { release(); await provider.stop(); await closeDesktopFixture(app, userData, error as Error); throw error; }
 }
@@ -171,6 +172,7 @@ async function installHistoryGate(app: ElectronApplication, root: string) {
 test('P9 T08 retries the whole frozen fork body after the source revision title and selected node change', async () => {
   const f = await fixture(); let failure: Error | undefined;
   try {
+    expect(await f.page.locator('.chat-current-title').innerText()).toBe('History original');
     const composer = f.page.getByRole('textbox', { name: 'Message to model' }); await composer.fill('Source draft stays here');
     const before = await f.page.evaluate(() => window.flowmate.readWorkspace()); if (!before.ok) throw new Error(before.error.code);
     const history = await f.page.evaluate(id => window.flowmate.querySessionHistory({ sessionId: id }), f.seed.sessionId); if (!history.ok) throw new Error(history.error.code);
@@ -269,6 +271,7 @@ test('P9 T08 preserves a durable fork across late navigation and a real Workspac
   try {
     const other = await f.page.evaluate(() => window.flowmate.createSession({ title: 'Concurrent selection' })); if (!other.ok) throw new Error(other.error.code);
     await f.page.reload();
+    await expect(f.page.locator('.chat-current-title')).toHaveText('History original');
     const composer = f.page.getByRole('textbox', { name: 'Message to model' }); await composer.fill('Unmoved source draft');
     await installHistoryGate(f.app, f.userData);
     const history = await f.page.evaluate(id => window.flowmate.querySessionHistory({ sessionId: id }), f.seed.sessionId); if (!history.ok) throw new Error(history.error.code);

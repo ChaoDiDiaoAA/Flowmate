@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { AgentRunSnapshot, BusinessEventSnapshot, DocumentSnapshot, JobSnapshot, PromptTraceResult,
   RunSnapshot, RuntimeEvent, RuntimeState, RuntimeToolView, SessionSnapshot, ContextReference } from '@flowmate/contracts';
 import type { EventViewState } from './event-state.ts';
+import { Subagents } from './subagents.tsx';
 
 const eventLabels: Record<RuntimeEvent['type'], string> = {
   run_created: 'Request accepted', run_started: 'Processing started', run_completed: 'Processing completed',
@@ -12,6 +13,7 @@ const eventLabels: Record<RuntimeEvent['type'], string> = {
 function toolLabel(name: string): string { return name.replaceAll('_', ' ').replace(/^./u, c => c.toUpperCase()); }
 function utc(value: string): string { return new Date(value).toLocaleString(undefined, { timeZone: 'UTC' }) + ' UTC'; }
 type Props = {
+  hostEpoch: number; ready: boolean;
   sessions: readonly SessionSnapshot[]; selectedSessionId: number | null; jobs: readonly JobSnapshot[];
   documents: readonly DocumentSnapshot[]; currentRun: RunSnapshot | null; runtime: RuntimeState | null;
   view: EventViewState | null; snapshot: RunSnapshot | null; tools: readonly RuntimeToolView[];
@@ -26,6 +28,7 @@ type Props = {
 
 export function ActivityPage(props: Props) {
   const [sessionId, setSessionId] = useState<number | null>(props.selectedSessionId);
+  const [parentRunId, setParentRunId] = useState<number | null>(null);
   const [requests, setRequests] = useState<readonly AgentRunSnapshot[]>([]);
   const [nextRunId, setNextRunId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
@@ -143,15 +146,18 @@ export function ActivityPage(props: Props) {
       <button className="secondary-button" disabled={loading || businessLoading} onClick={refreshActivity}>Refresh activity</button></div>
     {[error, requestError, businessError].filter(Boolean).map(message => <p key={message} className="notice bad" role="alert">{message}</p>)}
     <section className="panel"><div className="panel-head"><h2>Processing requests</h2></div><div className="activity-controls">
-      <label>Conversation<select aria-label="Conversation" value={sessionId ?? ''} onChange={e => { props.onClearObservation(); setSessionId(e.target.value ? Number(e.target.value) : null); }}>
+      <label>Conversation<select aria-label="Conversation" value={sessionId ?? ''} onChange={e => { props.onClearObservation(); setParentRunId(null); setSessionId(e.target.value ? Number(e.target.value) : null); }}>
         <option value="">Choose a conversation</option>{props.sessions.map(s => <option key={s.sessionId} value={s.sessionId}>{s.title}</option>)}</select></label>
-      <label>Request<select aria-label="Processing request" value={props.view?.sessionId === sessionId ? props.view.runId : ''}
-        onChange={e => { if (e.target.value && sessionId !== null) props.onObserve(Number(e.target.value), sessionId); }}>
+      <label>Request<select aria-label="Processing request" value={parentRunId ?? (props.view?.sessionId === sessionId ? props.view.runId : '')}
+        onChange={e => { setParentRunId(e.target.value ? Number(e.target.value) : null); if (e.target.value && sessionId !== null) props.onObserve(Number(e.target.value), sessionId); else props.onClearObservation(); }}>
         <option value="">Choose a processing request</option>{requests.map(r => <option key={r.runId} value={r.runId}>
           {new Date(r.createdAt).toLocaleString()} · {r.status} · {r.input.text.slice(0, 120)}</option>)}</select></label>
-      {props.currentRun && <button className="secondary-button" onClick={() => props.onObserve(props.currentRun!.runId, props.currentRun!.sessionId)}>View latest request</button>}
+      {props.currentRun && <button className="secondary-button" onClick={() => { setSessionId(props.currentRun!.sessionId); setParentRunId(props.currentRun!.kind === 'agent' ? props.currentRun!.runId : null); props.onObserve(props.currentRun!.runId, props.currentRun!.sessionId); }}>View latest request</button>}
       {nextRunId !== null && <button className="secondary-button" disabled={loading} onClick={() => void loadMoreRequests()}>Load earlier requests</button>}
     </div>{loading && <p className="activity-note" role="status">Loading processing requests…</p>}</section>
+    {parentRunId !== null && sessionId !== null && <Subagents key={`${props.hostEpoch}:${sessionId}:${parentRunId}`} parentRunId={parentRunId}
+      parentSessionId={sessionId} hostEpoch={props.hostEpoch} ready={props.ready} refreshToken={`${props.view?.runId}:${props.view?.events.size}:${snapshot?.status}`}
+      onObserve={props.onObserve} />}
     {props.view && <section className="panel" data-testid="processing-details"><div className="panel-head"><h2>Processing details</h2>
       <span role="status">{snapshot?.cancelRequestedAt && ['created', 'running'].includes(snapshot.status) ? 'Stopping' : snapshot?.status ?? 'Loading'}</span></div>
       {props.runtime?.blocked && <p className="notice bad" role="status">New requests are blocked. Saved processing details remain available to read.</p>}

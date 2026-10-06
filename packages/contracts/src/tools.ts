@@ -1,10 +1,12 @@
 import { z } from 'zod';
 import type { AppError, DbId } from './runtime.ts';
 import { RequestContextBindingSchema } from './context.ts';
+import { MAX_TOOL_NAME_CHARS, MAX_TOOL_VERSION_CHARS, RunScopeSchema } from './tool-config.ts';
+export { MAX_TOOL_NAME_CHARS, MAX_TOOL_VERSION_CHARS, RunScopeSchema } from './tool-config.ts';
 
 // 工具身份的固定契约长度，供装配、记录与 Schema 共用。
-export const MAX_TOOL_NAME_CHARS = 128;
-export const MAX_TOOL_VERSION_CHARS = 32;
+/** Registration names; observed invalid attempts retain their original bounded strings. */
+export const RegisteredToolNameSchema = z.string().regex(/^(?:Agent|[a-z][a-z0-9_]{0,127})$/);
 
 export const ToolEffectSchema = z.enum(['PURE', 'READ', 'LOCAL_WRITE']);
 export type ToolEffect = z.infer<typeof ToolEffectSchema>;
@@ -18,14 +20,6 @@ export const ToolIdentitySchema = z.object({
   effect: ToolEffectSchema,
   executionMode: ToolExecutionModeSchema,
 }).strict();
-
-const scopeShape = {
-  allowedTools: z.array(z.string().min(1).max(MAX_TOOL_NAME_CHARS)).max(64),
-  allowedDocumentIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(64),
-  allowedArtifactIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(128),
-  allowedResourcePaths: z.array(z.string().min(1).max(4_096)).max(64),
-};
-export const RunScopeSchema = z.object({ version: z.literal(2), ...scopeShape }).strict();
 
 type RunScopeValues = z.infer<typeof RunScopeSchema>;
 type ReadonlyScope<T> = {
@@ -100,6 +94,7 @@ export const ToolExecutionContextSchema = z.object({
   sessionId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   nativeToolCallId: z.string().min(1).max(256),
   requestBinding: RequestContextBindingSchema.optional(),
+  deadlineAt: z.number().finite().positive().optional(),
   scope: RunScopeSchema,
   signal: z.custom<AbortSignal>((value) => typeof value === 'object' && value !== null
     && typeof (value as AbortSignal).aborted === 'boolean'
@@ -109,7 +104,7 @@ export const ToolExecutionContextSchema = z.object({
   'Tool request binding belongs to a different Run or Session.');
 
 export type ToolExecutionContext = Readonly<Omit<z.infer<typeof ToolExecutionContextSchema>, 'scope'> & { scope: RunScope }>;
-export type ToolCallContext = Pick<ToolExecutionContext, 'nativeToolCallId' | 'signal' | 'requestBinding'>;
+export type ToolCallContext = Pick<ToolExecutionContext, 'nativeToolCallId' | 'signal' | 'requestBinding' | 'deadlineAt'>;
 export type ProductToolContext = Pick<ToolExecutionContext, 'sessionId' | 'runId' | 'scope'>;
 
 export type ToolResult<O> =

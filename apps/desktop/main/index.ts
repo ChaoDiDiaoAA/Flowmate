@@ -91,6 +91,7 @@ import { historyHostFailure, matchesHistoryResponse, parseHistoryHostResult, par
 import type { HostCommand } from '../../host/protocol.ts';
 import { DesktopSessionCompactionRequestSchema } from '@flowmate/contracts';
 import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../host/protocol.ts';
+import { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure } from '../../host/protocol.ts';
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 
@@ -427,13 +428,17 @@ async function contextIpcQuery(command: Extract<HostCommand, { type: 'list_conte
 async function assemblyIpcQuery(type: string, input?: unknown) {
   const command = parseHostCommand({ version: 1, requestId: randomUUID(), type, ...(input === undefined ? {} : { input }) });
   const extension = isExtensionHostCommand(type);
-  if (!command || !extension && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
+  const subagent = isSubagentHostCommand(type);
+  if (!command || !extension && !subagent && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
+  const [parse, matches, failure] = subagent ? [parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
+    : extension ? [parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure]
+      : [parseResourceHostResult, matchesResourceResponse, resourceHostFailure];
   const epoch = host.connectionEpoch;
   try {
     const { version: _version, requestId: _requestId, ...request } = command;
-    const checked = (extension ? parseExtensionHostResult : parseResourceHostResult)(type, await host.request(request));
-    return epoch === host.connectionEpoch && checked !== null && (extension ? matchesExtensionResponse : matchesResourceResponse)(command, checked) ? checked : (extension ? extensionHostFailure : resourceHostFailure)(type);
-  } catch { return (extension ? extensionHostFailure : resourceHostFailure)(type); }
+    const checked = parse(type, await host.request(request));
+    return epoch === host.connectionEpoch && checked !== null && matches(command, checked) ? checked : failure(type);
+  } catch { return failure(type); }
 }
 async function compactionIpcRequest(command: HostCommand) {
   const epoch = host.connectionEpoch;
@@ -525,7 +530,8 @@ function registerIpc(): void {
     catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool could not be confirmed.', true)); }
   });
   for (const type of ['list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file',
-    'list_extensions', 'update_extension_selection', 'query_session_extensions', 'query_run_extensions', 'execute_extension_command', 'dispose_session_extensions'] as const)
+    'list_extensions', 'update_extension_selection', 'query_session_extensions', 'query_run_extensions', 'execute_extension_command', 'dispose_session_extensions',
+    'list_subagents', 'query_subagent', 'cancel_subagent'] as const)
     handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => assemblyIpcQuery(type, raw));
   handle(channels.listContextSnapshots, async (_event, raw) => {
     const input = ContextSnapshotsRequestSchema.safeParse(raw);

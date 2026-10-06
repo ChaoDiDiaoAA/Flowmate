@@ -107,6 +107,8 @@ export class SessionService {
   }
 
   private acquireMutation(sessionId: DbId, cleanupInstanceId?: string): Result<void> {
+    const child = this.repository.isSubagentSession(sessionId); if (!child.ok) return child;
+    if (child.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
     const held = this.extensionCleanup.get(sessionId);
     if (this.managing.has(sessionId) && (!cleanupInstanceId || held?.instanceId !== cleanupInstanceId || held.inFlight))
       return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
@@ -150,8 +152,8 @@ export class SessionService {
   public async disposeSessionExtensions(request: import('@flowmate/contracts').ExtensionDisposeRequest): Promise<Result<import('@flowmate/contracts').ExtensionDisposeReceipt>> {
     const row = this.repository.get(request.sessionId); if (!row.ok) return row;
     const inspected = this.queryExtensions(request); if (!inspected.ok) return inspected;
-    const instance = inspected.data.instance;
-    if (!instance) return fail(appError('extension_not_loaded', 'extension', 'No Extension instance is known.'));
+    const instance = inspected.data.instances.find(item => item.instanceId === request.expectedInstanceId);
+    if (!instance) return fail(appError(inspected.data.instances.length ? 'extension_instance_conflict' : 'extension_not_loaded', 'extension', 'No matching Extension instance is known.', true));
     if (instance.instanceId !== request.expectedInstanceId) return fail(appError('extension_instance_conflict', 'session', 'Extension instance changed.', true));
     if (instance.state === 'disposed') return ok(ExtensionDisposeReceiptSchema.parse({
       sessionId: request.sessionId, instanceId: instance.instanceId, state: 'disposed', report: { stopped: true, closed: true, errors: [] } }));
@@ -391,7 +393,7 @@ export class SessionService {
     const runInputs: MessageRunInput[] = [];
     for (const runId of new Set(stored.data.bindings.map((binding) => binding.runId))) {
       const run = this.runs.get(runId);
-      if (!run.ok || run.data.kind !== 'agent' || !stored.data.origins.filter(origin => origin.originRunId === runId).every(origin => origin.originSessionId === run.data.sessionId)) {
+      if (!run.ok || run.data.kind === 'provider' || !stored.data.origins.filter(origin => origin.originRunId === runId).every(origin => origin.originSessionId === run.data.sessionId)) {
         return fail(appError('session_history_invalid', 'session', 'Saved message Run identity is inconsistent.'));
       }
       const config = run.data.config as Record<string, unknown>;

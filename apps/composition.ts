@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
-  ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService } from '@flowmate/core';
+  ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
@@ -68,8 +68,9 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const invoiceForms = options.invoiceFormBridge ? createInvoiceFormService({ recorder, runs: database.data.runs,
     sessions: database.data.sessions, documents: database.data.documents, jobs: database.data.jobs,
     workspace: database.data.workspace, candidates: database.data.candidates, bridge: options.invoiceFormBridge, now }) : undefined;
+  let agent: import('@flowmate/contracts').AgentPort;
   const assembled = [...createInvoiceTools({ documents, documentRepository: database.data.documents,
-    candidates: database.data.candidates, now }), ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), ...native.definitions];
+    candidates: database.data.candidates, now }), ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), createSubagentTool(() => agent), ...native.definitions];
   const definitions = Object.freeze([...(options.toolDefinitions?.(assembled) ?? assembled)]);
   const unavailableTools = new Set(native.availability.filter(item => !item.available).map(item => item.name as string));
   const resources = createResourceService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
@@ -82,7 +83,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
     monotonicNow: () => performance.now() });
   const provider = options.provider ?? new PiProviderAdapter();
-  const agent = options.agentFactory?.(definitions) ?? options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace,
+  agent = options.agentFactory?.(definitions) ?? options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace,
     resourceBundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
     tools: definitions });
   let sessionService: SessionService;

@@ -44,7 +44,7 @@ export function verifyNativeCommitContexts(db: Database, sessionId: DbId, contex
     let owner = owners.get(context.runId);
     if (!owner) {
       const row = db.query('SELECT * FROM runs WHERE id=?').get(context.runId) as Parameters<typeof readRunContextOwner>[1] | null;
-      if (!row || row.kind !== 'agent' || row.session_id !== sessionId) throw new Error('input_commit_owner_invalid');
+      if (!row || !['agent', 'subagent'].includes(row.kind) || row.session_id !== sessionId) throw new Error('input_commit_owner_invalid');
       readRunContextOwner(db, row, verified);
       owner = row; owners.set(context.runId, owner);
     }
@@ -123,6 +123,26 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
   }
   return {
     lookup,
+    createSubagentInputInTransaction(input: { childRunId: DbId; childSessionId: DbId; originToolCallId: DbId;
+      contextSnapshotId: DbId; content: SessionInputContentV2; at: string }): Result<{ inputId: DbId }> {
+      try {
+        if (!db.inTransaction) return fail(appError('state_conflict', 'runtime', 'Child input requires the admission transaction.'));
+        const run = db.query("SELECT * FROM runs WHERE id=? AND kind='subagent' AND session_id=? AND origin_tool_call_id=? AND status='created'")
+          .get(input.childRunId, input.childSessionId, input.originToolCallId) as Parameters<typeof readRunContextOwner>[1] | null;
+        if (!run || db.query('SELECT id FROM session_inputs WHERE session_id=? LIMIT 1').get(input.childSessionId))
+          return fail(appError('subagent_origin_invalid', 'runtime', 'Child input already exists or has no trusted origin.'));
+        const saved = readContextSnapshotOwner(db, input.contextSnapshotId, run), content = SessionInputContentV2Schema.parse(input.content);
+        if (saved.json.goalMode !== 'answer' || content.workspaceContext !== null || content.workspaceInput !== null
+          || content.text !== saved.json.text || !isDeepStrictEqual(content.allowedDocumentIds, saved.json.allowedDocumentIds)
+          || !isDeepStrictEqual(content.allowedArtifactIds, saved.json.allowedArtifactIds)
+          || !isDeepStrictEqual(content.resourceBinding, saved.json.resourceBinding)) throw new Error('child_input_snapshot_invalid');
+        const hash = createHash('sha256').update(JSON.stringify({ originToolCallId: input.originToolCallId, childRunId: input.childRunId, content })).digest('hex');
+        const inserted = db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
+          context_snapshot_id,content_json,status,processing_status,created_at,updated_at) VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`)
+          .run(input.childSessionId, hash, input.childRunId, input.contextSnapshotId, JSON.stringify(content), input.at, input.at);
+        const inputId = Number(inserted.lastInsertRowid); appendInputState(db, inputId, events); return ok({ inputId });
+      } catch { return fail(appError('subagent_persist_failed', 'storage', 'Child input could not be saved.', true)); }
+    },
     allocateSequence<T>(sessionId: DbId, accept: (sequence: number) => Result<T>): Result<T> {
       let rejected: Result<never> | null = null;
       try {
@@ -161,7 +181,7 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
         if (request.runId !== undefined) {
           const run = db.query('SELECT kind,session_id FROM runs WHERE id=?').get(request.runId) as { kind: string; session_id: number | null } | null;
           if (!run) return fail(appError('run_not_found', 'runtime', 'Run does not exist.'));
-          if (run.kind !== 'agent' || run.session_id !== request.sessionId)
+          if (!['agent', 'subagent'].includes(run.kind) || run.session_id !== request.sessionId)
             return fail(appError('state_conflict', 'session', 'Run does not belong to this Session.'));
         }
         const rows = db.query(`SELECT * FROM session_inputs WHERE session_id=? AND (? IS NULL OR run_id=?)
@@ -280,7 +300,7 @@ export function markInputConsumed(db: Database, inputId: DbId, runId: DbId, entr
     .get(row.session_id, entryId) as { entry_json: string; run_id: number | null } | null;
   const run = db.query('SELECT session_id,kind FROM runs WHERE id=?').get(runId) as { session_id: number; kind: string } | null;
   const native = entry ? JSON.parse(entry.entry_json) as NativeEntry : null;
-  if (!entry || entry.run_id !== runId || run?.kind !== 'agent' || run.session_id !== row.session_id
+  if (!entry || entry.run_id !== runId || !run || !['agent', 'subagent'].includes(run.kind) || run.session_id !== row.session_id
     || native?.type !== 'message' || native.message?.role !== 'user') throw new Error('input_consumption_identity_invalid');
   if (row.status === 'consumed') { if (row.native_entry_id !== entryId) throw new Error('input_consumption_identity_conflict'); return; }
   if (!['queued', 'delivery_unknown'].includes(row.status) || row.native_entry_id !== null) throw new Error('input_consumption_state_conflict');

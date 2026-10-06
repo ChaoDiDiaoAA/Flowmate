@@ -221,7 +221,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -298,7 +298,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -307,7 +307,9 @@ describe('P3 invoice storage migration', () => {
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
       .toHaveLength(16);
-    expect(db.query('PRAGMA table_info(runs)').all()).toHaveLength(27);
+    expect(db.query('PRAGMA table_info(runs)').all()).toHaveLength(30);
+    expect(db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs ORDER BY id').all())
+      .toEqual([{ parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);
     expect(db.query('SELECT metadata_json FROM sessions WHERE id=7').get()).toEqual({
       metadata_json: '{"version":1,"model_use_blocked":null}',
     });

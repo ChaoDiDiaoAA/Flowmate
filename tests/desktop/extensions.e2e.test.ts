@@ -80,7 +80,7 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
     await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click();
     await expect(page.getByTestId('extension-instance')).toContainText('active · open');
     const actual = await page.evaluate(sessionId => window.flowmate.querySessionExtensions({ sessionId }), seed.sessionId);
-    if (!actual.ok || !actual.data.instance) throw new Error('Actual instance missing'); const firstId = actual.data.instance.instanceId;
+    if (!actual.ok || !actual.data.instances[0]) throw new Error('Actual instance missing'); const firstId = actual.data.instances[0].instanceId;
     const runs = await page.evaluate(sessionId => window.flowmate.listSessionRuns({ sessionId }), seed.sessionId);
     if (!runs.ok || !runs.data.items[0]) throw new Error('Actual Run missing'); const runId = runs.data.items[0].runId;
     const feedback = payloads[1].messages.find((message: any) => message.role === 'tool'); expect(JSON.parse(feedback.content)).toMatchObject({ results: [{ status: 'valid' }] });

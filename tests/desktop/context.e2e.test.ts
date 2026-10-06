@@ -376,7 +376,7 @@ it('invalidates Context during real Host exit and reads the same saved facts aft
 });
 
 it('pages real original snapshots requests and Tool model human bases without changing the current other invoice', async () => {
-  it.setTimeout(60_000); // This new journey creates 22 real inputs and >20 real SDK requests before its read-only UI steps.
+  it.setTimeout(90_000); // Match the other denseFixture journey: 22 real inputs and >20 SDK requests precede the UI steps.
   const f = await denseFixture(); let failure: Error | undefined;
   try {
     const baseline = await f.page.evaluate(() => window.flowmate.readWorkspace()), http = f.requests();

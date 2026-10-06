@@ -455,7 +455,8 @@ describe('Fill backend through the public Application', () => {
           async close() { return { stopped: true, closed: true, errors: [] }; } };
       } }));
     try {
-      expect(names).toHaveLength(bridgePresent ? 22 : 21);
+      expect(names).toHaveLength(bridgePresent ? 23 : 22);
+      expect(names.filter(name => name === 'Agent')).toHaveLength(1);
       expect(names.includes('fill_invoice_form')).toBe(bridgePresent);
       expect(names.slice(0, 13)).not.toContain('fill_invoice_form');
       expect(await app.saveInvoiceCandidate({} as never)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });

@@ -59,6 +59,11 @@ export type ToolCallDelivery = {
   requestDispatchedAt: string | null;
   error: AppError | null;
 };
+export const ToolCallDeliverySchema: z.ZodType<ToolCallDelivery> = z.object({ version: z.literal(1),
+  state: z.enum(['not_attempted', 'message_observed', 'request_observed', 'failed', 'unknown']),
+  messageObservedAt: z.string().datetime({ offset: true }).nullable(),
+  includedInCallSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+  requestDispatchedAt: z.string().datetime({ offset: true }).nullable(), error: AppErrorSchema.nullable() }).strict();
 export type NativeProcessRecord = {
   nativeToolCallId: string;
   pid: number;

@@ -351,7 +351,11 @@ it('T08 portable Context error facts keep the original export binding and exact 
     resource_dependency_missing:['input',false],resource_required_unavailable:['input',false],resource_content_too_large:['input',false],
     resource_file_unavailable:['input',false],resource_bundle_unavailable:['storage',true],resource_expansion_mismatch:['runtime',false],
     resource_evidence_conflict:['runtime',false],resource_evidence_write_failed:['storage',true],
-    config_revision_conflict:['input',true],config_settings_write_failed:['storage',true] });
+    config_revision_conflict:['input',true],config_settings_write_failed:['storage',true],
+    subagent_origin_invalid:['runtime',false],subagent_identity_conflict:['runtime',false],
+    subagent_role_denied:['tool',false],subagent_tool_denied:['tool',false],subagent_busy:['runtime',true],
+    subagent_depth_exceeded:['runtime',false],subagent_foreground_required:['runtime',false],
+    subagent_execution_failed:['runtime',false],subagent_stop_unconfirmed:['runtime',true],subagent_persist_failed:['storage',true] });
   for (const [code,[category,retryable]] of Object.entries(portableFacts)) {
     const error={code,category,retryable,message:'Controlled product failure.'};
     expect(contracts.ContextErrorSchema.safeParse(error).success).toBe(true);

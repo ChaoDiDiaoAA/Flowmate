@@ -14,10 +14,11 @@ function checked<T>(action: () => T): Result<T> {
 }
 export function createExtensionService(options: { resourceRoot: string; sdkVersion: string;
   registeredTools: readonly Pick<ToolDefinition<any, any>, 'name' | 'version' | 'effect'>[] }) {
-  const root = resolve(options.resourceRoot), file = join(root, 'extensions', 'invoice-v1.json');
-  function read(): ExtensionCatalogItem {
+  const root = resolve(options.resourceRoot), files = ['invoice-v1.json', 'subagents-v1.json'] as const;
+  function read(name: typeof files[number]): ExtensionCatalogItem {
+    const file = join(root, 'extensions', name);
     const location = relative(realpathSync(root), realpathSync(file)).replaceAll('\\', '/');
-    if ((process.platform === 'win32' ? location.toLowerCase() : location) !== 'extensions/invoice-v1.json')
+    if ((process.platform === 'win32' ? location.toLowerCase() : location) !== `extensions/${name}`)
       throw appError('extension_config_invalid', 'input', 'The extension manifest is outside its trusted fixed location.');
     const fd = openSync(file, 'r');
     let text: string;
@@ -31,32 +32,40 @@ export function createExtensionService(options: { resourceRoot: string; sdkVersi
     } finally { closeSync(fd); }
     const manifest = ExtensionManifestSchema.parse(JSON.parse(text));
     const manifestHash = createHash('sha256').update(canonicalExtensionManifest(manifest)).digest('hex');
-    const tool = options.registeredTools.find(tool => tool.name === 'check_invoice_sources');
+    if (manifest.id !== (name === 'invoice-v1.json' ? 'invoice-assist' : 'subagents')) throw new Error('manifest identity');
     const code = options.sdkVersion !== manifest.sdkVersion ? 'sdk_version_mismatch' as const
-      : !tool || tool.version !== '1' || tool.effect !== 'READ' ? 'tool_definition_incompatible' as const : null;
+      : manifest.tools.some(required => !options.registeredTools.some(tool => tool.name === required.name
+        && tool.version === required.version && tool.effect === 'READ')) ? 'tool_definition_incompatible' as const : null;
     return ExtensionCatalogItemSchema.parse({ ref: { id: manifest.id, version: manifest.version, manifestHash }, manifest,
       compatibility: { available: code === null, code } });
   }
-  function selected(input: ExtensionSelection): ExtensionCatalogItem | null {
+  function selected(input: ExtensionSelection): ExtensionCatalogItem[] {
     const selection = ExtensionSelectionSchema.parse(input);
-    if (!selection.enabledExtensions.length) return null;
-    const item = read();
-    if (extensionRefKey(selection.enabledExtensions[0]) !== extensionRefKey(item.ref))
-      throw appError('extension_config_invalid', 'input', 'The selected extension differs from its trusted fixed identity.');
-    if (!item.compatibility.available) throw appError('extension_incompatible', 'extension', 'The extension is incompatible with the current SDK or business tool.');
-    return item;
+    if (!selection.enabledExtensions.length) return [];
+    const items = selection.enabledExtensions.map(ref => {
+      const name = files.find(name => (name === 'invoice-v1.json' ? 'invoice-assist' : 'subagents') === ref.id);
+      if (!name) throw appError('extension_config_invalid', 'input', 'Unknown trusted extension.');
+      const item = read(name);
+      if (extensionRefKey(ref) !== extensionRefKey(item.ref))
+        throw appError('extension_config_invalid', 'input', 'The selected extension differs from its trusted fixed identity.');
+      if (!item.compatibility.available) throw appError('extension_incompatible', 'extension', 'The extension is incompatible with the current SDK or business tool.');
+      return item;
+    });
+    return items.sort((a, b) => Number(a.ref.id === 'subagents') - Number(b.ref.id === 'subagents'));
   }
   return {
-    list(): Result<readonly ExtensionCatalogItem[]> { return checked(() => [read()]); },
+    list(): Result<readonly ExtensionCatalogItem[]> { return checked(() => files.map(read)); },
     validateSelection(selection: ExtensionSelection): Result<void> { return checked(() => { selected(selection); }); },
     freeze(input: { selection: ExtensionSelection; settingsRevision: number; activeToolNames: readonly string[];
       policy: 'p2' | 'p3' | 'fill' }): Result<FrozenExtensions> {
       return checked(() => {
-        const selection = ExtensionSelectionSchema.parse(input.selection), item = selected(selection);
-        const included = item !== null && input.policy === 'p3' && input.activeToolNames.includes('check_invoice_sources');
-        return FrozenExtensionsSchema.parse({ version: 1, policyVersion: 'p12-managed-extensions-v1', settingsRevision: input.settingsRevision,
-          selected: selection.enabledExtensions, included: included ? [{ ref: item.ref, manifest: item.manifest }] : [],
-          excluded: item && !included ? [{ ref: item.ref, code: 'tool_not_active' }] : [] });
+        const selection = ExtensionSelectionSchema.parse(input.selection), items = selected(selection);
+        const eligible = (item: ExtensionCatalogItem) => input.policy === 'p3' && (item.ref.id === 'invoice-assist'
+          ? input.activeToolNames.includes('check_invoice_sources')
+          : ['Agent', 'read_invoice_document', 'read_invoice_evidence', 'check_invoice_sources'].every(name => input.activeToolNames.includes(name)));
+        return FrozenExtensionsSchema.parse({ version: 1, policyVersion: 'p13-managed-extensions-v1', settingsRevision: input.settingsRevision,
+          selected: selection.enabledExtensions, included: items.filter(eligible).map(item => ({ ref: item.ref, manifest: item.manifest })),
+          excluded: items.filter(item => !eligible(item)).map(item => ({ ref: item.ref, code: 'tool_not_active' })) });
       });
     },
   };

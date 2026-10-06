@@ -52,16 +52,32 @@ export type DbHandle = {
   close: () => void;
 };
 
-type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16;
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17;
 function migrationSql(version: SchemaVersion): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql'][version - 1];
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
 
 function runMigration(db: Database, version: SchemaVersion): void {
+  const legacyAlter = version === 17 ? (db.query('PRAGMA legacy_alter_table').get() as { legacy_alter_table: number }).legacy_alter_table : 0;
   try {
-    if (version === 15 || version === 16) {
+    if (version === 17) {
+      const foreignKeys = (db.query('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys;
+      if (db.inTransaction || foreignKeys !== 1) throw new Error('migration_foreign_keys_disabled');
+      const columns = (db.query('PRAGMA table_info(runs)').all() as { name: string }[]).map(row => row.name);
+      const before = JSON.stringify(db.query('SELECT * FROM runs ORDER BY id').all());
+      const schemaQuery = "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND name!='context_snapshot_insert_guard' ORDER BY name";
+      const schema = JSON.stringify(db.query(schemaQuery).all());
+      db.exec('PRAGMA foreign_keys=OFF'); db.exec('PRAGMA legacy_alter_table=ON');
+      for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
+      if (db.query('PRAGMA foreign_key_check').all().length
+        || JSON.stringify(db.query(`SELECT ${columns.join(',')} FROM runs ORDER BY id`).all()) !== before
+        || JSON.stringify(db.query(schemaQuery).all()) !== schema
+        || db.query('SELECT id FROM runs WHERE parent_run_id IS NOT NULL OR origin_tool_call_id IS NOT NULL OR plugin_agent_id IS NOT NULL').get())
+        throw new Error('migration_preservation_failed');
+      db.exec('COMMIT');
+    } else if (version === 15 || version === 16) {
       // Trigger bodies contain semicolons: execute each explicit whole-statement boundary.
       for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
       if (db.query('PRAGMA foreign_key_check').all().length) throw new Error('migration_foreign_key_violation');
@@ -83,6 +99,10 @@ function runMigration(db: Database, version: SchemaVersion): void {
     throw error;
   } finally {
     if (version === 10) db.exec('PRAGMA foreign_keys=ON');
+    if (version === 17) {
+      db.exec(`PRAGMA legacy_alter_table=${legacyAlter ? 'ON' : 'OFF'}`); db.exec('PRAGMA foreign_keys=ON');
+      if ((db.query('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys !== 1) throw new Error('migration_foreign_keys_disabled');
+    }
   }
 }
 
@@ -92,10 +112,10 @@ function migrateToLatest(db: Database): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 16) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 17) {
     throw new Error('unsupported_schema_version');
   }
-  for (let version = versions.length + 1; version <= 16; version += 1) runMigration(db, version as SchemaVersion);
+  for (let version = versions.length + 1; version <= 17; version += 1) runMigration(db, version as SchemaVersion);
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ToolRuntimeObservationSchema } from './activity.ts';
+import { RegisteredToolNameSchema } from './tools.ts';
 import type {
   AppError,
   CloseReport,
@@ -73,7 +74,7 @@ export type NativeInput = {
 };
 
 export type AgentConfigFacts = {
-  extensionPolicy?: 'none' | 'p12-managed-extensions-v1';
+  extensionPolicy?: 'none' | 'p12-managed-extensions-v1' | 'p13-managed-extensions-v1';
   policyVersion: 'p2-invoice-chat-v1';
   nativeSessionId: string;
   systemPrompt: string;
@@ -88,7 +89,7 @@ export type AgentConfigFacts = {
 };
 
 export type P3AgentConfigFacts = {
-  extensionPolicy?: 'none' | 'p12-managed-extensions-v1';
+  extensionPolicy?: 'none' | 'p12-managed-extensions-v1' | 'p13-managed-extensions-v1';
   policyVersion: 'p3-invoice-tools-v1';
   nativeSessionId: string;
   systemPrompt: string;
@@ -117,7 +118,7 @@ export type RunAgentConfigFacts = AgentConfigFacts | P3AgentConfigFacts | P5Chat
 // runtime-v1 已保存策略的固定读取边界，不跟随新 Run 的可调默认变化。
 const observationFields = ToolRuntimeObservationSchema.innerType().shape;
 const calibrationGroupSchema = z.object({
-  toolName: z.string().regex(/^[a-z][a-z0-9_]{0,127}$/),
+  toolName: RegisteredToolNameSchema,
   toolVersion: z.string().min(1).max(32),
   groupKey: observationFields.groupKey, attemptCount: z.number().int().min(0).max(200),
   eligibleCount: z.number().int().min(0).max(200), p95Ms: z.number().finite().nonnegative().nullable(),
@@ -134,7 +135,7 @@ export const RuntimeStrategySnapshotSchema = z.object({
       && new Set(value.groups.map(group => group.groupKey)).size === value.groups.length, 'Duplicate calibration group.'),
   experience: z.object({ version: z.literal(1), modelKey: z.string().min(1).max(1024), promptVersion: z.string().min(1).max(128),
     taskType: z.string().min(1).max(128), items: z.array(z.object({
-      toolName: z.string().regex(/^[a-z][a-z0-9_]{0,127}$/), failureStage: observationFields.failureStage,
+      toolName: RegisteredToolNameSchema, failureStage: observationFields.failureStage,
       diagnosticCode: observationFields.diagnosticCode, afterStructure: observationFields.afterStructure,
       afterDomain: observationFields.afterDomain, timingComplete: z.boolean(), missingEvidence: z.boolean(),
       count: z.number().int().positive().max(200),
@@ -181,6 +182,8 @@ export type AgentExecutionInput = NativeInput & {
   budgetAwareness?: boolean;
   toolBinding?: AgentToolBinding;
   verifyModelUse: () => Result<void>;
+  /** P13 root budget, charged once per actual HTTP attempt including retries. */
+  reserveModelRequest?: () => Result<void>;
   /** Legacy direct SDK callers may omit these; complete product P5 paths always provide them. */
   inputId?: DbId;
   promptText?: string;
@@ -260,6 +263,10 @@ export interface PreparedAgent {
 }
 
 export interface AgentPort {
+  invokeSubagent?(context: import('./tools.ts').ToolExecutionContext,
+    args: import('./subagents.ts').DelegateArgs): Promise<import('./tools.ts').NativeToolOutput>;
+  bindSubagents?(callbacks: import('./subagents.ts').SubagentCallbacks): void;
+  requestSubagentStop?(input: { childRunId: DbId; childNativeSessionId: string; pluginAgentId: string }): Result<void>;
   inspectExtensions?(nativeSessionId: string): Result<import('./extensions.ts').NativeExtensionView>;
   executeExtensionCommand?(nativeSessionId: string, request: import('./extensions.ts').NativeExtensionCommandRequest): Promise<Result<import('./extensions.ts').NativeExtensionCommandReceipt>>;
   disposeExtensions?(nativeSessionId: string, expectedInstanceId: string): Promise<Result<import('./extensions.ts').NativeExtensionDisposeReceipt>>;

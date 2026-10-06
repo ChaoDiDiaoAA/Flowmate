@@ -58,7 +58,7 @@ export function loadNativeHistoryInTransaction(db: Database, sessionId: DbId): S
     if (item.sequence !== index || entry?.id !== item.entry_id) invalid();
     if (item.run_id !== null) {
       const run = db.query('SELECT kind,session_id FROM runs WHERE id=?').get(item.run_id) as { kind: string; session_id: number | null } | null;
-      if (!Number.isSafeInteger(item.run_id) || item.run_id <= 0 || run?.kind !== 'agent' || run.session_id !== sessionId || entry.type !== 'message') invalid();
+      if (!Number.isSafeInteger(item.run_id) || item.run_id <= 0 || !run || !['agent', 'subagent'].includes(run.kind) || run.session_id !== sessionId || entry.type !== 'message') invalid();
     }
     return entry;
   });
@@ -100,7 +100,7 @@ export function commitInTransaction(db: Database, input: HistoryCommitInput, eve
     const entry = entries.find(entry => entry.id === context.entryId);
     const run = db.query('SELECT kind,session_id FROM runs WHERE id=?').get(context.runId) as { kind: string; session_id: number | null } | null;
     const old = byId.get(context.entryId);
-    if (entry?.type !== 'message' || run?.kind !== 'agent' || run.session_id !== input.sessionId || old && old.run_id !== context.runId) conflict();
+    if (entry?.type !== 'message' || !run || !['agent', 'subagent'].includes(run.kind) || run.session_id !== input.sessionId || old && old.run_id !== context.runId) conflict();
     const role = (entry.message as { role?: unknown }).role;
     if (context.inputId !== undefined && (role !== 'user' || context.resultInputIds !== undefined)) conflict();
     if (context.resultInputIds !== undefined && role !== 'assistant') conflict();

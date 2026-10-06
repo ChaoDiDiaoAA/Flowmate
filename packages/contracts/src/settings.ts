@@ -149,7 +149,7 @@ export type DesktopInvoiceFormInspection = {
 };
 
 export type DesktopBridge = Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
-  | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions'> & {
+  | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent'> & {
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
   updateResourceSelection(input: import('./resources.ts').ResourceSelectionRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceSelectionResult>>;

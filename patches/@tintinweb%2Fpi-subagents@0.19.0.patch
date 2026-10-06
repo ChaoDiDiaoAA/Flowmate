@@ -1,0 +1,542 @@
+diff --git a/dist/agent-manager.js b/dist/agent-manager.js
+index 3718f9288982d0469fc593dedde96c158b3b3b9b..fa28d31bdfc358d417446c73f32adc5da9568267 100644
+--- a/dist/agent-manager.js
++++ b/dist/agent-manager.js
+@@ -271,8 +271,13 @@ export class AgentManager {
+         // Validate before the queue branch — a queued spawn should fail at the
+         // call, not minutes later at drain. Throw (not warn): programmatic callers
+         // can fix and retry; the RPC layer converts throws into error envelopes.
+-        assertValidSpawnCwd(options.cwd);
+-        const id = randomUUID().slice(0, 17);
++        if (options.managed && (options.isBackground || !options.blocking || options.parentAgentId || options.workflowId ||
++      options.resumeSessionFile || options.isolation || options.structuredOutput || options.bypassQueue))
++      throw new Error('subagent_parameters_invalid');
++    if (options.managed && !this.poolHasRoom('foreground')) throw new Error('subagent_busy');
++    assertValidSpawnCwd(options.cwd);
++
++    const id = randomUUID().slice(0, 17);
+         const abortController = new AbortController();
+         const record = {
+             id,
+@@ -522,6 +527,7 @@ export class AgentManager {
+         const promise = runAgent(ctx, type, prompt, {
+             pi,
+             agentId: id,
++      managed: options.managed,
+             model: options.model,
+             maxTurns: options.maxTurns,
+             isolated: options.isolated,
+diff --git a/dist/agent-runner.d.ts b/dist/agent-runner.d.ts
+index febe8c3c4321295ed4fa669f5468ecc8fb6b62e6..8d568c3502b261ac59e6f93f3c313243fe5f893e 100644
+--- a/dist/agent-runner.d.ts
++++ b/dist/agent-runner.d.ts
+@@ -3,9 +3,9 @@
+  */
+ import type { Model } from "@earendil-works/pi-ai";
+ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+-import { type AgentSession, DefaultResourceLoader, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
++import { type AgentSession, type CreateAgentSessionOptions, DefaultResourceLoader, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+ import { type NestedAgentManager } from "./nested-tools.js";
+-import type { SubagentType, ThinkingLevel } from "./types.js";
++import type { AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
+ import type { LifetimeUsage } from "./usage.js";
+ import type { CompiledSchema } from "./workflow/json-schema.js";
+ /**
+@@ -145,7 +145,17 @@ export interface ToolActivity {
+     type: "start" | "end";
+     toolName: string;
+ }
++export type ManagedChildControl = {
++  role: Readonly<AgentConfig>;
++  beforeCreate(agentId: string): Promise<{
++    options: CreateAgentSessionOptions;
++    promptText: string;
++    attach(session: AgentSession): Promise<void>;
++    settle(input: { session: AgentSession | null; error: unknown | null }): Promise<void>;
++  }>;
++};
+ export interface RunOptions {
++  managed?: ManagedChildControl;
+     /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
+     pi: ExtensionAPI;
+     /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
+diff --git a/dist/agent-runner.js b/dist/agent-runner.js
+index f2dd0e6e0e88c064aac1bdd04ff4ebf55cbcd60e..7a647780c414ac4a22d4deada7f5355edc970e53 100644
+--- a/dist/agent-runner.js
++++ b/dist/agent-runner.js
+@@ -419,6 +419,43 @@ function resolveConfiguredSessionDir(sessionDir, cwd) {
+     return resolve(cwd, sessionDir);
+ }
+ export async function runAgent(ctx, type, prompt, options) {
++  if (!options.managed)
++    return runAgentLoop(ctx, type, prompt, options);
++  if (!options.agentId)
++    throw new Error("subagent_identity_invalid");
++  if (options.signal?.aborted)
++    throw new Error("agent_cancelled");
++  const prepared = await options.managed.beforeCreate(options.agentId);
++  let native = null, error = null;
++  try {
++    const outcome = await runAgentLoop(ctx, type, prompt, options, {
++      ...prepared,
++      attach(session) {
++        native = session;
++        return prepared.attach(session);
++      }
++    });
++    if (outcome.failure)
++      error = new Error(outcome.failure);
++    else if (options.signal?.aborted)
++      error = new Error("agent_cancelled");
++    return outcome;
++  } catch (caught) {
++    error = caught;
++    throw caught;
++  } finally {
++    await prepared.settle({ session: native, error });
++  }
++}
++async function runAgentLoop(ctx, type, prompt, options, prepared) {
++  let session;
++  let structuredCapture;
++  if (prepared) {
++    session = (await runInChildSessionContext(() => createAgentSession(prepared.options))).session;
++    options.onSessionCreated?.(session);
++    await prepared.attach(session);
++    if (options.signal?.aborted) throw new Error('agent_cancelled');
++  } else {
+     const config = getConfig(type);
+     const agentConfig = getAgentConfig(type);
+     // Resolve working directory: worktree override > parent cwd
+@@ -654,7 +691,7 @@ export async function runAgent(ctx, type, prompt, options) {
+     // StructuredOutput, and `structuredJson` below is what the caller reads. The
+     // schema was already compiled by whoever asked for it, so a bad one failed
+     // before any of this ran.
+-    const structuredCapture = options.structuredOutput ? createStructuredCapture() : undefined;
++    structuredCapture = options.structuredOutput ? createStructuredCapture() : undefined;
+     const structuredTools = options.structuredOutput && structuredCapture
+         ? [createStructuredOutputTool(options.structuredOutput, structuredCapture)]
+         : [];
+@@ -781,7 +818,7 @@ export async function runAgent(ctx, type, prompt, options) {
+     if (thinkingLevel) {
+         sessionOpts.thinkingLevel = thinkingLevel;
+     }
+-    const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
++    session = (await runInChildSessionContext(() => createAgentSession(sessionOpts))).session;
+     const baseSessionName = agentConfig?.name ?? type;
+     session.setSessionName(options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName);
+     // Bind extensions so that session_start fires and extensions can initialize
+@@ -813,9 +850,11 @@ export async function runAgent(ctx, type, prompt, options) {
+         });
+     }
+     options.onSessionCreated?.(session);
+-    // Track turns for graceful max_turns enforcement
++  }
++
++  // Track turns for graceful max_turns enforcement
+     let turnCount = 0;
+-    const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
++    const maxTurns = prepared ? null : resolveEffectiveMaxTurns(type, options.maxTurns);
+     let softLimitReached = false;
+     let aborted = false;
+     let currentMessageText = "";
+@@ -865,8 +904,8 @@ export async function runAgent(ctx, type, prompt, options) {
+     const collector = collectResponseText(session);
+     const cleanupAbort = forwardAbortSignal(session, options.signal);
+     // Build the effective prompt: optionally prepend parent context
+-    let effectivePrompt = prompt;
+-    if (options.inheritContext) {
++    let effectivePrompt = prepared?.promptText ?? prompt;
++    if (!prepared && options.inheritContext) {
+         const parentContext = buildParentContext(ctx);
+         if (parentContext) {
+             effectivePrompt = parentContext + prompt;
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 1d993b08a8d164ca32d9b8214c87669bfcc9ee29..d47cd167a4e3f9beeacf084059062ae9d83d1c75 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -48,3 +48,7 @@ export declare const WORKFLOW_FILE_FLAG = "subagents-workflow-file";
+  */
+ export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData };
+ export default function (pi: ExtensionAPI): void;
++export type { ManagedChildControl } from './agent-runner.js';
++export declare function createManagedSubagentExtension(input: {
++  controlForCall(nativeToolCallId: string): import('./agent-runner.js').ManagedChildControl;
++}): import('@earendil-works/pi-coding-agent').ExtensionFactory;
+diff --git a/dist/index.js b/dist/index.js
+index 79e782077d8a4dbd3f4dbd9583fc070ede1465e5..3af7cb8540178b445c1711e648997dd4032cf404 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -2063,21 +2063,7 @@ Terse command-style prompts produce shallow, generic work.
+             // two describe the same work when the agent delegated to nested children.
+             const tokenText = formatLifetimeTokens(record);
+             const details = buildDetails(detailBaseFor(record), record, fgState, { tokens: tokenText });
+-            if (record.status === "error") {
+-                // Error headline + any partial output the run produced before failing.
+-                return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+-            }
+-            const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
+-            const statsParts = [`${record.toolUses} tool uses`];
+-            if (tokenText)
+-                statsParts.push(tokenText);
+-            if (showCost) {
+-                const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
+-                if (costText)
+-                    statsParts.push(costText);
+-            }
+-            return textResult(`${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+-                (record.result?.trim() || "No output."), details);
++            return foregroundAgentResult(record, details, fallbackNote, showCost);
+         },
+     });
+     /**
+@@ -3677,3 +3663,72 @@ Write the file using the write tool. Only write the file, nothing else.`;
+     };
+     fleet.setWorkflowSource(fleetWorkflows, id => openWorkflowFromFleet(id, workflowMenuDeps));
+ }
++
++export function createManagedSubagentExtension(input) {
++  return (pi) => {
++    const manager = new AgentManager;
++    manager.setMaxConcurrentForeground(1);
++    let closed = false;
++    pi.on("session_shutdown", async () => {
++      closed = true;
++      const pending = manager.listAgents().map((record) => record.promise);
++      manager.abortAll();
++      await Promise.allSettled(pending);
++      await manager.dispose();
++    });
++    pi.registerTool(defineTool({
++      name: SUBAGENT_TOOL_NAMES.AGENT,
++      label: "Agent",
++      description: "Delegate one foreground read-only source check to invoice-evidence-checker.",
++      parameters: Type.Object({
++        prompt: Type.String({ minLength: 1 }),
++        description: Type.String({ minLength: 1 }),
++        subagent_type: Type.Literal("invoice-evidence-checker"),
++        run_in_background: Type.Optional(Type.Literal(false))
++      }, { additionalProperties: false }),
++      async execute(toolCallId, params, signal, _onUpdate, ctx) {
++        const keys = ["prompt", "description", "subagent_type", "run_in_background"];
++        if (closed || !toolCallId || Object.keys(params).some((key) => !keys.includes(key)) || params.subagent_type !== "invoice-evidence-checker" || params.run_in_background !== undefined && params.run_in_background !== false || typeof params.prompt !== "string" || !params.prompt.trim() || Buffer.byteLength(params.prompt) > 65000 || typeof params.description !== "string" || !params.description.trim() || Buffer.byteLength(params.description) > 512)
++          throw new Error("subagent_parameters_invalid");
++        if (signal?.aborted)
++          throw new Error("agent_cancelled");
++        const control = input.controlForCall(toolCallId);
++        if (control.role.name !== params.subagent_type || control.role.extensions !== false || control.role.skills !== false || control.role.memory || control.role.persistSession || control.role.outputTranscript || control.role.runInBackground || control.role.allowedSubagents !== undefined && (control.role.allowedSubagents === "all" || control.role.allowedSubagents.length > 0))
++          throw new Error("subagent_role_invalid");
++        const { state, callbacks } = createActivityTracker();
++        const { record } = await manager.spawnAndWait(pi, ctx, params.subagent_type, params.prompt, {
++          description: params.description,
++          signal,
++          managed: control,
++          ...callbacks
++        });
++        const base = {
++          displayName: control.role.displayName ?? control.role.name,
++          description: params.description,
++          subagentType: params.subagent_type,
++          modelName: record.invocation?.modelName,
++          tags: undefined
++        };
++        const details = buildDetails(base, record, state);
++        return foregroundAgentResult(record, details, "", false);
++      }
++    }));
++  };
++}
++function foregroundAgentResult(record, details, fallbackNote, showCost) {
++  if (record.status === "error")
++    return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
++  const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
++  const statsParts = [`${record.toolUses} tool uses`];
++  const tokenText = formatLifetimeTokens(record);
++  if (tokenText)
++    statsParts.push(tokenText);
++  if (showCost) {
++    const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
++    if (costText)
++      statsParts.push(costText);
++  }
++  return textResult(`${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.
++
++` + (record.result?.trim() || "No output."), details);
++}
+diff --git a/src/agent-manager.ts b/src/agent-manager.ts
+index 8c973b6ac4d28b06c9a2c71ef992bec00b96ae2a..b692cbb68243fe9c8636ed9d06f8a7f33e7f4cd6 100644
+--- a/src/agent-manager.ts
++++ b/src/agent-manager.ts
+@@ -19,7 +19,7 @@ import { statSync } from "node:fs";
+ import { isAbsolute } from "node:path";
+ import type { Model } from "@earendil-works/pi-ai";
+ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
++import { resumeAgent, runAgent, type ToolActivity, type ManagedChildControl } from "./agent-runner.js";
+ import { assignHandle, handleBase } from "./mention.js";
+ import { describeModel } from "./model-resolver.js";
+ import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+@@ -167,6 +167,7 @@ interface SpawnArgs {
+ }
+ 
+ interface SpawnOptions {
++  managed?: ManagedChildControl;
+   description: string;
+   /**
+    * Optional memorable name for this instance, becoming a second handle
+@@ -496,6 +497,10 @@ export class AgentManager {
+     // Validate before the queue branch — a queued spawn should fail at the
+     // call, not minutes later at drain. Throw (not warn): programmatic callers
+     // can fix and retry; the RPC layer converts throws into error envelopes.
++    if (options.managed && (options.isBackground || !options.blocking || options.parentAgentId || options.workflowId ||
++      options.resumeSessionFile || options.isolation || options.structuredOutput || options.bypassQueue))
++      throw new Error('subagent_parameters_invalid');
++    if (options.managed && !this.poolHasRoom('foreground')) throw new Error('subagent_busy');
+     assertValidSpawnCwd(options.cwd);
+ 
+     const id = randomUUID().slice(0, 17);
+@@ -761,6 +766,7 @@ export class AgentManager {
+     const promise = runAgent(ctx, type, prompt, {
+       pi,
+       agentId: id,
++      managed: options.managed,
+       model: options.model,
+       maxTurns: options.maxTurns,
+       isolated: options.isolated,
+diff --git a/src/agent-runner.ts b/src/agent-runner.ts
+index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..0bcecae1d413e738014a17836b21dc21b4c34f23 100644
+--- a/src/agent-runner.ts
++++ b/src/agent-runner.ts
+@@ -9,6 +9,7 @@ import type { Model } from "@earendil-works/pi-ai";
+ import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+ import {
+   type AgentSession,
++  type CreateAgentSessionOptions,
+   type AgentSessionEvent,
+   createAgentSession,
+   DefaultResourceLoader,
+@@ -27,7 +28,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
+ import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+ import { preloadSkills } from "./skill-loader.js";
+ import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
+-import type { SubagentType, ThinkingLevel } from "./types.js";
++import type { AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
+ import type { LifetimeUsage } from "./usage.js";
+ import type { CompiledSchema } from "./workflow/json-schema.js";
+ 
+@@ -394,7 +395,18 @@ export interface ToolActivity {
+   toolName: string;
+ }
+ 
++export type ManagedChildControl = {
++  role: Readonly<AgentConfig>;
++  beforeCreate(agentId: string): Promise<{
++    options: CreateAgentSessionOptions;
++    promptText: string;
++    attach(session: AgentSession): Promise<void>;
++    settle(input: { session: AgentSession | null; error: unknown | null }): Promise<void>;
++  }>;
++};
++
+ export interface RunOptions {
++  managed?: ManagedChildControl;
+   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
+   pi: ExtensionAPI;
+   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
+@@ -607,12 +619,31 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
+   return resolve(cwd, sessionDir);
+ }
+ 
+-export async function runAgent(
+-  ctx: ExtensionContext,
+-  type: SubagentType,
+-  prompt: string,
+-  options: RunOptions,
+-): Promise<RunResult> {
++export async function runAgent(ctx: ExtensionContext, type: SubagentType, prompt: string, options: RunOptions): Promise<RunResult> {
++  if (!options.managed) return runAgentLoop(ctx, type, prompt, options);
++  if (!options.agentId) throw new Error('subagent_identity_invalid');
++  if (options.signal?.aborted) throw new Error('agent_cancelled');
++  const prepared = await options.managed.beforeCreate(options.agentId);
++  let native: AgentSession | null = null, error: unknown | null = null;
++  try {
++    const outcome = await runAgentLoop(ctx, type, prompt, options, { ...prepared,
++      attach(session) { native = session; return prepared.attach(session); } });
++    if (outcome.failure) error = new Error(outcome.failure);
++    else if (options.signal?.aborted) error = new Error('agent_cancelled');
++    return outcome;
++  } catch (caught) { error = caught; throw caught; }
++  finally { await prepared.settle({ session: native, error }); }
++}
++async function runAgentLoop(ctx: ExtensionContext, type: SubagentType, prompt: string, options: RunOptions,
++    prepared?: Awaited<ReturnType<ManagedChildControl['beforeCreate']>>): Promise<RunResult> {
++  let session!: AgentSession;
++  let structuredCapture: ReturnType<typeof createStructuredCapture> | undefined;
++  if (prepared) {
++    session = (await runInChildSessionContext(() => createAgentSession(prepared.options))).session;
++    options.onSessionCreated?.(session);
++    await prepared.attach(session);
++    if (options.signal?.aborted) throw new Error('agent_cancelled');
++  } else {
+   const config = getConfig(type);
+   const agentConfig = getAgentConfig(type);
+ 
+@@ -869,7 +900,7 @@ export async function runAgent(
+   // StructuredOutput, and `structuredJson` below is what the caller reads. The
+   // schema was already compiled by whoever asked for it, so a bad one failed
+   // before any of this ran.
+-  const structuredCapture = options.structuredOutput ? createStructuredCapture() : undefined;
++  structuredCapture = options.structuredOutput ? createStructuredCapture() : undefined;
+   const structuredTools = options.structuredOutput && structuredCapture
+     ? [createStructuredOutputTool(options.structuredOutput, structuredCapture)]
+     : [];
+@@ -1005,7 +1036,7 @@ export async function runAgent(
+     sessionOpts.thinkingLevel = thinkingLevel;
+   }
+ 
+-  const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
++  session = (await runInChildSessionContext(() => createAgentSession(sessionOpts))).session;
+ 
+   const baseSessionName = agentConfig?.name ?? type;
+   session.setSessionName(
+@@ -1043,10 +1074,11 @@ export async function runAgent(
+   }
+ 
+   options.onSessionCreated?.(session);
++  }
+ 
+   // Track turns for graceful max_turns enforcement
+   let turnCount = 0;
+-  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
++  const maxTurns = prepared ? null : resolveEffectiveMaxTurns(type, options.maxTurns);
+   let softLimitReached = false;
+   let aborted = false;
+ 
+@@ -1097,8 +1129,8 @@ export async function runAgent(
+   const cleanupAbort = forwardAbortSignal(session, options.signal);
+ 
+   // Build the effective prompt: optionally prepend parent context
+-  let effectivePrompt = prompt;
+-  if (options.inheritContext) {
++  let effectivePrompt = prepared?.promptText ?? prompt;
++  if (!prepared && options.inheritContext) {
+     const parentContext = buildParentContext(ctx);
+     if (parentContext) {
+       effectivePrompt = parentContext + prompt;
+diff --git a/src/index.ts b/src/index.ts
+index 4989968c98e186b3c94194ae8c05c7651374fcb6..945707ee4245550beaf61171d29a82cc774b68a3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -12,13 +12,15 @@
+ 
+ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+ import { isAbsolute, join } from "node:path";
+-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
++import { defineTool, type ExtensionAPI, type ExtensionFactory, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+ import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+ import { Type } from "@sinclair/typebox";
+ import { abortable } from "./abortable.js";
+ import { hasAgentBadge, renderAgentName } from "./agent-color.js";
+ import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
+ import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
++import type { ManagedChildControl } from "./agent-runner.js";
++export type { ManagedChildControl } from "./agent-runner.js";
+ import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+ import { inChildSessionContext } from "./child-context.js";
+@@ -2248,23 +2250,7 @@ Terse command-style prompts produce shallow, generic work.
+ 
+       const details = buildDetails(detailBaseFor(record), record, fgState, { tokens: tokenText });
+ 
+-      if (record.status === "error") {
+-        // Error headline + any partial output the run produced before failing.
+-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+-      }
+-
+-      const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
+-      const statsParts = [`${record.toolUses} tool uses`];
+-      if (tokenText) statsParts.push(tokenText);
+-      if (showCost) {
+-        const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
+-        if (costText) statsParts.push(costText);
+-      }
+-      return textResult(
+-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+-        (record.result?.trim() || "No output."),
+-        details,
+-      );
++      return foregroundAgentResult(record, details, fallbackNote, showCost);
+     },
+   });
+   /**
+@@ -3986,3 +3972,70 @@ Write the file using the write tool. Only write the file, nothing else.`;
+ 
+   fleet.setWorkflowSource(fleetWorkflows, id => openWorkflowFromFleet(id, workflowMenuDeps));
+ }
++
++export function createManagedSubagentExtension(input: {
++  controlForCall(nativeToolCallId: string): ManagedChildControl;
++}): ExtensionFactory {
++  return pi => {
++    const manager = new AgentManager();
++    manager.setMaxConcurrentForeground(1);
++    let closed = false;
++    pi.on('session_shutdown', async () => {
++      closed = true;
++      // Abort is an intent; keep the actual promises owned until they settle.
++      const pending = manager.listAgents().map(record => record.promise);
++      manager.abortAll();
++      await Promise.allSettled(pending);
++      await manager.dispose(); // No git pruning or transcript authority in managed mode.
++    });
++    pi.registerTool(defineTool({
++      name: SUBAGENT_TOOL_NAMES.AGENT,
++      label: 'Agent',
++      description: 'Delegate one foreground read-only source check to invoice-evidence-checker.',
++      parameters: Type.Object({
++        prompt: Type.String({ minLength: 1 }), description: Type.String({ minLength: 1 }),
++        subagent_type: Type.Literal('invoice-evidence-checker'),
++        run_in_background: Type.Optional(Type.Literal(false)),
++      }, { additionalProperties: false }),
++      async execute(toolCallId, params, signal, _onUpdate, ctx) {
++        const keys = ['prompt', 'description', 'subagent_type', 'run_in_background'];
++        if (closed || !toolCallId || Object.keys(params).some(key => !keys.includes(key)) ||
++          params.subagent_type !== 'invoice-evidence-checker' ||
++          (params.run_in_background !== undefined && params.run_in_background !== false) ||
++          typeof params.prompt !== 'string' || !params.prompt.trim() || Buffer.byteLength(params.prompt) > 65000 ||
++          typeof params.description !== 'string' || !params.description.trim() || Buffer.byteLength(params.description) > 512)
++          throw new Error('subagent_parameters_invalid');
++        if (signal?.aborted) throw new Error('agent_cancelled');
++        const control = input.controlForCall(toolCallId);
++        if (control.role.name !== params.subagent_type || control.role.extensions !== false || control.role.skills !== false ||
++          control.role.memory || control.role.persistSession || control.role.outputTranscript || control.role.runInBackground ||
++          (control.role.allowedSubagents !== undefined && (control.role.allowedSubagents === 'all' || control.role.allowedSubagents.length > 0)))
++          throw new Error('subagent_role_invalid');
++        const { state, callbacks } = createActivityTracker();
++        const { record } = await manager.spawnAndWait(pi, ctx, params.subagent_type, params.prompt, {
++          description: params.description, signal, managed: control, ...callbacks,
++        });
++        const base = { displayName: control.role.displayName ?? control.role.name, description: params.description,
++          subagentType: params.subagent_type, modelName: record.invocation?.modelName, tags: undefined };
++        const details = buildDetails(base, record, state);
++        return foregroundAgentResult(record, details, '', false);
++      },
++    }));
++  };
++}
++
++function foregroundAgentResult(record: AgentRecord, details: AgentDetails, fallbackNote: string, showCost: boolean) {
++  if (record.status === 'error')
++    return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
++  const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
++  const statsParts = [`${record.toolUses} tool uses`];
++  const tokenText = formatLifetimeTokens(record);
++  if (tokenText) statsParts.push(tokenText);
++  if (showCost) {
++    const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
++    if (costText) statsParts.push(costText);
++  }
++  return textResult(
++    `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(', ')})${getForegroundOutcomeNote(record.status)}.\n\n` +
++      (record.result?.trim() || 'No output.'), details);
++}

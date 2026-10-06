@@ -6,6 +6,19 @@ import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, Runti
   RuntimeEventsWakeSchema, RuntimeSubscriptionResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema } from '@flowmate/contracts';
 
+it('P13 validates the three child commands without accepting model-owned identities or replay controls', () => {
+  for (const command of [
+    { type: 'list_subagents', input: { parentRunId: 1, parentSessionId: 1 } },
+    { type: 'query_subagent', input: { parentRunId: 1, parentSessionId: 1, childRunId: 2 } },
+    { type: 'cancel_subagent', input: { parentRunId: 1, childRunId: 2 } },
+  ]) {
+    expect(parseHostCommand({ version: 1, requestId: 'p13', ...command })).not.toBeNull();
+    for (const key of ['pluginAgentId', 'childNativeSessionId', 'scope', 'resume', 'run_in_background'])
+      expect(parseHostCommand({ version: 1, requestId: 'p13', ...command, input: { ...command.input, [key]: 'untrusted' } })).toBeNull();
+    expect(parseHostCommand({ version: 1, requestId: 'p13', ...command, additional: true })).toBeNull();
+  }
+});
+
 it('P11 validates all five resource commands, results and original owner identity', () => {
   const ref = { kind: 'prompt', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) }, owner = { sessionId: 1, runId: 2 };
   const file = { ref, path: 'prompt.md' }, commands = [

@@ -4,11 +4,13 @@ import { acceptHistoryRead, beginHistoryRead, createHistoryRead, failHistoryRead
   historyLease, matchesHistoryDetail, matchesHistoryRead, mergeHistoryPage, sameHistoryIdentity, type HistoryIdentity } from './history-state.ts';
 
 type Props = { sessionId: number; hostEpoch: number; navigationToken: number; hostReady: boolean;
+  onOwner(sessionId: number, runId: number | null): void } & ({ readOnly: true } | {
+  readOnly?: false;
   initialForkRequest: ForkSessionRequest | null; onForkRequest(request: ForkSessionRequest | null): void;
   selectionToken: number; captureSelection(): () => boolean;
   onBranch(sessionId: number): void;
   onFork(result: ForkSessionResult, current: () => boolean): Promise<boolean>;
-  onOwner(sessionId: number, runId: number | null): void };
+});
 type TextDetail = { detail: SessionHistoryEntryDetail; chunks: readonly { kind: string; text: string }[] };
 function useHistoryRead<T>(identity: HistoryIdentity) {
   const state = useRef(createHistoryRead<T>(identity)), sequence = useRef(0), alive = useRef(true);
@@ -33,8 +35,9 @@ function useHistoryRead<T>(identity: HistoryIdentity) {
   return { state: state.current, read, invalidate };
 }
 export function SessionHistory(props: Props) {
-  const [opened, setOpened] = useState(false), [entryId, setEntryId] = useState<string | null>(null), [generation, setGeneration] = useState(0);
-  const [title, setTitle] = useState('Forked chat'), [confirming, setConfirming] = useState(props.initialForkRequest !== null), [frozen, setFrozen] = useState(props.initialForkRequest);
+  const [opened, setOpened] = useState(Boolean(props.readOnly)), [entryId, setEntryId] = useState<string | null>(null), [generation, setGeneration] = useState(0);
+  const [title, setTitle] = useState('Forked chat'), [confirming, setConfirming] = useState(!props.readOnly && props.initialForkRequest !== null),
+    [frozen, setFrozen] = useState(props.readOnly ? null : props.initialForkRequest);
   const [notice, setNotice] = useState<string | null>(null), [pending, setPending] = useState(false);
   const [detailRefresh, setDetailRefresh] = useState(0);
   const identity: HistoryIdentity = { sessionId: props.sessionId, hostEpoch: props.hostEpoch, navigationToken: props.navigationToken, entryId: opened ? 'open' : 'closed' };
@@ -45,7 +48,7 @@ export function SessionHistory(props: Props) {
   const leaseKey = `${identityKey}:${entryId}:${generation}`;
   latest.current = leaseKey;
   useEffect(() => { alive.current = true; return () => { alive.current = false; operation.current++; }; }, []);
-  useEffect(() => { operation.current++; setPending(false); setNotice(null); }, [leaseKey, props.selectionToken]);
+  useEffect(() => { operation.current++; setPending(false); setNotice(null); }, [leaseKey, props.readOnly ? null : props.selectionToken]);
   const page = pages.state.data, selected = page?.items.find(item => item.entryId === entryId);
   async function load(afterSequence?: number) {
     if (!props.hostReady) return;
@@ -74,6 +77,7 @@ export function SessionHistory(props: Props) {
   useEffect(() => { if (opened) void load(); }, [identityKey, props.hostReady]);
   useEffect(() => { if (opened && entryId) void loadDetail(); }, [identityKey, entryId, page?.commit.commitRevision, detailRefresh, props.hostReady]);
   async function manage(kind: 'branch' | 'fork') {
+    if (props.readOnly) return;
     if (!page || pending || !props.hostReady || kind === 'branch' && !selected?.canSelect || kind === 'fork' && !frozen && !selected?.canSelect) return;
     let forkInput = frozen;
     if (kind === 'fork' && !forkInput) {
@@ -109,7 +113,7 @@ export function SessionHistory(props: Props) {
     {opened && <><button className="text-button" disabled={!props.hostReady || pages.state.pending} onClick={() => { details.invalidate(); setGeneration(n => n + 1); void load(); }}>Reload history</button>
       {(!props.hostReady || pages.state.error) && <p className="notice bad" role="alert">{pages.state.error ?? 'History is unavailable.'}</p>}
       {!pages.state.error && page && (page.session.historyState === 'invalid' || page.session.availability === 'unusable' || page.session.availability === 'history-unavailable')
-        && <p className="notice bad" role="alert">History is unavailable.</p>}
+        && <p className="notice bad" role="alert">{props.readOnly ? 'Model use is blocked. Saved history below remains read-only.' : 'History is unavailable.'}</p>}
       {pages.state.pending && <p role="status">Loading history…</p>}
       {page && <><p>Saved revision {page.commit.commitRevision} · Current position {page.commit.leafId ?? 'Empty'} · {page.commit.entryCount} entries</p>
         <ol className="history-tree">{page.items.map(item => <li key={item.entryId} data-parent-id={item.parentId ?? ''}>
@@ -126,10 +130,11 @@ export function SessionHistory(props: Props) {
         {details.state.data && <><dl className="activity-facts">{Object.entries(details.state.data.detail.fields).map(([name, value]) => <div key={name}><dt>{name}</dt><dd>{value === null ? 'Not recorded' : typeof value === 'object' && !Array.isArray(value) && 'text' in value ? String(value.text) : Array.isArray(value) ? value.join(', ') : String(value)}</dd></div>)}</dl>
           <pre data-testid="history-text">{details.state.data.chunks.map(chunk => chunk.text).join('')}</pre>
           {details.state.data.detail.next && <button className="secondary-button" disabled={details.state.pending} onClick={() => void loadDetail(details.state.data!.detail.next!)}>More text</button>}</>}
-        <button className="secondary-button" disabled={!selected.canSelect || pending || !props.hostReady || !!pages.state.error || !!details.state.error} onClick={() => void manage('branch')}>Continue here</button>
+        {!props.readOnly && <><button className="secondary-button" disabled={!selected.canSelect || pending || !props.hostReady || !!pages.state.error || !!details.state.error} onClick={() => void manage('branch')}>Continue here</button>
         <button className="secondary-button" disabled={!selected.canSelect || pending || !props.hostReady || !!pages.state.error} onClick={() => setConfirming(true)}>Fork chat</button>
+        </>}
       </section>}
-      {confirming && <div className="history-fork"><label>Fork title<input aria-label="Fork title" value={title} onChange={event => setTitle(event.target.value)} /></label>
+      {!props.readOnly && confirming && <div className="history-fork"><label>Fork title<input aria-label="Fork title" value={title} onChange={event => setTitle(event.target.value)} /></label>
         <button className="primary-button" disabled={pending || !props.hostReady} onClick={() => void manage('fork')}>{frozen ? 'Retry same fork' : 'Confirm fork'}</button>
         {frozen && <p>Retry uses the originally confirmed entry, saved revision and title.</p>}
         {frozen && <button className="text-button" disabled={pending || !props.hostReady || !selected?.canSelect}

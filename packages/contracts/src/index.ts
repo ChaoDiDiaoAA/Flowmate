@@ -17,3 +17,4 @@ export * from './memory.ts';
 export * from './compaction.ts';
 export * from './resources.ts';
 export * from './extensions.ts';
+export * from './subagents.ts';

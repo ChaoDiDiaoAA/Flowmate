@@ -21,7 +21,11 @@ import {
   type AgentToolResult, type LoadExtensionsResult,
 } from '@earendil-works/pi-coding-agent';
 import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema } from '@flowmate/contracts';
-import { loadControlledExtensions, type LoadedExtensionSet } from './extensions/loader.ts';
+import { loadControlledExtensions, extensionAssembly, type LoadedExtensionSet } from './extensions/loader.ts';
+import type { DelegateExecution } from './extensions/subagents.ts';
+import type { ManagedChildControl } from '@tintinweb/pi-subagents/dist/agent-runner.js';
+import { DelegateArgsSchema, ToolExecutionFailure, SUBAGENT_ROLE, SUBAGENT_SYSTEM_PROMPT } from '@flowmate/contracts';
+import type { ToolExecutionContext, DelegateArgs, NativeToolOutput, SubagentCallbacks, PreparedSubagent } from '@flowmate/contracts';
 import { FrozenExtensionsSchema, matchesExtensionAssembly, type NativeExtensionView } from '@flowmate/contracts';
 import { createRunResourceLoader, verifySkillExpansion, verifyManagedReadOutput } from './resources/loader.ts';
 import { matchesResourceBinding, resourceContentKey, ResourceRequestEvidenceSchema } from '@flowmate/contracts';
@@ -166,7 +170,10 @@ type ActiveExecution = {
 };
 
 type SessionRecord = {
+  subagentOwner?: { childRunId: number; pluginAgentId: string };
   extensions?: LoadedExtensionSet;
+  delegations?: Map<string, { call: DelegateExecution; promise: Promise<AgentToolResult<unknown>>; control?: ManagedChildControl;
+    childError?: import('@flowmate/contracts').AppError }>;
   extensionKey?: string;
   disposing?: Promise<CloseReport>;
   commanding?: boolean;
@@ -359,6 +366,7 @@ export class PiAgentAdapter implements AgentPort {
   private readonly toolsByName: ReadonlyMap<string, ToolDefinition<any, any>>;
   private closed = false;
   private readonly recentExtensions = new Map<string, NativeExtensionView>();
+  private subagentCallbacks?: SubagentCallbacks;
 
   public constructor(dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
     resourceBundleRoot?: string;
@@ -375,6 +383,11 @@ export class PiAgentAdapter implements AgentPort {
     this.sessions.set(nativeSessionId, { manager, preparing: false, running: false, unusable: false, liveBindings: new Map(),
       contextEntries: new Map(), contextMessages: new WeakMap(), contextSeeded: false });
     return ok({ nativeSessionId });
+  }
+
+  public bindSubagents(callbacks: SubagentCallbacks): void {
+    if (this.subagentCallbacks || this.closed) throw new Error('subagent_callbacks_already_bound');
+    this.subagentCallbacks = callbacks;
   }
 
   public exportSession(nativeSessionId: string): Result<NativeSessionHistory> {
@@ -882,6 +895,9 @@ export class PiAgentAdapter implements AgentPort {
       if (!prepared.ok) return prepared;
       const { runtime, model } = prepared.data;
       const authSource = prepared.data.snapshot.native.authSource;
+      if (frozenExtensions?.included.some(item => item.ref.id === 'subagents')
+        && !observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch))
+        return fail(appError('extension_incompatible', 'extension', 'Managed delegation requires an observable SDK HTTP transport.'));
       if (authSource === 'unknown') return fail(appError('agent_auth_source_unknown', 'runtime', '无法确认 Agent 模型凭据来源。'));
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
 
@@ -897,25 +913,37 @@ export class PiAgentAdapter implements AgentPort {
         replacingSession = true;
       }
       if (!session) {
-        if (record.extensions && record.extensions.scope.view.state !== 'disposed') {
+        if (record.extensions?.scopes.some(scope => scope.view.state !== 'disposed')) {
           const disposed = await this.disposeManagedSession(record); if (!disposed.closed) return fail(disposed.errors[0]!);
         }
         record.extensions = undefined;
         let extensionResult: LoadExtensionsResult | undefined;
         if (frozenExtensions?.included.length) {
-          const definition = this.toolsByName.get('check_invoice_sources')!;
           const loaded = await loadControlledExtensions({ frozen: frozenExtensions, nativeSessionId, cwd, agentDir: this.dependencies.agentDir ?? cwd, signal,
-            sdkTool: toPiTool(definition, (id, input, toolSignal) => this.executePiTool(record, definition, id, input, toolSignal)),
+            sdkToolFor: (name, parameters) => {
+              const definition = this.toolsByName.get(name);
+              if (!definition) throw appError('extension_incompatible', 'extension', 'The controlled product tool is missing.');
+              return toPiTool(definition, (id, input, toolSignal) => this.executePiTool(record, definition, id, input, toolSignal), undefined, parameters);
+            },
+            subagent: {
+              withNativeCall: (call, invoke) => this.withDelegateCall(record, call, invoke),
+              controlForCall: id => {
+                const control = record.delegations?.get(id)?.control;
+                if (!control) throw appError('subagent_origin_invalid', 'runtime', 'Managed child assembly is unavailable for this call.');
+                return control;
+              },
+            },
             onCreated: loaded => { record.extensions = loaded; },
             assertCallOwner: (event, instanceId) => {
               const active = record.active, request = active?.toolRequests.get(event.toolCallId);
               if (!active || !request || request.name !== event.toolName || !request.requestBinding || !active.toolBinding
-                || record.extensions?.scope.view.instanceId !== instanceId || active.signal.aborted || active.failure)
+                || !record.extensions?.scopes.some(scope => scope.view.instanceId === instanceId && scope.view.registeredTools.includes(event.toolName))
+                || active.signal.aborted || active.failure)
                 return fail(appError('extension_hook_failed', 'extension', 'Extension call has no trusted active owner.'));
               return ok({ instanceId, nativeSessionId, runId: active.runId, sessionId: active.sessionId,
                 nativeToolCallId: event.toolCallId, requestBinding: request.requestBinding, scope: active.toolBinding.context.scope });
             },
-            onCriticalFailure: (error, instanceId) => { if (record.extensions?.scope.view.instanceId === instanceId && record.active) this.failToolRun(record, record.active, error); },
+            onCriticalFailure: (error, instanceId) => { if (record.extensions?.scopes.some(scope => scope.view.instanceId === instanceId) && record.active) this.failToolRun(record, record.active, error); },
           });
           record.extensions = loaded;
           if (loaded.error || !loaded.result) {
@@ -935,8 +963,10 @@ export class PiAgentAdapter implements AgentPort {
           sessionManager: record.manager,
           settingsManager: inMemorySettings(),
           resourceLoader: assembledLoader.data,
-          noTools: 'all', tools: policy === 'p2' ? [] : [...this.toolsByName.keys()],
-          customTools: policy !== 'p2' ? [...this.toolsByName.values()].filter(definition => !extensionResult || definition.name !== 'check_invoice_sources').map((definition) => toPiTool(
+          noTools: 'all', tools: policy === 'p2' ? [] : [...this.toolsByName.keys()].filter(name => name !== 'Agent'
+            || frozenExtensions?.included.some(item => item.ref.id === 'subagents')),
+          customTools: policy !== 'p2' ? [...this.toolsByName.values()].filter(definition => definition.name !== 'Agent'
+            && !frozenExtensions?.included.some(item => item.manifest.tools.some(tool => tool.name === definition.name))).map((definition) => toPiTool(
             definition,
             (toolCallId, input, toolSignal) => this.executePiTool(record, definition, toolCallId, input, toolSignal),
             raw => {
@@ -949,146 +979,33 @@ export class PiAgentAdapter implements AgentPort {
         session = created.session; record.session = session;
         record.resourceLoader = assembledLoader.data;
         if (record.extensions) {
-          record.extensions.scope.view.cleanup.sdkSessionCreated = true;
-          record.extensions.scope.view.cleanup.shutdownRequired = true;
+          for (const scope of record.extensions.scopes) {
+            scope.view.cleanup.sdkSessionCreated = true;
+            scope.view.cleanup.shutdownRequired = true;
+          }
         }
         const installed = session.getAllTools().map(tool => tool.name);
-        const expected = policy === 'p2' ? [] : [...this.toolsByName.keys()];
+        const expected = policy === 'p2' ? [] : [...this.toolsByName.keys()].filter(name => name !== 'Agent'
+          || frozenExtensions?.included.some(item => item.ref.id === 'subagents'));
         if (installed.length !== expected.length || new Set(installed).size !== installed.length
           || expected.some(name => !installed.includes(name))) {
           throw appError('extension_registration_conflict', 'extension', 'Controlled tool registry mismatch.');
         }
         this.dependencies.sessionSetup?.(session);
         if (record.extensions) {
-          const runner = session.extensionRunner, scope = record.extensions.scope;
-          if (runner.getAllRegisteredTools().length !== 1 || runner.getCommandDiagnostics().length || !runner.getCommand('invoice-assist'))
+          const runner = session.extensionRunner, scopes = record.extensions.scopes;
+          const commands = scopes.flatMap(scope => scope.view.registeredCommands);
+          if (runner.getAllRegisteredTools().length !== scopes.flatMap(scope => scope.view.registeredTools).length
+            || runner.getCommandDiagnostics().length || commands.some(name => !runner.getCommand(name)))
             throw appError('extension_registration_conflict', 'extension', 'Controlled command or tool registration conflicts.');
           await session.bindExtensions({ mode: 'print', onError: error => {
-            if (['tool_result', 'tool_execution_end'].includes(error.event)) scope.recordHook(error.event as 'tool_result' | 'tool_execution_end', 'sdk_observer_failed');
+            if (['tool_result', 'tool_execution_end'].includes(error.event)) for (const scope of scopes)
+              scope.recordHook(error.event as 'tool_result' | 'tool_execution_end', 'sdk_observer_failed');
           } });
           if (signal.aborted) throw appError('agent_cancelled', 'runtime', 'Extension startup was cancelled.');
-          const activated = scope.activate(); if (!activated.ok) throw activated.error;
+          for (const scope of scopes) { const activated = scope.activate(); if (!activated.ok) throw activated.error; }
         }
-        const beforeToolCall = session.agent.beforeToolCall;
-        session.agent.beforeToolCall = async (context, hookSignal) => {
-          const toolCall = context.toolCall;
-          const inherited = this.guardInheritedTool(record, toolCall.id);
-          if (!inherited.ok) return { block: true, reason: inherited.error.message };
-          const original = structuredClone(toolCall);
-          const request = record.active?.toolRequests.get(context.toolCall.id);
-          if (request) request.failureStage = 'sdk_before';
-          let result;
-          let changed = false;
-          try { result = await beforeToolCall?.(context, hookSignal); }
-          finally {
-            changed = context.toolCall !== toolCall || !isDeepStrictEqual(toolCall, original);
-            if (changed) {
-              // The SDK retains this raw block for execution, result identity, and history.
-              for (const key of Object.keys(toolCall)) Reflect.deleteProperty(toolCall, key);
-              Object.assign(toolCall, original);
-              if (request) request.sdkRaw = toolCall.arguments;
-            }
-          }
-          if (changed) {
-            const error = appError('extension_hook_failed', 'extension', 'The SDK before hook changed the original tool request.');
-            if (record.extensions) {
-              record.extensions.scope.fail(error);
-              if (record.active) this.failToolRun(record, record.active, error);
-            }
-            result = { block: true, reason: error.message };
-          }
-          if (request && result?.block) request.sdkBlocked = true;
-          return result;
-        };
-        const afterToolCall = session.agent.afterToolCall;
-        session.agent.afterToolCall = async (context, hookSignal) => {
-          const active = record.active;
-          try {
-            const request = active?.toolRequests.get(context.toolCall.id);
-            const feedback = structuredClone(request?.feedback ?? context.result);
-            const result = await afterToolCall?.(context, hookSignal);
-            if (!active) return result;
-            const saved = active.toolBinding?.queryCall?.(context.toolCall.id);
-            if (saved && (!saved.ok || saved.data.result === null)) {
-              return this.rejectPiFeedback(record, active, context.toolCall.id,
-                appError('storage_read_failed', 'storage', 'The saved tool outcome could not be verified.', true));
-            }
-            const expectedError = saved?.ok ? saved.data.result!.status !== 'succeeded'
-              : request?.feedbackIsError ?? context.isError;
-            const content = result?.content ?? context.result.content;
-            const details = result?.details ?? context.result.details;
-            const nativeFailure = active.nativeFailures.has(context.toolCall.id);
-            const isError = result?.isError ?? (nativeFailure ? true : context.isError);
-            if (isError !== expectedError || !isDeepStrictEqual(content, feedback.content)
-              || !isDeepStrictEqual(details, feedback.details)) {
-              return this.rejectPiFeedback(record, active, context.toolCall.id,
-                appError('tool_feedback_conflict', 'runtime', 'The SDK feedback differs from the saved tool outcome.'));
-            }
-            if (active.nativeFailures.delete(context.toolCall.id)) return { ...result, isError: true };
-            return result;
-          } catch {
-            if (!active) throw new Error('The SDK after hook failed.');
-            return this.rejectPiFeedback(record, active, context.toolCall.id,
-              appError('tool_sdk_after_failed', 'runtime', 'The SDK after hook failed.'));
-          }
-        };
-        session.agent.toolExecution = 'parallel';
-        // The controlled resource loader has no context handlers. Pi's empty
-        // ExtensionRunner still clones messages; preserve the saved native identities.
-        session.agent.transformContext = async messages => messages;
-        session.setActiveToolsByName(activeToolNames);
-        session.agent.streamFunction = this.wrapStream(record, session, session.agent.streamFunction);
-        this.installInputCapture(record, session);
-        const nativeConvert = session.agent.convertToLlm.bind(session.agent);
-        session.agent.convertToLlm = async (messages) => {
-          const rejectConversion = (error: ReturnType<typeof appError>): never => {
-            if (record.active) this.failToolRun(record, record.active, error); throw error;
-          };
-          const allowed = this.verifyModelUse(record);
-          const valid = this.validateMessages(record, messages, true);
-          if (!allowed.ok || !valid.ok) {
-            const error = !allowed.ok ? allowed.error : !valid.ok ? valid.error : appError('session_history_invalid', 'session', 'Invalid model messages.');
-            if (record.active) this.failToolRun(record, record.active, error);
-            throw new Error(error.code);
-          }
-          const nativeProof = messages.map(message => record.nativeObjects?.get(message));
-          for (let index = 0; index < messages.length; index++) {
-            const message = messages[index]!;
-            if ((record.contextSeeded || ['bashExecution', 'custom', 'branchSummary', 'compactionSummary'].includes(message.role))
-              && (!nativeProof[index] || !isDeepStrictEqual(message, nativeProof[index]!.original)))
-              rejectConversion(appError('context_binding_unknown', 'runtime', 'Native context object provenance is unavailable.'));
-          }
-          const converted = await nativeConvert(messages);
-          const structure = validateLlmMessages(converted); if (!structure.ok) rejectConversion(structure.error);
-          // The fixed converter drops only excluded bash. Compare every actual output against its single source conversion.
-          const derived = new WeakMap<object, NativeDerivedContextBinding>();
-          let outputIndex = 0;
-          for (let inputIndex = 0; inputIndex < messages.length; inputIndex++) {
-            const message = messages[inputIndex]!, expected = convertToLlm([message]);
-            if (expected.length === 0) continue;
-            const output = converted[outputIndex++];
-            if (!output || !isDeepStrictEqual(output, expected[0])
-              || ['user', 'assistant', 'toolResult'].includes(message.role) && output !== message)
-              rejectConversion(appError('context_binding_unknown', 'runtime', 'Converted context no longer preserves its source.'));
-            if (!['user', 'assistant', 'toolResult'].includes(message.role)) {
-              const proof = nativeProof[inputIndex], entry = proof && record.manager.getEntry(proof.entryId);
-              const origin = record.recoverySeed?.origins.find(o => o.nativeEntryId === proof?.entryId);
-              if (!entry || !origin || !['message', 'custom_message', 'branch_summary', 'compaction'].includes(entry.type))
-                return rejectConversion(appError('context_binding_unknown', 'runtime', 'Native context origin is unavailable.'));
-              derived.set(output, { nativeEntryId: entry.id, originSessionId: origin.originSessionId,
-                entryType: entry.type as NativeDerivedContextBinding['entryType'], messageRole: message.role as NativeDerivedContextBinding['messageRole'],
-                contextMessageIndex: inputIndex, referenceEntryIds: referenceIds(entry) });
-            }
-          }
-          if (outputIndex !== converted.length) rejectConversion(appError('context_binding_unknown', 'runtime', 'Converted context contains unproven messages.'));
-          record.convertedOrigins = derived;
-          const verified = this.validateMessages(record, converted);
-          if (!verified.ok) {
-            if (record.active) this.failToolRun(record, record.active, verified.error);
-            throw new Error(verified.error.code);
-          }
-          return converted;
-        };
+        this.installExecutionHooks(record, session, activeToolNames);
         record.session = session;
         record.policy = policy;
       } else if (!sameModel(record.model, model)) {
@@ -1142,12 +1059,12 @@ export class PiAgentAdapter implements AgentPort {
         thinkingLevel: session.thinkingLevel, resourcePolicy: resources ? 'p11-resources-v1' : 'none', historyPolicy: 'memory-only',
         maxContextBytes, maxOutputBytes, maxAssistantContentBytes, sessionRetry: false,
       };
-      const extensionFacts = frozenExtensions ? { extensionPolicy: frozenExtensions.included.length ? 'p12-managed-extensions-v1' as const : 'none' as const } : {};
+      const extensionFacts = frozenExtensions ? { extensionPolicy: frozenExtensions.included.length ? frozenExtensions.policyVersion : 'none' as const } : {};
       const agent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts = options?.runtimeBudget
         ? { ...taskAgent, ...extensionFacts, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : { ...taskAgent, ...extensionFacts };
       record.snapshot = { ...snapshot, historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent,
         ...(resources ? { resources: Object.freeze(structuredClone(resources)) } : {}),
-        ...(frozenExtensions ? { extensions: structuredClone(frozenExtensions), extensionAssembly: record.extensions?.scope.evidence() ?? { version: 1 as const, sdkVersion: '0.85.1' as const, instances: [] } } : {}),
+        ...(frozenExtensions ? { extensions: structuredClone(frozenExtensions), extensionAssembly: record.extensions ? extensionAssembly(record.extensions) : { version: 1 as const, sdkVersion: '0.85.1' as const, instances: [] } } : {}),
         ...(options?.compactionPolicy ? { compactionPolicy: Object.freeze(structuredClone(options.compactionPolicy)) } : {}) };
       if (options?.compactionPolicy && !record.compactionBridge) {
         const bridge = this.installCompaction(record, session);
@@ -1162,7 +1079,7 @@ export class PiAgentAdapter implements AgentPort {
       if (record.extensions) {
         const failure = error && typeof error === 'object' && 'code' in error ? error as ReturnType<typeof appError>
           : appError('extension_load_failed', 'extension', 'Controlled Extension assembly failed.', true);
-        record.extensions.scope.fail(failure);
+        for (const scope of record.extensions.scopes) scope.fail(failure);
         await this.disposeManagedSession(record); return fail(failure);
       }
       // createAgentSession can append native model metadata before it throws; do not reuse an uncertain manager.
@@ -1522,6 +1439,7 @@ export class PiAgentAdapter implements AgentPort {
         if (!wire.ok) reject(wire.error);
         verify();
         if (resources) saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
+        const reserved = active?.input.reserveModelRequest?.(); if (reserved && !reserved.ok) reject(reserved.error);
         attempt++;
         if (active) active.attempts++;
         if (attempt > 2) reject(appError('compaction_failed', 'runtime', 'Summary HTTP retry exceeded the frozen provider configuration.'));
@@ -1796,8 +1714,10 @@ export class PiAgentAdapter implements AgentPort {
   private verifyModelUse(record: SessionRecord, settledCompactionFailure = false): Result<void> {
     const active = record.active;
     if (!active) return fail(appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
-    if (record.extensions && (record.extensions.scope.view.state !== 'active' || record.extensions.scope.view.admission !== 'open'))
-      return fail(record.extensions.scope.view.lastError ?? appError('extension_hook_failed', 'extension', 'Extension execution admission is closed.'));
+    const registry = this.verifyChildRegistry(record);
+    if (!registry.ok) return registry;
+    const unavailable = record.extensions?.scopes.find(scope => scope.view.state !== 'active' || scope.view.admission !== 'open');
+    if (unavailable) return fail(unavailable.view.lastError ?? appError('extension_hook_failed', 'extension', 'Extension execution admission is closed.'));
     if (record.historyFailure) return fail(record.historyFailure);
     if (record.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
     if (active.failure && !settledCompactionFailure) return fail(active.failure);
@@ -1812,6 +1732,18 @@ export class PiAgentAdapter implements AgentPort {
       return ok(undefined);
     }
     catch { return fail(appError('storage_read_failed', 'storage', 'Session 使用权限无法确认。', true, active.runId, active.sessionId)); }
+  }
+
+  private verifyChildRegistry(record: SessionRecord): Result<void> {
+    if (!record.snapshot || !('subagent' in record.snapshot)) return ok(undefined);
+    const allowed = record.active?.toolBinding?.context.scope.allowedTools, session = record.session;
+    const registered = session?.getAllTools().map(tool => tool.name), visible = session?.getActiveToolNames();
+    if (!allowed || !registered || !visible || registered.length !== allowed.length || visible.length !== allowed.length
+      || new Set(registered).size !== registered.length || new Set(visible).size !== visible.length
+      || registered.some(name => !allowed.includes(name)) || visible.some(name => !allowed.includes(name))
+      || registered.some(name => this.toolsByName.get(name)?.effect !== 'READ'))
+      return fail(appError('subagent_tool_denied', 'tool', 'The live child tool registry exceeds its frozen read-only assembly.'));
+    return ok(undefined);
   }
 
   private validateMessages(record: SessionRecord, messages: Parameters<typeof validateModelMessages>[0], agentContext = false): Result<void> {
@@ -1962,6 +1894,258 @@ export class PiAgentAdapter implements AgentPort {
     }
   }
 
+  private installExecutionHooks(record: SessionRecord, session: AgentSession, activeToolNames: readonly string[]): void {
+    const beforeToolCall = session.agent.beforeToolCall;
+    session.agent.beforeToolCall = async (context, hookSignal) => {
+      const registry = this.verifyChildRegistry(record);
+      if (!registry.ok) {
+        if (record.active) this.failToolRun(record, record.active, registry.error);
+        return { block: true, reason: registry.error.message };
+      }
+      const toolCall = context.toolCall;
+      const inherited = this.guardInheritedTool(record, toolCall.id);
+      if (!inherited.ok) return { block: true, reason: inherited.error.message };
+      const original = structuredClone(toolCall);
+      const request = record.active?.toolRequests.get(context.toolCall.id);
+      if (request) request.failureStage = 'sdk_before';
+      let result;
+      let changed = false;
+      try { result = await beforeToolCall?.(context, hookSignal); }
+      finally {
+        changed = context.toolCall !== toolCall || !isDeepStrictEqual(toolCall, original);
+        if (changed) {
+          // The SDK retains this raw block for execution, result identity, and history.
+          for (const key of Object.keys(toolCall)) Reflect.deleteProperty(toolCall, key);
+          Object.assign(toolCall, original);
+          if (request) request.sdkRaw = toolCall.arguments;
+        }
+      }
+      if (changed) {
+        const error = appError('extension_hook_failed', 'extension', 'The SDK before hook changed the original tool request.');
+        if (record.extensions) {
+          for (const scope of record.extensions.scopes) scope.fail(error);
+          if (record.active) this.failToolRun(record, record.active, error);
+        }
+        result = { block: true, reason: error.message };
+      }
+      if (request && result?.block) request.sdkBlocked = true;
+      return result;
+    };
+    const afterToolCall = session.agent.afterToolCall;
+    session.agent.afterToolCall = async (context, hookSignal) => {
+      const active = record.active;
+      try {
+        const request = active?.toolRequests.get(context.toolCall.id);
+        const feedback = structuredClone(request?.feedback ?? context.result);
+        const result = await afterToolCall?.(context, hookSignal);
+        if (!active) return result;
+        const saved = active.toolBinding?.queryCall?.(context.toolCall.id);
+        if (saved && (!saved.ok || saved.data.result === null)) {
+          return this.rejectPiFeedback(record, active, context.toolCall.id,
+            appError('storage_read_failed', 'storage', 'The saved tool outcome could not be verified.', true));
+        }
+        const expectedError = saved?.ok ? saved.data.result!.status !== 'succeeded'
+          : request?.feedbackIsError ?? context.isError;
+        const content = result?.content ?? context.result.content;
+        const details = result?.details ?? context.result.details;
+        const nativeFailure = active.nativeFailures.has(context.toolCall.id);
+        const isError = result?.isError ?? (nativeFailure ? true : context.isError);
+        if (isError !== expectedError || !isDeepStrictEqual(content, feedback.content)
+          || !isDeepStrictEqual(details, feedback.details)) {
+          return this.rejectPiFeedback(record, active, context.toolCall.id,
+            appError('tool_feedback_conflict', 'runtime', 'The SDK feedback differs from the saved tool outcome.'));
+        }
+        if (active.nativeFailures.delete(context.toolCall.id)) return { ...result, isError: true };
+        return result;
+      } catch {
+        if (!active) throw new Error('The SDK after hook failed.');
+        return this.rejectPiFeedback(record, active, context.toolCall.id,
+          appError('tool_sdk_after_failed', 'runtime', 'The SDK after hook failed.'));
+      }
+    };
+    session.agent.toolExecution = 'parallel';
+    // The controlled resource loader has no context handlers. Pi's empty
+    // ExtensionRunner still clones messages; preserve the saved native identities.
+    session.agent.transformContext = async messages => messages;
+    session.setActiveToolsByName([...activeToolNames]);
+    session.agent.streamFunction = this.wrapStream(record, session, session.agent.streamFunction);
+    this.installInputCapture(record, session);
+    const nativeConvert = session.agent.convertToLlm.bind(session.agent);
+    session.agent.convertToLlm = async (messages) => {
+      const rejectConversion = (error: ReturnType<typeof appError>): never => {
+        if (record.active) this.failToolRun(record, record.active, error); throw error;
+      };
+      const allowed = this.verifyModelUse(record);
+      const valid = this.validateMessages(record, messages, true);
+      if (!allowed.ok || !valid.ok) {
+        const error = !allowed.ok ? allowed.error : !valid.ok ? valid.error : appError('session_history_invalid', 'session', 'Invalid model messages.');
+        if (record.active) this.failToolRun(record, record.active, error);
+        throw new Error(error.code);
+      }
+      const nativeProof = messages.map(message => record.nativeObjects?.get(message));
+      for (let index = 0; index < messages.length; index++) {
+        const message = messages[index]!;
+        if ((record.contextSeeded || ['bashExecution', 'custom', 'branchSummary', 'compactionSummary'].includes(message.role))
+          && (!nativeProof[index] || !isDeepStrictEqual(message, nativeProof[index]!.original)))
+          rejectConversion(appError('context_binding_unknown', 'runtime', 'Native context object provenance is unavailable.'));
+      }
+      const converted = await nativeConvert(messages);
+      const structure = validateLlmMessages(converted); if (!structure.ok) rejectConversion(structure.error);
+      // The fixed converter drops only excluded bash. Compare every actual output against its single source conversion.
+      const derived = new WeakMap<object, NativeDerivedContextBinding>();
+      let outputIndex = 0;
+      for (let inputIndex = 0; inputIndex < messages.length; inputIndex++) {
+        const message = messages[inputIndex]!, expected = convertToLlm([message]);
+        if (expected.length === 0) continue;
+        const output = converted[outputIndex++];
+        if (!output || !isDeepStrictEqual(output, expected[0])
+          || ['user', 'assistant', 'toolResult'].includes(message.role) && output !== message)
+          rejectConversion(appError('context_binding_unknown', 'runtime', 'Converted context no longer preserves its source.'));
+        if (!['user', 'assistant', 'toolResult'].includes(message.role)) {
+          const proof = nativeProof[inputIndex], entry = proof && record.manager.getEntry(proof.entryId);
+          const origin = record.recoverySeed?.origins.find(o => o.nativeEntryId === proof?.entryId);
+          if (!entry || !origin || !['message', 'custom_message', 'branch_summary', 'compaction'].includes(entry.type))
+            return rejectConversion(appError('context_binding_unknown', 'runtime', 'Native context origin is unavailable.'));
+          derived.set(output, { nativeEntryId: entry.id, originSessionId: origin.originSessionId,
+            entryType: entry.type as NativeDerivedContextBinding['entryType'], messageRole: message.role as NativeDerivedContextBinding['messageRole'],
+            contextMessageIndex: inputIndex, referenceEntryIds: referenceIds(entry) });
+        }
+      }
+      if (outputIndex !== converted.length) rejectConversion(appError('context_binding_unknown', 'runtime', 'Converted context contains unproven messages.'));
+      record.convertedOrigins = derived;
+      const verified = this.validateMessages(record, converted);
+      if (!verified.ok) {
+        if (record.active) this.failToolRun(record, record.active, verified.error);
+        throw new Error(verified.error.code);
+      }
+      return converted;
+    };
+  }
+
+  private withDelegateCall(record: SessionRecord, call: DelegateExecution, invokeProduct: () => Promise<AgentToolResult<unknown>>): Promise<AgentToolResult<unknown>> {
+    const calls = record.delegations ??= new Map(), id = call.ticket.nativeToolCallId, existing = calls.get(id);
+    if (existing) {
+      if (!isDeepStrictEqual(existing.call.ticket, call.ticket) || !isDeepStrictEqual(existing.call.arguments, call.arguments))
+        throw appError('subagent_identity_conflict', 'runtime', 'The native delegation identity has different arguments.');
+      return existing.promise;
+    }
+    // Invoke on the next microtask so the real SDK context is installed before Executor enters the product tool.
+    const promise = Promise.resolve().then(invokeProduct).finally(() => { if (calls.get(id)?.promise === promise) calls.delete(id); });
+    calls.set(id, { call, promise }); return promise;
+  }
+
+  public async invokeSubagent(context: ToolExecutionContext, args: DelegateArgs): Promise<NativeToolOutput> {
+    const binding = context.requestBinding, record = binding && this.sessions.get(binding.nativeSessionId);
+    const captured = record?.delegations?.get(context.nativeToolCallId), ticket = captured?.call.ticket;
+    const reject = () => new ToolExecutionFailure(appError('subagent_origin_invalid', 'runtime', 'Delegation has no matching live SDK call.'));
+    if (!record || !captured || !ticket || !record.active || record.active.failure || context.signal.aborted
+      || context.runId !== ticket.runId || context.sessionId !== ticket.sessionId
+      || !isDeepStrictEqual(context.requestBinding, ticket.requestBinding) || !isDeepStrictEqual(context.scope, ticket.scope)
+      || !isDeepStrictEqual(DelegateArgsSchema.parse(captured.call.arguments), DelegateArgsSchema.parse(args))
+      || !record.extensions?.scopes.some(scope => scope.view.instanceId === ticket.instanceId
+        && scope.view.ref.id === 'subagents' && scope.view.state === 'active' && scope.view.admission === 'open')) throw reject();
+    const saved = record.active.toolBinding?.queryCall?.(context.nativeToolCallId);
+    if (!saved?.ok || saved.data.status !== 'running' || saved.data.toolName !== 'Agent' || !this.subagentCallbacks) throw reject();
+    if (!Number.isFinite(context.deadlineAt)) throw reject();
+    captured.control = this.managedChildControl(record, captured.call, saved.data.toolCallId, context.deadlineAt!, context.signal,
+      error => { captured.childError = error; });
+    try {
+      const [, , , update, nativeContext] = captured.call.nativeArguments;
+      const raw = await captured.call.rawTool.execute(context.nativeToolCallId, DelegateArgsSchema.parse(args), context.signal, update, nativeContext);
+      const output = NativeToolOutputSchema.parse(JSON.parse(JSON.stringify({ content: raw.content, details: raw.details })));
+      if (captured.childError || output.details && typeof output.details === 'object' && Reflect.get(output.details, 'status') === 'error') throw new ToolExecutionFailure(captured.childError
+        ?? appError('subagent_execution_failed', 'runtime', 'The plugin reported a failed child.'), output);
+      return output;
+    } catch (error) {
+      if (error instanceof ToolExecutionFailure) throw error;
+      throw new ToolExecutionFailure(error && typeof error === 'object' && 'code' in error ? error as import('@flowmate/contracts').AppError
+        : appError('subagent_execution_failed', 'runtime', 'The managed child execution failed.'));
+    }
+  }
+
+  private managedChildControl(parent: SessionRecord, call: DelegateExecution, originToolCallId: number, delegateDeadlineAt: number, signal: AbortSignal,
+    onError: (error: import('@flowmate/contracts').AppError) => void): ManagedChildControl {
+    return { role: { name: SUBAGENT_ROLE, description: 'Read-only invoice evidence check', extensions: false, skills: false,
+      allowedSubagents: [], systemPrompt: SUBAGENT_SYSTEM_PROMPT, promptMode: 'replace', inheritContext: false,
+      runInBackground: false, isolated: true, persistSession: false, outputTranscript: false, isolation: 'off' },
+      beforeCreate: async pluginAgentId => {
+        const ticket = call.ticket;
+        const prepared = await this.subagentCallbacks!.prepare({ parentRunId: ticket.runId, parentSessionId: ticket.sessionId,
+          parentNativeSessionId: ticket.nativeSessionId, originToolCallId, parentNativeToolCallId: ticket.nativeToolCallId,
+          extensionInstanceId: ticket.instanceId, requestBinding: ticket.requestBinding, delegateDeadlineAt, delegateSignal: signal }, pluginAgentId, DelegateArgsSchema.parse(call.arguments));
+        if (!prepared.ok) { onError(prepared.error); throw prepared.error; }
+        const child = prepared.data, record = this.sessions.get(child.childNativeSessionId);
+        if (record) record.subagentOwner = { childRunId: child.childRunId, pluginAgentId };
+        let outcome: AgentNativeOutcome | undefined;
+        let settled = false;
+        const settle = async (error: unknown) => {
+          if (settled) throw appError('subagent_identity_conflict', 'runtime', 'The managed child has already settled.');
+          settled = true;
+          outcome ??= this.notStarted(child.childNativeSessionId,
+            error && typeof error === 'object' && 'code' in error ? error as import('@flowmate/contracts').AppError
+              : appError('subagent_execution_failed', 'runtime', 'Child creation or attachment failed.'));
+          const cleanup = record ? await this.disposeManagedSession(record) : { stopped: true, errors: [] };
+          outcome = { ...outcome, stopped: outcome.stopped && cleanup.stopped,
+            cleanupErrors: [...outcome.cleanupErrors, ...cleanup.errors] };
+          if (outcome.error) onError(outcome.error);
+          const finished = await this.subagentCallbacks!.finish(child.childRunId, outcome);
+          if (!finished.ok) { onError(finished.error); throw finished.error; }
+        };
+        try {
+        if (!record || !record.historyWriter || !record.receipt || record.recoverySeed?.sessionId !== child.childSessionId
+          || !parent.model || !parent.runtime || !parent.config || parent.active?.runId !== child.parentRunId)
+          throw appError('subagent_origin_invalid', 'runtime', 'Child history or parent model is not bound.');
+        const cwd = child.config.workingDirectory ?? parent.workingDirectory!;
+        const loader = createRunResourceLoader({ fixedSystemPrompt: child.config.agent.systemPrompt,
+          frozen: child.input.resources ?? null,
+          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), child.input.resources?.bundleHash ?? '') });
+        if (!loader.ok) throw loader.error;
+        const definitions = child.scope.allowedTools.map(name => this.toolsByName.get(name));
+        if (definitions.some(tool => !tool || tool.effect !== 'READ' || tool.name === 'Agent')
+          || new Set(child.scope.allowedTools).size !== child.scope.allowedTools.length)
+          throw appError('subagent_tool_denied', 'tool', 'Child registry would exceed the read-only scope.');
+        return { promptText: child.input.promptText!, options: { cwd, agentDir: this.dependencies.agentDir ?? cwd,
+          modelRuntime: parent.runtime, model: parent.model, sessionManager: record.manager,
+          settingsManager: inMemorySettings(), resourceLoader: loader.data, thinkingLevel: 'off', noTools: 'all',
+          tools: [...child.scope.allowedTools], customTools: definitions.map(definition => toPiTool(definition!,
+            (id, input, toolSignal) => this.executePiTool(record, definition!, id, input, toolSignal), raw => {
+              const requests = [...record.active?.toolRequests.values() ?? []].filter(call => call.name === definition!.name && call.sdkRaw === raw && !call.invoked);
+              if (requests.length === 1) requests[0]!.failureStage = 'sdk_arguments';
+            })) },
+          attach: async session => {
+            record.session = session;
+            this.dependencies.sessionSetup?.(session);
+            const installed = session.getAllTools().map(tool => tool.name);
+            if (session.sessionManager !== record.manager || session.sessionManager.getSessionId() !== child.childNativeSessionId
+              || !session.model || !sameModel(session.model, parent.model!)
+              || !session.systemPrompt.startsWith(`${loader.data.getSystemPrompt()}\n`)
+              || installed.length !== child.scope.allowedTools.length || new Set(installed).size !== installed.length
+              || installed.some(name => !child.scope.allowedTools.includes(name))
+              || session.extensionRunner.getAllRegisteredTools().length || session.extensionRunner.getCommandDiagnostics().length)
+              throw appError('subagent_tool_denied', 'tool', 'The actual child assembly differs from its frozen registry.');
+            record.runtime = parent.runtime; record.model = parent.model; record.config = structuredClone(parent.config!);
+            record.snapshot = { ...child.config, agent: { ...child.config.agent, systemPrompt: session.systemPrompt } };
+            record.policy = 'p3'; record.workingDirectory = cwd; record.resourceLoader = loader.data;
+            record.resourceKey = child.input.resources?.bundleHash ?? null; record.sessionInputs = true;
+            this.installExecutionHooks(record, session, child.scope.allowedTools);
+            const seeded = this.reseedContext(record); if (!seeded.ok) throw seeded.error;
+            const started = child.start(session.systemPrompt); if (!started.ok) throw started.error;
+            const originalPrompt = session.prompt.bind(session);
+            let prompted = false;
+            session.prompt = async (text, options) => {
+              if (prompted || text !== child.input.promptText || options !== undefined)
+                throw appError('subagent_identity_conflict', 'runtime', 'The managed child accepts its original prompt exactly once.');
+              prompted = true;
+              outcome = await this.execute(record, child.childNativeSessionId, child.input,
+                AbortSignal.any([child.signal, signal]), child.observe, () => originalPrompt(text, { expandPromptTemplates: false }));
+              if (outcome.error) throw outcome.error;
+            };
+          },
+          settle: ({ error }) => settle(error) };
+        } catch (error) { await settle(error); throw error; }
+      } };
+  }
+
   private async executePiTool(
     record: SessionRecord,
     definition: ToolDefinition<any, any>,
@@ -2025,7 +2209,7 @@ export class PiAgentAdapter implements AgentPort {
       this.failToolRun(record, active, error);
       throw new Error(error.message);
     }
-    if (getNativeToolParameters(definition)) {
+    if (getNativeToolParameters(definition) || definition.name === 'Agent') {
       const native = NativeToolOutputSchema.safeParse(result.data);
       if (native.success) {
         if (result.status !== 'succeeded') active.nativeFailures.add(nativeToolCallId);
@@ -2257,6 +2441,8 @@ export class PiAgentAdapter implements AgentPort {
       if (requestBinding) requireEvidence({ kind: 'attempt-prepared', evidence: { attempt, preparedAt: now().at,
         enteredAt: null, responseAt: null, responseStatus: null, transportErrorCode: null, nativeRequestId: null,
         wireInclusion: wire.data.inclusion, wireReason: wire.data.reason } });
+      const reserved = active.input.reserveModelRequest?.();
+      if (reserved && !reserved.ok) { this.failToolRun(record, active, reserved.error); throw new Error(reserved.error.code); }
       active.attempts += 1;
       const requestUrl = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url;
       this.observe(active, 'request_dispatched', { callSequence: active.callSequence, attempt: active.attempts, url: safeUrl(requestUrl) });
@@ -2535,6 +2721,15 @@ export class PiAgentAdapter implements AgentPort {
     }
   }
 
+  public requestSubagentStop(input: { childRunId: number; childNativeSessionId: string; pluginAgentId: string }): Result<void> {
+    const record = this.sessions.get(input.childNativeSessionId);
+    if (!record || record.subagentOwner?.childRunId !== input.childRunId || record.subagentOwner.pluginAgentId !== input.pluginAgentId
+      || record.active && record.active.runId !== input.childRunId)
+      return fail(appError('subagent_identity_conflict', 'runtime', 'Stop request has no matching child execution owner.'));
+    if (record.active) this.stop(record, record.active);
+    return ok(undefined);
+  }
+
   private providerError(active: ActiveExecution, error: unknown, transportFailed = false): ReturnType<typeof appError> {
     if (active.signal.aborted) return appError('agent_cancelled', 'runtime', 'Agent 执行已取消。');
     if (active.responseStatus === 401 || active.responseStatus === 403) return appError('provider_auth_failed', 'provider', 'Provider 认证失败。');
@@ -2560,6 +2755,7 @@ export class PiAgentAdapter implements AgentPort {
     input: AgentExecutionInput,
     signal: AbortSignal,
     observe: (event: AgentObservation) => void,
+    invokePrompt?: () => Promise<void>,
   ): Promise<AgentNativeOutcome> {
     const session = record.session;
     const model = record.model;
@@ -2675,7 +2871,7 @@ export class PiAgentAdapter implements AgentPort {
           const dispatchedInput = { inputId: input.inputId, text: input.text, promptText: input.promptText!, contextSnapshotId: input.contextSnapshotId,
             ...(input.resourceBinding ? { resourceBinding: input.resourceBinding } : {}) };
           const dispatched = await this.dispatchInput(record, active, dispatchedInput,
-            () => session.prompt(this.nativeInputText(dispatchedInput), { expandPromptTemplates: input.resourceBinding?.requiredSkill != null }), false);
+            invokePrompt ?? (() => session.prompt(this.nativeInputText(dispatchedInput), { expandPromptTemplates: input.resourceBinding?.requiredSkill != null })), false);
           await dispatched.execution;
         } else await session.prompt(formatExecutionPrompt({ ...input, business: input.toolBinding !== undefined }), { expandPromptTemplates: false });
       } finally { promptSettled = true; }
@@ -2816,43 +3012,44 @@ export class PiAgentAdapter implements AgentPort {
   }
 
   public inspectExtensions(nativeSessionId: string): Result<NativeExtensionView> {
-    const scope = this.sessions.get(nativeSessionId)?.extensions?.scope;
-    return ok(scope ? { nativeSessionId, instance: scope.snapshot() }
-      : structuredClone(this.recentExtensions.get(nativeSessionId) ?? { nativeSessionId, instance: null }));
+    const scopes = this.sessions.get(nativeSessionId)?.extensions?.scopes;
+    return ok(scopes ? { nativeSessionId, instances: scopes.map(scope => scope.snapshot()) }
+      : structuredClone(this.recentExtensions.get(nativeSessionId) ?? { nativeSessionId, instances: [] }));
   }
 
   private async disposeManagedSession(record: SessionRecord): Promise<CloseReport> {
     if (record.disposing) return record.disposing;
-    const scope = record.extensions?.scope;
-    if (scope) scope.view.admission = 'closed';
+    const scopes = record.extensions?.scopes ?? [];
+    for (const scope of scopes) scope.view.admission = 'closed';
     if (record.running || record.compacting || record.commanding || record.session && !record.session.isIdle)
       return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Agent Session has not stopped.', true)] };
-    if (scope && !scope.view.cleanup.ownedCallbacksSettled)
+    if (scopes.some(scope => !scope.view.cleanup.ownedCallbacksSettled))
       return { stopped: false, closed: false, errors: [appError('extension_cleanup_failed', 'runtime', 'Extension callbacks or factory have not settled.', true)] };
     const disposing = (async (): Promise<CloseReport> => {
       try {
-        if (scope?.view.cleanup.shutdownRequired && !scope.view.cleanup.shutdownAcknowledged) {
+        if (scopes.some(scope => scope.view.cleanup.shutdownRequired && !scope.view.cleanup.shutdownAcknowledged)) {
           if (!record.session) throw new Error('No native shutdown owner.');
-          scope.clearPhaseError('session_shutdown');
+          for (const scope of scopes) scope.clearPhaseError('session_shutdown');
           await record.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
-          if (scope.phaseError('session_shutdown') || !scope.view.cleanup.shutdownAcknowledged || !scope.view.cleanup.ownedCallbacksSettled)
+          if (scopes.some(scope => scope.phaseError('session_shutdown') || !scope.view.cleanup.shutdownAcknowledged || !scope.view.cleanup.ownedCallbacksSettled))
             throw new Error('Native shutdown was not acknowledged.');
         }
         record.compactionBridge?.dispose(); record.compactionBridge = undefined;
-        if (record.session && (!scope || !scope.view.cleanup.sdkDisposed)) {
-          record.session.dispose(); if (scope) scope.view.cleanup.sdkDisposed = true;
+        if (record.session && !scopes.some(scope => scope.view.cleanup.sdkDisposed)) {
+          record.session.dispose(); for (const scope of scopes) scope.view.cleanup.sdkDisposed = true;
         }
         record.session = undefined; record.resourceLoader = undefined;
-        if (scope) {
+        for (const scope of scopes) {
           scope.view.state = 'disposed'; scope.view.disposedAt = new Date().toISOString();
-          this.recentExtensions.set(scope.view.nativeSessionId, { nativeSessionId: scope.view.nativeSessionId, instance: scope.snapshot() });
         }
+        if (scopes.length) this.recentExtensions.set(record.manager.getSessionId(),
+          { nativeSessionId: record.manager.getSessionId(), instances: scopes.map(scope => scope.snapshot()) });
         return { stopped: true, closed: true, errors: [] };
       } catch {
-        const error = scope
+        const error = scopes.length
           ? appError('extension_cleanup_failed', 'runtime', 'Extension Session cleanup could not be confirmed. Retry the original instance.', true)
           : appError('agent_cleanup_failed', 'runtime', 'Agent Session cleanup could not be confirmed.', true);
-        if (scope) scope.view.lastError = error;
+        for (const scope of scopes) scope.view.lastError = error;
         return { stopped: true, closed: false, errors: [error] };
       }
     })();
@@ -2861,7 +3058,9 @@ export class PiAgentAdapter implements AgentPort {
   }
 
   public async executeExtensionCommand(nativeSessionId: string, request: import('@flowmate/contracts').NativeExtensionCommandRequest): Promise<Result<import('@flowmate/contracts').NativeExtensionCommandReceipt>> {
-    const record = this.sessions.get(nativeSessionId), scope = record?.extensions?.scope;
+    const record = this.sessions.get(nativeSessionId), scopes = record?.extensions?.scopes ?? [];
+    const scope = scopes.find(scope => scope.view.instanceId === request.expectedInstanceId);
+    if (!scope && scopes.length) return fail(appError('extension_instance_conflict', 'session', 'Extension instance changed.', true));
     if (!record || !scope || !record.session || scope.view.state !== 'active' || scope.view.admission !== 'open')
       return fail(appError('extension_not_loaded', 'extension', 'No active extension is loaded.'));
     if (scope.view.instanceId !== request.expectedInstanceId) return fail(appError('extension_instance_conflict', 'session', 'Extension instance changed.', true));
@@ -2881,13 +3080,13 @@ export class PiAgentAdapter implements AgentPort {
 
   public async disposeExtensions(nativeSessionId: string, expectedInstanceId: string): Promise<Result<import('@flowmate/contracts').NativeExtensionDisposeReceipt>> {
     const inspected = this.inspectExtensions(nativeSessionId); if (!inspected.ok) return inspected;
-    const instance = inspected.data.instance;
-    if (!instance) return fail(appError('extension_not_loaded', 'extension', 'No extension instance is known.'));
+    const instance = inspected.data.instances.find(item => item.instanceId === expectedInstanceId);
+    if (!instance) return fail(appError(inspected.data.instances.length ? 'extension_instance_conflict' : 'extension_not_loaded', 'extension', 'No matching extension instance is known.', true));
     if (instance.instanceId !== expectedInstanceId) return fail(appError('extension_instance_conflict', 'session', 'Extension instance changed.', true));
     if (instance.state === 'disposed') return ok({ nativeSessionId, instanceId: expectedInstanceId, state: 'disposed', report: { stopped: true, closed: true, errors: [] } });
     const report = await this.releaseSession(nativeSessionId);
-    const current = this.inspectExtensions(nativeSessionId); if (!current.ok || !current.data.instance) return fail(appError('extension_cleanup_failed', 'runtime', 'Extension cleanup facts are unavailable.', true));
-    return ok({ nativeSessionId, instanceId: expectedInstanceId, state: current.data.instance.state, report });
+    const current = this.inspectExtensions(nativeSessionId); const latest = current.ok ? current.data.instances.find(item => item.instanceId === expectedInstanceId) : undefined; if (!latest) return fail(appError('extension_cleanup_failed', 'runtime', 'Extension cleanup facts are unavailable.', true));
+    return ok({ nativeSessionId, instanceId: expectedInstanceId, state: latest.state, report });
   }
 
   public async releaseSession(nativeSessionId: string): Promise<CloseReport> {
