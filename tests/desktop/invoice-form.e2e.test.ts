@@ -1,10 +1,11 @@
 import { _electron as electron } from 'playwright';
 import { expect, test as it } from '@playwright/test';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
+import { CandidateDraftSchema } from '@flowmate/contracts';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, mkdtemp, waitFor } from '../support/resources.ts';
+import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, installReadGate, mkdtemp, waitFor } from '../support/resources.ts';
 
 it.setTimeout(90_000);
 it.afterEach(cleanupResources);
@@ -20,7 +21,7 @@ function stream(value: string | { name: string; id: string; args: unknown }) {
 }
 
 async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.launch>>, userData: string,
-  commandType: 'save_invoice_candidate' | 'submit_invoice_form_input' = 'save_invoice_candidate') {
+  commandType: 'save_invoice_candidate' | 'submit_invoice_form_input' | 'accept_invoice_candidate' | 'reject_invoice_candidate' = 'save_invoice_candidate') {
   await app.evaluate((_electron, { ownedRoot, commandType, tracePath }) => {
     const { writeFileSync } = process.getBuiltinModule('node:fs') as typeof import('node:fs');
     const handles = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles();
@@ -30,7 +31,7 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
     const write = child.stdin.write; const emit = child.stdout.emit;
     let buffered = Buffer.alloc(0); let targetRequestId: string | null = null;
     const gate = { saveRequests: [] as Array<{ requestId: string; operationRef: string }>,
-      inputRequests: [] as Array<{ requestId: string; clientSequence: number }>, dropped: 0,
+      inputRequests: [] as Array<{ requestId: string; clientSequence: number }>, exportRequests: [] as unknown[], decisionRequests: [] as unknown[], dropped: 0,
       originalInput: undefined as unknown, corruptQueryRunId: null as number | null, queryRequests: new Set<string>(),
       originalResult: undefined as unknown, restore: () => {
         child.stdin.write = write; child.stdout.emit = emit;
@@ -42,6 +43,11 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
       try {
         const command = JSON.parse(String(args[0])) as { type?: string; requestId?: string;
           input?: { operationRef?: string; clientSequence?: number } };
+        if (command.type === 'export_invoice_candidate') gate.exportRequests.push(command.input);
+        if ((command.type === 'accept_invoice_candidate' || command.type === 'reject_invoice_candidate') && command.requestId) {
+          gate.decisionRequests.push(command.input);
+          if (command.type === commandType) targetRequestId ??= command.requestId;
+        }
         if (command.type === 'save_invoice_candidate' && command.requestId && command.input?.operationRef) {
           gate.saveRequests.push({ requestId: command.requestId, operationRef: command.input.operationRef });
           recordIdentities();
@@ -85,14 +91,18 @@ async function dropOneOwnedHostResponse(app: Awaited<ReturnType<typeof electron.
   }, { ownedRoot: userData, commandType, tracePath: join(userData, 'form-transport-identities.json') });
 }
 
-for (const outcome of ['accept-export', 'save-on-close', 'discard-on-close', 'reject-reselect', 'unknown-close-save', 'unknown-ui-save-close', 'unknown-fill-input', 'concurrent-fill-input', 'selection-while-fill'] as const)
+for (const outcome of ['accept-export', 'save-on-close', 'discard-on-close', 'reject-reselect', 'unknown-close-save', 'unknown-ui-save-close', 'unknown-fill-input', 'concurrent-fill-input', 'selection-while-fill', 'manual-review', 'native-export-faults', 'unknown-accept', 'unknown-reject', 'save-refresh-failure', 'fill-no-tool', 'discard-preview-race', 'workspace-source-race'] as const)
 it(`real Fill and manual form public chain: ${outcome}`, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-form-desktop-'));
   const sourceRoot = await mkdtemp(join(tmpdir(), 'flowmate-form-source-'));
   const source = join(sourceRoot, '000001'); mkdirSync(source);
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64');
-  const content = JSON.stringify([{ type: 'header', text: 'Invoice number: INV-FORM-1', bbox: [0, 0, 10, 10], page_idx: 0 }]);
-  const pages = JSON.stringify([{ pageNumber: 1, text: 'Invoice number: INV-FORM-1', blockCount: 1 }]);
+  const blocks = [{ type: 'header', text: 'Invoice number: INV-FORM-1', bbox: [0, 0, 10, 10], page_idx: 0 }];
+  const manual = outcome === 'manual-review' || outcome === 'discard-preview-race' || outcome === 'workspace-source-race';
+  if (manual) for (let index = 2; index <= 55; index++) blocks.push({ type: 'text',
+    text: index === 54 ? 'A 113.00' : index === 55 ? 'B 113.00' : index === 3 ? 'A / B' : `Extra evidence ${index}`, bbox: [0, 0, 10, 10], page_idx: 0 });
+  const content = JSON.stringify(blocks);
+  const pages = JSON.stringify([{ pageNumber: 1, text: blocks.map(block => block.text).join('\n'), blockCount: blocks.length }]);
   writeFileSync(join(source, 'original.png'), png); writeFileSync(join(source, 'content.json'), content); writeFileSync(join(source, 'pages.json'), pages);
   writeFileSync(join(source, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId: '000001', datasetId: 'voxel51-hq-invoice-ocr',
     sourceRecordId: 'desktop-form-invoice', datasetRevision: 'rev-1', qualityStatus: 'complete', allowedUsesClaim: ['local review'],
@@ -102,10 +112,19 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
   for (const name of ['original.png', 'content.json', 'pages.json', 'metadata.json']) {
     const bytes = readFileSync(join(source, name)); const length = Buffer.alloc(8); length.writeBigUInt64BE(BigInt(bytes.length)); digest.update(length).update(bytes);
   }
-  const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
-  const candidate = { fields: Object.fromEntries(['invoiceNumber', 'issueDate', 'sellerName', 'sellerTaxId', 'buyerName', 'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount']
+  const missing = { raw: null, normalized: null, state: 'missing' as const, alternatives: [], sources: [] };
+  const documentVersion = `rev-1:parsed-v3:${digest.digest('hex')}`;
+  const candidate = CandidateDraftSchema.parse({ fields: Object.fromEntries(['invoiceNumber', 'issueDate', 'sellerName', 'sellerTaxId', 'buyerName', 'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount']
     .map(name => [name, name === 'invoiceNumber' ? { raw: 'INV-FORM-1', normalized: 'INV-FORM-1', state: 'present', alternatives: [],
-      sources: [{ documentId: 1, version: `rev-1:parsed-v3:${digest.digest('hex')}`, artifactId: 2, page: 1, blockId: 'b1', quote: 'INV-FORM-1' }] } : missing])), lines: [], notes: [] };
+      sources: [{ documentId: 1, version: documentVersion, artifactId: 2, page: 1, blockId: 'b1', quote: 'INV-FORM-1' }] } : missing])), lines: [], notes: [] });
+  if (manual) {
+    candidate.fields.buyerName = { raw: 'A / B', normalized: null, state: 'ambiguous', alternatives: ['A', 'B'],
+      sources: [{ documentId: 1, version: documentVersion, artifactId: 2, page: 1, blockId: 'b3', quote: 'A / B' }] };
+    candidate.lines = ['A', 'B'].map((name, index) => ({ description: missing, unit: missing, unitPrice: missing,
+      netAmount: missing, taxRate: missing, taxAmount: missing, totalAmount: missing,
+      quantity: { raw: '113.00', normalized: '113.00', state: 'present', alternatives: [],
+        sources: [{ documentId: 1, version: documentVersion, artifactId: 2, page: 1, blockId: `b${54 + index}`, quote: `${name} 113.00` }] } }));
+  }
   type Body = { tools?: Array<{ function: { name: string } }>; messages: Array<{ role: string; tool_call_id?: string; content: unknown }> };
   const requests: Body[] = [];
   let releaseHeldFill: (() => void) | undefined;
@@ -115,6 +134,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     const body = await request.json() as Body; requests.push(body);
     const fill = body.tools?.some(tool => tool.function.name === 'fill_invoice_form');
     if (fill) {
+      if (outcome === 'fill-no-tool') return stream('The form is completed.');
       if ((outcome === 'unknown-fill-input' || outcome === 'concurrent-fill-input' || outcome === 'selection-while-fill') && !fillRequestHeld && !body.messages.some(message => message.tool_call_id === 'form-apply')) {
         fillRequestHeld = true; await heldFill;
       }
@@ -163,6 +183,134 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     await page.getByRole('button', { name: 'Results', exact: true }).click();
     await page.getByRole('button', { name: /Result 1/ }).click();
     await page.getByRole('button', { name: 'Select result', exact: true }).click();
+    if (manual) {
+      checkpoint = 'P14 no-model Edit, field metadata, real evidence and Discard';
+      const beforeEdit = requests.length;
+      const withoutSession = await page.evaluate(async () => {
+        const current = await window.flowmate.readWorkspace(); if (!current.ok) throw new Error('Workspace missing');
+        return window.flowmate.updateWorkspace({ expectedRevision: current.data.revision, change: { kind: 'session', sessionId: null } });
+      });
+      expect(withoutSession).toMatchObject({ ok: true, data: { sessionId: null } });
+      await page.reload(); await page.getByRole('button', { name: 'Edit result', exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Edit result', exact: true }).click();
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('INV-FORM-1');
+      await expect(page.getByRole('button', { name: 'Save result', exact: true })).toBeDisabled();
+      await page.getByLabel('Invoice number', { exact: true }).fill('UNSAVED-MANUAL');
+      await expect(page.locator('[data-field-path="fields.invoiceNumber"]')).toContainText('Raw: INV-FORM-1');
+      await expect(page.locator('[data-field-path="fields.invoiceNumber"]')).toContainText('Normalized: INV-FORM-1');
+      await page.getByRole('button', { name: 'Review Invoice number source 1', exact: true }).click();
+      const evidence = page.getByRole('region', { name: 'Source evidence', exact: true });
+      await expect(evidence).toContainText('Invoice number: INV-FORM-1');
+      await expect(evidence).toContainText('Quote: INV-FORM-1');
+      await expect(page.locator('[data-field-path="fields.buyerName"]')).toContainText('Alternatives: A · B');
+      await page.getByRole('button', { name: 'Review Line 2 Quantity source 1', exact: true }).click();
+      await expect(evidence).toContainText('B 113.00'); // b55 requires the actual second page of blocks.
+      if (outcome === 'workspace-source-race') {
+        checkpoint = 'Workspace source click cannot promote a late parsed-page reply over newer evidence';
+        await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
+        await page.getByRole('tab', { name: 'Results', exact: true }).click();
+        await expect(page.getByRole('button', { name: 'Result source 1', exact: true })).toBeEnabled();
+        await installReadGate(app, userData);
+        await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { hold(count: number, type: string): void } }).contextReadGate.hold(1, 'read_document_page'));
+        await page.getByRole('button', { name: 'Result source 1', exact: true }).click();
+        await waitFor(() => app!.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { held: unknown[] } }).contextReadGate.held.length === 1));
+        await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Invoices', exact: true }).click();
+        await page.getByRole('button', { name: 'Review Line 2 Quantity source 1', exact: true }).click();
+        await expect(evidence).toContainText('Quote: B 113.00');
+        const beforeRelease = await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { commands: Array<{ type: string }> } }).contextReadGate.commands.filter(command => command.type === 'list_document_pages').length);
+        await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { release(index: number): void } }).contextReadGate.release(0));
+        // A later real IPC round trip and two paints drain the older reply, without a clock sleep.
+        await page.evaluate(async () => { await window.flowmate.getState(); await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); });
+        await expect(evidence).toContainText('Quote: B 113.00');
+        expect(await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { commands: Array<{ type: string }> } }).contextReadGate.commands.filter(command => command.type === 'list_document_pages').length)).toBe(beforeRelease);
+        await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('UNSAVED-MANUAL');
+        expect(requests).toHaveLength(beforeEdit); return;
+      }
+      await app.evaluate(({ ipcMain }) => {
+        const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => Promise<unknown>> })._invokeHandlers;
+        const original = handlers.get('flowmate:list-document-pages'); if (!original) throw new Error('Missing page index query');
+        ipcMain.removeHandler('flowmate:list-document-pages'); ipcMain.handle('flowmate:list-document-pages', async (event, raw) => {
+          const result = await original(event, raw);
+          ipcMain.removeHandler('flowmate:list-document-pages'); ipcMain.handle('flowmate:list-document-pages', original);
+          return new Promise(resolve => { (globalThis as typeof globalThis & { releaseEvidenceRead?: () => void }).releaseEvidenceRead = () => resolve(result); });
+        });
+      });
+      await page.getByRole('button', { name: 'Review Invoice number source 1', exact: true }).click();
+      await waitFor(() => app!.evaluate(() => Boolean((globalThis as typeof globalThis & { releaseEvidenceRead?: unknown }).releaseEvidenceRead)));
+      await page.getByRole('button', { name: 'Review Line 2 Quantity source 1', exact: true }).click();
+      await expect(evidence).toContainText('B 113.00');
+      await app.evaluate(() => (globalThis as typeof globalThis & { releaseEvidenceRead(): void }).releaseEvidenceRead());
+      await expect(evidence).toContainText('Quote: B 113.00');
+      await app.evaluate(({ ipcMain }) => {
+        const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => Promise<unknown>> })._invokeHandlers;
+        const original = handlers.get('flowmate:list-document-pages'); if (!original) throw new Error('Missing page index query');
+        ipcMain.removeHandler('flowmate:list-document-pages'); ipcMain.handle('flowmate:list-document-pages', async (event, raw) => {
+          const result = await original(event, raw) as { ok: boolean; data: { parsedArtifactId: number } };
+          ipcMain.removeHandler('flowmate:list-document-pages'); ipcMain.handle('flowmate:list-document-pages', original);
+          return result.ok ? { ...result, data: { ...result.data, parsedArtifactId: result.data.parsedArtifactId + 999 } } : result;
+        });
+      });
+      await page.getByRole('button', { name: 'Review Invoice number source 1', exact: true }).click();
+      await expect(evidence).toContainText('The saved evidence reference no longer matches the document.');
+      await page.getByRole('button', { name: 'Retry evidence', exact: true }).click();
+      await expect(evidence).toContainText('Invoice number: INV-FORM-1');
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('UNSAVED-MANUAL');
+      await page.getByRole('button', { name: 'Discard changes', exact: true }).click();
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('INV-FORM-1');
+      await expect(page.getByRole('region', { name: 'Invoice form', exact: true })).toContainText('Revision 0');
+      await page.getByRole('button', { name: 'Remove line 1', exact: true }).click();
+      await page.getByRole('button', { name: 'Add line', exact: true }).click();
+      await page.getByLabel('Line 2 Quantity', { exact: true }).fill('113.00');
+      const forgedMapping = await page.evaluate(async () => {
+        const workspace = await window.flowmate.readWorkspace(); if (!workspace.ok) throw new Error('Workspace missing');
+        const detail = await window.flowmate.queryJobCandidate({ jobId: 1, candidateId: 1 }); if (!detail.ok) throw new Error('Candidate missing');
+        const emptyLine = { description: '', quantity: '113.00', unit: '', unitPrice: '', netAmount: '', taxRate: '', taxAmount: '', totalAmount: '' };
+        return window.flowmate.saveInvoiceCandidate({ operationRef: 'forged-row-origins', jobId: 1, basedOnCandidateId: 1,
+          expectedCandidateId: 1, expectedRevision: workspace.data.revision, lineOrigins: [0, 1],
+          draft: { fields: { invoiceNumber: 'INV-FORM-1', buyerName: 'A / B', issueDate: '', sellerName: '', sellerTaxId: '', buyerTaxId: '', currency: '', netAmount: '', taxAmount: '', totalAmount: '' }, lines: [emptyLine, emptyLine], notes: [] } });
+      });
+      expect(forgedMapping).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      await page.getByRole('button', { name: 'Save result', exact: true }).click();
+      await page.getByText('Result saved for review.', { exact: true }).waitFor();
+      const savedRows = await page.evaluate(() => window.flowmate.queryJobCandidate({ jobId: 1, candidateId: 2 }));
+      expect(savedRows).toMatchObject({ ok: true, data: { candidate: { lines: [
+        { quantity: { sources: [{ quote: 'B 113.00' }] } }, { quantity: { valueOrigin: 'user-provided', sources: [] } }
+      ] } } });
+      expect(requests).toHaveLength(beforeEdit);
+      expect(await page.evaluate(() => window.flowmate.listJobCandidates({ jobId: 1, limit: 100 })))
+        .toMatchObject({ ok: true, data: { items: [{ candidateId: 2 }, { candidateId: 1 }] } });
+      if (outcome === 'discard-preview-race') {
+        checkpoint = 'Discard detail cannot replace a later candidate preview or recreate its editor';
+        await expect(page.getByRole('button', { name: 'Edit result', exact: true })).toBeEnabled();
+        await installReadGate(app, userData);
+        await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { hold(count: number, type: string): void } }).contextReadGate.hold(1, 'query_job_candidate'));
+        await page.getByRole('button', { name: 'Discard changes', exact: true }).click();
+        await waitFor(() => app!.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { held: Buffer[] } }).contextReadGate.held.length === 1));
+        expect(await app.evaluate(() => JSON.parse((globalThis as typeof globalThis & { contextReadGate: { held: Buffer[] } }).contextReadGate.held[0]!.toString()).value.data.candidate.candidateId)).toBe(2);
+        await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Processing History', exact: true }).click();
+        await page.locator('.route-row').filter({ hasText: 'Result 1 · generated' }).getByRole('button', { name: 'View', exact: true }).click();
+        await expect(page.locator('.candidate-details')).toContainText('A 113.00');
+        await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { release(index: number): void } }).contextReadGate.release(0));
+        await page.evaluate(async () => { await window.flowmate.getState(); await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); });
+        await expect(page.locator('.candidate-details')).toContainText('A 113.00');
+        await expect(page.getByRole('region', { name: 'Invoice form', exact: true })).toHaveCount(0);
+        expect(await page.evaluate(() => window.flowmate.readWorkspace())).toMatchObject({ ok: true, data: { candidateRef: { id: 2 } } });
+        expect(requests).toHaveLength(beforeEdit); return;
+      }
+      await app.evaluate(({ ipcMain }) => {
+        const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => Promise<unknown>> })._invokeHandlers;
+        const original = handlers.get('flowmate:register-invoice-form-target'); if (!original) throw new Error('Missing form registration');
+        ipcMain.removeHandler('flowmate:register-invoice-form-target'); ipcMain.handle('flowmate:register-invoice-form-target', async () => {
+          ipcMain.removeHandler('flowmate:register-invoice-form-target'); ipcMain.handle('flowmate:register-invoice-form-target', original);
+          return { ok: false, error: { code: 'state_conflict', category: 'input', retryable: false, message: 'Injected form registration refusal' } };
+        });
+      });
+      await page.getByRole('button', { name: 'Discard changes', exact: true }).click();
+      await page.getByText('Local changes discarded; the saved result is retained, but a new editor could not be registered.', { exact: true }).waitFor();
+      await expect(page.getByRole('region', { name: 'Invoice form', exact: true })).toHaveCount(0);
+      expect(requests).toHaveLength(beforeEdit);
+      return;
+    }
     if (outcome === 'selection-while-fill') {
       checkpoint = 'P7 Fill keeps its original revision while selection and view preserve the local form';
       await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
@@ -402,6 +550,16 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       await page.getByLabel('Next Run stop wait (ms)', { exact: true }).fill('900');
     }
     await page.getByRole('button', { name: 'Fill form', exact: true }).click();
+    if (outcome === 'fill-no-tool') {
+      await waitFor(() => page.evaluate(async () => { const value = await window.flowmate.queryRun(2); return value.ok && value.data.status === 'failed'; }));
+      await waitFor(() => page.evaluate(async () => { const value = await window.flowmate.queryRuntimeState(); return value.ok && value.data.active === null && !value.data.blocked; }));
+      await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('');
+      await expect(page.getByRole('button', { name: 'Save result', exact: true })).toBeDisabled();
+      expect(await page.evaluate(() => window.flowmate.queryRun(2))).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'agent_goal_not_met' } } });
+      expect(await page.evaluate(() => window.flowmate.listRunToolCalls({ runId: 2, sessionId: 1 }))).toMatchObject({ ok: true, data: { items: [] } });
+      expect(await page.evaluate(() => window.flowmate.listJobCandidates({ jobId: 1, limit: 100 }))).toMatchObject({ ok: true, data: { items: [{ candidateId: 1 }] } });
+      return;
+    }
     await page.getByLabel('Invoice number', { exact: true }).waitFor();
     await page.waitForFunction(() => (document.querySelector('[aria-label="Invoice number"]') as HTMLInputElement)?.value === 'INV-FORM-1');
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.queryRuntimeState(); return result.ok && result.data.active === null && !result.data.blocked; }));
@@ -546,6 +704,22 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       expect(requests).toHaveLength(beforeQuery); return;
     }
     checkpoint = 'real manual Save and Accept';
+    if (outcome === 'save-refresh-failure') {
+      await app.evaluate(({ ipcMain }) => {
+        const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => Promise<unknown>> })._invokeHandlers;
+        const original = handlers.get('flowmate:query-job-candidate'); if (!original) throw new Error('Missing candidate query');
+        ipcMain.removeHandler('flowmate:query-job-candidate'); ipcMain.handle('flowmate:query-job-candidate', async (event, raw) => {
+          if ((raw as { candidateId: number }).candidateId !== 2) return original(event, raw);
+          ipcMain.removeHandler('flowmate:query-job-candidate'); ipcMain.handle('flowmate:query-job-candidate', original);
+          return { ok: false, error: { code: 'storage_read_failed', category: 'storage', retryable: true, message: 'Injected post-Save detail read failure' } };
+        });
+      });
+      await page.getByRole('button', { name: 'Save result', exact: true }).click();
+      await page.getByText('Result saved: candidate 2. Editor could not be reloaded. Injected post-Save detail read failure', { exact: true }).waitFor();
+      expect(await page.evaluate(() => window.flowmate.queryJobCandidate({ jobId: 1, candidateId: 2 })))
+        .toMatchObject({ ok: true, data: { candidate: { origin: 'human_edit', status: 'generated' } } });
+      expect(requests).toHaveLength(beforeQuery); return;
+    }
     const originalSave = await page.evaluate(async () => {
       const workspace = await window.flowmate.readWorkspace(); if (!workspace.ok) throw new Error('Workspace missing');
       const original = window.crypto.randomUUID.bind(window.crypto);
@@ -553,7 +727,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       window.crypto.randomUUID = () => '00000000-0000-4000-8000-000000000001';
       return { operationRef: window.crypto.randomUUID(), jobId: 1, basedOnCandidateId: 1, expectedCandidateId: 1, expectedRevision: workspace.data.revision,
         draft: { fields: { invoiceNumber: 'MANUAL-FORM-2', issueDate: '', sellerName: '', sellerTaxId: '', buyerName: '', buyerTaxId: '',
-          currency: '', netAmount: '', taxAmount: '', totalAmount: '' }, lines: [], notes: [] } };
+          currency: '', netAmount: '', taxAmount: '', totalAmount: '' }, lines: [], notes: [] }, lineOrigins: [] };
     });
     await page.getByRole('button', { name: 'Save result', exact: true }).click();
     await page.evaluate(() => {
@@ -565,10 +739,37 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     // The exact committed operation is returned before the old target/Workspace gate.
     expect(await page.evaluate(input => window.flowmate.saveInvoiceCandidate(input), originalSave)).toMatchObject({ ok: true, data: { changed: true, candidate: { candidateId: 2 } } });
     expect(await page.evaluate(input => window.flowmate.queryInvoiceCandidateOperation({ kind: 'save', request: input }), originalSave)).toMatchObject({ ok: true, data: { changed: true, candidate: { candidateId: 2 } } });
-    await page.getByRole('button', { name: 'Save result', exact: true }).click();
-    await page.getByText('Result saved for review.', { exact: true }).waitFor();
+    await expect(page.getByRole('button', { name: 'Save result', exact: true })).toBeDisabled();
     const noDiff = await page.evaluate(() => window.flowmate.listJobCandidates({ jobId: 1, limit: 100 }));
     expect(noDiff).toMatchObject({ ok: true, data: { items: [{ candidateId: 2 }, { candidateId: 1 }] } });
+    if (outcome === 'unknown-accept' || outcome === 'unknown-reject') {
+      const kind = outcome === 'unknown-accept' ? 'accept' : 'reject';
+      checkpoint = `P14 real ${kind} commit with lost Host response`;
+      await dropOneOwnedHostResponse(app, userData, kind === 'accept' ? 'accept_invoice_candidate' : 'reject_invoice_candidate');
+      await page.getByRole('button', { name: kind === 'accept' ? 'Accept result' : 'Reject result', exact: true }).click();
+      if (kind === 'reject') {
+        const prompt = page.getByRole('dialog', { name: 'Reject invoice result', exact: true });
+        await prompt.getByLabel('Reason for rejection', { exact: true }).fill('Actual review refusal');
+        await prompt.getByRole('button', { name: 'Reject result', exact: true }).click();
+      }
+      await page.getByText(`${kind === 'accept' ? 'Accept' : 'Reject'} result is unknown. Query the original operation.`, { exact: true }).waitFor({ timeout: 15_000 });
+      const wire = await app.evaluate(() => {
+        const gate = (globalThis as typeof globalThis & { saveTransportGate: { dropped: number; decisionRequests: unknown[]; originalResult: unknown } }).saveTransportGate;
+        return { dropped: gate.dropped, decisions: gate.decisionRequests, result: gate.originalResult };
+      });
+      expect(wire.dropped).toBe(1); expect(wire.decisions).toHaveLength(1);
+      expect(wire.result).toMatchObject({ ok: true, data: { candidate: { candidateId: 2, status: kind === 'accept' ? 'accepted' : 'rejected' } } });
+      const laterWorkspace = await page.evaluate(async () => {
+        const value = await window.flowmate.readWorkspace(); if (!value.ok) throw new Error('Workspace missing');
+        return window.flowmate.updateWorkspace({ expectedRevision: value.data.revision, change: { kind: 'session', sessionId: null } });
+      });
+      expect(laterWorkspace.ok).toBe(true);
+      await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { restore(): void } }).saveTransportGate.restore());
+      await page.getByRole('button', { name: 'Check original operation', exact: true }).click();
+      await page.getByText(`Original ${kind} operation confirmed.`, { exact: true }).waitFor();
+      expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(laterWorkspace);
+      expect(requests).toHaveLength(beforeQuery); return;
+    }
     if (outcome === 'reject-reselect') {
       await page.getByRole('button', { name: 'Reject result', exact: true }).click();
       const dialog = page.getByRole('dialog', { name: 'Reject invoice result', exact: true });
@@ -587,14 +788,132 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     await page.getByRole('button', { name: 'Accept result', exact: true }).click();
     await page.getByText('Result accepted.', { exact: true }).waitFor();
     expect(requests).toHaveLength(beforeQuery);
+    if (outcome === 'accept-export') await dropOneOwnedHostResponse(app, userData);
+    if (outcome === 'native-export-faults') {
+      checkpoint = 'P14 Native cancellation, concurrency, partial publication and stale owner';
+      await dropOneOwnedHostResponse(app, userData);
+      const beforeCancel = await page.evaluate(() => window.flowmate.listActivity({ jobId: 1, limit: 100 }));
+      await app.evaluate(({ dialog }) => { dialog.showSaveDialog = async () => ({ canceled: true, filePath: '' }); });
+      await page.getByRole('button', { name: 'Export JSON', exact: true }).click();
+      await page.getByText('Export Save cancelled. No new managed export was created.', { exact: true }).waitFor();
+      expect(await page.evaluate(() => window.flowmate.listActivity({ jobId: 1, limit: 100 }))).toEqual(beforeCancel);
+      expect(await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { exportRequests: unknown[] } }).saveTransportGate.exportRequests)).toHaveLength(0);
+      expect(existsSync(join(userData, 'outputs', 'invoice-1-result-2.json'))).toBe(false);
+      await app.evaluate(({ dialog }) => {
+        dialog.showSaveDialog = () => new Promise(resolve => { (globalThis as typeof globalThis & { releaseInvoiceDialog?: (filePath: string) => void }).releaseInvoiceDialog = filePath => resolve({ canceled: false, filePath }); });
+      });
+      await page.evaluate(() => { (window as typeof window & { nativeExportPromise?: Promise<unknown> }).nativeExportPromise = window.flowmate.saveInvoiceExport({ operationRef: 'native-held', candidateId: 2, format: 'json' }); });
+      await waitFor(() => app!.evaluate(() => Boolean((globalThis as typeof globalThis & { releaseInvoiceDialog?: unknown }).releaseInvoiceDialog)));
+      expect(await page.evaluate(() => window.flowmate.saveInvoiceExport({ operationRef: 'native-second', candidateId: 2, format: 'json' })))
+        .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      const heldDestination = join(userData, 'held.json');
+      await app.evaluate((_electron, path) => (globalThis as typeof globalThis & { releaseInvoiceDialog(filePath: string): void }).releaseInvoiceDialog(path), heldDestination);
+      expect(await page.evaluate(() => (window as typeof window & { nativeExportPromise?: Promise<unknown> }).nativeExportPromise))
+        .toMatchObject({ ok: true, data: { outcome: 'saved', destinationPath: heldDestination } });
+      const conflictPath = join(userData, 'conflict.json'); writeFileSync(conflictPath, 'keep');
+      await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, conflictPath);
+      expect(await page.evaluate(() => window.flowmate.saveInvoiceExport({ operationRef: 'native-conflict', candidateId: 2, format: 'json' })))
+        .toMatchObject({ ok: false, error: { code: 'state_conflict', message: expect.stringContaining('Managed export registered') } });
+      expect(readFileSync(conflictPath, 'utf8')).toBe('keep');
+      expect(await page.evaluate(() => window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request: { operationRef: 'native-conflict', candidateId: 2, format: 'json' } })))
+        .toMatchObject({ ok: true, data: { candidateId: 2, sha256: expect.any(String) } });
+      const stalePath = join(userData, 'stale.csv');
+      await app.evaluate(({ dialog }) => {
+        delete (globalThis as typeof globalThis & { releaseInvoiceDialog?: unknown }).releaseInvoiceDialog;
+        dialog.showSaveDialog = () => new Promise(resolve => { (globalThis as typeof globalThis & { releaseInvoiceDialog?: (filePath: string) => void }).releaseInvoiceDialog = filePath => resolve({ canceled: false, filePath }); });
+      });
+      await page.evaluate(() => { void window.flowmate.saveInvoiceExport({ operationRef: 'native-stale', candidateId: 2, format: 'csv' }); });
+      await waitFor(() => app!.evaluate(() => Boolean((globalThis as typeof globalThis & { releaseInvoiceDialog?: unknown }).releaseInvoiceDialog)));
+      await page.reload();
+      await app.evaluate((_electron, path) => (globalThis as typeof globalThis & { releaseInvoiceDialog(filePath: string): void }).releaseInvoiceDialog(path), stalePath);
+      await waitFor(() => page.evaluate(async () => { const value = await window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request: { operationRef: 'native-stale', candidateId: 2, format: 'csv' } }); return value.ok; }));
+      expect(existsSync(stalePath)).toBe(false);
+      expect(await page.evaluate(() => window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request: { operationRef: 'native-stale', candidateId: 2, format: 'csv' } })))
+        .toEqual({ ok: true, data: null });
+      checkpoint = 'Native original-operation query cannot admit an export after its owner reloads';
+      await installReadGate(app, userData);
+      await app.evaluate(({ dialog, ipcMain }, filePath) => {
+        dialog.showSaveDialog = async () => ({ canceled: false, filePath });
+        const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => Promise<unknown>> })._invokeHandlers;
+        const original = handlers.get('flowmate:save-invoice-export'); if (!original) throw new Error('Missing Native Save handler');
+        ipcMain.removeHandler('flowmate:save-invoice-export'); ipcMain.handle('flowmate:save-invoice-export', async (event, raw) => {
+          const real = await original(event, raw);
+          (globalThis as typeof globalThis & { staleQueryNativeResult?: unknown }).staleQueryNativeResult = real;
+          ipcMain.removeHandler('flowmate:save-invoice-export'); ipcMain.handle('flowmate:save-invoice-export', original); return real;
+        });
+        (globalThis as typeof globalThis & { contextReadGate: { hold(count: number, type: string): void } }).contextReadGate.hold(1, 'query_invoice_candidate_operation');
+      }, stalePath);
+      const beforeStaleQuery = await page.evaluate(() => window.flowmate.listActivity({ jobId: 1, limit: 100 }));
+      await page.evaluate(() => { void window.flowmate.saveInvoiceExport({ operationRef: 'native-query-stale', candidateId: 2, format: 'csv' }); });
+      await waitFor(() => app!.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { held: unknown[] } }).contextReadGate.held.length === 1));
+      expect(await app.evaluate(() => JSON.parse((globalThis as typeof globalThis & { contextReadGate: { held: Buffer[] } }).contextReadGate.held[0]!.toString()).value)).toEqual({ ok: true, data: null });
+      await page.reload();
+      await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { release(index: number): void } }).contextReadGate.release(0));
+      await waitFor(() => app!.evaluate(() => Boolean((globalThis as typeof globalThis & { staleQueryNativeResult?: unknown }).staleQueryNativeResult)));
+      expect(await app.evaluate(() => (globalThis as typeof globalThis & { staleQueryNativeResult?: unknown }).staleQueryNativeResult)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      expect(await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { commands: Array<{ type: string }> } }).contextReadGate.commands.filter(command => command.type === 'export_invoice_candidate'))).toHaveLength(0);
+      expect(await page.evaluate(() => window.flowmate.listActivity({ jobId: 1, limit: 100 }))).toEqual(beforeStaleQuery);
+      expect(existsSync(join(userData, 'outputs', 'invoice-1-result-2.csv'))).toBe(false); expect(existsSync(stalePath)).toBe(false);
+      expect(await page.evaluate(() => window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request: { operationRef: 'native-query-stale', candidateId: 2, format: 'csv' } }))).toEqual({ ok: true, data: null });
+      await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { restore(): void } }).contextReadGate.restore());
+      const lostPath = join(userData, 'lost-response.json');
+      await app.evaluate(({ dialog, ipcMain }, filePath) => {
+        dialog.showSaveDialog = async () => ({ canceled: false, filePath });
+        const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => Promise<unknown>> })._invokeHandlers;
+        const original = handlers.get('flowmate:save-invoice-export'); if (!original) throw new Error('Missing Native Save handler');
+        ipcMain.removeHandler('flowmate:save-invoice-export'); ipcMain.handle('flowmate:save-invoice-export', async (event, raw) => {
+          const real = await original(event, raw);
+          (globalThis as typeof globalThis & { originalNativeResult?: unknown }).originalNativeResult = real;
+          ipcMain.removeHandler('flowmate:save-invoice-export'); ipcMain.handle('flowmate:save-invoice-export', original);
+          return { ok: false, error: { code: 'operation_result_unknown', category: 'runtime', retryable: false, message: 'Native Save response unknown. Check the original managed operation.' } };
+        });
+      }, lostPath);
+      await page.getByRole('button', { name: 'Export JSON', exact: true }).click();
+      await page.getByText('Native Save response unknown. Check the original managed operation.', { exact: true }).waitFor();
+      expect(await app.evaluate(() => (globalThis as typeof globalThis & { originalNativeResult?: unknown }).originalNativeResult))
+        .toMatchObject({ ok: true, data: { outcome: 'saved', destinationPath: lostPath } });
+      expect(readFileSync(lostPath)).toEqual(readFileSync(heldDestination));
+      await expect(page.getByRole('button', { name: 'Export JSON', exact: true })).toBeDisabled();
+      await page.getByRole('button', { name: 'Check original operation', exact: true }).click();
+      await page.getByText('Original managed export confirmed. The external destination is not recorded; inspect the chosen file or explicitly Save again.', { exact: true }).waitFor();
+      const managedPath = join(userData, 'outputs', 'invoice-1-result-2.json');
+      writeFileSync(managedPath, Buffer.alloc(readFileSync(managedPath).length, 32));
+      for (const query of ['query', 'direct'] as const) expect(await page.evaluate(kind => {
+        const request = { operationRef: 'native-held', candidateId: 2, format: 'json' as const };
+        return kind === 'query' ? window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request }) : window.flowmate.exportInvoiceCandidate(request);
+      }, query)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+      unlinkSync(managedPath);
+      expect(await page.evaluate(() => window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request: { operationRef: 'native-held', candidateId: 2, format: 'json' } })))
+        .toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+      expect(requests).toHaveLength(beforeQuery); return;
+    }
     for (const format of ['JSON', 'CSV', 'Markdown']) {
+      const destination = join(userData, `chosen-result.${format === 'Markdown' ? 'md' : format.toLowerCase()}`);
+      await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, destination);
       await page.getByRole('button', { name: `Export ${format}`, exact: true }).click();
-      await page.getByText(new RegExp(`Export created:.*\\.${format === 'Markdown' ? 'md' : format.toLowerCase()}`)).waitFor();
+      await page.getByText(`Export saved: ${destination}`, { exact: true }).waitFor();
+      expect(readFileSync(destination)).toEqual(readFileSync(join(userData, 'outputs', `invoice-1-result-2.${format === 'Markdown' ? 'md' : format.toLowerCase()}`)));
     }
     const facts = await page.evaluate(async () => ({ workspace: await window.flowmate.readWorkspace(), candidate: await window.flowmate.queryJobCandidate({ jobId: 1, candidateId: 2 }) }));
     expect(facts).toMatchObject({ candidate: { ok: true, data: { candidate: { origin: 'human_edit', status: 'accepted', basedOnCandidateId: 1,
       fields: { invoiceNumber: { raw: 'MANUAL-FORM-2', valueOrigin: 'user-provided', sources: [] } } } } } });
     expect(requests).toHaveLength(beforeQuery);
+    if (outcome === 'accept-export') {
+      checkpoint = 'P14 restart retains accepted/export facts without replaying model or tools';
+      const originals = await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { exportRequests: import('@flowmate/contracts').ExportInvoiceCandidateRequest[] } }).saveTransportGate.exportRequests);
+      expect(originals).toHaveLength(3);
+      await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { restore(): void } }).saveTransportGate.restore());
+      await closeDesktopFixture(app, userData); app = null;
+      app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+      const restarted = await app.firstWindow();
+      await waitFor(() => restarted.evaluate(async () => { const value = await window.flowmate.getState(); return value.ok && value.data.ready; }));
+      for (const original of originals) expect(await restarted.evaluate(request => window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request }), original))
+        .toMatchObject({ ok: true, data: { candidateId: 2, format: original.format } });
+      expect(await restarted.evaluate(() => window.flowmate.queryJobCandidate({ jobId: 1, candidateId: 2 })))
+        .toMatchObject({ ok: true, data: { candidate: { status: 'accepted', origin: 'human_edit' } } });
+      await expect(restarted.getByRole('region', { name: 'Invoice form', exact: true })).toHaveCount(0);
+      expect(requests).toHaveLength(beforeQuery);
+    }
   } catch (error) {
     failure = new Error(`Invoice form checkpoint ${checkpoint}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`, { cause: error });
     throw failure;
@@ -603,6 +922,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     releaseHeldFill?.();
     await server.stop(true);
     if (app) {
+      await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate?: { restore(): void } }).contextReadGate?.restore()).catch(() => undefined);
       await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate?: { restore(): void } }).saveTransportGate?.restore()).catch(() => undefined);
       await app.evaluate(() => (globalThis as typeof globalThis & { concurrentFillGate?: { restore(): void } }).concurrentFillGate?.restore()).catch(() => undefined);
       await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false }); }).catch(() => undefined);

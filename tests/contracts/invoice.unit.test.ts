@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { CandidateDraftSchema, FillInvoiceFormInputSchema, FillInvoiceFormOutputSchema, InvoiceFormApplicationReceiptSchema,
-  InvoiceFormTargetSchema, INVOICE_REVIEW_TOOL_NAMES, INVOICE_TOOL_NAMES, invoiceToolSchemas, ParsedBlockSchema } from '../../packages/contracts/src/invoice.ts';
+  InvoiceFormTargetSchema, InvoiceFormDraftSchema, InvoiceFormLineOriginsSchema, SaveInvoiceCandidateRequestSchema,
+  INVOICE_REVIEW_TOOL_NAMES, INVOICE_TOOL_NAMES, invoiceToolSchemas, ParsedBlockSchema } from '../../packages/contracts/src/invoice.ts';
 import { RunScopeSchema, ToolExecutionContextSchema, ToolExecutionModeSchema } from '../../packages/contracts/src/tools.ts';
 import type { AgentTool, ProductToolContext, ToolCallContext, ToolDefinition } from '../../packages/contracts/src/tools.ts';
 import { AppErrorSchema, InputRecordV2Schema, UsageRecordV2Schema } from '../../packages/contracts/src/runtime.ts';
@@ -37,6 +38,16 @@ const candidate = {
   notes: [],
 };
 const documentRef = { id: 1, version: 'fixture-v1' };
+it('keeps legacy Save query payloads unchanged and validates explicit structural origins', () => {
+  const draft = InvoiceFormDraftSchema.parse({ fields: Object.fromEntries(Object.keys(candidate.fields).map(name => [name, ''])), lines: [], notes: [] });
+  const legacy = { operationRef: 'legacy', jobId: 1, basedOnCandidateId: 1, expectedCandidateId: 1, expectedRevision: 3, draft };
+  expect(SaveInvoiceCandidateRequestSchema.parse(legacy)).toEqual(legacy);
+  expect(SaveInvoiceCandidateRequestSchema.parse(legacy)).not.toHaveProperty('lineOrigins');
+  expect(SaveInvoiceCandidateRequestSchema.safeParse({ ...legacy, lineOrigins: [null] }).success).toBe(false);
+  for (const origins of [[0, 0], [-1], [0.1], [Number.MAX_SAFE_INTEGER + 1], Array(201).fill(null)])
+    expect(InvoiceFormLineOriginsSchema.safeParse(origins).success).toBe(false);
+  expect(InvoiceFormLineOriginsSchema.parse([1, 0, null])).toEqual([1, 0, null]);
+});
 const source = { documentId: 1, version: 'fixture-v1', artifactId: 2, page: 1, blockId: 'b1', quote: 'Invoice' };
 const outputExamples = {
   list_invoice_pages: { documentRef, parsedArtifactId: 2, pageCount: 1, pages: [{ page: 1, blockCount: 1, tableCount: 0 }] },

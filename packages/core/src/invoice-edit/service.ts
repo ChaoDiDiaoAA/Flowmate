@@ -24,8 +24,11 @@ export class InvoiceEditService {
   }
   public queryOperation(raw: unknown): Result<InvoiceCandidateOperationResult> {
     const parsed = InvoiceCandidateOperationQuerySchema.safeParse(raw);
-    return parsed.success ? this.options.candidates.queryOperation({ ...parsed.data, at: this.options.now() })
-      : fail(appError('input_invalid', 'input', '操作查询参数无效。'));
+    if (!parsed.success) return fail(appError('input_invalid', 'input', '操作查询参数无效。'));
+    const result = this.options.candidates.queryOperation({ ...parsed.data, at: this.options.now() });
+    if (!result.ok || parsed.data.kind !== 'export' || result.data === null) return result;
+    const read = this.options.files.readInvoiceExport(result.data as InvoiceExportReference);
+    return read.ok ? result : read;
   }
   public reject(raw: unknown): Result<InvoiceCandidateDecisionResponse> {
     const parsed = RejectInvoiceCandidateRequestSchema.safeParse(raw);

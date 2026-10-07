@@ -146,6 +146,10 @@ export type DesktopInvoiceFormInspection = {
   basis: { sessionId: import('./runtime.ts').DbId | null; documentRef: import('./invoice.ts').DocumentRef;
     jobId: import('./runtime.ts').DbId; candidateId: import('./runtime.ts').DbId; candidateSequence: number };
   draft: import('./invoice.ts').InvoiceFormDraft;
+  lineOrigins?: import('./invoice.ts').InvoiceFormLineOrigins;
+};
+export type DesktopInvoiceExportResult = { outcome: 'cancelled' } | {
+  outcome: 'saved'; reference: import('./invoice.ts').InvoiceExportReference; destinationPath: string;
 };
 
 export type DesktopBridge = Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
@@ -192,6 +196,7 @@ export type DesktopBridge = Pick<import('./runtime.ts').Application, 'listExtens
   acceptInvoiceCandidate(input: import('./invoice.ts').AcceptInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
   rejectInvoiceCandidate(input: import('./invoice.ts').RejectInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
   exportInvoiceCandidate(input: import('./invoice.ts').ExportInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceExportReference>>;
+  saveInvoiceExport(input: import('./invoice.ts').ExportInvoiceCandidateRequest): Promise<import('./runtime.ts').Result<DesktopInvoiceExportResult>>;
   queryInvoiceCandidateOperation(input: import('./invoice.ts').InvoiceCandidateOperationQuery): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceCandidateOperationResult>>;
   startInvoiceFormRun(input: DesktopInvoiceFormRunRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').RunAccepted & { requestId: string }>>;
   querySessionInput(input: import('./session-inputs.ts').SessionInputQuery): Promise<import('./runtime.ts').Result<import('./session-inputs.ts').SessionInputQueryResult>>;

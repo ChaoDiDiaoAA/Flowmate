@@ -40,6 +40,8 @@ describe('trusted invoice form target binding', () => {
       expect(checkedInvoiceFormInspection(form, value, owner)).toBeNull();
     expect(checkedInvoiceFormInspection(form, inspection, { ...owner, frame: {} })).toBeNull();
     expect(checkedInvoiceFormInspection(form, inspection, { ...owner, epoch: 2 })).toBeNull();
+    expect(checkedInvoiceFormInspection(form, { ...inspection, lineOrigins: [] }, owner)).toEqual({ ...inspection, lineOrigins: [] });
+    expect(checkedInvoiceFormInspection(form, { ...inspection, lineOrigins: [null] }, owner)).toBeNull();
   });
   it('binds actual owner objects and rejects a new frame, window or Host epoch', () => {
     expect(matchesInvoiceFormTarget(binding(), request(), owner)).toBe(true);

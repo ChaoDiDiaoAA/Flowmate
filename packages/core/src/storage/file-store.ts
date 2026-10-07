@@ -71,6 +71,29 @@ function validArtifactName(name: string): boolean {
   return ['original.jpg', 'original.png', 'parsed.json', 'raw-content.json', 'raw-pages.json', 'source.json'].includes(name);
 }
 
+function invoiceExportPath(paths: Pick<ProductPaths, 'root' | 'outputsDir'>, relativePath: string): string {
+  if (!/^outputs\/invoice-[1-9]\d*-result-[1-9]\d*\.(json|csv|md)$/.test(relativePath)) throw new Error('invalid_export_path');
+  const outputRoot = resolve(paths.outputsDir);
+  if (!within(paths.root, outputRoot) || lstatSync(outputRoot).isSymbolicLink()
+    || !lstatSync(outputRoot).isDirectory() || relative(outputRoot, realpathSync(outputRoot)) !== '') throw new Error('invalid_export_root');
+  const target = join(outputRoot, relativePath.slice('outputs/'.length));
+  if (!within(outputRoot, target)) throw new Error('invalid_export_target');
+  return target;
+}
+
+export function readManagedInvoiceExport(paths: Pick<ProductPaths, 'root' | 'outputsDir'>, reference: InvoiceExportReference): Result<Uint8Array> {
+  try {
+    if (!/^[0-9a-f]{64}$/.test(reference.sha256) || !Number.isSafeInteger(reference.bytes) || reference.bytes < 1
+      || reference.bytes > 64 * 1024 * 1024) throw new Error('invalid_export_reference');
+    const path = invoiceExportPath(paths, reference.relativePath);
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== reference.bytes) throw new Error('invalid_export_file');
+    const bytes = readFileSync(path);
+    if (bytes.length !== reference.bytes || createHash('sha256').update(bytes).digest('hex') !== reference.sha256) throw new Error('export_hash_mismatch');
+    return ok(bytes);
+  } catch { return fail(appError('artifact_unavailable', 'storage', '已导出文件缺失或变化，需按原事实核对。')); }
+}
+
 export class FileStore {
   private tail: Promise<void> = Promise.resolve();
   private readonly root: string;
@@ -118,26 +141,11 @@ export class FileStore {
   }
 
   public readInvoiceExport(reference: InvoiceExportReference): Result<Uint8Array> {
-    try {
-      if (!/^[0-9a-f]{64}$/.test(reference.sha256) || !Number.isSafeInteger(reference.bytes) || reference.bytes < 1
-        || reference.bytes > 64 * 1024 * 1024) throw new Error('invalid_export_reference');
-      const path = this.invoiceExportPath(reference.relativePath);
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== reference.bytes) throw new Error('invalid_export_file');
-      const bytes = readFileSync(path);
-      if (createHash('sha256').update(bytes).digest('hex') !== reference.sha256) throw new Error('export_hash_mismatch');
-      return ok(bytes);
-    } catch { return fail(appError('artifact_unavailable', 'storage', '已导出文件缺失或变化，需按原事实核对。')); }
+    return readManagedInvoiceExport(this.paths, reference);
   }
 
   private invoiceExportPath(relativePath: string): string {
-    if (!/^outputs\/invoice-[1-9]\d*-result-[1-9]\d*\.(json|csv|md)$/.test(relativePath)) throw new Error('invalid_export_path');
-    const outputRoot = resolve(this.paths.outputsDir);
-    if (!within(this.root, outputRoot) || lstatSync(outputRoot).isSymbolicLink()
-      || !lstatSync(outputRoot).isDirectory() || relative(outputRoot, realpathSync(outputRoot)) !== '') throw new Error('invalid_export_root');
-    const target = join(outputRoot, relativePath.slice('outputs/'.length));
-    if (!within(outputRoot, target)) throw new Error('invalid_export_target');
-    return target;
+    return invoiceExportPath(this.paths, relativePath);
   }
 
   public publish(input: PublishArtifactInput): Promise<Result<PublishedArtifactPair>> {

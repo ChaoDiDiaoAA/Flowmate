@@ -1,4 +1,4 @@
-import { DocumentRefSchema, InvoiceFormDraftSchema, InvoiceFormTargetSchema, RunScopeSchema, WorkspaceContextSchema } from '@flowmate/contracts';
+import { DocumentRefSchema, InvoiceFormDraftSchema, InvoiceFormLineOriginsSchema, InvoiceFormTargetSchema, RunScopeSchema, WorkspaceContextSchema } from '@flowmate/contracts';
 import type { DesktopInvoiceFormInspection, DesktopInvoiceFormWorkspace, InvoiceFormBridgeRequest, InvoiceFormTarget, RunSnapshot } from '@flowmate/contracts';
 import { z } from 'zod';
 
@@ -6,7 +6,8 @@ export type InvoiceFormOwner = { frame: object; contents: object; epoch: number 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const inspectionSchema = z.object({ formInstanceId: z.string().min(1).max(128), revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   dirty: z.boolean(), valid: z.boolean(), basis: z.object({ sessionId: id.nullable(), documentRef: DocumentRefSchema,
-    jobId: id, candidateId: id, candidateSequence: id }).strict(), draft: InvoiceFormDraftSchema }).strict();
+    jobId: id, candidateId: id, candidateSequence: id }).strict(), draft: InvoiceFormDraftSchema,
+  lineOrigins: InvoiceFormLineOriginsSchema.optional() }).strict().refine(form => form.lineOrigins === undefined || form.lineOrigins.length === form.draft.lines.length);
 export function checkedInvoiceFormInspection(binding: InvoiceFormTargetBinding & { currentRevision: number }, raw: unknown,
   owner: InvoiceFormOwner): DesktopInvoiceFormInspection | null {
   const parsed = inspectionSchema.safeParse(raw);

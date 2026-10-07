@@ -175,7 +175,7 @@ describe('P7 frozen positioning through real Pi and loopback HTTP', () => {
     const draft: InvoiceFormDraft = { fields: Object.fromEntries(invoiceHeaderFields.map(name =>
       [name, invoiceFieldDisplayValue(name, original.fields[name])])) as InvoiceFormDraft['fields'], lines: [], notes: ['Human review'] };
     const saved = need(await f.app.saveInvoiceCandidate({ operationRef: `p8-human-${decision}`, jobId: original.jobId,
-      basedOnCandidateId: original.candidateId, expectedCandidateId: original.candidateId, expectedRevision: f.workspace.revision, draft }));
+      basedOnCandidateId: original.candidateId, expectedCandidateId: original.candidateId, expectedRevision: f.workspace.revision, draft, lineOrigins: [] }));
     expect(saved.candidate).toMatchObject({ origin: 'human_edit', basedOnCandidateId: original.candidateId,
       runId: null, toolCallId: null, context: null });
     const request = { operationRef: `p8-human-decision-${decision}`, jobId: original.jobId, candidateId: saved.candidate.candidateId,

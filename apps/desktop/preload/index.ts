@@ -71,6 +71,7 @@ const bridge: DesktopBridge = {
   acceptInvoiceCandidate: input => ipcRenderer.invoke('flowmate:accept-invoice-candidate', input),
   rejectInvoiceCandidate: input => ipcRenderer.invoke('flowmate:reject-invoice-candidate', input),
   exportInvoiceCandidate: input => ipcRenderer.invoke('flowmate:export-invoice-candidate', input),
+  saveInvoiceExport: input => ipcRenderer.invoke('flowmate:save-invoice-export', input),
   queryInvoiceCandidateOperation: input => ipcRenderer.invoke('flowmate:query-invoice-candidate-operation', input),
   replyInvoiceFormInspect: (id, value) => ipcRenderer.invoke('flowmate:reply-invoice-form-inspect', id, value),
   onInvoiceFormInspect(listener) {

@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
 import type { Result } from '@flowmate/contracts';
@@ -18,6 +18,26 @@ function fixture() {
 }
 
 describe('accepted invoice export', () => {
+  it('checks actual managed bytes on original queries without repairing missing or corrupted files', () => {
+    const store = fixture();
+    required(store.edits.accept({ operationRef: 'accept-query', jobId: store.jobId, candidateId: store.candidateId,
+      expectedCandidateId: store.candidateId, expectedRevision: store.selectedWorkspace.revision, dirty: false }));
+    const request = { operationRef: 'export-query', candidateId: store.candidateId, format: 'json' as const };
+    const reference = required(store.edits.export(request));
+    const path = join(store.root, reference.relativePath);
+    const bytes = readFileSync(path);
+    expect(required(store.edits.queryOperation({ kind: 'export', request }))).toEqual(reference);
+    const facts = store.db.query('SELECT * FROM business_events').all();
+    const altered = Buffer.from(bytes); altered[0] = altered[0] === 123 ? 91 : 123;
+    writeFileSync(path, altered);
+    expect(store.edits.queryOperation({ kind: 'export', request })).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+    expect(readFileSync(path)).toEqual(altered);
+    unlinkSync(path);
+    expect(store.edits.queryOperation({ kind: 'export', request })).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+    expect(store.edits.export(request)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+    expect(store.db.query('SELECT * FROM business_events').all()).toEqual(facts);
+    expect(required(store.jobs.get(store.jobId)).acceptedCandidateId).toBe(store.candidateId);
+  });
   it('publishes accepted-only deterministic JSON and recovers an orphan after registration failure', () => {
     const store = fixture(); const request = { operationRef: 'export-once', candidateId: store.candidateId, format: 'json' };
     expect(store.edits.export(request)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });

@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { DocumentRefSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormDraftSchema, InvoiceFormTargetSchema,
+import { DocumentRefSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormDraftSchema, InvoiceFormLineOriginsSchema, InvoiceFormTargetSchema,
   StoredCandidateDraftSchema, invoiceFieldDisplayValue, invoiceHeaderFields, invoiceLineFields, isLegalInvoiceNormalizedValue } from '../../../../packages/contracts/src/invoice.ts';
-import type { DbId, DocumentRef, InvoiceFormApplicationReceipt, InvoiceFormDraft, InvoiceFormTarget, StoredCandidateDraft, StoredInvoiceField } from '@flowmate/contracts';
+import type { DbId, DocumentRef, InvoiceFormApplicationReceipt, InvoiceFormDraft, InvoiceFormLineOrigins, InvoiceFormTarget, StoredCandidateDraft, StoredInvoiceField } from '@flowmate/contracts';
 export { invoiceHeaderFields, invoiceLineFields } from '../../../../packages/contracts/src/invoice.ts';
 export type { InvoiceFormDraft } from '@flowmate/contracts';
 export type InvoiceFormWarning = { path: string; reason: 'raw_fallback' | 'ambiguous' | 'unreadable' };
@@ -21,6 +21,8 @@ export type InvoiceFormState = {
   basis: InvoiceFormBasis;
   baseline: InvoiceFormDraft;
   draft: InvoiceFormDraft;
+  lineOrigins: InvoiceFormLineOrigins;
+  baselineLineOrigins: InvoiceFormLineOrigins;
   warnings: InvoiceFormWarning[];
   revision: number;
   dirty: boolean;
@@ -49,7 +51,8 @@ export function createInvoiceFormState(input: {
   }, warnings: [] } : mapInvoiceCandidate(input.candidate);
   if (!mapped) return null;
   return { formInstanceId: input.formInstanceId, basis: basis.data, baseline: structuredClone(mapped.draft),
-    draft: mapped.draft, warnings: mapped.warnings, revision: 0, dirty: false, editable: input.editable,
+    draft: mapped.draft, lineOrigins: mapped.draft.lines.map((_, index) => index), baselineLineOrigins: mapped.draft.lines.map((_, index) => index),
+    warnings: mapped.warnings, revision: 0, dirty: false, editable: input.editable,
     valid: true, cancelled: false, runId: null, runExpectedRevision: null, receipts: new Map() };
 }
 
@@ -59,13 +62,15 @@ export function bindInvoiceFormRun(state: InvoiceFormState, runId: DbId): Invoic
   return state.runId === runId ? state : { ...state, runId, runExpectedRevision: state.revision };
 }
 
-export function editInvoiceForm(state: InvoiceFormState, draft: unknown): InvoiceFormState | null {
+export function editInvoiceForm(state: InvoiceFormState, draft: unknown, lineOrigins: unknown = state.lineOrigins): InvoiceFormState | null {
   const parsed = InvoiceFormDraftSchema.safeParse(draft);
-  if (!state.valid || !state.editable || !parsed.success) return null;
-  if (sameDraft(parsed.data, state.draft)) return state;
+  const origins = InvoiceFormLineOriginsSchema.safeParse(lineOrigins);
+  if (!state.valid || !state.editable || !parsed.success || !origins.success || origins.data.length !== parsed.data.lines.length
+    || origins.data.some(origin => origin !== null && origin >= state.baseline.lines.length)) return null;
+  if (sameDraft(parsed.data, state.draft) && JSON.stringify(origins.data) === JSON.stringify(state.lineOrigins)) return state;
   if (state.revision === Number.MAX_SAFE_INTEGER) return null;
-  return { ...state, draft: parsed.data, revision: state.revision + 1,
-    dirty: !sameDraft(parsed.data, state.baseline) };
+  return { ...state, draft: parsed.data, lineOrigins: origins.data, revision: state.revision + 1,
+    dirty: !sameDraft(parsed.data, state.baseline) || JSON.stringify(origins.data) !== JSON.stringify(state.baselineLineOrigins) };
 }
 
 function sameDraft(left: InvoiceFormDraft, right: InvoiceFormDraft): boolean {
@@ -88,6 +93,7 @@ export function discardInvoiceForm(state: InvoiceFormState, newInstanceId: strin
     || !InvoiceFormTargetSchema.safeParse({ formInstanceId: newInstanceId, expectedRevision: 0 }).success) return null;
   return { ...state, formInstanceId: newInstanceId, baseline: structuredClone(state.baseline),
     draft: structuredClone(state.baseline), revision: 0, dirty: false, valid: true, cancelled: false,
+    lineOrigins: [...state.baselineLineOrigins], baselineLineOrigins: [...state.baselineLineOrigins],
     runId: null, runExpectedRevision: null, receipts: new Map() };
 }
 
@@ -132,6 +138,7 @@ export function applyInvoiceForm(state: InvoiceFormState, request: InvoiceFormAp
   const receipts = new Map(state.receipts);
   receipts.set(key, { identity: identityKey, content, receipt: { ...receipt } });
   return { state: mapping && reason === null ? { ...state, draft: mapping.draft, baseline: structuredClone(mapping.draft),
+    lineOrigins: mapping.draft.lines.map((_, index) => index), baselineLineOrigins: mapping.draft.lines.map((_, index) => index),
     warnings: mapping.warnings, revision: state.revision + 1, dirty: false, receipts } : { ...state, receipts }, receipt };
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { invoiceHeaderFields, invoiceFieldDisplayValue, CandidateDraftSchema, StoredCandidateDraftSchema } from '@flowmate/contracts';
+import { invoiceHeaderFields, invoiceLineFields, invoiceFieldDisplayValue, CandidateDraftSchema, StoredCandidateDraftSchema } from '@flowmate/contracts';
 import type { InvoiceFormDraft, Result } from '@flowmate/contracts';
 import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
 import { openDatabase } from '../../../packages/core/src/storage/database.ts';
@@ -10,6 +10,7 @@ import { createInvoiceEditService } from '../../../packages/core/src/invoice-edi
 import { createFileStore } from '../../../packages/core/src/storage/file-store.ts';
 import { DocumentService } from '../../../packages/data/src/documents.ts';
 import { validateHumanInvoiceCandidate } from '../../../packages/employee-invoice/src/validation.ts';
+import { createHash } from 'node:crypto';
 
 function required<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 function request(store: ReturnType<typeof makeSelectedCandidate>) {
@@ -21,6 +22,80 @@ function request(store: ReturnType<typeof makeSelectedCandidate>) {
 }
 
 describe('human candidate transactions', () => {
+  it('returns a historical line-changing Save before applying the new missing-mapping guard', () => {
+    const store = makeSelectedCandidate(); const input = request(store);
+    input.operationRef = 'legacy-lines';
+    input.draft.lines = [{ description: 'Old user row', quantity: '0', unit: '', unitPrice: '', netAmount: '', taxRate: '', taxAmount: '', totalAmount: '' }];
+    const saved = required(store.candidates.saveHuman({ ...input, lineOrigins: [null], at: store.stamp,
+      validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }));
+    // Historical canonical bytes omit lineOrigins entirely, including nested field key order.
+    const canonical = { basedOnCandidateId: input.basedOnCandidateId,
+      draft: { fields: Object.fromEntries(Object.entries(input.draft.fields).sort(([left], [right]) => left.localeCompare(right))),
+        lines: input.draft.lines.map(line => Object.fromEntries(Object.entries(line).sort(([left], [right]) => left.localeCompare(right)))), notes: input.draft.notes },
+      expectedCandidateId: input.expectedCandidateId, expectedRevision: input.expectedRevision, jobId: input.jobId, operationRef: input.operationRef };
+    const hash = createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+    store.db.query("UPDATE invoice_candidates SET fields_json=json_set(fields_json,'$.editRequestHash',?) WHERE id=?").run(hash, saved.candidate.candidateId);
+    required(store.workspace.selectCandidate({ jobId: store.jobId, candidateId: store.candidateId,
+      expectedCandidateId: saved.candidate.candidateId, expectedRevision: saved.workspace.revision, at: store.stamp }));
+    expect(store.candidates.queryOperation({ kind: 'save', request: input, at: store.stamp }))
+      .toMatchObject({ ok: true, data: { candidate: { candidateId: saved.candidate.candidateId }, workspace: { candidateRef: { id: store.candidateId } } } });
+    expect(store.candidates.saveHuman({ ...input, at: store.stamp, validate: () => { throw new Error('No new validation on historical query'); } }))
+      .toMatchObject({ ok: true, data: { changed: true, candidate: { candidateId: saved.candidate.candidateId } } });
+  });
+
+  it('rolls back each human write and preserves a committed Save when acceptance fails', () => {
+    for (const gate of ['BEFORE INSERT ON invoice_candidates', 'BEFORE UPDATE ON jobs', 'BEFORE UPDATE ON workspace', "BEFORE INSERT ON business_events WHEN NEW.type='candidate_edited'"]) {
+      const store = makeSelectedCandidate(); const input = request(store); input.draft.notes = ['Changed'];
+      const before = { candidates: store.db.query('SELECT * FROM invoice_candidates').all(), jobs: store.db.query('SELECT * FROM jobs').all(),
+        workspace: store.db.query('SELECT * FROM workspace').all(), events: store.db.query('SELECT * FROM business_events').all() };
+      store.db.exec(`CREATE TRIGGER reject_write ${gate} BEGIN SELECT RAISE(ABORT,'injected'); END`);
+      expect(store.candidates.saveHuman({ ...input, at: store.stamp, validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }))
+        .toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      expect({ candidates: store.db.query('SELECT * FROM invoice_candidates').all(), jobs: store.db.query('SELECT * FROM jobs').all(),
+        workspace: store.db.query('SELECT * FROM workspace').all(), events: store.db.query('SELECT * FROM business_events').all() }).toEqual(before);
+      store.db.exec('DROP TRIGGER reject_write');
+      const saved = required(store.candidates.saveHuman({ ...input, at: store.stamp, validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }));
+      store.db.exec("CREATE TRIGGER reject_accept BEFORE INSERT ON business_events WHEN NEW.type='candidate_accepted' BEGIN SELECT RAISE(ABORT,'injected'); END");
+      expect(store.candidates.accept({ operationRef: 'accept-fails', jobId: store.jobId, candidateId: saved.candidate.candidateId,
+        expectedCandidateId: saved.candidate.candidateId, expectedRevision: saved.workspace.revision, dirty: false, at: store.stamp,
+        validate: () => ({ ok: true, data: { checks: [], issues: [] } }) })).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+      expect(required(store.candidates.readByJob({ jobId: store.jobId, candidateId: saved.candidate.candidateId })).candidate)
+        .toMatchObject({ origin: 'human_edit', status: 'generated', notes: ['Changed'] });
+      expect(required(store.workspace.read(store.stamp)).candidateRef?.id).toBe(saved.candidate.candidateId);
+      expect(store.db.query("SELECT COUNT(*) AS count FROM business_events WHERE type='candidate_accepted'").get()).toEqual({ count: 0 });
+    }
+  });
+  it('preserves the retained row evidence after deletion and makes an identical new row user-provided', () => {
+    const store = makeSelectedCandidate(false, true);
+    const original = required(store.candidates.readByJob({ jobId: store.jobId, candidateId: store.candidateId })).candidate;
+    const lines = ['Total 113.00', '113.00'].map(quote => Object.fromEntries(invoiceLineFields.map(name => [name,
+      name === 'quantity' ? { ...original.fields.totalAmount, sources: original.fields.totalAmount.sources.map(source => ({ ...source, quote })) }
+        : { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] }])));
+    store.db.query('UPDATE invoice_candidates SET lines_json=? WHERE id=?').run(JSON.stringify({ version: 1, items: lines }), store.candidateId);
+    const input = request(store);
+    const displayed = Object.fromEntries(invoiceLineFields.map(name => [name, name === 'quantity' ? '113.00' : ''])) as InvoiceFormDraft['lines'][number];
+    input.draft.lines = [displayed, displayed];
+    const saved = required(store.candidates.saveHuman({ ...input, lineOrigins: [1, null], at: store.stamp,
+      validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }));
+    expect(saved.candidate.lines[0]?.quantity.sources[0]?.quote).toBe('113.00');
+    expect(saved.candidate.lines[1]?.quantity).toMatchObject({ normalized: '113.00', valueOrigin: 'user-provided', sources: [] });
+    expect(saved.candidate.lines[0]?.quantity).not.toHaveProperty('valueOrigin');
+  });
+
+  it('rejects invalid row origins and legacy line changes without committing anything', () => {
+    const store = makeSelectedCandidate(); const input = request(store);
+    input.draft.lines = [Object.fromEntries(invoiceLineFields.map(name => [name, ''])) as InvoiceFormDraft['lines'][number]];
+    const before = store.db.query('SELECT * FROM workspace').get();
+    for (const lineOrigins of [undefined, [], [0], [1], [-1], [0.5], [null, null]]) {
+      const mapping = lineOrigins === undefined ? {} : { lineOrigins };
+      expect(store.candidates.saveHuman({ ...input, ...mapping, at: store.stamp,
+        validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }))
+        .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    }
+    expect(store.db.query('SELECT * FROM workspace').get()).toEqual(before);
+    expect(store.db.query('SELECT COUNT(*) AS count FROM invoice_candidates').get()).toEqual({ count: 1 });
+    expect(required(store.candidates.queryOperation({ kind: 'save', request: request(store), at: store.stamp }))).toBeNull();
+  });
   it('migrates to the current schema while preserving model IDs, bytes, pointers and foreign keys', () => {
     const legacy = makeSelectedCandidate(true);
     const paths = { root: legacy.root, databaseFile: join(legacy.root,'data','flowmate.sqlite'), outputsDir: join(legacy.root,'outputs'),
@@ -186,7 +261,7 @@ describe('human candidate transactions', () => {
     input.draft.fields.totalAmount = '';
     input.draft.lines = [{ description: 'User line', quantity: '0', unit: 'each', unitPrice: '0.000001', netAmount: '0',
       taxRate: '0', taxAmount: '0', totalAmount: '0' }];
-    const saved = required(store.candidates.saveHuman({ ...input, at: store.stamp, validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }));
+    const saved = required(store.candidates.saveHuman({ ...input, lineOrigins: [null], at: store.stamp, validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }));
     expect(saved.candidate.fields.totalAmount).toEqual({ raw: null, normalized: null, state: 'missing', alternatives: [], sources: [], valueOrigin: 'user-provided' });
     expect(saved.candidate.fields.invoiceNumber).toEqual(basis.fields.invoiceNumber);
     expect(saved.candidate.fields.invoiceNumber).not.toHaveProperty('valueOrigin');

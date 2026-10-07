@@ -2227,10 +2227,16 @@ function humanField(name: string, text: string, before?: StoredInvoiceField): St
   return { raw: text, normalized, state: 'present', alternatives: [], sources: [], valueOrigin: 'user-provided' };
 }
 function humanDraft(input: SaveInvoiceCandidateRequest, before: CandidateSnapshot): StoredCandidateDraft {
+  const origins = input.lineOrigins ?? before.lines.map((_, index) => index);
+  if (input.lineOrigins === undefined && (input.draft.lines.length !== before.lines.length
+    || input.draft.lines.some((line, index) => invoiceLineFields.some(name => line[name] !== invoiceFieldDisplayValue(name, before.lines[index]![name])))))
+    throw new Error('line_origins_required');
+  if (origins.length !== input.draft.lines.length || origins.some(origin => origin !== null && origin >= before.lines.length))
+    throw new Error('line_origin_invalid');
   return StoredCandidateDraftSchema.parse({
     fields: Object.fromEntries(invoiceHeaderFields.map(name => [name, humanField(name, input.draft.fields[name], before.fields[name])])),
     lines: input.draft.lines.map((line, index) => Object.fromEntries(invoiceLineFields.map(name =>
-      [name, humanField(name, line[name], before.lines[index]?.[name])]))), notes: [...input.draft.notes],
+      [name, humanField(name, line[name], origins[index] === null ? undefined : before.lines[origins[index]!]![name])]))), notes: [...input.draft.notes],
   });
 }
 function invoiceOperationFacts(db: Database, input: { jobId: DbId; expectedCandidateId: DbId; expectedRevision: number }, at: string):

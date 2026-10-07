@@ -1,7 +1,6 @@
 import { expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { Type } from '@sinclair/typebox';
+import { InMemoryCredentialStore, Type } from '@earendil-works/pi-ai';
 import { join, resolve } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

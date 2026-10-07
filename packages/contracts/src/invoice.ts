@@ -161,8 +161,13 @@ export function invoiceFieldDisplayValue(name: string, field: StoredInvoiceField
 
 const invoiceOperationShape = { operationRef: z.string().min(1).max(256), jobId: idSchema,
   expectedCandidateId: idSchema, expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) };
+export const InvoiceFormLineOriginsSchema = z.array(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable())
+  .max(MAX_INVOICE_LINES).refine(origins => new Set(origins.filter(origin => origin !== null)).size === origins.filter(origin => origin !== null).length,
+    'An original line cannot be reused twice.');
+export type InvoiceFormLineOrigins = z.infer<typeof InvoiceFormLineOriginsSchema>;
 export const SaveInvoiceCandidateRequestSchema = z.object({ ...invoiceOperationShape,
-  basedOnCandidateId: idSchema, draft: InvoiceFormDraftSchema }).strict();
+  basedOnCandidateId: idSchema, draft: InvoiceFormDraftSchema, lineOrigins: InvoiceFormLineOriginsSchema.optional() }).strict()
+  .refine(input => input.lineOrigins === undefined || input.lineOrigins.length === input.draft.lines.length, 'Line origins must match the draft.');
 export type SaveInvoiceCandidateRequest = z.infer<typeof SaveInvoiceCandidateRequestSchema>;
 export const AcceptInvoiceCandidateRequestSchema = z.object({ ...invoiceOperationShape,
   candidateId: idSchema, dirty: z.literal(false) }).strict();

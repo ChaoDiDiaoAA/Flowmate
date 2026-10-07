@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { invoiceHeaderFields, invoiceLineFields } from '../../../../packages/contracts/src/invoice.ts';
-import type { CandidateJobDetail, DocumentOriginalImage, DocumentSnapshot, InvoiceField, InvoiceToolOutput,
+import type { CandidateJobDetail, DocumentOriginalImage, DocumentSnapshot, StoredInvoiceField, InvoiceIssue, InvoiceToolOutput,
   JobSnapshot, SourceRef, WorkspaceSelection, WorkspaceSnapshot, WorkspaceView } from '@flowmate/contracts';
 import { selectionLabel, sameWorkspaceSelection, type WorkspaceState } from './workspace-state.ts';
 
@@ -9,6 +9,20 @@ const labels: Record<typeof invoiceHeaderFields[number] | typeof invoiceLineFiel
   buyerName: 'Buyer name', buyerTaxId: 'Buyer tax ID', currency: 'Currency', netAmount: 'Net amount', taxAmount: 'Tax amount',
   totalAmount: 'Total amount', description: 'Description', quantity: 'Quantity', unit: 'Unit', unitPrice: 'Unit price', taxRate: 'Tax rate',
 };
+
+export function InvoiceFieldDetails({ value, path, issues }: { value: StoredInvoiceField; path: string; issues: readonly InvoiceIssue[] }) {
+  const fieldIssues = issues.filter(issue => issue.fieldPaths.includes(`/${path.replaceAll('.', '/')}`));
+  return <div className="invoice-field-details" data-field-path={path}>
+    <p>Raw: {value.raw ?? '—'}</p><p>Normalized: {value.normalized ?? '—'}</p>
+    <p>State: {value.state.replaceAll('_', ' ')}</p>
+    <p>Alternatives: {value.alternatives.length ? value.alternatives.join(' · ') : 'None'}</p>
+    <p>Origin: {value.valueOrigin ?? 'Document value (no explicit origin marker)'}</p>
+    {value.valueOrigin === 'user-provided' && <p>No document source: provided by the user.</p>}
+    {value.sources.map((source, index) => <p key={index}>Source {index + 1}: document {source.documentId} · {source.version} · artifact {source.artifactId}
+      {' · '}page {source.page} · {source.blockId ?? 'whole page'} · Quote: {source.quote ?? 'None'}</p>)}
+    {fieldIssues.map((issue, index) => <p key={index}>{issue.severity} · {issue.code} · {issue.message}</p>)}
+  </div>;
+}
 
 export function WorkspacePage(props: {
   state: WorkspaceState; workspace: WorkspaceSnapshot | null; document: DocumentSnapshot | null;
@@ -43,8 +57,8 @@ export function WorkspacePage(props: {
   const fromSource = (source: SourceRef): WorkspaceSelection => ({ formatVersion: 1, kind: 'source', target: 'document',
     targetId: source.documentId, targetVersion: source.version, artifactId: source.artifactId, page: source.page,
     ...(source.blockId ? { block: source.blockId } : {}) });
-  const field = (value: InvoiceField, path: string, label: string) => <article className={`workspace-field ${selected(fieldSelection(path)) ? 'selected' : ''}`} key={path}>
-    <div><strong>{label}</strong><p>{value.normalized ?? value.raw ?? '—'}</p><small>{value.state.replaceAll('_', ' ')}</small></div>
+  const field = (value: StoredInvoiceField, path: string, label: string) => <article className={`workspace-field ${selected(fieldSelection(path)) ? 'selected' : ''}`} key={path}>
+    <div><strong>{label}</strong><InvoiceFieldDetails value={value} path={path} issues={candidate!.candidate.issues} /></div>
     <button className="text-button" disabled={!dependentReady || !selectedCandidate} aria-label={`Select ${label}`} aria-pressed={selected(fieldSelection(path))}
       onClick={() => props.onSelection(fieldSelection(path))}>Select field</button>
     {value.sources.length > 0 && <div className="workspace-sources">{value.sources.map((source, index) => <button key={index} className="text-button"

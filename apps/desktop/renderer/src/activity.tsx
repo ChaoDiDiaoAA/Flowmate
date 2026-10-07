@@ -210,7 +210,7 @@ export function ActivityPage(props: Props) {
         {props.documents.map(d => <option key={`invoice:${d.documentRef.id}`} value={`invoice:${d.documentRef.id}`}>{d.displayName}</option>)}
         {props.jobs.map(j => <option key={`processing:${j.jobId}`} value={`processing:${j.jobId}`}>Processing · {j.goal}</option>)}</select></label></div>
       {business.length === 0 ? <p className="activity-note">Select an invoice or processing record to see its saved actions.</p> : <ol className="activity-timeline">{business.map(action =>
-        <li key={action.id}><div><strong>{action.type.replaceAll('_', ' ')}</strong><time dateTime={action.occurredAt}>{utc(action.occurredAt)}</time>
+        <li key={action.id}><div><strong>{action.type === 'candidate_exported' ? 'Managed export registered' : action.type.replaceAll('_', ' ')}</strong><time dateTime={action.occurredAt}>{utc(action.occurredAt)}</time>
           {action.documentId && <button className="text-button" onClick={() => props.onOpenInvoice(action.documentId!)}>View invoice</button>}
           {action.jobId && <button className="text-button" onClick={() => props.onOpenProcessing(action.jobId!)}>View processing</button>}</div></li>)}</ol>}
       {nextBusinessId !== null && <button className="secondary-button" disabled={businessLoading} onClick={() => void loadMoreBusiness()}>Load earlier actions</button>}

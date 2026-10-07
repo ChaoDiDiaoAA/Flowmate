@@ -96,7 +96,8 @@ describe('Fill backend through the public Application', () => {
     const formDraft = InvoiceFormDraftSchema.parse({ fields: Object.fromEntries(Object.keys(candidate.fields).map(name => [name, ''])),
       lines: values.map(description => ({ ...Object.fromEntries(invoiceLineFields.map(name => [name, ''])), description })), notes: [] });
     const human = need(await app.saveInvoiceCandidate({ operationRef: 't10-large-human-edit', jobId: task.job.jobId,
-      expectedCandidateId: candidateId, expectedRevision: selected.workspace.revision, basedOnCandidateId: candidateId, draft: formDraft }));
+      expectedCandidateId: candidateId, expectedRevision: selected.workspace.revision, basedOnCandidateId: candidateId, draft: formDraft,
+      lineOrigins: formDraft.lines.map(() => null) }));
     const large = { fields: human.candidate.fields, lines: human.candidate.lines, notes: human.candidate.notes };
     expect(human.candidate).toMatchObject({ origin: 'human_edit', basedOnCandidateId: candidateId, runId: null, toolCallId: null, context: null });
     candidateId = human.candidate.candidateId;

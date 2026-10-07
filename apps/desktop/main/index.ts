@@ -33,6 +33,7 @@ import {
   SessionInputsRequestSchema,
   SetSessionStatusRequestSchema,
   InvoiceCandidateOperationQuerySchema,
+  ExportInvoiceCandidateRequestSchema,
   RuntimeEventsQuerySchema,
   RuntimeEventsSubscriptionRequestSchema,
   RuntimeSubscriptionIdSchema,
@@ -75,6 +76,8 @@ import type {
   DesktopInvoiceFormInspection,
   InvoiceCandidateOperationQuery,
   InvoiceCandidateOperationResult,
+  DesktopInvoiceExportResult,
+  InvoiceExportReference,
   RuntimeEventsReadResult,
   RuntimeSubscriptionInfo,
   RuntimeEventsWake,
@@ -94,6 +97,9 @@ import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionRespo
 import { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure } from '../../host/protocol.ts';
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from '../../host/protocol.ts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
+import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
+import { readManagedInvoiceExport } from '../../../packages/core/src/storage/file-store.ts';
+import { publishInvoiceExportCopy } from './invoice-export.ts';
 
 const channels = {
   getState: 'flowmate:get-state',
@@ -147,6 +153,7 @@ const channels = {
   acceptInvoiceCandidate: 'flowmate:accept-invoice-candidate',
   rejectInvoiceCandidate: 'flowmate:reject-invoice-candidate',
   exportInvoiceCandidate: 'flowmate:export-invoice-candidate',
+  saveInvoiceExport: 'flowmate:save-invoice-export',
   queryInvoiceCandidateOperation: 'flowmate:query-invoice-candidate-operation',
   cancelRun: 'flowmate:cancel-run',
   queryRuntimeState: 'flowmate:query-runtime-state',
@@ -642,6 +649,7 @@ function registerIpc(): void {
       delete invoiceFormBinding.unknownOperationRef;
     return result;
   });
+  handle(channels.saveInvoiceExport, async (event, raw) => saveInvoiceExport(event, raw));
   handle(channels.startInvoiceFormRun, async (event, raw) => startInvoiceFormRun(event, raw));
   handle(channels.querySessionInput, async (_event, raw) => {
     const input = SessionInputQuerySchema.safeParse(raw);
@@ -1494,14 +1502,50 @@ async function inspectCurrentInvoiceForm(binding: DesktopFormBinding): Promise<D
   });
 }
 
+const pendingInvoiceExports = new WeakSet<object>();
+async function saveInvoiceExport(event: Electron.IpcMainInvokeEvent, raw: unknown): Promise<Result<DesktopInvoiceExportResult>> {
+  const parsed = ExportInvoiceCandidateRequestSchema.safeParse(raw);
+  if (!parsed.success) return fail(appError('input_invalid', 'input', 'Invoice export request is invalid.'));
+  if (!mainWindow || pendingInvoiceExports.has(event.sender)) return fail(appError('state_conflict', 'input', 'An invoice Save dialog is already open.'));
+  const window = mainWindow, frame = event.senderFrame, epoch = host.connectionEpoch;
+  const currentOwner = () => mainWindow === window && !window.isDestroyed() && epoch === host.connectionEpoch
+    && !event.sender.isDestroyed() && event.sender.mainFrame === frame && isTrustedSender(event);
+  pendingInvoiceExports.add(event.sender);
+  try {
+    const extension = parsed.data.format === 'markdown' ? 'md' : parsed.data.format;
+    const selected = await dialog.showSaveDialog(window, { title: 'Save invoice export',
+      defaultPath: `invoice-result-${parsed.data.candidateId}.${extension}`,
+      filters: [{ name: parsed.data.format.toUpperCase(), extensions: [extension] }] });
+    if (!currentOwner()) return fail(appError('state_conflict', 'input', 'The invoice export window or Host changed. Open Save again.'));
+    if (selected.canceled || !selected.filePath) return ok({ outcome: 'cancelled' });
+    const managed = await submitInvoiceCandidateOperation({ kind: 'export', request: parsed.data }, { frame: frame!, contents: event.sender, epoch });
+    if (!managed.ok) return managed;
+    const reference = managed.data as InvoiceExportReference;
+    if (!currentOwner()) return fail(appError('state_conflict', 'input', 'The managed export is registered; the window changed before the external copy.'));
+    const paths = resolveProductPaths(userDataRoot);
+    if (!paths.ok) return paths;
+    const source = readManagedInvoiceExport(paths.data, reference);
+    if (!source.ok) return source;
+    const published = publishInvoiceExportCopy(selected.filePath, source.data);
+    return published.ok ? ok({ outcome: 'saved', reference, destinationPath: published.data.destinationPath })
+      : fail({ ...published.error, message: `Managed export registered: ${reference.relativePath}. ${published.error.message}` });
+  } catch { return fail(appError('storage_write_failed', 'storage', 'The invoice Save dialog or copy could not be confirmed. Check the original managed operation before saving again.', true)); }
+  finally { pendingInvoiceExports.delete(event.sender); }
+}
+
 async function submitInvoiceCandidateOperation(raw: unknown, owner: InvoiceFormOwner,
   inspected?: DesktopInvoiceFormInspection): Promise<Result<InvoiceCandidateOperationResult>> {
+  const generation = mainWindow ? runtimeGenerations.get(mainWindow.webContents.id) ?? 0 : -1;
   const query = InvoiceCandidateOperationQuerySchema.safeParse(raw);
   if (!query.success) return fail(appError('input_invalid', 'input', 'Candidate operation is invalid.'));
   const input = query.data;
   // Resolve the exact original command before consulting a now-stale target or Workspace.
   const prior = await productHostRequest<InvoiceCandidateOperationResult>({ type: 'query_invoice_candidate_operation', input }, 'Original candidate operation could not be queried.');
   if (!prior.ok || prior.data !== null) return prior;
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()
+    || generation !== (runtimeGenerations.get(mainWindow.webContents.id) ?? 0)
+    || owner.contents !== mainWindow.webContents || owner.frame !== mainWindow.webContents.mainFrame || owner.epoch !== host.connectionEpoch)
+    return fail(appError('state_conflict', 'input', 'The invoice operation window or Host changed. Open the current result again.'));
   if (input.kind === 'export') return productHostRequest({ type: 'export_invoice_candidate', input: input.request }, 'Export result is unknown. Query the original operation.', 10_000, 'operation_result_unknown');
   const binding = invoiceFormBinding;
   if (!binding || !binding.valid || binding.frame !== owner.frame || binding.contents !== owner.contents || binding.epoch !== owner.epoch)
@@ -1520,7 +1564,8 @@ async function submitInvoiceCandidateOperation(raw: unknown, owner: InvoiceFormO
     || input.request.expectedRevision !== current.data.revision)
     return fail(appError('state_conflict', 'input', 'Current form or selected result changed.'));
   if (input.kind === 'save') {
-    if (input.request.basedOnCandidateId !== form.basis.candidateId || JSON.stringify(input.request.draft) !== JSON.stringify(form.draft))
+    if (input.request.basedOnCandidateId !== form.basis.candidateId || JSON.stringify(input.request.draft) !== JSON.stringify(form.draft)
+      || JSON.stringify(input.request.lineOrigins) !== JSON.stringify(form.lineOrigins))
       return fail(appError('state_conflict', 'input', 'Save draft does not match the current form.'));
     const result = await productHostRequest<InvoiceCandidateOperationResult>({ type: 'save_invoice_candidate', input: input.request }, 'Save result is unknown. Query the original operation.', 10_000, 'operation_result_unknown');
     if (!result.ok && result.error.code === 'operation_result_unknown') binding.unknownOperationRef = input.request.operationRef;
@@ -1556,7 +1601,7 @@ async function confirmInvoiceFormClose(): Promise<boolean> {
     if (!current.ok) return false;
     const operation: InvoiceCandidateOperationQuery = { kind: 'save', request: { operationRef: randomUUID(), jobId: form.basis.jobId,
       basedOnCandidateId: form.basis.candidateId, expectedCandidateId: form.basis.candidateId,
-      expectedRevision: current.data.revision, draft: form.draft } };
+      expectedRevision: current.data.revision, draft: form.draft, ...(form.lineOrigins === undefined ? {} : { lineOrigins: form.lineOrigins }) } };
     const result = await submitInvoiceCandidateOperation(operation, binding, form);
     if (!result.ok) {
       if (result.error.code === 'operation_result_unknown') unknownOperation = operation;

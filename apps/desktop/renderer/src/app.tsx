@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type ReactNode } from 'react';
 import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema,
-  MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS } from '../../../../packages/contracts/src/invoice.ts';
+  MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS, MAX_INVOICE_BLOCKS_PER_PAGE } from '../../../../packages/contracts/src/invoice.ts';
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
 import { RuntimeBudgetOverridesSchema, RuntimeRequestOverridesSchema } from '../../../../packages/contracts/src/runtime.ts';
 import { RUNTIME_CONFIG } from '../../../../packages/contracts/src/runtime-config.ts';
@@ -14,7 +14,7 @@ import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type Mes
 import { RequiredSkillPicker, ResourcePage } from './prompt.tsx';
 import { ExtensionsPage } from './extensions.tsx';
 import { ActivityPage } from './activity.tsx';
-import { WorkspacePage } from './workspace.tsx';
+import { WorkspacePage, InvoiceFieldDetails } from './workspace.tsx';
 import { SessionDetails, type ContextBasis } from './session-details.tsx';
 import { hasNewContextEvents } from './context-state.ts';
 import { createWorkspaceState, beginWorkspaceRequest, acceptWorkspaceSnapshot, failWorkspaceRequest,
@@ -192,6 +192,8 @@ export function App() {
   const [hidingDocumentId, setHidingDocumentId] = useState<number | null>(null);
   const [candidateSummaries, setCandidateSummaries] = useState<CandidateSummary[]>([]);
   const [candidateDetail, setCandidateDetail] = useState<CandidateJobDetail | null>(null);
+  const [sourceReview, setSourceReview] = useState<{ source: SourceRef; text: string | null; loading: boolean; error: string | null } | null>(null);
+  const sourceReviewGeneration = useRef(0);
   const [invoiceForm, setInvoiceForm] = useState<InvoiceFormState | null>(null);
   const [formFeedback, setFormFeedback] = useState('');
   const [formPreparing, setFormPreparing] = useState(false);
@@ -574,6 +576,36 @@ export function App() {
     setFormOutcomeUnknown(false);
   }
 
+  async function discardInvoiceChanges() {
+    const form = invoiceFormRef.current;
+    if (!form || formSubmittingRef.current || busy || formPreparing || humanOperationUnknown) return;
+    const epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
+    const basis = workspaceRef.current, sequence = ++candidateQuerySequence.current;
+    const currentPreview = () => epoch === workspaceHostEpoch.current && token === workspaceStateRef.current.requestToken
+      && sequence === candidateQuerySequence.current && sameWorkspaceBasis(basis, workspaceRef.current) && hostReadyRef.current;
+    setFormPreparing(true);
+    try {
+      await discardForm(); // Invalidate the old owner before registering another instance.
+      if (!currentPreview()) return;
+      const [current, runtime, detail] = await Promise.all([window.flowmate.readWorkspace(), window.flowmate.queryRuntimeState(),
+        window.flowmate.queryJobCandidate({ jobId: form.basis.jobId, candidateId: form.basis.candidateId })]);
+      if (!currentPreview()) return;
+      if (detail.ok) setCandidateDetail(detail.data);
+      if (!current.ok || !runtime.ok || !detail.ok || !hostReadyRef.current || current.data.invalidReferences.length
+        || current.data.jobId !== form.basis.jobId || current.data.candidateRef?.id !== form.basis.candidateId
+        || current.data.candidateRef.sequence !== form.basis.candidateSequence || current.data.documentRef?.id !== form.basis.documentRef.id
+        || current.data.documentRef.version !== form.basis.documentRef.version || detail.data.candidate.status === 'accepted'
+        || runtime.data.active !== null || runtime.data.blocked) {
+        setNotice({ tone: 'info', message: 'Local changes discarded. The saved result remains available; explicitly select a current editable result to continue.' });
+        return;
+      }
+      acceptWorkspace(current.data);
+      const next = await prepareInvoiceForm('edit', detail.data);
+      if (next) setFormFeedback('Local changes discarded. Saved result restored in a new form.');
+      else setNotice({ tone: 'bad', message: 'Local changes discarded; the saved result is retained, but a new editor could not be registered.' });
+    } finally { setFormPreparing(false); }
+  }
+
   async function confirmFormLeave(): Promise<boolean> {
     if (!invoiceFormRef.current) return true;
     if (formSubmittingRef.current) return false;
@@ -597,7 +629,7 @@ export function App() {
       if (!form || form.formInstanceId !== formInstanceId) { void window.flowmate.replyInvoiceFormInspect(requestId, null); return; }
       setFormSubmission(true);
       void window.flowmate.replyInvoiceFormInspect(requestId, { formInstanceId, revision: form.revision, dirty: form.dirty,
-        valid: form.valid, basis: structuredClone(form.basis), draft: structuredClone(form.draft) });
+        valid: form.valid, basis: structuredClone(form.basis), draft: structuredClone(form.draft), lineOrigins: [...form.lineOrigins] });
     });
     const finished = window.flowmate.onInvoiceFormInspectFinished(unknownOperation => {
       setFormSubmission(false);
@@ -654,15 +686,18 @@ export function App() {
   async function prepareInvoiceForm(purpose: 'fill' | 'edit', detail = candidateDetail): Promise<InvoiceFormState | null> {
     if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return null;
     const current = workspaceRef.current;
+    const sequence = candidateQuerySequence.current, epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
     if (!current?.documentRef || !current.jobId || !current.candidateRef || !detail
       || detail.candidate.candidateId !== current.candidateRef.id || detail.candidate.sequence !== current.candidateRef.sequence
       || detail.documentRef.id !== current.documentRef.id || detail.documentRef.version !== current.documentRef.version) return null;
     if (!await confirmFormLeave()) return null;
+    if (sequence !== candidateQuerySequence.current || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
     const expected = { revision: current.revision, sessionId: current.sessionId, documentRef: current.documentRef,
       jobId: current.jobId, candidateRef: current.candidateRef };
     const target = await window.flowmate.registerInvoiceFormTarget({ purpose, workspace: expected, formRevision: 0 });
     if (!target.ok) { setNotice({ tone: 'bad', message: errorMessage(target) }); return null; }
-    if (workspaceRef.current?.revision !== current.revision || !hostReadyRef.current) {
+    if (workspaceRef.current?.revision !== current.revision || !hostReadyRef.current || sequence !== candidateQuerySequence.current
+      || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) {
       await window.flowmate.invalidateInvoiceFormTarget(target.data.formInstanceId); return null;
     }
     const stored = StoredCandidateDraftSchema.safeParse({ fields: detail.candidate.fields, lines: detail.candidate.lines, notes: detail.candidate.notes });
@@ -749,25 +784,27 @@ export function App() {
     }
   }
 
-  function changeInvoiceFormDraft(value: InvoiceFormDraft) {
+  function changeInvoiceFormDraft(value: InvoiceFormDraft, lineOrigins?: InvoiceFormState['lineOrigins']) {
     if (formSubmittingRef.current) return;
     const current = invoiceFormRef.current; if (!current) return;
-    const next = editInvoiceForm(current, value); if (next) publishInvoiceForm(next);
+    const next = editInvoiceForm(current, value, lineOrigins); if (next) publishInvoiceForm(next);
   }
 
   async function saveInvoiceResult(): Promise<boolean> {
     const form = invoiceFormRef.current; const current = workspaceRef.current;
     if (!form?.valid || !current || formSubmittingRef.current || humanOperationUnknown) return false;
     const request = { operationRef: crypto.randomUUID(), jobId: form.basis.jobId, basedOnCandidateId: form.basis.candidateId,
-      expectedCandidateId: form.basis.candidateId, expectedRevision: current.revision, draft: structuredClone(form.draft) };
+      expectedCandidateId: form.basis.candidateId, expectedRevision: current.revision, draft: structuredClone(form.draft), lineOrigins: [...form.lineOrigins] };
     lastHumanOperation.current = { kind: 'save', request }; setFormSubmission(true);
     try {
       const result = await window.flowmate.saveInvoiceCandidate(request);
       if (!result.ok) { setHumanOperationUnknown(result.error.code === 'operation_result_unknown'); setFormFeedback(errorMessage(result)); return false; }
       await discardForm(); acceptWorkspace(result.data.workspace);
       const detail = await window.flowmate.queryJobCandidate({ jobId: request.jobId, candidateId: result.data.candidate.candidateId });
-      if (detail.ok) { setCandidateDetail(detail.data); await prepareInvoiceForm('edit', detail.data); }
-      setFormFeedback('Result saved for review.'); await loadTaskDetails(request.jobId); await loadProductLists(); return true;
+      const editor = detail.ok ? (setCandidateDetail(detail.data), await prepareInvoiceForm('edit', detail.data)) : null;
+      const feedback = editor ? 'Result saved for review.' : `Result saved: candidate ${result.data.candidate.candidateId}. Editor could not be reloaded.${detail.ok ? '' : ` ${errorMessage(detail)}`}`;
+      setFormFeedback(feedback); if (!editor) setNotice({ tone: 'info', message: feedback });
+      await loadTaskDetails(request.jobId); await loadProductLists(); return true;
     } finally { setFormSubmission(false); }
   }
 
@@ -798,9 +835,10 @@ export function App() {
     const request = { operationRef: crypto.randomUUID(), candidateId: candidate.candidateId, format };
     lastHumanOperation.current = { kind: 'export', request }; setFormSubmission(true);
     try {
-      const result = await window.flowmate.exportInvoiceCandidate(request);
+      const result = await window.flowmate.saveInvoiceExport(request);
       if (!result.ok) setHumanOperationUnknown(result.error.code === 'operation_result_unknown');
-      setNotice(result.ok ? { tone: 'good', message: `Export created: ${result.data.relativePath}` }
+      setNotice(result.ok ? result.data.outcome === 'cancelled' ? { tone: 'info', message: 'Export Save cancelled. No new managed export was created.' }
+        : { tone: 'good', message: `Export saved: ${result.data.destinationPath}` }
         : { tone: 'bad', message: errorMessage(result) });
     } finally { setFormSubmission(false); }
   }
@@ -808,7 +846,8 @@ export function App() {
   async function checkHumanOperation() {
     const operation = lastHumanOperation.current; if (!operation || formSubmittingRef.current) return;
     const result = await window.flowmate.queryInvoiceCandidateOperation(operation);
-    setNotice(result.ok ? { tone: 'info', message: result.data ? `Original ${operation.kind} operation confirmed.`
+    setNotice(result.ok ? { tone: 'info', message: result.data ? operation.kind === 'export'
+      ? 'Original managed export confirmed. The external destination is not recorded; inspect the chosen file or explicitly Save again.' : `Original ${operation.kind} operation confirmed.`
       : 'Original operation has no confirmed commit. Your local draft is retained.' } : { tone: 'bad', message: errorMessage(result) });
     if (result.ok && result.data) { setHumanOperationUnknown(false); await loadWorkspace(); await loadProductLists(); if (workspaceRef.current?.jobId) await loadTaskDetails(workspaceRef.current.jobId); }
   }
@@ -1186,14 +1225,53 @@ export function App() {
   }
 
   async function selectWorkspaceSource(source: SourceRef) {
+    const generation = sourceReviewGeneration.current, epoch = workspaceHostEpoch.current;
     const snapshot = await changeWorkspace({ kind: 'selection', selection: { formatVersion: 1, kind: 'source', target: 'document',
       targetId: source.documentId, targetVersion: source.version, artifactId: source.artifactId, page: source.page,
       ...(source.blockId ? { block: source.blockId } : {}) } });
-    if (!snapshot) return;
+    if (!snapshot || generation !== sourceReviewGeneration.current || epoch !== workspaceHostEpoch.current || !hostReadyRef.current) return;
     // Local navigation reveals the chosen evidence without adding a second persistent view write.
     setLocalWorkspaceView('parsed');
-    await readParsedPage(source.page);
+    await Promise.all([readParsedPage(source.page), reviewInvoiceSource(source)]);
   }
+
+  async function reviewInvoiceSource(source: SourceRef) {
+    const generation = ++sourceReviewGeneration.current, epoch = workspaceHostEpoch.current;
+    const current = () => generation === sourceReviewGeneration.current && epoch === workspaceHostEpoch.current && hostReadyRef.current;
+    setSourceReview(previous => ({ source, text: JSON.stringify(previous?.source) === JSON.stringify(source) ? previous!.text : null, loading: true, error: null }));
+    try {
+      const index = await window.flowmate.listDocumentPages({ documentId: source.documentId });
+      if (!current()) return;
+      if (!index.ok) throw new Error(errorMessage(index));
+      if (index.data.documentRef.id !== source.documentId || index.data.documentRef.version !== source.version
+        || index.data.parsedArtifactId !== source.artifactId || !index.data.pages.some(page => page.page === source.page)) throw new Error('The saved evidence reference no longer matches the document.');
+      let afterBlockId: string | null = null; const texts: string[] = []; const visited = new Set<string>();
+      for (;;) {
+        const result = await window.flowmate.readDocumentPage({ documentId: source.documentId, page: source.page, afterBlockId, limit: 50 });
+        if (!current()) return;
+        if (!result.ok) throw new Error(errorMessage(result));
+        const page = result.data;
+        if (page.documentRef.id !== source.documentId || page.documentRef.version !== source.version || page.parsedArtifactId !== source.artifactId || page.page !== source.page)
+          throw new Error('The parsed evidence changed during review.');
+        for (const block of page.blocks) {
+          if (visited.has(block.id)) throw new Error('The parsed evidence page repeated a block.');
+          visited.add(block.id);
+          if (source.blockId === null || source.blockId === block.id) texts.push(block.text);
+        }
+        if (source.blockId !== null && texts.length || page.nextAfterBlockId === null) break;
+        if (page.nextAfterBlockId === afterBlockId || visited.size >= MAX_INVOICE_BLOCKS_PER_PAGE) throw new Error('The parsed evidence cursor could not be advanced.');
+        afterBlockId = page.nextAfterBlockId;
+      }
+      const text = texts.join('\n');
+      setSourceReview({ source, text, loading: false, error: !texts.length ? 'Evidence gap: the referenced block was not found.'
+        : source.quote !== null && !text.includes(source.quote) ? 'Evidence gap: the quote does not appear in this parsed text.' : null });
+    } catch (error) {
+      if (current()) setSourceReview(previous => ({ source, text: JSON.stringify(previous?.source) === JSON.stringify(source) ? previous!.text : null,
+        loading: false, error: error instanceof Error ? error.message : 'Evidence could not be loaded.' }));
+    }
+  }
+
+  useEffect(() => { sourceReviewGeneration.current++; setSourceReview(null); }, [candidateDetail?.candidate.candidateId, workspace?.documentRef?.id, workspace?.documentRef?.version, state?.ready]);
 
   async function importInvoice() {
     if (!await confirmFormLeave()) return;
@@ -2544,8 +2622,8 @@ export function App() {
                 <button className="secondary-button" disabled={!dependentReady || !runtimeReady || busy || formPreparing || formSubmitting}
                   onClick={() => void beginEditInvoiceForm()}>Edit result</button></div>}
               {invoiceForm && <InvoiceFormEditor state={invoiceForm} feedback={formFeedback} disabled={!dependentReady || !invoiceForm.valid || busy || formPreparing || formSubmitting}
-                onChange={changeInvoiceFormDraft} onDiscard={() => void discardForm()} onQuery={() => void checkFillStatus()}
-                canQuery={invoiceForm.runId !== null || pendingFill.current !== null} canDiscard={!busy && !formPreparing && !formSubmitting}
+                onChange={changeInvoiceFormDraft} onDiscard={() => void discardInvoiceChanges()} onQuery={() => void checkFillStatus()}
+                canQuery={invoiceForm.runId !== null || pendingFill.current !== null} canDiscard={!busy && !formPreparing && !formSubmitting && !humanOperationUnknown}
                 operationUnknown={humanOperationUnknown} onSave={() => void saveInvoiceResult()} onAccept={() => void decideInvoiceResult('accept')} onReject={() => void decideInvoiceResult('reject')} />}
               {candidateDetail?.candidate.status === 'accepted' && <div className="button-row">{(['json', 'csv', 'markdown'] as const).map(format =>
                 <button key={format} className="secondary-button" disabled={formSubmitting || humanOperationUnknown} onClick={() => void exportInvoiceResult(format)}>Export {format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>)}</div>}
@@ -2644,6 +2722,14 @@ export function App() {
       </aside>
 
       <main className="workspace" data-testid="main-content">
+        {sourceReview && <section className="panel invoice-evidence" aria-label="Source evidence">
+          <div className="panel-head"><h2>Source evidence</h2><button className="text-button" onClick={() => { sourceReviewGeneration.current++; setSourceReview(null); }}>Close evidence</button></div>
+          <p>Document {sourceReview.source.documentId} · {sourceReview.source.version} · artifact {sourceReview.source.artifactId} · page {sourceReview.source.page} · {sourceReview.source.blockId ?? 'whole page'}</p>
+          <p>Quote: {sourceReview.source.quote ?? 'None saved'}</p>
+          {sourceReview.loading && <p role="status">Loading parsed evidence…</p>}
+          {sourceReview.error && <p role="alert">{sourceReview.error}<button className="text-button" onClick={() => void reviewInvoiceSource(sourceReview.source)}>Retry evidence</button></p>}
+          {sourceReview.text !== null && <pre>{sourceReview.text || '(no extracted text)'}</pre>}
+        </section>}
         <header className="topline">
           <div><span className="crumb">{pageLabels[page]}</span></div>
           <div className="top-state"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />{state?.ready ? 'LOCAL' : 'OFFLINE'}</div>
@@ -2658,6 +2744,7 @@ export function App() {
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
             onOpenContextBasis={candidate => void openCandidateContextBasis(candidate)}
+            onReviewSource={source => void reviewInvoiceSource(source)}
             onSelectCandidate={(jobId, candidateId) => void selectCandidate(jobId, candidateId)}
             formControls={invoiceFormControls}
             dependentReady={dependentReady}
@@ -2705,6 +2792,7 @@ export function App() {
             candidates={candidateSummaries}
             candidateDetail={candidateDetail}
             onOpenContextBasis={candidate => void openCandidateContextBasis(candidate)}
+            onReviewSource={source => void reviewInvoiceSource(source)}
             activity={activity}
             notice={notice}
             onOpenJob={(jobId) => void openJob(jobId)}
@@ -3046,6 +3134,7 @@ function InvoicesPage(props: {
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
   onOpenContextBasis(candidate: CandidateSummary): void;
+  onReviewSource(source: SourceRef): void;
   formControls: ReactNode;
   dependentReady: boolean;
   onSelectCandidate(jobId: number, candidateId: number): void;
@@ -3108,7 +3197,7 @@ function InvoicesPage(props: {
       {view === 'candidate' && !historical && workspace && <div className="invoice-results">{candidates.length === 0
         ? <div className="empty-route"><strong>No results yet</strong><span>Choose Process this invoice, then send the request in Assistant.</span></div>
         : <div className="model-list">{candidates.map((item) => <button className="route-row" key={item.candidateId} onClick={() => workspace.jobId && props.onOpenCandidate(workspace.jobId, item.candidateId)}><span className="route-icon">✓</span><span className="route-name"><strong>Result {item.sequence}</strong><small>{item.issueCount ? `${item.issueCount} issues to review` : 'No issues found'} · {new Date(item.createdAt).toLocaleDateString()}</small></span></button>)}</div>}
-        {candidateDetail && <><CandidateDetails detail={candidateDetail} onOpenContextBasis={props.onOpenContextBasis} />
+        {candidateDetail && <><CandidateDetails detail={candidateDetail} onOpenContextBasis={props.onOpenContextBasis} onReviewSource={props.onReviewSource} />
           {workspace.jobId && <button className="secondary-button" disabled={workspace.candidateRef?.id === candidateDetail.candidate.candidateId}
             onClick={() => props.onSelectCandidate(workspace.jobId!, candidateDetail.candidate.candidateId)}>Select result</button>}
           </>}{props.formControls}</div>}
@@ -3133,6 +3222,7 @@ function TasksPage(props: {
   candidates: readonly CandidateSummary[];
   candidateDetail: CandidateJobDetail | null;
   onOpenContextBasis(candidate: CandidateSummary): void;
+  onReviewSource(source: SourceRef): void;
   activity: readonly BusinessEventSnapshot[];
   notice: Notice;
   onOpenJob(jobId: number): void;
@@ -3164,7 +3254,7 @@ function TasksPage(props: {
             {!documentInfo(job.documentRef.id)?.isHidden && item.status === 'generated' && item.candidateId !== job.currentCandidateId && <button className="secondary-button" onClick={() => props.onSelectCandidate(job.jobId, item.candidateId)}>Select</button>}
           </div>)}</div>}
       </section>
-      {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><h2>Result details</h2></div><CandidateDetails detail={candidateDetail} onOpenContextBasis={props.onOpenContextBasis} /></section>}
+      {candidateDetail && <section className="panel profile-panel"><div className="panel-head"><h2>Result details</h2></div><CandidateDetails detail={candidateDetail} onOpenContextBasis={props.onOpenContextBasis} onReviewSource={props.onReviewSource} /></section>}
       <section className="panel profile-panel"><div className="panel-head"><h2>Activity</h2></div>
         {activity.length === 0 ? <p className="config-note">No actions recorded yet.</p> : <ol>{activity.map((event) => <li key={event.id}><strong>{activityLabel(event.type)}</strong> · {event.result} · {event.safeSummary} · {new Date(event.occurredAt).toLocaleString()}</li>)}</ol>}
       </section>
@@ -3175,7 +3265,7 @@ function TasksPage(props: {
 function activityLabel(type: BusinessEventSnapshot['type']): string {
   return ({ document_imported: 'Invoice imported', task_started: 'Processing started',
     candidate_generated: 'Result prepared', candidate_selected: 'Result selected', candidate_edited: 'Result edited',
-    candidate_accepted: 'Result accepted', candidate_rejected: 'Result rejected', candidate_exported: 'Result exported' })[type];
+    candidate_accepted: 'Result accepted', candidate_rejected: 'Result rejected', candidate_exported: 'Managed export registered' })[type];
 }
 
 const invoiceFieldLabels: Record<typeof invoiceHeaderFields[number] | typeof invoiceLineFields[number], string> = {
@@ -3188,7 +3278,7 @@ function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, op
   state: InvoiceFormState; feedback: string; disabled: boolean;
   canQuery: boolean; canDiscard: boolean;
   operationUnknown: boolean;
-  onChange(value: InvoiceFormDraft): void; onDiscard(): void; onQuery(): void;
+  onChange(value: InvoiceFormDraft, lineOrigins?: InvoiceFormState['lineOrigins']): void; onDiscard(): void; onQuery(): void;
   onSave(): void; onAccept(): void; onReject(): void;
 }) {
   return <section className="panel" aria-label="Invoice form"><div className="panel-head"><h2>Invoice form</h2>
@@ -3203,28 +3293,34 @@ function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, op
       <div className="profile-fields">{invoiceLineFields.map(name => <label className="field" key={name}><span>{invoiceFieldLabels[name]}</span>
         <input aria-label={`Line ${index + 1} ${invoiceFieldLabels[name]}`} value={line[name]} maxLength={MAX_INVOICE_FIELD_CHARS}
           onChange={event => onChange({ ...state.draft, lines: state.draft.lines.map((value, position) => position === index ? { ...value, [name]: event.target.value } : value) })} /></label>)}</div>
-      <button className="text-button" onClick={() => onChange({ ...state.draft, lines: state.draft.lines.filter((_, position) => position !== index) })}>Remove line {index + 1}</button>
+      <button className="text-button" onClick={() => onChange({ ...state.draft, lines: state.draft.lines.filter((_, position) => position !== index) },
+        state.lineOrigins.filter((_, position) => position !== index))}>Remove line {index + 1}</button>
     </fieldset>)}
     <button className="text-button" disabled={disabled || state.draft.lines.length >= MAX_INVOICE_LINES} onClick={() => onChange({ ...state.draft,
-      lines: [...state.draft.lines, Object.fromEntries(invoiceLineFields.map(name => [name, ''])) as InvoiceFormDraft['lines'][number]] })}>Add line</button>
+      lines: [...state.draft.lines, Object.fromEntries(invoiceLineFields.map(name => [name, ''])) as InvoiceFormDraft['lines'][number]] }, [...state.lineOrigins, null])}>Add line</button>
     <h3>Notes</h3>{state.draft.notes.map((note, index) => <label className="field" key={index}><span>Note {index + 1}</span>
       <input value={note} maxLength={MAX_INVOICE_NOTE_CHARS} disabled={disabled} onChange={event => onChange({ ...state.draft, notes: state.draft.notes.map((value, position) => position === index ? event.target.value : value) })} />
       <button className="text-button" disabled={disabled} onClick={() => onChange({ ...state.draft, notes: state.draft.notes.filter((_, position) => position !== index) })}>Remove note {index + 1}</button></label>)}
     <button className="text-button" disabled={disabled || state.draft.notes.length >= MAX_INVOICE_NOTES} onClick={() => onChange({ ...state.draft, notes: [...state.draft.notes, ''] })}>Add note</button>
     <div className="button-row"><button className="secondary-button" onClick={onQuery} disabled={!canQuery}>Check Fill status</button>
-      <button className="secondary-button" onClick={onSave} disabled={disabled || operationUnknown}>Save result</button>
+      <button className="secondary-button" onClick={onSave} disabled={disabled || !state.dirty || operationUnknown}>Save result</button>
       <button className="secondary-button" onClick={onAccept} disabled={disabled || state.dirty || operationUnknown}>Accept result</button>
       <button className="secondary-button" onClick={onReject} disabled={disabled || state.dirty || operationUnknown}>Reject result</button>
       <button className="danger-action" onClick={onDiscard} disabled={!canDiscard}>Discard changes</button></div>
   </section>;
 }
 
-function CandidateDetails({ detail, onOpenContextBasis }: { detail: CandidateJobDetail; onOpenContextBasis(candidate: CandidateSummary): void }) {
+function CandidateDetails({ detail, onOpenContextBasis, onReviewSource }: { detail: CandidateJobDetail; onOpenContextBasis(candidate: CandidateSummary): void; onReviewSource(source: SourceRef): void }) {
   const candidate = detail.candidate;
+  const field = (value: CandidateJobDetail['candidate']['fields'][typeof invoiceHeaderFields[number]], path: string, label: string) => <article key={path}>
+    <strong>{label}</strong><InvoiceFieldDetails value={value} path={path} issues={candidate.issues} />
+    {value.sources.map((source, index) => <button key={index} className="text-button" aria-label={`Review ${label} source ${index + 1}`} onClick={() => onReviewSource(source)}>Review source {index + 1}</button>)}
+  </article>;
   return <div className="candidate-details">
     {(candidate.context || candidate.basedOnCandidateId) && <button className="text-button" onClick={() => onOpenContextBasis(candidate)}>View original context basis</button>}
-    <div className="profile-fields">{Object.entries(candidate.fields).map(([name, field]) => <div key={name}><strong>{name.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase())}</strong><p>{field.normalized ?? field.raw ?? '—'}</p><small>{field.state.replaceAll('_', ' ')}</small></div>)}</div>
-    {candidate.lines.length > 0 && <><h3>Line items</h3><ul>{candidate.lines.map((line, index) => <li key={index}>{line.description.raw ?? 'Unnamed item'} · {line.quantity.normalized ?? line.quantity.raw ?? '—'} × {line.unitPrice.normalized ?? line.unitPrice.raw ?? '—'} = {line.totalAmount.normalized ?? line.totalAmount.raw ?? '—'}</li>)}</ul></>}
+    <div className="profile-fields">{invoiceHeaderFields.map(name => field(candidate.fields[name], `fields.${name}`, invoiceFieldLabels[name]))}</div>
+    {candidate.lines.length > 0 && <><h3>Line items</h3>{candidate.lines.map((line, index) => <section key={index}><h4>Line {index + 1}</h4>
+      <div className="profile-fields">{invoiceLineFields.map(name => field(line[name], `lines.${index}.${name}`, `Line ${index + 1} ${invoiceFieldLabels[name]}`))}</div></section>)}</>}
     <h3>Issues</h3>{candidate.issues.length ? <ul>{candidate.issues.map((issue, index) => <li key={index}>{issue.severity} · {issue.message}</li>)}</ul> : <p className="config-note">No validation issues.</p>}
     <h3>Sources</h3>{candidate.sources.length ? <ul>{candidate.sources.map((source, index) => <li key={index}>Page {source.page}{source.quote ? ` · “${source.quote}”` : ''}</li>)}</ul> : <p className="config-note">No source links were saved.</p>}
   </div>;

@@ -78,6 +78,20 @@ describe('fixed invoice form mapping', () => {
 
 const basis = { sessionId: 12, documentRef: { id: 4, version: 'doc-v1' }, jobId: 7, candidateId: 9, candidateSequence: 1 };
 
+it('tracks structural provenance even when deleting and adding an identical visible row', () => {
+  const original = createInvoiceFormState({ formInstanceId: 'structure', basis, candidate: candidate(), editable: true })!;
+  expect(original.lineOrigins).toEqual([0]);
+  const replaced = editInvoiceForm(original, original.draft, [null])!;
+  expect(replaced.dirty).toBe(true);
+  expect(replaced.revision).toBe(1);
+  expect(editInvoiceForm(replaced, original.draft, [0])?.dirty).toBe(false);
+  const reset = discardInvoiceForm(replaced, 'new-structure')!;
+  expect(reset.lineOrigins).toEqual([0]);
+  expect(reset.dirty).toBe(false);
+  expect(editInvoiceForm(original, original.draft, [0, null])).toBeNull();
+  expect(editInvoiceForm(original, original.draft, [1])).toBeNull();
+});
+
 function form() {
   return createInvoiceFormState({ formInstanceId: 'form-1', basis, candidate: candidate(), editable: true })!;
 }
@@ -112,13 +126,13 @@ describe('invoice form local draft and instance', () => {
     changedDraft.fields.taxAmount = '';
     changedDraft.lines.push({ ...changedDraft.lines[0]!, description: 'Added line' });
     changedDraft.notes = [];
-    const changed = editInvoiceForm(original, changedDraft)!;
+    const changed = editInvoiceForm(original, changedDraft, [0, null])!;
     changedDraft.fields.taxAmount = 'outside mutation';
     expect(changed.dirty).toBe(true);
     expect(changed.revision).toBe(1);
     expect(changed.draft.fields.taxAmount).toBe('');
     expect(original.draft.fields.taxAmount).toBe('0');
-    const reverted = editInvoiceForm(changed, original.baseline)!;
+    const reverted = editInvoiceForm(changed, original.baseline, original.baselineLineOrigins)!;
     expect(reverted.dirty).toBe(false);
     expect(reverted.revision).toBe(2);
   });

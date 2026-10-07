@@ -153,7 +153,13 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
     await expect(panel.getByTestId('subagent-detail')).toContainText('Read-only');
     await panel.getByRole('button', { name: 'View child events', exact: true }).click();
     await expect(page.getByTestId('processing-details')).toContainText('Read invoice document');
-    await panel.getByRole('button', { name: 'Stop child', exact: true }).click(); release();
+    const stopping = await page.evaluate(owner => window.flowmate.listSubagents(owner), { parentRunId: rootId, parentSessionId: seed.sessionId });
+    if (!stopping.ok || !stopping.data.items[0]) throw new Error('Stopping child missing');
+    await panel.getByRole('button', { name: 'Stop child', exact: true }).click();
+    await expect.poll(() => page.evaluate(owner => window.flowmate.querySubagent(owner), {
+      parentRunId: rootId, parentSessionId: seed.sessionId, childRunId: stopping.data.items[0].childRunId,
+    })).toMatchObject({ ok: true, data: { cancelRequestedAt: expect.any(String) } });
+    release();
     await expect.poll(() => page.evaluate(() => window.flowmate.queryRuntimeState())).toMatchObject({ ok: true, data: { active: null } });
     await panel.getByRole('button', { name: 'Refresh subagents', exact: true }).click();
     await expect(panel.getByTestId('subagent-detail')).toContainText('cancelled');

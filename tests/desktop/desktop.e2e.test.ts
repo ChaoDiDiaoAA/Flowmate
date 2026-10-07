@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, mkdtemp, waitFor } from '../support/resources.ts';
+import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, installReadGate, mkdtemp, waitFor } from '../support/resources.ts';
 
 it.afterEach(cleanupResources);
 
@@ -54,9 +54,24 @@ it('P6 Activity reads persistent processing through Electron without another mod
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
     await page.getByLabel('Processing request', { exact: true }).selectOption(String(identity.runId));
     await expect(page.getByTestId('processing-details')).toContainText('Processing completed', { timeout: 15_000 });
-    const persisted = await page.evaluate(id => window.flowmate.queryRuntimeEvents({ ...id,
+    await installReadGate(app, userData);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'query_runtime_events'));
+    const pendingPage = page.evaluate(id => window.flowmate.queryRuntimeEvents({ ...id,
       cursor: { runId: id.runId, lastPersistedSequence: 0 }, limit: 100 }), identity);
-    expect(persisted).toMatchObject({ ok: true, data: { coverage: 'from-created' } });
+    await expect.poll(() => app!.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
+    let persisted = await page.evaluate(id => window.flowmate.queryRuntimeEvents({ ...id,
+      cursor: { runId: id.runId, lastPersistedSequence: 0 }, limit: 100 }), identity);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
+    const pendingResult = await pendingPage;
+    expect(pendingResult.ok || pendingResult.error.code === 'event_query_busy', JSON.stringify(pendingResult)).toBe(true);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
+    expect(persisted).toMatchObject({ ok: false, error: { code: 'event_query_busy' } });
+    await expect.poll(async () => {
+      persisted = await page.evaluate(id => window.flowmate.queryRuntimeEvents({ ...id,
+        cursor: { runId: id.runId, lastPersistedSequence: 0 }, limit: 100 }), identity);
+      if (!persisted.ok && persisted.error.code !== 'event_query_busy') throw new Error(JSON.stringify(persisted));
+      return persisted;
+    }, { timeout: 15_000 }).toMatchObject({ ok: true, data: { coverage: 'from-created' } });
     if (persisted.ok) {
       expect(persisted.data.items.map(item => item.sequence)).toEqual(persisted.data.items.map((_, index) => index + 1));
       expect(persisted.data.items.map(item => item.type)).toContain('run_completed');
@@ -92,7 +107,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
     await expect(page.getByTestId('processing-details')).toContainText('Processing completed');
     expect(requestCount).toBe(1);
   } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
-  finally { try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await server.stop(true); } }
+  finally { try { if (app) { await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate')?.restore()).catch(() => {}); await closeDesktopFixture(app, userData, failure); } } finally { await server.stop(true); } }
 });
 
 it('P6 Activity preserves drafts and verified history across a gap, a lost wake and a late page', async () => {
