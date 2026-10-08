@@ -43,6 +43,23 @@ function fixture() {
 }
 
 describe('P11 real resource files and native discovery', () => {
+  it('reports each declared dependency without letting partial readiness bypass admission', () => {
+    const f = fixture(), skill = f.pack('skill', 'partial', 'v1', undefined,
+      [{ kind: 'tool', name: 'read' }, { kind: 'tool', name: 'missing_tool' }, { kind: 'extension', id: 'missing', version: 'v1' }]);
+    const hub = f.service(), selection = { prompt: null, enabledSkills: [skill.ref] };
+    const catalog = hub.catalog({ revision: 1, selection });
+    expect(catalog).toMatchObject({ ok: true, data: { items: [{ enabled: true, available: false, dependencyChecks: [
+      { dependency: { kind: 'tool', name: 'read' }, available: true, reason: null },
+      { dependency: { kind: 'tool', name: 'missing_tool' }, available: false, reason: expect.any(String) },
+      { dependency: { kind: 'extension', id: 'missing' }, available: false, reason: expect.any(String) },
+    ] }] } });
+    expect(hub.validateSelection(selection).ok).toBe(false);
+    expect(hub.freeze({ selection, settingsRevision: 1, activeToolNames: tools, requiredSkill: skill.ref }).ok).toBe(false);
+    const empty = f.pack('skill', 'plain');
+    expect(hub.catalog({ revision: 1, selection: EMPTY_RESOURCE_SELECTION })).toMatchObject({ ok: true,
+      data: { items: expect.arrayContaining([expect.objectContaining({ ref: empty.ref, available: true, dependencyChecks: [] })]) } });
+  });
+
   it('native-discovery-on-explicit-roots preserves native fields and exposes SDK warnings without discovering neighbours', () => {
     const f = fixture();
     const selected = f.pack('skill');

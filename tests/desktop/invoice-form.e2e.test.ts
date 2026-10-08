@@ -496,8 +496,11 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       checkpoint = 'Fill input accepted but its actual Host reply is lost before any apply';
       const openAssistant = page.getByRole('button', { name: 'Open Assistant', exact: true });
       if (await openAssistant.isVisible()) await openAssistant.click();
-      await page.getByText('Next Run limits', { exact: true }).click();
-      await page.getByLabel('Next Run model requests', { exact: true }).fill('31');
+      expect(await page.evaluate(async () => {
+        const state = await window.flowmate.getState(); if (!state.ok) return state;
+        return window.flowmate.saveSettings({ ...state.data.settings, runtime: { ...state.data.settings.runtime,
+          budget: { ...state.data.settings.runtime?.budget, maxModelCalls: 31 } } });
+      })).toMatchObject({ ok: true });
       await dropOneOwnedHostResponse(app, userData, 'submit_invoice_form_input');
       await page.getByRole('button', { name: 'Fill form', exact: true }).click();
       await page.getByText('Fill input delivery is unknown. Check the original status; do not repeat Fill.', { exact: true }).waitFor({ timeout: 20_000 });
@@ -521,7 +524,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
         .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
       await page.getByRole('button', { name: 'Check Fill status', exact: true }).click();
       await page.getByText('The saved input belongs to another form target. Your draft is preserved; check the original Fill again.', { exact: true }).waitFor();
-      expect(await page.getByLabel('Next Run model requests', { exact: true }).inputValue()).toBe('31');
+      expect(await page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { settings: { runtime: { budget: { maxModelCalls: 31 } } } } });
       expect(await page.getByLabel('Invoice number', { exact: true }).inputValue()).toBe('');
       expect(await page.getByRole('button', { name: 'Check Fill status', exact: true }).isEnabled()).toBe(true);
       expect(await page.getByRole('button', { name: 'Fill form', exact: true }).isDisabled()).toBe(true);
@@ -529,7 +532,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { restore(): void } }).saveTransportGate.restore());
       await page.getByRole('button', { name: 'Check Fill status', exact: true }).click();
       await page.getByText(/Original Fill input is (queued|consumed)\. Its form application has not been confirmed\./).waitFor();
-      expect(await page.getByLabel('Next Run model requests', { exact: true }).inputValue()).toBe('');
+      expect(await page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { settings: { runtime: { budget: { maxModelCalls: 31 } } } } });
       expect(requests).toHaveLength(beforeCheck);
       expect(await app.evaluate(() => (globalThis as typeof globalThis & { saveTransportGate: { inputRequests: unknown[] } }).saveTransportGate.inputRequests.length)).toBe(1);
       releaseHeldFill?.();
@@ -543,11 +546,11 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     if (outcome === 'accept-export') {
       const openAssistant = page.getByRole('button', { name: 'Open Assistant', exact: true });
       if (await openAssistant.isVisible()) await openAssistant.click();
-      await page.getByText('Next Run limits', { exact: true }).click();
-      await page.getByLabel('Next Run model requests', { exact: true }).fill('64');
-      await page.getByLabel('Next Run tool calls', { exact: true }).fill('100');
-      await page.getByLabel('Next Run Run timeout (ms)', { exact: true }).fill('150000');
-      await page.getByLabel('Next Run stop wait (ms)', { exact: true }).fill('900');
+      expect(await page.evaluate(async () => {
+        const state = await window.flowmate.getState(); if (!state.ok) return state;
+        return window.flowmate.saveSettings({ ...state.data.settings, runtime: { budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 20000 },
+          timeoutMs: 150000, stopGraceMs: 900 } });
+      })).toMatchObject({ ok: true });
     }
     await page.getByRole('button', { name: 'Fill form', exact: true }).click();
     if (outcome === 'fill-no-tool') {
@@ -579,8 +582,10 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       expect(frozen.run.config).toMatchObject({ version: 2, limits: { timeoutMs: 150_000, stopGraceMs: 900 },
         runtimeBudget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 20_000 } });
       expect(frozen.input.content).toMatchObject({ version: 2, requestIdentityVersion: 1,
-        originalBudgetOverrides: { budget: { maxModelCalls: 64, maxToolCalls: 100 }, timeoutMs: 150_000, stopGraceMs: 900 } });
-      expect(await page.getByLabel('Next Run model requests', { exact: true }).inputValue()).toBe('');
+        originalBudgetOverrides: {} });
+      if (!('originalBudgetOverrides' in frozen.input.content)) throw new Error('Missing original budget identity');
+      expect(frozen.input.content.originalBudgetOverrides).toEqual({});
+      expect(await page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { settings: { runtime: { budget: { maxModelCalls: 64 } } } } });
     }
     const beforeQuery = requests.length;
     await page.getByRole('button', { name: 'Check Fill status', exact: true }).click();

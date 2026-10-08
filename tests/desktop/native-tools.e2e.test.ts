@@ -82,8 +82,12 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
     await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, directoryA);
     await page.getByRole('button', { name: 'Choose directory', exact: true }).click();
     await page.waitForFunction(directory => (document.querySelector('.run-tools-panel input') as HTMLInputElement)?.value === directory, directoryA);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
+    await page.getByText('Diagnostics', { exact: true }).click();
     await page.getByRole('button', { name: 'Refresh tools', exact: true }).click();
-    await page.getByLabel('Native tool availability').getByText('powershell', { exact: true }).waitFor();
+    await page.getByText('Diagnostics', { exact: true }).locator('..').getByText('powershell', { exact: true }).waitFor();
+    await nav.getByRole('button', { name: 'Chats', exact: true }).click();
     expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(before);
     expect(await page.evaluate(() => window.flowmate.listSessions())).toMatchObject({ ok: true, data: { items: [] } });
     expect(requests).toHaveLength(0);

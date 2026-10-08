@@ -29,8 +29,8 @@ export function ResourceFile({ identity, ref: resource, path, run, enabled = tru
   </section>;
 }
 
-export function ResourcePage({ kind, hostEpoch, ready, revision, onSaved }: {
-  kind: 'prompt' | 'skill'; hostEpoch: number; ready: boolean; revision: number; onSaved(): Promise<void>;
+export function ResourcePage({ kind, hostEpoch, ready, revision, onSaved, embedded = false }: {
+  kind: 'prompt' | 'skill'; hostEpoch: number; ready: boolean; revision: number; onSaved(): Promise<void>; embedded?: boolean;
 }) {
   const identity: ContextIdentity = { hostEpoch, sessionId: 0, runId: null, selectionToken: 0 };
   const catalog = useRead<ResourceCatalog>(identity), saving = useRead<ResourceSelectionResult>(identity);
@@ -57,19 +57,19 @@ export function ResourcePage({ kind, hostEpoch, ready, revision, onSaved }: {
   }
   const data = catalog.state.data;
   const blocked = !ready || !data || data.settingsRevision < revision || catalog.state.pending || saving.state.pending || refreshRequired;
-  const visible = data?.items.filter(item => item.ref.kind === kind && (filter === 'all' || filter === 'enabled' && item.enabled || filter === 'disabled' && !item.enabled
-    || filter === 'available' && item.available || filter === 'unavailable' && !item.available)
+  const visible = data?.items.filter(item => item.ref.kind === kind && (filter === 'all' || filter === 'ready' && item.enabled && item.available || filter === 'disabled' && !item.enabled
+    || filter === 'partial' && item.enabled && !item.available)
     && `${item.name} ${item.ref.id} ${item.ref.version} ${item.description} ${item.keywords.join(' ')}`.toLowerCase().includes(search.toLowerCase())) ?? [];
-  return <section className="page-content"><div className="page-heading"><div><h1>{kind === 'prompt' ? 'Prompts' : 'Skills'}</h1>
-    <p>{kind === 'prompt' ? 'View versioned business instructions and choose the Prompt for later Runs.' : 'Discover and enable Skills. Their files are read only when requested.'}</p></div>
+  const title = kind === 'prompt' ? 'Business instructions' : 'Skills';
+  return <section className={embedded ? 'embedded-resources' : 'page-content'}><div className="page-heading"><div>{embedded ? <h2>{title}</h2> : <h1>{title}</h1>}
+    <p>{kind === 'prompt' ? 'Choose the business instructions for future conversations.' : 'Find and manage the skills available to your assistant.'}</p></div>
     <button className="secondary-button" disabled={!ready || catalog.state.pending || saving.state.pending} onClick={() => void refresh()}>Refresh resources</button></div>
     {notice && <p role="status">{notice}</p>}{!ready && <p role="alert">The Host is unavailable.</p>}
     {catalog.state.error && <p role="alert">{catalog.state.error}</p>}{saving.state.error && <p role="alert">{saving.state.error}</p>}
     {refreshRequired && <p role="alert">Refresh resources to confirm the saved selection before trying again.</p>}
-    {kind === 'skill' && <div className="context-controls"><label>Search skills<input aria-label="Search skills" value={search} onChange={event => setSearch(event.target.value)} /></label>
-      <label>Skill status<select aria-label="Skill status" value={filter} onChange={event => setFilter(event.target.value)}>
-        <option value="all">All</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option>
-        <option value="available">Available</option><option value="unavailable">Unavailable</option></select></label></div>}
+    {kind === 'skill' && <div className="skill-controls"><label className="field"><span className="sr-only">Search skills</span><input aria-label="Search skills" placeholder="Search skills…" value={search} onChange={event => setSearch(event.target.value)} /></label>
+      <div className="skill-filters" aria-label="Skill status">{['all', 'ready', 'partial', 'disabled'].map(status =>
+        <button key={status} className="secondary-button" aria-pressed={filter === status} onClick={() => setFilter(status)}>{status[0]!.toUpperCase() + status.slice(1)}</button>)}</div></div>}
     <button className="text-button" disabled={!ready || catalog.state.pending || saving.state.pending || refreshRequired}
       onClick={() => void save(EMPTY_RESOURCE_SELECTION)}>Clear all resource selections</button>
     {kind === 'prompt' && <p>Selected: {data?.selection.prompt ? label(data.selection.prompt) : 'None'} <button className="text-button" disabled={blocked || !data?.selection.prompt}
@@ -78,48 +78,37 @@ export function ResourcePage({ kind, hostEpoch, ready, revision, onSaved }: {
     {data?.selection.enabledSkills.filter(ref => !data.items.some(item => resourceRefKey(item.ref) === resourceRefKey(ref))).map(ref => <p key={resourceRefKey(ref)}>
       Missing enabled version: {label(ref)} <button disabled={blocked} onClick={() => void save({ ...data.selection,
         enabledSkills: data.selection.enabledSkills.filter(item => resourceRefKey(item) !== resourceRefKey(ref)) })}>Disable missing {label(ref)}</button></p>)}
-    <div className="model-list">{visible.map(item => <article className="panel" key={resourceRefKey(item.ref)}><h3>{label(item.ref)}</h3><p>{item.description}</p>
+    <div className={kind === 'skill' ? 'skill-list' : 'model-list'}>{visible.map(item => <article className={kind === 'skill' ? 'skill-row' : 'panel'} key={resourceRefKey(item.ref)}>
+      {kind === 'skill' ? <><div className="skill-row-main"><div className="skill-row-copy"><h3>{item.name}</h3><p>{item.description}</p>
+        <button className="text-button" onClick={() => { setSelected(item); setPath(item.bodyFile); }}>View {label(item.ref)}</button></div>
+        <div className="skill-readiness"><span className={`status-dot ${item.available ? 'ready' : ''}`} aria-hidden="true" />
+          <span>{item.dependencyChecks.length ? `${item.dependencyChecks.filter(check => check.available).length}/${item.dependencyChecks.length} requirements ready` : 'No requirements'}</span>
+          <small>{!item.enabled ? 'Disabled' : item.available ? 'Ready' : 'Partial'}</small></div>
+        <button type="button" role="switch" aria-checked={item.enabled} aria-label={`${item.enabled ? 'Disable' : 'Enable'} ${label(item.ref)}`}
+          className="resource-switch" disabled={blocked || !item.enabled && !item.available} onClick={() => data && void save({ ...data.selection,
+            enabledSkills: item.enabled ? data.selection.enabledSkills.filter(ref => resourceRefKey(ref) !== resourceRefKey(item.ref))
+              : [...data.selection.enabledSkills.filter(ref => ref.id !== item.ref.id), item.ref] })}><span /></button></div>
+        {item.dependencyChecks.some(check => !check.available) && <div className="missing-requirements">{item.dependencyChecks.filter(check => !check.available).map((check, index) =>
+          <span key={index} title={check.reason ?? undefined}>{check.dependency.kind === 'tool' ? check.dependency.name : check.dependency.id}</span>)}</div>}
+        {item.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.message}</p>)}
+      </> : <><h3>{label(item.ref)}</h3><p>{item.description}</p>
       <p>{item.enabled ? 'Selected / enabled' : 'Disabled'} · {item.available ? 'Verified discovery' : 'Unavailable'}{item.disableModelInvocation && ' · Explicit invocation only'}</p>
       <button className="text-button" onClick={() => { setSelected(item); setPath(item.bodyFile); }}>View {label(item.ref)}</button>{' '}
       <button className="secondary-button" disabled={blocked || !item.enabled && !item.available} onClick={() => data && void save(kind === 'prompt'
         ? { ...data.selection, prompt: item.ref } : { ...data.selection, enabledSkills: item.enabled
           ? data.selection.enabledSkills.filter(ref => resourceRefKey(ref) !== resourceRefKey(item.ref))
           : [...data.selection.enabledSkills.filter(ref => ref.id !== item.ref.id), item.ref] })}>{kind === 'prompt' ? 'Use' : item.enabled ? 'Disable' : 'Enable'} {label(item.ref)}</button>
-      {item.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.code} · {diagnostic.message}</p>)}</article>)}</div>
+      {item.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.code} · {diagnostic.message}</p>)}</>}</article>)}</div>
     {data && visible.length === 0 && <p>No matching resources.</p>}
     {selected && <section className="panel" aria-label="Resource details"><h3>{label(selected.ref)}</h3><p>Content SHA-256 {selected.ref.contentHash}</p>
       <p>Keywords: {selected.keywords.join(', ') || 'None'}</p><h4>Dependencies</h4>
-      {selected.dependencies.length ? <ul>{selected.dependencies.map((item, index) => <li key={index}>{item.kind} · {'name' in item ? item.name : item.id}{'version' in item ? ` ${item.version}` : ''}</li>)}</ul> : <p>None</p>}
+      {selected.dependencyChecks.length ? <ul>{selected.dependencyChecks.map((check, index) => <li key={index}>{check.dependency.kind} · {'name' in check.dependency ? check.dependency.name : check.dependency.id}
+        {'version' in check.dependency ? ` ${check.dependency.version}` : ''} · {check.available ? 'Ready' : check.reason}</li>)}</ul> : <p>No requirements</p>}
+      {kind === 'skill' && <p>{selected.disableModelInvocation ? 'Explicit invocation only.' : 'Available for automatic discovery when enabled and ready.'}</p>}
       <label>Resource file<select aria-label="Resource file" value={path} onChange={event => setPath(event.target.value)}>{selected.files.map(file => <option key={file.path} value={file.path}>{file.path}</option>)}</select></label>
       <ResourceFile key={`${resourceRefKey(selected.ref)}:${path}`} identity={identity} ref={selected.ref} path={path} enabled={ready && (kind === 'prompt' || selected.enabled)} />
       <p>Reading references, assets or scripts does not execute scripts or install dependencies.</p></section>}
   </section>;
-}
-
-export function RequiredSkillPicker({ identity, ready, revision, value, onChange }: {
-  identity: ContextIdentity; ready: boolean; revision: number; value: ResourceRef | null; onChange(value: ResourceRef | null): void;
-}) {
-  const choices = useRead<readonly ResourceRef[]>(identity);
-  async function refresh() {
-    await choices.read('skill-choices', async () => {
-      if (identity.runId !== null) {
-        const result = await window.flowmate.queryRunResources({ sessionId: identity.sessionId, runId: identity.runId });
-        return result.ok ? { ok: true, data: result.data.frozen?.discoveredSkills ?? [] } : result;
-      }
-      const result = await window.flowmate.listResources();
-      return result.ok ? { ok: true, data: result.data.items.filter(item => item.ref.kind === 'skill' && item.enabled && item.available).map(item => item.ref) } : result;
-    }, () => true);
-  }
-  useEffect(() => { onChange(null); if (ready) void refresh(); }, [identity.hostEpoch, identity.sessionId, identity.runId, ready]);
-  useEffect(() => { if (ready && identity.runId === null) void refresh(); }, [revision]);
-  return <div className="next-run-limits"><label>Required Skill for next input<select aria-label="Required Skill for next input" value={value ? resourceRefKey(value) : ''}
-    disabled={!ready || choices.state.pending || choices.state.error !== null} onChange={event => onChange(choices.state.data?.find(ref => resourceRefKey(ref) === event.target.value) ?? null)}>
-    <option value="">None</option>{value && !choices.state.data?.some(ref => resourceRefKey(ref) === resourceRefKey(value)) && <option value={resourceRefKey(value)}>Unavailable: {label(value)}</option>}
-    {choices.state.data?.map(ref => <option key={resourceRefKey(ref)} value={resourceRefKey(ref)}>{label(ref)}</option>)}</select></label>
-    <button className="text-button" disabled={!ready || choices.state.pending} onClick={() => void refresh()}>Refresh Skill choices</button>
-    {choices.state.error && <p role="alert">{choices.state.error}</p>}
-    <p>{identity.runId === null ? 'Uses an enabled fixed version when you Send or Fill.' : 'Uses this active Run’s fixed Skill versions for Steer or Follow up.'}</p>
-  </div>;
 }
 
 export function RunResources({ identity, ready, refreshToken }: { identity: ContextIdentity; ready: boolean; refreshToken: number }) {

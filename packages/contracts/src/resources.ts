@@ -130,8 +130,16 @@ export const ResourceCatalogSchema = z.object({ settingsRevision: integer, selec
   items: z.array(z.object({ ref: ResourceRefSchema, name: z.string().min(1).max(64), description: z.string().max(1024),
     keywords: z.array(z.string().max(64)).max(16).readonly(), enabled: z.boolean(), available: z.boolean(),
     disableModelInvocation: z.boolean(), bodyFile: ResourceFilePathSchema, files: z.array(z.object(manifestFileShape).strict().readonly()).max(RESOURCE_LIMITS.files).readonly(), dependencies: z.array(ResourceDependencySchema).max(64).readonly(),
+    dependencyChecks: z.array(z.object({ dependency: ResourceDependencySchema, available: z.boolean(),
+      reason: z.string().min(1).max(2048).nullable() }).strict().readonly()).max(RESOURCE_LIMITS.dependencies).readonly(),
     diagnostics: z.array(diagnostic).max(128).readonly() }).strict().readonly()).max(RESOURCE_LIMITS.packages).readonly(),
-}).strict().readonly();
+}).strict().superRefine((value, context) => {
+  for (const item of value.items) {
+    if (item.dependencyChecks.length !== item.dependencies.length || item.dependencyChecks.some((check, index) =>
+      dependencyKey(check.dependency) !== dependencyKey(item.dependencies[index]!) || check.available !== (check.reason === null)))
+      report(context, 'Dependency checks must match declared requirements and explain unavailable requirements.');
+  }
+}).readonly();
 export type ResourceCatalog = z.infer<typeof ResourceCatalogSchema>;
 export const ResourceFileRequestSchema = z.object({ ref: ResourceRefSchema, path: ResourceFilePathSchema,
   offset: integer.optional(), limit: integer.min(4).max(RESOURCE_LIMITS.pageBytes).optional() }).strict();

@@ -944,6 +944,11 @@ async function callProvider(inputRaw: unknown): Promise<Result<{ requestId: stri
   if (state.data.modelCredentials[model.id] !== 'configured')
     return fail(appError('model_credential_missing', 'input', 'Save an API key for this model in Models.'));
   const requestId = randomUUID();
+  let admittedRunId: number | null = null;
+  const unsubscribe = host.subscribe(event => {
+    if ((event.type === 'provider_observation' && event.observation === 'run_created' || event.type === 'provider_finished')
+      && event.requestId === requestId && Number.isSafeInteger(event.runId) && event.runId > 0) admittedRunId = event.runId;
+  });
   try {
     const value = await host.request({
       type: 'call_provider',
@@ -956,8 +961,10 @@ async function callProvider(inputRaw: unknown): Promise<Result<{ requestId: stri
     }
     return { ok: true, data: { requestId, runId: value.data.runId } };
   } catch {
+    // Recover a lost receipt only from this request's actual Host admission.
+    if (admittedRunId !== null) return { ok: true, data: { requestId, runId: admittedRunId } };
     return fail(appError('host_request_failed', 'runtime', 'Provider 请求未能提交给 Bun Host。', true));
-  }
+  } finally { unsubscribe(); }
 }
 
 async function cancelProvider(value: unknown): Promise<Result<{ accepted: boolean; runId: number | null }>> {

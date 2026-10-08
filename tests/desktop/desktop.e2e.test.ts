@@ -791,6 +791,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
       { modelId: 'p5-model', apiKey: 'synthetic-p5-key' });
     }, `http://127.0.0.1:${server.port}`)).toMatchObject({ ok: true });
     await page.locator('.rail').getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
     await page.getByLabel('Default model requests', { exact: true }).fill('32');
     await page.getByLabel('Default tool calls', { exact: true }).fill('40');
     await page.getByLabel('Default tool timeout (ms)', { exact: true }).fill('20000');
@@ -798,10 +799,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     await page.getByRole('button', { name: 'Save Run limits', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: 'Run limits saved.' })).toBeVisible();
     expect(requests).toHaveLength(0);
-    await page.getByText('Next Run limits', { exact: true }).click();
-    await page.getByLabel('Next Run model requests', { exact: true }).fill('64');
-    await page.getByLabel('Next Run tool calls', { exact: true }).fill('50');
-    await page.getByLabel('Next Run Run timeout (ms)', { exact: true }).fill('120000');
+    await expect(page.getByText('Next Run limits', { exact: true })).toHaveCount(0);
     await electronApp.evaluate(({ ipcMain }) => {
       const handlers = (ipcMain as unknown as { _invokeHandlers: Map<string, (...args: unknown[]) => unknown> })._invokeHandlers;
       const original = handlers.get('flowmate:submit-input'); if (!original) throw new Error('Missing submit-input');
@@ -821,8 +819,8 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
       if (!active.ok || !active.data.active || active.data.active.kind === 'compaction') throw new Error('Missing active Run');
       return window.flowmate.queryRun(active.data.active.runId);
     })).toMatchObject({ ok: true, data: { config: { version: 2,
-      runtimeBudget: { maxModelCalls: 64, maxToolCalls: 50, toolTimeoutMs: 20000 },
-      limits: { timeoutMs: 120000, stopGraceMs: 5000 } } } });
+      runtimeBudget: { maxModelCalls: 32, maxToolCalls: 40, toolTimeoutMs: 20000 },
+      limits: { timeoutMs: 90000, stopGraceMs: 5000 } } } });
     const active = await page.evaluate(() => window.flowmate.queryRuntimeState());
     expect(active).toMatchObject({ ok: true, data: { active: { runId: expect.any(Number), sessionId: expect.any(Number) } } });
     if (!active.ok || !active.data.active || active.data.active.kind === 'compaction' || active.data.active.sessionId === null) throw new Error('P5 Run did not start');
@@ -935,7 +933,12 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
         return result;
       });
     }, unknownCode);
-    await page.getByLabel('Next Run model requests', { exact: true }).fill('31');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
+    await page.getByLabel('Default model requests', { exact: true }).fill('31');
+    await page.getByRole('button', { name: 'Save Run limits', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Run limits saved.' })).toBeVisible();
+    await page.getByRole('button', { name: 'Chats', exact: true }).click();
     await composer.fill('P5 unknown receipt input');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
@@ -943,11 +946,11 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     expect(actualPromptReceipt, JSON.stringify({ actualPromptReceipt, workspace: await page.evaluate(() => window.flowmate.readWorkspace()) })).toMatchObject({ ok: true });
     await expect(composer).toHaveValue('P5 unknown receipt input');
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
-    await expect(page.getByLabel('Next Run model requests', { exact: true })).toHaveValue('31');
+    expect(await page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { settings: { runtime: { budget: { maxModelCalls: 31 } } } } });
     await page.getByRole('button', { name: 'Check input status', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toHaveCount(0);
     await expect(composer).toHaveValue('');
-    await expect(page.getByLabel('Next Run model requests', { exact: true })).toHaveValue('');
+    expect(await page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { settings: { runtime: { budget: { maxModelCalls: 31 } } } } });
     await expect.poll(async () => {
       const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
       return inputs.ok ? inputs.data.items.length : 0;
@@ -1227,9 +1230,12 @@ it(`desktop shows the actual frozen ${limit} allowance after budget exhaustion`,
     await page.reload();
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     await page.getByRole('button', { name: 'New chat', exact: true }).click();
-    await page.getByText('Next Run limits', { exact: true }).click();
-    await page.getByLabel('Next Run model requests', { exact: true }).fill(limit === 'model' ? '1' : '4');
-    await page.getByLabel('Next Run tool calls', { exact: true }).fill(limit === 'tool' ? '1' : '3');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
+    await page.getByLabel('Default model requests', { exact: true }).fill(limit === 'model' ? '1' : '4');
+    await page.getByLabel('Default tool calls', { exact: true }).fill(limit === 'tool' ? '1' : '3');
+    await page.getByRole('button', { name: 'Save Run limits', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Run limits saved.' })).toBeVisible();
     await page.getByRole('textbox', { name: 'Message to model' }).fill(`Exhaust the frozen ${limit} allowance`);
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled({ timeout: 15_000 });
     await page.getByRole('button', { name: 'Send', exact: true }).click();
@@ -1978,6 +1984,7 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
     expect(await check.isDisabled()).toBe(true);
     expect(await page.getByTestId('runtime-feedback').count()).toBe(0);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
     await page.getByText('Diagnostics', { exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Runtime is blocked'));
     expect(await page.getByTestId('runtime-feedback').textContent()).toContain('blocked');
@@ -2100,6 +2107,7 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
     await expect(check).toBeDisabled();
     expect(await page.getByTestId('runtime-feedback').count()).toBe(0);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
     await page.getByText('Diagnostics', { exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('blocked'));
 
@@ -2168,6 +2176,7 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
         state: { ...desktop, ready: false, host: 'error' } });
     }, connectedState.data);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
     await page.getByText('Diagnostics', { exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-testid="runtime-feedback"]')?.textContent?.includes('Host is not ready'));
     await app.evaluate(() => (globalThis as unknown as { desktopStateUiGate: { release: (() => void) | null } }).desktopStateUiGate.release?.());
@@ -2217,6 +2226,7 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
       BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state: gate.unavailable });
     }, removedState.data);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('tab', { name: 'Performance', exact: true }).click();
     await page.getByText('Diagnostics', { exact: true }).click();
     await expect(page.getByTestId('runtime-feedback')).toContainText('Host is not ready');
     await app.evaluate(() => (globalThis as unknown as { modelRemovalGate: { release: (() => void) | null } }).modelRemovalGate.release?.());

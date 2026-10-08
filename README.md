@@ -10,7 +10,7 @@
 bun install --frozen-lockfile
 ```
 
-模型只在桌面 **Models** 页面配置。选择 Pi 内置供应商和模型后，在页面填写并保存 API Key；现行桌面不使用环境变量或旧 OAuth 凭据代替该 Key。明确选择 **Custom model** 才填写 Base URL、Pi API 类型和实际模型能力。凭据保存在系统加密存储中。评测用的 Judge、Langfuse 可单独配置 [.env.example](.env.example)。
+模型在桌面 **Models** 或 **Settings → LLM** 配置，两处复用同一设置。选择 Pi 内置供应商和模型后，在页面填写并保存 API Key；现行桌面不使用环境变量或旧 OAuth 凭据代替该 Key。明确选择 **Custom model** 才填写 Base URL、Pi API 类型和实际模型能力。凭据保存在系统加密存储中。评测用的 Judge、Langfuse 可单独配置 [.env.example](.env.example)。
 
 ## 启动与使用
 
@@ -21,7 +21,7 @@ bun run dev                       # 启动桌面应用
 bun --no-env-file run test        # 工程验证，不运行 Agent 评测
 ```
 
-桌面启动、打开页面和保存配置不会自动请求模型。用户点击 **Test connection**、Assistant 的 **Send** 或 **Fill with Agent** 才会请求模型，可能产生费用。新会话的 Pi 原生历史保存到 SQLite，可在重启后续聊；升级前没有原生历史的旧会话只读。桌面正式数据位于 `%APPDATA%\Flowmate`，工程测试使用隔离临时目录。
+桌面启动、打开页面和保存配置不会自动请求模型。用户点击 **Test connection**、Prompts 的 **Optimize**、Assistant 的 **Send** 或 **Fill with Agent** 才会请求模型，可能产生费用。新会话的 Pi 原生历史保存到 SQLite，可在重启后续聊；升级前没有原生历史的旧会话只读。桌面正式数据位于 `%APPDATA%\Flowmate`，工程测试使用隔离临时目录。
 
 开发时 Renderer 支持热更新；修改 Main/Preload 会先停止当前请求、关闭旧 Host 和 Electron，再构建和启动新实例。构建失败会等待修正，停止未确认会阻止重启。结束开发请按 Ctrl+C，等待关闭完成。
 
@@ -31,9 +31,15 @@ bun --no-env-file run test        # 工程验证，不运行 Agent 评测
 
 在 **Invoices → Results** 明确选择未接受候选后，可点击 **Fill with Agent** 通过独立录入 Run 填入固定表单，或点击 **Edit** 直接人工编辑。**Save changes** 有真实差异才追加人工版本；**Accept result** 独立接受已保存版本，随后可导出 JSON、CSV、Markdown。打开、选择、人工保存和接受均不请求模型。未保存副本只存在于当前窗口，离开/正常关闭提供 Save、Discard、Continue editing；未知提交先查询原操作，不自动再填或再保存，重启只恢复已保存候选。
 
-**Chats → Run tools** 可用 **Choose directory** 设置下一次发送的工作目录，或用 **Use Run directory** 恢复默认的 `%APPDATA%\Flowmate\runtime\<runId>\work`。**Refresh tools** 查看当前平台支持的 Pi 原生工具；选择和刷新不执行，仍用普通 Assistant **Send** 发起、**Stop** 停止。目录不是沙箱，平台支持也不保证 Shell／搜索依赖已经可执行，实际缺失由 SDK 返回。
+**Chats → Working directory** 可用 **Choose directory** 设置下一次发送的工作目录，或用 **Use Run directory** 恢复默认的 `%APPDATA%\Flowmate\runtime\<runId>\work`。**Settings → Performance → Diagnostics → Refresh tools** 查看当前平台支持的 Pi 原生工具；选择和刷新不执行，仍用普通 Assistant **Send** 发起、**Stop** 停止。目录不是沙箱，平台支持也不保证 Shell／搜索依赖已经可执行，实际缺失由 SDK 返回。
 
-**Models** 和 **Settings → Diagnostics** 显示 Runtime 是否可继续，**Check runtime status** 只查询状态。取消受理、回答结束或数据库终态都不单独证明可以发送下一条；实际执行仍占用、必要保存失败或停止证据不足时，Send／Test connection 保持禁用。重启会核验原 Run／工具，不会重放或把未知停止改为成功；缺证据时仍只读受阻，具体实现与工程证据见 [P1 实施计划 §11.8](docs/plans/P1_实施计划_v1.md#p1-state-increment)。
+**Settings → Performance** 显示 Runtime 是否可继续，**Check runtime status** 只查询状态。取消受理、回答结束或数据库终态都不单独证明可以发送下一条；实际执行仍占用、必要保存失败或停止证据不足时，Send／Test connection 保持禁用。重启会核验原 Run／工具，不会重放或把未知停止改为成功；缺证据时仍只读受阻，具体实现与工程证据见 [P1 实施计划 §11.8](docs/plans/P1_实施计划_v1.md#p1-state-increment)。
+
+**Prompts** 提供原稿、可选优化要求和可编辑优化稿；Copy 和 Use in chat 只复制或填入/追加草稿，不发送。草稿仅保留当前窗口，重启不恢复。固定业务 Prompt 版本选择在 **Settings → LLM → Business instructions**。**Skills** 用搜索、All / Ready / Partial / Disabled 和开关管理；逐项依赖缺失仍阻止运行。**Extensions** 展示已登记插件，配置启用与当前会话实际加载分别显示，技术与历史证据在详情。
+
+**Settings** 分为 General / LLM / Connections / Skills / Performance。默认运行预算在 Performance；普通 Send / Fill 使用默认值，已受理请求的原预算与身份不变。Assistant 保留消息、真实业务上下文及输入/发送/停止；使用 `/skill:name` 可提出显式技能要求。
+
+本次界面调整的实现和验收见 [UI11 实施记录](docs/plans/P11_实施计划_v1.md#ui11-实施记录)，各页面与预算分别映射 UI03 / UI05 / UI12。
 
 ## 文档导航
 

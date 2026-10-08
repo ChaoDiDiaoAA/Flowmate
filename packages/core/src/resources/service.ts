@@ -134,7 +134,7 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
     });
     if (!verified.ok) diagnostics.push({ code: verified.error.code, message: verified.error.message });
     return { ref, manifest, directory: root, contents, item: { ref, name, description, keywords: manifest.keywords,
-      enabled: false, available: diagnostics.length === 0, disableModelInvocation, bodyFile: manifest.bodyFile, files: manifest.files, dependencies: manifest.requires, diagnostics } };
+      enabled: false, available: diagnostics.length === 0, disableModelInvocation, bodyFile: manifest.bodyFile, files: manifest.files, dependencies: manifest.requires, dependencyChecks: [], diagnostics } };
   }
   function discover() {
     const packages: Package[] = [], diagnostics: ResourceCatalog['diagnostics'][number][] = [];
@@ -181,7 +181,12 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
     const key = resourceRefKey(pack.ref);
     if (visiting.has(key)) reject('resource_dependency_missing', 'Selected Skill dependencies contain a cycle.');
     visiting.add(key);
-    for (const dependency of pack.manifest.requires) {
+    try { for (const dependency of pack.manifest.requires)
+      checkDependency(dependency, packages, selection, tools, availableExtensions, visiting);
+    } finally { visiting.delete(key); }
+  }
+  function checkDependency(dependency: ResourceDependency, packages: Package[], selection: ResourceSelection,
+    tools: ReadonlySet<string>, availableExtensions: AvailableExtensions, visiting: Set<string>) {
       if (dependency.kind === 'tool') {
         if (!tools.has(dependency.name)) reject('resource_dependency_missing', 'A declared tool is unavailable in this scope.');
       } else if (dependency.kind === 'extension') {
@@ -194,8 +199,6 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
           reject('resource_dependency_missing', 'A declared Skill dependency is not explicitly enabled at its fixed version.');
         dependencies(find(packages, ref), packages, selection, tools, availableExtensions, visiting);
       }
-    }
-    visiting.delete(key);
   }
   function readBundle(hash: string): ResourceBundleManifest {
     const raw = bytes(safePath(bundleRoot, `${hash}/bundle.json`), RESOURCE_LIMITS.manifestBytes * RESOURCE_LIMITS.packages * 2 + 65536);
@@ -266,7 +269,12 @@ export function createResourceService(options: { resourceRoot: string; bundleRoo
         const enabled = (pack.ref.kind === 'prompt' ? selection.prompt && resourceRefKey(selection.prompt) === resourceRefKey(pack.ref)
           : selection.enabledSkills.some(ref => resourceRefKey(ref) === resourceRefKey(pack.ref))) === true;
         const validated = checked(() => { find(packages, pack.ref); dependencies(pack, packages, selection, registeredTools, input.availableExtensions); });
-        return { ...pack.item, enabled, available: validated.ok,
+        const dependencyChecks = pack.manifest.requires.map(dependency => {
+          const result = checked(() => checkDependency(dependency, packages, selection, registeredTools,
+            input.availableExtensions ?? [], new Set([resourceRefKey(pack.ref)])));
+          return { dependency, available: result.ok, reason: result.ok ? null : result.error.message };
+        });
+        return { ...pack.item, enabled, available: validated.ok, dependencyChecks,
           diagnostics: validated.ok ? pack.item.diagnostics : pack.item.diagnostics.length ? pack.item.diagnostics : [{ code: validated.error.code, message: validated.error.message }] };
       });
       for (const ref of [...(selection.prompt ? [selection.prompt] : []), ...selection.enabledSkills]) {

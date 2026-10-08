@@ -70,7 +70,8 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
     await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Extensions', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Extensions', exact: true })).toBeVisible();
-    await page.getByRole('button', { name: 'Enable invoice-assist v1', exact: true }).click(); await expect(page.getByRole('status')).toContainText('Saved');
+    await page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true }).click(); await expect(page.getByRole('status')).toContainText('Saved');
+    await page.locator('details[aria-label="Session extension instance"]').evaluate(node => { (node as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Session', { exact: true }).selectOption(String(seed.sessionId));
     await expect(page.getByText('No instance recorded in this Host.', { exact: false })).toBeVisible();
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('Check the selected invoice');
@@ -92,6 +93,7 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
     await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click();
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'query_session_extensions'));
+    await page.locator('details[aria-label="Session extension instance"]').evaluate(node => { (node as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Session', { exact: true }).selectOption(String(seed.otherSessionId));
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(2);
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
@@ -99,13 +101,15 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
     await expect(page.getByTestId('extension-session-pending')).toHaveCount(0);
     await expect(page.getByTestId('extension-instance')).toHaveCount(0);
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
+    await page.locator('details[aria-label="Session extension instance"]').evaluate(node => { (node as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Session', { exact: true }).selectOption(String(seed.sessionId));
     await expect(page.getByTestId('extension-instance')).toContainText(firstId);
+    await page.locator('summary').filter({ hasText: /^History details$/ }).evaluate(node => { (node.parentElement as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Run', { exact: true }).selectOption(String(runId)); await expect(page.getByText(`Assembly: ${firstId}`, { exact: true })).toBeVisible();
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('Run until stopped'); await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect.poll(() => payloads.length).toBe(3); await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Release Session extensions', exact: true })).toBeDisabled();
-    await page.getByRole('button', { name: 'Disable invoice-assist v1', exact: true }).click(); await expect(page.getByRole('status')).toContainText('Saved');
+    await page.getByRole('switch', { name: 'Disable invoice-assist v1', exact: true }).click(); await expect(page.getByRole('status')).toContainText('Saved');
     const active = await page.evaluate(() => window.flowmate.queryRuntimeState()); if (!active.ok || !active.data.active) throw new Error('Active Run missing');
     expect(await page.evaluate(owner => window.flowmate.queryRunExtensions(owner), { sessionId: seed.sessionId, runId: active.data.active.runId! }))
       .toMatchObject({ ok: true, data: { frozen: { included: [{ ref: { id: 'invoice-assist' } }] } } });
@@ -116,10 +120,12 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
     await expect(page.getByTestId('extension-instance')).toContainText('disposed · closed'); await expect(page.getByRole('status')).toContainText('Session resources released');
     await closeDesktopFixture(app, userData); app = await launch(userData, sourceRoot); page = await app.firstWindow();
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
+    await page.locator('details[aria-label="Session extension instance"]').evaluate(node => { (node as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Session', { exact: true }).selectOption(String(seed.sessionId));
     await expect(page.getByTestId('extension-instance')).toHaveCount(0);
+    await page.locator('summary').filter({ hasText: /^History details$/ }).evaluate(node => { (node.parentElement as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Run', { exact: true }).selectOption(String(runId)); await expect(page.getByText(`Assembly: ${firstId}`, { exact: true })).toBeVisible();
-    await page.getByRole('button', { name: 'Enable invoice-assist v1', exact: true }).click();
+    await page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true }).click();
     // P8 deliberately blocks the conversation whose request was interrupted. Releasing an extension cannot clear that fact.
     expect(await page.evaluate(sessionId => window.flowmate.querySession(sessionId), seed.sessionId)).toMatchObject({ ok: true, data: { availability: 'unusable' } });
     const nextSession = await page.evaluate(async () => {
@@ -129,6 +135,7 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
       if (!selected.ok) throw new Error(selected.error.code); return session.data.sessionId;
     });
     await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor(); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
+    await page.locator('details[aria-label="Session extension instance"]').evaluate(node => { (node as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Session', { exact: true }).selectOption(String(nextSession));
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('New Host assembly'); await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect.poll(() => payloads.length).toBe(4);
@@ -149,19 +156,19 @@ it('[F12-03/24] confirms a lost save receipt by rereading real settings and igno
   try {
     const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     await installReadGate(app, userData); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
-    await expect(page.getByRole('button', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
+    await expect(page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
     await app.evaluate(() => { const gate = Reflect.get(globalThis, 'contextReadGate'); gate.hold(0, 'update_extension_selection'); gate.fail(); });
-    await page.getByRole('button', { name: 'Enable invoice-assist v1', exact: true }).click();
+    await page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true }).click();
     await expect(page.getByText('Refresh extensions to confirm the saved selection before trying again.', { exact: true })).toBeVisible();
     expect(await page.evaluate(() => window.flowmate.listExtensions())).toMatchObject({ ok: true, data: { revision: 1, selection: { enabledExtensions: [{ id: 'invoice-assist' }] } } });
-    await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click(); await expect(page.getByRole('button', { name: 'Disable invoice-assist v1', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click(); await expect(page.getByRole('switch', { name: 'Disable invoice-assist v1', exact: true })).toBeEnabled();
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'list_extensions'));
     await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click();
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
-    await page.getByRole('button', { name: 'Disable invoice-assist v1', exact: true }).click(); await expect(page.getByRole('status')).toContainText('Saved');
-    await expect(page.getByRole('button', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
+    await page.getByRole('switch', { name: 'Disable invoice-assist v1', exact: true }).click(); await expect(page.getByRole('status')).toContainText('Saved');
+    await expect(page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
-    await expect(page.getByRole('button', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
+    await expect(page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
     expect(await page.evaluate(() => window.flowmate.listExtensions())).toMatchObject({ ok: true, data: { revision: 2, selection: { enabledExtensions: [] } } });
     expect(await page.evaluate(() => window.flowmate.queryRuntimeState())).toMatchObject({ ok: true, data: { active: null } });
     // The write really commits; unavailable catalog reads must still recover its original settings receipt.
@@ -170,7 +177,7 @@ it('[F12-03/24] confirms a lost save receipt by rereading real settings and igno
     await expect(page.getByRole('alert').filter({ hasText: 'The extension operation could not be completed.' })).not.toHaveCount(0);
     await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Clear extension selection', exact: true })).toBeEnabled();
-    await expect(page.getByText('Settings revision 3 · Disabled', { exact: true })).toBeVisible();
+    await expect(page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true })).toBeEnabled();
     await expect(page.getByText('Refresh extensions to confirm the saved selection before trying again.', { exact: true })).toHaveCount(0);
     await expect(page.getByRole('alert').filter({ hasText: 'The extension operation could not be completed.' })).toHaveCount(2);
     expect(await page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { settings: { revision: 3, extensions: { enabledExtensions: [] } } } });
