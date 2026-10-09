@@ -196,7 +196,7 @@ describe('P5 migration compatibility', () => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true); if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 17 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 18 });
     expect(opened.data.db.query('SELECT * FROM session_inputs').get()).toEqual({ ...before as object, result_entry_id: null, context_snapshot_id: null });
     const rows = opened.data.db.query('SELECT id,metadata_json,hidden_at,updated_at FROM sessions ORDER BY id').all() as Array<{ id: number; metadata_json: string; hidden_at: string | null; updated_at: string }>;
     expect(JSON.parse(rows[0]!.metadata_json)).toEqual({ version: 1, model_use_blocked: null, tool_profile: 'invoice', delete_pending: true });
@@ -370,7 +370,7 @@ describe('P2 Session and Agent Run storage', () => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual(Array.from({ length: 17 }, (_, index) => ({ version: index + 1 })));
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual(Array.from({ length: 18 }, (_, index) => ({ version: index + 1 })));
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     opened.data.close();
   }));
@@ -388,7 +388,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
     try {
-    expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 17 });
+    expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 18 });
       expect(migrated.data.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: entry, run_id: null });
       expect(migrated.data.db.query('SELECT header_json,storage_version,leaf_id,entry_count FROM session_native_history').get())
         .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });

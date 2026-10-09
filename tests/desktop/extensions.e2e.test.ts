@@ -157,11 +157,21 @@ it('[F12-03/24] confirms a lost save receipt by rereading real settings and igno
     const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     await installReadGate(app, userData); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
     await expect(page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
-    await app.evaluate(() => { const gate = Reflect.get(globalThis, 'contextReadGate'); gate.hold(0, 'update_extension_selection'); gate.fail(); });
+    // An older real catalog response cannot confirm a write whose receipt was lost.
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'list_extensions'));
+    await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
+    await app.evaluate(() => { const gate = Reflect.get(globalThis, 'contextReadGate'); gate.hold(100, 'get_state'); gate.fail(1, 'update_extension_selection'); });
     await page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true }).click();
     await expect(page.getByText('Refresh extensions to confirm the saved selection before trying again.', { exact: true })).toBeVisible();
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
+    await expect(page.getByRole('button', { name: 'Clear extension selection', exact: true }).click({ timeout: 1000 })).rejects.toThrow(/Timeout/);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').commands.filter((command: { type: string }) => command.type === 'update_extension_selection').length)).toBe(1);
+    await expect(page.getByText('Refresh extensions to confirm the saved selection before trying again.', { exact: true })).toBeVisible();
     expect(await page.evaluate(() => window.flowmate.listExtensions())).toMatchObject({ ok: true, data: { revision: 1, selection: { enabledExtensions: [{ id: 'invoice-assist' }] } } });
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(0, 'get_state'));
     await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click(); await expect(page.getByRole('switch', { name: 'Disable invoice-assist v1', exact: true })).toBeEnabled();
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore()); await installReadGate(app, userData);
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'list_extensions'));
     await page.getByRole('button', { name: 'Refresh extensions', exact: true }).click();
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);

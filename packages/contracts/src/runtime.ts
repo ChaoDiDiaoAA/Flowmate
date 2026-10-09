@@ -596,6 +596,10 @@ export interface Application {
   readDocumentOriginal(documentId: DbId, page: number): Promise<Result<import('./workspace.ts').DocumentOriginalImage>>;
   revokeDocumentUse(documentId: DbId): Promise<Result<{ affectedSessionIds: DbId[]; stopRequested: boolean }>>;
   cancelRun(runId: DbId): Promise<Result<{ accepted: boolean; runId: DbId }>>;
+  listInputCommands(request?: { sessionId?: DbId }): Promise<Result<import('./input-commands.ts').InputCommandItem[]>>;
+  listSubagentDefinitions(): Promise<Result<import('./input-commands.ts').SubagentDefinition[]>>;
+  getSubagentDefinition(request: { id: string }): Promise<Result<import('./input-commands.ts').SubagentDefinition>>;
+  saveSubagentDefinition(request: import('./input-commands.ts').SaveSubagentDefinition): Promise<Result<import('./input-commands.ts').SubagentDefinition>>;
   cancelSubagent(request: import('./subagents.ts').CancelSubagentRequest): Promise<Result<import('./subagents.ts').SubagentCancelReceipt>>;
   listSubagents(request: import('./subagents.ts').ListSubagentsRequest): Promise<Result<import('./subagents.ts').SubagentPage>>;
   querySubagent(request: import('./subagents.ts').QuerySubagentRequest): Promise<Result<import('./subagents.ts').SubagentDetail>>;

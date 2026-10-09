@@ -30,7 +30,7 @@ function fixture() {
 function makeCatalog(resourceRoot: string, sdkVersion = '0.85.1') {
   const create = Reflect.get(core, 'createExtensionService');
   expect(typeof create).toBe('function');
-  return create?.({ resourceRoot, sdkVersion, registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }, { name: 'Agent', version: '0.19.0-p13.1', effect: 'READ' }] });
+  return create?.({ resourceRoot, sdkVersion, registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }, { name: 'Agent', version: '0.19.0-p13.2', effect: 'READ' }] });
 }
 
 describe('P12 trusted extension selection', () => {
@@ -85,7 +85,7 @@ describe('P12 trusted extension selection', () => {
   });
 
   it('[F12-04] checks explicit extension dependencies without loading code or silently enabling them', () => {
-    const f = fixture(), skillDir = join(f.resourceRoot, 'skills', 'invoice', 'v1'); mkdirSync(skillDir, { recursive: true });
+    const f = fixture(), skillDir = join(f.resourceRoot, 'skills', 'invoice'); mkdirSync(skillDir, { recursive: true });
     const text = '---\nname: invoice\ndescription: Invoice source SOP\n---\nCheck original invoice sources.';
     const skillManifest = { schemaVersion: 1, kind: 'skill', id: 'invoice', version: 'v1', bodyFile: 'SKILL.md', keywords: [],
       requires: [{ kind: 'extension', id: 'invoice-assist', version: 'v1' }],

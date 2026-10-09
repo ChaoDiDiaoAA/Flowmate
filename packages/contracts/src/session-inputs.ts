@@ -1,3 +1,4 @@
+import { FrozenInputCommandSchema } from './input-commands.ts';
 import { z } from 'zod';
 import { appError, fail, ok } from './errors.ts';
 import { AppErrorSchema, RuntimeRequestOverridesSchema } from './runtime.ts';
@@ -83,6 +84,7 @@ export type SessionInputContentV1 = z.infer<typeof LegacySessionInputContentSche
 export const SessionInputContentV2Schema = z.object({ version: z.literal(2), text: z.string(),
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id), promptText: z.string().min(1),
+  inputCommand: FrozenInputCommandSchema.optional(),
   resourceBinding: ResourceBindingSchema.optional(),
   desktopRequestHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   requestIdentityVersion: z.literal(1).optional(), originalBudgetOverrides: RuntimeRequestOverridesSchema.optional(),

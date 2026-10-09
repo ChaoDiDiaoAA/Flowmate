@@ -1,3 +1,4 @@
+import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../host/protocol.ts';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -131,7 +132,7 @@ export class HostClient {
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
     const rawMessage = { ...command, version: 1, requestId };
-    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type)
+    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type) || isInputDefinitionHostCommand(command.type)
       ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
     if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
@@ -245,6 +246,11 @@ export class HostClient {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
           const value = validEnvelope ? parseContextHostResult(pending.command.type, output.value) : null;
           if (value === null || !matchesContextResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(value);
+        } else if (isInputDefinitionHostCommand(pending.command.type)) {
+          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
+          const value = validEnvelope ? parseInputDefinitionHostResult(pending.command.type, output.value) : null;
+          if (value === null || !matchesInputDefinitionResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
           else pending.resolve(value);
         } else if (isSubagentHostCommand(pending.command.type)) {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));

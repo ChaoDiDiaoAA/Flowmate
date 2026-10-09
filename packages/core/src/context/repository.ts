@@ -5,11 +5,14 @@ import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import { join, relative, isAbsolute, sep } from 'node:path';
 import { resolveNativeFilePath, nativeFileResultIncludes } from '@flowmate/shared';
-import { verifyFrozenResourceMetadata } from '../resources/service.ts';
+import { verifyFrozenResourceMetadata } from '../skill-hub/index.ts';
+import { visibleFrozenSkills } from '../skill-hub/capability-map.ts';
+import { formatSkillReadinessSection } from '@flowmate/contracts';
 import { ResourceEvidenceJournalSchema, ResourceExpansionEvidenceSchema, ResourceReadEvidenceSchema,
   ResourceRequestEvidenceSchema, RunResourceQuerySchema, ResourceBindingSchema, SessionInputContentV2Schema,
   resourceRefKey, resourceContentKey, NativeDerivedContextBindingSchema } from '@flowmate/contracts';
-import { NativeToolOutputSchema } from '@flowmate/contracts';
+import { NativeToolOutputSchema, ListSkillResourcesInputSchema, ListSkillResourcesOutputSchema,
+  ReadSkillResourceInputSchema, ReadSkillResourceOutputSchema } from '@flowmate/contracts';
 import type { ResourceEvidenceJournal, ResourceExpansionEvidence, ResourceReadEvidence, ResourceRequestEvidence,
   RunResourceQuery, FrozenResources, ResourceRef } from '@flowmate/contracts';
 import { appError, fail, ok, ContextSnapshotSchema, ContextSnapshotJsonSchema, ContextReferenceSchema,
@@ -66,7 +69,7 @@ function includesResource(frozen: FrozenResources | null, ref: ResourceRef): boo
   return [frozen?.prompt, ...(frozen?.discoveredSkills ?? [])].some(item => item && resourceRefKey(item) === resourceRefKey(ref));
 }
 
-function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: ResourceReadEvidence): void {
+function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: ResourceReadEvidence, reader = createNativeOriginReader(db)): void {
   const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
   const frozen = frozenResources(json(row.config_json));
   if (!['agent', 'subagent'].includes(row.kind) || row.session_id !== owner.sessionId || frozen?.bundleHash !== value.bundleHash || !includesResource(frozen, value.ref)) resourceConflict();
@@ -74,24 +77,43 @@ function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: R
     result_json: z.string() }).parse(db.query('SELECT * FROM tool_calls WHERE id=?').get(value.toolCallId));
   if (tool.run_id !== owner.runId || tool.session_id !== owner.sessionId || tool.native_tool_call_id !== value.nativeToolCallId
     || tool.tool_name !== value.operation || tool.request_sequence !== value.requestSequence) resourceConflict();
-  const result = z.object({ status: z.literal('succeeded'), data: NativeToolOutputSchema }).parse(json(tool.result_json));
-  const file = frozen.manifests.find(item => resourceRefKey(item.ref) === resourceRefKey(value.ref))?.manifest.files.find(item => item.path === value.path);
+  const manifest = frozen.manifests.find(item => resourceRefKey(item.ref) === resourceRefKey(value.ref))?.manifest;
+  const file = manifest?.files.find(item => item.path === value.path);
   if (!file || file.sha256 !== value.fileHash) resourceConflict();
-  const config = z.object({ workingDirectory: z.string() }).parse(json(row.config_json));
   const storedArgs = z.object({ version: z.literal(1), raw: z.unknown(), final: z.unknown() }).parse(json(tool.args_json));
-  const args = z.object({ path: z.string().optional() }).parse(storedArgs.final ?? storedArgs.raw);
-  if (value.operation === 'read' && args.path === undefined) resourceConflict();
-  const target = resolveNativeFilePath(args.path ?? '.', config.workingDirectory);
-  const filePath = join(frozen.bundleDirectory,
-    value.ref.kind === 'skill' ? 'skills' : 'prompts', value.ref.id, value.ref.version, value.path);
-  const rel = relative(target, filePath);
-  if (value.operation === 'read' ? rel !== '' : rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) resourceConflict();
-  const text = result.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-  if (!nativeFileResultIncludes(value.operation, rel, text)) resourceConflict();
-  if (hashText(JSON.stringify(result.data.content)) !== value.deliveredHash) resourceConflict();
-  if (value.fullBody === true && hashText(result.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n')) !== value.fileHash) resourceConflict();
+  if (value.operation === 'list_skill_resources' || value.operation === 'read_skill_resource') {
+    const result = z.object({ status: z.literal('succeeded'), data: z.unknown() }).parse(json(tool.result_json));
+    const args = value.operation === 'list_skill_resources' ? ListSkillResourcesInputSchema.parse(storedArgs.final ?? storedArgs.raw)
+      : ReadSkillResourceInputSchema.parse(storedArgs.final ?? storedArgs.raw);
+    const data = value.operation === 'list_skill_resources' ? ListSkillResourcesOutputSchema.parse(result.data) : ReadSkillResourceOutputSchema.parse(result.data);
+    if (args.skill !== value.ref.id || resourceRefKey(data.ref) !== resourceRefKey(value.ref) || data.bundleHash !== frozen.bundleHash
+      || hashText(JSON.stringify([{ type: 'text', text: JSON.stringify(result.data) }])) !== value.deliveredHash) resourceConflict();
+    if ('files' in data) {
+      const ordered = [...manifest!.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+      if (!same(data.files, ordered) || value.fullBody !== false) resourceConflict();
+    } else {
+      const readArgs = ReadSkillResourceInputSchema.parse(storedArgs.final ?? storedArgs.raw);
+      if (readArgs.path !== value.path || data.path !== value.path || data.sha256 !== file.sha256
+        || data.totalBytes !== file.bytes || data.offset !== (readArgs.offset ?? 0) || Buffer.byteLength(data.text) > (readArgs.limit ?? 16384)
+        || (data.nextOffset ?? data.totalBytes) !== data.offset + Buffer.byteLength(data.text)) resourceConflict();
+      const complete = data.offset === 0 && data.nextOffset === null;
+      if (value.fullBody !== complete || complete && hashText(data.text) !== file.sha256) resourceConflict();
+    }
+  } else {
+    const result = z.object({ status: z.literal('succeeded'), data: NativeToolOutputSchema }).parse(json(tool.result_json));
+    const config = z.object({ workingDirectory: z.string() }).parse(json(row.config_json));
+    const args = z.object({ path: z.string().optional() }).parse(storedArgs.final ?? storedArgs.raw);
+    if (value.operation === 'read' && args.path === undefined) resourceConflict();
+    const target = resolveNativeFilePath(args.path ?? '.', config.workingDirectory);
+    const filePath = join(frozen.bundleDirectory, value.ref.kind === 'skill' ? 'skills' : 'prompts', value.ref.id, value.ref.version, value.path);
+    const rel = relative(target, filePath);
+    if (value.operation === 'read' ? rel !== '' : rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) resourceConflict();
+    const text = result.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+    if (!nativeFileResultIncludes(value.operation, rel, text) || hashText(JSON.stringify(result.data.content)) !== value.deliveredHash) resourceConflict();
+    if (value.fullBody === true && hashText(text) !== value.fileHash) resourceConflict();
+  }
   if (value.nativeEntryId !== null) {
-    const reader = createNativeOriginReader(db), native = reader.entry(owner.sessionId, value.nativeEntryId);
+    const native = reader.entry(owner.sessionId, value.nativeEntryId);
     if (native?.type !== 'message' || native.message.role !== 'toolResult' || native.message.toolCallId !== value.nativeToolCallId
       || reader.tool(owner.sessionId, value.nativeToolCallId, true).toolCallId !== value.toolCallId
       || reader.resolve(owner.sessionId, value.nativeEntryId).originRunId !== owner.runId
@@ -99,18 +121,24 @@ function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: R
   }
 }
 
-export function readResourceReads(db: Database, owner: RunResourceQuery): readonly ResourceReadEvidence[] {
+export function readResourceReads(db: Database, owner: RunResourceQuery, reader = createNativeOriginReader(db)): readonly ResourceReadEvidence[] {
   const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
   if (row.session_id !== owner.sessionId) resourceConflict();
   const reads = readRunContext(row).observations?.resources?.reads ?? [];
-  for (const value of reads) verifyResourceReadOwner(db, owner, value);
+  for (const value of reads) verifyResourceReadOwner(db, owner, value, reader);
   return reads;
 }
 
-function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence, row: RunRow, observations: ContextObservations) {
+function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence, row: RunRow, observations: ContextObservations, reader = createNativeOriginReader(db)) {
   const owner = { row, observations, frozen: frozenResources(json(row.config_json)) };
   if (!owner.observations?.resources) resourceConflict();
-  const reader = createNativeOriginReader(db);
+  // Reuse complete proofs only within this immutable validation batch.
+  const reads = new Map<string, readonly ResourceReadEvidence[]>();
+  const verifiedReads = (owner: RunResourceQuery) => {
+    const key = JSON.stringify([owner.sessionId, owner.runId]);
+    if (!reads.has(key)) reads.set(key, readResourceReads(db, owner, reader));
+    return reads.get(key)!;
+  };
   const binding = value.purpose === 'answer' ? owner.observations.requests.find(item => item.binding.callSequence === value.callSequence)?.binding : null;
   const operation = value.purpose === 'compaction' ? owner.observations.compactions?.find(item => item.operationId === value.compactionOperationId) : null;
   const summary = operation?.calls.find(call => call.modelCallIndex === value.callSequence);
@@ -148,6 +176,16 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
   }
   if (value.referencedBundleHashes.some(hash => !available.has(hash))) resourceConflict();
   for (const check of value.contentChecks) {
+    if (check.scope === 'skill-readiness') {
+      const entry = owner.frozen?.skillIndex?.entries.find(entry => same(entry.ref, check.ref));
+      if (!entry || value.purpose !== 'answer' || check.nativeEntryId !== null || check.path !== null) resourceConflict();
+      const scope = z.object({ scope_json: z.string() }).parse(db.query('SELECT scope_json FROM runs WHERE id=?').get(owner.row.id));
+      const tools = z.object({ allowedTools: z.array(z.string()).optional() }).parse(json(scope.scope_json)).allowedTools ?? [];
+      const child = owner.row.kind === 'subagent';
+      const visible = child ? visibleFrozenSkills(owner.frozen!, tools) : owner.frozen!.discoveredSkills;
+      if (check.expectedTextHash !== hashText(formatSkillReadinessSection(entry!, tools, visible, child))) resourceConflict();
+      continue;
+    }
     if (![...available.values()].some(frozen => includesResource(frozen, check.ref))) resourceConflict();
     if (check.scope === 'business-prompt' || check.scope === 'skill-index') {
       if (value.purpose !== 'answer' || check.nativeEntryId !== null || !includesResource(owner.frozen, check.ref)) resourceConflict();
@@ -165,7 +203,7 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
       if (native?.type !== 'message' || native.message.role !== 'toolResult') resourceConflict();
       const origin = reader.resolve(owner.row.session_id!, check.nativeEntryId!);
       if (origin.originRunId === null) resourceConflict();
-      const receipts = readResourceReads(db, { sessionId: origin.originSessionId, runId: origin.originRunId });
+      const receipts = verifiedReads({ sessionId: origin.originSessionId, runId: origin.originRunId });
       if (!receipts.some(receipt => receipt.nativeEntryId === check.nativeEntryId && same(receipt.ref, check.ref) && receipt.path === check.path && value.referencedBundleHashes.includes(receipt.bundleHash))
         || hashText(native.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')) !== check.expectedTextHash) resourceConflict();
     }
@@ -184,7 +222,7 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
           const receipt = readResourceExpansion(db, originalOwner, origin.inputId, entry.id);
           if (receipt && same(receipt.skill, check.ref) && (check.path === null || check.path === 'SKILL.md')
             && value.referencedBundleHashes.includes(receipt.bundleHash)) found = true;
-        } else if (entry.message.role === 'toolResult' && readResourceReads(db, originalOwner).some(receipt => receipt.nativeEntryId === entry.id
+        } else if (entry.message.role === 'toolResult' && verifiedReads(originalOwner).some(receipt => receipt.nativeEntryId === entry.id
           && same(receipt.ref, check.ref) && (check.path === null || check.path === receipt.path) && value.referencedBundleHashes.includes(receipt.bundleHash))) found = true;
       }
       if (!found) resourceConflict();
@@ -329,10 +367,11 @@ export function readRunContextOwner(db: Database, row: ContextOwnerRow, owners?:
   if (context.observations !== null) verifySavedSources(db, context.observations);
   for (const value of context.observations?.resources?.expansions ?? [])
     verifyResourceExpansionOwner(db, { sessionId: row.session_id!, runId: row.id }, value);
+  const resourceReader = createNativeOriginReader(db);
   for (const value of context.observations?.resources?.reads ?? [])
-    verifyResourceReadOwner(db, { sessionId: row.session_id!, runId: row.id }, value);
+    verifyResourceReadOwner(db, { sessionId: row.session_id!, runId: row.id }, value, resourceReader);
   for (const value of context.observations?.resources?.requests ?? [])
-    verifyResourceRequestOwner(db, value, runRowSchema.parse(row), context.observations!);
+    verifyResourceRequestOwner(db, value, runRowSchema.parse(row), context.observations!, resourceReader);
   owners?.set(row.id, { row, context });
   return context;
 }

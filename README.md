@@ -1,5 +1,32 @@
 # Flowmate
 
+## 当前命令菜单与三栏布局
+
+2026-10-09 本轮界面修订已通过标准入口 `bun --no-env-file run test`：类型检查、Unit 356/0、Integration 1341/0、桌面构建及 Electron 101/0（10.3m），退出 0。方案、审查修复和实际结果见 [本轮实施记录](docs/plans/2026-10-09_命令菜单英文与三栏调整_实施记录.md)；下方旧成绩保留原交付范围。
+
+输入 `/` 后，十六份内置 Skill 的介绍和悬停提示与 Skills / Settings → Skills 共用英文展示；未知或修改过的介绍保留原文。资源正文、身份、Pi 索引和聊天语言保持原合同，选择菜单项仍只修改草稿。
+
+拖动两条栏间分隔线调整导航和 Assistant，中间内容使用剩余空间；宽度在刷新及重启后恢复。分隔线可 Tab 聚焦，左右键调整 10px、Shift＋左右键调整 50px，Home 或双击恢复该侧默认值。完整导航 / Assistant / 中栏最小为 200 / 300 / 360px；窄中栏的配置和 Prompt 编辑转为单列。窗口小于 1200px 时沿用 64px 图标导航，仅右侧可调整；小于 1080px 时沿用 Assistant 浮层，隐藏调整手柄。收起 Assistant 保留此前展开宽度；窗口临时缩小不覆盖偏好。清除本地偏好后恢复默认 240 / 380px，存储失败不妨碍当前调整。
+
+## 当前 Skill、输入触发与 Subagent
+
+2026-10-09 联合修订已通过工程验收：类型检查、Unit 353/0、Integration 1341/0、桌面构建及 Electron 100/0（9.8m），标准入口 `bun --no-env-file run test` 退出 0。完整章节、任务、失败修复与证据见 [实施记录](docs/plans/2026-10-09_Skill输入与Subagent_实施记录.md)。以下旧日期记录保留其原交付范围。
+
+Skills 主页面与 Settings → Skills 共用紧凑列表、英文介绍、依赖计数和真实缺失标签；十六份作者资源位于 `resources/skills/<id>/`。Prompt 作者包位于 `resources/prompts/invoice/`，manifest 仍为 v1，固定 Run bundle 保留版本层。Prompts 页面用于显式 AI 优化，复制和填入只改草稿。Settings 使用 General / LLM / Connections / Skills / Performance；Assistant 已隐藏 Inputs 等辅助控件。
+
+在 Extensions 启用已登记的 subagents 插件，再创建后续会话；已有旧身份可在 Extensions 更新选择。输入 `/` 显示 Skills、Subagents、Prompt Templates、Extension Commands。可用入口示例：
+
+```text
+/skill:invoice Review the supplied invoice evidence.
+/subagent general-analyst Check the assumptions in this argument.
+/invoice-evidence-review Review the current invoice sources.
+/parallel-invoice-review Review the invoice with independent checks.
+```
+
+发票 Skill 和发票模板需要当前已授权的发票任务；普通聊天可以使用零工具 general-analyst。自然语言、Markdown 模板与真实 Extension Command 共用 Agent Tool。父子都使用 Pi SDK 循环，每个子有独立会话；同一 Root 最多四个前台子，工具只复用父实际 PURE/READ 范围，禁止嵌套/后台/写操作。Assistant 显示真实子任务、状态、结果及单子 Stop，Root Stop 取消全部。自然语言是否委派由模型实际 ToolCall 决定，文本声称委派不算成功。
+
+内置角色在 `resources/subagents/`；Extensions → subagents → Manage agents 可创建/编辑，用户覆盖在已解析产品 runtime 目录的 `subagents/` 中，后续 Run 生效。模板在 `resources/prompt-templates/`，与固定业务 Prompt 分开。018 迁移通过隔离库验证，正式用户库未在本轮打开或迁移。
+
 ## 项目与当前阶段
 
 基于 Pi SDK 的本地发票 Agent。当前工作区已实现受控解析材料导入、发票工作台、Assistant 对话及重启续聊、P4 原生消息查询/展示和候选来源记录。普通复核工厂保留13项业务工具，可信桌面另装配第14项填表工具；本轮人工保存、接受和三格式导出接合及工程证据见 [P4实施计划 §5](docs/plans/P4_实施计划_v1.md)。原票供人工查看，业务取证使用已登记解析材料。旧连接的真实模型 A20 请求、失败/复验和样例观察保留在 [P3 实施计划](docs/plans/P3_实施计划_v1.md)；新配置的连接/认证/协议工程记录按其实际范围解释。真实模型自主填表及业务正确性统一归 [评测总方案 §12](docs/eval/01_Flowmate_Agent评测总方案_v1.md#12-统一评测启用与验收)：P16及整体产品、真实 Agent 入口与必要采证就绪且工程验证通过后才制作和运行 Benchmark，不作为当前阶段剩余任务。
@@ -38,6 +65,10 @@ bun --no-env-file run test        # 工程验证，不运行 Agent 评测
 **Prompts** 提供原稿、可选优化要求和可编辑优化稿；Copy 和 Use in chat 只复制或填入/追加草稿，不发送。草稿仅保留当前窗口，重启不恢复。固定业务 Prompt 版本选择在 **Settings → LLM → Business instructions**。**Skills** 用搜索、All / Ready / Partial / Disabled 和开关管理；逐项依赖缺失仍阻止运行。**Extensions** 展示已登记插件，配置启用与当前会话实际加载分别显示，技术与历史证据在详情。
 
 **Settings** 分为 General / LLM / Connections / Skills / Performance。默认运行预算在 Performance；普通 Send / Fill 使用默认值，已受理请求的原预算与身份不变。Assistant 保留消息、真实业务上下文及输入/发送/停止；使用 `/skill:name` 可提出显式技能要求。
+
+**P11 Skills 当前资源库（SKEN11，2026-10-08 已验收）**：共十六份，新增买卖方角色、日期/币种、逐行计算、候选问题分级和人工交接五份只读Skill，默认关闭。Skills / Settings → Skills 的介绍统一英文，列表、完整提示、详情及双语搜索共用；原十一份作者文件、身份、Pi索引、正文及聊天语言保留。黄色标签表示真实缺失依赖，缺项仍不能开启。资源用途与路径见 [资源说明](resources/README.md)，同次完整门禁353单元/1322集成/99 Electron全部通过；已知批量读取结束/取消超时及工程边界见 [SKEN11实施记录](docs/plans/P11_实施计划_v1.md#2026-10-08-sken11-英文介绍与五份资源实施记录)。
+
+**P11 Skill Hub（2026-10-08 工程验收完成）**：具体 Skill 放在 `resources/skills/<id>/`，直接包含 `resource.json`、`SKILL.md` 和参考文件，无 `v1/` 作者目录。保留原 `invoice`，新增十份发票 SOP，默认关闭；编写、依赖、刷新和更新/回退见 [资源说明](resources/README.md)。管理入口共用 **Skills / Settings → Skills**；启用仅影响后续 Run。七个 Hub 模块在 `packages/core/src/skill-hub/`，两个专用工具在 `packages/employee-invoice/src/tools/`，单独注册并沿原 Executor/预算执行。Pi 接收短索引和原工作区 Context，正文按需读取原 Run 固定副本；专用文本读取不执行脚本。最终同次标准门禁 exit 0：类型检查、Unit 353/0、Integration 1317/0、Electron 98/0。工程证据与未验边界见 [HUB11 计划](docs/plans/P11_实施计划_v1.md#hub11-07标准门禁审查与交接)。
 
 本次界面调整的实现和验收见 [UI11 实施记录](docs/plans/P11_实施计划_v1.md#ui11-实施记录)，各页面与预算分别映射 UI03 / UI05 / UI12。
 

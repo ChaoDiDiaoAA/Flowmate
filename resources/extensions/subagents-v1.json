@@ -6,15 +6,37 @@
   "sdkVersion": "0.85.1",
   "entryId": "pi-subagents-managed-v1",
   "pluginVersion": "0.19.0",
-  "patchVersion": "flowmate-p13.1",
-  "patchHash": "a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a",
-  "tools": [{ "name": "Agent", "version": "0.19.0-p13.1" }],
-  "commands": [],
+  "patchVersion": "flowmate-p13.2",
+  "patchHash": "3e6ee0d9cf2f45ba37be90eebbd3edbdfa838de85958c139b62b37371a1b8ebe",
+  "tools": [
+    {
+      "name": "Agent",
+      "version": "0.19.0-p13.2"
+    }
+  ],
+  "commands": [
+    "subagent"
+  ],
   "hooks": [
-    { "event": "session_start", "policy": "critical" },
-    { "event": "tool_call", "policy": "critical" },
-    { "event": "tool_result", "policy": "observer" },
-    { "event": "tool_execution_end", "policy": "observer" },
-    { "event": "session_shutdown", "policy": "critical" }
+    {
+      "event": "session_start",
+      "policy": "critical"
+    },
+    {
+      "event": "tool_call",
+      "policy": "critical"
+    },
+    {
+      "event": "tool_result",
+      "policy": "observer"
+    },
+    {
+      "event": "tool_execution_end",
+      "policy": "observer"
+    },
+    {
+      "event": "session_shutdown",
+      "policy": "critical"
+    }
   ]
 }

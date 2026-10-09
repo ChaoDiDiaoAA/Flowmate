@@ -221,7 +221,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -298,7 +298,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');

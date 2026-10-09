@@ -52,9 +52,9 @@ export type DbHandle = {
   close: () => void;
 };
 
-type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17;
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18;
 function migrationSql(version: SchemaVersion): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql'][version - 1];
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
@@ -77,7 +77,7 @@ function runMigration(db: Database, version: SchemaVersion): void {
         || db.query('SELECT id FROM runs WHERE parent_run_id IS NOT NULL OR origin_tool_call_id IS NOT NULL OR plugin_agent_id IS NOT NULL').get())
         throw new Error('migration_preservation_failed');
       db.exec('COMMIT');
-    } else if (version === 15 || version === 16) {
+    } else if (version === 15 || version === 16 || version === 18) {
       // Trigger bodies contain semicolons: execute each explicit whole-statement boundary.
       for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
       if (db.query('PRAGMA foreign_key_check').all().length) throw new Error('migration_foreign_key_violation');
@@ -112,10 +112,10 @@ function migrateToLatest(db: Database): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 17) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 18) {
     throw new Error('unsupported_schema_version');
   }
-  for (let version = versions.length + 1; version <= 17; version += 1) runMigration(db, version as SchemaVersion);
+  for (let version = versions.length + 1; version <= 18; version += 1) runMigration(db, version as SchemaVersion);
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {

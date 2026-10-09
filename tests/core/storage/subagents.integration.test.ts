@@ -105,6 +105,41 @@ function admissionFixture() {
 }
 
 describe('P13 SQLite ownership and migration', () => {
+  it('018 limits four owned children, including terminal children whose stop is unconfirmed', () => {
+    const { db } = need(openTestDatabase(paths())); rootRun(db);
+    for (let index = 0; index < 4; index++) {
+      origin(db, index+1); session(db, index+2);
+      child(db, { id: index+2, tool: index+1, sessionId: index+2, pluginId: 'parallel-'+index });
+    }
+    origin(db, 5); session(db, 6);
+    expect(() => child(db, { id: 6, tool: 5, sessionId: 6, pluginId: 'fifth' })).toThrow('subagent_busy');
+    db.query("UPDATE runs SET status='failed',ended_at=?,error_json='{}' WHERE id=2").run(at);
+    expect(() => child(db, { id: 6, tool: 5, sessionId: 6, pluginId: 'fifth' })).toThrow('subagent_busy');
+    db.query('UPDATE runs SET stopped_at=? WHERE id=2').run(at);
+    expect(() => child(db, { id: 6, tool: 5, sessionId: 6, pluginId: 'fifth' })).not.toThrow();
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+  it.each(['DROP INDEX runs_one_active_child', 'CREATE TRIGGER subagent_parallel_limit', 'VALUES (18,', 'COMMIT'])
+    ('018 rolls back migration failure at %s with its original single-child index', failure => {
+      const p = paths(), old = schema16(p);
+      old.exec('PRAGMA foreign_keys=OFF'); old.exec('PRAGMA legacy_alter_table=ON');
+      const sql = readFileSync(new URL('../../../packages/core/src/storage/migrations/017_subagent_runs.sql', import.meta.url), 'utf8');
+      for (const statement of sql.split(/^\s*-- statement\s*$/m).map(value => value.trim()).filter(Boolean)) old.exec(statement);
+      old.exec('COMMIT'); old.exec('PRAGMA foreign_keys=ON'); old.exec('PRAGMA legacy_alter_table=OFF'); old.close();
+      const original = Database.prototype.exec; let in18 = false, fired = false;
+      const exec = spyOn(Database.prototype, 'exec').mockImplementation(function (this: Database, sql: string) {
+        if (sql.includes('DROP INDEX runs_one_active_child')) in18 = true;
+        if (in18 && !fired && sql.includes(failure)) { fired = true; throw new Error('injected-018'); }
+        return Reflect.apply(original, this, [sql]);
+      });
+      try { expect(openTestDatabase(p)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } }); expect(fired).toBe(true); }
+      finally { exec.mockRestore(); }
+      const after = new Database(p.databaseFile);
+      try { expect(after.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 17 });
+        expect(after.query("SELECT name FROM sqlite_master WHERE name='runs_one_active_child'").get()).not.toBeNull();
+        expect(after.query("SELECT name FROM sqlite_master WHERE name='subagent_parallel_limit'").get()).toBeNull(); }
+      finally { after.close(); }
+    });
   it('[F13-12/25] derives parent and every child token totals independently of pagination without writing them back', () => {
     const f = admissionFixture(), child = need(f.store.runs.createSubagent(f.request));
     f.store.db.query('UPDATE runs SET input_tokens=?,output_tokens=?,total_tokens=?,cost=?,usage_complete=1 WHERE id=?').run(10, 4, 14, '0.25', f.runId);
@@ -239,21 +274,20 @@ describe('P13 SQLite ownership and migration', () => {
     const objects = old.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND name!='context_snapshot_insert_guard' ORDER BY name").all();
     old.close();
     const store = need(openTestDatabase(p));
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 17 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 18 });
     expect(store.db.query(`SELECT ${columns.join(',')} FROM runs ORDER BY id`).all()).toEqual(before);
     expect(store.db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs').all()).toEqual([
       { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);
-    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND name!='context_snapshot_insert_guard' ORDER BY name").all()).toEqual(objects);
+    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND name NOT IN ('context_snapshot_insert_guard','subagent_parallel_limit') ORDER BY name").all()).toEqual(objects);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(store.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     expect(store.db.query('PRAGMA legacy_alter_table').get()).toEqual({ legacy_alter_table: 0 });
   });
 
-  it('[F13-08/15] admits one root and one child, with immutable, unique origin and terminal ordering', () => {
+  it('[F13-08/15] preserves root ownership, immutable origins and terminal ordering with parallel child capacity', () => {
     const { db } = need(openTestDatabase(paths())); rootRun(db); origin(db); session(db, 2); child(db);
     session(db, 3); origin(db, 2);
     expect(() => rootRun(db, 4)).toThrow();
-    expect(() => child(db, { id: 3, tool: 2, sessionId: 3, pluginId: 'plugin-2' })).toThrow();
     expect(() => failRun(db, 1)).toThrow('subagent_active_child');
     expect(() => db.query('UPDATE runs SET plugin_agent_id=? WHERE id=2').run('forged')).toThrow('subagent_identity_immutable');
     expect(() => child(db, { id: 3, parent: 2, tool: 2, sessionId: 3 })).toThrow('subagent_origin_invalid');

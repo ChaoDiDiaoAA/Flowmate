@@ -15,11 +15,11 @@ import { createHttpProvider, deferCleanup, mkdtempSync } from '../../support/res
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`); return result.data; }
 
 async function fixture(delegate: boolean, options: { allTools?: boolean; maxModelCalls?: number; maxToolCalls?: number;
-  reuseNativeId?: boolean; lateTool?: boolean; resources?: boolean; switchWorkspace?: boolean;
+  reuseNativeId?: boolean; lateTool?: boolean; resources?: boolean; skillTools?: boolean; switchWorkspace?: boolean;
   cancel?: 'parent' | 'child'; hang?: boolean;
   historyFault?: 'child-before-request' | 'child-final' | 'parent-feedback'; childRetry?: boolean;
   duplicateDelegate?: boolean; delegateFault?: 'return' | 'parent-http'; secondDelegate?: boolean;
-  cancelAfterChild?: boolean; deniedChildTool?: 'write' | 'Agent'; hungTool?: boolean; delegateTimeout?: boolean } = {}) {
+  cancelAfterChild?: boolean; deniedChildTool?: 'write' | 'Agent'; hungTool?: boolean; delegateTimeout?: boolean; pureTools?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p13-business-')), paths = need(resolveProductPaths(join(root, 'product')));
   const sourceRoot = join(root, 'source'), source = join(sourceRoot, '000001'); mkdirSync(source, { recursive: true });
   const files = { 'original.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64'),
@@ -56,7 +56,7 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
     const requested = childRequest ? childCalls[ordinal - 1] : undefined;
     const delta = !delegate ? { role: 'assistant', content: 'No delegation needed.' }
       : !childRequest && (ordinal === 1 || ordinal === 2 && options.secondDelegate) ? call('Agent', { prompt: 'Verify total from native and invoice sources.', description: 'Check invoice total', subagent_type: 'invoice-evidence-checker' }, ordinal === 1 ? 'parent-delegate' : 'parent-delegate-2')
-      : requested ? call(requested.name, requested.args, options.reuseNativeId && ordinal === 1 ? 'parent-delegate' : `child-${requested.name}`)
+      : requested ? call(requested.name, requested.args, options.reuseNativeId && ordinal === 1 ? 'parent-delegate' : `child-${requested.name}${options.skillTools ? `-${ordinal}` : ''}`)
       : { role: 'assistant', content: childRequest ? 'Child verified total 113.00 from both sources.' : 'Parent received the child findings.' };
     if (childRequest) {
       const records = Reflect.get(adapter, 'sessions') as Map<string, any>;
@@ -135,6 +135,11 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   };
   if (options.hang || options.hungTool) deferCleanup(releaseHung);
   refs = need(await app.listExtensions()).items.map(item => item.ref);
+  if (options.pureTools) {
+    const role = need(await app.getSubagentDefinition({ id: 'invoice-evidence-checker' }));
+    need(await app.saveSubagentDefinition({ id: role.id, expectedHash: role.hash,
+      content: '---\nname: invoice-evidence-checker\ndescription: Read-only calculations\ntools: [normalize_invoice_values, calculate_invoice_amounts]\n---\nVerify invoice evidence with exact decimal calculations.' }));
+  }
   if (options.resources) {
     const refs = need(await app.listResources()).items.map(item => item.ref);
     selection = { prompt: refs.find(ref => ref.kind === 'prompt')!, enabledSkills: refs.filter(ref => ref.kind === 'skill') };
@@ -143,6 +148,15 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   rootSessionId = session.sessionId;
   const file = join(paths.runtimeDir, 'subagent-source.txt');
   childCalls = [{ name: 'read', args: { path: file } }, { name: 'read_invoice_document', args: { documentId: docId, page: 1, afterBlockId: null, limit: 10 } }];
+  if (options.pureTools) childCalls = [
+    { name: 'normalize_invoice_values', args: { items: [{ kind: 'decimal', raw: ' 113.00 ' }] } },
+    { name: 'calculate_invoice_amounts', args: { operation: 'sum', values: ['100', '13'], scale: 2 } },
+  ];
+  if (options.skillTools) childCalls = [
+    { name: 'list_skill_resources', args: { skill: 'invoice-source-audit' } },
+    { name: 'read_skill_resource', args: { skill: 'invoice-source-audit', path: 'SKILL.md' } },
+    { name: 'read_skill_resource', args: { skill: 'invoice-candidate-save', path: 'SKILL.md' } },
+  ];
   if (options.allTools) childCalls.push(
     { name: 'grep', args: { pattern: '113', path: paths.runtimeDir } },
     { name: 'find', args: { pattern: '*.txt', path: paths.runtimeDir } }, { name: 'ls', args: { path: paths.runtimeDir } },
@@ -165,7 +179,8 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
     ...(options.hang || options.hungTool ? { stopGraceMs: 100 } : {}),
     ...(options.delegateTimeout ? { timeoutMs: 4000 } : {}),
     ...(options.resources ? { requiredSkill: selection.enabledSkills[0] } : {}),
-    ...(options.maxModelCalls || options.maxToolCalls || options.delegateTimeout ? { budget: { ...(options.maxModelCalls ? { maxModelCalls: options.maxModelCalls } : {}),
+    ...(options.maxModelCalls || options.maxToolCalls || options.delegateTimeout || options.resources ? { budget: { ...(options.maxModelCalls ? { maxModelCalls: options.maxModelCalls } : {}),
+      ...(options.resources ? { toolTimeoutMs: 30000 } : {}),
       ...(options.delegateTimeout ? { toolTimeoutMs: 500 } : {}),
       ...(options.maxToolCalls ? { maxToolCalls: options.maxToolCalls } : {}) } } : {}),
     workspace: { revision: current.revision, sessionId: session.sessionId, documentRef: current.documentRef, jobId: current.jobId, candidateRef: current.candidateRef } },
@@ -174,6 +189,19 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   return { app, adapter, paths, payloads, observed, session, accepted, terminal, childCalls, injectedExecutions, cancellations, releaseHung, outcomes, injectedFaults, duplicateResults, conflicts,
     elapsedMs: performance.now() - executionStarted };
 }
+
+it('[F13-30] dynamically declared PURE tools execute through the real child SDK registry', async () => {
+  const f = await fixture(true, { pureTools: true });
+  expect(need(f.terminal.result).status).toBe('completed');
+  const child = need(await f.app.listSubagents({ parentRunId: f.accepted.runId, parentSessionId: f.session.sessionId })).items[0]!;
+  expect(child).toMatchObject({ status: 'completed', stoppedAt: expect.any(String) });
+  const calls = need(await f.app.listRunToolCalls({ runId: child.childRunId, sessionId: child.childSessionId })).items;
+  expect(calls.map(call => [call.toolName, call.status])).toEqual([
+    ['calculate_invoice_amounts', 'succeeded'], ['normalize_invoice_values', 'succeeded']]);
+  const childRequests = f.payloads.filter(payload => payload.messages[0]?.content.startsWith('Verify invoice evidence'));
+  expect(childRequests.every(payload => payload.tools.map((tool: any) => tool.function.name).sort().join(',') === 'calculate_invoice_amounts,normalize_invoice_values')).toBe(true);
+  expect(JSON.stringify(childRequests.at(-1).messages)).toContain('113');
+});
 
 it('[F13-12/21] original Agent tool timeout closes a hung child within its grace without waiting for root timeout', async () => {
   const f = await fixture(true, { hungTool: true, delegateTimeout: true });
@@ -309,6 +337,29 @@ it('[F13-01/02] actual registered extension with no Agent call starts zero child
     expect(sql.query('SELECT count(*) AS n FROM sessions').get()).toEqual({ n: 1 });
   } finally { sql.close(); }
 });
+
+it('[F11-31/32] a real child indexes only READ-ready Skills and records dedicated reads against the original parent bundle', async () => {
+  const f = await fixture(true, { resources: true, skillTools: true });
+  expect(f.terminal.result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  const child = need(await f.app.listSubagents({ parentRunId: f.accepted.runId, parentSessionId: f.session.sessionId })).items[0]!;
+  const rootResources = need(await f.app.queryRunResources({ sessionId: f.session.sessionId, runId: f.accepted.runId }));
+  const childResources = need(await f.app.queryRunResources({ sessionId: child.childSessionId, runId: child.childRunId }));
+  expect(childResources.frozen?.bundleHash).toBe(rootResources.frozen?.bundleHash);
+  expect(childResources.frozen?.discoveredSkills).toEqual(rootResources.frozen?.discoveredSkills);
+  const childPayloads = f.payloads.filter(payload => payload.messages[0]?.content.startsWith('Verify invoice evidence'));
+  expect(f.elapsedMs).toBeLessThan(30000);
+  expect(childPayloads).toHaveLength(4);
+  const system = childPayloads[0].messages[0].content;
+  expect(system.match(/<name>invoice-source-audit<\/name>/g)).toHaveLength(1);
+  expect(system).not.toContain('<name>invoice-header-extraction</name>');
+  expect(system).not.toContain('<name>invoice-candidate-save</name>');
+  expect(system).not.toContain('<name>invoice</name>');
+  expect(childPayloads.at(-1).messages).toContainEqual(expect.objectContaining({ role: 'tool', content: expect.stringContaining('not available') }));
+  expect(childResources.evidence?.reads).toHaveLength(3);
+  expect(childResources.evidence?.reads.every(read => read.ref.id === 'invoice-source-audit' && read.nativeEntryId !== null)).toBe(true);
+  expect(childResources.evidence?.requests[0]?.contentChecks.filter(check => check.scope === 'skill-index').map(check => check.ref.id)).not.toContain('invoice-header-extraction');
+  expect(need(await f.app.querySubagent({ parentRunId: f.accepted.runId, parentSessionId: f.session.sessionId, childRunId: child.childRunId })).scope.allowedTools).toContain('read_skill_resource');
+}, 30000);
 
 it('[F13-03/05/10/14/15] real plugin child uses its own frozen identity and existing tools; raw result enters the next parent request', async () => {
   const f = await fixture(true);
@@ -474,7 +525,7 @@ it('[F13-11/25] public child queries return the saved owner, original delivery a
   const detail = need(await f.app.querySubagent({ ...owner, childRunId: child.childRunId }));
   expect(detail).toMatchObject({ ...child, description: 'Check invoice total', status: 'completed', stopConfirmed: true,
     historyUsable: true, output: { text: 'Child verified total 113.00 from both sources.' }, delivery: { state: 'request_observed' } });
-  expect(detail.scope.allowedTools).toHaveLength(10);
+  expect(detail.scope.allowedTools).toHaveLength(12);
   expect(need(await f.app.listSubagents({ ...owner, beforeRunId: child.childRunId }))).toEqual({ items: [], nextBeforeRunId: null, totals: page.totals });
   expect(await f.app.querySubagent({ ...owner, parentSessionId: child.childSessionId, childRunId: child.childRunId }))
     .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
@@ -523,6 +574,21 @@ it('[F13-11/15/20] original completion may repeat but conflicting or foreign cal
   }
   expect(await callbacks.finish(first.runId, first.outcome)).toEqual({ ok: true, data: undefined });
   expect(await callbacks.finish(first.runId, { ...first.outcome, text: 'Late replacement' }))
+    .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
+  expect(await callbacks.finish(first.runId, { ...first.outcome, tokens: { ...first.outcome.tokens, inputTokens: 999 } }))
+    .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
+  for (const inputTokens of [NaN, Infinity, -Infinity]) expect(await callbacks.finish(first.runId,
+    { ...first.outcome, tokens: { ...first.outcome.tokens, inputTokens } }))
+    .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
+  const { subagentCompletionHash } = await import('../../../packages/core/src/storage/repositories.ts');
+  const hashWithTokens = (inputTokens: number | null) => subagentCompletionHash({ ...first.outcome, tokens: { ...first.outcome.tokens, inputTokens } });
+  expect(new Set([null, NaN, Infinity, -Infinity, 0, -0].map(hashWithTokens)).size).toBe(6);
+  expect(subagentCompletionHash(Object.assign({ agent: first.outcome.agent }, first.outcome))).toBe(subagentCompletionHash(first.outcome));
+  const foreignArray = structuredClone(first.outcome.agent.modelCalls ?? []);
+  Object.setPrototypeOf(foreignArray, null);
+  expect(await callbacks.finish(first.runId, { ...first.outcome, agent: { ...first.outcome.agent, modelCalls: foreignArray } }))
+    .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
+  expect(await callbacks.finish(first.runId, { ...first.outcome, stopped: false }))
     .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
   expect(await callbacks.finish(first.runId, { ...first.outcome, agent: { ...first.outcome.agent, nativeSessionId: f.session.nativeSessionId } }))
     .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });

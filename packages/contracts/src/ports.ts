@@ -1,3 +1,4 @@
+import type { FrozenInputDefinitions } from './input-commands.ts';
 import { z } from 'zod';
 import { ToolRuntimeObservationSchema } from './activity.ts';
 import { RegisteredToolNameSchema } from './tools.ts';
@@ -46,6 +47,8 @@ export interface CandidateRepository {
 }
 
 export type SafeConfigSnapshot = {
+  inputDefinitions?: FrozenInputDefinitions;
+  inputCommandReceipt?: import('zod').z.infer<typeof import('./input-commands.ts').InputCommandReceiptSchema>;
   extensions?: import('./extensions.ts').FrozenExtensions;
   extensionAssembly?: import('./extensions.ts').ExtensionAssemblyEvidence;
   resources?: FrozenResources;
@@ -165,8 +168,11 @@ export type AgentToolBinding = {
 };
 
 export type AgentExecutionInput = NativeInput & {
+  inputDefinitions?: FrozenInputDefinitions;
   extensions?: import('./extensions.ts').FrozenExtensions;
   resources?: FrozenResources;
+  /** Trusted child visibility; the original immutable bundle remains intact. */
+  visibleSkillRefs?: readonly import('./resources.ts').ResourceRef[];
   resourceBinding?: ResourceBinding;
   runId: DbId;
   sessionId: DbId;
@@ -293,7 +299,7 @@ export interface AgentPort {
     config: ProviderConfig,
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
-    options?: { activeToolNames?: readonly string[]; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
+    options?: { activeToolNames?: readonly string[]; inputDefinitions?: FrozenInputDefinitions; inputCommandOwner?: { runId: DbId; sessionId: DbId; inputId: DbId }; chatDelegation?: boolean; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
       runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot; compactionPolicy?: CompactionPolicy;
       resources?: FrozenResources; extensions?: import('./extensions.ts').FrozenExtensions; verifyExtensions?: () => Result<void> },
   ): Promise<Result<PreparedAgent>>;

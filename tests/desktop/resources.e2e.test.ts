@@ -3,10 +3,130 @@ import { expect, test as it } from '@playwright/test';
 import { join, resolve } from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import type { ResourceCatalog } from '@flowmate/contracts';
 import { cleanupResources, closeDesktopFixture, installReadGate, createHttpProvider, mkdtemp, Database } from '../support/resources.ts';
 
 it.afterEach(cleanupResources);
 const repository = resolve(import.meta.dirname, '../..');
+it('displays Core readiness independently of enablement and adapts both Skills entry points', async () => {
+  it.setTimeout(90_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-skills-display-'));
+  const fixtureRoot = await mkdtemp(join(tmpdir(), 'flowmate-skills-catalog-'));
+  const catalogs: Record<'full' | 'partial' | 'zero' | 'invalid' | 'updated', ResourceCatalog> = JSON.parse(execFileSync('bun',
+    ['--no-env-file', join(repository, 'tests/support/skill-ui-catalog.ts'), fixtureRoot], { encoding: 'utf8' }));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
+    args: [join(repository, 'out/main/index.js')], env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Skills', exact: true }).click();
+    await page.getByRole('switch', { name: 'Enable invoice v1', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
+    await expect(page.locator('.skill-row-copy p').first()).toContainText('Organize fields');
+    await installReadGate(app, userData);
+    let held = 0;
+    async function display(catalog: ResourceCatalog) {
+      await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'list_resources'));
+      await page.getByRole('button', { name: 'Refresh resources', exact: true }).click();
+      await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(held + 1);
+      await app.evaluate((_electron, input) => {
+        const gate = Reflect.get(globalThis, 'contextReadGate'), packet = JSON.parse(gate.held[input.index].toString());
+        packet.value.data = { ...input.catalog, settingsRevision: packet.value.data.settingsRevision };
+        gate.held[input.index] = Buffer.from(JSON.stringify(packet) + '\n'); gate.release(input.index);
+      }, { catalog, index: held++ });
+      await expect(page.getByRole('button', { name: 'Refresh resources', exact: true })).toBeEnabled();
+    }
+    const row = (id: string) => page.locator('.skill-row').filter({ has: page.getByRole('button', { name: `View ${id} v1`, exact: true }) });
+    await display(catalogs.zero);
+    await expect(row('invoice').getByText('0/5 capabilities', { exact: true })).toBeVisible();
+    await expect(row('invoice').locator('.skill-capability-mark')).toHaveClass(/empty/);
+    await expect(row('invoice').getByRole('switch')).toBeEnabled();
+    await expect(row('invoice-source-audit').getByRole('switch')).toBeDisabled();
+    await display(catalogs.partial);
+    await expect(row('invoice').getByText('1/5 capabilities', { exact: true })).toBeVisible();
+    await expect(row('invoice').locator('.skill-capability-mark')).toHaveClass(/partial/);
+    await expect(row('invoice').getByRole('button', { name: 'read_invoice_evidence', exact: true })).toHaveAttribute('title', /unavailable/);
+    await expect(row('invoice').locator('.skill-missing button')).toHaveCount(4);
+    await row('invoice').getByRole('button', { name: 'read_invoice_evidence', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Resource details' })).toContainText('A declared tool is unavailable');
+    await page.screenshot({ path: it.info().outputPath('skills-partial.png') });
+    await page.getByRole('button', { name: 'Partial', exact: true }).click(); await expect(page.getByRole('switch')).toHaveCount(1);
+    await page.getByRole('button', { name: 'Disabled', exact: true }).click(); await expect(row('invoice')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Ready', exact: true }).click(); await expect(page.getByRole('switch')).toHaveCount(0);
+    await page.getByRole('button', { name: 'All', exact: true }).click();
+    await expect(row('ui-no-requirements').getByText('No requirements', { exact: true })).toBeVisible();
+    await expect(row('ui-no-requirements').getByRole('switch')).toBeEnabled();
+    const mismatchedName = 'ui-skill-with-a-long-mismatched-name-preserved-for-accessibility';
+    await expect(page.getByRole('button', { name: `View ${mismatchedName} (ui-name-mismatch v1)`, exact: true })).toBeVisible();
+    await expect(page.getByRole('switch', { name: 'Enable ui-name-mismatch v1', exact: true })).toBeDisabled();
+    await display(catalogs.updated);
+    await expect(row('invoice').locator('.skill-row-copy p')).toHaveText('同一名称的新介绍不应套用旧译文。');
+    await expect(row('invoice').locator('.skill-row-copy p')).toHaveAttribute('title', '同一名称的新介绍不应套用旧译文。');
+    await display(catalogs.invalid);
+    await expect(row('invoice-source-audit').getByText('4/4 capabilities', { exact: true })).toBeVisible();
+    await expect(row('invoice-source-audit').getByText('Unavailable', { exact: true })).toBeVisible();
+    await expect(row('invoice-source-audit').getByRole('switch')).toBeDisabled();
+    await display(catalogs.partial);
+    await row('invoice').getByRole('switch').click();
+    await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
+    expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { enabledSkills: [] } } });
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
+    // Recovery clears both the Prompt and Skill selection in one real save.
+    await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'LLM', exact: true }).click();
+    await page.locator('summary').filter({ hasText: /^Business instructions$/ }).click(); await page.getByRole('button', { name: 'Use invoice v1', exact: true }).click();
+    await page.getByRole('button', { name: 'Skills', exact: true }).click(); await page.getByRole('switch', { name: 'Enable invoice v1', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
+    await page.locator('summary').filter({ hasText: /^Resource recovery$/ }).focus(); await page.keyboard.press('Enter');
+    await page.getByRole('button', { name: 'Clear all resource selections', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
+    expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { prompt: null, enabledSkills: [] } } });
+    await page.getByRole('button', { name: 'Close Assistant', exact: true }).click();
+    await installReadGate(app, userData); held = 0;
+    for (const theme of ['light', 'dark']) {
+      await page.setViewportSize({ width: 1600, height: 1000 });
+      await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'General', exact: true }).click();
+      await page.getByLabel('Theme').selectOption(theme); await page.getByRole('button', { name: 'Save appearance', exact: true }).click();
+      await page.getByRole('button', { name: 'Skills', exact: true }).click();
+      await expect(page.locator('.desktop-shell')).toHaveClass(new RegExp(`theme-${theme}`));
+      const name = row('invoice').getByRole('button', { name: 'View invoice v1', exact: true });
+      await name.focus(); await page.keyboard.press('Enter'); await expect(page.getByRole('region', { name: 'Resource details' })).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Refresh resources', exact: true })).toBeEnabled();
+      await page.getByRole('button', { name: 'Refresh resources', exact: true }).focus(); await expect(page.getByRole('button', { name: 'Refresh resources', exact: true })).toBeFocused();
+      const copy = await row('invoice').locator('.skill-row-copy').boundingBox(), readiness = await row('invoice').locator('.skill-readiness').boundingBox();
+      expect(readiness!.y).toBeLessThan(copy!.y + copy!.height);
+      await page.screenshot({ path: it.info().outputPath(`skills-${theme}.png`) });
+      await page.setViewportSize({ width: 850, height: 900 });
+      const narrowCopy = await row('invoice').locator('.skill-row-copy').boundingBox(), narrowCount = await row('invoice').locator('.skill-readiness').boundingBox();
+      expect(narrowCount!.y).toBeGreaterThanOrEqual(narrowCopy!.y + narrowCopy!.height);
+      expect(await page.locator('main').evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+      await page.screenshot({ path: it.info().outputPath(`skills-narrow-${theme}.png`) });
+      await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'Skills', exact: true }).click();
+      await expect(page.locator('.embedded-resources .skill-controls')).toBeVisible(); await expect(row('invoice').getByText('5/5 capabilities', { exact: true })).toBeVisible();
+      await page.setViewportSize({ width: 1600, height: 1000 });
+      await page.locator('.embedded-resources').evaluate(node => { (node as HTMLElement).style.maxWidth = '650px'; });
+      const embeddedCopy = await row('invoice').locator('.skill-row-copy').boundingBox(), embeddedCount = await row('invoice').locator('.skill-readiness').boundingBox();
+      expect(embeddedCount!.y).toBeGreaterThanOrEqual(embeddedCopy!.y + embeddedCopy!.height);
+      expect(await row('invoice').locator('.skill-row-copy p').evaluate(node => getComputedStyle(node).whiteSpace)).toBe('nowrap');
+      await page.screenshot({ path: it.info().outputPath(`settings-skills-${theme}.png`) });
+      await display(catalogs.zero);
+      await expect(row('invoice').locator('.skill-missing button')).toHaveCount(5);
+      expect(await row('invoice').evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+      for (const tag of await row('invoice').locator('.skill-missing button').all())
+        await expect(tag).toHaveAttribute('title', /unavailable/);
+      await page.screenshot({ path: it.info().outputPath(`settings-skills-missing-${theme}.png`) });
+      await display(catalogs.full);
+      await page.getByRole('button', { name: 'Skills', exact: true }).click();
+    }
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+  const db = new Database(join(userData, 'data/app.sqlite'), { readonly: true });
+  try { for (const table of ['runs', 'tool_calls', 'session_inputs']) expect(db.query(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 }); }
+  finally { db.close(); }
+});
 it('manages fixed Prompt and Skill versions through real IPC without model or tool execution', async () => {
   it.setTimeout(60_000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p11-resources-ui-'));
@@ -28,6 +148,47 @@ it('manages fixed Prompt and Skill versions through real IPC without model or to
     expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { prompt: { id: 'invoice', version: 'v1' } } } });
     await page.getByRole('button', { name: 'Skills', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toBeVisible();
+    await expect(page.getByRole('switch')).toHaveCount(16);
+    const introductions = await page.locator('.skill-row-copy p').allTextContents();
+    expect(introductions).toHaveLength(16);
+    expect(introductions.every(text => text.length > 0 && !/[\u3400-\u9fff]/.test(text))).toBe(true);
+    for (const description of await page.locator('.skill-row-copy p').all())
+      await expect(description).toHaveAttribute('title', await description.textContent() ?? '');
+    await page.getByLabel('Search skills').fill('explicitly requests saving');
+    await expect(page.getByRole('switch', { name: 'Enable invoice-candidate-save v1', exact: true })).toBeVisible();
+    await expect(page.getByRole('switch')).toHaveCount(1);
+    await page.getByLabel('Search skills').fill('无法辨认');
+    await expect(page.getByRole('button', { name: 'View invoice v1', exact: true })).toBeVisible();
+    await page.getByLabel('Search skills').fill('');
+    await expect(page.locator('.skill-controls').getByRole('button', { name: 'Refresh resources', exact: true })).toBeVisible();
+    await expect(page.locator('.skill-row').filter({ has: page.getByRole('button', { name: 'View invoice v1', exact: true }) }).getByText('5/5 capabilities', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Clear all resource selections', exact: true })).toBeHidden();
+    await page.locator('summary').filter({ hasText: /^Resource recovery$/ }).click();
+    await expect(page.getByRole('button', { name: 'Clear all resource selections', exact: true })).toBeVisible();
+    await page.locator('summary').filter({ hasText: /^Resource recovery$/ }).click();
+    const library = await page.evaluate(() => window.flowmate.listResources());
+    expect(library).toMatchObject({ ok: true, data: { selection: { enabledSkills: [] } } });
+    if (!library.ok) throw new Error(library.error.code);
+    expect(library.data.items.filter(item => item.ref.kind === 'skill')).toHaveLength(16);
+    await page.getByLabel('Search skills').fill('invoice-source-audit');
+    await expect(page.getByRole('switch')).toHaveCount(1);
+    await page.getByRole('switch', { name: 'Enable invoice-source-audit v1', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
+    await page.getByRole('button', { name: 'View invoice-source-audit v1', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Resource details' })).toContainText('Verify source identities');
+    await expect(page.getByTestId('resource-file')).toContainText('check_invoice_sources');
+    await page.getByRole('combobox', { name: 'Resource file', exact: true }).selectOption('references/guide.md');
+    await expect(page.getByTestId('resource-file')).toContainText('来源');
+    const savedSelection = await page.evaluate(() => window.flowmate.listResources());
+    await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'Skills', exact: true }).click();
+    await expect(page.locator('.embedded-resources .skill-row')).toHaveCount(16);
+    const embeddedIntroductions = await page.locator('.embedded-resources .skill-row-copy p').allTextContents();
+    expect(embeddedIntroductions).toEqual(introductions);
+    expect(await page.evaluate(() => window.flowmate.listResources())).toEqual(savedSelection);
+    await page.getByRole('button', { name: 'Skills', exact: true }).click();
+    await page.getByLabel('Search skills').fill('invoice-source-audit');
+    await page.getByRole('switch', { name: 'Disable invoice-source-audit v1', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
     await page.getByLabel('Search skills').fill('invoice');
     await page.getByRole('button', { name: 'Disabled', exact: true }).click();
     await expect(page.getByRole('switch', { name: 'Enable invoice v1', exact: true })).toBeVisible();
@@ -157,7 +318,8 @@ it('uses the desktop Prompt in real SDK and HTTP requests, rejects unavailable n
     expect(payloads[0].messages.find(item => item.role === 'system')?.content).toContain('缺失');
     expect(await page.evaluate(owner => window.flowmate.queryRunResources(owner), { sessionId, runId }))
       .toMatchObject({ ok: true, data: { frozen: { prompt: { id: 'invoice', version: 'v1' }, discoveredSkills: [] }, evidence: { requests: [
-        { contentChecks: [{ scope: 'business-prompt', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }] }] } } });
+        { contentChecks: [{ scope: 'business-prompt', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' },
+          { scope: 'skill-readiness', ref: { id: 'invoice' }, sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }] }] } } });
     await page.getByRole('button', { name: 'Session details', exact: true }).click();
     const panel = page.getByRole('dialog', { name: 'Session details', exact: true });
     await expect(panel.getByRole('heading', { name: 'Run resources', exact: true })).toBeVisible();

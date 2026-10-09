@@ -10,7 +10,7 @@ import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import * as core from '../../../packages/core/src/index.ts';
 import * as pi from '../../../packages/runtime-pi/src/index.ts';
 import { canonicalResourceManifest, EMPTY_RESOURCE_SELECTION, ResourceManifestSchema, ResourceRefSchema, FrozenResourcesSchema, ok } from '../../../packages/contracts/src/index.ts';
-import type { ResourceDependency, ResourceSelection } from '../../../packages/contracts/src/index.ts';
+import type { ResourceDependency, ResourceSelection, ToolDefinition, AgentRunEvent, RunScope } from '../../../packages/contracts/src/index.ts';
 import { mkdtempSync, createHttpProvider, deferCleanup } from '../../support/resources.ts';
 
 const digest = (text: string | Buffer) => createHash('sha256').update(text).digest('hex');
@@ -20,7 +20,7 @@ function fixture() {
   const resourceRoot = join(root, 'author'), bundleRoot = join(root, 'bundles');
   mkdirSync(resourceRoot);
   function pack(kind: 'prompt' | 'skill', id = 'invoice', version = 'v1', body?: string, requires: ResourceDependency[] = []) {
-    const dir = join(resourceRoot, kind === 'prompt' ? 'prompts' : 'skills', id, version);
+    const dir = join(resourceRoot, kind === 'prompt' ? 'prompts' : 'skills', id);
     mkdirSync(join(dir, 'references'), { recursive: true });
     const bodyFile = kind === 'prompt' ? 'prompt.md' : 'SKILL.md';
     const bodyText = body ?? (kind === 'prompt' ? '核对发票字段，不补造缺失值。' : `---\nname: ${id}\ndescription: 发票字段整理\ndisable-model-invocation: false\n---\n请读取 references/field-rules.md。`);
@@ -43,6 +43,280 @@ function fixture() {
 }
 
 describe('P11 real resource files and native discovery', () => {
+  it('freezes a readiness index and injects scope-specific missing dependencies without exposing excluded bodies', () => {
+    const f = fixture(), ready = f.pack('skill', 'ready', 'v1', undefined, [{ kind: 'tool', name: 'read' }]),
+      missing = f.pack('skill', 'missing', 'v1', undefined, [{ kind: 'tool', name: 'write' }]);
+    const frozen = f.service().freeze({ settingsRevision: 1, selection: { prompt: null, enabledSkills: [ready.ref, missing.ref] },
+      activeToolNames: ['read'], requiredSkill: null });
+    expect(frozen.ok).toBe(true); if (!frozen.ok || !frozen.data) throw new Error('missing frozen resources');
+    const loader = pi.createRunResourceLoader({ fixedSystemPrompt: 'review', frozen: frozen.data,
+      bundleDirectory: frozen.data.bundleDirectory, activeToolNames: ['read'] });
+    expect(loader.ok).toBe(true); if (!loader.ok) throw new Error(loader.error.code);
+    const text = loader.data.getAppendSystemPrompt().join('\n');
+    expect(text).toContain('ready:'); expect(text).toContain('Ready (1/1 capabilities)');
+    expect(text).toContain('missing:'); expect(text).toContain('Partial (0/1 capabilities)'); expect(text).toContain('write');
+    expect(loader.data.getSkills().skills.map(skill => skill.name)).toEqual(['ready']);
+    expect(loader.data.bodyFor(missing.ref)).toBeNull();
+    const child = pi.createRunResourceLoader({ fixedSystemPrompt: 'child', frozen: frozen.data,
+      bundleDirectory: frozen.data.bundleDirectory, activeToolNames: [], visibleSkillRefs: [] });
+    expect(child.ok).toBe(true); if (!child.ok) throw new Error(child.error.code);
+    expect(child.data.getSkills().skills).toEqual([]);
+    expect(child.data.getAppendSystemPrompt().join('\n')).toContain('Partial (0/1 capabilities)');
+    if (!frozen.data.skillIndex) throw Error('Missing fixed readiness index');
+    const changed = { ...frozen.data, skillIndex: { ...frozen.data.skillIndex, hash: '0'.repeat(64) } };
+    expect(f.service().verifyFrozen(changed).ok).toBe(false);
+    expect(pi.createRunResourceLoader({ fixedSystemPrompt: 'review', frozen: changed,
+      bundleDirectory: frozen.data.bundleDirectory, activeToolNames: ['read'] }).ok).toBe(false);
+  });
+  it('rejects a combined native Skill index and readiness section larger than 16 KiB', () => {
+    const f = fixture(), refs = Array.from({ length: 18 }, (_, index) => f.pack('skill', `sop-${index}`, 'v1',
+      `---\nname: sop-${index}\ndescription: ${'a'.repeat(1000)}\n---\nRead this SOP only when needed.`).ref);
+    const frozen = f.service().freeze({ settingsRevision: 1, selection: { prompt: null, enabledSkills: refs },
+      activeToolNames: ['read'], requiredSkill: null });
+    if (!frozen.ok || !frozen.data) throw Error('Expected valid packages before runtime index validation');
+    expect(pi.createRunResourceLoader({ fixedSystemPrompt: 'review', frozen: frozen.data,
+      bundleDirectory: frozen.data.bundleDirectory, activeToolNames: ['read'] })).toMatchObject({ ok: false,
+      error: { code: 'resource_bundle_unavailable' } });
+  });
+  it.each(['invoice-party-role-review', 'invoice-date-currency-review', 'invoice-line-calculation-review', 'invoice-candidate-issue-triage', 'invoice-review-handoff', 'all-five', 'all-five-budget', 'all-five-cancel'])
+    ('delivers the new invoice Skill index and frozen files through the real Provider and dedicated tools: %s', async id => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-five-skill-run-'));
+    const paths = resolveProductPaths(join(root, 'product')); if (!paths.ok) throw new Error(paths.error.code);
+    const sourceRoot = join(root, 'source'), source = join(sourceRoot, '000001'); mkdirSync(source, { recursive: true });
+    const files = { 'original.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64'),
+      'content.json': Buffer.from(JSON.stringify([{ type: 'text', text: 'Total 113.00', bbox: [0, 0, 1, 1], page_idx: 0 }])),
+      'pages.json': Buffer.from(JSON.stringify([{ pageNumber: 1, text: 'Total 113.00', blockCount: 1 }])) };
+    for (const [name, bytes] of Object.entries(files)) writeFileSync(join(source, name), bytes);
+    writeFileSync(join(source, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId: '000001', datasetId: 'voxel51-hq-invoice-ocr',
+      sourceRecordId: 'sken-local', datasetRevision: 'sken-controlled', qualityStatus: 'complete', allowedUsesClaim: ['local test'], licenseVerification: 'not_verified',
+      files: Object.entries(files).map(([path, bytes]) => ({ path, bytes: bytes.length })) }));
+    const ids = ['invoice-party-role-review', 'invoice-date-currency-review', 'invoice-line-calculation-review', 'invoice-candidate-issue-triage', 'invoice-review-handoff'];
+    const requested = id.startsWith('all-five') ? ids : [id];
+    const calls = requested.flatMap(skill => [{ name: 'list_skill_resources', args: { skill } },
+      { name: 'read_skill_resource', args: { skill, path: 'SKILL.md' } }, { name: 'read_skill_resource', args: { skill, path: 'references/guide.md' } }]);
+    const payloads: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    let entered!: () => void;
+    const secondRequest = new Promise<void>(resolve => { entered = resolve; });
+    const server = await createHttpProvider(async request => {
+      payloads.push(await request.json() as (typeof payloads)[number]);
+      if (id === 'all-five-cancel' && payloads.length === 2) {
+        entered();
+        await new Promise<void>(resolve => {
+          if (request.signal.aborted) resolve(); else request.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+      }
+      const toolCalls = payloads.length === 1;
+      const delta = toolCalls ? { role: 'assistant', tool_calls: calls.map((call, index) => ({ index, id: `sken-${index}`,
+        type: 'function', function: { name: call.name, arguments: JSON.stringify(call.args) } })) } : { role: 'assistant', content: '五份指导已读取。' };
+      const chunk = (value: unknown, finish: string | null) => 'data: ' + JSON.stringify({ id: 'sken', choices: [{ index: 0, delta: value, finish_reason: finish }] }) + '\n\n';
+      return new Response(chunk(delta, null) + chunk({}, toolCalls ? 'tool_calls' : 'stop') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    }); deferCleanup(() => server.stop());
+    let selection: ResourceSelection = EMPTY_RESOURCE_SELECTION;
+    const created = await createApplication({ paths: paths.data, invoiceSourceRoot: sourceRoot,
+      resourceDefaults: () => ok({ revision: 1, selection }),
+      agentFactory: tools => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-sken-key' }) });
+    if (!created.ok) throw new Error(created.error.code); const app = created.data; deferCleanup(() => app.close());
+    const catalog = await app.listResources(); if (!catalog.ok) throw new Error(catalog.error.code);
+    const skills = catalog.data.items.filter(item => item.ref.kind === 'skill' && ids.includes(item.ref.id)); expect(skills).toHaveLength(5);
+    selection = { prompt: null, enabledSkills: skills.map(item => item.ref) };
+    const doc = await app.importInvoiceMaterial(source); if (!doc.ok) throw new Error(doc.error.code);
+    const session = await app.createSession(); if (!session.ok) throw new Error(session.error.code);
+    const before = await app.readWorkspace(); if (!before.ok) throw new Error(before.error.code);
+    const sessionWorkspace = await app.updateWorkspace({ expectedRevision: before.data.revision, change: { kind: 'session', sessionId: session.data.sessionId } });
+    if (!sessionWorkspace.ok) throw new Error(sessionWorkspace.error.code);
+    const documentWorkspace = await app.updateWorkspace({ expectedRevision: sessionWorkspace.data.revision, change: { kind: 'document', documentId: doc.data.documentRef.id } });
+    if (!documentWorkspace.ok) throw new Error(documentWorkspace.error.code);
+    const task = await app.startTask({ clientSequence: 1, expectedRevision: documentWorkspace.data.revision, documentRef: doc.data.documentRef, goal: 'Inspect five review guides' });
+    if (!task.ok) throw new Error(task.error.code);
+    const workspace = await app.readWorkspace(); if (!workspace.ok) throw new Error(workspace.error.code);
+    let finish!: (event: Extract<AgentRunEvent, { type: 'run_finished' }>) => void;
+    const done = new Promise<Extract<AgentRunEvent, { type: 'run_finished' }>>(resolve => { finish = resolve; });
+    const accepted = await app.submitInput({ sessionId: session.data.sessionId, clientSequence: 1, mode: 'prompt', text: '读取这五份复核指导，不修改候选。',
+      timeoutMs: 30000, budget: { maxToolCalls: id === 'all-five-budget' ? 14 : 20, maxModelCalls: 3 }, workspace: { revision: workspace.data.revision, sessionId: session.data.sessionId,
+        documentRef: workspace.data.documentRef, jobId: workspace.data.jobId, candidateRef: workspace.data.candidateRef },
+      config: { version: 1, name: 'SKEN controlled', revision: 1, modelRef: { provider: 'sken', model: 'sken' }, native: { authPath: join(root, 'empty.json'), modelsPath: null },
+        connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 } } },
+      { onEvent: event => { if (event.type === 'run_finished') finish(event); } });
+    if (!accepted.ok) throw new Error(accepted.error.code);
+    const started = performance.now();
+    if (id === 'all-five-cancel') {
+      await secondRequest;
+      const cancelling = performance.now();
+      expect(await app.cancelRun(accepted.data.runId)).toMatchObject({ ok: true });
+      expect((await done).result).toMatchObject({ ok: true, data: { status: 'cancelled', stopped: true } });
+      expect(performance.now() - cancelling).toBeLessThan(3000);
+      expect(payloads).toHaveLength(2);
+      return;
+    }
+    const ended = await done;
+    expect(performance.now() - started).toBeLessThan(30000);
+    if (id === 'all-five-budget') {
+      expect(ended.result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true, error: { code: 'tool_budget_exceeded' } } });
+      expect(payloads).toHaveLength(1);
+      return;
+    }
+    expect(ended.result).toMatchObject({ ok: true, data: { status: 'completed' } }); expect(payloads).toHaveLength(2);
+    const view = await app.queryRunResources({ sessionId: session.data.sessionId, runId: accepted.data.runId }); if (!view.ok) throw new Error(view.error.code);
+    const system = payloads[0]!.messages.find(message => message.role === 'system')!.content;
+    for (const indexed of ids) expect(system.split(`<name>${indexed}</name>`)).toHaveLength(2);
+    expect(view.data.evidence?.requests[0]?.contentChecks.filter(check => check.scope === 'skill-readiness'))
+      .toHaveLength(ids.length);
+    expect(view.data.evidence?.requests[0]?.contentChecks.filter(check => check.scope === 'skill-readiness')
+      .every(check => check.sdkInclusion === 'confirmed' && check.wireInclusion === 'confirmed' && check.expectedTextHash !== null)).toBe(true);
+    for (const id of requested) for (const path of ['SKILL.md', 'references/guide.md']) {
+        const text = readFileSync(join(import.meta.dir, '../../../resources/skills', id, path), 'utf8');
+        expect(system).not.toContain(text);
+        expect(payloads[1]!.messages.filter(message => message.role === 'tool').some(message => message.content.includes(JSON.stringify(text).slice(1, -1)))).toBe(true);
+        expect(view.data.evidence?.reads).toContainEqual(expect.objectContaining({ ref: expect.objectContaining({ id }), path, operation: 'read_skill_resource', fullBody: true }));
+      }
+    expect(view.data.evidence?.reads.filter(read => read.operation === 'list_skill_resources')).toHaveLength(requested.length * 2);
+    expect(view.data.evidence?.reads.every(read => read.nativeEntryId !== null)).toBe(true);
+    const run = await app.queryRun(accepted.data.runId); if (!run.ok || run.data.kind !== 'agent' || !('allowedTools' in run.data.scope)) throw new Error('Missing owned invoice Run');
+    expect(run.data.scope.allowedTools).toContain('read_skill_resource');
+    expect(view.data.frozen?.discoveredSkills.map(ref => ref.id).sort()).toEqual([...ids].sort());
+  });
+
+  it('loads the shipped sixteen flat Skills with real SDK metadata and excludes write-dependent SOPs from READ and Fill scopes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-shipped-skills-'));
+    const paths = resolveProductPaths(root); if (!paths.ok) throw new Error(paths.error.code);
+    let definitions: readonly ToolDefinition<any, any>[] = [];
+    const created = await createApplication({ paths: paths.data, toolDefinitions: tools => { definitions = tools; return tools; } });
+    if (!created.ok) throw new Error(created.error.code); deferCleanup(() => created.data.close());
+    const catalog = await created.data.listResources(); if (!catalog.ok) throw new Error(catalog.error.code);
+    const skills = catalog.data.items.filter(item => item.ref.kind === 'skill');
+    expect(skills.map(item => item.ref.id)).toEqual(['invoice', 'invoice-amount-reconciliation', 'invoice-candidate-comparison',
+      'invoice-candidate-issue-triage', 'invoice-candidate-save', 'invoice-conflict-review', 'invoice-date-currency-review',
+      'invoice-evidence-discovery', 'invoice-form-readiness-review', 'invoice-header-extraction', 'invoice-line-calculation-review',
+      'invoice-line-item-extraction', 'invoice-missing-info-review', 'invoice-party-role-review', 'invoice-review-handoff', 'invoice-source-audit']);
+    for (const skill of skills) expect(skill).toMatchObject({ available: true, enabled: false, diagnostics: [],
+      bodyFile: 'SKILL.md', disableModelInvocation: skill.ref.id === 'invoice-candidate-save' });
+    const service = core.createResourceService({ resourceRoot: join(import.meta.dir, '../../../resources'),
+      bundleRoot: join(root, 'library-bundles'), registeredToolNames: definitions.map(tool => tool.name), inspectNativeResources: pi.inspectNativeResources });
+    const selection = { prompt: null, enabledSkills: skills.map(item => item.ref) };
+    const frozen = service.freeze({ selection, settingsRevision: 1, activeToolNames: definitions.map(tool => tool.name), requiredSkill: null });
+    expect(frozen.ok && frozen.data?.discoveredSkills).toEqual(selection.enabledSkills);
+    if (!frozen.ok || !frozen.data) throw new Error('shipped library unavailable');
+    const all = pi.createRunResourceLoader({ fixedSystemPrompt: 'Invoice review', frozen: frozen.data,
+      bundleDirectory: frozen.data.bundleDirectory, activeToolNames: definitions.map(tool => tool.name) });
+    if (!all.ok) throw new Error(all.error.code);
+    for (const [id, count] of [['invoice-party-role-review', 5], ['invoice-date-currency-review', 5],
+      ['invoice-line-calculation-review', 7], ['invoice-candidate-issue-triage', 5], ['invoice-review-handoff', 5]] as const) {
+      const skill = skills.find(item => item.ref.id === id)!;
+      expect(skill.dependencyChecks).toHaveLength(count);
+      expect(skill.dependencyChecks.every(check => check.available)).toBe(true);
+      expect(all.data.getSkills().skills.find(item => item.name === id)?.description).toBe(skill.description);
+      expect(skill.description).not.toMatch(/[\u3400-\u9fff]/);
+      for (const path of ['SKILL.md', 'references/guide.md']) {
+        const read = service.readFrozenFile(frozen.data, { ref: skill.ref, path });
+        if (!read.ok) throw new Error(read.error.code);
+        expect(read.data.text).toBe(readFileSync(join(import.meta.dir, '../../../resources/skills', id, path), 'utf8'));
+      }
+    }
+    const visible = core.visibleFrozenSkills(frozen.data, definitions.filter(tool => tool.effect === 'READ').map(tool => tool.name));
+    expect(visible.map(ref => ref.id)).toContain('invoice-source-audit');
+    expect(visible.map(ref => ref.id)).not.toContain('invoice-candidate-save');
+    expect(core.visibleFrozenSkills(frozen.data, ['fill_invoice_form'])).toEqual([]);
+    const loaderInput = { fixedSystemPrompt: 'Read-only Skill context', frozen: frozen.data, bundleDirectory: frozen.data.bundleDirectory,
+      activeToolNames: ['list_skill_resources', 'read_skill_resource'], visibleSkillRefs: visible };
+    const loader = pi.createRunResourceLoader(loaderInput);
+    expect(loader.ok && loader.data.getSkills().skills.map(skill => skill.name)).toEqual(visible.map(ref => ref.id));
+    if (!loader.ok) throw new Error(loader.error.code);
+    const hidden = frozen.data.discoveredSkills.find(ref => ref.id === 'invoice-candidate-save')!;
+    expect(loader.data.bodyFor(hidden)).toBeNull();
+    writeFileSync(join(frozen.data.bundleDirectory, 'skills', hidden.id, hidden.version, 'SKILL.md'), 'Changed hidden frozen file');
+    expect(pi.createRunResourceLoader(loaderInput)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
+  });
+
+  it('dedicated tools resolve the owned active Run and read its frozen Skill instead of the current author package', async () => {
+    const f = fixture(), skill = f.pack('skill');
+    const binary = Buffer.from([0xff, 0xfe, 0x00]);
+    const controls = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x00, 0x00]);
+    const whitespace = Buffer.from('中文\ttext\r\n');
+    skill.manifest = ResourceManifestSchema.parse({ ...skill.manifest, files: [...skill.manifest.files,
+      { path: 'references/binary.bin', bytes: binary.length, sha256: digest(binary) },
+      { path: 'references/controls.bin', bytes: controls.length, sha256: digest(controls) },
+      { path: 'references/text.txt', bytes: whitespace.length, sha256: digest(whitespace) }] });
+    skill.ref = ResourceRefSchema.parse({ ...skill.ref, contentHash: digest(canonicalResourceManifest(skill.manifest)) });
+    writeFileSync(join(skill.dir, 'references/binary.bin'), binary);
+    writeFileSync(join(skill.dir, 'references/controls.bin'), controls);
+    writeFileSync(join(skill.dir, 'references/text.txt'), whitespace);
+    writeFileSync(join(skill.dir, 'resource.json'), JSON.stringify(skill.manifest));
+    const paths = resolveProductPaths(join(f.root, 'owned-product')); if (!paths.ok) throw new Error(paths.error.code);
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), barrier = new Promise<void>(resolve => { release = resolve; });
+    const server = await createHttpProvider(async () => { entered(); await barrier;
+      return new Response('data: ' + JSON.stringify({ id: 'owned-skill', choices: [{ index: 0, delta: { role: 'assistant', content: 'Done' }, finish_reason: 'stop' }] })
+        + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }); });
+    deferCleanup(async () => { release(); await server.stop(); });
+    let definitions: readonly ToolDefinition<any, any>[] = [];
+    const created = await createApplication({ paths: paths.data, resourceRoot: f.resourceRoot,
+      resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
+      toolDefinitions: tools => { definitions = tools; return tools; },
+      agentFactory: tools => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'owned-skill-key' }) });
+    if (!created.ok) throw new Error(created.error.code); const app = created.data;
+    deferCleanup(async () => { release(); await app.close(); });
+    const list = definitions.find(tool => tool.name === 'list_skill_resources'), read = definitions.find(tool => tool.name === 'read_skill_resource');
+    expect(list).toBeDefined(); expect(read).toBeDefined(); if (!list || !read) return;
+    const session = await app.createSession({ title: 'Owned Skill' }); if (!session.ok) throw new Error(session.error.code);
+    const workspace = await app.readWorkspace(); if (!workspace.ok) throw new Error(workspace.error.code);
+    const selected = await app.updateWorkspace({ expectedRevision: workspace.data.revision, change: { kind: 'session', sessionId: session.data.sessionId } });
+    if (!selected.ok) throw new Error(selected.error.code);
+    let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+    const done = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finish = resolve; });
+    const accepted = await app.submitInput({ sessionId: session.data.sessionId, clientSequence: 1, mode: 'prompt', text: 'Inspect the SOP',
+      workspace: { revision: selected.data.revision, sessionId: session.data.sessionId, documentRef: null, jobId: null, candidateRef: null },
+      config: { version: 1, name: 'P11 tools', revision: 1, modelRef: { provider: 'p11', model: 'p11' },
+        native: { authPath: join(f.root, 'empty.json'), modelsPath: null },
+        connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 },
+        parameters: { maxRetries: 0, maxRetryDelayMs: 100 } } }, { onEvent: event => { if (event.type === 'run_finished') finish(event); } });
+    if (!accepted.ok) throw new Error(accepted.error.code);
+    try {
+      await Promise.race([started, done.then(event => { throw new Error(`Run stopped before the controlled request: ${JSON.stringify(event.result)}`); })]);
+      const run = await app.queryRun(accepted.data.runId); if (!run.ok || run.data.kind !== 'agent') throw new Error('missing Agent owner');
+      const context = { sessionId: run.data.sessionId, runId: run.data.runId, scope: run.data.scope as RunScope };
+      const call = { nativeToolCallId: 'owned-skill-read', signal: new AbortController().signal };
+      writeFileSync(join(skill.dir, 'SKILL.md'), 'New unverified author text');
+      expect(await list.execute({ skill: 'invoice' }, call, context)).toEqual({ ref: skill.ref,
+        bundleHash: FrozenResourcesSchema.parse(run.data.config.resources).bundleHash,
+        files: [...skill.manifest.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0) });
+      expect(await read.execute({ skill: 'invoice', path: 'SKILL.md' }, call, context)).toMatchObject({ ref: skill.ref, text: skill.bodyText,
+        offset: 0, nextOffset: null, totalBytes: Buffer.byteLength(skill.bodyText) });
+      await expect(read.execute({ skill: 'invoice', path: 'resource.json' }, call, context)).rejects.toMatchObject({ code: 'resource_file_unavailable' });
+      await expect(read.execute({ skill: 'invoice', path: 'references/binary.bin' }, call, context)).rejects.toMatchObject({ code: 'resource_file_unavailable' });
+      await expect(read.execute({ skill: 'invoice', path: 'references/controls.bin' }, call, context)).rejects.toMatchObject({ code: 'resource_file_unavailable' });
+      expect(await read.execute({ skill: 'invoice', path: 'references/text.txt' }, call, context)).toMatchObject({ text: whitespace.toString() });
+      await expect(list.execute({ skill: 'missing' }, call, context)).rejects.toMatchObject({ code: 'resource_required_unavailable' });
+      await expect(list.execute({ skill: 'invoice' }, call, { ...context, sessionId: context.sessionId + 1 })).rejects.toMatchObject({ code: 'resource_required_unavailable' });
+      await expect(read.execute({ skill: 'invoice', path: 'SKILL.md' }, call, { ...context, scope: { ...context.scope, allowedTools: [] } })).rejects.toMatchObject({ code: 'resource_required_unavailable' });
+      await expect(read.execute({ skill: 'invoice', path: 'references/field-rules.md', offset: 1, limit: 4 }, call, context)).rejects.toMatchObject({ code: 'resource_file_unavailable' });
+      const abort = new AbortController(); abort.abort();
+      await expect(list.execute({ skill: 'invoice' }, { ...call, signal: abort.signal }, context)).rejects.toMatchObject({ code: 'tool_cancelled' });
+    } finally { release(); await done; }
+  });
+
+  it('indexes a flat author Skill and preserves older frozen versions when the current package is replaced', () => {
+    const f = fixture(), first = f.pack('skill'), hub = f.service();
+    const frozen = hub.freeze({ selection: { prompt: null, enabledSkills: [first.ref] }, settingsRevision: 1,
+      activeToolNames: tools, requiredSkill: first.ref });
+    expect(frozen.ok && frozen.data?.discoveredSkills).toEqual([first.ref]);
+    if (!frozen.ok || !frozen.data) throw new Error('missing original frozen version');
+    const next = f.pack('skill', 'invoice', 'v2', '---\nname: invoice\ndescription: updated SOP\n---\nNew author body');
+    expect(hub.catalog({ revision: 2, selection: EMPTY_RESOURCE_SELECTION })).toMatchObject({ ok: true,
+      data: { items: [{ ref: next.ref }] } });
+    expect(hub.readFrozenFile(frozen.data, { ref: first.ref, path: 'SKILL.md' })).toMatchObject({ ok: true,
+      data: { ref: first.ref, text: first.bodyText } });
+    expect(hub.freeze({ selection: { prompt: null, enabledSkills: [first.ref] }, settingsRevision: 2,
+      activeToolNames: tools, requiredSkill: first.ref })).toMatchObject({ ok: false,
+      error: { code: 'resource_required_unavailable' } });
+    const nested = join(f.resourceRoot, 'skills', 'nested', 'v1');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, 'resource.json'), JSON.stringify({ ...first.manifest, id: 'nested' }));
+    expect(hub.catalog({ revision: 2, selection: EMPTY_RESOURCE_SELECTION })).toMatchObject({ ok: true,
+      data: { diagnostics: [expect.objectContaining({ resourceId: 'nested' })], items: [{ ref: next.ref }] } });
+  });
+
   it('reports each declared dependency without letting partial readiness bypass admission', () => {
     const f = fixture(), skill = f.pack('skill', 'partial', 'v1', undefined,
       [{ kind: 'tool', name: 'read' }, { kind: 'tool', name: 'missing_tool' }, { kind: 'extension', id: 'missing', version: 'v1' }]);

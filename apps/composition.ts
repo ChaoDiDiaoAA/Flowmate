@@ -1,9 +1,11 @@
+import { createInputDefinitions } from '../packages/core/src/prompt-templates.ts';
+import { parseFrontmatter, loadPromptTemplates, expandPromptTemplate } from '@flowmate/runtime-pi';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
   ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
-import { createInvoiceTools, fillInvoiceForm, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
+import { createInvoiceTools, fillInvoiceForm, listSkillResources, readSkillResource, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createNativeTools, inspectNativeResources, PI_SDK_VERSION } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
@@ -70,14 +72,19 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     workspace: database.data.workspace, candidates: database.data.candidates, bridge: options.invoiceFormBridge, now }) : undefined;
   let agent: import('@flowmate/contracts').AgentPort;
   const assembled = [...createInvoiceTools({ documents, documentRepository: database.data.documents,
-    candidates: database.data.candidates, now }), ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), createSubagentTool(() => agent), ...native.definitions];
+    candidates: database.data.candidates, now }), listSkillResources((input, context) => resources.listSkillResources(input, context)),
+    readSkillResource((input, context) => resources.readSkillResource(input, context)),
+    ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), createSubagentTool(() => agent), ...native.definitions];
   const definitions = Object.freeze([...(options.toolDefinitions?.(assembled) ?? assembled)]);
   const unavailableTools = new Set(native.availability.filter(item => !item.available).map(item => item.name as string));
   const resources = createResourceService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
     bundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
-    registeredToolNames: definitions.filter(tool => !unavailableTools.has(tool.name)).map(tool => tool.name), inspectNativeResources });
+    registeredToolNames: definitions.filter(tool => !unavailableTools.has(tool.name)).map(tool => tool.name), inspectNativeResources,
+    getRun: runId => database.data.runs.get(runId) });
   const extensions = createExtensionService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
     sdkVersion: PI_SDK_VERSION, registeredTools: definitions });
+  const inputDefinitions = createInputDefinitions({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
+    runtimeRoot: options.paths.runtimeDir, tools: assembled, parseFrontmatter, loadPromptTemplates, expandPromptTemplate });
   const toolExecutor = createToolExecutor({ definitions, recorder,
     strategyPolicy: options.runtimePolicy, sampleSource: options.sampleSource,
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
@@ -100,6 +107,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     resources,
     extensions,
     resourceDefaults: options.resourceDefaults,
+    inputDefinitions,
     isSessionManaging: sessionId => sessionService?.isManaging(sessionId) ?? false,
     provider,
     agent,
@@ -137,6 +145,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     resources,
     extensions,
     resourceDefaults: options.resourceDefaults,
+    inputDefinitions,
     saveResourceSelection: options.saveResourceSelection,
     saveExtensionSelection: options.saveExtensionSelection,
     documents: database.data.documents,

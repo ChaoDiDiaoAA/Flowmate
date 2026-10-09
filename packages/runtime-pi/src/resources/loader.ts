@@ -1,8 +1,9 @@
 import { loadSkillsFromDir, formatSkillsForPrompt, createExtensionRuntime, parseSkillBlock, stripFrontmatter,
   truncateHead, DEFAULT_MAX_BYTES, formatSize, type ResourceLoader, type Skill, type LoadExtensionsResult } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok, ResourceNativeMetadataSchema, FrozenResourcesSchema, ResourceBundleManifestSchema, ResourceManifestSchema,
-  RESOURCE_LIMITS, canonicalResourceManifest, resourceRefKey } from '@flowmate/contracts';
-import type { InspectNativeResources, FrozenResources, ResourceRef, Result } from '@flowmate/contracts';
+  RESOURCE_LIMITS, canonicalResourceManifest, resourceRefKey, formatSkillReadinessSection } from '@flowmate/contracts';
+import { ListSkillResourcesInputSchema, ListSkillResourcesOutputSchema, ReadSkillResourceInputSchema, ReadSkillResourceOutputSchema } from '@flowmate/contracts';
+import type { InspectNativeResources, FrozenResources, ResourceRef, Result, SkillIndexEntry, FrozenInputDefinitions } from '@flowmate/contracts';
 import { resolve, join, relative, isAbsolute, sep } from 'node:path';
 import { lstatSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -13,6 +14,7 @@ const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const samePath = (left: string, right: string) => process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 const resourcePath = (ref: ResourceRef) => `${ref.kind === 'prompt' ? 'prompts' : 'skills'}/${ref.id}/${ref.version}`;
 export type ManagedReadFile = { ref: ResourceRef; path: string; fileHash: string; text: string | null; relativePath: string };
+export { formatSkillReadinessSection } from '@flowmate/contracts';
 /** Match this installed SDK's observable text projection, using its public truncation helper. */
 export function verifyManagedReadOutput(file: ManagedReadFile, args: Record<string, unknown>, text: string): Result<void> {
   if (file.text === null) return ok(undefined);
@@ -53,14 +55,25 @@ function readFixed(root: string, path: string, limit: number): Buffer {
 
 /** No default discovery, configuration reload, extension loading, or PromptTemplate expansion. */
 export function createRunResourceLoader(input: { fixedSystemPrompt: string; frozen: FrozenResources | null;
-  bundleDirectory: string; extensionResult?: LoadExtensionsResult }): Result<ResourceLoader & { bodyFor(ref: ResourceRef): string | null;
+  bundleDirectory: string; activeToolNames?: readonly string[]; visibleSkillRefs?: readonly ResourceRef[]; roleIndex?: string;
+  templates?: FrozenInputDefinitions['templates']; child?: boolean; extensionResult?: LoadExtensionsResult }): Result<ResourceLoader & { bodyFor(ref: ResourceRef): string | null;
+    readinessFor(ref: ResourceRef): string | null;
     filesForOperation(path: string, cwd: string, operation: string): ManagedReadFile[] }> {
   try {
     const skills: Skill[] = [], appended: string[] = [], sources: Array<{ path: string }> = [];
     const bodies = new Map<string, string>();
     const files: Array<{ ref: ResourceRef; path: string; bytes: number; sha256: string }> = [];
+    const readiness = new Map<string, string>();
+    if (input.roleIndex) {
+      if (Buffer.byteLength(input.roleIndex) > 16384) throw new Error('Role index exceeds 16 KiB.');
+      appended.push('Registered subagent roles (use Agent with subagent_type; independent calls can run concurrently, maximum four):\n'+input.roleIndex);
+    }
     if (input.frozen !== null) {
       const frozen = FrozenResourcesSchema.parse(input.frozen), root = resolve(input.bundleDirectory);
+      if (frozen.skillIndex && hash(JSON.stringify(frozen.skillIndex.entries)) !== frozen.skillIndex.hash) throw new Error('Fixed Skill index changed.');
+      const visible = new Set((input.visibleSkillRefs ?? frozen.discoveredSkills).map(resourceRefKey));
+      if (input.visibleSkillRefs?.some(ref => !frozen.discoveredSkills.some(item => resourceRefKey(item) === resourceRefKey(ref)))
+        || input.visibleSkillRefs && visible.size !== input.visibleSkillRefs.length) throw new Error('Visible Skills exceed the fixed bundle.');
       if (!samePath(root, resolve(frozen.bundleDirectory))) throw new Error('Frozen content location differs from the controlled Loader root.');
       const manifest = ResourceBundleManifestSchema.parse(JSON.parse(decoder.decode(readFixed(root, 'bundle.json', RESOURCE_LIMITS.manifestBytes * RESOURCE_LIMITS.packages * 2 + 65536))));
       const refs = [...(frozen.prompt ? [frozen.prompt] : []), ...frozen.discoveredSkills];
@@ -94,13 +107,27 @@ export function createRunResourceLoader(input: { fixedSystemPrompt: string; froz
             || !ResourceNativeMetadataSchema.safeParse({ name: skill.name, description: skill.description,
               disableModelInvocation: skill.disableModelInvocation, diagnostics: [] }).success
             || hash(readFixed(root, bodyPath, RESOURCE_LIMITS.bodyBytes)) !== hash(body)) throw new Error('Fixed native Skill could not be verified.');
-          skills.push(skill);
+          if (visible.has(resourceRefKey(item.ref))) skills.push(skill);
         }
       }
-      if (Buffer.byteLength(formatSkillsForPrompt(skills, 'read')) > RESOURCE_LIMITS.indexBytes) throw new Error('Native Skill index exceeds its limit.');
+      for (let i = files.length - 1; i >= 0; i--) if (files[i]!.ref.kind === 'skill' && !visible.has(resourceRefKey(files[i]!.ref))) files.splice(i, 1);
+      for (const ref of frozen.discoveredSkills) if (!visible.has(resourceRefKey(ref))) bodies.delete(resourceRefKey(ref));
+      const toolNames = input.activeToolNames ?? ['read'];
+      for (const entry of frozen.skillIndex?.entries ?? []) readiness.set(resourceRefKey(entry.ref),
+        formatSkillReadinessSection(entry, toolNames, input.visibleSkillRefs ?? frozen.discoveredSkills, input.child === true));
+      const readinessSection = readiness.size ? 'Skill readiness for this Run (diagnostics do not grant execution permission):\n'+[...readiness.values()].join('\n') : '';
+      const index = formatSkillsForPrompt(skills, 'read');
+      const guidance = toolNames.includes('read_skill_resource') && skills.length
+        ? 'For registered Skills, use list_skill_resources({skill}) to list files and read_skill_resource({skill, path, offset?, limit?}) to read UTF-8 pages from this Run’s fixed bundle. Use the listed Skill name, SKILL.md for its body, and a listed relative path for references. Listing does not read bodies; reading scripts does not execute them.' : '';
+      const nativeIndex = toolNames.includes('read') || toolNames.includes('bash');
+      const fallback = !nativeIndex && guidance ? (index.match(/  <skill>[\s\S]*?  <\/skill>/g) ?? []).join('\n') : '';
+      if (Buffer.byteLength(index) + Buffer.byteLength(guidance) + Buffer.byteLength(readinessSection) > RESOURCE_LIMITS.indexBytes) throw new Error('Native Skill index and reading guidance exceed their limit.');
+      if (readinessSection) appended.push(readinessSection);
+      if (guidance) appended.push([guidance, fallback && `<available_skills>\n${fallback}\n</available_skills>`].filter(Boolean).join('\n\n'));
     }
     return ok({
       bodyFor: ref => bodies.get(resourceRefKey(ref)) ?? null,
+      readinessFor: ref => readiness.get(resourceRefKey(ref)) ?? null,
       filesForOperation: (path, cwd, operation) => {
         const target = resolveNativeFilePath(path, cwd), root = resolve(input.bundleDirectory);
         return files.flatMap(file => {
@@ -109,18 +136,49 @@ export function createRunResourceLoader(input: { fixedSystemPrompt: string; froz
           const content = readFixed(root, filePath, RESOURCE_LIMITS.fileBytes);
           if (content.length !== file.bytes || hash(content) !== file.sha256) throw new Error('Managed file changed during native read.');
           let text: string | null = null; try { text = decoder.decode(content); } catch { /* Binary output is not full text evidence. */ }
+          if (text !== null && /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) text = null;
           return [{ ref: file.ref, path: file.path, fileHash: file.sha256, text, relativePath: rel }];
         });
       },
       getExtensions: () => input.extensionResult ?? ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
       getSkills: () => ({ skills: [...skills], diagnostics: [] }),
-      getPrompts: () => ({ prompts: [], diagnostics: [] }), getThemes: () => ({ themes: [], diagnostics: [] }),
+      getPrompts: () => ({ prompts: (input.templates ?? []).map(template => ({ name: template.name,
+        description: template.description, content: template.content, filePath: template.filePath,
+        sourceInfo: { path: template.filePath, source: 'Flowmate fixed input', scope: 'temporary' as const, origin: 'top-level' as const } })), diagnostics: [] }),
+      getThemes: () => ({ themes: [], diagnostics: [] }),
       getAgentsFiles: () => ({ agentsFiles: [] }), getSystemPrompt: () => input.fixedSystemPrompt,
       getSystemPromptSource: () => undefined, getAppendSystemPrompt: () => [...appended],
       getAppendSystemPromptSources: () => [...sources],
       extendResources: () => { throw new Error('agent_resources_disabled'); }, reload: async () => {},
     });
   } catch { return fail(appError('resource_bundle_unavailable', 'storage', 'Fixed Pi resources could not be assembled.', true)); }
+}
+
+/** Recheck structured feedback against fixed files before recording SDK delivery evidence. */
+export function verifySkillToolOutput(frozen: FrozenResources, loader: Extract<ReturnType<typeof createRunResourceLoader>, { ok: true }>['data'],
+  operation: 'list_skill_resources' | 'read_skill_resource', raw: unknown, output: unknown): Result<Array<ManagedReadFile & { fullBody: boolean }>> {
+  try {
+    const args = operation === 'list_skill_resources' ? ListSkillResourcesInputSchema.parse(raw) : ReadSkillResourceInputSchema.parse(raw);
+    const data = operation === 'list_skill_resources' ? ListSkillResourcesOutputSchema.parse(output) : ReadSkillResourceOutputSchema.parse(output);
+    const item = frozen.manifests.find(item => resourceRefKey(item.ref) === resourceRefKey(data.ref));
+    if (!item || data.bundleHash !== frozen.bundleHash || data.ref.id !== args.skill || loader.bodyFor(data.ref) === null) throw new Error('Hidden or foreign Skill.');
+    const directory = join(frozen.bundleDirectory, resourcePath(data.ref));
+    if ('files' in data) {
+      const ordered = [...item.manifest.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+      if (JSON.stringify(data.files) !== JSON.stringify(ordered)) throw new Error('Listed metadata changed.');
+      return ok(loader.filesForOperation(directory, directory, 'ls').map(file => ({ ...file, fullBody: false })));
+    }
+    const readArgs = ReadSkillResourceInputSchema.parse(raw);
+    const file = loader.filesForOperation(join(directory, readArgs.path), directory, 'read')[0];
+    if (!file || file.text === null || data.path !== readArgs.path || data.sha256 !== file.fileHash || data.offset !== (readArgs.offset ?? 0)) throw new Error('Read identity changed.');
+    const content = Buffer.from(file.text), start = data.offset;
+    if (start > content.length || start < content.length && (content[start]! & 0xc0) === 0x80) throw new Error('Invalid UTF-8 offset.');
+    let end = Math.min(start + (readArgs.limit ?? RESOURCE_LIMITS.pageBytes), content.length);
+    while (end < content.length && end > start && (content[end]! & 0xc0) === 0x80) end--;
+    if (data.totalBytes !== content.length || data.text !== decoder.decode(content.subarray(start, end))
+      || data.nextOffset !== (end < content.length ? end : null)) throw new Error('Read projection changed.');
+    return ok([{ ...file, fullBody: start === 0 && end === content.length }]);
+  } catch { return fail(appError('resource_evidence_conflict', 'runtime', 'Structured Skill feedback differs from its fixed file.')); }
 }
 
 /** Verify the result created by Pi; never construct or execute a Skill message here. */

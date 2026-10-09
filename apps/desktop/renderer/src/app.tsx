@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type ReactNode } from 'react';
+import { usePanelLayout } from './panel-layout.tsx';
 import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema,
   MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS, MAX_INVOICE_BLOCKS_PER_PAGE } from '../../../../packages/contracts/src/invoice.ts';
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
@@ -14,6 +15,8 @@ import { applyMessageUpsert, mergeSavedHistory, messageViewsForDisplay, type Mes
 import { ResourcePage } from './prompt.tsx';
 import { PromptOptimizer } from './prompt-optimizer.tsx';
 import { ExtensionsPage } from './extensions.tsx';
+import { InputCommands } from './input-commands.tsx';
+import { Subagents } from './subagents.tsx';
 import { ActivityPage } from './activity.tsx';
 import { WorkspacePage, InvoiceFieldDetails } from './workspace.tsx';
 import { SessionDetails, type ContextBasis } from './session-details.tsx';
@@ -159,9 +162,7 @@ export function App() {
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [messageState, setMessageState] = useState<MessageViewState | null>(null);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
-  const [sessionInputs, setSessionInputs] = useState<SessionInputSnapshot[]>([]);
   const [inputReadError, setInputReadError] = useState<string | null>(null);
-  const [inputCursor, setInputCursor] = useState<number | null>(null);
   const [inputSubmitting, setInputSubmitting] = useState(false);
   const [unknownInput, setUnknownInput] = useState<{ sessionId: number; clientSequence: number } | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -223,6 +224,7 @@ export function App() {
   const [sessionMutating, setSessionMutating] = useState(false);
   const [revokingAccess, setRevokingAccess] = useState(false);
   const [chatCollapsed, setChatCollapsed] = useState(() => window.innerWidth < 1080);
+  const panels = usePanelLayout(chatCollapsed);
   const [navOpen, setNavOpen] = useState(false);
   const [run, setRun] = useState<RunSnapshot | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
@@ -279,7 +281,6 @@ export function App() {
   const eventSequences = useRef(new Map<number, number>());
   const messageStates = useRef(new Map<number, MessageViewState>());
   const messageCursors = useRef(new Map<number, string | null>());
-  const inputPages = useRef(new Map<number, { items: SessionInputSnapshot[]; cursor: number | null }>());
   const inputReadTokens = useRef(new Map<number, number>());
   const unknownInputs = useRef(new Map<number, DesktopSessionInputRequest & { submittedDraft?: string }>());
   const inputSubmittingRef = useRef(false);
@@ -1451,23 +1452,18 @@ export function App() {
     setChatTurns((turns) => turns.filter((turn) => turn.clientSequence !== undefined || turn.runId === null || !userRuns.has(turn.runId)));
   }
 
-  async function loadSessionInputs(sessionId: number, beforeInputId?: number) {
+  async function loadSessionInputs(sessionId: number) {
     const epoch = workspaceHostEpoch.current, selection = sessionLoadSequence.current;
     const request = (inputReadTokens.current.get(sessionId) ?? 0) + 1; inputReadTokens.current.set(sessionId, request);
-    const result = await window.flowmate.listSessionInputs({ sessionId, limit: 50, ...(beforeInputId ? { beforeInputId } : {}) }).catch(() => null);
+    const result = await window.flowmate.listSessionInputs({ sessionId, limit: 50 }).catch(() => null);
     if (inputReadTokens.current.get(sessionId) !== request || epoch !== workspaceHostEpoch.current || selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
     if (!result?.ok) { setInputReadError('Saved inputs are unavailable.'); return; }
     setInputReadError(null);
-    const previous = beforeInputId ? inputPages.current.get(sessionId)?.items ?? [] : [];
-    const items = [...new Map([...previous, ...result.data.items].map(input => [input.inputId, input])).values()]
-      .sort((left, right) => right.inputId - left.inputId);
-    inputPages.current.set(sessionId, { items, cursor: result.data.nextBeforeInputId });
-    const resolved = items.filter(input => input.status !== 'queued');
+    const resolved = result.data.items.filter(input => input.status !== 'queued');
     const resolvedIds = new Set(resolved.map(input => input.inputId));
     const resolvedSequences = new Set(resolved.map(input => input.clientSequence));
     setChatTurns(turns => turns.filter(turn => turn.sessionId !== sessionId
       || (turn.inputId !== undefined ? !resolvedIds.has(turn.inputId) : turn.clientSequence === undefined || !resolvedSequences.has(turn.clientSequence))));
-    if (selectedSessionIdRef.current === sessionId) { setSessionInputs(items); setInputCursor(result.data.nextBeforeInputId); }
   }
 
   async function checkInputStatus() {
@@ -1623,9 +1619,7 @@ export function App() {
     setChatTurns([]);
     setMessageState(sessionId === null ? null : messageStates.current.get(sessionId) ?? null);
     setMessageCursor(sessionId === null ? null : messageCursors.current.get(sessionId) ?? null);
-    setSessionInputs(sessionId === null ? [] : inputPages.current.get(sessionId)?.items ?? []);
     setInputReadError(null);
-    setInputCursor(sessionId === null ? null : inputPages.current.get(sessionId)?.cursor ?? null);
     setUnknownInput(sessionId !== null && unknownInputs.current.has(sessionId)
       ? { sessionId, clientSequence: unknownInputs.current.get(sessionId)!.clientSequence } : null);
     if (sessionId === null) setHistoryLoading(false);
@@ -1769,7 +1763,6 @@ export function App() {
     sessionCursorRef.current = nextCursor;
     chatDrafts.current.delete(draftKey(sessionId));
     unknownInputs.current.delete(sessionId);
-    inputPages.current.delete(sessionId);
     historyPositions.current.delete(sessionId);
     const next = wasSelected ? remaining.find((item) => item.status === 'active' && item.availability === 'ready'
       && item.historyState === 'recoverable' && !item.modelUseBlocked) ?? null : null;
@@ -1780,8 +1773,6 @@ export function App() {
       updateChatInput(chatDrafts.current.get(draftKey(next?.sessionId ?? null)) ?? '');
       setChatTurns([]);
       setMessageState(next ? messageStates.current.get(next.sessionId) ?? null : null);
-      setSessionInputs(next ? inputPages.current.get(next.sessionId)?.items ?? [] : []);
-      setInputCursor(next ? inputPages.current.get(next.sessionId)?.cursor ?? null : null);
       setUnknownInput(next && unknownInputs.current.has(next.sessionId)
         ? { sessionId: next.sessionId, clientSequence: unknownInputs.current.get(next.sessionId)!.clientSequence } : null);
       setMessageCursor(next ? messageCursors.current.get(next.sessionId) ?? null : null);
@@ -2622,7 +2613,8 @@ export function App() {
             </> : null;
 
   return (
-    <div className={`desktop-shell theme-${profileDraft.theme} ${chatCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''}`}>
+    <div ref={panels.shellRef} style={panels.style} className={`desktop-shell theme-${profileDraft.theme} ${chatCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''} ${panels.dragging ? 'panels-resizing' : ''}`}>
+      {panels.separators}
       {rejectPrompt && <div role="dialog" aria-modal="true" aria-label="Reject invoice result"
         style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,.45)', display: 'grid', placeItems: 'center' }}>
         <section className="panel" style={{ maxWidth: 440, padding: 24 }}><h2>Reject invoice result</h2>
@@ -2968,6 +2960,8 @@ export function App() {
         )}
       </main>
       <AgentChatPanel
+        key={`chat:${workspaceHostEpoch.current}`}
+        hostEpoch={workspaceHostEpoch.current} hostReady={Boolean(state?.ready)}
         collapsed={chatCollapsed}
         onToggle={() => { assistantWasToggled.current = true; setChatCollapsed((collapsed) => !collapsed); }}
         selectedSessionId={selectedSessionId}
@@ -2978,6 +2972,7 @@ export function App() {
         onLoadOlderRuns={() => void loadOlderRuns()}
         turns={chatTurns}
         messages={messageState ? messageViewsForDisplay(messageState) : []}
+        ownsRun={runId => knownRunSessions.current.get(runId) === selectedSessionId}
         unconfirmedCount={messageState ? [...messageState.liveByRun]
           .filter(([runId]) => messageState.closedRuns.has(runId)).reduce((total, [, items]) => total + items.size, 0) : 0}
         historyLoading={historyLoading}
@@ -2992,10 +2987,7 @@ export function App() {
         onSend={() => void sendChatMessage()}
         onAppend={mode => void appendChatInput(mode)}
         canAppend={canAppend}
-        sessionInputs={sessionInputs}
         inputReadError={inputReadError}
-        hasOlderInputs={inputCursor !== null}
-        onLoadOlderInputs={() => { if (selectedSessionIdRef.current !== null && inputCursor !== null) void loadSessionInputs(selectedSessionIdRef.current, inputCursor); }}
         unknownInput={unknownInput !== null}
         onCheckInputStatus={() => void checkInputStatus()}
         onBranch={entryId => void branchSession(entryId)}
@@ -3354,6 +3346,7 @@ function turnFromRun(run: AgentRunSnapshot): ChatTurn {
 }
 
 function AgentChatPanel({
+  hostEpoch, hostReady,
   collapsed,
   onToggle,
   selectedSessionId,
@@ -3364,6 +3357,7 @@ function AgentChatPanel({
   onLoadOlderRuns,
   turns,
   messages,
+  ownsRun,
   unconfirmedCount,
   historyLoading,
   historyError,
@@ -3377,10 +3371,7 @@ function AgentChatPanel({
   onSend,
   onAppend,
   canAppend,
-  sessionInputs,
   inputReadError,
-  hasOlderInputs,
-  onLoadOlderInputs,
   unknownInput,
   onCheckInputStatus,
   canBranch,
@@ -3402,6 +3393,7 @@ function AgentChatPanel({
   onGoalModeChange,
   sessionHint,
 }: {
+  hostEpoch: number; hostReady: boolean;
   collapsed: boolean;
   onToggle(): void;
   selectedSessionId: number | null;
@@ -3412,6 +3404,7 @@ function AgentChatPanel({
   onLoadOlderRuns(): void;
   turns: readonly ChatTurn[];
   messages: readonly SessionMessageView[];
+  ownsRun(runId: number): boolean;
   unconfirmedCount: number;
   historyLoading: boolean;
   historyError: string | null;
@@ -3425,10 +3418,7 @@ function AgentChatPanel({
   onSend(): void;
   onAppend(mode: 'steer' | 'followUp'): void;
   canAppend: boolean;
-  sessionInputs: readonly SessionInputSnapshot[];
   inputReadError: string | null;
-  hasOlderInputs: boolean;
-  onLoadOlderInputs(): void;
   unknownInput: boolean;
   onCheckInputStatus(): void;
   canBranch: boolean;
@@ -3450,6 +3440,35 @@ function AgentChatPanel({
   onGoalModeChange(value: 'answer' | 'save-candidate'): void;
   sessionHint: string;
 }) {
+  const [commandError, setCommandError] = useState<string | null>(null);
+  const [commandPending, setCommandPending] = useState(false);
+  const commandOwner = useRef(0);
+  const currentDraft = useRef(input); currentDraft.current = input;
+  useEffect(() => () => { commandOwner.current++; }, []);
+  useEffect(() => { commandOwner.current++; setCommandPending(false); setCommandError(null); }, [selectedSessionId, hostEpoch]);
+  async function send() {
+    if (commandPending) return;
+    if (!/^\/invoice-assist(?:\s|$)/.test(input)) { onSend(); return; }
+    const token = ++commandOwner.current; setCommandError(null);
+    if (input.trim() !== '/invoice-assist') { setCommandError('invoice-assist is a diagnostic command and takes no arguments.'); return; }
+    if (!hostReady || busy || selectedSessionId === null) { setCommandError('Choose an idle conversation with invoice-assist loaded. Your draft is retained.'); return; }
+    const draft = input; setCommandPending(true);
+    try {
+      const loaded = await window.flowmate.querySessionExtensions({ sessionId: selectedSessionId });
+      if (commandOwner.current !== token) return;
+      const instance = loaded.ok ? loaded.data.instances.find(item => item.state === 'active' && item.ref.id === 'invoice-assist'
+        && item.registeredCommands.includes('invoice-assist')) : null;
+      if (!instance) { setCommandError('The diagnostic command is not registered in this conversation.'); return; }
+      const result = await window.flowmate.executeExtensionCommand({ sessionId: selectedSessionId, expectedInstanceId: instance.instanceId,
+        name: 'invoice-assist', arguments: '' });
+      if (commandOwner.current !== token) return;
+      if (result.ok) { if (currentDraft.current === draft) onInputChange(''); setCommandError('Diagnostic confirmed.'); } else setCommandError(result.error.message);
+    } catch { if (commandOwner.current === token) setCommandError('Command receipt is unknown. Your draft is retained.'); }
+    finally { if (commandOwner.current === token) setCommandPending(false); }
+  }
+  const childParent = activeAgentSessionId === selectedSessionId && activeAgentRunId !== null ? activeAgentRunId
+    : [...messages].reverse().find(message => message.runId !== null && ownsRun(message.runId))?.runId
+      ?? [...turns].reverse().find(turn => turn.sessionId === selectedSessionId)?.runId;
   if (collapsed) {
     return <aside className="agent-chat-panel collapsed" data-testid="agent-chat-panel">
       <button className="chat-expand" type="button" onClick={onToggle} aria-label="Open Assistant" aria-expanded={false} title="Open Assistant"><span aria-hidden="true">‹</span><b>Assistant</b></button>
@@ -3520,28 +3539,21 @@ function AgentChatPanel({
       </div>)}
     </div>
     {inputReadError && <p className="chat-save-feedback" role="alert">{inputReadError}</p>}
-    {sessionInputs.length > 0 && <details className="chat-input-queue" open><summary>Inputs · {sessionInputs.length}</summary>
-      <ul>{sessionInputs.slice().reverse().map(item => <li key={item.inputId} data-testid="session-input" data-input-id={item.inputId}>
-        <span>Input {item.clientSequence} · {item.mode} · Run {item.runId ?? 'unconfirmed'}</span>
-        <span>{item.status} · {item.processingStatus}</span>
-        <p>{item.content.text}</p>
-        {item.resultEntryId && <small>Reply saved</small>}
-        {item.error && <small>{errorMessage({ error: item.error })}</small>}
-      </li>)}</ul>
-      {hasOlderInputs && <button className="text-button" type="button" onClick={onLoadOlderInputs}>Earlier inputs</button>}
-    </details>}
     {unknownInput && <div className="chat-save-feedback" role="status">The original input receipt is unknown. Your draft is preserved.
       <button className="text-button" type="button" onClick={onCheckInputStatus}>Check input status</button></div>}
-    <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); onSend(); }}>
+    {childParent != null && selectedSessionId !== null && <Subagents compact busy={busy && activeAgentSessionId === selectedSessionId}
+      key={`${hostEpoch}:${selectedSessionId}:${childParent}`} parentRunId={childParent} parentSessionId={selectedSessionId}
+      hostEpoch={hostEpoch} ready={hostReady} refreshToken={`${busy}:${messages.length}:${turns.length}`}
+      onObserve={() => onSessionDetails()} />}
+    {commandError && <p className="chat-save-feedback" role="status">{commandError}</p>}
+    <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void send(); }}>
       {(activeInputTarget ? activeInputTarget.material !== 'General conversation' : Boolean(contextName)) && <div className="chat-context">{activeInputTarget ? `Responding to ${activeInputTarget.material}${activeInputTarget.selection && activeInputTarget.selection !== 'No selection' ? ` · ${activeInputTarget.selection}` : ''}`
         : `Working with ${contextName}`}</div>}
       {sessionHint && <p className="chat-config-hint">{sessionHint}</p>}
       {(selectedSession?.historyState === 'legacy-read-only' || selectedSession?.historyState === 'invalid') && input.trim() && <button className="secondary-button" type="button" disabled={!canNewChatAndSend} onClick={onNewChatAndSend}>New chat and send</button>}
       {canGenerate && <button className={`generate-toggle ${goalMode === 'save-candidate' ? 'selected' : ''}`} type="button" aria-pressed={goalMode === 'save-candidate'} onClick={() => onGoalModeChange(goalMode === 'save-candidate' ? 'answer' : 'save-candidate')}>Generate result {goalMode === 'save-candidate' ? 'for next message' : ''}</button>}
-      <label className="sr-only" htmlFor="agent-chat-input">Message to model</label>
-      <textarea ref={composerRef} id="agent-chat-input" aria-label="Message to model" value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => {
-        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSend(); }
-      }} placeholder="Write a message…" rows={3} />
+      <InputCommands input={input} onChange={onInputChange} onSend={() => void send()} composerRef={composerRef}
+        sessionId={selectedSessionId} ready={hostReady} busy={busy} />
       <div className="chat-composer-foot"><span>{busy ? 'Choose how to add this input' : 'Enter to send · Shift+Enter for a new line'}</span>
         {busy ? <><button className="secondary-button" type="button" disabled={!canAppend || !input.trim()} onClick={() => onAppend('steer')}>Steer</button>
           <button className="secondary-button" type="button" disabled={!canAppend || !input.trim()} onClick={() => onAppend('followUp')}>Follow up</button>

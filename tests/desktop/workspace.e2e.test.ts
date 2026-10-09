@@ -510,7 +510,12 @@ it('P7 real Workspace selects every saved field and line, pages sources, freezes
     expect(requests.length).toBe(countBeforeRestore + 1);
     await composer.fill('Preserve this later draft.');
     await page.getByRole('button', { name: 'Follow up', exact: true }).click();
-    await expect(page.getByTestId('session-input').filter({ hasText: 'Preserve this later draft.' })).toBeVisible();
+    const queuedSessionId = currentRun.sessionId;
+    await expect.poll(async () => {
+      const inputs = await page.evaluate(sessionId => window.flowmate.listSessionInputs({ sessionId, limit: 50 }), queuedSessionId);
+      return inputs.ok && inputs.data.items.some(item => item.content.text === 'Preserve this later draft.');
+    }).toBe(true);
+    await expect(page.getByText(/^Inputs ·/)).toHaveCount(0);
     await composer.fill('Unsaved newer draft survives Stop.');
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);

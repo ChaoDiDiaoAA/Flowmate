@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill",
+  "id": "invoice-candidate-issue-triage",
+  "version": "v1",
+  "bodyFile": "SKILL.md",
+  "keywords": [
+    "candidate",
+    "issue",
+    "triage",
+    "候选",
+    "问题",
+    "分级"
+  ],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "list_skill_resources"
+    },
+    {
+      "kind": "tool",
+      "name": "read_skill_resource"
+    },
+    {
+      "kind": "tool",
+      "name": "get_invoice_candidate"
+    },
+    {
+      "kind": "tool",
+      "name": "read_invoice_evidence"
+    },
+    {
+      "kind": "tool",
+      "name": "check_invoice_sources"
+    }
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "bytes": 1494,
+      "sha256": "2dd2794bbd23a07bd8d5eac60b68c59f95d70cda528675fdc3797c8aa6d3ae97"
+    },
+    {
+      "path": "references/guide.md",
+      "bytes": 1104,
+      "sha256": "d7260bfcd5cfb8879a403a906e281f6a7a5ef06f7db1db7b8dd6dec120981b7a"
+    }
+  ]
+}

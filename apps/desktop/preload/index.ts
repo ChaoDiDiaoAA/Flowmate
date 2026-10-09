@@ -1,3 +1,4 @@
+import { parseInputDefinitionCommand, isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../../packages/contracts/src/input-commands.ts';
 import { contextBridge, ipcRenderer } from 'electron';
 import { appError, fail } from '../../../packages/contracts/src/errors.ts';
 import { parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../../packages/contracts/src/resources.ts';
@@ -8,7 +9,9 @@ import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest 
 
 async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<T>> {
   const extension = isExtensionHostCommand(type);
-  const [parse, result, matches, failure] = isSubagentHostCommand(type)
+  const [parse, result, matches, failure] = isInputDefinitionHostCommand(type)
+    ? [parseInputDefinitionCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure]
+    : isSubagentHostCommand(type)
     ? [parseSubagentCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
     : extension ? [parseExtensionCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure]
       : [parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure];
@@ -22,6 +25,10 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
 }
 
 const bridge: DesktopBridge = {
+  listInputCommands: input => invokeAssembly('list_input_commands', input ?? {}),
+  listSubagentDefinitions: () => invokeAssembly('list_subagent_definitions', {}),
+  getSubagentDefinition: input => invokeAssembly('get_subagent_definition', input),
+  saveSubagentDefinition: input => invokeAssembly('save_subagent_definition', input),
   listSubagents: input => invokeAssembly('list_subagents', input),
   querySubagent: input => invokeAssembly('query_subagent', input),
   cancelSubagent: input => invokeAssembly('cancel_subagent', input),

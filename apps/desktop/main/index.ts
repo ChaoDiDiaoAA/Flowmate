@@ -1,3 +1,4 @@
+import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../host/protocol.ts';
 import { ResourceRefSchema } from '@flowmate/contracts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
@@ -436,8 +437,9 @@ async function assemblyIpcQuery(type: string, input?: unknown) {
   const command = parseHostCommand({ version: 1, requestId: randomUUID(), type, ...(input === undefined ? {} : { input }) });
   const extension = isExtensionHostCommand(type);
   const subagent = isSubagentHostCommand(type);
-  if (!command || !extension && !subagent && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
-  const [parse, matches, failure] = subagent ? [parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
+  const definition = isInputDefinitionHostCommand(type);
+  if (!command || !extension && !subagent && !definition && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
+  const [parse, matches, failure] = definition ? [parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure] : subagent ? [parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
     : extension ? [parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure]
       : [parseResourceHostResult, matchesResourceResponse, resourceHostFailure];
   const epoch = host.connectionEpoch;
@@ -538,7 +540,7 @@ function registerIpc(): void {
   });
   for (const type of ['list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file',
     'list_extensions', 'update_extension_selection', 'query_session_extensions', 'query_run_extensions', 'execute_extension_command', 'dispose_session_extensions',
-    'list_subagents', 'query_subagent', 'cancel_subagent'] as const)
+    'list_subagents', 'query_subagent', 'cancel_subagent', 'list_input_commands', 'list_subagent_definitions', 'get_subagent_definition', 'save_subagent_definition'] as const)
     handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => assemblyIpcQuery(type, raw));
   handle(channels.listContextSnapshots, async (_event, raw) => {
     const input = ContextSnapshotsRequestSchema.safeParse(raw);

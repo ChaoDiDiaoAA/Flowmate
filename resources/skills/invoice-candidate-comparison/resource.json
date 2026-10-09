@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill",
+  "id": "invoice-candidate-comparison",
+  "version": "v1",
+  "bodyFile": "SKILL.md",
+  "keywords": [
+    "发票",
+    "候选",
+    "比较",
+    "版本",
+    "差异"
+  ],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "list_skill_resources"
+    },
+    {
+      "kind": "tool",
+      "name": "read_skill_resource"
+    },
+    {
+      "kind": "tool",
+      "name": "list_invoice_candidates"
+    },
+    {
+      "kind": "tool",
+      "name": "get_invoice_candidate"
+    },
+    {
+      "kind": "tool",
+      "name": "compare_invoice_candidates"
+    }
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "bytes": 1430,
+      "sha256": "36591e58f1a513e3d2a9dbf09ef485778b36e41a2e7e2e2f8ee97127e999d298"
+    },
+    {
+      "path": "references/guide.md",
+      "bytes": 771,
+      "sha256": "c0b4f23071db3ef23d4876ac086394c3e0304f6fcc5e1aad3fb27735e685204b"
+    }
+  ]
+}

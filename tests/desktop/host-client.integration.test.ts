@@ -813,8 +813,8 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     expect(credentialRequests).toContain('read');
     expect(requestBodies.map(({ body }) => (body.tools ?? []).map((tool) =>
       (tool as { function?: { name?: string } }).function?.name).sort())).toEqual([
-      ['bash', 'calculate_invoice_amounts', 'edit', 'find', 'grep', 'ls', 'normalize_invoice_values', 'powershell', 'read', 'write'],
-      ['bash', 'calculate_invoice_amounts', 'edit', 'find', 'grep', 'ls', 'normalize_invoice_values', 'powershell', 'read', 'write'],
+      ['bash', 'calculate_invoice_amounts', 'edit', 'find', 'grep', 'list_skill_resources', 'ls', 'normalize_invoice_values', 'powershell', 'read', 'read_skill_resource', 'write'],
+      ['bash', 'calculate_invoice_amounts', 'edit', 'find', 'grep', 'list_skill_resources', 'ls', 'normalize_invoice_values', 'powershell', 'read', 'read_skill_resource', 'write'],
     ]);
     expect(JSON.stringify(requestBodies[0].body.messages)).toContain('INV-2048');
     expect(JSON.stringify(requestBodies[1].body.messages)).toContain('INV-2048');

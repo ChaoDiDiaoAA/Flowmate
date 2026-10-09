@@ -1,3 +1,5 @@
+export { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../packages/contracts/src/input-commands.ts';
+import { InputDefinitionCommandSchema } from '@flowmate/contracts';
 import { z } from 'zod';
 export { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure } from '../../packages/contracts/src/extensions.ts';
 export { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../packages/contracts/src/resources.ts';
@@ -106,6 +108,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_login'), loginRequestId: requestId }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('save_settings'), settings: z.unknown() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_extensions'), input: SessionExtensionQuerySchema }).strict(),
+  ...InputDefinitionCommandSchema.options.map(option => option.extend({ version: z.literal(1), requestId })),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_subagents'), input: ListSubagentsRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_subagent'), input: QuerySubagentRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_subagent'), input: CancelSubagentRequestSchema }).strict(),

@@ -3,8 +3,8 @@ import type { AgentPort, DelegateArgs, NativeToolOutput, ToolDefinition } from '
 
 /** The plugin runs the child; this definition keeps delegation inside Executor/Recorder. */
 export function createSubagentTool(agent: () => AgentPort): ToolDefinition<DelegateArgs, NativeToolOutput> {
-  return { name: 'Agent', version: '0.19.0-p13.1', label: 'Agent', effect: 'READ', executionMode: 'sequential',
-    description: 'Delegate one foreground, read-only invoice source check to invoice-evidence-checker. Return its findings to this conversation.',
+  return { name: 'Agent', version: '0.19.0-p13.2', label: 'Agent', effect: 'READ', executionMode: 'parallel',
+    description: 'Delegate a foreground task to a registered role. Independent calls may run concurrently (maximum four). Return actual findings. No background, nested delegation, or writes.',
     inputSchema: DelegateArgsSchema, outputSchema: NativeToolOutputSchema,
     execute: async (args, call, product) => {
       const adapter = agent();

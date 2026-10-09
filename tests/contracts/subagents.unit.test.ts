@@ -11,10 +11,11 @@ it('accepts the fixed foreground role and preserves the exact task text', () => 
 });
 it('rejects model-controlled authority, background and byte-limit expansion', () => {
   for (const value of [{ ...args, prompt: ' ' }, { ...args, description: '\n' }, { ...args, run_in_background: true },
-    { ...args, subagent_type: 'general-purpose' }, { ...args, prompt: '界'.repeat(21667) },
+    { ...args, subagent_type: '../general-purpose' }, { ...args, prompt: '界'.repeat(21667) },
     { ...args, description: '界'.repeat(171) }, ...['model', 'scope', 'childRunId', 'tools', 'extensions', 'resume', 'schedule']
       .map(key => ({ ...args, [key]: 'untrusted' }))]) expect(schema().safeParse(value).success).toBe(false);
   expect(schema().safeParse({ ...args, prompt: 'x'.repeat(65000), description: 'x'.repeat(512) }).success).toBe(true);
+  expect(schema().safeParse({ ...args, subagent_type: 'general-analyst' }).success).toBe(true);
 });
 it('keeps the exact Agent exception without allowing other capitalized tool definitions', () => {
   const schema = Reflect.get(contracts, 'RegisteredToolNameSchema'); expect(schema).toBeDefined();

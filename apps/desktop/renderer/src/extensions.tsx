@@ -3,6 +3,7 @@ import type { ExtensionCatalog, ExtensionSelection, ExtensionSelectionResult, Se
   ExtensionCommandReceipt, ExtensionDisposeReceipt, ExtensionInstanceView, ProductSettings, RuntimeState, SessionPage, SessionRunsPage } from '@flowmate/contracts';
 import { EMPTY_EXTENSION_SELECTION, extensionRefKey } from '../../../../packages/contracts/src/extensions.ts';
 import { useRead, type ContextIdentity } from './context-state.ts';
+import { SubagentDefinitions } from './subagent-definitions.tsx';
 
 export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, refreshToken, onSaved, summary = false }: {
   hostEpoch: number; ready: boolean; settings: ProductSettings; selectedSessionId: number | null;
@@ -55,6 +56,7 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
   }, [hostEpoch, ready, sessionId, runId]);
   async function save(selection: ExtensionSelection) {
     const expectedRevision = configuration.revision, originalEpoch = hostEpoch;
+    ++catalogRefresh.current; // A catalog read started before this write cannot confirm its unknown receipt.
     setNotice('');
     const result = await saving.read(`save:${expectedRevision}`, () => window.flowmate.updateExtensionSelection({ expectedRevision, selection }),
       value => value.revision === expectedRevision + 1 && JSON.stringify(value.selection) === JSON.stringify(selection));
@@ -106,6 +108,8 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
             className="resource-switch" disabled={configurationBusy || !enabled && !item.compatibility.available}
             onClick={() => void save({ enabledExtensions: enabled ? selected.enabledExtensions.filter(ref => ref.id !== item.ref.id)
               : [...selected.enabledExtensions, item.ref].sort((a, b) => Number(a.id === 'subagents') - Number(b.id === 'subagents')) })}><span /></button>}</div>
+          {!summary && item.ref.id === 'subagents' && <details className="plugin-details"><summary>Manage agents</summary>
+            <SubagentDefinitions hostEpoch={hostEpoch} ready={ready} /></details>}
           {!summary && <details className="plugin-details"><summary>Plugin details</summary><p>Pi {item.manifest.sdkVersion} · Settings revision {configuration.revision}</p>
           <p>Tools: {item.manifest.tools.map(tool => tool.name).join(', ')} · Command: {item.manifest.commands.join(', ')}</p>
           <p>Hooks: {item.manifest.hooks.map(hook => `${hook.event} (${hook.policy})`).join(', ')}</p>

@@ -1,3 +1,4 @@
+import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from './protocol.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
@@ -533,6 +534,15 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       });
       send({ version: 1, type: 'response', requestId: command.requestId, value: saved });
       return;
+    }
+    if (isInputDefinitionHostCommand(command.type)) {
+      const value = command.type === 'list_input_commands' ? await application.listInputCommands(command.input)
+        : command.type === 'list_subagent_definitions' ? await application.listSubagentDefinitions()
+        : command.type === 'get_subagent_definition' ? await application.getSubagentDefinition(command.input)
+        : command.type === 'save_subagent_definition' ? await application.saveSubagentDefinition(command.input) : null;
+      const result = parseInputDefinitionHostResult(command.type, value);
+      send({ version: 1, type: 'response', requestId: command.requestId, value: result && matchesInputDefinitionResponse(command, result) ? result
+        : inputDefinitionHostFailure(command.type) }); return;
     }
     if (isSubagentHostCommand(command.type)) {
       const value = command.type === 'list_subagents' ? await application.listSubagents(command.input)

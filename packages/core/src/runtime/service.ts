@@ -1,3 +1,6 @@
+import { FrozenInputDefinitionsSchema } from '@flowmate/contracts';
+import type { FrozenInputDefinitions } from '@flowmate/contracts';
+import type { InputDefinitions } from '../prompt-templates.ts';
 import { appError, fail, ok, RuntimeRequestOverridesSchema, normalizeSessionInputRequest, formatExecutionPrompt, WorkspaceContextSchema, INVOICE_CHAT_GOAL, INVOICE_CHAT_SYSTEM_PROMPT, INVOICE_TOOLS_SYSTEM_PROMPT, INVOICE_FILL_FORM_SYSTEM_PROMPT, NATIVE_TOOL_NAMES, RUNTIME_CONFIG } from '@flowmate/contracts';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -5,9 +8,10 @@ import { CompactionObservationSchema, SessionCompactionSnapshotSchema, Compactio
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import { FrozenResourcesSchema, AssemblySelectionSnapshotSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, EMPTY_RESOURCE_SELECTION, resourceRefKey } from '@flowmate/contracts';
 import type { FrozenResources, ResourceBinding, ResourceSelectionResult, AssemblySelectionSnapshot, FrozenExtensions } from '@flowmate/contracts';
-import { invoiceToolNamesForRun } from '../storage/repositories.ts';
+import { invoiceToolNamesForRun, subagentCompletionHash } from '../storage/repositories.ts';
 import type { ExtensionService } from '../extensions/service.ts';
-import { resolveRequiredSkill, type createResourceService } from '../resources/service.ts';
+import { resolveRequiredSkill, type createResourceService } from '../skill-hub/index.ts';
+import { SKILL_RESOURCE_TOOL_NAMES } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
   P3AgentConfigFacts,
@@ -63,6 +67,7 @@ import type { WorkspaceVerifier } from '../workspace/verification.ts';
 import type { ContextService } from '../context/service.ts';
 import type { ContextRepository } from '../context/repository.ts';
 import { SUBAGENT_ROLE, SUBAGENT_SYSTEM_PROMPT, SUBAGENT_TOOL_NAMES, DelegateArgsSchema } from '@flowmate/contracts';
+import { visibleFrozenSkills } from '../skill-hub/capability-map.ts';
 import type { SubagentOrigin, PreparedSubagent, SubagentConfig, DelegateArgs, AgentObservation, AgentToolBinding } from '@flowmate/contracts';
 
 export interface RuntimeLogger {
@@ -87,6 +92,7 @@ export type RuntimeDependencies = {
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
   resources?: ReturnType<typeof createResourceService>;
   extensions?: ExtensionService;
+  inputDefinitions?: InputDefinitions;
   resourceDefaults?: () => Result<AssemblySelectionSnapshot | ResourceSelectionResult>;
   runtimePolicy?: RuntimeStrategyPolicy;
   sampleSource?: 'production' | 'test' | 'evaluation';
@@ -162,6 +168,7 @@ type AgentExecutionContext = {
   readStop: () => StopIntent | undefined;
   emit: (event: AgentEventPayload) => void;
   resolveCompletion?: (result: Result<ProviderOutcome>) => void;
+  inputDefinitions?: FrozenInputDefinitions;
   subagentOutcome?: AgentNativeOutcome;
 };
 type FrozenAgentRunRequest = NormalizedAgentRunRequest & { goalMode: import('@flowmate/contracts').GoalMode;
@@ -304,9 +311,7 @@ export class RuntimeService {
   private readonly dependencies: RuntimeDependencies;
   private active: ActiveCall | ActiveCompaction | null = null;
   private agentContext: AgentExecutionContext | null = null;
-  private childSlot: AgentExecutionContext | null = null;
-  private childOrigin: SubagentOrigin | null = null;
-  private childStopUnsubscribe?: () => void;
+  private readonly childSlots = new Map<number, { context: AgentExecutionContext; origin: SubagentOrigin; unsubscribe?: () => void }>();
   private readonly compactions = new Map<string, ActiveCompaction>();
   private readonly lastManualCompaction = new Map<number, string>();
   private closing = false;
@@ -634,8 +639,8 @@ export class RuntimeService {
     if (!saved.ok) return saved;
     if (saved.data.kind !== 'subagent' || saved.data.parentRunId !== input.parentRunId)
       return fail(appError('subagent_identity_conflict', 'runtime', 'The child does not belong to this root.'));
-    const child = this.childSlot;
-    const accepted = child?.active.runId === input.childRunId && this.childOrigin?.parentRunId === input.parentRunId
+    const owner = this.childSlots.get(input.childRunId), child = owner?.context;
+    const accepted = child?.active.runId === input.childRunId && owner?.origin.parentRunId === input.parentRunId
       ? child.active.stop('user') : false;
     if (child?.active.runId === input.childRunId && (child.active.storageError || child.active.stopFailure))
       return fail(child.active.storageError ?? child.active.stopFailure!);
@@ -660,6 +665,8 @@ export class RuntimeService {
     if (!prior.ok) return prior;
     if (prior.data) return prior.data.runId === null ? fail(appError('operation_result_unknown', 'session', 'Original Run is unknown.'))
       : ok({ inputId: prior.data.inputId, runId: prior.data.runId, sessionId: prior.data.sessionId });
+    if (request.text.trimStart().startsWith('/') && !request.text.trimStart().startsWith('/skill:'))
+      return fail(appError('input_admission_closed', 'session', 'Start delegation commands and templates after the active Run stops.'));
     const active = this.active;
     if (this.poisoned || this.closing || this.closed || !active || active.kind !== 'agent' || active.runId !== request.runId
       || active.sessionId !== request.sessionId || !active.inputStreamingStarted || active.terminalCommitted || active.stopIntent || active.inputAdmissionClosed)
@@ -725,6 +732,7 @@ export class RuntimeService {
     const built = contextService.build({ runId, sessionId, jobId: run.data.jobId, text: content.text,
       goalMode, workspaceContext: content.workspaceContext, workspaceInput: content.workspaceInput,
       ...(content.resourceBinding ? { resourceBinding: content.resourceBinding } : {}),
+      ...(content.inputCommand ? { inputCommand: content.inputCommand } : {}),
       allowedDocumentIds: content.allowedDocumentIds, allowedArtifactIds: content.allowedArtifactIds,
       workingDirectory: typeof run.data.config.workingDirectory === 'string' ? run.data.config.workingDirectory : null, createdAt: at });
     return built.ok ? ok({ runId, content: { ...content, promptText: built.data.promptText },
@@ -771,6 +779,12 @@ export class RuntimeService {
       if (content.workspaceContext !== null || content.workspaceInput !== null
         || content.allowedDocumentIds.length !== 0 || content.allowedArtifactIds.length !== 0) return corrupt();
     } else if (run.data.scope.version === 2) {
+      if (run.data.config.inputDefinitions && run.data.scope.allowedTools.includes('Agent')
+        && run.data.input.version === 1 && content.workspaceContext === null && content.workspaceInput === null
+        && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
+        && !run.data.scope.allowedDocumentIds.length && !run.data.scope.allowedArtifactIds.length
+        && run.data.scope.allowedTools.every(name => name === 'Agent')) return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier,
+          { runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
       const frozen = content.workspaceContext;
       const initial = WorkspaceContextSchema.safeParse(run.data.config.workspaceContext);
       const sameIds = (left: readonly number[], right: readonly number[]) => left.length === right.length
@@ -807,6 +821,17 @@ export class RuntimeService {
       if (context.request.goalMode === 'save-candidate' && evidence.data.inputs.some(input => input.mode === 'prompt') && !facts.data.deliveredCandidateIds.length)
         return fail(appError('agent_goal_not_met', 'runtime', 'This response batch did not deliver a saved candidate.', false, context.active.runId));
       if (context.request.goalMode === 'fill-form') return ok(false);
+    }
+    if (context.scope?.allowedTools.includes('Agent') && context.inputDefinitions?.command?.requiredRoles.length) {
+      const children = this.dependencies.runs.listSubagents({ parentRunId: context.active.runId, limit: 100 });
+      if (!children.ok) return children;
+      const delivered = children.data.items.filter(child => evidence.data.toolCallIds.includes(child.parentNativeToolCallId)
+        && child.status === 'completed' && child.stoppedAt !== null);
+      for (const role of context.inputDefinitions.command.requiredRoles) {
+        const index = delivered.findIndex(child => child.role === role);
+        if (index < 0) return fail(appError('agent_goal_not_met', 'runtime', 'The input did not produce the required verified delegation.', false, context.active.runId));
+        delivered.splice(index, 1);
+      }
     }
     return ok(true);
   }
@@ -880,16 +905,21 @@ export class RuntimeService {
     if (!settings.ok) return settings;
     const defaults = RuntimeRequestOverridesSchema.safeParse(settings.data);
     if (!defaults.success) return fail(appError('config_settings_invalid', 'input', 'Runtime defaults are invalid.'));
-    if (!rawRequest.workspace && (rawRequest.budget?.maxToolCalls ?? 0) !== 0)
+    const assemblyDefaults = this.dependencies.resourceDefaults?.() ?? ok({ revision: 0, selection: EMPTY_RESOURCE_SELECTION });
+    if (!assemblyDefaults.ok) return assemblyDefaults;
+    const assembly = AssemblySelectionSnapshotSchema.safeParse(assemblyDefaults.data);
+    if (!assembly.success) return fail(appError('config_settings_invalid', 'input', 'Assembly defaults are invalid.'));
+    const delegationConfigured = assembly.data.extensions.enabledExtensions.some(ref => ref.id === 'subagents');
+    if (!rawRequest.workspace && !delegationConfigured && (rawRequest.budget?.maxToolCalls ?? 0) !== 0)
       return fail(appError('input_invalid', 'input', 'A text-only Run cannot receive tool permission.'));
     const request: FrozenAgentRunRequest = { ...rawRequest,
       goalMode: rawRequest.goalMode ?? 'answer',
       timeoutMs: rawRequest.timeoutMs ?? defaults.data.timeoutMs ?? (rawRequest.goalMode === 'save-candidate' ? RUNTIME_CONFIG.request.saveCandidateTimeoutMs : RUNTIME_CONFIG.request.timeoutMs),
       stopGraceMs: rawRequest.stopGraceMs ?? defaults.data.stopGraceMs ?? RUNTIME_CONFIG.request.stopGraceMs,
-      budget: Object.freeze({ maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, maxModelCalls: rawRequest.workspace
+      budget: Object.freeze({ maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, maxModelCalls: rawRequest.workspace || delegationConfigured
           ? RUNTIME_CONFIG.runBudget.maxModelCalls.workspace : RUNTIME_CONFIG.runBudget.maxModelCalls.chat,
         toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs,
-        ...defaults.data.budget, ...rawRequest.budget, ...(!rawRequest.workspace ? { maxToolCalls: 0 } : {}) }) };
+        ...defaults.data.budget, ...rawRequest.budget, ...(!rawRequest.workspace && !delegationConfigured ? { maxToolCalls: 0 } : {}) }) };
     const { agent, sessions } = this.dependencies;
     if (!agent || !sessions) return fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'));
     if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Agent 停止或 Run 保存未确认，运行实例不可复用。'));
@@ -937,19 +967,14 @@ export class RuntimeService {
     }
     const hub = this.dependencies.resources;
     if (hub && !this.dependencies.contextService) return fail(appError('resource_evidence_write_failed', 'storage', 'Resource admission requires Context persistence.', true));
-    let selected: AssemblySelectionSnapshot;
-    try {
-      const value = this.dependencies.resourceDefaults?.() ?? ok({ revision: 0, selection: EMPTY_RESOURCE_SELECTION });
-      if (!value.ok) return value;
-      const parsed = AssemblySelectionSnapshotSchema.safeParse(value.data);
-      if (!parsed.success) return fail(appError('config_settings_invalid', 'input', 'Resource defaults are invalid.'));
-      selected = parsed.data;
-    } catch { return fail(appError('config_settings_invalid', 'input', 'Resource defaults could not be read.')); }
+    const selected: AssemblySelectionSnapshot = assembly.data;
     const required = resolveRequiredSkill(request.text, request.requiredSkill, selected.selection.enabledSkills);
     if (!required.ok) return required;
+    const skillNames = request.workspace && request.goalMode !== 'fill-form'
+      ? SKILL_RESOURCE_TOOL_NAMES.filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : [];
     const activeToolNames = request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
-      request.workspace.documentRef !== null, request.workspace.jobId !== null), ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
-    if (request.workspace?.documentRef && request.workspace.jobId && request.goalMode !== 'fill-form'
+      request.workspace.documentRef !== null, request.workspace.jobId !== null), ...skillNames, ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
+    if (delegationConfigured && request.goalMode !== 'fill-form'
       && request.budget.maxToolCalls > 0 && request.budget.maxModelCalls >= 3
       && this.dependencies.tools?.listTools().some(tool => tool.name === 'Agent')) activeToolNames.push('Agent');
     const extensionHub = this.dependencies.extensions;
@@ -967,17 +992,26 @@ export class RuntimeService {
     if (!hub && (selected.selection.prompt || selected.selection.enabledSkills.length || required.data))
       return fail(appError('resource_required_unavailable', 'input', 'Managed resources are unavailable.'));
     const resources = fixed.data;
+    const definitions = this.dependencies.inputDefinitions?.freeze(request.text) ?? ok(null);
+    if (!definitions.ok) return definitions;
+    const inputDefinitions = definitions.data;
+    if (inputDefinitions?.command && !extensions?.included.some(item => item.ref.id === 'subagents'))
+      return fail(appError('extension_not_loaded', 'extension', 'Delegation input requires the compatible subagents plugin.'));
+    if (inputDefinitions?.command?.requiredRoles.some(id => !activeToolNames.includes('Agent')
+      || !inputDefinitions.roles.find(role => role.id === id)?.tools.every(name => activeToolNames.includes(name))))
+      return fail(appError('subagent_tool_denied', 'tool', 'The requested role requires tools unavailable in this Run.'));
     const resourceBinding: ResourceBinding | undefined = resources ? { bundleHash: resources.bundleHash,
       requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
     const freezeConfig = (config: ReturnType<typeof initialAgentSnapshot>) => ({ ...config,
-      ...(resources ? { resources } : {}), ...(extensions ? { extensions } : {}),
+      ...(resources ? { resources } : {}), ...(extensions ? { extensions } : {}), ...(inputDefinitions ? { inputDefinitions } : {}),
       agent: { ...config.agent, ...(resources ? { resourcePolicy: 'p11-resources-v1' as const } : {}),
         ...(extensions ? { extensionPolicy: extensions.included.length ? extensions.policyVersion : 'none' as const } : {}) } });
     const createdAt = this.dependencies.now();
     const input: InputRecord = { version: 1, goal: INVOICE_CHAT_GOAL,
       text: request.text, messageTimestamp: Date.now() };
     let admission: WorkspaceRunAdmission | null = null;
-    let scope: RunScope | null = null;
+    let scope: RunScope | null = !request.workspace && activeToolNames.includes('Agent')
+      ? { version: 2, allowedTools: ['Agent'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] } : null;
     let inputId: number | undefined;
     let frozenContent: SessionInputContentV2 | undefined;
     const createInput = (submission: NormalizedSessionInputRequest) => this.dependencies.sessionInputs!.admit(submission, () => {
@@ -993,7 +1027,7 @@ export class RuntimeService {
             ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
             ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
               ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
-          cleanup: initialCleanup(), createdAt,
+          cleanup: initialCleanup(), createdAt, skillToolNames: skillNames,
           ...(hub ? { collectResourceEvidence: true as const } : {}),
           ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
           ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
@@ -1007,23 +1041,26 @@ export class RuntimeService {
           workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(runId), 'work');
       } else {
         const created = this.dependencies.runs.createAgent({ goal: INVOICE_CHAT_GOAL, input,
-          config: { ...freezeConfig(initialAgentSnapshot(request, session.nativeSessionId)),
+          config: { ...freezeConfig(scope ? { ...initialP3AgentSnapshot(request, session.nativeSessionId),
+            agent: { ...initialP3AgentSnapshot(request, session.nativeSessionId).agent, systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT } }
+            : initialAgentSnapshot(request, session.nativeSessionId)),
             ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
             ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
               ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
-          cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: chatScope,
+          cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: scope ?? chatScope,
           ...(hub ? { collectResourceEvidence: true as const } : {}) });
         if (!created.ok) return created;
         runId = created.data;
       }
       const content: SessionInputContentV2 = { version: 2, text: request.text,
+        ...(inputDefinitions?.command ? { inputCommand: inputDefinitions.command } : {}),
         ...(resourceBinding ? { resourceBinding } : {}),
         requestIdentityVersion: 1, originalBudgetOverrides: originalOverrides(rawRequest),
         workspaceContext: admission?.workspaceContext ?? null, workspaceInput: admission?.workspaceInput ?? null,
         allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : [],
         allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : [],
         ...(control.desktopRequestHash === undefined ? {} : { desktopRequestHash: control.desktopRequestHash }),
-        promptText: formatExecutionPrompt({ text: request.text, business: admission !== null,
+        promptText: formatExecutionPrompt({ text: inputDefinitions?.command?.expandedText ?? request.text, business: admission !== null,
           ...(admission ? { workspaceInput: admission.workspaceInput, workspaceContext: admission.workspaceContext,
             goalMode: request.goalMode ?? 'answer' } : {}),
           ...(workingDirectory ? { workingDirectory } : {}) }) };
@@ -1094,7 +1131,7 @@ export class RuntimeService {
     active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
     this.active = active;
     const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: frozenContent.promptText,
-      resources, extensions, ...(resourceBinding ? { resourceBinding } : {}),
+      resources, extensions, ...(inputDefinitions ? { inputDefinitions } : {}), ...(resourceBinding ? { resourceBinding } : {}),
       ...(extensions?.included.some(item => item.ref.id === 'subagents')
         ? { modelBudget: { used: 0, limit: request.budget.maxModelCalls } } : {}),
       ...(inputId === undefined ? {} : { inputId }),
@@ -1236,22 +1273,18 @@ export class RuntimeService {
     const parent = this.agentContext, agent = this.dependencies.agent, sessions = this.dependencies.sessions;
     const args = DelegateArgsSchema.safeParse(rawArgs);
     const denied = () => fail<PreparedSubagent>(appError('subagent_origin_invalid', 'runtime', 'Delegation has no open root execution.'));
-    if (!args.success || !parent || !agent || !sessions || !this.dependencies.sessionInputs || !this.dependencies.tools
+    const role = args.success ? parent?.inputDefinitions?.roles.find(role => role.id === args.data.subagent_type) : null;
+    if (!role || role.tools.some(name => !parent?.scope?.allowedTools.includes(name)) || !args.success || !parent || !agent || !sessions || !this.dependencies.sessionInputs || !this.dependencies.tools
       || this.active !== parent.active || this.poisoned || this.closing || parent.active.controller.signal.aborted
       || parent.active.terminalCommitted || parent.active.runId !== origin.parentRunId
       || parent.session.sessionId !== origin.parentSessionId || parent.session.nativeSessionId !== origin.parentNativeSessionId
       || !parent.scope || !parent.extensions?.included.some(item => item.ref.id === 'subagents')) return denied();
-    if (this.childSlot) {
-      const prior = this.dependencies.runs.get(this.childSlot.active.runId);
-      if (!prior.ok) return prior;
-      const original = this.childOrigin && this.dependencies.tools.queryCall({ runId: this.childOrigin.parentRunId,
-        sessionId: this.childOrigin.parentSessionId }, this.childOrigin.parentNativeToolCallId);
-      if (!this.childSlot.active.terminalCommitted || this.childSlot.active.poisoned || prior.data.stoppedAt === null)
-        return fail(appError('subagent_busy', 'runtime', 'The original child still owns the execution slot.', true));
-      if (!original?.ok || original.data.result === null || !original.data.cleanup.stopped)
-        return fail(appError('subagent_busy', 'runtime', 'The original delegation has not finished saving its result.', true));
-      this.childSlot = null;
+    let held = 0;
+    for (const owner of this.childSlots.values()) {
+      const prior = this.dependencies.runs.get(owner.context.active.runId); if (!prior.ok) return prior;
+      if (!owner.context.active.terminalCommitted || owner.context.active.poisoned || prior.data.stoppedAt === null) held++;
     }
+    if (held >= 4) return fail(appError('subagent_busy', 'runtime', 'Four child executions are already owned.', true));
     const savedParent = this.dependencies.runs.get(origin.parentRunId);
     if (!savedParent.ok) return savedParent;
     if (savedParent.data.kind !== 'agent' || savedParent.data.status !== 'running') return denied();
@@ -1270,19 +1303,20 @@ export class RuntimeService {
     const nativeId = native.data.nativeSessionId, history = agent.exportSession?.(nativeId);
     if (!history?.ok) { await agent.releaseSession(nativeId); return history ?? denied(); }
     const parentFacts = savedParent.data.config as SafeConfigSnapshot & Record<string, unknown> & { agent: RuntimeAgentConfigFacts };
-    const { extensions: _extensions, extensionAssembly: _assembly, compactionPolicy: _compaction, runtimeStrategy: _strategy,
+    const { extensions: _extensions, extensionAssembly: _assembly, inputCommandReceipt: _commandReceipt, compactionPolicy: _compaction, runtimeStrategy: _strategy,
       workspaceContext: _workspace, formTarget: _form, ...base } = parentFacts;
     const budget = { ...parent.request.budget, maxModelCalls: available };
     const { extensionPolicy: _extensionPolicy, ...parentAgent } = parentFacts.agent;
-    const config = { ...base, goalMode: 'answer' as const, contextPolicyVersion: 'p8-context-v1' as const, historyPolicyVersion: 'p9-native-history-v1' as const,
+    const childDefinitions = parent.inputDefinitions ? { ...parent.inputDefinitions, command: null } : undefined;
+    const config = { ...base, ...(childDefinitions ? { inputDefinitions: childDefinitions } : {}), goalMode: 'answer' as const, contextPolicyVersion: 'p8-context-v1' as const, historyPolicyVersion: 'p9-native-history-v1' as const,
       runtimeBudget: budget, limits: { timeoutMs: remaining, stopGraceMs: parent.request.stopGraceMs },
-      agent: { ...parentAgent, ...budget, nativeSessionId: nativeId, systemPrompt: SUBAGENT_SYSTEM_PROMPT },
-      subagent: { version: 1 as const, role: SUBAGENT_ROLE, pluginVersion: '0.19.0' as const, patchVersion: 'flowmate-p13.1' as const,
+      agent: { ...parentAgent, ...budget, nativeSessionId: nativeId, systemPrompt: role.systemPrompt },
+      subagent: { version: 1 as const, role: role.id, definition: role, pluginVersion: '0.19.0' as const, patchVersion: 'flowmate-p13.2' as const,
         extensionInstanceId: origin.extensionInstanceId, parentNativeSessionId: origin.parentNativeSessionId,
         parentContextSnapshotId: origin.requestBinding.snapshotId, parentInputId: origin.requestBinding.inputId,
         parentRequestSequence: origin.requestBinding.requestSequence } };
     const scope: RunScope = Object.freeze({ ...parent.scope,
-      allowedTools: Object.freeze(SUBAGENT_TOOL_NAMES.filter(name => parent.scope!.allowedTools.includes(name))) });
+      allowedTools: Object.freeze([...role.tools]) });
     const created = this.dependencies.runs.createSubagent({ origin, pluginAgentId, nativeSessionId: nativeId,
       args: args.data, scope, config, history: history.data, at: this.dependencies.now() });
     if (!created.ok) { await agent.releaseSession(nativeId); return created; }
@@ -1318,19 +1352,18 @@ export class RuntimeService {
     const stopFromDelegate = () => active.stop(origin.delegateSignal!.reason === 'tool_timeout' ? 'timeout' : 'shutdown');
     parent.active.controller.signal.addEventListener('abort', stopFromParent, { once: true });
     origin.delegateSignal.addEventListener('abort', stopFromDelegate, { once: true });
-    this.childStopUnsubscribe = () => {
+    const unsubscribe = () => {
       parent.active.controller.signal.removeEventListener('abort', stopFromParent);
       origin.delegateSignal!.removeEventListener('abort', stopFromDelegate);
     };
-    const context: AgentExecutionContext = { ...parent, active, session: row.data,
+    const context: AgentExecutionContext = { ...parent, active, session: row.data, inputDefinitions: childDefinitions,
       request: { ...parent.request, sessionId: row.data.sessionId, text: args.data.prompt, goalMode: 'answer',
         budget, timeoutMs: remaining }, admission: null, scope, input: saved.data.input,
       promptText: storedInput.data.content.promptText, inputId: created.data.inputId, contextSnapshotId: created.data.contextSnapshotId,
       extensions: null, resources: parent.resources, resourceBinding: storedInput.data.content.resourceBinding,
       maxModelCalls: budget.maxModelCalls, runtimeStrategy: undefined, control: {},
       emit: () => undefined, stopPromise, readStop: () => active.stopIntent, resolveCompletion };
-    this.childSlot = context;
-    this.childOrigin = origin;
+    this.childSlots.set(active.runId, { context, origin, unsubscribe });
     void stopPromise.then(async intent => {
       const settled = await withinGrace(active.completion, this.remainingGrace(context, intent));
       if (settled.kind !== 'grace' || active.terminalCommitted) return;
@@ -1348,7 +1381,7 @@ export class RuntimeService {
     const installed = ensureNativeSession(sessions, agent, row.data, this.dependencies.memory);
     if (!installed.ok) {
       this.finishAgent(context, null, installed.error, true); await agent.releaseSession(nativeId);
-      this.childStopUnsubscribe?.(); this.childStopUnsubscribe = undefined; return installed;
+      unsubscribe(); return installed;
     }
     let started = false;
     return ok({ childRunId: active.runId, childSessionId: row.data.sessionId, childNativeSessionId: nativeId,
@@ -1356,9 +1389,9 @@ export class RuntimeService {
       config: frozenConfig, input: this.executionInput(context), signal: active.controller.signal,
       observe: event => { if (event.type === 'agent_event' && event.data.eventName === 'agent_start') active.inputStreamingStarted = true; },
       start: systemPrompt => {
-        if (started || active.controller.signal.aborted || this.poisoned || this.childSlot !== context)
+        if (started || active.controller.signal.aborted || this.poisoned || this.childSlots.get(active.runId)?.context !== context)
           return fail(appError('subagent_origin_invalid', 'runtime', 'Child admission is closed.'));
-        if (systemPrompt !== SUBAGENT_SYSTEM_PROMPT && !systemPrompt.startsWith(`${SUBAGENT_SYSTEM_PROMPT}\n`))
+        if (systemPrompt !== role.systemPrompt && !systemPrompt.startsWith(`${role.systemPrompt}\n`))
           return fail(appError('subagent_tool_denied', 'tool', 'Child system prompt differs from the trusted role.'));
         const strategy = this.dependencies.tools!.freezeStrategy({ allowedTools: scope.allowedTools,
           configuredToolTimeoutMs: budget.toolTimeoutMs, sdk: frozenConfig.sdk, environment: `${process.platform}-${process.arch}-${process.versions.bun ? 'bun' : 'node'}`,
@@ -1379,7 +1412,18 @@ export class RuntimeService {
   }
 
   public async finishSubagent(childRunId: number, outcome: AgentNativeOutcome): Promise<Result<void>> {
-    const child = this.childSlot;
+    const owner = this.childSlots.get(childRunId), child = owner?.context;
+    let completionHash: string;
+    try { completionHash = subagentCompletionHash(outcome); }
+    catch { return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion facts cannot be verified.')); }
+    if (!owner) {
+      const saved = this.dependencies.runs.get(childRunId);
+      if (!saved.ok) return saved;
+      if (saved.data.kind !== 'subagent' || saved.data.stoppedAt === null || saved.data.status === 'created' || saved.data.status === 'running'
+        || saved.data.output?.nativeOutcomeHash !== completionHash)
+        return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion differs from its saved original facts.'));
+      return saved.data.error ? fail(saved.data.error) : ok(undefined);
+    }
     if (!child || child.active.runId !== childRunId || child.session.nativeSessionId !== outcome.agent.nativeSessionId)
       return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion has no matching execution owner.'));
     if (child.subagentOutcome && !isDeepStrictEqual(child.subagentOutcome, outcome))
@@ -1406,7 +1450,7 @@ export class RuntimeService {
       }
     }
     child.resolveCompletion?.(result);
-    if (outcome.stopped) { this.childStopUnsubscribe?.(); this.childStopUnsubscribe = undefined; }
+    if (outcome.stopped) { owner?.unsubscribe?.(); if (owner) owner.unsubscribe = undefined; }
     return !result.ok ? result : result.data.error ? fail(result.data.error) : ok(undefined);
   }
 
@@ -1454,7 +1498,10 @@ export class RuntimeService {
       ...(contextHooks ? { contextHooks } : {}),
       promptText: context.promptText,
       ...(context.resources ? { resources: context.resources } : {}),
-        ...(context.extensions ? { extensions: context.extensions } : {}),
+      ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}),
+      ...(this.childSlots.get(active.runId)?.context.active === active && context.resources && context.scope
+        ? { visibleSkillRefs: visibleFrozenSkills(context.resources, context.scope.allowedTools) } : {}),
+      ...(context.extensions ? { extensions: context.extensions } : {}),
       ...(context.resourceBinding ? { resourceBinding: context.resourceBinding } : {}),
       runtimeBudget: request.budget, runtimeStrategy: context.runtimeStrategy,
       budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
@@ -1565,12 +1612,15 @@ export class RuntimeService {
       request.config,
       { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
       active.controller.signal,
-      context.scope ? { activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,
+      context.scope ? { ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}),
+        ...(context.inputId && context.inputDefinitions?.command?.kind === 'subagent'
+          ? { inputCommandOwner: { runId: active.runId, sessionId: request.sessionId, inputId: context.inputId } } : {}),
+        ...(!context.admission && context.scope.allowedTools.every(name => name === 'Agent') ? { chatDelegation: true } : {}), activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,
         ...(context.resources ? { resources: context.resources } : {}),
         ...extensionPreparation,
         ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}),
         sessionInputs: true, ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) }
-        : { sessionInputs: true, runtimeBudget: request.budget,
+        : { ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}), sessionInputs: true, runtimeBudget: request.budget,
           ...(context.resources ? { resources: context.resources } : {}),
         ...extensionPreparation,
           ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}) },
@@ -1745,14 +1795,16 @@ export class RuntimeService {
   ): Result<AgentOutcome> {
     const { active, request, session } = context;
     if (active.terminalCommitted) return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已开始提交。', false, active.runId), active.runId);
-    const child = this.childSlot;
-    if (child && child !== context && this.childOrigin?.parentRunId === active.runId) {
+    const settledChildren: number[] = [];
+    for (const owner of this.childSlots.values()) {
+      const child = owner.context;
+      if (child === context || owner.origin.parentRunId !== active.runId) continue;
       if (!child.active.terminalCommitted) {
         child.active.stopFailure = appError('subagent_stop_unconfirmed', 'runtime', 'The child did not settle within the root stop grace.', true, child.active.runId);
         const ended = this.finishAgent(child, null, child.active.stopFailure, false, true);
         if (!ended.ok) { active.poisoned = this.poisoned = true; return ended; }
         const tool = this.dependencies.tools?.failUnconfirmedDelegation({ runId: active.runId, sessionId: session.sessionId },
-          this.childOrigin.parentNativeToolCallId);
+          owner.origin.parentNativeToolCallId);
         if (!tool?.ok) { active.poisoned = this.poisoned = true; return tool ?? fail(appError('subagent_persist_failed', 'storage', 'The original delegation could not be closed.', true, active.runId)); }
       }
       const savedChild = this.dependencies.runs.get(child.active.runId);
@@ -1764,7 +1816,7 @@ export class RuntimeService {
       if (savedChild.data.stoppedAt === null) {
         stopped = false; unconfirmed = true;
         active.stopFailure ??= appError('subagent_stop_unconfirmed', 'runtime', 'Child stop remains unconfirmed.', true, active.runId);
-      }
+      } else if (!child.active.poisoned && !child.active.storageError) settledChildren.push(child.active.runId);
     }
     active.inputAdmissionClosed = true;
     const toolExecutor = context.scope ? this.dependencies.tools : undefined;
@@ -1863,10 +1915,11 @@ export class RuntimeService {
         }
       }
     }
-    if (finalError?.category === 'storage' && this.childSlot && (context === this.childSlot || this.childOrigin?.parentRunId === active.runId)) {
+    const ownedChild = this.childSlots.get(active.runId);
+    if (finalError?.category === 'storage' && (ownedChild || [...this.childSlots.values()].some(owner => owner.origin.parentRunId === active.runId))) {
       // Necessary P13 persistence cannot be treated as an ordinary child task failure.
       cleanupFailure ??= finalError; active.stopFailure ??= finalError; active.poisoned = this.poisoned = true;
-      if (context === this.childSlot && this.agentContext && this.childOrigin?.parentRunId === this.agentContext.active.runId) {
+      if (ownedChild && this.agentContext && ownedChild.origin.parentRunId === this.agentContext.active.runId) {
         this.agentContext.active.stopFailure ??= finalError;
         this.agentContext.active.inputAdmissionClosed = true;
         this.dependencies.tools?.closeRun(this.agentContext.active.runId);
@@ -1892,6 +1945,7 @@ export class RuntimeService {
       ...outputRecord(outcome),
       version: 2,
       agent: { ...productAgent, ...(context.admission ? { candidateIds } : {}) },
+      ...(ownedChild ? { nativeOutcomeHash: subagentCompletionHash(outcome) } : {}),
     } : null;
     const usage = outcome?.usage ?? initialUsage(this.dependencies.now());
     const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
@@ -1930,6 +1984,7 @@ export class RuntimeService {
       this.poisoned = true;
       return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已由其他路径提交。', false, active.runId), active.runId);
     }
+    for (const childRunId of settledChildren) this.childSlots.delete(childRunId);
     if (stopped && !unconfirmed && !cleanupFailure && !active.poisoned && !active.storageError) toolExecutor?.releaseRun(active.runId);
     active.poisoned ||= unconfirmed || !!cleanupFailure;
     if (unconfirmed || cleanupFailure) this.poisoned = true;

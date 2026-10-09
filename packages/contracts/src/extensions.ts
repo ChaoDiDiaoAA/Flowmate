@@ -35,11 +35,14 @@ export const ExtensionManifestSchema = z.discriminatedUnion('id', [z.object({ ..
   tools: z.tuple([z.object({ name: z.literal('check_invoice_sources'), version: z.literal('1') }).strict().readonly()]).readonly(),
   commands: z.tuple([z.literal('invoice-assist')]).readonly(),
 }).strict(), z.object({ ...manifestCommon, id: z.literal('subagents'), version: z.literal('v1'), sdkVersion: z.literal('0.85.1'),
-  entryId: z.literal('pi-subagents-managed-v1'), pluginVersion: z.literal('0.19.0'), patchVersion: z.literal('flowmate-p13.1'),
-  patchHash: z.literal('a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a'),
-  tools: z.tuple([z.object({ name: z.literal('Agent'), version: z.literal('0.19.0-p13.1') }).strict().readonly()]).readonly(),
-  commands: z.tuple([]).readonly(),
+  entryId: z.literal('pi-subagents-managed-v1'), pluginVersion: z.literal('0.19.0'), patchVersion: z.enum(['flowmate-p13.1', 'flowmate-p13.2']),
+  patchHash: z.enum(['a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a', '3e6ee0d9cf2f45ba37be90eebbd3edbdfa838de85958c139b62b37371a1b8ebe']),
+  tools: z.tuple([z.object({ name: z.literal('Agent'), version: z.enum(['0.19.0-p13.1', '0.19.0-p13.2']) }).strict().readonly()]).readonly(),
+  commands: z.array(z.literal('subagent')).max(1).readonly(),
 }).strict()]).superRefine((value, ctx) => {
+  if (value.id === 'subagents' && (value.patchVersion === 'flowmate-p13.1'
+    ? value.patchHash !== 'a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a' || value.tools[0].version !== '0.19.0-p13.1' || value.commands.length !== 0
+    : value.patchHash !== '3e6ee0d9cf2f45ba37be90eebbd3edbdfa838de85958c139b62b37371a1b8ebe' || value.tools[0].version !== '0.19.0-p13.2' || value.commands[0] !== 'subagent')) report(ctx, 'Managed patch, Tool and Command declarations differ.');
   if (value.hooks.some((hook, index) => hook.event !== EXTENSION_HOOKS[index].event || hook.policy !== EXTENSION_HOOKS[index].policy))
     report(ctx, 'Hook declarations must match the supported extension and their required policies.');
 }).readonly();
@@ -68,10 +71,11 @@ export type FrozenExtensions = z.infer<typeof FrozenExtensionsSchema>;
 const actualTools = z.tuple([z.literal('check_invoice_sources')]).readonly();
 const actualCommands = z.tuple([z.literal('invoice-assist')]).readonly();
 const registeredTools = z.array(z.enum(['check_invoice_sources', 'Agent'])).max(1).readonly();
-const registeredCommands = z.array(z.literal('invoice-assist')).max(1).readonly();
+const registeredCommands = z.array(z.enum(['invoice-assist', 'subagent'])).max(1).readonly();
 function matchesRegistration(value: { ref: ExtensionRef; registeredTools: readonly string[]; registeredCommands: readonly string[] }): boolean {
   return value.ref.id === 'invoice-assist' ? actualTools.safeParse(value.registeredTools).success && actualCommands.safeParse(value.registeredCommands).success
-    : value.ref.id === 'subagents' && value.registeredTools.length === 1 && value.registeredTools[0] === 'Agent' && value.registeredCommands.length === 0;
+    : value.ref.id === 'subagents' && value.registeredTools.length === 1 && value.registeredTools[0] === 'Agent'
+      && (value.registeredCommands.length === 0 || value.registeredCommands.length === 1 && value.registeredCommands[0] === 'subagent');
 }
 const actualHooks = z.array(ExtensionHookEventSchema).length(5).readonly().refine(
   values => values.every((value, index) => value === EXTENSION_HOOKS[index].event), 'Actual Hooks must match the required set.');
@@ -85,6 +89,7 @@ export function matchesExtensionAssembly(frozen: FrozenExtensions, assembly: Ext
   return frozen.included.length === assembly.instances.length && assembly.instances.every((item, index) =>
     extensionRefKey(item.ref) === extensionRefKey(frozen.included[index].ref)
     && matchesRegistration(item)
+    && JSON.stringify(item.registeredCommands) === JSON.stringify(frozen.included[index].manifest.commands)
     && (nativeSessionId === undefined || item.nativeSessionId === nativeSessionId));
 }
 export const ExtensionInstanceStateSchema = z.enum(['loading', 'active', 'load_failed', 'disposed']);

@@ -4,7 +4,7 @@ import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction,
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { join, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
-import { verifyFrozenResourceMetadata } from '../resources/service.ts';
+import { verifyFrozenResourceMetadata } from '../skill-hub/index.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { completeSessionInputs, createSessionInputLedger, finishSessionInputs, recoverSessionInputs } from '../sessions/input-ledger.ts';
@@ -16,7 +16,7 @@ import type { ContextOwnerCache } from '../context/repository.ts';
 import { buildSubagentContextInTransaction, formatContextPrompt } from '../context/service.ts';
 import { createContextRepository } from '../context/repository.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, emptyResourceJournal } from '@flowmate/contracts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, emptyResourceJournal, FrozenInputDefinitionsSchema, InputCommandReceiptSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -151,6 +151,7 @@ export type NewWorkspaceAgentRun = {
   cleanup: CleanupRecord;
   createdAt: string;
   nativeTools?: { runtimeDir: string; allowedTools: readonly string[]; workingDirectory?: string };
+  skillToolNames?: readonly string[];
   formTarget?: InvoiceFormTarget;
   collectResourceEvidence?: true;
 };
@@ -186,7 +187,7 @@ export type SessionRow = {
 
 export type NewSession = { nativeSessionId: string; title: string; at: string; expectedRevision?: number; nativeHistory?: NativeSessionHistory };
 
-export type AgentOutputRecord = OutputRecord & { agent: AgentFacts };
+export type AgentOutputRecord = OutputRecord & { agent: AgentFacts; nativeOutcomeHash?: string };
 
 export type ArtifactMetadata = {
   version: 1;
@@ -488,6 +489,24 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
   const raw = object(value, 'config');
   if (Object.hasOwn(raw, 'contextPolicyVersion') && (raw.contextPolicyVersion !== 'p8-context-v1' || kind === 'provider')) throw new Error('invalid_context_policy');
   const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
+  if (record.inputDefinitions !== undefined) {
+    if (kind === 'provider') throw new Error('unexpected_input_definitions');
+    const fixed = FrozenInputDefinitionsSchema.parse(record.inputDefinitions);
+    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+    if (hash(JSON.stringify({ roles: fixed.roles, templates: fixed.templates })) !== fixed.hash
+      || new Set(fixed.roles.map(role => role.id)).size !== fixed.roles.length
+      || fixed.roles.some(role => hash(role.content) !== role.hash)
+      || fixed.command && (hash(fixed.command.expandedText) !== fixed.command.expandedHash
+        || fixed.command.requiredRoles.some(id => !fixed.roles.some(role => role.id === id))
+        || fixed.command.sourceHash !== (fixed.command.kind === 'subagent'
+          ? fixed.roles.find(role => role.id === fixed.command!.requiredRoles[0])?.hash
+          : fixed.templates.find(template => template.name === fixed.command!.name)?.hash))) throw new Error('invalid_input_definitions');
+    if (record.inputCommandReceipt !== undefined) {
+      const receipt = InputCommandReceiptSchema.parse(record.inputCommandReceipt);
+      if (fixed.command?.kind !== 'subagent' || receipt.originalHash !== hash(fixed.command.originalText)
+        || receipt.role !== fixed.command.requiredRoles[0]) throw new Error('invalid_input_command_receipt');
+    }
+  } else if (record.inputCommandReceipt !== undefined) throw new Error('unexpected_input_command_receipt');
   if (typeof record.name !== 'string' || !Number.isSafeInteger(record.revision) || Number(record.revision) <= 0) throw new Error('invalid_config_shape');
   const model = (candidate: unknown, label: string) => {
     if (candidate === null && label === 'resolvedModel') return;
@@ -585,6 +604,8 @@ function validatedScope(value: unknown): ChatScope | RunScope | LegacyRunScope {
 
 function validatedOutput(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
   const raw = object(value, 'output');
+  if (raw.nativeOutcomeHash !== undefined && (kind !== 'subagent' || raw.version !== 2
+    || typeof raw.nativeOutcomeHash !== 'string' || !/^[a-f0-9]{64}$/.test(raw.nativeOutcomeHash))) throw new Error('invalid_subagent_completion_hash');
   const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'output', ['text', 'partial', 'stopReason', 'responseId', 'responseModel']);
   if (typeof record.text !== 'string' || typeof record.partial !== 'boolean' || typeof record.stopReason !== 'string'
     || (record.wireMaxTokens !== undefined && record.wireMaxTokens !== null && (!Number.isSafeInteger(record.wireMaxTokens) || Number(record.wireMaxTokens) < 1))) throw new Error('invalid_output_shape');
@@ -2129,6 +2150,26 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
   };
 }
 
+export function subagentCompletionHash(outcome: import('@flowmate/contracts').AgentNativeOutcome): string {
+  const visiting = new Set<object>();
+  const encode = (value: unknown): unknown => {
+    if (value === null) return ['null'];
+    if (typeof value === 'number') return ['number', Object.is(value, -0) ? '-0' : String(value)];
+    if (typeof value === 'undefined') return ['undefined'];
+    if (typeof value === 'string' || typeof value === 'boolean') return [typeof value, value];
+    if (typeof value !== 'object' || visiting.has(value)) throw new Error('Invalid completion facts.');
+    const prototype = Object.getPrototypeOf(value);
+    if ((Array.isArray(value) ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null)
+      || Object.getOwnPropertySymbols(value).some(key => Object.prototype.propertyIsEnumerable.call(value, key))) throw new Error('Invalid completion facts.');
+    visiting.add(value);
+    const encoded = [Array.isArray(value) ? ['array', value.length] : prototype === null ? 'null-object' : 'object',
+      Object.keys(value).sort().map(key => [key, encode(Reflect.get(value, key))])];
+    visiting.delete(value);
+    return encoded;
+  };
+  return createHash('sha256').update(JSON.stringify(encode(outcome))).digest('hex');
+}
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') {
@@ -2624,12 +2665,30 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
   };
 }
 
+function verifyInputCommandOwner(db: Database, row: RunRow, config: Record<string, unknown>, started: boolean): void {
+  const definitions = config.inputDefinitions === undefined ? null : FrozenInputDefinitionsSchema.parse(config.inputDefinitions);
+  if (definitions?.command?.kind !== 'subagent') return;
+  if (!started && config.inputCommandReceipt === undefined) return;
+  const receipt = InputCommandReceiptSchema.parse(config.inputCommandReceipt);
+  const input = db.query('SELECT session_id,run_id,content_json FROM session_inputs WHERE id=?').get(receipt.inputId) as
+    { session_id: number; run_id: number; content_json: string } | null;
+  const native = db.query('SELECT native_session_id FROM sessions WHERE id=?').get(row.session_id) as { native_session_id: string } | null;
+  const content = input && readJson(input.content_json, 'command_input');
+  const assembly = ExtensionAssemblyEvidenceSchema.parse(config.extensionAssembly);
+  if (row.kind !== 'agent' || receipt.runId !== row.id || receipt.sessionId !== row.session_id
+    || input?.run_id !== row.id || input.session_id !== row.session_id || receipt.nativeSessionId !== native?.native_session_id
+    || !content || typeof content !== 'object' || !isDeepStrictEqual(Reflect.get(content, 'inputCommand'), definitions.command)
+    || !assembly.instances.some(instance => instance.instanceId === receipt.instanceId && instance.ref.id === 'subagents'
+      && instance.registeredCommands.includes('subagent'))) throw new Error('invalid_input_command_owner');
+}
+
 function snapshotFromRow(db: Database, row: RunRow): RunSnapshot {
   const context = readRunContextOwner(db, row);
   const output = row.output_json === null ? null : validatedOutput(readJson(row.output_json, 'output'), row.kind);
   const error = validatedError(readJson(row.error_json ?? 'null', 'error'));
   const input = validatedInput(readJson(row.input_json, 'input'));
   const config = validatedConfig(readJson(row.config_json, 'config'), row.kind);
+  verifyInputCommandOwner(db, row, config, row.started_at !== null);
   if (row.kind === 'agent' && row.status === 'running' && Object.hasOwn(config, 'extensions') && !Object.hasOwn(config, 'extensionAssembly')) throw new Error('missing_extension_assembly');
   const usage = validatedUsage(readJson(row.usage_json, 'usage'));
   const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
@@ -2668,7 +2727,7 @@ function snapshotFromRow(db: Database, row: RunRow): RunSnapshot {
   if (row.kind === 'subagent') {
     const provenance = SubagentProvenanceSchema.parse(config.subagent), scope = RunScopeSchema.parse(readJson(row.scope_json, 'scope'));
     if (!Number.isSafeInteger(row.parent_run_id) || !Number.isSafeInteger(row.origin_tool_call_id) || !row.plugin_agent_id
-      || scope.allowedTools.some(name => !(SUBAGENT_TOOL_NAMES as readonly string[]).includes(name))) throw new Error('invalid_subagent_origin');
+      || scope.allowedTools.some(name => !(provenance.definition?.tools ?? SUBAGENT_TOOL_NAMES as readonly string[]).includes(name))) throw new Error('invalid_subagent_origin');
     const origin = db.query(`SELECT p.kind,p.session_id,s.native_session_id,t.run_id,t.session_id AS tool_session_id,
       t.context_snapshot_id,t.request_sequence,t.tool_name FROM runs p JOIN sessions s ON s.id=p.session_id
       JOIN tool_calls t ON t.id=? WHERE p.id=?`).get(row.origin_tool_call_id, row.parent_run_id) as {
@@ -3216,7 +3275,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
       childRunId: child.runId, childSessionId: child.sessionId, childNativeSessionId: session.data.nativeSessionId,
       parentRunId: parent.runId, parentSessionId: parent.sessionId, originToolCallId: child.originToolCallId,
       parentNativeToolCallId: original.data.nativeToolCallId, pluginAgentId: child.pluginAgentId,
-      role: 'invoice-evidence-checker', description: child.input.goal, status: child.status, createdAt: child.createdAt,
+      role: SubagentProvenanceSchema.parse(child.config.subagent).role, description: child.input.goal, status: child.status, createdAt: child.createdAt,
       startedAt: child.startedAt, endedAt: child.endedAt, cancelRequestedAt: child.cancelRequestedAt, stoppedAt: child.stoppedAt }) };
   };
   return {
@@ -3261,12 +3320,15 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Original running Agent call could not be verified.'));
         if (db.query('SELECT id FROM runs WHERE origin_tool_call_id=?').get(call.toolCallId))
           throw new MemoryCommitFault(appError('subagent_identity_conflict', 'runtime', 'The original call already owns a child.'));
-        if (db.query("SELECT id FROM runs WHERE parent_run_id=? AND status IN ('created','running')").get(parent.runId))
-          throw new MemoryCommitFault(appError('subagent_busy', 'runtime', 'A child is already active.', true));
+        if ((db.query("SELECT COUNT(*) AS count FROM runs WHERE parent_run_id=? AND (status IN ('created','running') OR stopped_at IS NULL)").get(parent.runId) as { count: number }).count >= 4)
+          throw new MemoryCommitFault(appError('subagent_busy', 'runtime', 'Four child executions are already owned.', true));
         const scope = RunScopeSchema.parse(input.scope);
-        const expectedTools = SUBAGENT_TOOL_NAMES.filter(name => parentScope.allowedTools.includes(name));
-        if (!isDeepStrictEqual(scope.allowedTools, expectedTools) || scope.allowedDocumentIds.length === 0
-          || ['read_invoice_document', 'read_invoice_evidence', 'check_invoice_sources'].some(name => !scope.allowedTools.includes(name))
+        const role = input.config.subagent.definition;
+        const expectedTools = role?.tools ?? SUBAGENT_TOOL_NAMES.filter(name => parentScope.allowedTools.includes(name));
+        const roles = (parent.config.inputDefinitions as import('@flowmate/contracts').FrozenInputDefinitions | undefined)?.roles;
+        if (role && (!isDeepStrictEqual(roles?.find(item => item.id === args.subagent_type), role) || args.subagent_type !== role.id
+          || role.tools.some(name => !parentScope.allowedTools.includes(name) || name === 'Agent'))) throw new MemoryCommitFault(appError('subagent_tool_denied', 'tool', 'Frozen role or required tools differ from the parent.'));
+        if (!isDeepStrictEqual(scope.allowedTools, expectedTools)
           || scope.allowedDocumentIds.some(id => !parentScope.allowedDocumentIds.includes(id))
           || scope.allowedArtifactIds.some(id => !parentScope.allowedArtifactIds.includes(id))
           || scope.allowedResourcePaths.some(path => !parentScope.allowedResourcePaths.includes(path)))
@@ -3421,9 +3483,11 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const frozen = freezeWorkspaceInput(db, input, verify);
         if (!frozen.ok) return frozen;
         const { document, job, workspaceContext, workspaceInput } = frozen.data;
-        const allowedTools = [...invoiceToolNamesForRun(input.goalMode, document !== null, job !== null)];
+        const allowedTools = [...invoiceToolNamesForRun(input.goalMode, document !== null, job !== null), ...(fill ? [] : input.skillToolNames ?? [])];
         const nativeNames = fill ? [] : input.nativeTools?.allowedTools ?? [];
-        if (!fill && document && job && input.config.extensions?.included.some(item => item.ref.id === 'subagents')) allowedTools.push('Agent');
+        const delegationBudget = storedRuntimeBudgetSchema.safeParse(input.config.runtimeBudget);
+        if (!fill && delegationBudget.success && delegationBudget.data.maxToolCalls > 0 && delegationBudget.data.maxModelCalls >= 3
+          && input.config.extensions?.included.some(item => item.ref.id === 'subagents')) allowedTools.push('Agent');
         const scope = RunScopeSchema.parse({ version: 2, allowedTools: [...allowedTools, ...nativeNames],
           allowedDocumentIds: document ? [document.id] : [],
           allowedArtifactIds: document ? [document.parsed_artifact_id] : [],
@@ -3522,6 +3586,9 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
                 policyVersion: snapshot.json.policyVersion, projectionMode: 'fill-reference', gaps: snapshot.json.modelProjection.gaps })}`
               : formatContextPrompt(snapshot, raw.kind === 'subagent');
             if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
+              || !isDeepStrictEqual(snapshot.json.inputCommand, content.inputCommand)
+              || content.inputCommand && !isDeepStrictEqual(content.inputCommand,
+                FrozenInputDefinitionsSchema.parse(validatedConfig(readJson(raw.config_json, 'config'), raw.kind).inputDefinitions).command)
               || !isDeepStrictEqual(snapshot.json.resourceBinding, content.resourceBinding)
               || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
               || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds) || content.promptText !== expectedPrompt) return corruptWorkspace();
@@ -3594,9 +3661,10 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
 
     start(runId, config, startedAt) {
       try {
-        const owner = db.query('SELECT kind FROM runs WHERE id=?').get(runId) as { kind: RunRow['kind'] } | null;
+        const owner = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
         if (!owner) return fail(appError('run_state_invalid', 'runtime', 'Run does not exist.', false, runId));
         const checked = validatedConfig(config, owner.kind);
+        verifyInputCommandOwner(db, owner, checked, true);
         if (owner.kind === 'agent' && Object.hasOwn(checked, 'extensions') && !Object.hasOwn(checked, 'extensionAssembly')) throw new Error('missing_extension_assembly');
         const saved = writeTransaction(() => {
           const changed = db

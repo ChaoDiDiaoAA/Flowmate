@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill",
+  "id": "invoice-conflict-review",
+  "version": "v1",
+  "bodyFile": "SKILL.md",
+  "keywords": [
+    "发票",
+    "冲突",
+    "歧义",
+    "替代值",
+    "复核"
+  ],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "list_skill_resources"
+    },
+    {
+      "kind": "tool",
+      "name": "read_skill_resource"
+    },
+    {
+      "kind": "tool",
+      "name": "read_invoice_evidence"
+    },
+    {
+      "kind": "tool",
+      "name": "check_invoice_sources"
+    }
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "bytes": 1334,
+      "sha256": "9d82cfea6325fb262787a9829e617fc7b1e8b57fe6ae1ecb2c55604cb737a80a"
+    },
+    {
+      "path": "references/guide.md",
+      "bytes": 772,
+      "sha256": "7db9ab3e23bd107a0e2dfea21a4d11c21f109c47e46a9c6ebc46b856307579b8"
+    }
+  ]
+}

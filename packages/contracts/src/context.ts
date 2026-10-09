@@ -12,6 +12,7 @@ import { WorkingDirectorySchema } from './schemas.ts';
 import { RESOURCE_ERROR_CODES, ResourceBindingSchema, ResourceEvidenceJournalSchema } from './resources.ts';
 import type { ResourceReadEvidence, ResourceRequestEvidence } from './resources.ts';
 import { SUBAGENT_ERROR_CODES } from './errors.ts';
+import { FrozenInputCommandSchema } from './input-commands.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const nonnegative = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -122,7 +123,7 @@ export const ContextBudgetsSchema = z.object({ projectionBytes: z.literal(65536)
   fragments: z.literal(32), issueCount: z.literal(20), snapshotBytes: z.literal(262144) }).strict();
 const publicJsonShape = { version: z.literal(1), policyVersion: z.literal('p8-context-v1'), text: userText, goalMode,
   workspaceContext: WorkspaceContextSchema.nullable(), resourcePolicy: z.enum(['none', 'p11-resources-v1']),
-  resourceBinding: ResourceBindingSchema.optional(),
+  resourceBinding: ResourceBindingSchema.optional(), inputCommand: FrozenInputCommandSchema.optional(),
   modelProjection: ContextProjectionSchema, budgets: ContextBudgetsSchema };
 function checkResourcePolicy(value: { resourcePolicy: string; resourceBinding?: unknown }, context: z.RefinementCtx) {
   if ((value.resourcePolicy === 'p11-resources-v1') !== (value.resourceBinding !== undefined))
@@ -151,6 +152,7 @@ export const ContextBuildRequestSchema = z.object({ runId: id, sessionId: id, jo
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id).max(64).readonly(), allowedArtifactIds: z.array(id).max(128).readonly(),
   workingDirectory: WorkingDirectorySchema.nullable(), createdAt: time, resourceBinding: ResourceBindingSchema.optional(),
+  inputCommand: FrozenInputCommandSchema.optional(),
 }).strict().superRefine((value, context) => {
   if (value.workspaceContext && (value.workspaceContext.sessionId !== value.sessionId || value.workspaceContext.jobId !== value.jobId))
     report(context, 'Build and frozen Workspace identity disagree.');

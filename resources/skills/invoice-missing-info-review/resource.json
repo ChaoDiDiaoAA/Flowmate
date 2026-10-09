@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill",
+  "id": "invoice-missing-info-review",
+  "version": "v1",
+  "bodyFile": "SKILL.md",
+  "keywords": [
+    "发票",
+    "缺失",
+    "无法辨认",
+    "补充资料",
+    "不适用"
+  ],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "list_skill_resources"
+    },
+    {
+      "kind": "tool",
+      "name": "read_skill_resource"
+    },
+    {
+      "kind": "tool",
+      "name": "read_invoice_evidence"
+    }
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "bytes": 1290,
+      "sha256": "1212631711a7ca24a73d55feae61b194a50d04a470d4b93a6a4ba634ccf4c44c"
+    },
+    {
+      "path": "references/guide.md",
+      "bytes": 865,
+      "sha256": "0bf378de0b212a0a6525f8304880645eb636bedf412c9e19da380f3554aeba64"
+    }
+  ]
+}

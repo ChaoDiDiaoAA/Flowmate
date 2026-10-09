@@ -80,6 +80,11 @@ export type ResourceSelection = z.infer<typeof ResourceSelectionSchema>;
 export const EMPTY_RESOURCE_SELECTION: ResourceSelection = Object.freeze({ prompt: null, enabledSkills: Object.freeze([]) });
 export const ResourceBindingSchema = z.object({ bundleHash: hash, requiredSkill: skillRef.nullable() }).strict().readonly();
 export type ResourceBinding = z.infer<typeof ResourceBindingSchema>;
+export const SkillIndexEntrySchema = z.object({ ref: skillRef, description: z.string().max(160),
+  checks: z.array(z.object({ dependency: ResourceDependencySchema, available: z.boolean(), reason: z.string().max(2048).nullable() }).strict())
+    .max(RESOURCE_LIMITS.dependencies).readonly(), diagnostic: z.string().max(2048).nullable() }).strict().readonly();
+export type SkillIndexEntry = z.infer<typeof SkillIndexEntrySchema>;
+export const SkillIndexSnapshotSchema = z.object({ entries: z.array(SkillIndexEntrySchema).max(RESOURCE_LIMITS.packages).readonly(), hash }).strict().readonly();
 export const FrozenResourcesSchema = z.object({ version: z.literal(1), policyVersion: z.literal('p11-resources-v1'),
   settingsRevision: integer, bundleHash: hash, bundleDirectory: z.string().min(1).max(8192)
     .refine(value => !/[\x00-\x1f\x7f]/.test(value) && /^(?:[a-z]:[\\/]|\/|\\\\)/i.test(value)), prompt: promptRef.nullable(),
@@ -87,6 +92,7 @@ export const FrozenResourcesSchema = z.object({ version: z.literal(1), policyVer
   selectedSkills: z.array(skillRef).max(RESOURCE_LIMITS.packages).readonly(),
   discoveredSkills: z.array(skillRef).max(RESOURCE_LIMITS.packages).readonly(),
   excludedSkills: z.array(z.object({ ref: skillRef, code }).strict().readonly()).max(RESOURCE_LIMITS.packages).readonly(),
+  skillIndex: SkillIndexSnapshotSchema.optional(),
 }).strict().superRefine((value, context) => {
   const selected = value.selectedSkills.map(resourceRefKey);
   const partition = [...value.discoveredSkills.map(resourceRefKey), ...value.excludedSkills.map(item => resourceRefKey(item.ref))];
@@ -95,6 +101,10 @@ export const FrozenResourcesSchema = z.object({ version: z.literal(1), policyVer
   if (selected.length + Number(value.prompt !== null) > RESOURCE_LIMITS.packages) report(context, 'Too many selected resource packages.');
   if (!value.bundleDirectory.replaceAll('\\', '/').endsWith('/' + value.bundleHash)) report(context, 'Frozen content location must identify its bundle.');
   const included = [...(value.prompt ? [value.prompt] : []), ...value.discoveredSkills].map(resourceRefKey);
+  if (value.skillIndex && (value.skillIndex.entries.length !== selected.length
+    || !unique(value.skillIndex.entries.map(entry => resourceRefKey(entry.ref)))
+    || value.skillIndex.entries.some(entry => !selected.includes(resourceRefKey(entry.ref)))))
+    report(context, 'Skill index must exactly identify the original enabled versions.');
   if (!unique(value.manifests.map(item => resourceRefKey(item.ref))) || value.manifests.length !== included.length
     || value.manifests.some(item => !included.includes(resourceRefKey(item.ref)) || item.ref.kind !== item.manifest.kind
       || item.ref.id !== item.manifest.id || item.ref.version !== item.manifest.version)) report(context, 'Frozen manifests must exactly identify included resources.');
@@ -152,6 +162,22 @@ export const ResourceFilePageSchema = z.object({ ref: ResourceRefSchema, path: R
     && (value.nextOffset <= value.offset || value.nextOffset >= value.totalBytes)) report(context, 'Page offsets must make bounded progress.');
 }).readonly();
 export type ResourceFilePage = z.infer<typeof ResourceFilePageSchema>;
+export const SKILL_RESOURCE_TOOL_NAMES = ['list_skill_resources', 'read_skill_resource'] as const;
+export const ListSkillResourcesInputSchema = z.object({ skill: ResourceIdSchema }).strict();
+export type ListSkillResourcesInput = z.infer<typeof ListSkillResourcesInputSchema>;
+export const ReadSkillResourceInputSchema = z.object({ skill: ResourceIdSchema, path: ResourceFilePathSchema,
+  offset: integer.optional(), limit: integer.min(4).max(RESOURCE_LIMITS.pageBytes).optional() }).strict();
+export type ReadSkillResourceInput = z.infer<typeof ReadSkillResourceInputSchema>;
+export const ListSkillResourcesOutputSchema = z.object({ ref: skillRef, bundleHash: hash,
+  files: z.array(manifestFile).min(1).max(RESOURCE_LIMITS.files).readonly() }).strict().refine(value =>
+    unique(value.files.map(file => file.path.toLowerCase())), 'Listed files must be unique.').readonly();
+export type ListSkillResourcesOutput = z.infer<typeof ListSkillResourcesOutputSchema>;
+export const ReadSkillResourceOutputSchema = ResourceFilePageSchema.unwrap().innerType().extend({ ref: skillRef, bundleHash: hash })
+  .strict().superRefine((value, context) => {
+    if (value.offset > value.totalBytes || value.nextOffset !== null
+      && (value.nextOffset <= value.offset || value.nextOffset >= value.totalBytes)) report(context, 'Page offsets must make bounded progress.');
+  }).readonly();
+export type ReadSkillResourceOutput = z.infer<typeof ReadSkillResourceOutputSchema>;
 export const ResourceSelectionRequestSchema = z.object({ expectedRevision: integer, selection: ResourceSelectionSchema }).strict();
 export type ResourceSelectionRequest = z.infer<typeof ResourceSelectionRequestSchema>;
 export const ResourceSelectionResultSchema = z.object({ revision: integer, selection: ResourceSelectionSchema }).strict().readonly();
@@ -165,11 +191,11 @@ export const ResourceExpansionEvidenceSchema = z.object({ inputId: id, nativeEnt
 export type ResourceExpansionEvidence = z.infer<typeof ResourceExpansionEvidenceSchema>;
 export const ResourceReadEvidenceSchema = z.object({ toolCallId: id, nativeToolCallId: opaque, requestSequence: id,
   ref: ResourceRefSchema, bundleHash: hash, path: ResourceFilePathSchema, fileHash: hash, deliveredHash: hash,
-  operation: z.enum(['read', 'grep', 'find', 'ls']), fullBody: z.boolean().nullable(), nativeEntryId: opaque.nullable(), at: time,
-}).strict().refine(value => value.fullBody !== true || value.operation === 'read', 'Only actual read can prove a full body.').readonly();
+  operation: z.enum(['read', 'grep', 'find', 'ls', 'list_skill_resources', 'read_skill_resource']), fullBody: z.boolean().nullable(), nativeEntryId: opaque.nullable(), at: time,
+}).strict().refine(value => value.fullBody !== true || value.operation === 'read' || value.operation === 'read_skill_resource', 'Only actual read can prove a full body.').readonly();
 export type ResourceReadEvidence = z.infer<typeof ResourceReadEvidenceSchema>;
 export const ResourceContentEvidenceSchema = z.object({ ref: ResourceRefSchema, nativeEntryId: opaque.nullable(),
-  path: ResourceFilePathSchema.nullable(), scope: z.enum(['business-prompt', 'skill-index', 'expanded-body', 'tool-output', 'derived-source']),
+  path: ResourceFilePathSchema.nullable(), scope: z.enum(['business-prompt', 'skill-index', 'skill-readiness', 'expanded-body', 'tool-output', 'derived-source']),
   expectedTextHash: hash.nullable(), sdkInclusion: z.enum(['confirmed', 'not-included', 'unknown']),
   wireInclusion: z.enum(['confirmed', 'not-included', 'unknown']), reason: z.string().min(1).max(256).nullable(),
 }).strict().superRefine((value, context) => {
@@ -185,6 +211,17 @@ export const ResourceContentEvidenceSchema = z.object({ ref: ResourceRefSchema, 
     report(context, 'Content scope must match its resource kind.');
 }).readonly();
 export type ResourceContentEvidence = z.infer<typeof ResourceContentEvidenceSchema>;
+export function formatSkillReadinessSection(entry: SkillIndexEntry, tools: readonly string[], visible: readonly ResourceRef[], child: boolean): string {
+  const checks = entry.checks.map(check => {
+    const dependency = check.dependency;
+    const available = check.available && (dependency.kind === 'tool' ? tools.includes(dependency.name)
+      : dependency.kind === 'skill' ? visible.some(ref => resourceRefKey(ref) === resourceRefKey(dependency)) : !child);
+    return { ...check, available, reason: available ? null : check.reason ?? 'Unavailable in this Run scope.' };
+  });
+  const ready = visible.some(ref => resourceRefKey(ref) === resourceRefKey(entry.ref)) && !entry.diagnostic && checks.every(check => check.available);
+  const missing = checks.filter(check => !check.available).map(check => `${check.dependency.kind === 'tool' ? check.dependency.name : check.dependency.id}: ${check.reason}`);
+  return `- ${entry.ref.id}: ${entry.description}\n  readiness: ${ready ? 'Ready' : 'Partial'} (${checks.filter(check => check.available).length}/${checks.length} capabilities)${checks.length ? '' : '; No requirements'}${missing.length ? '; missing: '+missing.join(', ') : ''}${entry.diagnostic ? '; '+entry.diagnostic : ''}`;
+}
 export function resourceContentKey(value: Pick<ResourceContentEvidence, 'ref' | 'scope' | 'nativeEntryId' | 'path'>): string {
   return JSON.stringify([resourceRefKey(value.ref), value.scope, value.nativeEntryId, value.path]);
 }

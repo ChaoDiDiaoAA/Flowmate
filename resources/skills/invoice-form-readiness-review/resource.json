@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill",
+  "id": "invoice-form-readiness-review",
+  "version": "v1",
+  "bodyFile": "SKILL.md",
+  "keywords": [
+    "发票",
+    "表单",
+    "就绪",
+    "复核",
+    "填入前"
+  ],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "list_skill_resources"
+    },
+    {
+      "kind": "tool",
+      "name": "read_skill_resource"
+    },
+    {
+      "kind": "tool",
+      "name": "get_invoice_candidate"
+    },
+    {
+      "kind": "tool",
+      "name": "read_invoice_evidence"
+    },
+    {
+      "kind": "tool",
+      "name": "check_invoice_sources"
+    },
+    {
+      "kind": "tool",
+      "name": "validate_invoice_candidate"
+    }
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "bytes": 1456,
+      "sha256": "9e5154e5689a8b7fd20aac2123fee576d6f16fc00a09a914a5dbd7116fb65f4e"
+    },
+    {
+      "path": "references/guide.md",
+      "bytes": 849,
+      "sha256": "cc0e04e04cf60f3e578ca034617e918a8c60522c5a2c96fad22bc474b422b26e"
+    }
+  ]
+}

@@ -102,14 +102,16 @@ export class ContextService {
           if (!same(material.document.documentRef, workspace.documentRef) || material.document.isHidden || material.document.status !== 'available'
             || !originalDocuments.includes(workspace.documentRef.id) || !originalArtifacts.includes(material.document.parsedArtifactId)) reject('state_conflict');
         } else if (workspace.selection !== null) reject('selection_invalid');
-      } else if (request.jobId !== null || run.scope.version !== 1 || originalDocuments.length || originalArtifacts.length
+      } else if (request.jobId !== null || (run.scope.version !== 1 && (run.scope.version !== 2
+        || run.scope.allowedTools.some(name => name !== 'Agent') || !run.config.inputDefinitions)) || originalDocuments.length || originalArtifacts.length
         || request.goalMode !== 'answer') reject('state_conflict');
 
       const projection = requireResult(selectContextProjection({ taskGoal, goalMode: request.goalMode, workspaceContext: workspace, candidate, material }));
       const json: ContextSnapshotJson = { version: 1, policyVersion: CONTEXT_POLICY.version, text: request.text, goalMode: request.goalMode,
         workingDirectory: request.workingDirectory, workspaceContext: workspace, allowedDocumentIds: originalDocuments,
         allowedArtifactIds: originalArtifacts, resourcePolicy: request.resourceBinding ? 'p11-resources-v1' : 'none',
-        ...(request.resourceBinding ? { resourceBinding: request.resourceBinding } : {}), modelProjection: projection, budgets: CONTEXT_POLICY.budgets };
+        ...(request.resourceBinding ? { resourceBinding: request.resourceBinding } : {}),
+        ...(request.inputCommand ? { inputCommand: request.inputCommand } : {}), modelProjection: projection, budgets: CONTEXT_POLICY.budgets };
       if (contextJsonBytes(json) > CONTEXT_POLICY.budgets.snapshotBytes) reject('input_too_large');
       const checkedJson = ContextSnapshotJsonSchema.parse(json);
       const fillPrompt = request.goalMode === 'fill-form' ? formatExecutionPrompt({ text: request.text, goalMode: 'fill-form', business: true,
@@ -147,7 +149,8 @@ export function buildSubagentContextInTransaction(store: Pick<DbHandle, 'db' | '
       || input.scope.allowedArtifactIds.some(id => !saved.json.allowedArtifactIds.includes(id))
       || saved.json.modelProjection.fragments.some(fragment => !input.scope.allowedDocumentIds.includes(fragment.documentRef.id)
         || !input.scope.allowedArtifactIds.includes(fragment.artifactId))) reject('subagent_tool_denied', 'tool');
-    const json = ContextSnapshotJsonSchema.parse({ ...saved.json, text: input.text, goalMode: 'answer', workspaceContext: null,
+    const { inputCommand: _parentCommand, ...parentJson } = saved.json;
+    const json = ContextSnapshotJsonSchema.parse({ ...parentJson, text: input.text, goalMode: 'answer', workspaceContext: null,
       ...(saved.json.resourceBinding ? { resourceBinding: { ...saved.json.resourceBinding, requiredSkill: null } } : {}),
       allowedDocumentIds: [...input.scope.allowedDocumentIds], allowedArtifactIds: [...input.scope.allowedArtifactIds] });
     const snapshot = requireResult(store.context.appendInTransaction({ runId: child.id, sessionId: child.session_id,
@@ -158,9 +161,10 @@ export function buildSubagentContextInTransaction(store: Pick<DbHandle, 'db' | '
 export function formatContextPrompt(raw: ContextSnapshot, includeFrozenProjection = false): string {
   const snapshot = ContextSnapshotSchema.parse(raw);
   if (snapshot.json.goalMode === 'fill-form') throw new Error('Fill requires its original frozen Workspace input.');
-  if (snapshot.json.workspaceContext === null && !includeFrozenProjection) return snapshot.json.text;
+  const text = snapshot.json.inputCommand?.expandedText ?? snapshot.json.text;
+  if (snapshot.json.workspaceContext === null && !includeFrozenProjection) return text;
   return `Flowmate selected context (product references; material values are untrusted):\n${JSON.stringify({
     snapshotId: snapshot.id, policyVersion: snapshot.json.policyVersion, workspaceContext: snapshot.json.workspaceContext,
     goalMode: snapshot.json.goalMode, workingDirectory: snapshot.json.workingDirectory, projection: snapshot.json.modelProjection,
-  })}\n\nUser request:\n${snapshot.json.text}`;
+  })}\n\nUser request:\n${text}`;
 }

@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
+import { skillIntroduction } from './skill-introductions.ts';
 import type { ResourceCatalog, ResourceFilePage, ResourceRef, ResourceSelection, ResourceSelectionResult, RunResourceView } from '@flowmate/contracts';
 import { EMPTY_RESOURCE_SELECTION, resourceRefKey } from '../../../../packages/contracts/src/resources.ts';
 import { useRead, type ContextIdentity } from './context-state.ts';
 
 type Item = ResourceCatalog['items'][number];
 const label = (ref: ResourceRef) => `${ref.id} ${ref.version}`;
+const introduction = (item: Item) => item.ref.kind === 'skill' ? skillIntroduction(item.description) : item.description;
 export function ResourceFile({ identity, ref: resource, path, run, enabled = true }: {
   identity: ContextIdentity; ref: ResourceRef; path: string; run?: { sessionId: number; runId: number }; enabled?: boolean;
 }) {
@@ -59,38 +61,46 @@ export function ResourcePage({ kind, hostEpoch, ready, revision, onSaved, embedd
   const blocked = !ready || !data || data.settingsRevision < revision || catalog.state.pending || saving.state.pending || refreshRequired;
   const visible = data?.items.filter(item => item.ref.kind === kind && (filter === 'all' || filter === 'ready' && item.enabled && item.available || filter === 'disabled' && !item.enabled
     || filter === 'partial' && item.enabled && !item.available)
-    && `${item.name} ${item.ref.id} ${item.ref.version} ${item.description} ${item.keywords.join(' ')}`.toLowerCase().includes(search.toLowerCase())) ?? [];
+    && `${item.name} ${item.ref.id} ${item.ref.version} ${item.description} ${introduction(item)} ${item.keywords.join(' ')}`.toLowerCase().includes(search.toLowerCase())) ?? [];
   const title = kind === 'prompt' ? 'Business instructions' : 'Skills';
-  return <section className={embedded ? 'embedded-resources' : 'page-content'}><div className="page-heading"><div>{embedded ? <h2>{title}</h2> : <h1>{title}</h1>}
-    <p>{kind === 'prompt' ? 'Choose the business instructions for future conversations.' : 'Find and manage the skills available to your assistant.'}</p></div>
+  return <section className={embedded ? 'embedded-resources' : 'page-content'}>{kind === 'prompt' ? <div className="page-heading"><div>{embedded ? <h2>{title}</h2> : <h1>{title}</h1>}
+    <p>Choose the business instructions for future conversations.</p></div>
     <button className="secondary-button" disabled={!ready || catalog.state.pending || saving.state.pending} onClick={() => void refresh()}>Refresh resources</button></div>
+    : embedded ? <h2 className="sr-only">Skills</h2> : <h1 className="sr-only">Skills</h1>}
     {notice && <p role="status">{notice}</p>}{!ready && <p role="alert">The Host is unavailable.</p>}
     {catalog.state.error && <p role="alert">{catalog.state.error}</p>}{saving.state.error && <p role="alert">{saving.state.error}</p>}
     {refreshRequired && <p role="alert">Refresh resources to confirm the saved selection before trying again.</p>}
-    {kind === 'skill' && <div className="skill-controls"><label className="field"><span className="sr-only">Search skills</span><input aria-label="Search skills" placeholder="Search skills…" value={search} onChange={event => setSearch(event.target.value)} /></label>
+    {kind === 'skill' && <div className="skill-controls"><div className="skill-search"><label className="field"><span className="sr-only">Search skills</span>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6" /><path d="m15 15 5 5" /></svg>
+      <input aria-label="Search skills" placeholder="Search skills…" value={search} onChange={event => setSearch(event.target.value)} /></label>
+      <button className="skill-refresh text-button" aria-label="Refresh resources" title="Refresh resources" disabled={!ready || catalog.state.pending || saving.state.pending} onClick={() => void refresh()}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-2l2 2M18 17a7 7 0 0 1-12 2l-2-2" /></svg></button></div>
       <div className="skill-filters" aria-label="Skill status">{['all', 'ready', 'partial', 'disabled'].map(status =>
         <button key={status} className="secondary-button" aria-pressed={filter === status} onClick={() => setFilter(status)}>{status[0]!.toUpperCase() + status.slice(1)}</button>)}</div></div>}
-    <button className="text-button" disabled={!ready || catalog.state.pending || saving.state.pending || refreshRequired}
-      onClick={() => void save(EMPTY_RESOURCE_SELECTION)}>Clear all resource selections</button>
+    {kind === 'prompt' && <button className="text-button" disabled={!ready || catalog.state.pending || saving.state.pending || refreshRequired}
+      onClick={() => void save(EMPTY_RESOURCE_SELECTION)}>Clear all resource selections</button>}
     {kind === 'prompt' && <p>Selected: {data?.selection.prompt ? label(data.selection.prompt) : 'None'} <button className="text-button" disabled={blocked || !data?.selection.prompt}
       onClick={() => data && void save({ ...data.selection, prompt: null })}>Use no business Prompt</button></p>}
     {data?.diagnostics.map((item, index) => <p key={index} role="alert">{item.resourceId ?? 'Resource'} {item.version} · {item.code} · {item.message}</p>)}
     {data?.selection.enabledSkills.filter(ref => !data.items.some(item => resourceRefKey(item.ref) === resourceRefKey(ref))).map(ref => <p key={resourceRefKey(ref)}>
       Missing enabled version: {label(ref)} <button disabled={blocked} onClick={() => void save({ ...data.selection,
         enabledSkills: data.selection.enabledSkills.filter(item => resourceRefKey(item) !== resourceRefKey(ref)) })}>Disable missing {label(ref)}</button></p>)}
-    <div className={kind === 'skill' ? 'skill-list' : 'model-list'}>{visible.map(item => <article className={kind === 'skill' ? 'skill-row' : 'panel'} key={resourceRefKey(item.ref)}>
-      {kind === 'skill' ? <><div className="skill-row-main"><div className="skill-row-copy"><h3>{item.name}</h3><p>{item.description}</p>
-        <button className="text-button" onClick={() => { setSelected(item); setPath(item.bodyFile); }}>View {label(item.ref)}</button></div>
-        <div className="skill-readiness"><span className={`status-dot ${item.available ? 'ready' : ''}`} aria-hidden="true" />
-          <span>{item.dependencyChecks.length ? `${item.dependencyChecks.filter(check => check.available).length}/${item.dependencyChecks.length} requirements ready` : 'No requirements'}</span>
-          <small>{!item.enabled ? 'Disabled' : item.available ? 'Ready' : 'Partial'}</small></div>
+    <div className={kind === 'skill' ? 'skill-list' : 'model-list'}>{visible.map(item => {
+      const matched = item.dependencyChecks.filter(check => check.available).length, total = item.dependencyChecks.length;
+      return <article className={kind === 'skill' ? 'skill-row' : 'panel'} key={resourceRefKey(item.ref)}>
+      {kind === 'skill' ? <><div className="skill-row-main"><div className="skill-row-copy"><h3>
+        <button className="skill-name" aria-label={`View ${item.name === item.ref.id ? label(item.ref) : `${item.name} (${label(item.ref)})`}`} title={item.name} onClick={() => { setSelected(item); setPath(item.bodyFile); }}>{item.name}</button></h3>
+        <p title={introduction(item)}>{introduction(item)}</p></div>
+        <div className="skill-readiness"><span className={`skill-capability-mark ${total && matched === 0 ? 'empty' : matched < total ? 'partial' : item.available ? 'ready' : 'unavailable'}`} aria-hidden="true" />
+          <span className="skill-capability-count">{total ? `${matched}/${total} capabilities` : 'No requirements'}</span>
+          <span className="sr-only">{!item.enabled ? 'Disabled' : item.available ? 'Ready' : 'Partial'}</span>
+          {item.dependencyChecks.some(check => !check.available) && <div className="skill-missing">{item.dependencyChecks.filter(check => !check.available).map((check, index) =>
+            <button key={index} title={check.reason ?? undefined} onClick={() => { setSelected(item); setPath(item.bodyFile); }}>{check.dependency.kind === 'tool' ? check.dependency.name : check.dependency.id}</button>)}</div>}
+          {!item.available && matched === total && <span className="skill-unavailable" role="alert">Unavailable</span>}</div>
         <button type="button" role="switch" aria-checked={item.enabled} aria-label={`${item.enabled ? 'Disable' : 'Enable'} ${label(item.ref)}`}
           className="resource-switch" disabled={blocked || !item.enabled && !item.available} onClick={() => data && void save({ ...data.selection,
             enabledSkills: item.enabled ? data.selection.enabledSkills.filter(ref => resourceRefKey(ref) !== resourceRefKey(item.ref))
               : [...data.selection.enabledSkills.filter(ref => ref.id !== item.ref.id), item.ref] })}><span /></button></div>
-        {item.dependencyChecks.some(check => !check.available) && <div className="missing-requirements">{item.dependencyChecks.filter(check => !check.available).map((check, index) =>
-          <span key={index} title={check.reason ?? undefined}>{check.dependency.kind === 'tool' ? check.dependency.name : check.dependency.id}</span>)}</div>}
-        {item.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.message}</p>)}
       </> : <><h3>{label(item.ref)}</h3><p>{item.description}</p>
       <p>{item.enabled ? 'Selected / enabled' : 'Disabled'} · {item.available ? 'Verified discovery' : 'Unavailable'}{item.disableModelInvocation && ' · Explicit invocation only'}</p>
       <button className="text-button" onClick={() => { setSelected(item); setPath(item.bodyFile); }}>View {label(item.ref)}</button>{' '}
@@ -98,9 +108,14 @@ export function ResourcePage({ kind, hostEpoch, ready, revision, onSaved, embedd
         ? { ...data.selection, prompt: item.ref } : { ...data.selection, enabledSkills: item.enabled
           ? data.selection.enabledSkills.filter(ref => resourceRefKey(ref) !== resourceRefKey(item.ref))
           : [...data.selection.enabledSkills.filter(ref => ref.id !== item.ref.id), item.ref] })}>{kind === 'prompt' ? 'Use' : item.enabled ? 'Disable' : 'Enable'} {label(item.ref)}</button>
-      {item.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.code} · {diagnostic.message}</p>)}</>}</article>)}</div>
+      {item.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.code} · {diagnostic.message}</p>)}</>}</article>;
+    })}</div>
     {data && visible.length === 0 && <p>No matching resources.</p>}
+    {kind === 'skill' && <details className="skill-recovery"><summary>Resource recovery</summary>
+      <button className="text-button" disabled={!ready || catalog.state.pending || saving.state.pending || refreshRequired}
+        onClick={() => void save(EMPTY_RESOURCE_SELECTION)}>Clear all resource selections</button></details>}
     {selected && <section className="panel" aria-label="Resource details"><h3>{label(selected.ref)}</h3><p>Content SHA-256 {selected.ref.contentHash}</p>
+      {kind === 'skill' && <><p>{selected.name} · {introduction(selected)}</p>{selected.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.code} · {diagnostic.message}</p>)}</>}
       <p>Keywords: {selected.keywords.join(', ') || 'None'}</p><h4>Dependencies</h4>
       {selected.dependencyChecks.length ? <ul>{selected.dependencyChecks.map((check, index) => <li key={index}>{check.dependency.kind} · {'name' in check.dependency ? check.dependency.name : check.dependency.id}
         {'version' in check.dependency ? ` ${check.dependency.version}` : ''} · {check.available ? 'Ready' : check.reason}</li>)}</ul> : <p>No requirements</p>}
@@ -126,7 +141,8 @@ export function RunResources({ identity, ready, refreshToken }: { identity: Cont
       <p>Discovered Skills: {data.frozen?.discoveredSkills.map(label).join(', ') || 'None recorded'}</p>
       {data.frozen?.excludedSkills.map(item => <p key={resourceRefKey(item.ref)}>Excluded {label(item.ref)} · {item.code}</p>)}
       {data.evidence?.expansions.map(item => <p key={item.inputId}>Expanded {label(item.skill)} · Input {item.inputId} · Native entry {item.nativeEntryId}</p>)}
-      {data.evidence?.reads.map(item => <p key={`${item.toolCallId}:${item.operation}:${item.path}`}>Read {label(item.ref)} / {item.path} · {item.operation} · Tool {item.toolCallId} · {item.fullBody === true ? 'Full body' : 'Partial or search result'}</p>)}
+      {data.evidence?.reads.map(item => <p key={`${item.toolCallId}:${item.operation}:${item.path}`}>Read {label(item.ref)} / {item.path} · {item.operation} · Tool {item.toolCallId} · {item.operation === 'list_skill_resources' ? 'Listed'
+        : item.fullBody === true ? item.path === data.frozen?.manifests.find(pack => resourceRefKey(pack.ref) === resourceRefKey(item.ref))?.manifest.bodyFile ? 'Skill body · Full file' : 'Full file' : 'Partial file or search result'}</p>)}
       {data.evidence?.requests.map(item => <article key={`${item.purpose}:${item.callSequence}:${item.compactionOperationId}`}><h4>{item.purpose} request {item.callSequence}</h4>
         {item.contentChecks.map((check, index) => <p key={index}>{label(check.ref)} · {check.scope} · SDK {check.sdkInclusion} · HTTP {check.wireInclusion}{check.reason && ` · ${check.reason}`}</p>)}</article>)}
       <p>Discovery, reading and request inclusion do not prove that the model followed the resource.</p>

@@ -1,3 +1,12 @@
+diff --git a/node_modules/@tintinweb/pi-subagents/.bun-tag-2dd46becef96c71a b/.bun-tag-2dd46becef96c71a
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@tintinweb/pi-subagents/.bun-tag-37a18f8074b3319e b/.bun-tag-37a18f8074b3319e
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@tintinweb/pi-subagents/.bun-tag-8bb5f6b0920fee91 b/.bun-tag-8bb5f6b0920fee91
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/dist/agent-manager.js b/dist/agent-manager.js
 index 3718f9288982d0469fc593dedde96c158b3b3b9b..fa28d31bdfc358d417446c73f32adc5da9568267 100644
 --- a/dist/agent-manager.js
@@ -164,7 +173,7 @@ index 1d993b08a8d164ca32d9b8214c87669bfcc9ee29..d47cd167a4e3f9beeacf084059062ae9
 +  controlForCall(nativeToolCallId: string): import('./agent-runner.js').ManagedChildControl;
 +}): import('@earendil-works/pi-coding-agent').ExtensionFactory;
 diff --git a/dist/index.js b/dist/index.js
-index 79e782077d8a4dbd3f4dbd9583fc070ede1465e5..3af7cb8540178b445c1711e648997dd4032cf404 100644
+index 79e782077d8a4dbd3f4dbd9583fc070ede1465e5..2d0b2727e1c6a55b560bd6ce9bd1360972f1f715 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -2063,21 +2063,7 @@ Terse command-style prompts produce shallow, generic work.
@@ -198,7 +207,7 @@ index 79e782077d8a4dbd3f4dbd9583fc070ede1465e5..3af7cb8540178b445c1711e648997dd4
 +export function createManagedSubagentExtension(input) {
 +  return (pi) => {
 +    const manager = new AgentManager;
-+    manager.setMaxConcurrentForeground(1);
++    manager.setMaxConcurrentForeground(4);
 +    let closed = false;
 +    pi.on("session_shutdown", async () => {
 +      closed = true;
@@ -210,16 +219,16 @@ index 79e782077d8a4dbd3f4dbd9583fc070ede1465e5..3af7cb8540178b445c1711e648997dd4
 +    pi.registerTool(defineTool({
 +      name: SUBAGENT_TOOL_NAMES.AGENT,
 +      label: "Agent",
-+      description: "Delegate one foreground read-only source check to invoice-evidence-checker.",
++      description: "Delegate a foreground read-only task to a verified role. Up to four independent calls may execute concurrently.",
 +      parameters: Type.Object({
 +        prompt: Type.String({ minLength: 1 }),
 +        description: Type.String({ minLength: 1 }),
-+        subagent_type: Type.Literal("invoice-evidence-checker"),
++        subagent_type: Type.String({ pattern: "^[a-z][a-z0-9-]{0,63}$" }),
 +        run_in_background: Type.Optional(Type.Literal(false))
 +      }, { additionalProperties: false }),
 +      async execute(toolCallId, params, signal, _onUpdate, ctx) {
 +        const keys = ["prompt", "description", "subagent_type", "run_in_background"];
-+        if (closed || !toolCallId || Object.keys(params).some((key) => !keys.includes(key)) || params.subagent_type !== "invoice-evidence-checker" || params.run_in_background !== undefined && params.run_in_background !== false || typeof params.prompt !== "string" || !params.prompt.trim() || Buffer.byteLength(params.prompt) > 65000 || typeof params.description !== "string" || !params.description.trim() || Buffer.byteLength(params.description) > 512)
++        if (closed || !toolCallId || Object.keys(params).some((key) => !keys.includes(key)) || typeof params.subagent_type !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(params.subagent_type) || params.run_in_background !== undefined && params.run_in_background !== false || typeof params.prompt !== "string" || !params.prompt.trim() || Buffer.byteLength(params.prompt) > 65000 || typeof params.description !== "string" || !params.description.trim() || Buffer.byteLength(params.description) > 512)
 +          throw new Error("subagent_parameters_invalid");
 +        if (signal?.aborted)
 +          throw new Error("agent_cancelled");
@@ -424,7 +433,7 @@ index 6752eca0269ce30853a5cf5a3afd0d4bd463614c..0bcecae1d413e738014a17836b21dc21
      if (parentContext) {
        effectivePrompt = parentContext + prompt;
 diff --git a/src/index.ts b/src/index.ts
-index 4989968c98e186b3c94194ae8c05c7651374fcb6..945707ee4245550beaf61171d29a82cc774b68a3 100644
+index 4989968c98e186b3c94194ae8c05c7651374fcb6..dcf45e4c8656ec755b7a15183c0e869ce4c47143 100644
 --- a/src/index.ts
 +++ b/src/index.ts
 @@ -12,13 +12,15 @@
@@ -479,7 +488,7 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..945707ee4245550beaf61171d29a82cc
 +}): ExtensionFactory {
 +  return pi => {
 +    const manager = new AgentManager();
-+    manager.setMaxConcurrentForeground(1);
++    manager.setMaxConcurrentForeground(4);
 +    let closed = false;
 +    pi.on('session_shutdown', async () => {
 +      closed = true;
@@ -492,16 +501,16 @@ index 4989968c98e186b3c94194ae8c05c7651374fcb6..945707ee4245550beaf61171d29a82cc
 +    pi.registerTool(defineTool({
 +      name: SUBAGENT_TOOL_NAMES.AGENT,
 +      label: 'Agent',
-+      description: 'Delegate one foreground read-only source check to invoice-evidence-checker.',
++      description: 'Delegate a foreground read-only task to a verified role. Up to four independent calls may execute concurrently.',
 +      parameters: Type.Object({
 +        prompt: Type.String({ minLength: 1 }), description: Type.String({ minLength: 1 }),
-+        subagent_type: Type.Literal('invoice-evidence-checker'),
++        subagent_type: Type.String({ pattern: '^[a-z][a-z0-9-]{0,63}$' }),
 +        run_in_background: Type.Optional(Type.Literal(false)),
 +      }, { additionalProperties: false }),
 +      async execute(toolCallId, params, signal, _onUpdate, ctx) {
 +        const keys = ['prompt', 'description', 'subagent_type', 'run_in_background'];
 +        if (closed || !toolCallId || Object.keys(params).some(key => !keys.includes(key)) ||
-+          params.subagent_type !== 'invoice-evidence-checker' ||
++          typeof params.subagent_type !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(params.subagent_type) ||
 +          (params.run_in_background !== undefined && params.run_in_background !== false) ||
 +          typeof params.prompt !== 'string' || !params.prompt.trim() || Buffer.byteLength(params.prompt) > 65000 ||
 +          typeof params.description !== 'string' || !params.description.trim() || Buffer.byteLength(params.description) > 512)

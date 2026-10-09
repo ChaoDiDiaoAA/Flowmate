@@ -456,8 +456,10 @@ describe('Fill backend through the public Application', () => {
           async close() { return { stopped: true, closed: true, errors: [] }; } };
       } }));
     try {
-      expect(names).toHaveLength(bridgePresent ? 23 : 22);
+      expect(names).toHaveLength(bridgePresent ? 25 : 24);
       expect(names.filter(name => name === 'Agent')).toHaveLength(1);
+      expect(names.filter(name => name === 'list_skill_resources')).toHaveLength(1);
+      expect(names.filter(name => name === 'read_skill_resource')).toHaveLength(1);
       expect(names.includes('fill_invoice_form')).toBe(bridgePresent);
       expect(names.slice(0, 13)).not.toContain('fill_invoice_form');
       expect(await app.saveInvoiceCandidate({} as never)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });

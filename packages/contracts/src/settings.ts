@@ -153,7 +153,7 @@ export type DesktopInvoiceExportResult = { outcome: 'cancelled' } | {
 };
 
 export type DesktopBridge = Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
-  | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent'> & {
+  | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
   updateResourceSelection(input: import('./resources.ts').ResourceSelectionRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceSelectionResult>>;

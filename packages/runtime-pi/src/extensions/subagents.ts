@@ -38,6 +38,10 @@ export function createSubagentExtension(input: { sdkTool: (parameters: ToolDefin
       return input.withNativeCall({ rawTool: tool, ticket, arguments: parameters, nativeArguments: args },
         () => sdkTool.execute(...args));
     } });
+    pi.registerCommand('subagent', { description: 'Delegate a task to a registered subagent', handler: async (args, ctx) => {
+      if (ctx.mode !== 'print') reject();
+      input.scope.acknowledgeInputCommand(args, ctx.sessionManager.getSessionId());
+    } });
     pi.on('session_start', (_event, ctx) => {
       if (ctx.mode !== 'print' || ctx.sessionManager.getSessionId() !== input.scope.view.nativeSessionId) reject();
       input.scope.acknowledgeStart();

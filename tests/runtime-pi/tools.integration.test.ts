@@ -14,6 +14,9 @@ import { openDatabase } from '../../packages/core/src/storage/database.ts';
 import { deferCleanup, mkdtempSync } from '../support/resources.ts';
 import { CandidateDraftSchema, INVOICE_TOOL_NAMES, invoiceToolSchemas } from '../../packages/contracts/src/invoice.ts';
 import { toPiParameters } from '../../packages/runtime-pi/src/schema.ts';
+import { ListSkillResourcesInputSchema, ReadSkillResourceInputSchema } from '@flowmate/contracts';
+import { toPiTool } from '../../packages/runtime-pi/src/tools.ts';
+import { readSkillResource } from '@flowmate/employee-invoice';
 import { z } from 'zod';
 
 const field = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
@@ -639,6 +642,19 @@ it('persists real material revocation between conversion and fetch while saved h
 });
 
 describe('Pi argument schema conversion', () => {
+  it('offers optional Skill page arguments while enforcing path refinements at the real tool preparation boundary', () => {
+    const list = { name: 'list_skill_resources', description: 'list', parameters: toPiParameters(ListSkillResourcesInputSchema) };
+    expect(validateToolArguments(list, { name: list.name, arguments: { skill: 'invoice' } } as never)).toEqual({ skill: 'invoice' });
+    const tool = toPiTool(readSkillResource(() => { throw new Error('Preparation must not execute the tool.'); }), async () => { throw new Error('Not executed.'); });
+    expect(validateToolArguments(tool, { name: tool.name, arguments: { skill: 'invoice', path: 'SKILL.md' } } as never))
+      .toEqual({ skill: 'invoice', path: 'SKILL.md' });
+    expect(tool.prepareArguments?.({ skill: 'invoice', path: 'references/guide.md', offset: 0, limit: 4 }))
+      .toEqual({ skill: 'invoice', path: 'references/guide.md', offset: 0, limit: 4 });
+    expect(() => tool.prepareArguments?.({ skill: 'invoice', path: '../secret' })).toThrow('Invalid arguments');
+    expect(() => tool.prepareArguments?.({ skill: 'CON', path: 'SKILL.md' })).toThrow('Invalid arguments');
+    expect(() => validateToolArguments(tool, { name: tool.name, arguments: { skill: 'invoice', path: 'SKILL.md', limit: 3 } } as never)).toThrow();
+  });
+
   it('preserves all supported strict Zod constraints through the installed Pi validator', async () => {
     for (const name of INVOICE_TOOL_NAMES) {
       const schema = invoiceToolSchemas[name].input;

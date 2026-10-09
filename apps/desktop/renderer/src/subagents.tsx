@@ -3,7 +3,7 @@ import type { SubagentDetail, SubagentSummary, TokenColumns } from '@flowmate/co
 import { SessionHistory } from './session-history.tsx';
 
 type Props = { parentRunId: number; parentSessionId: number; hostEpoch: number; ready: boolean;
-  refreshToken: string; onObserve(runId: number, sessionId: number): void };
+  refreshToken: string; compact?: boolean; busy?: boolean; onObserve(runId: number, sessionId: number): void };
 
 export function Subagents(props: Props) {
   const [items, setItems] = useState<readonly SubagentSummary[]>([]), [next, setNext] = useState<number | null>(null);
@@ -11,6 +11,7 @@ export function Subagents(props: Props) {
   const [loading, setLoading] = useState(false), [detailLoading, setDetailLoading] = useState(false), [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null), [detailError, setDetailError] = useState<string | null>(null), [notice, setNotice] = useState<string | null>(null);
   const [history, setHistory] = useState(false);
+  const [summaries, setSummaries] = useState<Record<number, SubagentDetail>>({});
   const [totals, setTotals] = useState<TokenColumns | null>(null);
   const alive = useRef(true), ready = useRef(props.ready), selection = useRef<number | null>(null);
   const reads = useRef({ list: 0, detail: 0, stop: 0 }); ready.current = props.ready;
@@ -35,7 +36,14 @@ export function Subagents(props: Props) {
       const result = await window.flowmate.listSubagents({ parentRunId: props.parentRunId, parentSessionId: props.parentSessionId,
         ...(beforeRunId === undefined ? {} : { beforeRunId }), limit: 20 });
       if (!current()) return;
-      if (result.ok) { setItems(prior => beforeRunId === undefined ? result.data.items : [...prior, ...result.data.items]); setNext(result.data.nextBeforeRunId); setTotals(result.data.totals); }
+      if (result.ok) { setItems(prior => beforeRunId === undefined ? result.data.items : [...prior, ...result.data.items]); setNext(result.data.nextBeforeRunId); setTotals(result.data.totals);
+        if (props.compact) {
+          const details = await Promise.all(result.data.items.map(child => window.flowmate.querySubagent({ parentRunId: props.parentRunId,
+            parentSessionId: props.parentSessionId, childRunId: child.childRunId }).catch(() => null)));
+          if (current()) setSummaries(Object.fromEntries(details.flatMap((detail, index) => detail?.ok
+            && detail.data.childRunId === result.data.items[index]?.childRunId ? [[detail.data.childRunId, detail.data]] : [])));
+        }
+      }
       else setError(`Subagents could not be loaded (${result.error.code}). Saved details are retained.`);
     } catch { if (current()) setError('Subagents are unavailable. Refresh to try again.'); }
     finally { if (current()) setLoading(false); }
@@ -43,36 +51,46 @@ export function Subagents(props: Props) {
   function refresh() { void load(); if (selection.current !== null) void readDetail(selection.current); }
   useEffect(() => { if (props.ready) refresh(); else { reads.current.list++; reads.current.detail++; reads.current.stop++; setLoading(false); setDetailLoading(false); setStopping(false); } },
     [props.ready, props.refreshToken]);
+  useEffect(() => { if (!props.compact || !props.busy || !props.ready) return;
+    const timer = setInterval(refresh, 1000); return () => clearInterval(timer);
+  }, [props.compact, props.busy, props.ready]);
   function select(childRunId: number) {
     selection.current = childRunId; reads.current.stop++; setSelected(childRunId); setDetail(null); setNotice(null); setStopping(false); setHistory(false);
     void readDetail(childRunId);
   }
-  async function stop() {
-    if (!detail || stopping || !ready.current || !['created', 'running'].includes(detail.status)) return;
-    const childRunId = detail.childRunId, token = ++reads.current.stop;
-    const current = () => alive.current && ready.current && reads.current.stop === token && selection.current === childRunId;
+  async function stop(childRunId = detail?.childRunId) {
+    if (childRunId === undefined || stopping || !ready.current) return;
+    const token = ++reads.current.stop;
+    const current = () => alive.current && ready.current && reads.current.stop === token;
     setStopping(true); setNotice(null);
     try {
       const result = await window.flowmate.cancelSubagent({ parentRunId: props.parentRunId, childRunId });
       if (!current()) return;
       setNotice(result.ok ? result.data.accepted ? 'Stop requested. Actual stopping is being checked.' : 'No new stop was accepted. Read the saved child facts.'
         : result.error.code === 'operation_result_unknown' ? 'Stop receipt is unknown. Read the original child facts before retrying.' : `Stop could not be accepted (${result.error.code}).`);
-      await readDetail(childRunId);
+      await load(); if (selection.current === childRunId) await readDetail(childRunId);
     } catch { if (current()) { setNotice('Stop receipt is unknown. Read the original child facts before retrying.'); await readDetail(childRunId); } }
     finally { if (current()) setStopping(false); }
   }
-  return <section className="panel" data-testid="subagents-panel"><div className="panel-head"><div><h2>Subagents</h2>
-    <p>Parent request {props.parentRunId} · Conversation {props.parentSessionId}</p></div>
+  if (props.compact && !items.length && !error) return null;
+  return <section className={`panel ${props.compact ? 'chat-subagents' : ''}`} data-testid="subagents-panel"><div className="panel-head"><div><h2>Subagents</h2>
+    {!props.compact && <p>Parent request {props.parentRunId} · Conversation {props.parentSessionId}</p>}</div>
     <button className="secondary-button" disabled={!props.ready || loading} onClick={refresh}>Refresh subagents</button></div>
     {!props.ready && <p className="notice bad" role="alert">The Host is unavailable. Saved details have not been reconfirmed.</p>}
     {error && <p className="notice bad" role="alert">{error}</p>}
     {loading && <p role="status">Loading subagents…</p>}
-    {totals && <p className="activity-note" data-testid="subagent-total">Parent + all children · {totals.usageComplete ? 'Complete' : 'Partial'} ·
+    {totals && !props.compact && <p className="activity-note" data-testid="subagent-total">Parent + all children · {totals.usageComplete ? 'Complete' : 'Partial'} ·
       {' '}Input / output / total tokens: {totals.inputTokens ?? 'Unknown'} / {totals.outputTokens ?? 'Unknown'} / {totals.totalTokens ?? 'Unknown'} ·
       {' '}Estimated cost: {totals.cost ?? 'Unknown'}</p>}
     {!loading && !error && items.length === 0 && <p>No delegation recorded.</p>}
-    <div className="activity-tools">{items.map(child => <button className="route-row" key={child.childRunId} aria-pressed={selected === child.childRunId}
-      onClick={() => select(child.childRunId)}><strong>{child.description}</strong><span>{child.role} · {child.status} · Child {child.childRunId}</span></button>)}</div>
+    <div className="activity-tools">{items.map(child => <article key={child.childRunId} className="subagent-card">
+      <button className="route-row" aria-pressed={selected === child.childRunId} onClick={() => select(child.childRunId)}>
+        <strong>{child.description}</strong><span>{child.role} · {child.status} · Child {child.childRunId}</span></button>
+      {summaries[child.childRunId]?.output && <p>{String(summaries[child.childRunId]!.output!.text ?? '').slice(0,240)}</p>}
+      {summaries[child.childRunId]?.error && <p role="status">{summaries[child.childRunId]!.error!.code}</p>}
+      {props.compact && ['created','running'].includes(child.status) && <button className="secondary-button" type="button"
+        disabled={!props.ready || stopping || child.cancelRequestedAt !== null} onClick={() => void stop(child.childRunId)}>Stop {child.role}</button>}
+    </article>)}</div>
     {next !== null && <button className="secondary-button" disabled={!props.ready || loading} onClick={() => void load(next)}>Load earlier subagents</button>}
     {detailError && <p className="notice bad" role="alert">{detailError}</p>}
     {detailLoading && <p role="status">Reading child facts…</p>}

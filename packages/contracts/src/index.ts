@@ -18,3 +18,4 @@ export * from './compaction.ts';
 export * from './resources.ts';
 export * from './extensions.ts';
 export * from './subagents.ts';
+export * from './input-commands.ts';

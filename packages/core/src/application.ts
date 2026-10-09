@@ -1,3 +1,4 @@
+import type { InputDefinitions } from './prompt-templates.ts';
 import {
   appError,
   fail,
@@ -66,7 +67,7 @@ import type { InvoiceEditService } from './invoice-edit/service.ts';
 import type { ContextService } from './context/service.ts';
 import type { ContextRepository } from './context/repository.ts';
 import type { z } from 'zod';
-import type { createResourceService } from './resources/service.ts';
+import type { createResourceService } from './skill-hub/index.ts';
 import type { ResourceSelectionRequest, ResourceSelectionResult, AssemblySelectionSnapshot, ExtensionSelectionRequest, ExtensionSelectionResult } from '@flowmate/contracts';
 import type { ExtensionService } from './extensions/service.ts';
 
@@ -91,6 +92,7 @@ export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunReposito
 
 export type DisposeResources = () => Promise<CloseReport>;
 type ProductApplicationOptions = {
+  inputDefinitions?: InputDefinitions;
   resources?: ReturnType<typeof createResourceService>;
   extensions?: ExtensionService;
   resourceDefaults?: () => Result<AssemblySelectionSnapshot | ResourceSelectionResult>;
@@ -141,6 +143,28 @@ export function makeApplication(
     } catch { return fail(appError('config_settings_invalid', 'input', 'Resource configuration is unavailable.')); }
   };
   return {
+    listSubagentDefinitions: async () => products?.inputDefinitions?.listSubagentDefinitions() ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
+    getSubagentDefinition: async raw => products?.inputDefinitions?.getSubagentDefinition(raw) ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
+    saveSubagentDefinition: async raw => products?.inputDefinitions?.saveSubagentDefinition(raw) ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
+    async listInputCommands(request = {}) {
+      const definitions = products?.inputDefinitions?.commands(); if (!definitions?.ok) return definitions ?? fail(appError('input_invalid','input','Input definitions are unavailable.'));
+      const resources = await this.listResources(); if (!resources.ok) return resources;
+      const extensions = await this.listExtensions(); if (!extensions.ok) return extensions;
+      let actual: string[] = [];
+      if (request.sessionId) { const loaded = await this.querySessionExtensions({ sessionId: request.sessionId });
+        if (!loaded.ok) return loaded; actual = loaded.data.instances.filter(item => item.state === 'active').flatMap(item => [...item.registeredCommands]); }
+      const subagents = extensions.data.items.find(item => item.ref.id === 'subagents');
+      const enabled = (item: import('@flowmate/contracts').ExtensionCatalogItem) => extensions.data.selection.enabledExtensions.some(ref => ref.id === item.ref.id && ref.manifestHash === item.ref.manifestHash);
+      const canDelegate = !!subagents && enabled(subagents) && subagents.compatibility.available;
+      return ok([...resources.data.items.filter(item => item.ref.kind === 'skill').map(item => ({ group: 'Skills' as const,
+        name: item.ref.id, text: '/skill:'+item.ref.id+' ', description: item.description, available: item.enabled && item.available,
+        reason: item.enabled && item.available ? null : 'Skill is disabled or has unmet requirements.', assembled: false })),
+        ...definitions.data.map(item => ({ ...item, available: item.available && canDelegate,
+          reason: canDelegate ? item.reason : 'Enable the compatible subagents plugin first.', assembled: actual.includes('subagent') })),
+        ...extensions.data.items.flatMap(item => (item.manifest.commands as readonly string[]).filter(name => name !== 'subagent').map(name => ({ group: 'Extension Commands' as const,
+          name, text: '/'+name+' ', description: item.ref.id, available: enabled(item) && item.compatibility.available,
+          reason: enabled(item) && item.compatibility.available ? null : 'Plugin is disabled or unavailable.', assembled: actual.includes(name) }))) ]);
+    },
     listSubagents: async raw => {
       const parsed = ListSubagentsRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Child list parameters are invalid.'));

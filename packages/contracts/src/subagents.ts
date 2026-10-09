@@ -1,3 +1,4 @@
+import { InputDefinitionIdSchema, SubagentDefinitionSchema } from './input-commands.ts';
 import { z } from 'zod';
 import { AppErrorSchema, UsageRecordSchema, TokenColumnsSchema } from './runtime.ts';
 import { ToolCallDeliverySchema } from './activity.ts';
@@ -10,22 +11,22 @@ import type { AgentExecutionInput, AgentNativeOutcome, AgentObservation, Runtime
 export const SUBAGENT_ROLE = 'invoice-evidence-checker' as const;
 export const SUBAGENT_SYSTEM_PROMPT = 'Verify invoice evidence using only the provided read-only tools and frozen document scope. Report findings, source references, uncertainties and missing evidence to the parent. Do not save candidates, edit files, run commands, delegate again or claim business completion.';
 export const SUBAGENT_TOOL_NAMES = ['read', 'grep', 'find', 'ls', 'list_invoice_pages', 'read_invoice_document',
-  'search_invoice_document', 'list_invoice_tables', 'read_invoice_evidence', 'check_invoice_sources'] as const;
+  'search_invoice_document', 'list_invoice_tables', 'read_invoice_evidence', 'check_invoice_sources', 'list_skill_resources', 'read_skill_resource'] as const;
 const text = (maxBytes: number) => z.string().max(maxBytes).refine(value => value.trim().length > 0
   && new TextEncoder().encode(value).byteLength <= maxBytes, 'Text is empty or exceeds its UTF-8 byte limit.');
 export const DelegateArgsSchema = z.object({ prompt: text(65000), description: text(512),
-  subagent_type: z.literal(SUBAGENT_ROLE), run_in_background: z.literal(false).optional().default(false) }).strict();
+  subagent_type: InputDefinitionIdSchema, run_in_background: z.literal(false).optional().default(false) }).strict();
 export type DelegateArgs = z.input<typeof DelegateArgsSchema>;
 export { SUBAGENT_ERROR_CODES } from './errors.ts';
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER), nativeId = z.string().min(1).max(256);
 const time = z.string().datetime({ offset: true });
-export const SubagentProvenanceSchema = z.object({ version: z.literal(1), role: z.literal(SUBAGENT_ROLE),
-  pluginVersion: z.literal('0.19.0'), patchVersion: z.literal('flowmate-p13.1'), extensionInstanceId: z.string().uuid(),
+export const SubagentProvenanceSchema = z.object({ version: z.literal(1), role: InputDefinitionIdSchema, definition: SubagentDefinitionSchema.optional(),
+  pluginVersion: z.literal('0.19.0'), patchVersion: z.enum(['flowmate-p13.1', 'flowmate-p13.2']), extensionInstanceId: z.string().uuid(),
   parentNativeSessionId: nativeId, parentContextSnapshotId: id, parentInputId: id, parentRequestSequence: id,
   childInputId: id }).strict().readonly();
 export const SubagentSummarySchema = z.object({ childRunId: id, childSessionId: id, childNativeSessionId: nativeId,
   parentRunId: id, parentSessionId: id, originToolCallId: id, parentNativeToolCallId: nativeId, pluginAgentId: nativeId,
-  role: z.literal(SUBAGENT_ROLE), description: text(512), status: z.enum(['created', 'running', 'completed', 'failed', 'cancelled']),
+  role: InputDefinitionIdSchema, description: text(512), status: z.enum(['created', 'running', 'completed', 'failed', 'cancelled']),
   createdAt: time, startedAt: time.nullable(), endedAt: time.nullable(), cancelRequestedAt: time.nullable(), stoppedAt: time.nullable(),
 }).strict().readonly();
 export type SubagentSummary = z.infer<typeof SubagentSummarySchema>;

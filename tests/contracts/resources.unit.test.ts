@@ -16,6 +16,21 @@ const frozen = { version: 1, policyVersion: 'p11-resources-v1', settingsRevision
   prompt: null, manifests: [{ ref: skill, manifest }], selectedSkills: [skill], discoveredSkills: [skill], excludedSkills: [] };
 
 describe('P11 resource trust contracts', () => {
+  it('limits dedicated Skill tools to names and registered relative files rather than model-supplied owners', () => {
+    expect(schema('ListSkillResourcesInputSchema')?.safeParse({ skill: 'invoice' }).success).toBe(true);
+    expect(schema('ReadSkillResourceInputSchema')?.safeParse({ skill: 'invoice', path: 'references/guide.md', offset: 0, limit: 4 }).success).toBe(true);
+    for (const change of [{ runId: 1 }, { sessionId: 1 }, { version: 'v1' }, { contentHash: hash }, { skill: '../invoice' }])
+      expect(schema('ListSkillResourcesInputSchema')?.safeParse({ skill: 'invoice', ...change }).success).toBe(false);
+    for (const change of [{ path: '../secret' }, { path: 'C:/secret' }, { path: 'x:stream' }, { path: 'CON.txt' },
+      { offset: -1 }, { limit: 3 }, { limit: 16385 }, { runId: 1 }])
+      expect(schema('ReadSkillResourceInputSchema')?.safeParse({ skill: 'invoice', path: 'SKILL.md', ...change }).success).toBe(false);
+    const list = { ref: skill, bundleHash: hash, files: manifest.files };
+    expect(schema('ListSkillResourcesOutputSchema')?.safeParse(list).success).toBe(true);
+    expect(schema('ListSkillResourcesOutputSchema')?.safeParse({ ...list, files: [...manifest.files, ...manifest.files] }).success).toBe(false);
+    expect(schema('ReadSkillResourceOutputSchema')?.safeParse({ ref: skill, bundleHash: hash, path: 'SKILL.md', sha256: hash,
+      offset: 0, text: '规则', totalBytes: 6, nextOffset: null }).success).toBe(true);
+  });
+
   it('strict-ref-and-manifest accepts bounded identities and rejects path aliases or invented fields', () => {
     expect(schema('ResourceRefSchema')?.safeParse(skill).success).toBe(true);
     for (const change of [{ id: '..' }, { version: 'CON' }, { contentHash: 'A'.repeat(64) }, { keywords: ['invented'] }])

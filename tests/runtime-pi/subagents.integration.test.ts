@@ -156,22 +156,21 @@ it.each([{ ...delegate, run_in_background: true }, { ...delegate, subagent_type:
     expect(f.parent.messages.find(m => m.role === 'toolResult')).toMatchObject({ isError: true });
   });
 
-it('[F13-08] rejects a second true concurrent foreground call instead of queueing it', async () => {
+it('[F13-31] accepts two true concurrent foreground calls without queuing them', async () => {
   const gate = barrier(); let parentCalls = 0, childCalls = 0;
   const f = await fixture(body => {
     if (body.model === 'child') { childCalls++; return response({ content: 'One child.' }); }
     if (++parentCalls === 1) return response({ tool_calls: [1, 2].map((number, index) => ({ index,
       id: `delegate-${number}`, type: 'function', function: { name: 'Agent', arguments: JSON.stringify(delegate) } })) }, 'tool_calls');
-    return response({ content: 'Parent received one result and one busy error.' });
+    return response({ content: 'Parent received both independent results.' });
   }, gate.promise);
   const running = f.parent.prompt('Concurrent calls.');
   try {
-    await f.attachStarted; expect(f.prepared()).toBe(1); gate.release(); await running;
-    expect(f.prepared()).toBe(1); expect(childCalls).toBe(1);
+    await f.attachStarted; expect(f.prepared()).toBe(2); gate.release(); await running;
+    expect(f.prepared()).toBe(2); expect(childCalls).toBe(2);
     const results = f.parent.messages.filter(m => m.role === 'toolResult');
     expect(results).toHaveLength(2);
-    expect(results[1]).toMatchObject({ toolCallId: 'delegate-2', isError: true });
-    expect(JSON.stringify(results[1])).toContain('subagent_busy');
+    expect(results.every(result => !Reflect.get(result, 'isError'))).toBe(true);
   } finally { gate.release(); await running; }
 });
 

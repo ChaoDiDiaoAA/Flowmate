@@ -60,9 +60,9 @@ export function createExtensionService(options: { resourceRoot: string; sdkVersi
       policy: 'p2' | 'p3' | 'fill' }): Result<FrozenExtensions> {
       return checked(() => {
         const selection = ExtensionSelectionSchema.parse(input.selection), items = selected(selection);
-        const eligible = (item: ExtensionCatalogItem) => input.policy === 'p3' && (item.ref.id === 'invoice-assist'
-          ? input.activeToolNames.includes('check_invoice_sources')
-          : ['Agent', 'read_invoice_document', 'read_invoice_evidence', 'check_invoice_sources'].every(name => input.activeToolNames.includes(name)));
+        const eligible = (item: ExtensionCatalogItem) => input.policy !== 'fill' && (item.ref.id === 'invoice-assist'
+          ? input.policy === 'p3' && input.activeToolNames.includes('check_invoice_sources')
+          : input.activeToolNames.includes('Agent'));
         return FrozenExtensionsSchema.parse({ version: 1, policyVersion: 'p13-managed-extensions-v1', settingsRevision: input.settingsRevision,
           selected: selection.enabledExtensions, included: items.filter(eligible).map(item => ({ ref: item.ref, manifest: item.manifest })),
           excluded: items.filter(item => !eligible(item)).map(item => ({ ref: item.ref, code: 'tool_not_active' })) });

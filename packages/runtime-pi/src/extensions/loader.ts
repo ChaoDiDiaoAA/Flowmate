@@ -27,8 +27,9 @@ function createScope(input: { selected: FrozenExtensions['included'][number]; na
     cleanup: { shutdownRequired: false, shutdownAcknowledged: false, sdkSessionCreated: false, sdkDisposed: false, ownedCallbacksSettled: false } };
   let pending = 0, factorySettled = false, startAcknowledged = false;
   let command: { ticket: CommandTicket; receipt?: NativeExtensionCommandReceipt } | null = null;
+  let inputCommand: { arguments: string; owner: { inputId: number; runId: number; sessionId: number }; acknowledged: boolean } | null = null;
   const tickets = new Map<string, CallTicket>(), phaseErrors = new Map<ExtensionHookEvent, AppError>();
-  const settled = () => { view.cleanup.ownedCallbacksSettled = factorySettled && pending === 0 && command === null; };
+  const settled = () => { view.cleanup.ownedCallbacksSettled = factorySettled && pending === 0 && command === null && inputCommand === null; };
   const scope = {
     view,
     factorySettled() { factorySettled = true; settled(); },
@@ -52,6 +53,16 @@ function createScope(input: { selected: FrozenExtensions['included'][number]; na
       if (!command || view.state !== 'active' || view.admission !== 'open') throw new Error('Command has no active owner.');
       return command.ticket;
     },
+    beginInputCommand(argumentsText: string, owner: { inputId: number; runId: number; sessionId: number }) {
+      if (command || inputCommand || view.state !== 'active' || view.admission !== 'open') throw new Error('Input command has no open owner.');
+      inputCommand = { arguments: argumentsText, owner: { ...owner }, acknowledged: false }; settled();
+    },
+    acknowledgeInputCommand(argumentsText: string, nativeSessionId: string) {
+      if (!inputCommand || inputCommand.acknowledged || argumentsText !== inputCommand.arguments || nativeSessionId !== view.nativeSessionId
+        || view.state !== 'active' || view.admission !== 'open') throw new Error('Input command binding changed.');
+      inputCommand.acknowledged = true;
+    },
+    finishInputCommand() { const receipt = inputCommand?.acknowledged ? inputCommand.owner : null; inputCommand = null; settled(); return receipt; },
     writeCommandReceipt(ticket: CommandTicket) {
       if (!command || command.ticket !== ticket || command.receipt) throw new Error('Command receipt is stale or duplicated.');
       command.receipt = NativeExtensionCommandReceiptSchema.parse({ nativeSessionId: view.nativeSessionId, instanceId: view.instanceId, name: 'invoice-assist', ref: view.ref,

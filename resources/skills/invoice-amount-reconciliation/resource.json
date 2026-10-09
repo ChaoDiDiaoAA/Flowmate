@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill",
+  "id": "invoice-amount-reconciliation",
+  "version": "v1",
+  "bodyFile": "SKILL.md",
+  "keywords": [
+    "发票",
+    "金额",
+    "税额",
+    "合计",
+    "舍入"
+  ],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "list_skill_resources"
+    },
+    {
+      "kind": "tool",
+      "name": "read_skill_resource"
+    },
+    {
+      "kind": "tool",
+      "name": "read_invoice_evidence"
+    },
+    {
+      "kind": "tool",
+      "name": "normalize_invoice_values"
+    },
+    {
+      "kind": "tool",
+      "name": "calculate_invoice_amounts"
+    }
+  ],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "bytes": 1447,
+      "sha256": "220424e0ede1d85b12f08d01960fae0c0b07c9be8f23819bfaead51493c9a6a1"
+    },
+    {
+      "path": "references/guide.md",
+      "bytes": 841,
+      "sha256": "ac959b9ae4f314ac588f88e2c8bf869fc6b0340336d738b325e077d27a578e7e"
+    }
+  ]
+}

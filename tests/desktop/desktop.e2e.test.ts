@@ -887,7 +887,8 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
       const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), sessionId);
       return inputs.ok ? inputs.data.items.map(input => [input.mode, input.runId]) : [];
     }).toEqual([[acceptedMode, runId], [unknownMode, runId], ['prompt', runId]]);
-    await expect(page.locator('[data-testid="session-input"]')).toHaveCount(3);
+    await expect(page.getByText(/^Inputs ·/)).toHaveCount(0);
+    await expect(page.getByTestId('session-input')).toHaveCount(0);
     expect(requests).toHaveLength(1);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Chats', exact: true }).click();
     await expect(page.locator(`.chat-directory-row[data-session-id="${sessionId}"]`).getByRole('button', { name: 'Archive', exact: true })).toBeDisabled();
@@ -1511,7 +1512,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     expect(await page.locator('[data-message-role="assistant"]').getByText('Saved', { exact: true }).count()).toBe(1);
     expect(requestBodies).toHaveLength(1);
     expect(((requestBodies[0] as { tools?: Array<{ function: { name: string } }> }).tools ?? []).map(tool => tool.function.name).sort())
-      .toEqual([...NATIVE_TOOL_NAMES, 'calculate_invoice_amounts', 'normalize_invoice_values'].sort());
+      .toEqual([...NATIVE_TOOL_NAMES, 'calculate_invoice_amounts', 'normalize_invoice_values', 'list_skill_resources', 'read_skill_resource'].sort());
     const firstSessionId = Number(await page.locator('.sidebar-chat.selected').getAttribute('data-session-id'));
     expect(firstSessionId).toBeGreaterThan(0);
     await composer.fill('What was the total?');
@@ -2777,7 +2778,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     expect(requests).toHaveLength(3);
     expect(requests.every(({ authorization }) => authorization === 'Bearer synthetic-desktop-p3-key')).toBe(true);
     const toolNames = (requests[0]?.body.tools ?? []).map((tool) => (tool as { function?: { name?: string } }).function?.name ?? '').sort();
-    expect(toolNames).toEqual([...INVOICE_TOOL_NAMES, ...NATIVE_TOOL_NAMES].sort());
+    expect(toolNames).toEqual([...INVOICE_TOOL_NAMES, ...NATIVE_TOOL_NAMES, 'list_skill_resources', 'read_skill_resource'].sort());
     const toolEvents = await page.evaluate(() =>
       (window as unknown as { toolEvents: Array<{ toolName: string; phase: string; [key: string]: unknown }> }).toolEvents);
     expect(toolEvents.filter((event) => event.phase === 'running').map((event) => event.toolName).sort()).toEqual([...INVOICE_TOOL_NAMES].sort());

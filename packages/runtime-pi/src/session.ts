@@ -1,3 +1,4 @@
+import { FrozenInputDefinitionsSchema, InputCommandOwnerSchema, InputCommandReceiptSchema } from '@flowmate/contracts';
 import { nativeFileResultIncludes } from '@flowmate/shared';
 import {
   createAssistantMessageEventStream,
@@ -27,7 +28,7 @@ import type { ManagedChildControl } from '@tintinweb/pi-subagents/dist/agent-run
 import { DelegateArgsSchema, ToolExecutionFailure, SUBAGENT_ROLE, SUBAGENT_SYSTEM_PROMPT } from '@flowmate/contracts';
 import type { ToolExecutionContext, DelegateArgs, NativeToolOutput, SubagentCallbacks, PreparedSubagent } from '@flowmate/contracts';
 import { FrozenExtensionsSchema, matchesExtensionAssembly, type NativeExtensionView } from '@flowmate/contracts';
-import { createRunResourceLoader, verifySkillExpansion, verifyManagedReadOutput } from './resources/loader.ts';
+import { createRunResourceLoader, verifySkillExpansion, verifyManagedReadOutput, verifySkillToolOutput } from './resources/loader.ts';
 import { matchesResourceBinding, resourceContentKey, ResourceRequestEvidenceSchema } from '@flowmate/contracts';
 import type { ResourceRef, ResourceBinding, ResourceExpansionEvidence, ResourceRequestEvidence, ResourceContentEvidence, ResourceReadEvidence } from '@flowmate/contracts';
 import type {
@@ -867,12 +868,20 @@ export class PiAgentAdapter implements AgentPort {
     if (extensions && !extensions.success) return fail(appError('extension_config_invalid', 'input', 'Frozen extensions are invalid.'));
     const frozenExtensions = extensions?.success ? extensions.data : null;
     const extensionKey = JSON.stringify(frozenExtensions?.included ?? []);
-    if (frozenExtensions?.included.length && (policy !== 'p3' || !activeToolNames.includes('check_invoice_sources')))
+    if (frozenExtensions?.included.some(item => policy !== 'p3' || (item.ref.id === 'invoice-assist'
+      ? !activeToolNames.includes('check_invoice_sources') : !activeToolNames.includes('Agent'))))
       return fail(appError('extension_incompatible', 'extension', 'Extension is not eligible for this Run.'));
-    const resources = options?.resources ?? null, resourceKey = resources?.bundleHash ?? null;
+    const resources = options?.resources ?? null;
+    const inputDefinitions = options?.inputDefinitions ? FrozenInputDefinitionsSchema.parse(options.inputDefinitions) : null;
+    if (inputDefinitions && createHash('sha256').update(JSON.stringify({ roles: inputDefinitions.roles, templates: inputDefinitions.templates })).digest('hex') !== inputDefinitions.hash)
+      return fail(appError('input_invalid', 'input', 'Frozen role index changed.'));
+    const resourceKey = JSON.stringify([resources?.bundleHash ?? null, resources?.skillIndex?.hash ?? null, inputDefinitions?.hash ?? null, options?.chatDelegation ?? false, [...activeToolNames].sort()]);
+    const roleIndex = activeToolNames.includes('Agent') && inputDefinitions ? inputDefinitions.roles.map(role => '- '+role.id+': '+role.description.slice(0,160)+'; '+(role.tools.every(name=>activeToolNames.includes(name)) ? 'available' : 'unavailable: required tools missing')).join('\n') : undefined;
     const loader = createRunResourceLoader({ fixedSystemPrompt: policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
-      : policy === 'p3' ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT, frozen: resources,
-      bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resourceKey ?? '') });
+      : policy === 'p3' && !options?.chatDelegation ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT, frozen: resources,
+      activeToolNames,
+      roleIndex, templates: inputDefinitions?.templates,
+      bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleHash ?? '') });
     if (!loader.ok) return loader;
     if (record.session && !record.session.isIdle) return fail(appError('agent_session_busy', 'session', 'The native Session has not stopped.'));
 
@@ -952,7 +961,8 @@ export class PiAgentAdapter implements AgentPort {
           extensionResult = loaded.result;
         }
         const assembledLoader = createRunResourceLoader({ fixedSystemPrompt: loader.data.getSystemPrompt()!, frozen: resources,
-          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resourceKey ?? ''), extensionResult });
+          activeToolNames, roleIndex, templates: inputDefinitions?.templates,
+          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleHash ?? ''), extensionResult });
         if (!assembledLoader.ok) return assembledLoader;
         sessionCreationStarted = true;
         const created = await createAgentSession({
@@ -1035,6 +1045,20 @@ export class PiAgentAdapter implements AgentPort {
         session.setFollowUpMode('one-at-a-time');
       }
 
+      let inputCommandReceipt: import('@flowmate/contracts').SafeConfigSnapshot['inputCommandReceipt'];
+      if (inputDefinitions?.command?.kind === 'subagent') {
+        const owner = InputCommandOwnerSchema.parse(options?.inputCommandOwner);
+        const scope = record.extensions?.scopes.find(scope => scope.view.ref.id === 'subagents');
+        const command = session.extensionRunner.getCommand('subagent');
+        if (!scope || !command || !scope.view.registeredCommands.includes('subagent')) throw new Error('Subagent command is not registered.');
+        const args = inputDefinitions.command.originalText.replace(/^\/subagent\s+/, '');
+        scope.beginInputCommand(args, owner);
+        try { await command.handler(args, session.extensionRunner.createCommandContext());
+          const receipt = scope.finishInputCommand(); if (!receipt || !isDeepStrictEqual(receipt, owner)) throw new Error('Input command has no bound receipt.');
+          inputCommandReceipt = InputCommandReceiptSchema.parse({ ...receipt, nativeSessionId, instanceId: scope.view.instanceId,
+            originalHash: createHash('sha256').update(inputDefinitions.command.originalText).digest('hex'), role: inputDefinitions.command.requiredRoles[0] });
+        } finally { scope.finishInputCommand(); }
+      }
       const snapshot = modelRuntimeSnapshot(config, limits, model, authSource);
       record.runtime = runtime;
       record.model = model;
@@ -1062,7 +1086,8 @@ export class PiAgentAdapter implements AgentPort {
       const extensionFacts = frozenExtensions ? { extensionPolicy: frozenExtensions.included.length ? frozenExtensions.policyVersion : 'none' as const } : {};
       const agent: AgentConfigFacts | P3AgentConfigFacts | P5ChatAgentConfigFacts | RuntimeAgentConfigFacts = options?.runtimeBudget
         ? { ...taskAgent, ...extensionFacts, ...options.runtimeBudget, policyVersion: 'runtime-v1', taskPolicyVersion: taskAgent.policyVersion } : { ...taskAgent, ...extensionFacts };
-      record.snapshot = { ...snapshot, historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent,
+      record.snapshot = { ...snapshot, ...(inputDefinitions ? { inputDefinitions: structuredClone(inputDefinitions) } : {}),
+        ...(inputCommandReceipt ? { inputCommandReceipt } : {}), historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent,
         ...(resources ? { resources: Object.freeze(structuredClone(resources)) } : {}),
         ...(frozenExtensions ? { extensions: structuredClone(frozenExtensions), extensionAssembly: record.extensions ? extensionAssembly(record.extensions) : { version: 1 as const, sdkVersion: '0.85.1' as const, instances: [] } } : {}),
         ...(options?.compactionPolicy ? { compactionPolicy: Object.freeze(structuredClone(options.compactionPolicy)) } : {}) };
@@ -1741,7 +1766,7 @@ export class PiAgentAdapter implements AgentPort {
     if (!allowed || !registered || !visible || registered.length !== allowed.length || visible.length !== allowed.length
       || new Set(registered).size !== registered.length || new Set(visible).size !== visible.length
       || registered.some(name => !allowed.includes(name)) || visible.some(name => !allowed.includes(name))
-      || registered.some(name => this.toolsByName.get(name)?.effect !== 'READ'))
+      || registered.some(name => !['PURE', 'READ'].includes(this.toolsByName.get(name)?.effect ?? '') || name === 'Agent'))
       return fail(appError('subagent_tool_denied', 'tool', 'The live child tool registry exceeds its frozen read-only assembly.'));
     return ok(undefined);
   }
@@ -2065,8 +2090,11 @@ export class PiAgentAdapter implements AgentPort {
 
   private managedChildControl(parent: SessionRecord, call: DelegateExecution, originToolCallId: number, delegateDeadlineAt: number, signal: AbortSignal,
     onError: (error: import('@flowmate/contracts').AppError) => void): ManagedChildControl {
-    return { role: { name: SUBAGENT_ROLE, description: 'Read-only invoice evidence check', extensions: false, skills: false,
-      allowedSubagents: [], systemPrompt: SUBAGENT_SYSTEM_PROMPT, promptMode: 'replace', inheritContext: false,
+    const args = DelegateArgsSchema.parse(call.arguments);
+    const definition = parent.active?.input.inputDefinitions?.roles.find(role => role.id === args.subagent_type);
+    if (!definition) throw appError('subagent_tool_denied', 'tool', 'Role is absent from the frozen parent index.');
+    return { role: { name: definition.id, description: definition.description, extensions: false, skills: false,
+      allowedSubagents: [], systemPrompt: definition.systemPrompt, promptMode: 'replace', inheritContext: false,
       runInBackground: false, isolated: true, persistSession: false, outputTranscript: false, isolation: 'off' },
       beforeCreate: async pluginAgentId => {
         const ticket = call.ticket;
@@ -2097,11 +2125,11 @@ export class PiAgentAdapter implements AgentPort {
           throw appError('subagent_origin_invalid', 'runtime', 'Child history or parent model is not bound.');
         const cwd = child.config.workingDirectory ?? parent.workingDirectory!;
         const loader = createRunResourceLoader({ fixedSystemPrompt: child.config.agent.systemPrompt,
-          frozen: child.input.resources ?? null,
+          frozen: child.input.resources ?? null, activeToolNames: child.scope.allowedTools, visibleSkillRefs: child.input.visibleSkillRefs, child: true,
           bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), child.input.resources?.bundleHash ?? '') });
         if (!loader.ok) throw loader.error;
         const definitions = child.scope.allowedTools.map(name => this.toolsByName.get(name));
-        if (definitions.some(tool => !tool || tool.effect !== 'READ' || tool.name === 'Agent')
+        if (definitions.some(tool => !tool || !['PURE', 'READ'].includes(tool.effect) || tool.name === 'Agent')
           || new Set(child.scope.allowedTools).size !== child.scope.allowedTools.length)
           throw appError('subagent_tool_denied', 'tool', 'Child registry would exceed the read-only scope.');
         return { promptText: child.input.promptText!, options: { cwd, agentDir: this.dependencies.agentDir ?? cwd,
@@ -2179,7 +2207,7 @@ export class PiAgentAdapter implements AgentPort {
       ? AbortSignal.any([active.signal, toolSignal]) : active.signal,
       ...(request.requestBinding ? { requestBinding: request.requestBinding } : {}) });
     request.invoked = true;
-    const operation = ['read', 'grep', 'find', 'ls'].includes(definition.name) ? definition.name as ResourceReadEvidence['operation'] : null;
+    const operation = ['read', 'grep', 'find', 'ls'].includes(definition.name) ? definition.name as 'read' | 'grep' | 'find' | 'ls' : null;
     const args = input && typeof input === 'object' ? input as Record<string, unknown> : {};
     let managed: import('./resources/loader.ts').ManagedReadFile[] = [];
     if (operation && active.input.contextHooks?.recordResourceRead) {
@@ -2208,6 +2236,26 @@ export class PiAgentAdapter implements AgentPort {
         : result.error;
       this.failToolRun(record, active, error);
       throw new Error(error.message);
+    }
+    if (result.status === 'succeeded' && (definition.name === 'list_skill_resources' || definition.name === 'read_skill_resource')) {
+      const owner = binding.queryCall?.(nativeToolCallId);
+      const verified = active.input.resources && record.resourceLoader
+        ? verifySkillToolOutput(active.input.resources, record.resourceLoader, definition.name, input, result.data) : null;
+      if (!verified?.ok || !owner?.ok || !request.requestBinding || !active.input.contextHooks?.recordResourceRead) {
+        const failure = verified && !verified.ok ? verified.error
+          : appError('resource_evidence_conflict', 'runtime', 'Original Skill read identity is unavailable.');
+        this.failToolRun(record, active, failure); throw failure;
+      }
+      const deliveredHash = resourceTextHash(JSON.stringify(request.feedback!.content));
+      const receipts = verified.data.map(file => ({ toolCallId: owner.data.toolCallId, nativeToolCallId,
+        requestSequence: request.requestBinding!.requestSequence, ref: file.ref, bundleHash: active.input.resources!.bundleHash,
+        path: file.path, fileHash: file.fileHash, deliveredHash, operation: definition.name as 'list_skill_resources' | 'read_skill_resource',
+        fullBody: file.fullBody, nativeEntryId: null, at: now().at }));
+      request.resourceReads = receipts;
+      for (const receipt of receipts) {
+        const saved = active.input.contextHooks.recordResourceRead(receipt);
+        if (!saved.ok) { this.failToolRun(record, active, saved.error); throw saved.error; }
+      }
     }
     if (getNativeToolParameters(definition) || definition.name === 'Agent') {
       const native = NativeToolOutputSchema.safeParse(result.data);
@@ -2321,6 +2369,11 @@ export class PiAgentAdapter implements AgentPort {
       const text = formatSkillsForPrompt([skill], 'read').match(/  <skill>[\s\S]*?  <\/skill>/)?.[0];
       if (!text) throw new Error('Native Skill index is unavailable.');
       add({ ref, scope: 'skill-index', path: 'SKILL.md', nativeEntryId: null }, { role: 'system', text });
+    }
+    if (compactionOperationId === null) for (const entry of frozen?.skillIndex?.entries ?? []) {
+      const text = record.resourceLoader?.readinessFor(entry.ref);
+      if (!text) throw new Error('Fixed Skill readiness is unavailable.');
+      add({ ref: entry.ref, scope: 'skill-readiness', path: null, nativeEntryId: null }, { role: 'system', text });
     }
     for (const receipt of record.recoverySeed?.resourceExpansions ?? []) {
       const source = binding.includedBindings.find(source => source.nativeEntryId === receipt.nativeEntryId && source.inputId === receipt.inputId);

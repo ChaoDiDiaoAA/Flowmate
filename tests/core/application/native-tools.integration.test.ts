@@ -46,8 +46,10 @@ describe('native tools through the public Application', () => {
     const launch = () => createApplication({ paths, logger: { write() {}, close: async () => {} },
       agentFactory: definitions => {
         expect(definitions.map(tool => tool.name).slice(-8)).toEqual([...NATIVE_TOOL_NAMES]);
-        expect(new Set(definitions.map(tool => tool.name)).size).toBe(22);
+        expect(new Set(definitions.map(tool => tool.name)).size).toBe(24);
         expect(definitions.filter(tool => tool.name === 'Agent')).toHaveLength(1);
+        expect(definitions.filter(tool => tool.name === 'list_skill_resources')).toHaveLength(1);
+        expect(definitions.filter(tool => tool.name === 'read_skill_resource')).toHaveLength(1);
         return new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools: definitions,
           credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-native-key' });
       } });

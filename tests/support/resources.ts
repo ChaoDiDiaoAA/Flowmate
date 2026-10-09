@@ -161,7 +161,7 @@ export async function installReadGate(app: ElectronApplication, userData: string
           if (closeGate && packet.type === 'response' && kinds.get(packet.requestId) === 'close') { closeReplies.push(Buffer.from(line)); continue; }
           if (packet.type === 'response') {
             const kind = kinds.get(packet.requestId)!;
-            if ((faults.get(kind) ?? 0) > 0) { packet.value = ['update_resource_selection', 'update_extension_selection'].includes(kind)
+            if ((faults.get(kind) ?? 0) > 0) { packet.value = ['update_resource_selection', 'update_extension_selection', 'save_subagent_definition'].includes(kind)
               ? { ok: false, error: { code: 'operation_result_unknown', category: 'runtime', retryable: true, message: 'Synthetic lost receipt after actual save.' } }
               : kind === 'list_extensions' ? { ok: false, error: { code: 'extension_config_invalid', category: 'input', retryable: false, message: 'The trusted extension manifest is unavailable.' } }
               : { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'PRIVATE-CONTEXT sdk credential token', sessionId: packet.value.data?.snapshot?.sessionId, runId: packet.value.data?.snapshot?.runId } };

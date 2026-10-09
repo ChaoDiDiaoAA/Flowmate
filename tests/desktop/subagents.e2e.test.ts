@@ -137,15 +137,16 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
       expect(history.ok).toBe(true); expect(payloads).toHaveLength(3);
       await page.getByRole('button', { name: 'Activity', exact: true }).click(); await page.getByLabel('Conversation', { exact: true }).selectOption(String(seed.sessionId));
       await page.getByLabel('Processing request', { exact: true }).selectOption(String(rootId));
-      await page.getByTestId('subagents-panel').getByRole('button', { name: 'Check invoice total', exact: false }).click();
-      await expect(page.getByTestId('subagent-detail')).toContainText(scenario === 'parent-result' ? 'completed' : 'failed');
-      await expect(page.getByTestId('subagent-detail')).toContainText('Parent receipt not confirmed');
+      const panel = page.getByTestId('activity-page').getByTestId('subagents-panel');
+      await panel.getByRole('button', { name: 'Check invoice total', exact: false }).click();
+      await expect(panel.getByTestId('subagent-detail')).toContainText(scenario === 'parent-result' ? 'completed' : 'failed');
+      await expect(panel.getByTestId('subagent-detail')).toContainText('Parent receipt not confirmed');
       expect(payloads).toHaveLength(3); return;
     }
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(seed.sessionId));
     await page.getByLabel('Processing request', { exact: true }).selectOption(String(rootId));
-    const panel = page.getByTestId('subagents-panel'); await expect(panel).toBeVisible();
+    const panel = page.getByTestId('activity-page').getByTestId('subagents-panel'); await expect(panel).toBeVisible();
     await expect(panel.getByTestId('subagent-total')).toContainText('Partial');
     await expect(panel.getByTestId('subagent-total')).toContainText('Unknown');
     await panel.getByRole('button', { name: 'Check invoice total', exact: false }).click();
@@ -190,9 +191,10 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
     await closeDesktopFixture(app, userData); app = await launch(userData, sourceRoot); page = await app.firstWindow();
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(seed.sessionId)); await page.getByLabel('Processing request', { exact: true }).selectOption(String(rootId));
-    await page.getByTestId('subagents-panel').getByRole('button', { name: 'Check invoice total', exact: false }).click();
-    await expect(page.getByTestId('subagent-detail')).toContainText('cancelled');
-    await page.getByRole('button', { name: 'Browse child history', exact: true }).click(); await expect(page.getByTestId('subagent-history')).toContainText('Total 113.00');
+    const restoredPanel = page.getByTestId('activity-page').getByTestId('subagents-panel');
+    await restoredPanel.getByRole('button', { name: 'Check invoice total', exact: false }).click();
+    await expect(restoredPanel.getByTestId('subagent-detail')).toContainText('cancelled');
+    await restoredPanel.getByRole('button', { name: 'Browse child history', exact: true }).click(); await expect(restoredPanel.getByTestId('subagent-history')).toContainText('Total 113.00');
     expect(payloads).toHaveLength(4);
   } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
   finally {

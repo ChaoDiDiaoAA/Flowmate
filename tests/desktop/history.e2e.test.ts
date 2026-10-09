@@ -334,7 +334,11 @@ test('P9 T08 restores the saved leaf after relaunch and keeps valid unknown inpu
     expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(workspace);
     expect(f.requests()).toBe(1);
     console.log('T08 actual queued lost-outcome facts', JSON.stringify(await page.evaluate(async id => ({ session: await window.flowmate.querySession(id), inputs: await window.flowmate.listSessionInputs({ sessionId: id }), workspace: await window.flowmate.readWorkspace() }), f.seed.sessionId)));
-    await expect(page.getByTestId('session-input').filter({ hasText: 'Unconfirmed follow-up gap' })).toContainText('delivery_unknown');
+    const restoredInputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), f.seed.sessionId);
+    expect(restoredInputs).toMatchObject({ ok: true, data: { items: expect.arrayContaining([
+      expect.objectContaining({ inputId: f.queuedInputId, status: 'delivery_unknown', nativeEntryId: null }),
+    ]) } });
+    await expect(page.getByText(/^Inputs ·/)).toHaveCount(0);
     expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(workspace);
     await page.getByRole('textbox', { name: 'Message to model' }).fill('Do not replay an unknown input');
     await expect(page.getByRole('button', { name: /^Send/ })).toBeDisabled();

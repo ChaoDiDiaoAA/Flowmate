@@ -18,6 +18,8 @@ type ZodNodeDefinition = {
   options?: readonly z.ZodTypeAny[];
   type?: z.ZodTypeAny;
   innerType?: z.ZodTypeAny;
+  schema?: z.ZodTypeAny;
+  effect?: { type: string };
   minLength?: { value: number } | null;
   maxLength?: { value: number } | null;
   exactLength?: { value: number } | null;
@@ -34,6 +36,11 @@ function nodeDefinition(schema: z.ZodTypeAny): ZodNodeDefinition {
 function convert(schema: z.ZodTypeAny, path = 'root'): TSchema {
   const def = nodeDefinition(schema);
   switch (def.typeName) {
+    case 'ZodEffects':
+      // Custom refinements still run in prepareArguments and Executor; transformations remain unsupported.
+      return def.effect?.type === 'refinement' && def.schema ? convert(def.schema, path) : unsupported(path);
+    case 'ZodOptional':
+      return def.innerType ? Type.Optional(convert(def.innerType, path)) : unsupported(path);
     case 'ZodObject': {
       if (def.unknownKeys !== 'strict' || !def.shape || !def.catchall
         || nodeDefinition(def.catchall).typeName !== 'ZodNever') return unsupported(path);

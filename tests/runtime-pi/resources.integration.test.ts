@@ -16,7 +16,7 @@ import * as pi from '../../packages/runtime-pi/src/index.ts';
 import { createResourceService } from '../../packages/core/src/resources/service.ts';
 import { readProductSettings, saveProductSettings, defaultProductSettings } from '../../packages/core/src/configuration/settings.ts';
 import { checkResourcePayload, checkResourceWire } from '../../packages/runtime-pi/src/context-evidence.ts';
-import { verifyManagedReadOutput } from '../../packages/runtime-pi/src/resources/loader.ts';
+import { verifyManagedReadOutput, verifySkillToolOutput } from '../../packages/runtime-pi/src/resources/loader.ts';
 import { createHttpProvider, deferCleanup, mkdtempSync } from '../support/resources.ts';
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -25,7 +25,7 @@ function packs(prefix = 'flowmate-p11-sdk-') {
   const root = mkdtempSync(join(tmpdir(), prefix)), resourceRoot = join(root, 'author'); mkdirSync(resourceRoot);
   const paths = need(resolveProductPaths(join(root, 'product'))), bundleRoot = join(paths.runtimeDir, 'resource-bundles');
   function pack(kind: 'prompt' | 'skill', version = 'v1', disabled = false, extraFiles: Array<{ path: string; text: string }> = []) {
-    const dir = join(resourceRoot, kind === 'prompt' ? 'prompts' : 'skills', 'invoice', version); mkdirSync(dir, { recursive: true });
+    const dir = join(resourceRoot, kind === 'prompt' ? 'prompts' : 'skills', 'invoice'); mkdirSync(dir, { recursive: true });
     const text = kind === 'prompt' ? `Business invoice constraints ${version}.` : `---\nname: invoice\ndescription: Invoice fields ${version}\ndisable-model-invocation: ${disabled}\n---\nInvoice SOP ${version}.`;
     const path = kind === 'prompt' ? 'prompt.md' : 'SKILL.md';
     const files = [{ path, text }, ...extraFiles];
@@ -61,6 +61,92 @@ function responsesReply() {
 }
 
 describe('P11 controlled native resources', () => {
+  it('rejects altered structured pages and foreign ownership before SDK evidence', () => {
+    const controls = '\u0000\u0001\u0002\u0003\u0000\u0000';
+    const f = packs(), skill = f.pack('skill', 'v1', false, [{ path: 'references/guide.md', text: '中文 reference' },
+      { path: 'references/controls.bin', text: controls }]);
+    const frozen = need(f.hub.freeze({ selection: { prompt: null, enabledSkills: [skill.ref] }, settingsRevision: 1, activeToolNames: ['read'], requiredSkill: null }))!;
+    const loader = need(pi.createRunResourceLoader({ fixedSystemPrompt: 'Skill test', frozen, bundleDirectory: frozen.bundleDirectory,
+      activeToolNames: ['list_skill_resources', 'read_skill_resource'] }));
+    const args = { skill: 'invoice', path: 'references/guide.md', limit: 6 };
+    const page = { ...need(f.hub.readFrozenFile(frozen, { path: args.path, limit: args.limit, ref: skill.ref })), bundleHash: frozen.bundleHash };
+    expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', args, page)).toMatchObject({ ok: true, data: [{ fullBody: false, text: '中文 reference' }] });
+    for (const changed of [{ text: 'different' }, { path: 'SKILL.md' }, { offset: 3 }, { nextOffset: null }, { totalBytes: 6 },
+      { bundleHash: 'f'.repeat(64) }, { ref: { ...skill.ref, version: 'v2' } }])
+      expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', args, { ...page, ...changed })).toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
+    expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', { ...args, sessionId: 1 }, page).ok).toBe(false);
+    expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', { skill: 'invoice', path: 'references/controls.bin' },
+      { ref: skill.ref, bundleHash: frozen.bundleHash, path: 'references/controls.bin', sha256: hash(controls),
+        offset: 0, text: controls, nextOffset: null, totalBytes: Buffer.byteLength(controls) }))
+      .toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
+    const files = [...frozen.manifests[0]!.manifest.files].sort((a, b) => a.path < b.path ? -1 : 1);
+    expect(verifySkillToolOutput(frozen, loader, 'list_skill_resources', { skill: 'invoice' }, { ref: skill.ref, bundleHash: frozen.bundleHash, files })).toMatchObject({ ok: true });
+    expect(verifySkillToolOutput(frozen, loader, 'list_skill_resources', { skill: 'invoice' }, { ref: skill.ref, bundleHash: frozen.bundleHash, files: files.slice(0, 1) }).ok).toBe(false);
+  });
+  it.each([false, true])('uses the dedicated Skill tools without native readers and preserves owned receipts (receipt fault=%s)', async receiptFault => {
+    const f = packs(), marker = join(f.root, 'skill-script-executed');
+    const guide = '中文 reference stays frozen.', script = `throw new Error(${JSON.stringify(marker)});`;
+    const skill = f.pack('skill', 'v1', false, [{ path: 'references/guide.md', text: guide }, { path: 'scripts/check.ts', text: script }]);
+    const payloads: Array<{ messages: Array<{ role: string; content: string }>; tools: Array<{ function: { name: string } }> }> = [];
+    const server = await createHttpProvider(async request => {
+      payloads.push(await request.json() as (typeof payloads)[number]);
+      return payloads.length === 1 ? toolReply([
+        { name: 'list_skill_resources', args: { skill: 'invoice' } },
+        { name: 'read_skill_resource', args: { skill: 'invoice', path: 'SKILL.md' } },
+        { name: 'read_skill_resource', args: { skill: 'invoice', path: 'references/guide.md', limit: 6 } },
+        { name: 'read_skill_resource', args: { skill: 'invoice', path: 'scripts/check.ts' } },
+      ]) : reply();
+    }); deferCleanup(() => server.stop());
+    const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
+      resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
+      toolDefinitions: definitions => definitions.filter(tool => !['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'].includes(tool.name)),
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir,
+        tools: definitions,
+        credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
+    let app = need(await open()); deferCleanup(() => app.close());
+    const session = need(await app.createSession({ title: 'Dedicated Skill reading' }));
+    const w = need(await app.readWorkspace()); need(await app.updateWorkspace({ expectedRevision: w.revision, change: { kind: 'session', sessionId: session.sessionId } }));
+    const workspace = need(await app.readWorkspace());
+    if (receiptFault) {
+      need(await app.close());
+      const db = new Database(f.paths.databaseFile);
+      try { db.exec(`CREATE TRIGGER p11_receipt_fault BEFORE UPDATE OF context_observations_json ON runs
+        WHEN NEW.context_observations_json LIKE '%"operation":"list_skill_resources"%'
+        BEGIN SELECT RAISE(ABORT,'controlled receipt fault'); END;`); } finally { db.close(); }
+      app = need(await open());
+    }
+    let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
+    const done = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finish = resolve; });
+    const accepted = need(await app.submitInput({ sessionId: session.sessionId, clientSequence: 1, mode: 'prompt', text: 'Inspect the registered Skill files.',
+      workspace: { revision: workspace.revision, sessionId: session.sessionId, documentRef: null, jobId: null, candidateRef: null },
+      config: { version: 1, name: 'P11 dedicated', revision: 1, modelRef: { provider: 'p11', model: 'p11' }, native: { authPath: join(f.root, 'empty-auth.json'), modelsPath: null },
+        connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 } } },
+      { onEvent: event => { if (event.type === 'run_finished') finish(event); } }));
+    const ended = await done;
+    if (!payloads.length) throw new Error(JSON.stringify(ended));
+    expect(payloads[0]!.messages.find(message => message.role === 'system')!.content.match(/<name>invoice<\/name>/g)).toHaveLength(1);
+    expect(payloads[0]!.messages.find(message => message.role === 'system')!.content).toContain('read_skill_resource');
+    const userText = JSON.stringify(payloads[0]!.messages.find(message => message.role === 'user')!.content);
+    expect(userText).toContain('Inspect the registered Skill files.');
+    expect(userText).toContain('workspaceContext');
+    expect(payloads[0]!.tools.map(tool => tool.function.name)).toContain('list_skill_resources');
+    expect(payloads[0]!.tools.map(tool => tool.function.name)).not.toContain('read');
+    expect(existsSync(marker)).toBe(false);
+    if (receiptFault) {
+      expect(ended.result).toMatchObject({ ok: true, data: { status: 'failed' } });
+      expect(payloads).toHaveLength(1); return;
+    }
+    expect(ended.result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    const view = need(await app.queryRunResources({ sessionId: session.sessionId, runId: accepted.runId }));
+    expect(payloads).toHaveLength(2);
+    expect(view.evidence?.reads).toHaveLength(6);
+    expect(view.evidence?.reads.filter(read => read.operation === 'list_skill_resources').every(read => read.fullBody === false)).toBe(true);
+    expect(view.evidence?.reads.find(read => read.operation === 'read_skill_resource' && read.path === 'SKILL.md')).toMatchObject({ fullBody: true });
+    expect(view.evidence?.reads.find(read => read.operation === 'read_skill_resource' && read.path === 'references/guide.md')).toMatchObject({ fullBody: false });
+    expect(view.evidence?.reads.every(read => read.nativeEntryId !== null)).toBe(true);
+    expect(view.evidence?.requests[0]!.contentChecks).toContainEqual(expect.objectContaining({ scope: 'skill-index', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }));
+    expect(view.evidence?.requests[1]!.contentChecks).toContainEqual(expect.objectContaining({ scope: 'tool-output', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }));
+  });
   it('classifies the path spellings accepted by the actual installed native read tool', async () => {
     const f = packs('flowmate p11-sdk-'), extra = { path: 'references/note.md', text: 'Pinned reference text.' }, skill = f.pack('skill', 'v1', false, [extra]);
     const frozen = need(f.hub.freeze({ selection: { prompt: null, enabledSkills: [skill.ref] }, settingsRevision: 1, activeToolNames: ['read'], requiredSkill: null }))!;
@@ -120,6 +206,7 @@ describe('P11 controlled native resources', () => {
     expect(need(await app.queryRunResources(owner))).toEqual(oldEvidence); expect(need(await app.querySessionHistory({ sessionId: session.sessionId }))).toEqual(oldHistory);
     expect(await app.submitInput(request)).toEqual({ ok: true, data: accepted });
     expect(await app.submitInput({ ...request, clientSequence: 2 })).toMatchObject({ ok: false, error: { code: 'resource_required_unavailable' } }); expect(payloads).toHaveLength(1);
+    f.pack('skill', 'v1', true); // Restore the prior author package before explicitly selecting it.
     const fallback = { prompt: null, enabledSkills: [older.ref] }; need(app.validateResourceSelection(fallback));
     settings = need(await saveProductSettings(settingsFile, { ...settings, resources: fallback }));
     const later = await execute({ ...request, clientSequence: 2, requiredSkill: older.ref });
@@ -497,7 +584,7 @@ describe('P11 controlled native resources', () => {
   });
 
   it.each(['steer', 'followUp', 'cancel', 'steer-fallback', 'followUp-fallback'] as const)('keeps queued %s bound to the original Run after configuration changes and respects cancellation', async mode => {
-    const f = packs(), firstSkill = f.pack('skill', 'v1', true), nextSkill = f.pack('skill', 'v2', true);
+    const f = packs(), firstSkill = f.pack('skill', 'v1', true);
     let selection: ResourceSelection = { prompt: null, enabledSkills: [firstSkill.ref] }, revision = 1;
     let entered!: () => void, release!: () => void;
     const firstEntered = new Promise<void>(resolve => { entered = resolve; }), barrier = new Promise<void>(resolve => { release = resolve; });
@@ -525,7 +612,9 @@ describe('P11 controlled native resources', () => {
     const done = new Promise<AgentRunEvent & { type: 'run_finished' }>(resolve => { finish = resolve; });
     const first = need(await app.submitInput({ sessionId: session.sessionId, clientSequence: 1, mode: 'prompt', text: 'Initial request', config }, { onEvent: event => { if (event.type === 'run_finished') finish(event); } }));
     try {
-      await firstEntered; selection = { prompt: null, enabledSkills: [nextSkill.ref] }; revision = 2;
+      await firstEntered;
+      const nextSkill = f.pack('skill', 'v2', true);
+      selection = { prompt: null, enabledSkills: [nextSkill.ref] }; revision = 2;
       const request = { sessionId: session.sessionId, runId: first.runId, clientSequence: 2, mode: inputMode, text: `Queued ${mode} original text`, requiredSkill: firstSkill.ref };
       const submitted = await app.submitInput(request);
       expect(payloads).toHaveLength(1);
@@ -577,7 +666,7 @@ describe('P11 controlled native resources', () => {
     const loader = need<import('@earendil-works/pi-coding-agent').ResourceLoader>(create({ fixedSystemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT,
       frozen, bundleDirectory: join(f.bundleRoot, frozen.bundleHash) }));
     expect(loader.getSystemPrompt()).toBe(INVOICE_TOOLS_SYSTEM_PROMPT);
-    expect(loader.getAppendSystemPrompt()).toEqual([prompt.text]);
+    expect(loader.getAppendSystemPrompt()).toEqual([prompt.text, expect.stringContaining('readiness: Ready (0/0 capabilities); No requirements')]);
     expect(loader.getSkills().skills.map(item => item.name)).toEqual(['invoice']);
     expect(formatSkillsForPrompt(loader.getSkills().skills, 'read')).toContain('Invoice fields v1');
     expect(loader.getPrompts()).toEqual({ prompts: [], diagnostics: [] }); expect(loader.getAgentsFiles()).toEqual({ agentsFiles: [] });
@@ -621,7 +710,8 @@ describe('P11 controlled native resources', () => {
       expect(resources.evidence!.requests[0]!.systemPromptHash).toBe(hash(system));
       expect(resources.evidence!.requests[0]!.contentChecks).toContainEqual(expect.objectContaining({ scope: 'business-prompt', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }));
       expect(resources.evidence!.requests[0]!.contentChecks.filter(check => check.scope === 'skill-index')).toHaveLength(index === 1 ? 1 : 0);
-      expect(system.includes('Invoice fields v1')).toBe(index === 1); expect(system).not.toContain('Invoice fields v2');
+      expect(system.includes('Invoice fields v1')).toBe(index === 1);
+      expect(system.includes('Invoice fields v2')).toBe(index !== 1);
       expect(payloads.at(-1)!.messages.filter(message => message.role === 'user')).toHaveLength(index);
       expect(need(await app.listSessionMessages({ sessionId: session.sessionId })).items.filter(message => message.role === 'user')).toHaveLength(index);
     }
