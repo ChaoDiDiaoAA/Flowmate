@@ -1,27 +1,21 @@
 # Agent Benchmark 制作说明
 
-修订：2026-10-02（删除提前制作的评测数据）。旧 `flowmate-agent-v1/` 的50条Case、清单及专属README，以及本轮 `flowmate-runtime-recovery-v1/` 的24条Case、清单、Gold审核草稿与A–D四组配置均已删除，不留冻结/归档副本，不改名或移作工程夹具。当前 `datasets/` 只有本制作说明。
+现行修订：2026-10-10。当前只有本说明，没有正式业务Case/Gold/成员清单；50/10与Runtime24/8/16是计划。旧提前草稿已删除，历史未验收工程已撤回，不恢复/归档或改名Fixture；原始voxel51、独立夹具和历史结果保留。
 
-**现行顺序：按 06 制作→07 接入/执行→08 核验，完整独立流程验收后由用户启动 P15，P16 后验安装。** 正式制作按 01 §12.1 核对产品能力、契约/处理器、公开入口、采证及工程证据；缺项先接合验证，不等待 P15/P16。 规则沿 [01 §12.1](../../docs/eval/01_Flowmate_Agent评测总方案_v1.md)。Runtime 专题见 [01 §12.2](../../docs/eval/01_Flowmate_Agent评测总方案_v1.md)/[02 §7.10](../../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)，仅为整体门槛后的待实施计划。requires子集/空数组、draft/null、配置或凭据不能解锁；生产 productAgent.readiness=false、prepare拒绝。
+制作由Agent按[06](../../docs/eval/06_Flowmate_Agent评测数据集制作实施与操作手册_v1.md)执行，用户不手工创建JSON/复制/hash。权威为[02§2–12](../../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md#eval02-2)和[01§4–8](../../docs/eval/01_Flowmate_Agent评测总方案_v1.md#eval01-4)：先接通契约/处理器/真实Adapter/采证/必要评分并受控验证，再覆盖矩阵→种子→材料/来源→投影→Case→Gold/行为预期→评分映射→真实审核/交付。P1–P14对应能力/工程为依据，不等待P15/P16，不靠空requires/draft/null绕过。
 
-完整首版规划50条、Smoke引用10条；Runtime规划12正常/故障配对共24条，8开发/Smoke、16留出，同来源和配对在同分区。不沿用旧草稿、类别配额或审核结果；复用同一Runner，不按开发阶段另建运行器。
+完整50条、Smoke引用10条。Runtime12正常/故障对24条，4对8开发/Smoke、8对16留出；配对/同来源/近重复同分区，跨集合暴露登记。正式范围为[33项](../../docs/eval/01_Flowmate_Agent评测总方案_v1.md#eval01-8-4)，全部有适用机会/单位/原公式/分子分母/证据/方法/缺失映射，不按指标数分配Case；退役指标不恢复。
 
-原Loader保留严格 `flowmate-agent-dataset/v1`。本轮新增v2/holdout/校准/故障与产品Adapter增量及专属测试已撤回，Runtime T15/T16 随独立手册前置开发实施；未来先实现契约、公共采证及独立最小合成设施验证，再由T18正式制作。一JSON一任务，清单维护版本/成员/Smoke/环境/评分；未来v2字段和校准要求见 [02 §3.3](../../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)，当前不可冒称已支持。
+原始`data/invoices/voxel51`只读；准备脚本生成agent-input及报告，产品注册/解析版本另取证。模型只见当前输入和允许材料，Gold/未来步骤/控制故障/评分/审核留质量侧。Gold从原件/可见解析独立核，不从模型输出或人工接受反推；真实人工参考/审核须有真实来源/姓名/日期/内容hash，Agent自检另列。
 
-制作时逐项核验真实用户输入、初始环境、成功/失败标准、评分和风险，公共要求只维护一次。Gold及未来消息不进入Agent；材料、真值、审核和冻结遵循 [02制作手册](../../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)。正式数据核验后才真实开发及必要Judge校准、冻结、Smoke/留出和四组对照，不自动付费补20条样本，留出不反哺。
+当前[src/datasets/local.ts](../src/datasets/local.ts)严格v1，只接受manifest draft、Case review pending；步骤枚举不表示执行能力。阶段一按[02§3.3](../../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md#eval02-3-3)接通审核/冻结、v2 pairs/profile/calibration与holdout，保持v1兼容，不往v1塞未来字段。生产readiness=false/prepare拒绝，无数据时明确报错，不生成占位。
 
-原始来源 `data/invoices/voxel51` 只读保留。`src/datasets/` 是加载代码，原独立 `tests/fixtures/` 是通用工程夹具，`runs/` 保留独立历史记录；不把它们当业务Case正文替身。本轮依赖Runtime数据的专属测试及支持文件随实现撤回。产品Runtime T10–T14与适用工程验证保留，T17当前不依赖正式评测数据。
+阶段一交付数据/Gold/覆盖/工程与无密钥模板后停止；用户按[07](../../docs/eval/07_Flowmate_Langfuse接入与评测执行操作手册_v1.md)真实校准/先导/快照/统一冻结/完整执行，按[08](../../docs/eval/08_Flowmate_Agent评测结果核验与流程验收手册_v1.md)核验/真实平台反馈/补传，再明确启动P15，P16后验安装。复用Langfuse4.55.0，但数据/Gold权威在本地。
 
-完整产品和正式制作核验完成后使用：
+Runtime A–D保留权限/停止/提交/必要保存；开发真实快照/hash/cutoff冻结，留出不反哺。样本不足回退、不自动付费凑20。单组留出Judge12288，四组留出49152＋正式Smoke8192＝57344，额外校准先导单列累计，不事后拆超额Execution。
 
-```powershell
-bun run eval -- dataset validate --dir agent-eval/datasets/flowmate-agent-v1
-```
+工程制作命令/新增修改目录/审核模板见06；`dataset validate`和`status --dataset`由Agent在制作后执行，结构合法不等于Gold核验或真实质量通过。
 
-当前业务Dataset缺失时明确报错，不生成占位、自动回退或模型请求。doctor只检查声明范围；原报告查询/比较/反馈/显式补传保留原执行与评分事实，反馈另存、补传只更新导出状态，不解锁质量运行。
+Case是[任务定义](../../docs/eval/01_Flowmate_Agent评测总方案_v1.md#eval01-trial-model)，同一任务只保存一份JSON，Smoke引用原成员；不为Trial1/2/3复制Case正文、不在严格v1添加repeat或未来聚合字段。重复属于Execution计划，优先级`--repeat → config.repeat → 1`。固定初态/预置历史种子须可重建，各Trial独立可写且不继承上次候选、文件、历史或经验；同Trial恢复保留已发生事实。
 
-未来四组A基础/B预算/C统计期限/D经验均保留安全、权限、提交、停止及必要保存。独立留出Execution各12288<15000、四组49152，四组正式Smoke8192，八正式Execution57344；额外校准事前单列并汇总，不事后拆超额计划。安全停止确定性核验，无模型解释则语义理解未测；所有规模和预算是计划，没有质量成绩。
-
-[06 逐步制作](../../docs/eval/06_Flowmate_Agent评测数据集制作实施与操作手册_v1.md) · [05 总入口](../../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md) · [评测 README](../README.md) · [源码职责](../src/README.md)
-
-后续平台统一复用本机已部署的 **Langfuse 服务端 4.55.0**，见 [03 §6](../../docs/eval/03_Flowmate_Langfuse平台接入设计方案_v1.md#eval03-6)；正式数据与 Gold 仍由本地制作/审核，不以平台部署完成代替。
+制作交付分别登记唯一Case数和计划Trial数：50条全量×1、两个10条Smoke各×1、Runtime每组16条留出×3；任务数量不随重复增长，配对/来源分区不变。两层评分及[Case/Dataset正式聚合](../../docs/eval/01_Flowmate_Agent评测总方案_v1.md#eval01-trial-aggregation)仍须阶段一实现；不能把成员去重当成删除真实Trial，或将repeat=1声称为稳定性证明。
