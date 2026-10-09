@@ -1,6 +1,6 @@
 # Flowmate Agent 评测操作手册
 
-修订：2026-10-02（删除提前实现的评测数据及 Runtime 评测增量）。所有正式 Case/Gold 制作、真实开发及必要 Judge 校准、Smoke、留出和四组质量运行，统一等待完整 P1–P16、公共入口、必要采证及工程就绪（01 §12.1）。旧完整数据及本轮 Runtime 24 Cases、清单、Gold 审核草稿、A–D 配置已删除，不归档、不改名为夹具；本轮新增 Runtime Adapter/v2/holdout/校准/故障增量和专属测试已撤回。原通用 Runner、评分、独立工程夹具与历史记录保留，生产 productAgent.readiness=false、prepare 拒绝。T15/T16 均延期到完整产品门槛后；以下 50/10、24/8/16 与四组设计仅为待实施计划。
+现行基线：2026-10-09，撤回本轮未验收工程增量，保留原设施和历史记录。先按 [05 总入口](../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md)完成 [06 数据制作](../docs/eval/06_Flowmate_Agent评测数据集制作实施与操作手册_v1.md)、[07 接入与执行](../docs/eval/07_Flowmate_Langfuse接入与评测执行操作手册_v1.md)、[08 结果核验](../docs/eval/08_Flowmate_Agent评测结果核验与流程验收手册_v1.md)，每阶段停下交付，用户明确启动下一阶段。完整独立流程验收后再启动 P15，P16 后验安装；当前 readiness=false、prepare 拒绝、无正式业务数据/成绩。两份 SDK 补丁与 HEAD 一致，完整源码/资源指纹仍待补齐。
 
 ## 完整目录与职责
 
@@ -97,9 +97,9 @@ runs/<executionId>/ 保存 summary.json、snapshot.json、source.json 和各 Tri
 
 退出码：0 必要自动检查通过；1 失败、错误或未完成；2 必要评分未完成。人工反馈和导出不影响自动成绩。旧契约报告仅 status 只读展示，不重评分或导出为新版本。
 
-## 完整产品后 Runtime 专题的操作（待实施）
+## 独立 Runtime 专题的操作（待实施）
 
-提前制作的 `flowmate-runtime-recovery-v1` 数据目录已删除，新增产品 Adapter/v2/holdout/故障/校准设施与专属测试已撤回。完整产品门槛之后才实施 T15 适配与过程报告、T16 契约/设施/冻结协议；当前 T17 仅验证产品 Runtime T10–T14，不依赖正式数据。
+提前制作的 `flowmate-runtime-recovery-v1` 数据目录已删除，新增产品 Adapter/v2/holdout/故障/校准设施与专属测试已撤回。Runtime T15/T16 随 06/07 前置开发接合适配、过程报告与契约/设施/冻结协议，不等待 P15/P16；当前 T17 仅验证产品 Runtime T10–T14，不依赖正式数据。
 
 未来 T18 正式制作12正常/故障配对共24 Cases、8开发/Smoke和16留出；同来源及配对在同分区。审核和真实开发/必要 Judge 校准后冻结模型/预算、材料、profile、真实统计/经验快照 hash/cutoff 与 A–D 配置，留出不反哺。v2/v1兼容、holdout、calibration 引用和 Runtime 过程报告均为待实施要求，字段见 [02 §3.3](../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)，方法见 [01 §6.4/§12.2](../docs/eval/01_Flowmate_Agent评测总方案_v1.md)。
 
@@ -107,10 +107,10 @@ A基础/B预算/C统计期限/D经验均强制 before/after、权限、提交查
 
 以下仅为**完整产品、T15/T16设施验收及T18数据核验/对应校准冻结完成后的命令设计**，当前未实现 holdout，不能执行为质量证据：
 
-```powershell
-bun run eval -- run --dataset flowmate-runtime-recovery-v1 --selection smoke --repeat 1 --config <开发组配置路径> --judge required --backend local
-bun run eval -- run --dataset flowmate-runtime-recovery-v1 --selection holdout --repeat 3 --config <冻结组配置路径> --judge required --backend local
-```
+| 命令状态 | 说明 |
+|---|---|
+| run + smoke/full | 入口存在但生产 Adapter/数据未就绪，不能执行质量运行 |
+| holdout、judge calibrate、runtime snapshot | 待开发验证，没有当前可执行命令；交付后同步 CLI 帮助与 07 |
 
 未来四组分别预登记独立 Execution/config hash，单组16×3留出 Judge 输出上界12288<15000，四组49152；每组8×1正式 Smoke上界2048，四组8192，八正式Execution合计57344。额外校准事前单列并纳入累计，不事后拆同一超额Execution；全24×3=18432单执行仍须拒绝。报告保留全部计划、原 Run 终态、暴露和独立预期；未暴露不计恢复成功，未知提交/停止不重投。安全停止确定性核验，无模型解释则语义理解未测，质量 Judge 仍依 started/completed/endpoint。
 
@@ -119,6 +119,8 @@ bun run eval -- run --dataset flowmate-runtime-recovery-v1 --selection holdout -
 ## 可选 Langfuse
 
 local 不初始化 SDK、不验证平台密钥、不请求平台。启用时读取 LANGFUSE_*，先保存本地结果，再导出；失败不改分、不重跑模型。
+
+本机 `D:\langfuse` Docker 部署已完成，平台服务端统一 **4.55.0**，web/worker 版本、镜像摘要和只读健康结果见 [03 §6](../docs/eval/03_Flowmate_Langfuse平台接入设计方案_v1.md#eval03-6)。直接按 [07](../docs/eval/07_Flowmate_Langfuse接入与评测执行操作手册_v1.md#platform-step-01)复用实例；项目认证、上传/Score、审核与重复补传仍待验证。SDK 锁定版本 5.11.1 单独记录，不因服务端版本修改依赖。
 
 ```powershell
 bun run eval -- doctor --backend langfuse
@@ -135,7 +137,7 @@ review apply 已退役；导入使用 review import。平台反馈导入绑定�
 
 `bun run typecheck`、`bun run test:unit`、`bun run test:integration` 均为设施验证，不调用模型。产品阶段测试继续在 tests/；旧 Provider 控制器、阶段 Dataset、阶段命令已移除。sync、dataset publish、--version、--wait-seconds、--stage、--mode 返回迁移错误。
 
-材料不可用不回退；完整产品评测接合和必要领域采证仍待实施，原通用比较器不能证明这些能力。正式 Gold、语义参考及真实 Judge 校准只在完整产品门槛后制作核验。产品 Runtime 工程保留，本轮新增评测实现及其专属测试已撤回；未升级依赖、不恢复旧成绩、不操作平台。
+正式上传前须补齐完整字段白名单，当前 exporter 会携带输入/回答/产物/Observation/Judge raw，秘密扫描不等于白名单。compare 尚缺完整 Agent 配置身份检查。材料不可用不回退；完整产品评测接合和必要领域采证仍待实施，原通用比较器不能证明这些能力。正式 Gold、语义参考及真实 Judge 校准只在完整产品门槛后制作核验。产品 Runtime 工程保留，本轮新增评测实现及其专属测试已撤回；未升级依赖、不恢复旧成绩、不操作平台。
 
 [源码职责](src/README.md) · [任务与材料](datasets/README.md) · [Judge](src/scoring/judges/README.md) · [总方案](../docs/eval/01_Flowmate_Agent评测总方案_v1.md)
 
@@ -143,6 +145,6 @@ review apply 已退役；导入使用 review import。平台反馈导入绑定�
 
 旧 `datasets/flowmate-agent-v1` 已删除，包括 50 条草稿、dataset.json 与专属 README，不保留归档副本或空清单。先前“内容版本 2、16 类已分配、草稿暂存”的记录均已被本次决定替代；不据此认定当前已有数据。历史修订依据见 [核对表](../docs/eval/04_统一评测修订核对表.md)。原始发票来源、独立测试夹具、评分代码和已有运行记录保留，未操作 Langfuse。
 
-正式制作依 [01 总方案](../docs/eval/01_Flowmate_Agent评测总方案_v1.md) 与 [02 手册](../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)，先满足完整 P1–P16、公共入口、必要采证及工程就绪，不按阶段、requires 子集或空数组提前开放。50/10与Runtime24/8/16均仅为待实施计划；此前“Runtime draft 冻结保留”和“部分评测增量已接通”已由本次删除/撤回取代。
+正式制作依 [01 总方案](../docs/eval/01_Flowmate_Agent评测总方案_v1.md) 与 [02 手册](../docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)，先满足01 §12.1/05–08 的产品能力、契约/处理器、公开入口、必要采证及工程就绪，不按阶段、requires 子集或空数组提前开放。50/10与Runtime24/8/16均仅为待实施计划；此前“Runtime draft 冻结保留”和“部分评测增量已接通”已由本次删除/撤回取代。
 
 设施测试边界见 [测试说明](tests/README.md)。原独立通用夹具保留，本轮依赖已删 Runtime 数据的专属测试及支持文件撤回；不得将业务评测数据改名移作夹具。工程通过不能形成 Agent 质量结论。本轮未执行 Agent/Judge、平台或 Benchmark。
