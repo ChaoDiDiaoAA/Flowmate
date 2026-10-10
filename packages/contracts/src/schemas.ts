@@ -14,6 +14,7 @@ import type {
 import { WorkspaceContextSchema } from './workspace.ts';
 import { RuntimeRequestOverridesSchema } from './runtime.ts';
 import { RUNTIME_CONFIG } from './runtime-config.ts';
+import { ResearchIntentSchema } from './research.ts';
 import { ResourceRefSchema } from './resources.ts';
 
 const modelRefSchema = z
@@ -95,6 +96,7 @@ export const INVOICE_FILL_FORM_SYSTEM_PROMPT = `You are Flowmate's invoice form 
 export const WorkingDirectorySchema = z.string().min(1).max(4096).refine(value => isAbsolute(value)
   && value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value), 'Invalid working directory.');
 const agentRunRequestSchema = z.object({
+  research: ResearchIntentSchema.optional(),
   requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional(),
   sessionId: dbIdSchema,
   text: z.string(),
@@ -192,6 +194,8 @@ export function normalizeAgentRunRequest(raw: unknown): Result<NormalizedAgentRu
   const parsed = agentRunRequestSchema.safeParse(raw);
   if (!parsed.success) return fail(appError('input_invalid', 'input', 'Agent 请求参数无效。'));
 
+  if (parsed.data.research && (parsed.data.goalMode !== 'answer' || parsed.data.workspace || parsed.data.workingDirectory !== undefined))
+    return fail(appError('input_invalid', 'input', 'Research requires its dedicated Session and explicit source policy.'));
   const config = normalizeProviderConfig(parsed.data.config);
   if (!config.ok) return fail(appError('input_invalid', 'input', 'Agent 模型配置无效。'));
   if (parsed.data.text.trim().length === 0) return fail(appError('input_invalid', 'input', 'Agent 输入不能为空。'));

@@ -414,7 +414,7 @@ it('P10 overflow continuation then tool-loop threshold refuses the exhausted bud
     expect((await seed.terminal).result.ok).toBe(true);
   }
   const workspace = need(await f.app.readWorkspace());
-  const active = await begin(f.app, { ...f.prompt(5, 'Original explicit invoice question'), budget: { maxModelCalls: 5 },
+  const active = await begin(f.app, { ...f.prompt(5, 'Original explicit invoice question'), timeoutMs: 12000, budget: { maxModelCalls: 5 },
     workspace: { revision: workspace.revision, sessionId: f.session.sessionId, documentRef: null, jobId: null, candidateRef: null } });
   expect((await active.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'agent_model_call_budget' } } });
   expect(f.payloads).toHaveLength(9); expect(f.executions()).toBe(1);

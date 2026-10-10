@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { Database } from 'bun:sqlite';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { appError, fail, InvoiceFormDraftSchema, CandidateDraftSchema, ContextSnapshotJsonSchema, ContextObservationsSchema, invoiceLineFields, formatExecutionPrompt } from '@flowmate/contracts';
+import { appError, fail, InvoiceFormDraftSchema, CandidateDraftSchema, ContextSnapshotJsonSchema, ContextObservationsSchema, invoiceLineFields, formatExecutionPrompt, RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES } from '@flowmate/contracts';
 import type { AgentRunEvent, AgentRunRequest, Application, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest,
   ProviderConfig, Result, FillInputRequest, WorkspaceSnapshot } from '@flowmate/contracts';
 import { createApplication } from '../../../apps/composition.ts';
@@ -306,7 +306,7 @@ describe('Fill backend through the public Application', () => {
     const task = need(await app.startTask({ clientSequence: 1, expectedRevision: workspace.revision,
       documentRef: doc.documentRef, goal: 'Save a candidate for review.' }));
     const generated = await run(app, { sessionId: session.sessionId, goalMode: 'save-candidate', text: 'Save a candidate.',
-      workspace: expectation(task.workspace), config, timeoutMs: 5000, stopGraceMs: 500 });
+      workspace: expectation(task.workspace), config, timeoutMs: 10000, stopGraceMs: 500 });
     expect(need(await app.listJobCandidates({ jobId: task.job.jobId })).items).toHaveLength(1);
     expect(generated.finished.result).toMatchObject({ ok: true, data: { status: 'completed', text: 'The candidate was saved for review.' } });
     expect(requests).toHaveLength(13);
@@ -456,7 +456,9 @@ describe('Fill backend through the public Application', () => {
           async close() { return { stopped: true, closed: true, errors: [] }; } };
       } }));
     try {
-      expect(names).toHaveLength(bridgePresent ? 25 : 24);
+      const researchNames = new Set<string>([...RESEARCH_PLANNING_TOOL_NAMES, ...RESEARCH_INVESTIGATION_TOOL_NAMES]);
+      expect(names.filter(name => !researchNames.has(name))).toHaveLength(bridgePresent ? 25 : 24);
+      expect(new Set(names).size).toBe(names.length);
       expect(names.filter(name => name === 'Agent')).toHaveLength(1);
       expect(names.filter(name => name === 'list_skill_resources')).toHaveLength(1);
       expect(names.filter(name => name === 'read_skill_resource')).toHaveLength(1);

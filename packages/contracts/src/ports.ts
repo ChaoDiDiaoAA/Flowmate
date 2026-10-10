@@ -299,7 +299,7 @@ export interface AgentPort {
     config: ProviderConfig,
     limits: { timeoutMs: number; stopGraceMs: number },
     signal: AbortSignal,
-    options?: { activeToolNames?: readonly string[]; inputDefinitions?: FrozenInputDefinitions; inputCommandOwner?: { runId: DbId; sessionId: DbId; inputId: DbId }; chatDelegation?: boolean; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
+    options?: { activeToolNames?: readonly string[]; inputDefinitions?: FrozenInputDefinitions; inputCommandOwner?: { runId: DbId; sessionId: DbId; inputId: DbId }; chatDelegation?: boolean; researchPhase?: 'planning' | 'researching'; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
       runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot; compactionPolicy?: CompactionPolicy;
       resources?: FrozenResources; extensions?: import('./extensions.ts').FrozenExtensions; verifyExtensions?: () => Result<void> },
   ): Promise<Result<PreparedAgent>>;

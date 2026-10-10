@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "skill",
+  "id": "deep-research",
+  "version": "v1",
+  "bodyFile": "SKILL.md",
+  "keywords": [
+    "research",
+    "研究",
+    "证据",
+    "报告"
+  ],
+  "requires": [{ "kind": "tool", "name": "read_research_local" }],
+  "files": [
+    {
+      "path": "SKILL.md",
+      "bytes": 2663,
+      "sha256": "3311ecd6c929f0ffb3c846989840ba99046c33ac3d700fb2ba07ef86c0f5a034"
+    }
+  ]
+}

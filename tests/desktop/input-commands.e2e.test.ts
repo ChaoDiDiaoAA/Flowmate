@@ -58,13 +58,13 @@ test('four command groups, keyboard and IME, role overrides, themes and real con
     await input.fill('/'); const menu = page.getByRole('listbox', { name: 'Input commands' });
     await expect(menu).toBeVisible();
     const skillOptions = menu.getByRole('option').filter({ hasText: /^\/skill:/ });
-    await expect(skillOptions).toHaveCount(16);
+    await expect(skillOptions).toHaveCount(17);
     for (const option of await skillOptions.all()) {
       const description = await option.locator('span').innerText();
       expect(description).not.toMatch(/[\u3400-\u9fff]/u);
       expect(await option.getAttribute('title')).toContain(description);
     }
-    await expect(skillOptions.first().locator('span')).toContainText('Organize fields');
+    await expect(skillOptions.filter({ has: page.getByText('/skill:invoice', { exact: true }) }).locator('span')).toContainText('Organize fields');
     await page.screenshot({ path: test.info().outputPath('skill-command-menu-english.png') });
     for (const name of ['Skills', 'Subagents', 'Prompt Templates', 'Extension Commands']) await expect(menu.getByRole('heading', { name, exact: true })).toBeVisible();
     await input.press('ArrowDown'); await expect(input).toHaveAttribute('aria-activedescendant', 'input-command-1');

@@ -23,3 +23,8 @@ export * from './tools/executor.ts';
 export * from './skill-hub/index.ts';
 export * from './extensions/service.ts';
 export { createSubagentTool } from './subagents.ts';
+export * from './research/repository.ts';
+export * from './research/tools.ts';
+export * from './research/read-tools.ts';
+export * from './research/synthesis-tools.ts';
+export * from './research/export.ts';

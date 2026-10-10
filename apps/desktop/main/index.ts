@@ -1,4 +1,5 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../host/protocol.ts';
+import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, researchOperations } from '../../../packages/contracts/src/research-commands.ts';
 import { ResourceRefSchema } from '@flowmate/contracts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
@@ -101,6 +102,8 @@ import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceForm
 import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import { readManagedInvoiceExport } from '../../../packages/core/src/storage/file-store.ts';
 import { publishInvoiceExportCopy } from './invoice-export.ts';
+import { publishExportCopy } from './invoice-export.ts';
+import { ResearchReportRequestSchema, ResearchExportResultSchema } from '@flowmate/contracts';
 
 const channels = {
   getState: 'flowmate:get-state',
@@ -438,8 +441,8 @@ async function assemblyIpcQuery(type: string, input?: unknown) {
   const extension = isExtensionHostCommand(type);
   const subagent = isSubagentHostCommand(type);
   const definition = isInputDefinitionHostCommand(type);
-  if (!command || !extension && !subagent && !definition && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
-  const [parse, matches, failure] = definition ? [parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure] : subagent ? [parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
+  if (!command || !extension && !subagent && !definition && !isResearchHostCommand(type) && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
+  const [parse, matches, failure] = isResearchHostCommand(type) ? [parseResearchHostResult, matchesResearchResponse, researchHostFailure] : definition ? [parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure] : subagent ? [parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
     : extension ? [parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure]
       : [parseResourceHostResult, matchesResourceResponse, resourceHostFailure];
   const epoch = host.connectionEpoch;
@@ -482,6 +485,27 @@ function registerIpc(): void {
     });
   };
 
+  handle('flowmate:save-research-export', async (event, raw) => {
+    const parsed = ResearchReportRequestSchema.safeParse(raw);
+    if (!parsed.success) return fail(appError('input_invalid', 'input', 'Report export request is invalid.'));
+    const owner = mainWindow, frame = event.senderFrame, epoch = host.connectionEpoch;
+    const current = () => owner !== null && owner === mainWindow && !owner.isDestroyed()
+      && event.sender === owner.webContents && frame === owner.webContents.mainFrame && epoch === host.connectionEpoch;
+    if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed.'));
+    const exported = ResearchExportResultSchema.safeParse(await assemblyIpcQuery('export_research_report', parsed.data));
+    if (!exported.success) return fail(appError('host_protocol_invalid', 'runtime', 'Report export could not be verified.'));
+    if (!exported.data.ok) return exported.data;
+    if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed.'));
+    const report = exported.data.data;
+    if (createHash('sha256').update(report.markdown).digest('hex') !== report.sha256)
+      return fail(appError('research_evidence_mismatch', 'storage', 'Report export content changed.'));
+    const selected = await dialog.showSaveDialog(owner!, { title: 'Save research report', defaultPath: report.filename,
+      filters: [{ name: 'Markdown', extensions: ['md'] }] });
+    if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed before saving.'));
+    if (selected.canceled || !selected.filePath) return ok({ cancelled: true });
+    const saved = publishExportCopy(selected.filePath, Buffer.from(report.markdown, 'utf8'));
+    return saved.ok ? ok({ cancelled: false, destinationPath: saved.data.destinationPath }) : saved;
+  });
   handle(channels.getState, async () => readDesktopState());
   handle(channels.saveSettings, async (_event, settingsRaw, credentialUpdateRaw) => saveSettings(settingsRaw, credentialUpdateRaw));
   handle(channels.listModelCatalog, async (_event, providerId, refresh) => {
@@ -538,7 +562,7 @@ function registerIpc(): void {
     try { return RuntimeToolResultSchema.parse(await host.request({ type: 'query_run_tool_call', input: input.data })); }
     catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool could not be confirmed.', true)); }
   });
-  for (const type of ['list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file',
+  for (const type of [...Object.keys(researchOperations), 'list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file',
     'list_extensions', 'update_extension_selection', 'query_session_extensions', 'query_run_extensions', 'execute_extension_command', 'dispose_session_extensions',
     'list_subagents', 'query_subagent', 'cancel_subagent', 'list_input_commands', 'list_subagent_definitions', 'get_subagent_definition', 'save_subagent_definition'] as const)
     handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => assemblyIpcQuery(type, raw));

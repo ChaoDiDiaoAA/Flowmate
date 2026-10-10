@@ -1,3 +1,4 @@
+import { readResearchContext, researchMaterialScope } from '../research/context.ts';
 import { createNativeOriginReader, NativeOriginFault, verifyNativeForkCopy } from '../memory/origins.ts';
 import { evidenceReadFailure, readTransaction } from './reads.ts';
 import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction, markUnusableInTransaction } from '../memory/persistence.ts';
@@ -2851,7 +2852,8 @@ function hasBusinessHistory(db: Database, sessionId: DbId): boolean {
     OR EXISTS (SELECT 1 FROM tool_calls WHERE session_id=?)
     OR EXISTS (SELECT 1 FROM business_events event JOIN runs run ON run.id=event.run_id WHERE run.session_id=?)
     OR EXISTS (SELECT 1 FROM invoice_candidates candidate JOIN runs run ON run.id=candidate.run_id WHERE run.session_id=?)`)
-    .get(sessionId, sessionId, sessionId, sessionId) !== null;
+    .get(sessionId, sessionId, sessionId, sessionId) !== null
+    || hasTable(db, 'research_tasks') && db.query('SELECT 1 FROM research_tasks WHERE session_id=?').get(sessionId) !== null;
 }
 
 function readSessionRow(db: Database, value: unknown): SessionRow {
@@ -3369,6 +3371,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           childSessionId: session.sessionId, originToolCallId: call.toolCallId, contextSnapshotId: built.snapshot.id, at: input.at,
           content: { version: 2, text: args.prompt, workspaceContext: null, workspaceInput: null, allowedDocumentIds: [...scope.allowedDocumentIds],
             allowedArtifactIds: [...scope.allowedArtifactIds], promptText: built.promptText,
+            ...(built.snapshot.json.research ? { research: built.snapshot.json.research } : {}),
             ...(built.snapshot.json.resourceBinding ? { resourceBinding: built.snapshot.json.resourceBinding } : {}) } }));
         db.query('UPDATE runs SET config_json=? WHERE id=?').run(asJson(validatedConfig({ ...config,
           subagent: { ...config.subagent, childInputId: admitted.inputId } }, 'subagent')), runId);
@@ -3538,6 +3541,13 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const scope = validatedScope(readJson(raw.scope_json!, 'scope'));
         const goalMode = config.goalMode ?? 'answer';
         if (goalMode === 'fill-form') return fail(appError('input_invalid', 'input', 'Fill does not accept active input.'));
+        const research = readResearchContext(db, input.runId);
+        if (research) {
+          if (input.expected !== undefined || scope.version !== 2 || config.workspaceContext !== undefined) return corruptWorkspace();
+          researchMaterialScope(db, research.binding.sourcePolicy);
+          return ok({ runId: input.runId, content: { version: 2, text: input.text, research, workspaceContext: null, workspaceInput: null,
+            allowedDocumentIds: [...scope.allowedDocumentIds], allowedArtifactIds: [...scope.allowedArtifactIds], promptText: input.text } });
+        }
         if (scope.version === 1) {
           const savedInput = validatedInput(readJson(raw.input_json, 'input'));
           if (input.expected !== undefined) return fail(appError('state_conflict', 'input', 'This Chat Run has no Workspace.'));
@@ -3586,6 +3596,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
                 policyVersion: snapshot.json.policyVersion, projectionMode: 'fill-reference', gaps: snapshot.json.modelProjection.gaps })}`
               : formatContextPrompt(snapshot, raw.kind === 'subagent');
             if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
+              || !isDeepStrictEqual(snapshot.json.research, content.research)
               || !isDeepStrictEqual(snapshot.json.inputCommand, content.inputCommand)
               || content.inputCommand && !isDeepStrictEqual(content.inputCommand,
                 FrozenInputDefinitionsSchema.parse(validatedConfig(readJson(raw.config_json, 'config'), raw.kind).inputDefinitions).command)
@@ -3609,6 +3620,14 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
             if (!verified.ok) return verified;
             const valid = requireValidWorkspace(verified.data); if (!valid.ok) return valid;
           }
+          return ok(undefined);
+        }
+        if (content.research) {
+          if (!binding || content.workspaceContext !== null || content.workspaceInput !== null
+            || !isDeepStrictEqual(content.research, readResearchContext(db, binding.runId))) return corruptWorkspace();
+          const scope = researchMaterialScope(db, content.research.binding.sourcePolicy);
+          if (!isDeepStrictEqual(content.allowedDocumentIds, scope.allowedDocumentIds)
+            || !isDeepStrictEqual(content.allowedArtifactIds, scope.allowedArtifactIds)) return corruptWorkspace();
           return ok(undefined);
         }
         const frozen = content.workspaceContext;

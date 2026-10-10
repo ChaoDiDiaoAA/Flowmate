@@ -5,10 +5,10 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 
-test('all sixteen builtin introductions are English while an unknown or changed description keeps its meaning', () => {
+test('all seventeen builtin introductions are English while an unknown or changed description keeps its meaning', () => {
   const root = resolve(import.meta.dirname, '../../resources/skills');
   const descriptions = readdirSync(root).map(id => parseFrontmatter<{ description: string }>(readFileSync(join(root, id, 'SKILL.md'), 'utf8')).frontmatter.description);
-  expect(descriptions).toHaveLength(16);
+  expect(descriptions).toHaveLength(17);
   for (const description of descriptions) expect(skillIntroduction(description)).not.toMatch(/[\u3400-\u9fff]/u);
   const changed = '同一名称的新介绍不应套用旧译文。';
   expect(skillIntroduction(changed)).toBe(changed);

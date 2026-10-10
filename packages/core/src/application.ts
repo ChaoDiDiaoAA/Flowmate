@@ -1,4 +1,5 @@
 import type { InputDefinitions } from './prompt-templates.ts';
+import { ResearchSessionRequestSchema, ResearchSessionResultSchema } from '@flowmate/contracts';
 import {
   appError,
   fail,
@@ -70,6 +71,12 @@ import type { z } from 'zod';
 import type { createResourceService } from './skill-hub/index.ts';
 import type { ResourceSelectionRequest, ResourceSelectionResult, AssemblySelectionSnapshot, ExtensionSelectionRequest, ExtensionSelectionResult } from '@flowmate/contracts';
 import type { ExtensionService } from './extensions/service.ts';
+import type { ResearchRepository } from './research/repository.ts';
+import { ResearchTasksResultSchema, ResearchTaskResultSchema, ResearchPlanResultSchema, ResearchSourceResultSchema,
+  ResearchClaimResultSchema, ResearchReportResultSchema, ResearchSourcesResultSchema, ResearchClaimsResultSchema, ResearchReportsResultSchema,
+  ResearchPlanRequestSchema, ResearchSourceRequestSchema, ResearchClaimRequestSchema, ResearchReportRequestSchema,
+  ResearchSourcesRequestSchema, ResearchClaimsRequestSchema, CreateResearchTaskSchema, ImportResearchMaterialSchema,
+  ResearchMaterialResultSchema, ResearchMaterialsResultSchema } from '@flowmate/contracts';
 
 export interface RuntimeServicePort {
   compactSession: Application['compactSession'];
@@ -92,6 +99,10 @@ export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunReposito
 
 export type DisposeResources = () => Promise<CloseReport>;
 type ProductApplicationOptions = {
+  research?: ResearchRepository;
+  queryResearchEvidence?: (input: import('zod').z.input<typeof import('@flowmate/contracts').ResearchEvidenceRequestSchema>) => Result<import('zod').z.infer<typeof import('@flowmate/contracts').ResearchEvidenceSchema>>;
+  exportResearchReport?: (input: import('zod').z.infer<typeof import('@flowmate/contracts').ResearchReportRequestSchema>) => Result<import('@flowmate/contracts').ResearchExport>;
+  importResearchMaterial?: (input: import('@flowmate/contracts').ImportResearchMaterialRequest) => Result<import('@flowmate/contracts').ResearchMaterial>;
   inputDefinitions?: InputDefinitions;
   resources?: ReturnType<typeof createResourceService>;
   extensions?: ExtensionService;
@@ -143,6 +154,61 @@ export function makeApplication(
     } catch { return fail(appError('config_settings_invalid', 'input', 'Resource configuration is unavailable.')); }
   };
   return {
+    importResearchMaterial: async raw => {
+      const parsed = ImportResearchMaterialSchema.safeParse(raw);
+      return parsed.success ? contextRead(ResearchMaterialResultSchema, () => products?.importResearchMaterial?.(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Selected research material is invalid.'));
+    },
+    listResearchMaterials: async (input = {}) => contextRead(ResearchMaterialsResultSchema, () => products?.research?.listMaterials(input)),
+    createResearchTask: async raw => {
+      const parsed = CreateResearchTaskSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Research task parameters are invalid.'));
+      return contextRead(ResearchTaskResultSchema, () => products?.research?.create({ ...parsed.data, at: new Date().toISOString() }));
+    },
+    listResearchTasks: async (input = {}) => contextRead(ResearchTasksResultSchema, () => products?.research?.list(input)),
+    queryResearchTask: async id => contextRead(ResearchTaskResultSchema, () => products?.research?.get(id)),
+    queryResearchForSession: async input => {
+      const parsed = ResearchSessionRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchSessionResultSchema, () => products?.research?.forSession(parsed.data.sessionId))
+        : fail(appError('input_invalid', 'input', 'Research Session query is invalid.'));
+    },
+    queryResearchPlan: async input => {
+      const parsed = ResearchPlanRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchPlanResultSchema, () => products?.research?.getPlan(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research plan query is invalid.'));
+    },
+    queryResearchSource: async input => {
+      const parsed = ResearchSourceRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchSourceResultSchema, () => products?.research?.getSource(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research source query is invalid.'));
+    },
+    queryResearchClaim: async input => {
+      const parsed = ResearchClaimRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchClaimResultSchema, () => products?.research?.getClaim(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research Claim query is invalid.'));
+    },
+    queryResearchReport: async input => {
+      const parsed = ResearchReportRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchReportResultSchema, () => products?.research?.getReport(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research report query is invalid.'));
+    },
+    listResearchSources: async input => {
+      const parsed = ResearchSourcesRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchSourcesResultSchema, () => products?.research?.listSources(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research source list is invalid.'));
+    },
+    listResearchClaims: async input => {
+      const parsed = ResearchClaimsRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchClaimsResultSchema, () => products?.research?.listClaims(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research Claim list is invalid.'));
+    },
+    listResearchReports: async input => {
+      const parsed = ResearchSourcesRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchReportsResultSchema, () => products?.research?.listReports(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research report list is invalid.'));
+    },
+    queryResearchEvidence: async input => products?.queryResearchEvidence?.(input) ?? fail(appError('research_unavailable', 'storage', 'Research evidence is unavailable.')),
+    exportResearchReport: async input => products?.exportResearchReport?.(input) ?? fail(appError('research_unavailable', 'storage', 'Research export is unavailable.')),
     listSubagentDefinitions: async () => products?.inputDefinitions?.listSubagentDefinitions() ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
     getSubagentDefinition: async raw => products?.inputDefinitions?.getSubagentDefinition(raw) ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
     saveSubagentDefinition: async raw => products?.inputDefinitions?.saveSubagentDefinition(raw) ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),

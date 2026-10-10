@@ -45,7 +45,7 @@ describe('P6 runtime event migration', () => {
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 18 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
     expect(opened.data.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     expect(opened.data.db.query('PRAGMA busy_timeout').get()).toEqual({ timeout: 1000 });
     expect(opened.data.db.query('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
@@ -62,7 +62,7 @@ describe('P6 runtime event migration', () => {
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 18 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
     expect(opened.data.db.query('SELECT * FROM runs WHERE id=24').get()).toEqual({ ...(before as Record<string, unknown>),
       current_context_snapshot_id: null, context_observations_json: null, parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null });
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -91,7 +91,7 @@ describe('P6 runtime event migration', () => {
     if (!opened.ok) throw new Error(opened.error.code);
     const product = opened.data; deferCleanup(() => product.close());
     const db = product.db;
-    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 18 });
+    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
     expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     const firstSession = product.sessions.create({ nativeSessionId: 'p6-ddl-first', title: 'First', at: stamp });
     const secondSession = product.sessions.create({ nativeSessionId: 'p6-ddl-second', title: 'Second', at: stamp });

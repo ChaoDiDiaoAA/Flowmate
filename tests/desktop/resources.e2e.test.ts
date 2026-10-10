@@ -26,7 +26,7 @@ it('displays Core readiness independently of enablement and adapts both Skills e
     await page.getByRole('button', { name: 'Skills', exact: true }).click();
     await page.getByRole('switch', { name: 'Enable invoice v1', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
-    await expect(page.locator('.skill-row-copy p').first()).toContainText('Organize fields');
+    await expect(page.locator('.skill-row').filter({ has: page.getByRole('button', { name: 'View invoice v1', exact: true }) }).locator('.skill-row-copy p')).toContainText('Organize fields');
     await installReadGate(app, userData);
     let held = 0;
     async function display(catalog: ResourceCatalog) {
@@ -148,9 +148,9 @@ it('manages fixed Prompt and Skill versions through real IPC without model or to
     expect(await page.evaluate(() => window.flowmate.listResources())).toMatchObject({ ok: true, data: { selection: { prompt: { id: 'invoice', version: 'v1' } } } });
     await page.getByRole('button', { name: 'Skills', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toBeVisible();
-    await expect(page.getByRole('switch')).toHaveCount(16);
+    await expect(page.getByRole('switch')).toHaveCount(17);
     const introductions = await page.locator('.skill-row-copy p').allTextContents();
-    expect(introductions).toHaveLength(16);
+    expect(introductions).toHaveLength(17);
     expect(introductions.every(text => text.length > 0 && !/[\u3400-\u9fff]/.test(text))).toBe(true);
     for (const description of await page.locator('.skill-row-copy p').all())
       await expect(description).toHaveAttribute('title', await description.textContent() ?? '');
@@ -169,7 +169,7 @@ it('manages fixed Prompt and Skill versions through real IPC without model or to
     const library = await page.evaluate(() => window.flowmate.listResources());
     expect(library).toMatchObject({ ok: true, data: { selection: { enabledSkills: [] } } });
     if (!library.ok) throw new Error(library.error.code);
-    expect(library.data.items.filter(item => item.ref.kind === 'skill')).toHaveLength(16);
+    expect(library.data.items.filter(item => item.ref.kind === 'skill')).toHaveLength(17);
     await page.getByLabel('Search skills').fill('invoice-source-audit');
     await expect(page.getByRole('switch')).toHaveCount(1);
     await page.getByRole('switch', { name: 'Enable invoice-source-audit v1', exact: true }).click();
@@ -181,7 +181,7 @@ it('manages fixed Prompt and Skill versions through real IPC without model or to
     await expect(page.getByTestId('resource-file')).toContainText('来源');
     const savedSelection = await page.evaluate(() => window.flowmate.listResources());
     await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'Skills', exact: true }).click();
-    await expect(page.locator('.embedded-resources .skill-row')).toHaveCount(16);
+    await expect(page.locator('.embedded-resources .skill-row')).toHaveCount(17);
     const embeddedIntroductions = await page.locator('.embedded-resources .skill-row-copy p').allTextContents();
     expect(embeddedIntroductions).toEqual(introductions);
     expect(await page.evaluate(() => window.flowmate.listResources())).toEqual(savedSelection);
@@ -243,7 +243,8 @@ it('atomically clears multiple unavailable selected resources through visible co
     const saved = await page.evaluate(async () => {
       const state = await window.flowmate.getState(), catalog = await window.flowmate.listResources();
       if (!state.ok || !catalog.ok) throw new Error('Fixture settings unavailable');
-      const prompt = catalog.data.items.find(item => item.ref.kind === 'prompt')!.ref, skill = catalog.data.items.find(item => item.ref.kind === 'skill')!.ref;
+      const prompt = catalog.data.items.find(item => item.ref.kind === 'prompt' && item.ref.id === 'invoice')!.ref,
+        skill = catalog.data.items.find(item => item.ref.kind === 'skill' && item.ref.id === 'invoice')!.ref;
       return { ...state.data.settings, revision: state.data.settings.revision + 1,
         resources: { prompt: { ...prompt, version: 'missing-prompt' }, enabledSkills: [{ ...skill, version: 'missing-skill' }] } };
     });

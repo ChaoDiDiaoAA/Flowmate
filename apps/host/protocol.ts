@@ -1,5 +1,7 @@
 export { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../packages/contracts/src/input-commands.ts';
 import { InputDefinitionCommandSchema } from '@flowmate/contracts';
+import { ResearchIntentSchema } from '@flowmate/contracts';
+import { researchOperations } from '../../packages/contracts/src/research-commands.ts';
 import { z } from 'zod';
 export { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure } from '../../packages/contracts/src/extensions.ts';
 export { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../packages/contracts/src/resources.ts';
@@ -39,7 +41,7 @@ const requiredSkill = ResourceRefSchema.refine(ref => ref.kind === 'skill').opti
 const inputText = z.string().refine(value => value.trim().length > 0 && new TextEncoder().encode(value).byteLength <= 65_000);
 export const DesktopSessionInputRequestSchema = z.discriminatedUnion('mode', [
   z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('prompt'), text: inputText, modelId, requiredSkill,
-    goalMode: z.enum(['answer', 'save-candidate']).default('answer'), workspace: WorkspaceExpectationSchema.optional(),
+    research: ResearchIntentSchema.optional(), goalMode: z.enum(['answer', 'save-candidate']).default('answer'), workspace: WorkspaceExpectationSchema.optional(),
     workingDirectory: WorkingDirectorySchema.optional(), ...RuntimeRequestOverridesSchema.shape,
   }).strict(),
   z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('steer'), runId: dbId, text: inputText, requiredSkill,
@@ -49,6 +51,8 @@ export const DesktopSessionInputRequestSchema = z.discriminatedUnion('mode', [
 ]).superRefine((input, ctx) => {
   if (input.workspace && input.workspace.sessionId !== input.sessionId)
     ctx.addIssue({ code: 'custom', message: 'Workspace must refer to the same Session.' });
+  if (input.mode === 'prompt' && input.research && (input.workspace || input.workingDirectory !== undefined || input.goalMode !== 'answer'))
+    ctx.addIssue({ code: 'custom', message: 'Research requires its own explicit source policy.' });
   if (input.mode === 'prompt' && input.workingDirectory !== undefined && input.workspace === undefined)
     ctx.addIssue({ code: 'custom', message: 'Working directory requires a Workspace Run.' });
   if (input.mode === 'prompt' && input.goalMode === 'save-candidate' && (!input.workspace?.documentRef || !input.workspace.jobId))
@@ -109,6 +113,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('save_settings'), settings: z.unknown() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_extensions'), input: SessionExtensionQuerySchema }).strict(),
   ...InputDefinitionCommandSchema.options.map(option => option.extend({ version: z.literal(1), requestId })),
+  ...(Object.keys(researchOperations) as (keyof typeof researchOperations)[]).map(type => z.object({ version: z.literal(1), requestId,
+    type: z.literal(type), input: researchOperations[type][1] }).strict()),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_subagents'), input: ListSubagentsRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_subagent'), input: QuerySubagentRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('cancel_subagent'), input: CancelSubagentRequestSchema }).strict(),

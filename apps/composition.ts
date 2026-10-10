@@ -2,14 +2,17 @@ import { createInputDefinitions } from '../packages/core/src/prompt-templates.ts
 import { parseFrontmatter, loadPromptTemplates, expandPromptTemplate } from '@flowmate/runtime-pi';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import { readResearchEvidence, exportResearchReport } from '@flowmate/core';
+import { ResearchEvidenceRequestSchema } from '@flowmate/contracts';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
-  ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool } from '@flowmate/core';
+  ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool, createResearchPlanTool, createResearchReadTools, createResearchSynthesisTools } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, listSkillResources, readSkillResource, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createNativeTools, inspectNativeResources, PI_SDK_VERSION } from '@flowmate/runtime-pi';
 import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
-import { appError, ok } from '@flowmate/contracts';
+import { appError, fail, ok } from '@flowmate/contracts';
 import type { Application, MemoryStore, ProductPaths, PromptTraceBuffer, Result, RuntimeRequestOverrides, RuntimeStrategyPolicy } from '@flowmate/contracts';
 import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ProviderPort, ToolDefinition } from '@flowmate/contracts';
 import type { SafeLogger } from '@flowmate/shared';
@@ -71,7 +74,15 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     sessions: database.data.sessions, documents: database.data.documents, jobs: database.data.jobs,
     workspace: database.data.workspace, candidates: database.data.candidates, bridge: options.invoiceFormBridge, now }) : undefined;
   let agent: import('@flowmate/contracts').AgentPort;
-  const assembled = [...createInvoiceTools({ documents, documentRepository: database.data.documents,
+  const researchReads = createResearchReadTools({ research: database.data.research, calls: database.data.toolCalls, files,
+    documents: database.data.documents, now,
+    readDocument: (id, context) => {
+      const loaded = documents.readParsedForRun(id, context);
+      return loaded.ok ? ok({ text: loaded.data.parsed.pages.map(page => `[Page ${page.page}]\n${page.blocks.map(block => block.text).join('\n')}`).join('\n\n'),
+        artifactId: loaded.data.document.parsedArtifactId, title: `Document ${id}` }) : loaded;
+    } });
+  const researchSynthesis = createResearchSynthesisTools({ research: database.data.research, calls: database.data.toolCalls, files, now });
+  const assembled = [createResearchPlanTool(database.data.research, database.data.toolCalls, now), ...researchReads, ...researchSynthesis, ...createInvoiceTools({ documents, documentRepository: database.data.documents,
     candidates: database.data.candidates, now }), listSkillResources((input, context) => resources.listSkillResources(input, context)),
     readSkillResource((input, context) => resources.readSkillResource(input, context)),
     ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), createSubagentTool(() => agent), ...native.definitions];
@@ -97,6 +108,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const memory: MemoryStore = Object.assign(database.data.memory, { list: (input: Parameters<MemoryStore['list']>[0]) => sessionService.listHistory(input) });
   const runtime = new RuntimeService({
     memory,
+    research: database.data.research,
     runs: database.data.runs,
     recoveryError: database.data.recoveryError,
     sessions: database.data.sessions,
@@ -150,6 +162,29 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     saveExtensionSelection: options.saveExtensionSelection,
     documents: database.data.documents,
     jobs: database.data.jobs,
+    research: database.data.research,
+    exportResearchReport: input => exportResearchReport({ research: database.data.research, calls: database.data.toolCalls, files }, input),
+    queryResearchEvidence: input => {
+      const parsed = ResearchEvidenceRequestSchema.safeParse(input);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Evidence request is invalid.'));
+      const task = database.data.research.get(parsed.data.researchId);
+      return task.ok ? readResearchEvidence({ research: database.data.research, calls: database.data.toolCalls, files }, parsed.data, task.data.sourcePolicy) : task;
+    },
+    importResearchMaterial: input => {
+      const contentHash = createHash('sha256').update(input.text, 'utf8').digest('hex');
+      const found = database.data.research.findMaterial({ title: input.title, format: input.format, contentHash });
+      if (!found.ok) return found;
+      if (found.data) {
+        const artifact = database.data.documents.getArtifact(found.data.artifactId);
+        if (!artifact.ok) return artifact;
+        const body = files.read(artifact.data);
+        if (!body.ok) return body;
+        return createHash('sha256').update(body.data).digest('hex') === contentHash ? ok(found.data)
+          : fail(appError('research_source_unavailable', 'storage', 'The saved material has changed.'));
+      }
+      const published = files.publishResearchMaterial({ ...input, at: now() });
+      return published.ok ? database.data.research.registerMaterial(published.data) : published;
+    },
     candidates: database.data.candidates,
     events: database.data.businessEvents,
     runtimeEvents: database.data.runtimeEvents,

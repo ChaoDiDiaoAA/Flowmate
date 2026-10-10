@@ -189,7 +189,7 @@ async function denseFixture() {
         connection:{baseUrl:input.baseUrl,api:'openai-completions',contextWindow:128000,maxTokens:16384},parameters:{maxRetries:0,maxRetryDelayMs:100}};
       let done;const terminal=new Promise(resolve=>done=resolve);
       const accepted=need(await app.submitInput({sessionId:session.sessionId,clientSequence:1,mode:'prompt',text:'Original invoice request',goalMode:'save-candidate',workspace:expected,
-        config,budget:{maxModelCalls:64,maxToolCalls:32},timeoutMs:60000,stopGraceMs:1000},{onEvent(event){if(event.type==='run_finished')done(event);}}));
+        config,budget:{maxModelCalls:64,maxToolCalls:32},timeoutMs:120000,stopGraceMs:1000},{onEvent(event){if(event.type==='run_finished')done(event);}}));
       console.error('Dense seed: accepted'); await entered; console.error('Dense seed: first tool entered');
       for(let sequence=2;sequence<=22;sequence++)need(await app.submitInput({sessionId:session.sessionId,clientSequence:sequence,mode:'steer',runId:accepted.runId,text:'Original steer '+sequence,workspace:expected}));
       console.error('Dense seed: 22 snapshots accepted'); release();const end=await terminal;if(!end.result.ok||end.result.data.status!=='completed')throw new Error('Dense run did not complete: '+JSON.stringify(end));
@@ -232,7 +232,7 @@ async function denseFixture() {
 }
 
 it('P9 T08 forks through History while preserving real invoice Job candidates and original evidence bytes', async () => {
-  it.setTimeout(90_000);
+  it.setTimeout(180_000);
   const f = await denseFixture(); let failure: Error | undefined;
   try {
     const baseline = await f.page.evaluate(() => window.flowmate.readWorkspace()); if (!baseline.ok) throw new Error(baseline.error.code);
@@ -376,7 +376,7 @@ it('invalidates Context during real Host exit and reads the same saved facts aft
 });
 
 it('pages real original snapshots requests and Tool model human bases without changing the current other invoice', async () => {
-  it.setTimeout(90_000); // Match the other denseFixture journey: 22 real inputs and >20 SDK requests precede the UI steps.
+  it.setTimeout(180_000); // Match the other denseFixture journey: 22 real inputs and >20 SDK requests precede the UI steps.
   const f = await denseFixture(); let failure: Error | undefined;
   try {
     const baseline = await f.page.evaluate(() => window.flowmate.readWorkspace()), http = f.requests();

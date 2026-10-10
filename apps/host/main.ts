@@ -1,4 +1,5 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from './protocol.ts';
+import { isResearchHostCommand, parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchOperations } from '../../packages/contracts/src/research-commands.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
@@ -562,6 +563,15 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
       const result = parseExtensionHostResult(command.type, value);
       send({ version: 1, type: 'response', requestId: command.requestId, value: result && matchesExtensionResponse(command, result) ? result
         : fail(appError('host_protocol_invalid', 'runtime', 'Extension response could not be verified.')) }); return;
+    }
+    if (isResearchHostCommand(command.type)) {
+      const captured = parseResearchCommand({ type: command.type, input: 'input' in command ? command.input : undefined });
+      if (!captured) { send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('input_invalid', 'input', 'Research request is invalid.')) }); return; }
+      const value = captured.type === 'query_research_task' ? await application.queryResearchTask((captured.input as { researchId: number }).researchId)
+        : await application[researchOperations[captured.type][0]](captured.input as never);
+      const result = parseResearchHostResult(captured.type, value);
+      send({ version: 1, type: 'response', requestId: command.requestId, value: result && matchesResearchResponse(captured, result) ? result
+        : fail(appError('host_protocol_invalid', 'runtime', 'Research response could not be verified.')) }); return;
     }
     if (isResourceHostCommand(command.type)) {
       const value = command.type === 'list_resources' ? await application.listResources()

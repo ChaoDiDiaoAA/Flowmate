@@ -36,6 +36,8 @@ function nodeDefinition(schema: z.ZodTypeAny): ZodNodeDefinition {
 function convert(schema: z.ZodTypeAny, path = 'root'): TSchema {
   const def = nodeDefinition(schema);
   switch (def.typeName) {
+    case 'ZodBoolean':
+      return def.coerce ? unsupported(path) : Type.Boolean();
     case 'ZodEffects':
       // Custom refinements still run in prepareArguments and Executor; transformations remain unsupported.
       return def.effect?.type === 'refinement' && def.schema ? convert(def.schema, path) : unsupported(path);

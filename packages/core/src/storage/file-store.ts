@@ -1,9 +1,9 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, linkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, writeFileSync, linkSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Dirent } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { appError, fail, ok } from '@flowmate/contracts';
-import type { DbId, ProductPaths, Result, ExportInvoiceCandidateRequest, InvoiceExportReference } from '@flowmate/contracts';
+import type { DbId, ProductPaths, Result, ExportInvoiceCandidateRequest, InvoiceExportReference, SourceSnapshot } from '@flowmate/contracts';
 import type { DocumentRepository, StoredArtifact } from './repositories.ts';
 
 export type ArtifactPayload = {
@@ -68,7 +68,7 @@ function fileMime(name: string): string {
 }
 
 function validArtifactName(name: string): boolean {
-  return ['original.jpg', 'original.png', 'parsed.json', 'raw-content.json', 'raw-pages.json', 'source.json'].includes(name);
+  return ['original.jpg', 'original.png', 'parsed.json', 'raw-content.json', 'raw-pages.json', 'source.json', 'source.txt', 'source.md'].includes(name);
 }
 
 function invoiceExportPath(paths: Pick<ProductPaths, 'root' | 'outputsDir'>, relativePath: string): string {
@@ -102,6 +102,81 @@ export class FileStore {
   public constructor(private readonly paths: ProductPaths, private readonly documents: DocumentRepository) {
     this.root = resolve(paths.root);
     this.artifactRoot = resolve(paths.artifactsDir);
+  }
+
+  public publishResearchSource(input: { researchId: number; text: string }): Result<Pick<SourceSnapshot, 'relativePath' | 'contentHash' | 'bytes' | 'characters'>> {
+    const bytes = Buffer.from(input.text, 'utf8');
+    if (!Number.isSafeInteger(input.researchId) || input.researchId < 1 || bytes.length < 1 || bytes.length > 2_000_000
+      || new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) !== input.text) return fail(appError('input_invalid', 'input', 'Research source body is invalid.'));
+    const contentHash = createHash('sha256').update(bytes).digest('hex');
+    const value = { relativePath: `artifacts/research/${input.researchId}/${contentHash}.txt`, contentHash, bytes: bytes.length, characters: input.text.length };
+    let temporary: string | null = null;
+    try {
+      const target = this.researchSourcePath(input.researchId, contentHash, true);
+      if (existsSync(target)) return this.readResearchSource({ ...value, researchId: input.researchId }).ok
+        ? ok(value) : fail(appError('research_source_conflict', 'storage', 'Existing research evidence cannot be overwritten.'));
+      temporary = join(dirname(target), `.research-source-${randomUUID()}.tmp`);
+      writeFileSync(temporary, bytes, { flag: 'wx' });
+      if (!readFileSync(temporary).equals(bytes)) throw new Error('research_publish_check');
+      try { linkSync(temporary, target); }
+      catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error; }
+      return this.readResearchSource({ ...value, researchId: input.researchId }).ok ? ok(value)
+        : fail(appError('research_source_conflict', 'storage', 'Published research evidence differs from its receipt.'));
+    } catch { return fail(appError('storage_write_failed', 'storage', 'Research evidence publication failed.', true)); }
+    finally { if (temporary) try { rmSync(temporary); } catch { /* keep the publication result */ } }
+  }
+
+  public publishResearchMaterial(input: { title: string; format: 'text' | 'markdown'; text: string; at: string }): Result<PublishedArtifact> {
+    const bytes = Buffer.from(input.text, 'utf8'), name = input.format === 'markdown' ? 'source.md' : 'source.txt';
+    if (bytes.length < 1 || bytes.length > 2_000_000 || bytes.toString('utf8') !== input.text) return fail(appError('input_invalid', 'input', 'Selected text is invalid.'));
+    let staging: string | null = null;
+    try {
+      if (!within(realpathSync(this.root), this.artifactRoot) || lstatSync(this.artifactRoot).isSymbolicLink()
+        || realpathSync(this.artifactRoot) !== this.artifactRoot) throw new Error('research_material_root');
+      const known = this.documents.listArtifactIds(); if (!known.ok) return known;
+      const occupied = new Set([...known.data, ...readdirSync(this.artifactRoot).filter(value => /^[1-9]\d*$/.test(value)).map(Number)]);
+      let artifactId = 1; while (occupied.has(artifactId)) artifactId++;
+      if (!Number.isSafeInteger(artifactId)) throw new Error('artifact_id_exhausted');
+      const mimeType = input.format === 'markdown' ? 'text/markdown' : 'text/plain';
+      const metadata = { version: 1 as const, sourceKey: 'research-local-v1', sourceRecordId: input.title,
+        sourceVersion: createHash('sha256').update(bytes).digest('hex'), files: [{ relativePath: name, bytes: bytes.length, mimeType }] };
+      staging = mkdtempSync(join(this.artifactRoot, '.research-material-'));
+      writeFileSync(join(staging, name), bytes, { flag: 'wx' });
+      writeFileSync(join(staging, 'manifest.json'), jsonBytes({ ...metadata, kind: 'original', files: [{ name, bytes: bytes.length, mimeType }] }), { flag: 'wx' });
+      if (!readFileSync(join(staging, name)).equals(bytes)) throw new Error('research_material_publication');
+      renameSync(staging, join(this.artifactRoot, String(artifactId))); staging = null;
+      return ok({ artifactId, kind: 'original', relativePath: `artifacts/${artifactId}/${name}`, bytes: bytes.length, mimeType, metadata, createdAt: input.at });
+    } catch { return fail(appError('storage_write_failed', 'storage', 'Research material publication failed.', true)); }
+    finally {
+      if (staging) try { for (const name of ['source.md', 'source.txt', 'manifest.json']) if (existsSync(join(staging, name))) rmSync(join(staging, name)); rmdirSync(staging); }
+      catch { /* keep owned staging for inspection */ }
+    }
+  }
+
+  public readResearchSource(reference: Pick<SourceSnapshot, 'researchId' | 'relativePath' | 'contentHash' | 'bytes' | 'characters'>): Result<string> {
+    try {
+      if (reference.relativePath !== `artifacts/research/${reference.researchId}/${reference.contentHash}.txt`
+        || !Number.isSafeInteger(reference.bytes) || reference.bytes < 1 || reference.bytes > 2_000_000) throw new Error('research_source_reference');
+      const path = this.researchSourcePath(reference.researchId, reference.contentHash, false), stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== reference.bytes) throw new Error('research_source_file');
+      const bytes = readFileSync(path);
+      if (bytes.length !== reference.bytes || createHash('sha256').update(bytes).digest('hex') !== reference.contentHash) throw new Error('research_source_hash');
+      const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      if (text.length !== reference.characters) throw new Error('research_source_characters');
+      return ok(text);
+    } catch { return fail(appError('research_source_unavailable', 'tool', 'Saved research evidence is missing or changed.')); }
+  }
+
+  private researchSourcePath(researchId: number, hash: string, create: boolean): string {
+    if (!Number.isSafeInteger(researchId) || researchId < 1 || !/^[0-9a-f]{64}$/.test(hash)) throw new Error('research_source_reference');
+    const root = realpathSync(this.root);
+    for (const directory of [this.artifactRoot, join(this.artifactRoot, 'research'), join(this.artifactRoot, 'research', String(researchId))]) {
+      if (!within(root, directory)) throw new Error('research_source_directory');
+      if (create && !existsSync(directory)) mkdirSync(directory);
+      const stat = lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || !within(root, directory) || realpathSync(directory) !== resolve(directory)) throw new Error('research_source_directory');
+    }
+    return join(this.artifactRoot, 'research', String(researchId), `${hash}.txt`);
   }
 
   public publishInvoiceExport(input: { candidateId: DbId; jobId: DbId; sequence: number;

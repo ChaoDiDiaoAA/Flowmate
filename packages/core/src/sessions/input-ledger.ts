@@ -62,6 +62,7 @@ export function verifyNativeCommitContexts(db: Database, sessionId: DbId, contex
       if (input.contextSnapshotId !== null) {
         const saved = readContextSnapshotOwner(db, input.contextSnapshotId, owner);
         if (input.content.version !== 2 || input.content.text !== saved.json.text || input.goalMode !== saved.json.goalMode
+          || !isDeepStrictEqual(input.content.research, saved.json.research)
           || !isDeepStrictEqual(input.content.resourceBinding, saved.json.resourceBinding)
           || !isDeepStrictEqual(input.content.workspaceContext, saved.json.workspaceContext)
           || !isDeepStrictEqual(input.content.allowedDocumentIds, saved.json.allowedDocumentIds)

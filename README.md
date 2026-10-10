@@ -1,5 +1,11 @@
 # Flowmate
 
+> Deep Research当前实施范围：仅用户选择的本地文本／Markdown和已有解析资料；本轮不实现联网搜索／网页提取，也无需Tavily key。核心设计见[主方案第19章](docs/spec/00_Flowmate完整方案_v1.md#deep-research)。
+
+**Deep Research核心价值与设计：** 用户确认复杂问题的研究计划后，工作流组织资料获取、综合与证据核验，交付覆盖／依据／局限可查看的保存报告。核心为研究规划→能力执行→证据收集→Agent综合→证据报告→持久化，复用Pi SDK／现有Runtime，详见[主§19.1–19.2](docs/spec/00_Flowmate完整方案_v1.md#research-core-chain)。本地研究产品已接合；研究质量仍待独立评测验证。
+
+> **2026-10-10 Deep Research现行交付：** P1–P14→P15 Deep Research→独立统一评测→P16 Evaluation桌面→P17 Host & Packaging。[主方案§19](docs/spec/00_Flowmate完整方案_v1.md#deep-research)、[P15目标](docs/spec/P15_目标方案_v1.md)、[P15计划](docs/plans/P15_实施计划_v1.md)、[评测总计划](docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md#manual-route)。桌面在Chats之后新增独立Deep Research，研究列表／新建／Plan、Evidence、Report及右侧关联Session。原50／10＋研究12／4＝62／14，原33项＋研究6项＝39，Runtime24另报；本地研究产品已交付，证据见[P15实施记录](docs/plans/P15_实施计划_v1.md#p15-engineering-delivery)；研究评测工程及正式数据仍待实施，现有readiness=false保持，历史日期／成绩／Runtime T15/T16不改。
+
 ## 当前命令菜单与三栏布局
 
 2026-10-09 本轮界面修订已通过标准入口 `bun --no-env-file run test`：类型检查、Unit 356/0、Integration 1341/0、桌面构建及 Electron 101/0（10.3m），退出 0。方案、审查修复和实际结果见 [本轮实施记录](docs/plans/2026-10-09_命令菜单英文与三栏调整_实施记录.md)；下方旧成绩保留原交付范围。
@@ -29,7 +35,7 @@ Skills 主页面与 Settings → Skills 共用紧凑列表、英文介绍、依�
 
 ## 项目与当前阶段
 
-基于 Pi SDK 的本地发票 Agent。当前工作区已实现受控解析材料导入、发票工作台、Assistant 对话及重启续聊、P4 原生消息查询/展示和候选来源记录。普通复核工厂保留13项业务工具，可信桌面另装配第14项填表工具；本轮人工保存、接受和三格式导出接合及工程证据见 [P4实施计划 §5](docs/plans/P4_实施计划_v1.md)。原票供人工查看，业务取证使用已登记解析材料。旧连接的真实模型 A20 请求、失败/复验和样例观察保留在 [P3 实施计划](docs/plans/P3_实施计划_v1.md)；新配置的连接/认证/协议工程记录按其实际范围解释。真实模型自主填表及业务正确性统一归 [评测总方案 §12](docs/eval/01_Flowmate_Agent评测总方案_v1.md#12-统一评测启用与验收)：P16及整体产品、真实 Agent 入口与必要采证就绪且工程验证通过后才制作和运行 Benchmark，不作为当前阶段剩余任务。
+基于 Pi SDK 的本地发票 Agent。当前工作区已实现受控解析材料导入、发票工作台、Assistant 对话及重启续聊、P4 原生消息查询/展示和候选来源记录。普通复核工厂保留13项业务工具，可信桌面另装配第14项填表工具；本轮人工保存、接受和三格式导出接合及工程证据见 [P4实施计划 §5](docs/plans/P4_实施计划_v1.md)。原票供人工查看，业务取证使用已登记解析材料。旧连接的真实模型 A20 请求、失败/复验和样例观察保留在 [P3 实施计划](docs/plans/P3_实施计划_v1.md)；新配置的连接/认证/协议工程记录按其实际范围解释。真实模型自主填表及业务正确性统一归 [评测总方案 §12](docs/eval/01_Flowmate_Agent评测总方案_v1.md#eval01-12)：P1–P15对应产品能力、真实Agent入口与必要采证就绪且工程验证通过后才制作和运行 Benchmark，不作为当前阶段剩余任务。
 
 ## 安装与配置
 

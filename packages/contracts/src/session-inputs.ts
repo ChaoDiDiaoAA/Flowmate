@@ -1,5 +1,7 @@
 import { FrozenInputCommandSchema } from './input-commands.ts';
 import { z } from 'zod';
+import { ResearchIntentSchema, ResearchContextSchema } from './research.ts';
+import type { ResearchIntent } from './research.ts';
 import { appError, fail, ok } from './errors.ts';
 import { AppErrorSchema, RuntimeRequestOverridesSchema } from './runtime.ts';
 import type { DbId, ProviderConfig, Result, RuntimeBudgetOverrides } from './runtime.ts';
@@ -31,12 +33,14 @@ export const LegacySessionInputRequestSchema = z.object({
   && value.workspace.documentRef !== null && value.workspace.jobId !== null && value.workspace.candidateRef !== null,
 'Fill requires the selected candidate in the same Session.');
 const promptSchema = z.object({
+  research: ResearchIntentSchema.optional(),
   sessionId: id, clientSequence: id, mode: z.literal('prompt'), goalMode: z.enum(['answer', 'save-candidate']).default('answer'), text,
   requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional(),
   config: providerConfig, workspace: WorkspaceExpectationSchema.optional(),
   workingDirectory: WorkingDirectorySchema.optional(), ...RuntimeRequestOverridesSchema.shape,
 }).strict().refine(value => (!value.workspace || value.workspace.sessionId === value.sessionId)
   && (value.workingDirectory === undefined || value.workspace !== undefined)
+  && (!value.research || value.goalMode === 'answer' && !value.workspace && value.workingDirectory === undefined)
   && (value.goalMode !== 'save-candidate' || !!value.workspace?.documentRef && !!value.workspace.jobId),
 'Prompt requires a compatible Workspace and business target.');
 const activeSchema = z.object({ sessionId: id, clientSequence: id, mode: z.enum(['steer', 'followUp']),
@@ -54,7 +58,7 @@ const fillSchema = z.object({
 export const SessionInputRequestSchema = z.union([fillSchema, promptSchema, activeSchema]);
 type InputBase = { sessionId: DbId; clientSequence: DbId; text: string; requiredSkill?: ResourceRef };
 export type PromptInputRequest = InputBase & { mode: 'prompt'; config: ProviderConfig; workspace?: WorkspaceExpectation;
-  goalMode?: 'answer' | 'save-candidate'; workingDirectory?: string; budget?: RuntimeBudgetOverrides; timeoutMs?: number; stopGraceMs?: number };
+  research?: ResearchIntent; goalMode?: 'answer' | 'save-candidate'; workingDirectory?: string; budget?: RuntimeBudgetOverrides; timeoutMs?: number; stopGraceMs?: number };
 export type FillInputRequest = InputBase & { mode: 'prompt'; goalMode: 'fill-form'; config: ProviderConfig;
   workspace: WorkspaceExpectation; formTarget: InvoiceFormTarget; budget?: RuntimeBudgetOverrides; timeoutMs?: number; stopGraceMs?: number };
 export type ActiveInputRequest = InputBase & { mode: 'steer' | 'followUp'; runId: DbId; workspace?: WorkspaceExpectation };
@@ -81,7 +85,7 @@ export function normalizeSessionInputsRequest(raw: unknown): Result<NormalizedSe
 export const LegacySessionInputContentSchema = z.object({ version: z.literal(1), text: z.string(),
   workspaceContext: LegacyWorkspaceContextSchema, allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id) }).strict();
 export type SessionInputContentV1 = z.infer<typeof LegacySessionInputContentSchema>;
-export const SessionInputContentV2Schema = z.object({ version: z.literal(2), text: z.string(),
+export const SessionInputContentV2Schema = z.object({ research: ResearchContextSchema.optional(), version: z.literal(2), text: z.string(),
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id), promptText: z.string().min(1),
   inputCommand: FrozenInputCommandSchema.optional(),

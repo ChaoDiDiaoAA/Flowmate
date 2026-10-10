@@ -274,11 +274,11 @@ describe('P13 SQLite ownership and migration', () => {
     const objects = old.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND name!='context_snapshot_insert_guard' ORDER BY name").all();
     old.close();
     const store = need(openTestDatabase(p));
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 18 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
     expect(store.db.query(`SELECT ${columns.join(',')} FROM runs ORDER BY id`).all()).toEqual(before);
     expect(store.db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs').all()).toEqual([
       { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);
-    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND name NOT IN ('context_snapshot_insert_guard','subagent_parallel_limit') ORDER BY name").all()).toEqual(objects);
+    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND tbl_name NOT IN ('research_tasks','research_runs','research_plans','research_sources','research_claims','research_reports') AND name NOT IN ('context_snapshot_insert_guard','subagent_parallel_limit') ORDER BY name").all()).toEqual(objects);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(store.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     expect(store.db.query('PRAGMA legacy_alter_table').get()).toEqual({ legacy_alter_table: 0 });

@@ -177,7 +177,7 @@ describe('P11 real resource files and native discovery', () => {
     expect(view.data.frozen?.discoveredSkills.map(ref => ref.id).sort()).toEqual([...ids].sort());
   });
 
-  it('loads the shipped sixteen flat Skills with real SDK metadata and excludes write-dependent SOPs from READ and Fill scopes', async () => {
+  it('loads the shipped seventeen flat Skills with real SDK metadata and excludes write-dependent SOPs from READ and Fill scopes', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-shipped-skills-'));
     const paths = resolveProductPaths(root); if (!paths.ok) throw new Error(paths.error.code);
     let definitions: readonly ToolDefinition<any, any>[] = [];
@@ -185,7 +185,7 @@ describe('P11 real resource files and native discovery', () => {
     if (!created.ok) throw new Error(created.error.code); deferCleanup(() => created.data.close());
     const catalog = await created.data.listResources(); if (!catalog.ok) throw new Error(catalog.error.code);
     const skills = catalog.data.items.filter(item => item.ref.kind === 'skill');
-    expect(skills.map(item => item.ref.id)).toEqual(['invoice', 'invoice-amount-reconciliation', 'invoice-candidate-comparison',
+    expect(skills.map(item => item.ref.id)).toEqual(['deep-research', 'invoice', 'invoice-amount-reconciliation', 'invoice-candidate-comparison',
       'invoice-candidate-issue-triage', 'invoice-candidate-save', 'invoice-conflict-review', 'invoice-date-currency-review',
       'invoice-evidence-discovery', 'invoice-form-readiness-review', 'invoice-header-extraction', 'invoice-line-calculation-review',
       'invoice-line-item-extraction', 'invoice-missing-info-review', 'invoice-party-role-review', 'invoice-review-handoff', 'invoice-source-audit']);

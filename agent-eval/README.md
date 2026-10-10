@@ -1,12 +1,16 @@
 # 独立 Agent 评测
 
-现行修订：2026-10-10，代码/部署盘点沿2026-10-09。[05唯一总计划](../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md)→[06 Agent工程/制作](../docs/eval/06_Flowmate_Agent评测数据集制作实施与操作手册_v1.md)→[07用户完整执行/UI](../docs/eval/07_Flowmate_Langfuse接入与评测执行操作手册_v1.md)→[08核验](../docs/eval/08_Flowmate_Agent评测结果核验与流程验收手册_v1.md)→用户明确启动P15。每阶段交付后停止；本轮只修订文档，不制作数据/调用模型或平台。
+**Deep Research核心价值与设计（目标）：** 用户确认复杂问题的研究计划后，工作流组织资料获取、综合与证据核验，交付覆盖／依据／局限可查看的保存报告。核心为研究规划→能力执行→证据收集→Agent综合→证据报告→持久化，复用Pi SDK／现有Runtime，详见[主§19.1–19.2](../docs/spec/00_Flowmate完整方案_v1.md#research-core-chain)。产品和研究质量仍待实施／验证。
+
+> **2026-10-10 Deep Research现行设计增量（待实施）：** P1–P14→P15 Deep Research→独立统一评测→P16 Evaluation桌面→P17 Host & Packaging。[主方案§19](../docs/spec/00_Flowmate完整方案_v1.md#deep-research)、[P15目标](../docs/spec/P15_目标方案_v1.md)、[P15计划](../docs/plans/P15_实施计划_v1.md)、[评测总计划](../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md#manual-route)。桌面目标在Chats之后新增独立Deep Research，研究列表／新建／Plan、Evidence、Report及右侧关联Session。原50／10＋研究12／4＝62／14，原33项＋研究6项＝39，Runtime24另报；产品研究／研究评测工程及正式数据均待实施，现有readiness=false保持，历史日期／成绩／Runtime T15/T16不改。
+
+前次修订记录：2026-10-10，代码/部署盘点沿2026-10-09。[05唯一总计划](../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md)→[06 Agent工程/制作](../docs/eval/06_Flowmate_Agent评测数据集制作实施与操作手册_v1.md)→[07用户完整执行/UI](../docs/eval/07_Flowmate_Langfuse接入与评测执行操作手册_v1.md)→[08核验](../docs/eval/08_Flowmate_Agent评测结果核验与流程验收手册_v1.md)→用户明确启动P16。每阶段交付后停止；本轮只修订文档，不制作数据/调用模型或平台。
 
 ## 架构与真实状态
 
 Node/tsx CLI与Runner→生产Adapter→Bun Host公共产品入口/必要Electron Fill→采证→本地确定性评分/独立Judge→本地报告→Execution结束后可选Langfuse。Host是对应产品SQLite的唯一所有者，Node/Main不直接开业务库；不新增评测服务、统一预检层、第二套Loop或桌面评分。
 
-正式[指标33项](../docs/eval/01_Flowmate_Agent评测总方案_v1.md#eval01-8-4)，[退役76项](../docs/eval/04_统一评测修订核对表.md#metric-retirement)不进现行汇总/覆盖/待测占位；Gold/隔离/停止/清理/校准/费用仍是必要事实和约束。当前8个确定性Grader＋1个answer-relevance Judge不能认领33项都已实现。P1–P14产品机制已有实现；production productAgent.readiness=false/prepare拒绝，datasets只有说明，strict v1、draft/pending；高级契约/v2/holdout/故障/校准命令待接合。完整配置比较/指纹/平台白名单也有缺口，不能靠draft/空requires/凭据放行。
+正式[指标39项](../docs/eval/01_Flowmate_Agent评测总方案_v1.md#eval01-8-4)，[退役76项](../docs/eval/04_统一评测修订核对表.md#metric-retirement)不进现行汇总/覆盖/待测占位；Gold/隔离/停止/清理/校准/费用仍是必要事实和约束。当前8个确定性Grader＋1个answer-relevance Judge不能认领39项都已实现。P1–P14产品机制已有实现；production productAgent.readiness=false/prepare拒绝，datasets只有说明，strict v1、draft/pending；高级契约/v2/holdout/故障/校准命令待接合。完整配置比较/指纹/平台白名单也有缺口，不能靠draft/空requires/凭据放行。
 
 SDK补丁已恢复，未验收增量已撤回，不再回退；原始材料、原通用设施、产品Runtime和运行/人工记录保留。没有本轮正式Benchmark或Baseline，工程通过与自动评分/完整质量验收分开。
 
@@ -36,8 +40,10 @@ Judge使用独立FLOWMATE_JUDGE_*，最多一次/Trial、输出256、无自动�
 
 ## Langfuse定位与接入
 
-复用本机D:/langfuse服务端4.55.0，SDK锁定5.11.1分列；部署记录见[03§6](../docs/eval/03_Flowmate_Langfuse平台接入设计方案_v1.md#eval03-6)。Langfuse展示Trace/Observation/Score/Sessions、筛选与审核队列；Execution→sessionId、Trial→稳定Trace，子仍同Trial。本地定义33项与算分，不使用平台自动Judge/SDK Experiment/权威Dataset；跨Trial分子分母以本地报告为准。
+复用本机D:/langfuse服务端4.55.0，SDK锁定5.11.1分列；部署记录见[03§6](../docs/eval/03_Flowmate_Langfuse平台接入设计方案_v1.md#eval03-6)。Langfuse展示Trace/Observation/Score/Sessions、筛选与审核队列；Execution→sessionId、Trial→稳定Trace，子仍同Trial。本地定义39项与算分，不使用平台自动Judge/SDK Experiment/权威Dataset；跨Trial分子分母以本地报告为准。
 
 local不初始化SDK、不请求平台；显式langfuse先落本地再导出，失败不改分。当前导出仍含input/answer/artifacts/Observation/Judge raw，正式上传必须阶段一补字段白名单。resend只修复原对象/导出状态，不重跑Agent/Judge或重算分；平台review明确真实审核人/版本/Trial和去重。完整流程验收按08包含真实上传/查看/审核/两次补传，doctor成功不能替代。
 
 [源码职责](src/README.md) · [数据制作](datasets/README.md) · [设施测试](tests/README.md) · [总方案](../docs/eval/01_Flowmate_Agent评测总方案_v1.md)
+
+研究交接增量：先接版本化网页／本地材料与规划／精确确认／调查步骤、冻结来源传输，再制作研究12／4与独立Claim／证据链Gold；DR01–06计数按01§8.12，原33项公式不变。两个业务Full事前分别登记Execution，Judge输出12800＋3072＝15872，单Execution15000及每Trial一次／256守卫不变；研究先导、校准、复测另登记并计Agent／搜索／Judge全部费用。新任务集名及契约是待实施目标，不代表现有严格v1可直接解析或运行。

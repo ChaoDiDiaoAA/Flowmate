@@ -142,7 +142,8 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   }
   if (options.resources) {
     const refs = need(await app.listResources()).items.map(item => item.ref);
-    selection = { prompt: refs.find(ref => ref.kind === 'prompt')!, enabledSkills: refs.filter(ref => ref.kind === 'skill') };
+    selection = { prompt: refs.find(ref => ref.kind === 'prompt' && ref.id === 'invoice')!,
+      enabledSkills: refs.filter(ref => ref.kind === 'skill' && ref.id.startsWith('invoice')) };
   }
   const doc = need(await app.importInvoiceMaterial(source)), session = need(await app.createSession()); docId = doc.documentRef.id;
   rootSessionId = session.sessionId;
@@ -206,7 +207,16 @@ it('[F13-30] dynamically declared PURE tools execute through the real child SDK 
 it('[F13-12/21] original Agent tool timeout closes a hung child within its grace without waiting for root timeout', async () => {
   const f = await fixture(true, { hungTool: true, delegateTimeout: true });
   expect(f.cancellations).toHaveLength(0); expect(f.elapsedMs).toBeLessThan(2500);
-  expect(need(await f.app.queryRuntimeState()).blocked).toBe(true);
+  const runtime = need(await f.app.queryRuntimeState());
+  if (!runtime.blocked) {
+    const children = need(await f.app.listSubagents({ parentRunId: f.accepted.runId, parentSessionId: f.session.sessionId })).items;
+    const calls = await Promise.all([f.accepted.runId, ...children.map(child => child.childRunId)].map(async runId => {
+      const run = need(await f.app.queryRun(runId));
+      return { runId, calls: need(await f.app.listRunToolCalls({ runId, sessionId: run.sessionId! })).items.map(call => ({ name: call.toolName, status: call.status, code: call.errorCode })) };
+    }));
+    throw new Error(JSON.stringify({ expected: 'hung child stop remains unknown', elapsedMs: f.elapsedMs, children, calls }));
+  }
+  expect(runtime.blocked).toBe(true);
   const child = need(await f.app.querySubagent({ parentRunId: f.accepted.runId, parentSessionId: f.session.sessionId,
     childRunId: need(await f.app.listSubagents({ parentRunId: f.accepted.runId, parentSessionId: f.session.sessionId })).items[0]!.childRunId }));
   expect(child).toMatchObject({ status: 'failed', stopConfirmed: false, cancelRequestedAt: null });

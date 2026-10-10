@@ -1,5 +1,6 @@
 import { parseInputDefinitionCommand, isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../../packages/contracts/src/input-commands.ts';
 import { contextBridge, ipcRenderer } from 'electron';
+import { parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, isResearchHostCommand } from '../../../packages/contracts/src/research-commands.ts';
 import { appError, fail } from '../../../packages/contracts/src/errors.ts';
 import { parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../../packages/contracts/src/resources.ts';
 import { parseExtensionCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure, isExtensionHostCommand } from '../../../packages/contracts/src/extensions.ts';
@@ -9,7 +10,8 @@ import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest 
 
 async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<T>> {
   const extension = isExtensionHostCommand(type);
-  const [parse, result, matches, failure] = isInputDefinitionHostCommand(type)
+  const [parse, result, matches, failure] = isResearchHostCommand(type)
+    ? [parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure] : isInputDefinitionHostCommand(type)
     ? [parseInputDefinitionCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure]
     : isSubagentHostCommand(type)
     ? [parseSubagentCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
@@ -25,6 +27,22 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
 }
 
 const bridge: DesktopBridge = {
+  importResearchMaterial: input => invokeAssembly('import_research_material', input),
+  listResearchMaterials: input => invokeAssembly('list_research_materials', input ?? {}),
+  createResearchTask: input => invokeAssembly('create_research_task', input),
+  listResearchTasks: input => invokeAssembly('list_research_tasks', input ?? {}),
+  queryResearchTask: researchId => invokeAssembly('query_research_task', { researchId }),
+  queryResearchForSession: input => invokeAssembly('query_research_for_session', input),
+  queryResearchPlan: input => invokeAssembly('query_research_plan', input),
+  queryResearchSource: input => invokeAssembly('query_research_source', input),
+  queryResearchEvidence: input => invokeAssembly('query_research_evidence', input),
+  queryResearchClaim: input => invokeAssembly('query_research_claim', input),
+  queryResearchReport: input => invokeAssembly('query_research_report', input),
+  listResearchSources: input => invokeAssembly('list_research_sources', input),
+  listResearchClaims: input => invokeAssembly('list_research_claims', input),
+  listResearchReports: input => invokeAssembly('list_research_reports', input),
+  exportResearchReport: input => invokeAssembly('export_research_report', input),
+  saveResearchExport: input => ipcRenderer.invoke('flowmate:save-research-export', input),
   listInputCommands: input => invokeAssembly('list_input_commands', input ?? {}),
   listSubagentDefinitions: () => invokeAssembly('list_subagent_definitions', {}),
   getSubagentDefinition: input => invokeAssembly('get_subagent_definition', input),

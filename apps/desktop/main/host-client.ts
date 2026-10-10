@@ -1,5 +1,6 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../host/protocol.ts';
 import { spawn } from 'node:child_process';
+import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse } from '../../../packages/contracts/src/research-commands.ts';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
@@ -132,7 +133,7 @@ export class HostClient {
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
     const rawMessage = { ...command, version: 1, requestId };
-    const message = isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type) || isInputDefinitionHostCommand(command.type)
+    const message = isResearchHostCommand(command.type) || isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type) || isInputDefinitionHostCommand(command.type)
       ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
     if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
@@ -227,7 +228,12 @@ export class HostClient {
         if (!pending) return;
         clearTimeout(pending.timer);
         this.pending.delete(output.requestId);
-        if (isCompactionHostCommand(pending.command.type)) {
+        if (isResearchHostCommand(pending.command.type)) {
+          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
+          const value = validEnvelope ? parseResearchHostResult(pending.command.type, output.value) : null;
+          if (value === null || !matchesResearchResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(value);
+        } else if (isCompactionHostCommand(pending.command.type)) {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
           const value = validEnvelope ? parseCompactionHostResult(pending.command.type, output.value) : null;
           if (value === null || !matchesCompactionResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));

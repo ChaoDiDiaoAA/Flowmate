@@ -1,3 +1,5 @@
+import { ResearchContextSchema } from '@flowmate/contracts';
+import { readResearchContext } from '../research/context.ts';
 import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.ts';
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { z } from 'zod';
@@ -339,6 +341,7 @@ export function readContextSnapshotOwner(db: Database, snapshotId: number, owner
   if (snapshot.runId !== owner.id || snapshot.sessionId !== owner.session_id || snapshot.jobId !== (owner.job_id ?? null)) throw new Error('invalid_context_owner');
   const config = z.object({ config_json: z.string() }).parse(db.query('SELECT config_json FROM runs WHERE id=?').get(owner.id));
   const resources = z.object({ resources: FrozenResourcesSchema.optional() }).parse(json(config.config_json)).resources ?? null;
+  if (!same(snapshot.json.research ?? null, readResearchContext(db, owner.id))) throw new Error('invalid_context_research_binding');
   if (!matchesResourceBinding(resources, snapshot.json.resourceBinding)) throw new Error('invalid_context_resource_binding');
   return snapshot;
 }
@@ -407,7 +410,8 @@ export function readInputContext(db: Database, row: { run_id: number | null; ses
   if (snapshotId !== null) {
     const snapshot = readContextSnapshotOwner(db, snapshotId, owner);
     if (row.content_json !== undefined) {
-      const content = z.object({ resourceBinding: ResourceBindingSchema.optional() }).parse(json(row.content_json));
+      const content = z.object({ research: ResearchContextSchema.optional(), resourceBinding: ResourceBindingSchema.optional() }).parse(json(row.content_json));
+      if (!same(content.research, snapshot.json.research)) throw new Error('invalid_input_research_binding');
       if (!same(content.resourceBinding, snapshot.json.resourceBinding)) throw new Error('invalid_input_resource_binding');
     }
   }
@@ -538,6 +542,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
     readInputContext(db, { run_id: saved.runId, session_id: saved.sessionId, context_snapshot_id: saved.contextSnapshotId }, owners);
     if (saved.runId !== value.runId || saved.sessionId !== value.sessionId || saved.content.text !== value.json.text
       || !same(saved.content.version === 2 ? saved.content.resourceBinding : undefined, value.json.resourceBinding)
+      || !same(saved.content.version === 2 ? saved.content.research : undefined, value.json.research)
       || saved.goalMode !== value.json.goalMode || !same(saved.content.workspaceContext, value.json.workspaceContext)
       || !same(saved.content.allowedDocumentIds, value.json.allowedDocumentIds)
       || !same(saved.content.allowedArtifactIds, value.json.allowedArtifactIds)) return corrupt();

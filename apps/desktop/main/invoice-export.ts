@@ -4,9 +4,9 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { Result } from '@flowmate/contracts';
 
-export function publishInvoiceExportCopy(destinationPath: string, bytes: Uint8Array): Result<{ destinationPath: string; bytes: number; sha256: string }> {
+export function publishExportCopy(destinationPath: string, bytes: Uint8Array): Result<{ destinationPath: string; bytes: number; sha256: string }> {
   if (!isAbsolute(destinationPath) || bytes.byteLength < 1 || bytes.byteLength > 64 * 1024 * 1024)
-    return fail(appError('input_invalid', 'input', 'The invoice export destination or size is invalid.'));
+    return fail(appError('input_invalid', 'input', 'The export destination or size is invalid.'));
   const matches = () => {
     const stat = lstatSync(destinationPath);
     return stat.isFile() && !stat.isSymbolicLink() && stat.size === bytes.byteLength && readFileSync(destinationPath).equals(Buffer.from(bytes));
@@ -19,7 +19,7 @@ export function publishInvoiceExportCopy(destinationPath: string, bytes: Uint8Ar
       if (!matches()) return conflict();
     } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
-      temporary = join(dirname(destinationPath), `.invoice-export-${randomUUID()}.tmp`);
+      temporary = join(dirname(destinationPath), `.flowmate-export-${randomUUID()}.tmp`);
       writeFileSync(temporary, bytes, { flag: 'wx' });
       if (!readFileSync(temporary).equals(Buffer.from(bytes))) throw new Error('export_copy_check_failed');
       try { linkSync(temporary, destinationPath); }
@@ -33,3 +33,4 @@ export function publishInvoiceExportCopy(destinationPath: string, bytes: Uint8Ar
   } catch { return fail(appError('storage_write_failed', 'storage', 'The external copy could not be confirmed. The managed export and any published copy are retained for inspection.', true)); }
   finally { if (temporary !== null) try { rmSync(temporary); } catch { /* Keep the publication result. */ } }
 }
+export const publishInvoiceExportCopy = publishExportCopy;

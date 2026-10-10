@@ -1,5 +1,11 @@
 # Flowmate 领域词汇
 
+> Deep Research当前实施范围：仅用户选择的本地文本／Markdown和已有解析资料；本轮不实现联网搜索／网页提取，也无需Tavily key。核心设计见[主方案第19章](docs/spec/00_Flowmate完整方案_v1.md#deep-research)。
+
+**Deep Research核心价值与设计：** 用户确认复杂问题的研究计划后，工作流组织资料获取、综合与证据核验，交付覆盖／依据／局限可查看的保存报告。核心为研究规划→能力执行→证据收集→Agent综合→证据报告→持久化，复用Pi SDK／现有Runtime，详见[主§19.1–19.2](docs/spec/00_Flowmate完整方案_v1.md#research-core-chain)。本地研究产品已接合；研究质量仍待独立评测验证。
+
+> **2026-10-10 Deep Research现行交付：** P1–P14→P15 Deep Research→独立统一评测→P16 Evaluation桌面→P17 Host & Packaging。[主方案§19](docs/spec/00_Flowmate完整方案_v1.md#deep-research)、[P15目标](docs/spec/P15_目标方案_v1.md)、[P15计划](docs/plans/P15_实施计划_v1.md)、[评测总计划](docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md#manual-route)。桌面在Chats之后新增独立Deep Research，研究列表／新建／Plan、Evidence、Report及右侧关联Session。原50／10＋研究12／4＝62／14，原33项＋研究6项＝39，Runtime24另报；本地研究产品已交付，证据见[P15实施记录](docs/plans/P15_实施计划_v1.md#p15-engineering-delivery)；研究评测工程及正式数据仍待实施，现有readiness=false保持，历史日期／成绩／Runtime T15/T16不改。
+
 **2026-10-09 命令菜单与三栏布局当前状态：** 本轮已实现 Renderer 共用 skillIntroduction，十六份内置 Skill 在 Skills / Settings → Skills / 斜杠菜单中显示一致英文介绍和完整提示；全文匹配回退规则、原作者文件及模型索引身份保留。usePanelLayout 沿用 CSS Grid、两条 8px Pointer Capture 分隔线及键盘调整，独立 flowmate.panel-widths 偏好在刷新/重启后恢复，存储异常容错；240/380 默认、200/300/360 下限、1200/1080 响应式及 680 容器单列规则已通过真实 Electron 验证。显式调整固定另一可见栏当前宽度，隐藏64/44px不覆盖展开偏好；主聊天 DOM、草稿及两个正在执行子任务不重建或额外请求。标准门禁 exit0：typecheck/fresh build、Unit356/0、Integration1341/0、Electron101/0（10.3m）。420项源码/配置/资源/测试门禁前后指纹一致，2项CSS/HTML构建前后指纹一致，48份Skill作者文件SHA-256不变。独立审查的另一栏自动扩张、次指针提前结束和小数响应式断点均有RED→GREEN并复核关闭。见 [实施记录](docs/plans/2026-10-09_命令菜单英文与三栏调整_实施记录.md)。未新增依赖/公共API/迁移；保留此前未提交成果，本轮未提交或推送。以下旧状态和成绩继续作为历史记录。
 
 
@@ -9,7 +15,7 @@
 
 2026-10-08 HUB11 当前工作区状态：分支 `codex/hide-assistant-inputs`，起始/当前 HEAD `e1130ec`，本轮未提交、推送或合并。Core 原资源服务拆成 `skill-hub/` 七个实际模块；两个自定义 READ 工具放在 `employee-invoice/src/tools/` 并单独组合。作者 `resources/skills/<id>/` 无版本一级，原 invoice 身份/内容保留并新增十份默认关闭的 SOP；manifest 版本、固定 Bundle 版本路径和 journal v1 兼容。Pi 原短索引/system 与冻结工作区/user 链继续复用，增加专用读取器独立索引模式、实际读取反馈与原请求证据；子 READ 可见集合不扩大父范围，Fill 唯一工具不变。定向真实 Core/SDK/HTTP/SQLite 与十一包 Electron 管理已验证，独立审查的二进制文本边界已通过 RED→GREEN；最终同次标准门禁 exit 0：类型检查、Unit353/0、Integration1317/0、fresh build、Electron98/0；383项源码前后hash同为 a543f96be37ba66287c059b90e556de31a5bcd3f2981a81074d3c16ff43c033e。方案/任务/验收及入口记录已最终化，保留本地日志和未提交工作区。历史 Prompt 正文标签可能显示 Skill body，列为待处理小项。详见 [HUB11](docs/plans/P11_实施计划_v1.md#hub11-07标准门禁审查与交接)，下方 UI11 与旧日期结果不能替代本轮成绩。
 
-当前设计以 [产品主方案](docs/spec/00_Flowmate完整方案_v1.md)、[评测主方案](docs/eval/01_Flowmate_Agent评测总方案_v1.md)和[数据制作方案](docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)为准。路线是 Agent Engineering + Invoice Product + Agent Evaluation；核心为 Agent Harness / Runtime，不以完整企业后台为目标。此前 P14 工作基线 HEAD 13c83028f3342174d25363230f322050bf2330d7 已包含 P1—P13 工程接合及迁移 001—017；P14 此前在 codex/p14-invoice-workflow 实施。下文 P8 的附着分支、当时 D:仅同步文档和未合并记录保留为历史范围，不能作为当前代码状态。后续阶段按主方案边界实施。P3 唯一正式发票输入目录为 `data/invoices/agent-input/`，业务取证读取已登记解析、候选来源仍按其版本/引用核验；普通 Run 的 SDK read 支持文本/图像，图像向模型交付仍核验 model.input，不能把“原图仅 UI 查看”的 P3 业务历史限制泛化成 SDK 无图像能力。旧连接的真实模型 A20 请求、失败/复验和样例观察已记录，新配置的连接/认证/协议兼容性按 P3 实施计划中的实际工程证据解释。模型行为、业务质量与真实语义评测统一依评测主方案§12.1，包含Runtime专题，全部等P1–P16完整产品、公共入口、采证及适用工程门禁就绪后才制作／核验正式Case／Gold、真实校准、Smoke／对照／Benchmark。子集提前准入例外已撤销；阶段只依工程交付，未评测不是阶段未完成项，旧样例不作为退出条件。
+当前设计以 [产品主方案](docs/spec/00_Flowmate完整方案_v1.md)、[评测主方案](docs/eval/01_Flowmate_Agent评测总方案_v1.md)和[数据制作方案](docs/eval/02_Flowmate_Agent评测数据集制作方案_v1.md)为准。路线是 Agent Engineering + Invoice Product + Deep Research + Agent Evaluation；核心为 Agent Harness / Runtime，不以完整企业后台为目标。此前 P14 工作基线 HEAD 13c83028f3342174d25363230f322050bf2330d7 已包含 P1—P13 工程接合及迁移 001—017；P14 此前在 codex/p14-invoice-workflow 实施。下文 P8 的附着分支、当时 D:仅同步文档和未合并记录保留为历史范围，不能作为当前代码状态。后续阶段按主方案边界实施。P3 唯一正式发票输入目录为 `data/invoices/agent-input/`，业务取证读取已登记解析、候选来源仍按其版本/引用核验；普通 Run 的 SDK read 支持文本/图像，图像向模型交付仍核验 model.input，不能把“原图仅 UI 查看”的 P3 业务历史限制泛化成 SDK 无图像能力。旧连接的真实模型 A20 请求、失败/复验和样例观察已记录，新配置的连接/认证/协议兼容性按 P3 实施计划中的实际工程证据解释。模型行为、业务质量与真实语义评测统一依评测主方案§12.1，包含Runtime专题，全部等P1–P15对应产品能力、公共入口、采证及适用工程门禁就绪后才制作／核验正式Case／Gold、真实校准、Smoke／对照／Benchmark。子集提前准入例外已撤销；阶段只依工程交付，未评测不是阶段未完成项，旧样例不作为退出条件。
 
 2026-10-08 当前工程状态：在 `codex/ui-workbench`、起始 HEAD `66107c182535fe3e2336d1023499849edd60aeec` 完成界面职责修订。Chats 保留工作目录/会话，诊断归 Settings → Performance；Prompts 为单轮 Provider 优化工作台，窗口草稿可编辑/复制/填入聊天且不自动发送；固定业务 Prompt 选择在 LLM 高级区。Skills 为真实依赖就绪度及四筛选，Extensions 为登记插件列表与实例/历史详情，Settings 五个标签复用原状态；Assistant 删除指定辅助控件，新 Send/Fill 使用默认预算，公共覆盖、显式 Skill 和旧原输入冻结仍有效。同次标准门禁 typecheck/fresh build、Unit 352、Integration 1309、Electron 98 全部通过；本次记录见 [UI11](docs/plans/P11_实施计划_v1.md#ui11-实施记录)、[UI03](docs/plans/P3_实施计划_v1.md#ui03-实施记录)、[UI05](docs/plans/P5_实施计划_v1.md#ui05-实施记录)、[UI12](docs/plans/P12_实施计划_v1.md#ui12-实施记录)。改动仍在本地分支工作区；既有迁移/依赖与正式评测门槛保持，以下旧日期记录解释当时状态。
 
@@ -33,7 +39,7 @@
 
 2026-10-04 P8产品工程交付：在`C:/Users/yyc/.codex/worktrees/p8-context-engineering/Flowmate`，分支`codex/p8-context-engineering`实现真实受管选材、015不可变快照／原事务Input关联、稳定entry桥与原请求采证、Tool／Candidate历史依据、三公共只读查询及Session Details／Context。T01—T10独立审查及F8-01—24适用证据完成；固定HEAD`895c41a19cd43b4ab67e784fb9928b8283c028ec`的同次标准入口exit0，typecheck exit0；Unit 291 pass／0 fail／2401断言／34文件；Integration 802 pass／0 fail／7824断言／58文件；fresh Main／Preload／Renderer build完成；Electron 60 passed／0 failed／9文件／1 worker，287文件指纹一致。原失败及限制见[P8实施计划§5.3](docs/plans/P8_实施计划_v1.md#53-最终同次门禁与阶段交接)和[P8目标方案](docs/spec/P8_目标方案_v1.md)。旧请求／Tool／Candidate读原snapshot/request pair，旧NULL保缺口；查看／重启不重放，新合法Input才恢复原native种子。两个OpenAI codec的保存／消费／包含／传输／响应分事实，不能证明语义采用；正式用户库／付费模型／质量评测未运行，P9／P10／P11按边界交接。D:仅同步四份文档，main产品与用户prompt保留；代码未merge／push。
 
-本轮统一评测约束：严格依评测主方案§12.1，完整flowmate-agent-v1的50／10与Runtime专题24／8／16均为完整P1–P16产品／公共入口／采证和适用工程验证就绪后的设计。已提前制作的Runtime Case／Gold／manifest／配置及其配套Adapter、校准、holdout与评分增量已经删除，不归档、不改名、不改称工程夹具；当前productAgent.readiness=false、prepare拒绝。T15／T16配套评测设施延期至整体就绪后；当前各阶段继续产品工程实现与T17工程交接，退出不依赖这些任务、正式数据或语义成绩，不能独立开启T18。原有框架合成测试夹具与产品工程测试保留，不再依赖被删除资产。整体就绪后再实施T15／T16、制作核验T18正式Case／Gold、真实开发与必要Judge校准、冻结配置／数据／统计／经验并执行Smoke／对照／正式评测；calibration=null、CLI／环境变量或空能力列表不能绕过门槛。跨Run产品观察冷启动／不足／失败用工程验证，不主动调用模型补早期样本。未来四组安全边界一致、留出不反哺；正式八Execution Judge上界57344及额外校准／重跑累计设计保留，未执行不认领效果。旧样例及历史工程记录保留原日期与范围。
+本轮统一评测约束：严格依评测主方案§12.1，原flowmate-agent-v1的50／10、新flowmate-research-v1的12／4与单列Runtime专题24／8／16均为P1–P15对应产品能力／公共入口／采证和适用工程验证就绪后的设计。已提前制作的Runtime Case／Gold／manifest／配置及其配套Adapter、校准、holdout与评分增量已经删除，不归档、不改名、不改称工程夹具；当前productAgent.readiness=false、prepare拒绝。T15／T16配套评测设施延期至整体就绪后；当前各阶段继续产品工程实现与T17工程交接，退出不依赖这些任务、正式数据或语义成绩，不能独立开启T18。原有框架合成测试夹具与产品工程测试保留，不再依赖被删除资产。整体就绪后再实施T15／T16、制作核验T18正式Case／Gold、真实开发与必要Judge校准、冻结配置／数据／统计／经验并执行Smoke／对照／正式评测；calibration=null、CLI／环境变量或空能力列表不能绕过门槛。跨Run产品观察冷启动／不足／失败用工程验证，不主动调用模型补早期样本。未来四组安全边界一致、留出不反哺；正式八Execution Judge上界57344及额外校准／重跑累计设计保留，未执行不认领效果。旧样例及历史工程记录保留原日期与范围。
 
 2026-10-07 P14 实施：当前工作分支 codex/p14-invoice-workflow，起始 HEAD 13c83028f3342174d25363230f322050bf2330d7。Pi 0.85.1、pi-subagents 0.19.0 及锁定补丁，迁移仍 001—017。行来源映射贯通内存、inspection 与人工新版本；共享原导出查询核实际文件；Native 另存为、逐字段来源／原文复核和独立用户 Discard 已接通。工程门禁／审查及 F14 实际证据见 [P14 实施计划 §4.4](docs/plans/P14_实施计划_v1.md#44-2026-10-07-实施记录)，职责、状态、接口、存储和限制见 [P14 目标方案](docs/spec/P14_目标方案_v1.md)。最终同一固定源码标准门禁已通过：typecheck／fresh build、Unit 352／Integration 1308／Electron 95 全部零失败（P14 17项）；一次整枝审查的三个 Important 均经真实 IPC 反例 RED→GREEN，前后源指纹一致。P14 工程完成；内存草稿不跨重启恢复、查询不重放、受管登记与外部副本分事实。正式用户库／付费 Provider／Judge／模型质量评测未运行，P15／P16 按主方案整体准入边界交接。
 
@@ -98,9 +104,9 @@
 | Case / expected | 质量场景及预期约束，采用 input + expected；expected 不发送模型 |
 | Gold | 经核验的领域真值，独立于模型候选和用户接受，留质量侧 |
 | Trial | 一个独立评测尝试，可含多个 Run/恢复/子任务；专用 trial-序号.sqlite，不是正式库副本 |
-| F / A / B | 机制、真实Agent行为、发票结果三类判断；阶段只以产品机制、实际链路、失败路径和工程回归验收。包括Runtime专题的所有正式数据与A/B质量评测均等完整P1–P16产品就绪，受控工程不证明真实语义；等待质量不构成阶段未完成 |
+| F / A / B | 机制、真实Agent行为、发票结果三类判断；阶段只以产品机制、实际链路、失败路径和工程回归验收。包括Runtime专题的所有正式数据与A/B质量评测均等P1–P15对应产品能力就绪，受控工程不证明真实语义；等待质量不构成阶段未完成 |
 | Fixture / Live | 受控测试与真实运行方式，不等同 F/A/B 或来源类别 |
-| Benchmark / Baseline | 固定测试定义与实际参照成绩分别记录；完整50／10和Runtime24条专题均继承完整P1–P16产品／公共入口／采证／工程门槛，能力子集不是提前准入。提前Runtime草稿及配套评测增量已经删除，整体就绪后才重新制作核验，不制造阶段质量成绩；未运行不叫Baseline |
+| Benchmark / Baseline | 固定测试定义与实际参照成绩分别记录；业务62／14（原50／10＋研究12／4）和Runtime24条专题均继承P1–P15对应产品能力／公共入口／采证／工程门槛，能力子集不是提前准入。提前Runtime草稿及配套评测增量已经删除，整体就绪后才重新制作核验，不制造阶段质量成绩；未运行不叫Baseline |
 
 数据库持久化、历史恢复、错误、取消和质量隔离是核心工程内容。业务终点为候选、人工修正/接受、导出；不包含审批、B2B 写入、组织权限、预算账本或生产治理。
 

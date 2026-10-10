@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type ReactNode } from 'react';
 import { usePanelLayout } from './panel-layout.tsx';
+import { ResearchPage } from './research.tsx';
+import type { ResearchTask, ResearchIntent, ResearchPlanBody } from '@flowmate/contracts';
 import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema,
   MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS, MAX_INVOICE_BLOCKS_PER_PAGE } from '../../../../packages/contracts/src/invoice.ts';
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
@@ -27,9 +29,9 @@ import { createEventView, bindEventSubscription, applyEventWake, applyEventRead,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'activity' | 'models' | 'settings' | 'prompts' | 'skills' | 'extensions';
+type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'research' | 'activity' | 'models' | 'settings' | 'prompts' | 'skills' | 'extensions';
 const pageLabels: Record<Page, string> = {
-  workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats',
+  workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats', research: 'Deep Research',
   activity: 'Activity', models: 'Models', settings: 'Settings', prompts: 'Prompts', skills: 'Skills', extensions: 'Extensions',
 };
 type EventObservation = { view: EventViewState; wanted: boolean; opening: boolean; through?: number;
@@ -172,6 +174,8 @@ export function App() {
   const [sidebarRenameId, setSidebarRenameId] = useState<number | null>(null);
   const [sidebarRenameTitle, setSidebarRenameTitle] = useState('');
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
+  const [researchTask, setResearchTask] = useState<ResearchTask | null>(null);
+  const [researchSessionLoading, setResearchSessionLoading] = useState(false);
   const [selectedSession, setSelectedSession] = useState<SessionSnapshot | null>(null);
   const [sessionDetails, setSessionDetails] = useState<{ sessionId: number; basis: ContextBasis | null; token: number; initialRunId?: number | null; initialSnapshotId?: number } | null>(null);
   const [contextRefresh, setContextRefresh] = useState(0);
@@ -224,7 +228,9 @@ export function App() {
   const [sessionMutating, setSessionMutating] = useState(false);
   const [revokingAccess, setRevokingAccess] = useState(false);
   const [chatCollapsed, setChatCollapsed] = useState(() => window.innerWidth < 1080);
-  const panels = usePanelLayout(chatCollapsed);
+  const [researchChatCollapsed, setResearchChatCollapsed] = useState(true);
+  const assistantCollapsed = page === 'research' ? researchChatCollapsed : chatCollapsed;
+  const panels = usePanelLayout(assistantCollapsed);
   const [navOpen, setNavOpen] = useState(false);
   const [run, setRun] = useState<RunSnapshot | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
@@ -1607,7 +1613,10 @@ export function App() {
     return () => epoch === workspaceHostEpoch.current && selection === sessionLoadSequence.current && sessionId === selectedSessionIdRef.current;
   }
 
-  function selectSession(sessionId: number | null, focusComposer = false) {
+  function selectSession(sessionId: number | null, focusComposer = false, researchSelection = false) {
+    const knownResearch = researchSelection || sessionId !== null && sessionId === researchTask?.sessionId;
+    if (!knownResearch) setResearchTask(null);
+    setResearchSessionLoading(!knownResearch && sessionId !== null);
     chatDrafts.current.set(draftKey(selectedSessionIdRef.current), chatInputRef.current);
     setSessionMutating(false);
     focusComposerWhenReady.current = focusComposer;
@@ -1626,7 +1635,15 @@ export function App() {
     setHistoryError(null);
     setRunFeedbacks([]);
     setNotice(null);
-    if (workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
+    if (!knownResearch && sessionId !== null) {
+      const selection = sessionLoadSequence.current;
+      void window.flowmate.queryResearchForSession({ sessionId }).then(result => {
+        if (selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
+        if (!result.ok) { setNotice({ tone: 'bad', message: 'The Session purpose could not be verified. Select it again to retry.' }); return; }
+        setResearchTask(result.data); setResearchSessionLoading(false);
+        if (!result.data && workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
+      }).catch(() => { if (selection === sessionLoadSequence.current) setNotice({ tone: 'bad', message: 'The Session purpose could not be verified. Select it again to retry.' }); });
+    } else if (!knownResearch && workspaceRef.current?.sessionId !== sessionId) void changeWorkspace({ kind: 'session', sessionId });
     if (sessionId !== null) {
       void loadSession(sessionId);
     }
@@ -1761,24 +1778,12 @@ export function App() {
     const nextCursor = refreshed.ok ? refreshed.data.next : null;
     setSessionCursor(nextCursor);
     sessionCursorRef.current = nextCursor;
-    chatDrafts.current.delete(draftKey(sessionId));
     unknownInputs.current.delete(sessionId);
     historyPositions.current.delete(sessionId);
     const next = wasSelected ? remaining.find((item) => item.status === 'active' && item.availability === 'ready'
       && item.historyState === 'recoverable' && !item.modelUseBlocked) ?? null : null;
     if (wasSelected) {
       allowInitialSessionSelection.current = false;
-      publishSelectedSession(next?.sessionId ?? null);
-      setSelectedSession(null);
-      updateChatInput(chatDrafts.current.get(draftKey(next?.sessionId ?? null)) ?? '');
-      setChatTurns([]);
-      setMessageState(next ? messageStates.current.get(next.sessionId) ?? null : null);
-      setUnknownInput(next && unknownInputs.current.has(next.sessionId)
-        ? { sessionId: next.sessionId, clientSequence: unknownInputs.current.get(next.sessionId)!.clientSequence } : null);
-      setMessageCursor(next ? messageCursors.current.get(next.sessionId) ?? null : null);
-      setHistoryError(null);
-      setRunFeedbacks([]);
-      setRunCursor(null);
     }
     if (activeAgentSessionId === sessionId) {
       setBusy(false);
@@ -1791,14 +1796,12 @@ export function App() {
       setActiveRunModel(null);
     }
     if (workspaceRef.current?.sessionId === sessionId) {
-      const refreshedWorkspace = await loadWorkspace();
-      if (refreshedWorkspace && next && refreshedWorkspace.sessionId !== next.sessionId) {
-        await changeWorkspace({ kind: 'session', sessionId: next.sessionId });
-      }
+      await loadWorkspace();
     }
+    if (wasSelected) selectSession(next?.sessionId ?? null);
+    chatDrafts.current.delete(draftKey(sessionId));
     setNotice({ tone: 'good', message: result.data.disposition === 'hidden'
       ? 'Chat removed from Conversations. Invoice history and saved results remain available.' : 'Chat deleted.' });
-    if (wasSelected && next) void loadSession(next.sessionId);
     setSessionMutating(false);
   }
 
@@ -2001,11 +2004,14 @@ export function App() {
     return () => narrow.removeEventListener('change', followWidth);
   }, []);
 
+  useEffect(() => { if (page === 'research') setResearchChatCollapsed(true); }, [page]);
+
   useEffect(() => {
     if (!assistantWasToggled.current) return;
-    if (chatCollapsed) document.querySelector<HTMLButtonElement>('.chat-expand')?.focus();
+    assistantWasToggled.current = false;
+    if (assistantCollapsed) document.querySelector<HTMLButtonElement>('.chat-expand')?.focus();
     else chatComposerRef.current?.focus();
-  }, [chatCollapsed]);
+  }, [assistantCollapsed]);
 
   useEffect(() => {
     if (!state) return;
@@ -2046,12 +2052,13 @@ export function App() {
   const canNewChatAndSend = Boolean(dependentReady && modelReady && runtimeReady && !busy && !sessionLoading && !sessionMutating && !inputSubmitting);
   const inputEnabled = true;
   const selectedForSend = selectedSession ?? sessions.find((item) => item.sessionId === selectedSessionId) ?? null;
-  const canChat = Boolean(dependentReady && modelReady && runtimeReady && !busy && !sessionLoading && !sessionMutating && !historyLoading && !historyError
-    && !inputSubmitting && !unknownInput
+  const researchSelected = researchTask !== null && researchTask.sessionId === selectedSessionId;
+  const canChat = Boolean((researchSelected || dependentReady) && modelReady && runtimeReady && !busy && !sessionLoading && !sessionMutating && !historyLoading && !historyError
+    && !inputSubmitting && !unknownInput && !researchSessionLoading
     && (selectedSessionId === null || selectedForSend?.availability === 'ready' && !selectedForSend.modelUseBlocked
       && !selectedForSend.deletePending && selectedForSend.status === 'active' && selectedForSend.historyState === 'recoverable')
-    && (goalMode !== 'save-candidate' || (workspace?.documentRef && workspace.jobId)));
-  const canAppend = Boolean(dependentReady && state?.ready && busy && activeAgentRunId !== null && activeAgentSessionId === selectedSessionId
+    && (researchSelected || goalMode !== 'save-candidate' || (workspace?.documentRef && workspace.jobId)));
+  const canAppend = Boolean((researchSelected || dependentReady) && state?.ready && busy && activeAgentRunId !== null && activeAgentSessionId === selectedSessionId
     && !cancelPending && !agentStopRequested.current && !inputSubmitting && !unknownInput && !sessionMutating && !historyError
     && selectedForSend?.status === 'active' && !selectedForSend.deletePending && !selectedForSend.modelUseBlocked
     && selectedForSend.historyState === 'recoverable' && !(invoiceForm?.runId === activeAgentRunId));
@@ -2232,13 +2239,30 @@ export function App() {
     await loadRun(accepted.data.runId);
   }
 
-  async function sendChatMessage(override?: { sessionId: number; prompt: string; scene: WorkspaceSnapshot; hostEpoch: number; detached: boolean }) {
-    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
+  async function sendAssistantMessage() {
+    if (!researchTask || selectedSessionIdRef.current !== researchTask.sessionId) return sendChatMessage();
+    const expectedSession = researchTask.sessionId;
+    const loaded = await window.flowmate.queryResearchTask(researchTask.researchId);
+    if (!loaded.ok) { setNotice({ tone: 'bad', message: errorMessage(loaded) }); return; }
+    const task = loaded.data;
+    const saved = task.currentPlanId ? await window.flowmate.queryResearchPlan({ researchId: task.researchId, planId: task.currentPlanId }) : null;
+    if (selectedSessionIdRef.current !== expectedSession) return;
+    if (saved && !saved.ok) { setNotice({ tone: 'bad', message: errorMessage(saved) }); return; }
+    const plan = saved?.ok ? saved.data : null;
+    const planning = task.status === 'planning' || task.status === 'awaiting_confirmation' || !task.planConfirmed || !plan;
+    await sendChatMessage(undefined, { text: chatInputRef.current, intent: planning
+      ? { researchId: task.researchId, phase: 'planning', plan: null }
+      : { researchId: task.researchId, phase: 'researching', plan: { planId: plan.planId, revision: plan.revision }, continuation: true },
+      ...(!planning && plan ? { execution: plan.body.execution } : {}) });
+  }
+  async function sendChatMessage(override?: { sessionId: number; prompt: string; scene: WorkspaceSnapshot; hostEpoch: number; detached: boolean },
+    researchInput?: { text: string; intent: ResearchIntent; execution?: ResearchPlanBody['execution'] }) {
+    if (!researchInput && (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current)) return;
     const sendEpoch = override?.hostEpoch ?? workspaceHostEpoch.current;
-    const submittedDraft = override?.prompt ?? chatInputRef.current;
+    const submittedDraft = researchInput?.text ?? override?.prompt ?? chatInputRef.current;
     const prompt = submittedDraft.trim();
     let sessionId = override?.sessionId ?? selectedSessionIdRef.current;
-    const directory = workingDirectory;
+    const directory = researchInput ? '' : workingDirectory;
     const model = persistedModel;
     if ((!canChat && !override) || !modelReady || busy || !selectedModelId || !model || !prompt || inputSubmittingRef.current) return;
     if (override?.detached && (goalMode !== 'answer' || directory)) {
@@ -2254,7 +2278,7 @@ export function App() {
       setNotice({ tone: 'bad', message: runtimeMessage(actualRuntime, !actualRuntime, hostReadyRef.current) });
       return;
     }
-    if (sendEpoch !== workspaceHostEpoch.current || !workspaceReady(workspaceStateRef.current)) {
+    if (sendEpoch !== workspaceHostEpoch.current || !researchInput && !workspaceReady(workspaceStateRef.current)) {
       setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
     }
     setNotice({ tone: 'info', message: 'Preparing your request…' });
@@ -2263,16 +2287,16 @@ export function App() {
       if (!created) { setBusy(false); return; }
       sessionId = created.sessionId;
     }
-    let current = workspaceRef.current ?? await loadWorkspace();
-    if (sendEpoch !== workspaceHostEpoch.current || !workspaceReady(workspaceStateRef.current)) {
+    let current = researchInput ? null : workspaceRef.current ?? await loadWorkspace();
+    if (sendEpoch !== workspaceHostEpoch.current || !researchInput && !workspaceReady(workspaceStateRef.current)) {
       setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
     }
     if (override && (override.hostEpoch !== workspaceHostEpoch.current || !current || current.revision !== override.scene.revision
       || !sameWorkspaceBasis(current, override.scene))) {
       setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
     }
-    if (!override?.detached && current && current.sessionId !== sessionId) current = await changeWorkspace({ kind: 'session', sessionId });
-    if (!current) { setBusy(false); return; }
+    if (!researchInput && !override?.detached && current && current.sessionId !== sessionId) current = await changeWorkspace({ kind: 'session', sessionId });
+    if (!researchInput && !current) { setBusy(false); return; }
     const sequence = await window.flowmate.querySessionInput({ sessionId });
     if (!sequence.ok || sequence.data.nextClientSequence === null) {
       setBusy(false);
@@ -2280,8 +2304,8 @@ export function App() {
       return;
     }
     const clientSequence = sequence.data.nextClientSequence;
-    if (sendEpoch !== workspaceHostEpoch.current || !workspaceReady(workspaceStateRef.current) || workspacePendingRef.current
-      || workspaceRef.current?.revision !== current.revision || !sameWorkspaceBasis(workspaceRef.current, current)) {
+    if (sendEpoch !== workspaceHostEpoch.current || !researchInput && (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current
+      || workspaceRef.current?.revision !== current!.revision || !sameWorkspaceBasis(workspaceRef.current, current!))) {
       setBusy(false); setNotice({ tone: 'bad', message: 'The workspace changed while preparing your message. Your draft is preserved.' }); return;
     }
     const turnId = newId();
@@ -2309,14 +2333,15 @@ export function App() {
       mode: 'prompt',
       text: prompt,
       modelId: model.id,
-      ...(!override?.detached ? { workspace: {
-        revision: current.revision,
-        documentRef: current.documentRef,
-        jobId: current.jobId,
-        candidateRef: current.candidateRef,
+      ...(!researchInput && !override?.detached ? { workspace: {
+        revision: current!.revision,
+        documentRef: current!.documentRef,
+        jobId: current!.jobId,
+        candidateRef: current!.candidateRef,
         sessionId,
       } } : {}),
-      goalMode,
+      goalMode: researchInput ? 'answer' : goalMode,
+      ...(researchInput ? { research: researchInput.intent, ...researchInput.execution } : {}),
       ...(directory ? { workingDirectory: directory } : {}),
     };
     const accepted = await window.flowmate.submitInput(request);
@@ -2384,7 +2409,7 @@ export function App() {
   }
 
   async function appendChatInput(mode: 'steer' | 'followUp') {
-    if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
+    if (!researchSelected && (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current)) return;
     const sessionId = selectedSessionIdRef.current;
     const runId = activeAgentRunIdRef.current;
     const submittedDraft = chatInputRef.current;
@@ -2405,7 +2430,7 @@ export function App() {
       if (originalRun.data.runId === runId && originalRun.data.sessionId === sessionId) setRun(originalRun.data);
       const clientSequence = sequence.data.nextClientSequence;
       const current = workspaceRef.current;
-      if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return;
+      if (!researchSelected && (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current)) return;
       const hasWorkspace = originalRun.data.config.workspaceContext !== undefined;
       if (hasWorkspace && (!current || current.sessionId !== sessionId)) {
         setNotice({ tone: 'bad', message: 'Select this Run’s invoice context before adding an input. Your draft is preserved.' }); return;
@@ -2613,7 +2638,7 @@ export function App() {
             </> : null;
 
   return (
-    <div ref={panels.shellRef} style={panels.style} className={`desktop-shell theme-${profileDraft.theme} ${chatCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''} ${panels.dragging ? 'panels-resizing' : ''}`}>
+    <div ref={panels.shellRef} style={panels.style} className={`desktop-shell theme-${profileDraft.theme} ${assistantCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''} ${panels.dragging ? 'panels-resizing' : ''}`}>
       {panels.separators}
       {rejectPrompt && <div role="dialog" aria-modal="true" aria-label="Reject invoice result"
         style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,.45)', display: 'grid', placeItems: 'center' }}>
@@ -2651,6 +2676,7 @@ export function App() {
             ['workspace-detail', 'Workspace', '▦'],
             ['tasks', 'Processing History', '☷'],
             ['chats', 'Chats', '◌'],
+            ['research', 'Deep Research', '⌕'],
             ['activity', 'Activity', '≋'],
           ] as const).map(([target, label, glyph]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
@@ -2795,6 +2821,14 @@ export function App() {
             ready={Boolean(state?.ready && !sessionLoading && !sessionMutating)}
             mutating={sessionMutating} notice={notice} onSelect={openChat}
             onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onLoadMore={() => void loadMoreSessions()} />
+        ) : page === 'research' && state ? (
+          <ResearchPage key={`research:${workspaceHostEpoch.current}`} ready={state.ready} documents={documents}
+            canRun={canChat && researchSelected} selectedId={researchTask?.researchId ?? null} refreshToken={`${contextRefresh}:${busy}:${runId}`}
+            onSelect={(task, draft) => { setResearchChatCollapsed(draft === undefined); setResearchTask(task); selectSession(task.sessionId, draft !== undefined, true); if (draft !== undefined) updateChatInput(draft); void loadSessionList(); }}
+            onUpdated={task => setResearchTask(current => current?.researchId === task.researchId ? task : current)}
+            onAssistant={collapsed => { setResearchChatCollapsed(collapsed); if (!collapsed) requestAnimationFrame(() => chatComposerRef.current?.focus()); }}
+            running={busy && researchTask?.sessionId === activeAgentSessionId} stopping={cancelPending} onStop={() => void cancelAgentRun()}
+            onRun={(text, intent, execution) => { setResearchChatCollapsed(false); void sendChatMessage(undefined, { text, intent, execution }); }} />
         ) : page === 'activity' ? (
           <ActivityPage key={`activity:${workspaceHostEpoch.current}`} hostEpoch={workspaceHostEpoch.current} ready={Boolean(state?.ready)}
             sessions={sessions} selectedSessionId={selectedSessionId} jobs={jobs} documents={documents}
@@ -2962,8 +2996,9 @@ export function App() {
       <AgentChatPanel
         key={`chat:${workspaceHostEpoch.current}`}
         hostEpoch={workspaceHostEpoch.current} hostReady={Boolean(state?.ready)}
-        collapsed={chatCollapsed}
-        onToggle={() => { assistantWasToggled.current = true; setChatCollapsed((collapsed) => !collapsed); }}
+        collapsed={assistantCollapsed}
+        onToggle={() => { assistantWasToggled.current = true; if (page === 'research') setResearchChatCollapsed(value => !value); else setChatCollapsed(value => !value); }}
+        researchContext={page === 'research' || researchSelected}
         selectedSessionId={selectedSessionId}
         selectedSession={selectedSession}
         hasOlderRuns={selectedSession?.historyState === 'legacy-read-only' ? runCursor !== null : messageCursor !== null}
@@ -2984,7 +3019,7 @@ export function App() {
         input={chatInput}
         composerRef={chatComposerRef}
         onInputChange={updateChatInput}
-        onSend={() => void sendChatMessage()}
+        onSend={() => void sendAssistantMessage()}
         onAppend={mode => void appendChatInput(mode)}
         canAppend={canAppend}
         inputReadError={inputReadError}
@@ -3007,11 +3042,11 @@ export function App() {
         selectedModelId={selectedModelId}
         modelName={persistedModel?.name ?? null}
         modelId={persistedModel?.model ?? null}
-        contextName={workspace?.documentRef ? [documents.find(item => item.documentRef.id === workspace.documentRef!.id)?.displayName ?? 'Selected invoice',
+        contextName={researchSelected ? `Research: ${researchTask.title}` : workspace?.documentRef ? [documents.find(item => item.documentRef.id === workspace.documentRef!.id)?.displayName ?? 'Selected invoice',
           workspace.jobId ? 'Processing task selected' : null, workspace.candidateRef ? `Result ${workspace.candidateRef.sequence}` : null,
           selectionLabel(workspace.selection)].filter(Boolean).join(' · ') : null}
-        goalMode={goalMode}
-        canGenerate={Boolean(workspace?.documentRef && workspace.jobId)}
+        goalMode={researchSelected ? 'answer' : goalMode}
+        canGenerate={!researchSelected && Boolean(workspace?.documentRef && workspace.jobId)}
         onGoalModeChange={setGoalMode}
         sessionHint={!runtimeReady ? '' : !selectedSession ? selectedSessionId !== null ? 'Loading this chat. You can write while it loads.' : ''
           : selectedSession.historyState === 'legacy-read-only' ? 'This older conversation is read only. Start a new chat to continue.'
@@ -3388,6 +3423,7 @@ function AgentChatPanel({
   modelName,
   modelId,
   contextName,
+  researchContext,
   goalMode,
   canGenerate,
   onGoalModeChange,
@@ -3435,6 +3471,7 @@ function AgentChatPanel({
   modelName: string | null;
   modelId: string | null;
   contextName: string | null;
+  researchContext: boolean;
   goalMode: 'answer' | 'save-candidate';
   canGenerate: boolean;
   onGoalModeChange(value: 'answer' | 'save-candidate'): void;
@@ -3472,6 +3509,7 @@ function AgentChatPanel({
   if (collapsed) {
     return <aside className="agent-chat-panel collapsed" data-testid="agent-chat-panel">
       <button className="chat-expand" type="button" onClick={onToggle} aria-label="Open Assistant" aria-expanded={false} title="Open Assistant"><span aria-hidden="true">‹</span><b>Assistant</b></button>
+      {busy && <button className="chat-collapsed-stop" type="button" onClick={onCancel} disabled={cancelPending} aria-label={cancelPending ? 'Stopping…' : 'Stop'} title={cancelPending ? 'Stopping…' : 'Stop active run'}>■</button>}
     </aside>;
   }
   return <aside className="agent-chat-panel" data-testid="agent-chat-panel" aria-label="Assistant" onKeyDown={(event) => { if (event.key === 'Escape' && window.innerWidth < 1080) onToggle(); }}>
@@ -3496,7 +3534,7 @@ function AgentChatPanel({
       </div>
       {historyError && <p className="chat-error" role="alert">{historyError}</p>}
       {unconfirmedCount > 0 && <p className="chat-save-feedback" role="status">{unconfirmedCount} {unconfirmedCount === 1 ? 'message has' : 'messages have'} not been confirmed as saved. Refresh history to check.</p>}
-      {messages.length === 0 && turns.length === 0 && !historyLoading && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>How can I help?</strong><p>Ask about this invoice, or start a general conversation.</p></div>}
+      {messages.length === 0 && turns.length === 0 && !historyLoading && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>{researchContext ? 'Explore your research question' : 'How can I help?'}</strong><p>{researchContext ? 'Create or select a research task to plan an investigation, refine its scope, or discuss a saved report.' : 'Ask about this invoice, or start a general conversation.'}</p></div>}
       {messages.map((message) => <article className="chat-turn native-message" data-testid="chat-turn"
         data-message-role={message.role} data-message-entry={message.entryId ?? undefined}
         data-message-run={message.runId ?? undefined} data-message-ordinal={message.liveOrdinal ?? undefined}

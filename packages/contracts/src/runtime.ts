@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { WorkspaceInputSchema } from './workspace.ts';
 import { RUNTIME_CONFIG } from './runtime-config.ts';
+import type { ResearchQueryApi } from './research.ts';
 
 export type DbId = number;
 
@@ -429,6 +430,7 @@ export type NormalizedListSessionsRequest = { limit: number; before?: SessionCur
 export type SessionPage = { items: SessionSnapshot[]; next: SessionCursor | null };
 
 export type AgentRunRequest = {
+  research?: import('./research.ts').ResearchIntent;
   requiredSkill?: import('./resources.ts').ResourceRef;
   sessionId: DbId;
   text: string;
@@ -523,7 +525,7 @@ export type CloseReport = {
   errors: readonly AppError[];
 };
 
-export interface Application {
+export interface Application extends ResearchQueryApi {
   querySessionExtensions(input: import('./extensions.ts').SessionExtensionQuery): Promise<Result<import('./extensions.ts').SessionExtensionView>>;
   queryRunExtensions(input: import('./extensions.ts').RunExtensionQuery): Promise<Result<import('./extensions.ts').RunExtensionView>>;
   executeExtensionCommand(input: import('./extensions.ts').ExtensionCommandRequest): Promise<Result<import('./extensions.ts').ExtensionCommandReceipt>>;

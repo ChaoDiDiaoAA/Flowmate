@@ -1,3 +1,6 @@
+import type { ResearchRepository } from '../research/repository.ts';
+import type { ResearchContext, ResearchPlan, ResearchSourcePolicy } from '@flowmate/contracts';
+import { RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES, RESEARCH_PLANNING_SYSTEM_PROMPT, RESEARCH_INVESTIGATION_SYSTEM_PROMPT } from '@flowmate/contracts';
 import { FrozenInputDefinitionsSchema } from '@flowmate/contracts';
 import type { FrozenInputDefinitions } from '@flowmate/contracts';
 import type { InputDefinitions } from '../prompt-templates.ts';
@@ -76,6 +79,7 @@ export interface RuntimeLogger {
 }
 
 export type RuntimeDependencies = {
+  research?: ResearchRepository;
   memory: Pick<MemoryStore, 'load' | 'commit'>;
   runs: RunRepository;
   recoveryError?: AppError | null;
@@ -730,6 +734,7 @@ export class RuntimeService {
     if (goalMode !== 'answer' && goalMode !== 'save-candidate' && goalMode !== 'fill-form')
       return fail(appError('storage_corrupt', 'storage', 'Saved Context goal is invalid.'));
     const built = contextService.build({ runId, sessionId, jobId: run.data.jobId, text: content.text,
+      ...(content.research ? { research: content.research } : {}),
       goalMode, workspaceContext: content.workspaceContext, workspaceInput: content.workspaceInput,
       ...(content.resourceBinding ? { resourceBinding: content.resourceBinding } : {}),
       ...(content.inputCommand ? { inputCommand: content.inputCommand } : {}),
@@ -772,6 +777,12 @@ export class RuntimeService {
     if (run.data.kind === 'subagent') {
       const provenance = run.data.config.subagent as import('@flowmate/contracts').SubagentConfig['subagent'];
       if (inputId !== provenance.childInputId) return corrupt();
+      return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier,
+        { runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
+    }
+    if (content.research) {
+      const binding = this.dependencies.research?.bindingForRun(active.runId);
+      if (!binding?.ok || !isDeepStrictEqual(binding.data, content.research.binding) || run.data.scope.version !== 2) return corrupt();
       return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier,
         { runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
     }
@@ -901,6 +912,37 @@ export class RuntimeService {
     }
     if (rawRequest.workspace && !this.dependencies.workspaceVerifier)
       return fail(appError('workspace_unavailable', 'storage', 'Workspace verification is unavailable.', true));
+    const taskForSession = this.dependencies.research?.forSession(rawRequest.sessionId);
+    if (taskForSession && !taskForSession.ok) return taskForSession;
+    if (taskForSession?.ok && taskForSession.data && !rawRequest.research)
+      return fail(appError('research_intent_required', 'input', 'Choose a research action for this dedicated Session.'));
+    let researchPolicy: ResearchSourcePolicy | undefined;
+    let researchGoal: string | undefined;
+    let confirmedPlan: ResearchPlan | undefined;
+    if (rawRequest.research) {
+      const repository = this.dependencies.research;
+      if (!repository || !this.dependencies.contextService || !inputSubmission) return fail(appError('research_unavailable', 'runtime', 'Research requires durable input admission.'));
+      const task = repository.get(rawRequest.research.researchId); if (!task.ok) return task;
+      if (task.data.sessionId !== rawRequest.sessionId) return fail(appError('research_identity_conflict', 'runtime', 'Research task belongs to another Session.'));
+      researchPolicy = task.data.sourcePolicy;
+      researchGoal = task.data.title;
+      if (rawRequest.research.phase === 'researching') {
+        const reference = rawRequest.research.plan;
+        if (!reference || task.data.currentPlanId !== reference.planId) return fail(appError('research_plan_stale', 'runtime', 'Confirm the latest plan version.'));
+        const plan = repository.getPlan({ researchId: task.data.researchId, planId: reference.planId }); if (!plan.ok) return plan;
+        if (plan.data.revision !== reference.revision) return fail(appError('research_plan_stale', 'runtime', 'Confirm the latest plan version.'));
+        if (rawRequest.research.continuation && !task.data.planConfirmed)
+          return fail(appError('research_plan_not_confirmed', 'runtime', 'Confirm this plan before continuing its investigation.'));
+        if (task.data.planConfirmed && !rawRequest.research.continuation)
+          return fail(appError('research_already_started', 'runtime', 'This plan has already been confirmed. Continue explicitly.'));
+        confirmedPlan = plan.data; researchPolicy = confirmedPlan.body.sourcePolicy;
+        const supplied = originalOverrides(rawRequest), fixed = confirmedPlan.body.execution;
+        if (supplied.timeoutMs !== undefined && supplied.timeoutMs !== fixed.timeoutMs || supplied.stopGraceMs !== undefined && supplied.stopGraceMs !== fixed.stopGraceMs
+          || Object.entries(supplied.budget ?? {}).some(([key, value]) => fixed.budget[key as keyof typeof fixed.budget] !== value))
+          return fail(appError('research_budget_conflict', 'input', 'Execution must use the confirmed plan budget.'));
+      }
+    }
+    const effectiveRequest = { ...rawRequest, ...(confirmedPlan ? confirmedPlan.body.execution : {}) };
     const settings = this.dependencies.runtimeDefaults?.() ?? ok({});
     if (!settings.ok) return settings;
     const defaults = RuntimeRequestOverridesSchema.safeParse(settings.data);
@@ -910,16 +952,16 @@ export class RuntimeService {
     const assembly = AssemblySelectionSnapshotSchema.safeParse(assemblyDefaults.data);
     if (!assembly.success) return fail(appError('config_settings_invalid', 'input', 'Assembly defaults are invalid.'));
     const delegationConfigured = assembly.data.extensions.enabledExtensions.some(ref => ref.id === 'subagents');
-    if (!rawRequest.workspace && !delegationConfigured && (rawRequest.budget?.maxToolCalls ?? 0) !== 0)
+    if (!rawRequest.workspace && !rawRequest.research && !delegationConfigured && (rawRequest.budget?.maxToolCalls ?? 0) !== 0)
       return fail(appError('input_invalid', 'input', 'A text-only Run cannot receive tool permission.'));
-    const request: FrozenAgentRunRequest = { ...rawRequest,
+    const request: FrozenAgentRunRequest = { ...effectiveRequest,
       goalMode: rawRequest.goalMode ?? 'answer',
-      timeoutMs: rawRequest.timeoutMs ?? defaults.data.timeoutMs ?? (rawRequest.goalMode === 'save-candidate' ? RUNTIME_CONFIG.request.saveCandidateTimeoutMs : RUNTIME_CONFIG.request.timeoutMs),
-      stopGraceMs: rawRequest.stopGraceMs ?? defaults.data.stopGraceMs ?? RUNTIME_CONFIG.request.stopGraceMs,
-      budget: Object.freeze({ maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, maxModelCalls: rawRequest.workspace || delegationConfigured
+      timeoutMs: effectiveRequest.timeoutMs ?? defaults.data.timeoutMs ?? (rawRequest.goalMode === 'save-candidate' ? RUNTIME_CONFIG.request.saveCandidateTimeoutMs : RUNTIME_CONFIG.request.timeoutMs),
+      stopGraceMs: effectiveRequest.stopGraceMs ?? defaults.data.stopGraceMs ?? RUNTIME_CONFIG.request.stopGraceMs,
+      budget: Object.freeze({ maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, maxModelCalls: rawRequest.workspace || rawRequest.research || delegationConfigured
           ? RUNTIME_CONFIG.runBudget.maxModelCalls.workspace : RUNTIME_CONFIG.runBudget.maxModelCalls.chat,
         toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs,
-        ...defaults.data.budget, ...rawRequest.budget, ...(!rawRequest.workspace && !delegationConfigured ? { maxToolCalls: 0 } : {}) }) };
+        ...defaults.data.budget, ...effectiveRequest.budget, ...(!rawRequest.workspace && !rawRequest.research && !delegationConfigured ? { maxToolCalls: 0 } : {}) }) };
     const { agent, sessions } = this.dependencies;
     if (!agent || !sessions) return fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'));
     if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Agent 停止或 Run 保存未确认，运行实例不可复用。'));
@@ -967,19 +1009,29 @@ export class RuntimeService {
     }
     const hub = this.dependencies.resources;
     if (hub && !this.dependencies.contextService) return fail(appError('resource_evidence_write_failed', 'storage', 'Resource admission requires Context persistence.', true));
-    const selected: AssemblySelectionSnapshot = assembly.data;
+    let selected: AssemblySelectionSnapshot = assembly.data;
+    if (request.research && hub) {
+      const catalog = hub.catalog({ revision: selected.revision, selection: EMPTY_RESOURCE_SELECTION });
+      if (!catalog.ok) return catalog;
+      const prompt = catalog.data.items.find(item => item.available && item.ref.kind === 'prompt' && item.ref.id === 'research')?.ref;
+      const skill = catalog.data.items.find(item => item.available && item.ref.kind === 'skill' && item.ref.id === 'deep-research')?.ref;
+      if (!prompt || !skill) return fail(appError('resource_required_unavailable', 'input', 'The research Prompt and Skill are unavailable.'));
+      selected = { ...selected, selection: { prompt, enabledSkills: [skill] },
+        extensions: { enabledExtensions: selected.extensions.enabledExtensions.filter(ref => ref.id === 'subagents') } };
+    }
     const required = resolveRequiredSkill(request.text, request.requiredSkill, selected.selection.enabledSkills);
     if (!required.ok) return required;
-    const skillNames = request.workspace && request.goalMode !== 'fill-form'
+    const skillNames = (request.workspace || request.research) && request.goalMode !== 'fill-form'
       ? SKILL_RESOURCE_TOOL_NAMES.filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : [];
-    const activeToolNames = request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
+    const activeToolNames = request.research ? [...(request.research.phase === 'planning' ? RESEARCH_PLANNING_TOOL_NAMES : RESEARCH_INVESTIGATION_TOOL_NAMES), ...skillNames]
+      .filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
       request.workspace.documentRef !== null, request.workspace.jobId !== null), ...skillNames, ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
-    if (delegationConfigured && request.goalMode !== 'fill-form'
+    if (delegationConfigured && (!request.research || request.research.phase === 'researching') && request.goalMode !== 'fill-form'
       && request.budget.maxToolCalls > 0 && request.budget.maxModelCalls >= 3
       && this.dependencies.tools?.listTools().some(tool => tool.name === 'Agent')) activeToolNames.push('Agent');
     const extensionHub = this.dependencies.extensions;
     const fixedExtensions = extensionHub?.freeze({ selection: selected.extensions, settingsRevision: selected.revision, activeToolNames,
-      policy: request.goalMode === 'fill-form' ? 'fill' : request.workspace ? 'p3' : 'p2' }) ?? ok(null);
+      policy: request.goalMode === 'fill-form' ? 'fill' : request.workspace || request.research ? 'p3' : 'p2' }) ?? ok(null);
     if (!fixedExtensions.ok) return fixedExtensions;
     if (!extensionHub && selected.extensions.enabledExtensions.length) return fail(appError('extension_config_invalid', 'input', 'Extension directory is unavailable.'));
     const extensions = fixedExtensions.data;
@@ -1007,10 +1059,14 @@ export class RuntimeService {
       agent: { ...config.agent, ...(resources ? { resourcePolicy: 'p11-resources-v1' as const } : {}),
         ...(extensions ? { extensionPolicy: extensions.included.length ? extensions.policyVersion : 'none' as const } : {}) } });
     const createdAt = this.dependencies.now();
-    const input: InputRecord = { version: 1, goal: INVOICE_CHAT_GOAL,
+    const input: InputRecord = { version: 1, goal: researchGoal ?? INVOICE_CHAT_GOAL,
       text: request.text, messageTimestamp: Date.now() };
     let admission: WorkspaceRunAdmission | null = null;
-    let scope: RunScope | null = !request.workspace && activeToolNames.includes('Agent')
+    const materials = researchPolicy ? this.dependencies.research!.materialScope(researchPolicy) : null;
+    if (materials && !materials.ok) return materials;
+    let researchContext: ResearchContext | undefined;
+    let scope: RunScope | null = request.research && materials?.ok
+      ? { version: 2, allowedTools: activeToolNames, ...materials.data, allowedResourcePaths: [] } : !request.workspace && activeToolNames.includes('Agent')
       ? { version: 2, allowedTools: ['Agent'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] } : null;
     let inputId: number | undefined;
     let frozenContent: SessionInputContentV2 | undefined;
@@ -1040,9 +1096,9 @@ export class RuntimeService {
         if (this.dependencies.nativeTools && submission.goalMode !== 'fill-form')
           workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(runId), 'work');
       } else {
-        const created = this.dependencies.runs.createAgent({ goal: INVOICE_CHAT_GOAL, input,
+        const created = this.dependencies.runs.createAgent({ goal: input.goal, input,
           config: { ...freezeConfig(scope ? { ...initialP3AgentSnapshot(request, session.nativeSessionId),
-            agent: { ...initialP3AgentSnapshot(request, session.nativeSessionId).agent, systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT } }
+            agent: { ...initialP3AgentSnapshot(request, session.nativeSessionId).agent, systemPrompt: request.research ? request.research.phase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT } }
             : initialAgentSnapshot(request, session.nativeSessionId)),
             ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
             ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
@@ -1052,13 +1108,18 @@ export class RuntimeService {
         if (!created.ok) return created;
         runId = created.data;
       }
-      const content: SessionInputContentV2 = { version: 2, text: request.text,
+      if (request.research) {
+        const bound = this.dependencies.research!.bindRun({ ...request.research, sessionId: request.sessionId, runId, at: createdAt });
+        if (!bound.ok) return bound;
+        researchContext = { binding: bound.data, plan: confirmedPlan?.body ?? null };
+      }
+      const content: SessionInputContentV2 = { ...(researchContext ? { research: researchContext } : {}), version: 2, text: request.text,
         ...(inputDefinitions?.command ? { inputCommand: inputDefinitions.command } : {}),
         ...(resourceBinding ? { resourceBinding } : {}),
         requestIdentityVersion: 1, originalBudgetOverrides: originalOverrides(rawRequest),
         workspaceContext: admission?.workspaceContext ?? null, workspaceInput: admission?.workspaceInput ?? null,
-        allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : [],
-        allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : [],
+        allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : researchContext && scope?.version === 2 ? [...scope.allowedDocumentIds] : [],
+        allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : researchContext && scope?.version === 2 ? [...scope.allowedArtifactIds] : [],
         ...(control.desktopRequestHash === undefined ? {} : { desktopRequestHash: control.desktopRequestHash }),
         promptText: formatExecutionPrompt({ text: inputDefinitions?.command?.expandedText ?? request.text, business: admission !== null,
           ...(admission ? { workspaceInput: admission.workspaceInput, workspaceContext: admission.workspaceContext,
@@ -1612,7 +1673,7 @@ export class RuntimeService {
       request.config,
       { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
       active.controller.signal,
-      context.scope ? { ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}),
+      context.scope ? { ...(request.research ? { researchPhase: request.research.phase } : {}), ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}),
         ...(context.inputId && context.inputDefinitions?.command?.kind === 'subagent'
           ? { inputCommandOwner: { runId: active.runId, sessionId: request.sessionId, inputId: context.inputId } } : {}),
         ...(!context.admission && context.scope.allowedTools.every(name => name === 'Agent') ? { chatDelegation: true } : {}), activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,

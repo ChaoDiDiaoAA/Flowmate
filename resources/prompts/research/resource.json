@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "prompt",
+  "id": "research",
+  "version": "v1",
+  "bodyFile": "prompt.md",
+  "keywords": [
+    "research",
+    "研究",
+    "证据",
+    "报告"
+  ],
+  "requires": [{ "kind": "tool", "name": "read_research_local" }],
+  "files": [
+    {
+      "path": "prompt.md",
+      "bytes": 1024,
+      "sha256": "976aae108a53afe3beebafd87d15aea25db7230e412c781a6d6f4ea1b463ef40"
+    }
+  ]
+}

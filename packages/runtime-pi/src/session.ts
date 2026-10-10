@@ -1,3 +1,4 @@
+import { RESEARCH_PLANNING_SYSTEM_PROMPT, RESEARCH_INVESTIGATION_SYSTEM_PROMPT } from '@flowmate/contracts';
 import { FrozenInputDefinitionsSchema, InputCommandOwnerSchema, InputCommandReceiptSchema } from '@flowmate/contracts';
 import { nativeFileResultIncludes } from '@flowmate/shared';
 import {
@@ -875,9 +876,9 @@ export class PiAgentAdapter implements AgentPort {
     const inputDefinitions = options?.inputDefinitions ? FrozenInputDefinitionsSchema.parse(options.inputDefinitions) : null;
     if (inputDefinitions && createHash('sha256').update(JSON.stringify({ roles: inputDefinitions.roles, templates: inputDefinitions.templates })).digest('hex') !== inputDefinitions.hash)
       return fail(appError('input_invalid', 'input', 'Frozen role index changed.'));
-    const resourceKey = JSON.stringify([resources?.bundleHash ?? null, resources?.skillIndex?.hash ?? null, inputDefinitions?.hash ?? null, options?.chatDelegation ?? false, [...activeToolNames].sort()]);
+    const resourceKey = JSON.stringify([resources?.bundleHash ?? null, resources?.skillIndex?.hash ?? null, inputDefinitions?.hash ?? null, options?.chatDelegation ?? false, options?.researchPhase ?? null, [...activeToolNames].sort()]);
     const roleIndex = activeToolNames.includes('Agent') && inputDefinitions ? inputDefinitions.roles.map(role => '- '+role.id+': '+role.description.slice(0,160)+'; '+(role.tools.every(name=>activeToolNames.includes(name)) ? 'available' : 'unavailable: required tools missing')).join('\n') : undefined;
-    const loader = createRunResourceLoader({ fixedSystemPrompt: policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
+    const loader = createRunResourceLoader({ fixedSystemPrompt: options?.researchPhase ? options.researchPhase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
       : policy === 'p3' && !options?.chatDelegation ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT, frozen: resources,
       activeToolNames,
       roleIndex, templates: inputDefinitions?.templates,
@@ -2083,7 +2084,9 @@ export class PiAgentAdapter implements AgentPort {
       return output;
     } catch (error) {
       if (error instanceof ToolExecutionFailure) throw error;
-      throw new ToolExecutionFailure(error && typeof error === 'object' && 'code' in error ? error as import('@flowmate/contracts').AppError
+      throw new ToolExecutionFailure(error instanceof Error && error.message === 'subagent_busy'
+        ? appError('subagent_busy', 'runtime', 'Four child executions are already owned.', true)
+        : error && typeof error === 'object' && 'code' in error ? error as import('@flowmate/contracts').AppError
         : appError('subagent_execution_failed', 'runtime', 'The managed child execution failed.'));
     }
   }

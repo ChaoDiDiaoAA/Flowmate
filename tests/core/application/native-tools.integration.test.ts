@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Database } from 'bun:sqlite';
-import { NATIVE_TOOL_NAMES } from '@flowmate/contracts';
+import { NATIVE_TOOL_NAMES, RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES } from '@flowmate/contracts';
 import type { AgentRunEvent, AgentRunSnapshot, ProviderConfig } from '@flowmate/contracts';
 import { createApplication } from '../../../apps/composition.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
@@ -46,7 +46,9 @@ describe('native tools through the public Application', () => {
     const launch = () => createApplication({ paths, logger: { write() {}, close: async () => {} },
       agentFactory: definitions => {
         expect(definitions.map(tool => tool.name).slice(-8)).toEqual([...NATIVE_TOOL_NAMES]);
-        expect(new Set(definitions.map(tool => tool.name)).size).toBe(24);
+        const researchNames = new Set<string>([...RESEARCH_PLANNING_TOOL_NAMES, ...RESEARCH_INVESTIGATION_TOOL_NAMES]);
+        expect(new Set(definitions.map(tool => tool.name)).size).toBe(definitions.length);
+        expect(definitions.filter(tool => !researchNames.has(tool.name))).toHaveLength(24);
         expect(definitions.filter(tool => tool.name === 'Agent')).toHaveLength(1);
         expect(definitions.filter(tool => tool.name === 'list_skill_resources')).toHaveLength(1);
         expect(definitions.filter(tool => tool.name === 'read_skill_resource')).toHaveLength(1);

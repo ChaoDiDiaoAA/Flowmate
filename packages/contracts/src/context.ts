@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ResearchContextSchema } from './research.ts';
 import { RunCompactionEvidenceSchema } from './compaction.ts';
 import type { RunCompactionEvidence } from './compaction.ts';
 import { AppErrorSchema } from './runtime.ts';
@@ -121,7 +122,7 @@ export const ContextProjectionSchema = z.object({ taskGoal: z.string().nullable(
 export type ContextProjection = z.infer<typeof ContextProjectionSchema>;
 export const ContextBudgetsSchema = z.object({ projectionBytes: z.literal(65536), fragmentBytes: z.literal(4096),
   fragments: z.literal(32), issueCount: z.literal(20), snapshotBytes: z.literal(262144) }).strict();
-const publicJsonShape = { version: z.literal(1), policyVersion: z.literal('p8-context-v1'), text: userText, goalMode,
+const publicJsonShape = { research: ResearchContextSchema.optional(), version: z.literal(1), policyVersion: z.literal('p8-context-v1'), text: userText, goalMode,
   workspaceContext: WorkspaceContextSchema.nullable(), resourcePolicy: z.enum(['none', 'p11-resources-v1']),
   resourceBinding: ResourceBindingSchema.optional(), inputCommand: FrozenInputCommandSchema.optional(),
   modelProjection: ContextProjectionSchema, budgets: ContextBudgetsSchema };
@@ -148,7 +149,7 @@ export const ContextSnapshotSchema = z.object({ ...snapshotIdentity, json: Conte
   .refine(value => value.json.workspaceContext === null || value.json.workspaceContext.sessionId === value.sessionId
     && value.json.workspaceContext.jobId === value.jobId, 'Snapshot and frozen Workspace identity disagree.').readonly();
 export type ContextSnapshot = z.infer<typeof ContextSnapshotSchema>;
-export const ContextBuildRequestSchema = z.object({ runId: id, sessionId: id, jobId: id.nullable(), text: userText, goalMode,
+export const ContextBuildRequestSchema = z.object({ research: ResearchContextSchema.optional(), runId: id, sessionId: id, jobId: id.nullable(), text: userText, goalMode,
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id).max(64).readonly(), allowedArtifactIds: z.array(id).max(128).readonly(),
   workingDirectory: WorkingDirectorySchema.nullable(), createdAt: time, resourceBinding: ResourceBindingSchema.optional(),
