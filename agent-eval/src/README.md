@@ -1,8 +1,10 @@
 # 评测源码职责
 
-**Deep Research核心价值与设计（目标）：** 用户确认复杂问题的研究计划后，工作流组织资料获取、综合与证据核验，交付覆盖／依据／局限可查看的保存报告。核心为研究规划→能力执行→证据收集→Agent综合→证据报告→持久化，复用Pi SDK／现有Runtime，详见[主§19.1–19.2](../../docs/spec/00_Flowmate完整方案_v1.md#research-core-chain)。产品和研究质量仍待实施／验证。
+已有产品入口位于[research.ts](../../packages/contracts/src/research.ts)、[research-commands.ts](../../packages/contracts/src/research-commands.ts)及[ProductApi](../../packages/contracts/src/runtime.ts)；研究核心／工具／SQLite存储在产品内已实现。待接合的是Node→Bun Host评测Adapter、用户确认步骤、列表分页／片段／原Run采证、独立DR评分与白名单；不复制产品研究服务、API或数据库写入者。来源body、Gold、资源正文及本地路径默认留本地，Langfuse4.55.0只展示本地结果。
 
-> **2026-10-10 Deep Research现行设计增量（待实施）：** P1–P14→P15 Deep Research→独立统一评测→P16 Evaluation桌面→P17 Host & Packaging。[主方案§19](../../docs/spec/00_Flowmate完整方案_v1.md#deep-research)、[P15目标](../../docs/spec/P15_目标方案_v1.md)、[P15计划](../../docs/plans/P15_实施计划_v1.md)、[评测总计划](../../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md#manual-route)。桌面目标在Chats之后新增独立Deep Research，研究列表／新建／Plan、Evidence、Report及右侧关联Session。原50／10＋研究12／4＝62／14，原33项＋研究6项＝39，Runtime24另报；产品研究／研究评测工程及正式数据均待实施，现有readiness=false保持，历史日期／成绩／Runtime T15/T16不改。
+**Deep Research产品与评测现状（2026-10-10，`acf1257`）：** P15本地产品已实现规划→精确Plan确认→调查→来源／Claim→保存证据报告，复用Pi SDK与现有Runtime，见[主§19](../../docs/spec/00_Flowmate完整方案_v1.md#deep-research)及[P15实施§6](../../docs/plans/P15_实施计划_v1.md#p15-engineering-delivery)。当前仅显式本地UTF-8文本、Markdown和已有解析Document，无搜索／网页提取／Tavily／检索回放前置；产品工程记录及限制不等于评测工程或正式质量已通过。
+
+> **现行交接：** P1–P15适用产品→独立评测前三阶段→用户明确启动P16 Evaluation桌面→P17安装。原50／10＋研究12／4＝62／14，原33项＋DR01–06＝39项，Runtime24（8开发／16留出）另报。生产Adapter仍readiness=false，研究评测契约／步骤／采证／评分及正式数据未接通；已撤回工程不再次回退或恢复。执行状态以[05总计划](../../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md#current-state)为准，历史数字按当时语境解释。
 
 前次修订记录：2026-10-10。[05](../../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md)为唯一总计划，06 Agent工程/制作→07用户真实执行/平台查看→08核验，通过后用户明确启动P16。当前strict v1、smoke/full、production readiness=false/prepare拒绝，正式数据/质量未测；本轮只文档修订，不再次回退工程。
 
@@ -34,4 +36,4 @@ Langfuse服务端4.55.0与锁定SDK5.11.1分列。Execution为平台sessionId、
 
 各Trial等价初态/独立可写实例与同Trial恢复保留事实要分别验证；生产未就绪不能认领真实隔离通过。不同Execution默认独立报告/比较，A–D各自统计；Trace稳定身份包含Execution，补传不增加Trial或模型调用。完整repeat=1、两个Smoke Execution及每组留出repeat=3的既定规模/预算不变。
 
-研究交接增量：先接版本化网页／本地材料与规划／精确确认／调查步骤、冻结来源传输，再制作研究12／4与独立Claim／证据链Gold；DR01–06计数按01§8.12，原33项公式不变。两个业务Full事前分别登记Execution，Judge输出12800＋3072＝15872，单Execution15000及每Trial一次／256守卫不变；研究先导、校准、复测另登记并计Agent／搜索／Judge全部费用。新任务集名及契约是待实施目标，不代表现有严格v1可直接解析或运行。
+研究阶段一复用[现有研究操作](../../packages/contracts/src/research-commands.ts)，接合版本化本地材料／精确确认／调查与分页采证，制作12／4和独立Claim／证据链Gold。SourceSnapshot完整保存、首段4000 UTF-16字符及续读、后续请求／采用分别取证，Gold只要求本题允许材料支持的结论，Report新增事实同样核验。DR01–06及原33项由本地算分，产品full／supported不替代独立结果；每Trial一次Judge／256／无重试不变。原业务Full12800、研究Full3072，事前分别Execution累计15872，单Execution15000；校准／先导／复测另登记，Agent／Judge真实费用及未知保留，当前搜索未发生／不适用。研究Dataset和配置目标未创建，严格v1不接受未来字段。
