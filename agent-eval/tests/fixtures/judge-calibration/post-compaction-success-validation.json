@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "post-compaction-success-validation",
+  "instanceId": "post-compaction-success-validation-independent",
+  "sourceGroup": "post-compaction-success-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "post-compaction-success",
+        "version": "v1",
+        "unit": "后续任务",
+        "denominator": 1,
+        "required": true,
+        "rule": "以事前计划的压缩后任务为分母，结合独立成果检查后续是否成功；发生压缩、生成摘要或非空回答不等于后续任务成功。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The declared post-compaction task requires amount 862.40 from document morrow-archive-62.",
+      "originalObservation": "After actual native compaction, the original receipt has 862.40 for morrow-archive-62 and independently confirmed stop.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "post-compaction-success",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

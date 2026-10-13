@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "current-fact-use-tune",
+  "instanceId": "current-fact-use-tune-independent",
+  "sourceGroup": "current-fact-use-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "current-fact-use",
+        "version": "v1",
+        "unit": "使用点",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个当前事实使用点对照有效新旧事实、来源和答案；新信息注入成功不证明采用，旧事实覆盖新纠正判错。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The latest valid original source replaces the old amount with 137.25.",
+      "originalObservation": "The final response repeats the superseded amount.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "current-fact-use",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "tool-selection-tune",
+  "instanceId": "tool-selection-tune-independent",
+  "sourceGroup": "tool-selection-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "tool-selection",
+        "version": "v1",
+        "unit": "决策点",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个实际调用或不调用决策核对任务需要、已知信息和合法替代路径；允许无需工具及更便宜的合法替代，不强制唯一工具序列。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The current original receipt already contains the requested total; no update or recomputation is needed.",
+      "originalObservation": "A write tool changes the original receipt to answer a read-only question.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "tool-selection",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

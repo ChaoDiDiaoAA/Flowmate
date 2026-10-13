@@ -2303,8 +2303,10 @@ export class RuntimeService {
     }
     try {
       const providerReport = await this.dependencies.provider.close();
-      this.closed = activeStopped && agentReport.closed && providerReport.closed;
-      const stopped = activeStopped && agentReport.stopped && providerReport.stopped;
+      const toolsReport=this.dependencies.tools?.close()??{stopped:true,closed:true,errors:[]};
+      for(const error of toolsReport.errors)this.closeErrors.set(error.code,error);
+      this.closed = activeStopped && agentReport.closed && providerReport.closed && toolsReport.closed;
+      const stopped = activeStopped && agentReport.stopped && providerReport.stopped && toolsReport.stopped;
       this.poisoned ||= !stopped;
       for (const error of providerReport.errors) this.closeErrors.set(error.code, error);
       return { stopped, closed: this.closed, errors: [...this.closeErrors.values()] };

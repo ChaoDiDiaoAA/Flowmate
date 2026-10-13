@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { AppError, DbId, Result, ToolCallDelivery, ToolDefinition, ToolExecutionContext, ToolResult, ToolCallSnapshot, ToolRuntimeObservation, RuntimeStrategySnapshot, ResolvedRuntimeBudget, RuntimeStrategyPolicy } from '@flowmate/contracts';
 import { RegisteredToolNameSchema, MAX_TOOL_VERSION_CHARS } from '@flowmate/contracts';
 import { createToolRecorder } from './recorder.ts';
+import { createCaseEvaluationFault } from './evaluation-fault.ts';
 type Recorder = ReturnType<typeof createToolRecorder>;
 export type ToolExecution = { call: ToolCallSnapshot; result: ToolResult<unknown>; fatal: boolean };
 export type ToolExecutor = ReturnType<typeof createToolExecutor>;
@@ -33,12 +34,14 @@ function isToolExperience(call: ToolCallSnapshot, observation: ToolRuntimeObserv
     || !['identity', 'sdk_before', 'commit', 'storage', 'sdk_after', 'delivery', 'history'].includes(observation.failureStage ?? '');
 }
 
-export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Recorder; definitions: readonly ToolDefinition<any, any>[];
+export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Pick<Recorder,'observationCutoff'|'recentStarted'|'recentObservations'>; definitions: readonly Pick<ToolDefinition<any, any>,'name'|'version'|'effect'>[];
   policy?: RuntimeStrategyPolicy }): Result<RuntimeStrategySnapshot> {
   if (input.policy?.frozenStrategy && !RuntimeStrategySnapshotSchema.safeParse(input.policy.frozenStrategy).success) {
     return fail(appError('input_invalid', 'runtime', 'The trusted Runtime strategy snapshot is invalid.'));
   }
-  const cutoff = input.policy?.frozenStrategy ? ok(input.policy.frozenStrategy.calibration.sourceCutoffToolCallId) : input.recorder.observationCutoff();
+  const suppliedStrategies=input.policy?.frozenStrategies??(input.policy?.frozenStrategy?[input.policy.frozenStrategy]:undefined);
+  if(suppliedStrategies?.some(strategy=>!RuntimeStrategySnapshotSchema.safeParse(strategy).success))return fail(appError('input_invalid','runtime','The trusted Runtime strategy snapshot is invalid.'));
+  const cutoff = suppliedStrategies ? ok(suppliedStrategies[0]?.calibration.sourceCutoffToolCallId??0) : input.recorder.observationCutoff();
   const groups: RuntimeStrategySnapshot['calibration']['groups'] = [];
   const experience: RuntimeStrategySnapshot['experience'] = { version: 1, modelKey: input.modelKey,
     promptVersion: input.promptVersion, taskType: input.taskType, items: [] };
@@ -53,18 +56,20 @@ export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Recorde
     groups.push(group);
     const statistical = name !== 'Agent' && ['PURE', 'READ'].includes(definition.effect)
       && !NATIVE_TOOL_NAMES.includes(name as (typeof NATIVE_TOOL_NAMES)[number]);
-    const supplied = input.policy?.frozenStrategy;
-    if (supplied) {
-      const frozen = supplied.calibration.groups.find(candidate => candidate.groupKey === groupKey);
-      const compatible = supplied.version === 'runtime-v1' && supplied.sampleSource === input.sampleSource
+    const supplied=suppliedStrategies?.find(strategy=>strategy.calibration.groups.some(candidate=>candidate.groupKey===groupKey));
+    if (suppliedStrategies) {
+      const frozen = supplied?.calibration.groups.find(candidate => candidate.groupKey === groupKey);
+      if(!supplied&&suppliedStrategies.some(strategy=>strategy.calibration.groups.some(candidate=>candidate.toolName===name)))
+        return fail(appError('input_invalid','runtime','Frozen Runtime tool, SDK, environment, model or task is incompatible.'));
+      const compatible = supplied?.version === 'runtime-v1' && supplied.sampleSource === input.sampleSource
         && supplied.experience.modelKey === input.modelKey && supplied.experience.promptVersion === input.promptVersion
         && supplied.experience.taskType === input.taskType;
       if (frozen && compatible) Object.assign(group, frozen, { selectedTimeoutMs: Math.min(input.configuredToolTimeoutMs, frozen.selectedTimeoutMs) });
-      else group.fallbackReason = 'incompatible_snapshot';
+      else group.fallbackReason = 'insufficient_samples';
       if (!statistical || input.policy?.statistics === false) Object.assign(group, { selectedTimeoutMs: input.configuredToolTimeoutMs,
         timeoutSource: 'configured', fallbackReason: !statistical ? 'ineligible_tool' : 'disabled' });
       if (frozen && compatible && input.policy?.experience !== false) {
-        experience.items.push(...supplied.experience.items.filter(item => item.toolName === name));
+        experience.items.push(...supplied!.experience.items.filter(item => item.toolName === name));
       }
       continue;
     }
@@ -121,7 +126,10 @@ export function createToolExecutor(input: {
   monotonicNow?: () => number;
   strategyPolicy?: RuntimeStrategyPolicy;
   sampleSource?: ToolRuntimeObservation['sampleSource'];
+  caseFaultProfile?: import('@flowmate/contracts').CaseEvaluationFaultProfile;
 }) {
+  const caseFault=createCaseEvaluationFault(input.caseFaultProfile);
+  if(caseFault&&input.sampleSource!=='evaluation')throw new Error('Case faults require independent evaluation provenance');
   const definitions = Object.freeze([...input.definitions]);
   const byName = new Map<string, ToolDefinition<any, any>>();
   const versionPattern = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]{0,${MAX_TOOL_VERSION_CHARS - 1}}$`);
@@ -226,6 +234,14 @@ export function createToolExecutor(input: {
   function recordDelivery(context: Pick<ToolExecutionContext, 'runId' | 'sessionId'>, nativeToolCallId: string, delivery: ToolCallDelivery): Result<void> {
     const call = input.recorder.query({ ...context, nativeToolCallId });
     if (!call.ok) return call;
+    if(caseFault?.profile.id==='case-save-delivery-loss'&&call.data.toolName==='save_invoice_candidate'&&delivery.state==='message_observed'&&call.data.status==='succeeded'){
+      const commit=input.recorder.queryCandidateCommit({toolCallId:call.data.toolCallId,...context});
+      if(commit.ok&&commit.data!==null&&isDeepStrictEqual(call.data.result?.data,commit.data)&&caseFault.activate(call.data.toolName)){
+        const error=appError('tool_execution_failed','tool','Committed candidate model delivery failed.',false,context.runId,context.sessionId,nativeToolCallId);
+        const saved=input.recorder.recordDelivery(call.data.toolCallId,{version:1,state:'failed',messageObservedAt:null,includedInCallSequence:null,requestDispatchedAt:null,error});
+        return saved.ok?fail(error):saved;
+      }
+    }
     const updated = input.recorder.recordDelivery(call.data.toolCallId, delivery);
     return updated.ok ? ok(undefined) : updated;
   }
@@ -334,7 +350,12 @@ export function createToolExecutor(input: {
         deadlineAt: startedMs + use.timeoutMs,
         ...(context.requestBinding ? { requestBinding: context.requestBinding } : {}) });
       const product = Object.freeze({ runId: context.runId, sessionId: context.sessionId, scope: context.scope });
-      data = await definition.execute(use.arguments, call, product);
+      if(caseFault)await caseFault.commitGate('before-commit',definition.name,signal);
+      const returned = await definition.execute(use.arguments, call, product);
+      if(caseFault)await caseFault.commitGate('after-commit',definition.name,signal);
+      if(caseFault?.profile.id==='case-evidence-read-execution-failure'&&caseFault.activate(definition.name))
+        throw new ToolExecutionFailure(appError('tool_execution_failed','tool','Original evidence read execution failed.',false,context.runId,context.sessionId,context.nativeToolCallId));
+      data = returned;
       endedMs = monotonicNow();
       timedOut ||= endedMs - startedMs >= use.timeoutMs;
       const output = definition.outputSchema?.safeParse(data);
@@ -466,6 +487,7 @@ export function createToolExecutor(input: {
   }
 
   return {
+    close:():{stopped:boolean;closed:boolean;errors:AppError[]}=>({stopped:true,closed:true,errors:[]}),
     failUnconfirmedDelegation(context: { runId: DbId; sessionId: DbId }, nativeToolCallId: string): Result<void> {
       const call = input.recorder.query({ ...context, nativeToolCallId });
       if (!call.ok) return call;

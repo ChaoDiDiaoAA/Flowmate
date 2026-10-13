@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "completion-verification-tune",
+  "instanceId": "completion-verification-tune-independent",
+  "sourceGroup": "completion-verification-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "completion-verification",
+        "version": "v1",
+        "unit": "终结机会",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个终结机会核对原目标、必要提交、真实停止和独立成果。按成功/失败条件及Gold核对内容；引用格式有效、Run completed、产品supported或助手自述均不足以证明正确。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The only required total is 137.25, and the original saved receipt is available.",
+      "originalObservation": "The receipt total is 8 while the terminal response declares the required 137.25 verified.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "completion-verification",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": true,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

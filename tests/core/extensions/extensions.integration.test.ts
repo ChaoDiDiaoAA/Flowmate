@@ -33,6 +33,21 @@ function makeCatalog(resourceRoot: string, sdkVersion = '0.85.1') {
   return create?.({ resourceRoot, sdkVersion, registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }, { name: 'Agent', version: '0.19.0-p13.2', effect: 'READ' }] });
 }
 
+it('requires actual invoice extension selection and eligibility for an evaluation Hook profile', () => {
+  const f = fixture();
+  const service = core.createExtensionService({ resourceRoot: f.resourceRoot, sdkVersion: '0.85.1',
+    registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }],
+    evaluationProfile: { id: 'source-quote-trim', version: 1 } });
+  const request = { selection, settingsRevision: 7, activeToolNames: ['check_invoice_sources'], policy: 'p3' as const };
+  expect(service.freeze(request)).toMatchObject({ ok: true, data: { evaluationProfile: { id: 'source-quote-trim', version: 1 }, included: [{ ref }] } });
+  for (const change of [{ activeToolNames: [] }, { policy: 'p2' as const }, { policy: 'fill' as const }, { selection: { enabledExtensions: [] } }])
+    expect(service.freeze({ ...request, ...change })).toMatchObject({ ok: false, error: { code: 'extension_config_invalid' } });
+  const baseline = makeCatalog(f.resourceRoot).freeze(request);
+  expect(baseline.ok).toBe(true);
+  if (!baseline.ok) throw new Error(baseline.error.code);
+  expect(baseline.data).not.toHaveProperty('evaluationProfile');
+});
+
 describe('P12 trusted extension selection', () => {
   it('[F12-02/04] freezes only eligible tools without enabling an excluded extension', () => {
     const f = fixture(), hub = makeCatalog(f.resourceRoot);

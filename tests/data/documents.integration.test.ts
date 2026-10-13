@@ -1,6 +1,7 @@
 import { copyFileSync, cpSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'bun:test';
 import { appError, fail, ok } from '@flowmate/contracts';
 import { createDocumentService } from '../../packages/data/src/documents.ts';
@@ -60,6 +61,40 @@ function serviceFor(root: string, allowedSourceRoot = join(root, 'source')) {
     allowedSourceRoot, now: () => '2026-09-28T00:00:00.000Z' });
   return { opened: opened.data, files, service, productPaths };
 }
+
+it('prepared text and three-page PDF register immutable public Documents with real page and version identities', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'prepared-documents-')), { service } = serviceFor(root);
+  const sourceText = 'Page one synthetic item A\nPage two synthetic item B\nPage three synthetic total 3.00';
+  const original = readFileSync(new URL('../fixtures/eval-prepared-invoice/three-pages.pdf', import.meta.url));
+  const input = { contract: 'flowmate-prepared-invoice/v1', sample: 'synthetic-three-page',
+    original: { name: 'original.pdf', sha256: createHash('sha256').update(original).digest('hex'), base64: original.toString('base64') }, sourceText,
+    pages: sourceText.split('\n').map((text, index) => ({ page: index + 1, blocks: [{ id: 'b1', kind: 'text', text,
+      sourceIndex: 0, sourceType: 'prepared-text', bbox: null }] })) };
+  const register = service.importPrepared;
+  const first = await register.call(service, input);
+  expect(first).toMatchObject({ ok: true, data: { pageCount: 3, status: 'available' } });
+  const replay = await register.call(service, input);
+  expect(replay).toEqual(first);
+  if (!first.ok) throw new Error('Synthetic registration failed');
+  expect(service.inspectForWorkspace(first.data.documentRef)).toMatchObject({ ok: true, data: { kind: 'valid', document: { pageCount: 3 } } });
+  expect(service.readParsedForWorkspace(first.data.documentRef.id)).toMatchObject({ ok: true, data: { parsed: { pages: input.pages } } });
+  expect(service.readOriginalForWorkspace(first.data.documentRef.id, 1)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+  expect(service.restoreDocument(first.data.documentRef.id)).toMatchObject({ ok: true, data: { status: 'available' } });
+  const changed = await register.call(service, { ...input, sourceText: sourceText.replace('3.00', '4.00'),
+    pages: input.pages.map(page => ({ ...page, blocks: page.blocks.map(block => ({ ...block, text: block.text.replace('3.00', '4.00') })) })) });
+  expect(changed).toMatchObject({ ok: true, data: { documentRef: { id: expect.any(Number) } } });
+  if (!changed.ok) throw new Error('Changed synthetic registration failed');
+  expect(changed.data.documentRef).not.toEqual(first.data.documentRef);
+  expect(service.inspectForWorkspace(first.data.documentRef)).toMatchObject({ ok: true, data: { kind: 'valid' } });
+  expect(await register.call(service, { ...input, original: { ...input.original, sha256: '0'.repeat(64) } }))
+    .toMatchObject({ ok: false, error: { code: 'source_invalid' } });
+  const textOriginal = Buffer.from(sourceText);
+  const text = await register.call(service, { ...input, sample: 'synthetic-local-text',
+    original: { name: 'source.md', sha256: createHash('sha256').update(textOriginal).digest('hex'), base64: textOriginal.toString('base64') } });
+  expect(text).toMatchObject({ ok: true, data: { pageCount: 3 } });
+  expect(await register.call(service, { ...input, sourceText: 'UNRELATED_GOLD', pages: input.pages }))
+    .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+});
 
 function sample() {
   return {

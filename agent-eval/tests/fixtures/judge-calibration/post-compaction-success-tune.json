@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "post-compaction-success-tune",
+  "instanceId": "post-compaction-success-tune-independent",
+  "sourceGroup": "post-compaction-success-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "post-compaction-success",
+        "version": "v1",
+        "unit": "后续任务",
+        "denominator": 1,
+        "required": true,
+        "rule": "以事前计划的压缩后任务为分母，结合独立成果检查后续是否成功；发生压缩、生成摘要或非空回答不等于后续任务成功。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The declared post-compaction task requires amount 137.25 from document lark-warehouse-17.",
+      "originalObservation": "After the actual native summary, the saved receipt and answer contain a different amount.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "post-compaction-success",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

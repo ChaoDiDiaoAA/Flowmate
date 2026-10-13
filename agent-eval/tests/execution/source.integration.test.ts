@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { codeIdentity } from '../../src/execution/source.ts';
-import { hash as contentHash } from '../../src/datasets/local.ts';
+import { hash as contentHash } from '../../src/dataset-loader/local.ts';
 test('source snapshot reconstructs dirty and untracked execution code without environment files', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-source-'));
     const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
@@ -30,12 +30,49 @@ test('source snapshot reconstructs dirty and untracked execution code without en
         expect(snapshot.files.some((file: any) => file.path.endsWith('/new.ts'))).toBe(true);
         expect(JSON.stringify(snapshot)).not.toContain('private-value');
         expect(snapshot.files.some((file: any) => file.path.includes('.env'))).toBe(false);
-        expect(snapshot.workspaceHash).toBe(identity.workspaceHash);
-        expect(contentHash(snapshot.files.map((file: any) => [file.path, file.hash]))).toBe(identity.workspaceHash);
+        expect(snapshot.workspaceHash).toBeUndefined();
+        expect(snapshot.files.every((file:any)=>!('hash' in file))).toBe(true);
         expect(codeIdentity(root).workspaceHash).not.toBe(identity.workspaceHash);
         expect(identity.dirty).toBe(true);
     }
     finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+}, 30000);
+
+test('reproduction includes desktop TSX, resource text and SDK patches but excludes quality assets', () => {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-source-assets-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
+    try {
+        git('init');
+        const sources = ['apps/desktop/renderer/App.tsx', 'apps/desktop/renderer/styles.css', 'apps/desktop/renderer/index.html',
+            'packages/data/migrations/019.sql', 'resources/skills/invoice/SKILL.md',
+            'resources/prompts/system.md', 'resources/roles/research.md', 'resources/templates/report.json',
+            'patches/pi-sdk.patch', 'scripts/host-launch.ts', 'electron.vite.config.ts', 'bun.lock'];
+        const excluded = ['agent-eval/src/datasets/secret-gold.json', 'agent-eval/src/testing/scenarios.ts',
+            'agent-eval/src/testing/fixtures/private.json', 'agent-eval/runs/old/summary.json',
+            'resources/.env.local', 'docs/eval/notes.md'];
+        for (const path of [...sources, ...excluded]) {
+            mkdirSync(join(root, path, '..'), { recursive: true });
+            writeFileSync(join(root, path), 'initial');
+        }
+        git('add', '.');
+        git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'test baseline');
+        let previous = codeIdentity(root).workspaceHash;
+        for (const path of sources) {
+            writeFileSync(join(root, path), 'changed');
+            const current = codeIdentity(root).workspaceHash;
+            expect(current, path).not.toBe(previous);
+            previous = current;
+        }
+        for (const path of excluded) writeFileSync(join(root, path), 'quality-or-secret');
+        expect(codeIdentity(root).workspaceHash).toBe(previous);
+        const destination = join(root, 'snapshot.json');
+        codeIdentity(root, destination);
+        const snapshot = JSON.parse(readFileSync(destination, 'utf8'));
+        expect(snapshot.files.map((file: { path: string }) => file.path)).toEqual([...sources].sort());
+        expect(JSON.stringify(snapshot)).not.toContain('quality-or-secret');
+    } finally {
         rmSync(root, { recursive: true, force: true });
     }
 }, 30000);

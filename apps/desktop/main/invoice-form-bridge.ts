@@ -4,13 +4,13 @@ import { z } from 'zod';
 
 export type InvoiceFormOwner = { frame: object; contents: object; epoch: number };
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const inspectionSchema = z.object({ formInstanceId: z.string().min(1).max(128), revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+export const invoiceFormInspectionSchema = z.object({ formInstanceId: z.string().min(1).max(128), revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   dirty: z.boolean(), valid: z.boolean(), basis: z.object({ sessionId: id.nullable(), documentRef: DocumentRefSchema,
     jobId: id, candidateId: id, candidateSequence: id }).strict(), draft: InvoiceFormDraftSchema,
   lineOrigins: InvoiceFormLineOriginsSchema.optional() }).strict().refine(form => form.lineOrigins === undefined || form.lineOrigins.length === form.draft.lines.length);
 export function checkedInvoiceFormInspection(binding: InvoiceFormTargetBinding & { currentRevision: number }, raw: unknown,
   owner: InvoiceFormOwner): DesktopInvoiceFormInspection | null {
-  const parsed = inspectionSchema.safeParse(raw);
+  const parsed = invoiceFormInspectionSchema.safeParse(raw);
   if (!parsed.success || !binding.valid || binding.frame !== owner.frame || binding.contents !== owner.contents || binding.epoch !== owner.epoch) return null;
   const form = parsed.data;
   return form.valid && form.formInstanceId === binding.target.formInstanceId && form.revision === binding.currentRevision && form.dirty === binding.dirty
@@ -37,7 +37,7 @@ export function matchesInvoiceFormTarget(binding: InvoiceFormTargetBinding, requ
 }
 
 export function matchesInvoiceFormRun(binding: InvoiceFormTargetBinding, request: InvoiceFormBridgeRequest,
-  run: RunSnapshot): boolean {
+  run: Pick<RunSnapshot, 'kind' | 'runId' | 'sessionId' | 'jobId' | 'config' | 'scope' | 'status' | 'cancelRequestedAt'>): boolean {
   if (run.kind !== 'agent' || run.runId !== request.runId || run.sessionId !== request.sessionId || run.jobId !== request.jobId
     || binding.runId !== null && binding.runId !== run.runId || binding.runId === null && !binding.pendingFill
     || run.config.goalMode !== 'fill-form') return false;

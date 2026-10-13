@@ -4,8 +4,9 @@ import { isDeepStrictEqual } from 'node:util';
 import type { AgentKernel, AgentTrial, AgentTrialSession } from '../adapters/agent.ts';
 import type { CaseExecutionResult } from '../types.ts';
 import { scanEvidence } from './evidence-safety.ts';
-import { hash } from '../datasets/local.ts';
+import { hash } from '../dataset-loader/local.ts';
 import { z } from 'zod';
+import { artifactJson } from '../artifacts.ts';
 const inputSchema = z.object({ prompt: z.string(), materials: z.array(z.object({ sample: z.string(), file: z.string(), text: z.string() }).strict()) }).strict();
 const bounded = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
     let timer: ReturnType<typeof setTimeout>;
@@ -58,7 +59,7 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
             leaked: boolean;
         }).leaked)
             throw new Error('Secret in prepared input');
-        writeFileSync(join(trial.directory, 'input.json'), JSON.stringify({ original, input: projected, hash: hash(projected), setup: trial.setup }, null, 2) + '\n', { flag: 'wx' });
+        writeFileSync(join(trial.directory, 'input.json'), artifactJson({ original, input: projected, setup: trial.setup }), { flag: 'wx' });
         if (controller.signal.aborted)
             throw new Error('Cancelled before model execution');
         const cancelled = new Promise<never>((_, reject) => {
@@ -90,6 +91,11 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
                 if (controller.signal.aborted)
                     try {
                         await bounded(session.cancel(), stopGraceMs);
+                        const controlled = { status: execution.status, error: execution.error };
+                        execution = structuredClone(await bounded(session.snapshot(), stopGraceMs));
+                        execution.status = controlled.status;
+                        execution.error = controlled.error;
+                        execution.endpointReached = false;
                     }
                     catch (error) {
                         cancelError = error;
@@ -112,16 +118,36 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
             }
         }
     }
+    const originalRuns=execution.evidence.runs;
+    const race=execution.evidence['case-controller'];
+    if(race?.present&&z.object({profile:z.object({id:z.literal('invoice-save-cancel-race'),version:z.literal(1)}).passthrough(),
+        exposure:z.object({verified:z.literal(true)}).passthrough(),stopConfirmed:z.literal(false)}).passthrough().safeParse(race.actual).success){
+        stopFailed=true;execution.status='error';execution.endpointReached=false;
+        execution.error??={code:'stop_unconfirmed',message:'Original save cancellation did not confirm every descendant stopped; later cleanup cannot authorize another Trial.',infrastructure:true};
+    }
+    const stopping=originalRuns?.present?z.array(z.object({runId:z.number().int().positive(),status:z.enum(['created','running','completed','failed','cancelled']),
+        stoppedAt:z.string().datetime().nullable(),cleanup:z.object({stopped:z.boolean(),lateObservationRequired:z.boolean()}).passthrough()}).passthrough()).safeParse(originalRuns.actual):null;
+    if(stopping?.success&&stopping.data.some(run=>!['created','running'].includes(run.status)&&(!run.cleanup.stopped||run.cleanup.lateObservationRequired))){
+        stopFailed=true;execution.status='error';execution.endpointReached=false;
+        execution.error??={code:'stop_unconfirmed',message:'Original terminal Run stopping was unconfirmed; later cleanup does not authorize another Trial.',infrastructure:true};
+    }
+    if(execution.error?.code==='stop_unconfirmed'&&execution.error.infrastructure){
+        stopFailed=true;execution.status='error';execution.endpointReached=false;
+    }
     if (!isDeepStrictEqual(execution.identity, expectedIdentity)) {
+        execution.evidence['identity-conflict'] = { present: true, actual: { expected: expectedIdentity, observed: structuredClone(execution.identity) },
+            source: 'Controller identity comparison; conflicting original evidence is preserved without attribution' };
+        execution.identity = structuredClone(expectedIdentity);
         execution.status = 'error';
         execution.endpointReached = false;
         stopFailed = true;
         execution.error = { code: 'identity_mismatch', message: 'Agent evidence belongs to another Trial', infrastructure: true };
     }
-    execution.endedAt ??= new Date().toISOString();
+    // A Trial also owns non-Run operations and stopping; original Run timestamps remain in evidence.
+    execution.endedAt = new Date().toISOString();
     const scanned = scanEvidence(execution);
     execution = scanned.value;
     execution.evidence['redaction-scan'] = scanned.fact;
-    writeFileSync(join(trial.directory, 'execution.json'), JSON.stringify(execution, null, 2) + '\n');
+    writeFileSync(join(trial.directory, 'execution.json'), artifactJson(execution));
     return { execution, stopFailed, projected };
 }

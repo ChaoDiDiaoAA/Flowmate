@@ -2,13 +2,19 @@ import { mkdtempSync } from '../../../tests/support/resources.ts';
 import { test, expect } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { readFileSync, rmSync } from 'node:fs';
+import { existsSync,mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dataset, observed, task } from '../support/fixtures.ts';
 import { runLocal } from '../../src/execution/runner.ts';
 import { fixtureRepo as REPO_ROOT } from '../support/fixtures.ts';
 import type { AgentKernel, AgentTrial } from '../../src/adapters/agent.ts';
 import { executeCase } from '../../src/execution/execute-case.ts';
+import { caseV2Schema, manifestSchema } from '../../src/dataset-loader/schema.ts';
+import { metricCatalog } from '../../src/scoring/catalog.ts';
+import { hash } from '../../src/dataset-loader/local.ts';
+import { readReport } from '../../src/reports/store.ts';
+import { formalFixture } from '../support/formal.ts';
+import { compileFormalSemanticPlan } from '../../src/scoring/formal-rules.ts';
 function kernel(transform?: (r: ReturnType<typeof observed>) => void): AgentKernel {
     return { readiness: () => ({ ready: true, reason: 'test-only' }), async prepare(trial) {
             expect(trial).not.toHaveProperty('expected');
@@ -22,8 +28,101 @@ function kernel(transform?: (r: ReturnType<typeof observed>) => void): AgentKern
             return { input: trial.input, async execute() { return result; }, async snapshot() { return result; }, async cancel() { }, async close() { return { present: true, actual: { closed: true, stopped: true }, source: 'test-session' }; } };
         } };
 }
-test('production adapter is explicitly unavailable, never Provider fallback', async () => {
-    await expect(runLocal(REPO_ROOT, { dataset, backend: 'local', judge: 'off' })).rejects.toThrow('完整 Agent');
+
+function semanticDataset() {
+    const criteria = [
+        { metricId: 'tool-selection', version: 1, unit: '决策点', denominator: 3, required: true, rule: 'Count three decisions.', evidence: ['task-facts'], trigger: 'started' },
+        { metricId: 'tool-arguments', version: 1, unit: '请求', denominator: 4, required: true, rule: 'Count four requests.', evidence: ['task-facts'], trigger: 'completed-endpoint' }
+    ];
+    const item = caseV2Schema.parse({ ...structuredClone(task), contract: 'flowmate-agent-case/v2',
+        input: { prompt: 'Execute the synthetic controlled protocol.', materials: [] }, expected: {
+        success: ['Synthetic controlled task saved'], failure: ['Invent the save'],
+        checks: [{ metric: 'fact-check', required: true, evidence: 'task-facts', path: ['saved'], equals: true }],
+        semantic: { contract: 'flowmate-semantic-plan/v1', criteria }, metrics: metricCatalog.map(m => m.id === 'task-success'
+            ? { metricId: m.id, version: m.version, unit: m.unit, denominator: 1 }
+            : criteria.some(c => c.metricId === m.id) ? { metricId: m.id, version: m.version, unit: m.unit, denominator: criteria.find(c => c.metricId === m.id)!.denominator }
+                : { metricId: m.id, version: m.version, unit: m.unit, notApplicable: 'Synthetic orchestration fixture only.' }) } });
+    const data = { ...structuredClone(dataset), manifest: manifestSchema.parse({ ...dataset.manifest, contract: 'flowmate-agent-dataset/v2',
+        members: ['cases/' + item.id + '.json'], smoke: [item.id], environment: { profile: 'isolated-agent/v2', source: 'voxel51', risks: ['synthetic'] },
+        scoring: { ...dataset.manifest.scoring, judges: [{ id: 'semantic-batch', required: true }] } }), cases: [item] };
+    data.hash = hash({ manifest: data.manifest, cases: data.cases });
+    return data;
+}
+
+test('a simple authored Case without a Fixture executes and saves no placeholder scene', async () => {
+    const data = structuredClone(dataset), item = data.cases[0]!;
+    data.cases = [item]; data.manifest.members = ['cases/' + item.id + '.json']; data.manifest.smoke = [item.id];
+    const content = readFileSync(join(REPO_ROOT, 'data/invoices/voxel51/000001/content.md'), 'utf8');
+    const metadata = '{}';
+    const file = (path: string, text: string) => ({ path, encoding: 'utf8' as const, content: text, bytes: Buffer.byteLength(text), sha256: hash(text) });
+    data.embedded = { manifest: data.manifest, tasks: {}, files: {
+        'voxel51/000001/content.md': file('voxel51/000001/content.md', content),
+        'voxel51/000001/metadata.json': file('voxel51/000001/metadata.json', metadata)
+    }, inputs: { [item.id]: [] }, reviews: {}, hash: data.hash, authored: { version: 'v1', cases: [{ id: item.id, input: { prompt: item.input.prompt } }],
+        gold: { [item.id]: {} }, reviews: {}, fixtures: {} } };
+    let prepared = 0; const product = kernel(); const prepare = product.prepare;
+    product.prepare = async (trial, signal) => { prepared++; return prepare(trial, signal); };
+    const result = await runLocal(REPO_ROOT, { dataset: data, executionId: 'no-fixture-' + randomUUID(), backend: 'local', judge: 'off' }, { kernel: product });
+    expect(prepared).toBe(1);
+    expect(readReport(result.file).trials[0]!.execution!.status).toBe('completed');
+    expect(JSON.parse(readFileSync(join(result.file, '../snapshot.json'), 'utf8')).fixtures).toEqual({});
+});
+
+test('Runner binds one compact Judge per Trial, distinct ratios and original counts without exposing grading plans to Agent', async () => {
+    const data = semanticDataset(), id = 'compact-' + randomUUID(); let requests = 0;
+    const selectedCriteria = structuredClone(data.cases[0]!.expected.semantic!.criteria);
+    const product = kernel(), prepare = product.prepare;
+    product.prepare = async (trial, signal) => {
+        expect(JSON.stringify(trial)).not.toContain('flowmate-semantic-plan');
+        expect(JSON.stringify(trial.input)).not.toContain('Count three decisions');
+        data.cases[0]!.expected.semantic!.criteria[0]!.rule = 'Changed after the Trial was declared.';
+        return prepare(trial, signal);
+    };
+    const run = await runLocal(REPO_ROOT, { dataset: data, executionId: id, backend: 'local', judge: 'auto', repeat: 2 }, { kernel: product,
+        env: { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic', FLOWMATE_JUDGE_API_KEY: 'synthetic-batch-key',
+            FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1' }, fetcher: async (_, init) => {
+            requests++; const body = JSON.parse(String(init.body)); expect(body).not.toHaveProperty('max_tokens');expect(body).not.toHaveProperty('temperature');
+            expect(JSON.parse(body.messages[1].content).plan.criteria).toHaveLength(2);
+            expect(JSON.parse(body.messages[1].content).plan.criteria).toEqual(selectedCriteria);
+            return new Response(JSON.stringify({ choices: [{ message: { content: '{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}' }, finish_reason: 'stop' }] }));
+        } });
+    expect(requests).toBe(2);
+    expect(run.report.trials.map(t => t.judgeCalls.length)).toEqual([1, 1]);
+    expect(readReport(run.file).trials[0]!.scores.filter(s => s.judge)).toMatchObject([
+        { metricId: 'tool-selection', value: 2 / 3 }, { metricId: 'tool-arguments', value: 1 }
+    ]);
+    expect(run.report.aggregation!.metrics.find(m => m.metricId === 'tool-selection')).toMatchObject({ numerator: 4, denominator: 6, missing: 0, value: 2 / 3 });
+    expect(run.report.aggregation!.metrics.find(m => m.metricId === 'tool-arguments')).toMatchObject({ numerator: 8, denominator: 8, missing: 0, value: 1 });
+}, 30000);
+
+test('compact selection and required criteria are checked before Agent preparation or Judge dispatch', async () => {
+    let prepared = 0;
+    const product = kernel(); product.prepare = async () => { prepared++; throw new Error('must not prepare'); };
+    const data = semanticDataset();
+    await expect(runLocal(REPO_ROOT, { dataset: data, backend: 'local', judge: 'auto' }, { kernel: product, env: {} })).rejects.toThrow('Required Judge');
+    data.manifest.scoring.judges = [];
+    await expect(runLocal(REPO_ROOT, { dataset: data, backend: 'local', judge: 'off' }, { kernel: product })).rejects.toThrow('semantic-batch');
+    expect(prepared).toBe(0);
+});
+test('requiring a Judge preserves the Case distinction between optional process metrics and necessary task predicates',async()=>{
+    const data=semanticDataset();data.cases[0]!.expected.semantic!.criteria[0]!.required=false;
+    const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'optional-process-'+randomUUID(),backend:'local',judge:'required'},{kernel:kernel(),env:{FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic',FLOWMATE_JUDGE_API_KEY:'synthetic-optional-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
+        fetcher:async()=>new Response(JSON.stringify({choices:[{message:{content:'{"v":1,"r":[[0,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]}))});
+    expect(run.report.trials[0]!.scores.find(s=>s.metricId==='tool-selection')).toMatchObject({status:'FAIL',required:false});
+    expect(run.report.trials[0]!.status).toBe('PASS');
+});
+test('production adapter requires its dedicated credential, never Provider fallback', async () => {
+    await expect(runLocal(REPO_ROOT, { dataset, backend: 'local', judge: 'off' }, { env: {} })).rejects.toThrow('FLOWMATE_EVAL_AGENT_API_KEY');
+});
+test('a linked result root is rejected before creating an Execution or preparing Agent', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'flowmate-result-root-')), outside = mkdtempSync(join(tmpdir(), 'flowmate-result-outside-'));
+    mkdirSync(join(repo, 'agent-eval'));
+    symlinkSync(outside, join(repo, 'agent-eval/runs'), 'junction');
+    let prepared = 0;
+    const product = kernel(); product.prepare = async () => { prepared++; throw new Error('must not prepare'); };
+    await expect(runLocal(repo, { dataset, executionId: 'linked-root', backend: 'local', judge: 'off' }, { kernel: product })).rejects.toThrow('result root');
+    expect(prepared).toBe(0);
+    expect(readdirSync(outside)).toEqual([]);
 });
 test('local orchestration stores all selected members, independent trials and missing material; no backend needed', async () => {
     const id = 'unit-' + randomUUID(), data = structuredClone(dataset);
@@ -33,27 +132,29 @@ test('local orchestration stores all selected members, independent trials and mi
     try {
         const { report, file } = await runLocal(REPO_ROOT, { dataset: data, executionId: id, backend: 'local', judge: 'off', repeat: 2 }, { kernel: kernel() });
         expect(report.trials).toHaveLength(4);
+        expect(report.contract).toBe('flowmate-agent-run/v2');
+        expect(report.aggregation?.cases).toHaveLength(2);
+        // The second fixture has pending Gold, so its two attempts cannot claim success.
+        expect(report.aggregation?.metrics.find(m => m.metricId === 'task-success')).toMatchObject({ numerator: 0, denominator: 4, value: 0, missing: 4 });
         expect(report.trials[0]!.status).toBe('NOT_RUN');
         expect(report.trials[2]!.status).toBe('NOT_RUN');
         expect(report.trials[1]!.execution!.identity.trialId).not.toBe(report.trials[3]!.execution!.identity.trialId);
         expect(report.export.status).toBe('disabled');
         expect(report.manualReview).toBe('none');
-        expect(JSON.parse(readFileSync(join(file, '../snapshot.json'), 'utf8')).members).toHaveLength(2);
+        expect(JSON.parse(readFileSync(join(file, '../snapshot.json'), 'utf8')).cases).toHaveLength(2);
         await expect(runLocal(REPO_ROOT, { dataset: data, executionId: id, backend: 'local', judge: 'off' }, { kernel: kernel() })).rejects.toThrow();
     }
     finally {
         rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
     }
 }, 30000);
-test('Judge preflight rejects partial/missing config and frozen budget before preparing Agent', async () => {
+test('Judge preflight rejects partial or missing configuration before preparing Agent', async () => {
     let called = 0;
     const product = kernel();
     product.prepare = async () => { called++; throw new Error('unexpected'); };
     for (const env of [{ FLOWMATE_JUDGE_MODEL: 'partial' }, {}]) {
         await expect(runLocal(REPO_ROOT, { dataset, backend: 'local', judge: 'required' }, { kernel: product, env })).rejects.toThrow();
     }
-    const env = { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'judge', FLOWMATE_JUDGE_BASE_URL: 'https://invalid.example/v1', FLOWMATE_JUDGE_API_KEY: 'mock' };
-    await expect(runLocal(REPO_ROOT, { dataset, backend: 'local', judge: 'auto', repeat: 20 }, { kernel: product, env })).rejects.toThrow('15000');
     expect(called).toBe(0);
 });
 test('wrong identity and failed cleanup block grading; timeout requests actual cancellation', async () => {
@@ -61,6 +162,8 @@ test('wrong identity and failed cleanup block grading; timeout requests actual c
     const wrong = await executeCase(kernel(r => { r.identity = { ...r.identity, trialId: 'wrong' }; }), trial(), 50, 50);
     expect(wrong.execution.status).toBe('error');
     expect(wrong.stopFailed).toBe(true);
+    expect(wrong.execution.identity).toEqual(observed().identity);
+    expect(wrong.execution.evidence['identity-conflict']).toMatchObject({ present: true, actual: { observed: { trialId: 'wrong' } } });
     let cancelled = 0;
     const hanging = kernel();
     hanging.prepare = async () => ({ input: observed().input, execute: async () => new Promise(() => { }), snapshot: async () => observed(), cancel: async () => { cancelled++; }, close: async () => ({ present: true, actual: { closed: true, stopped: true }, source: 'test' }) });
@@ -68,7 +171,38 @@ test('wrong identity and failed cleanup block grading; timeout requests actual c
     expect(timed.execution.status).toBe('timeout');
     expect(cancelled).toBe(1);
 });
-test('controlled material variants are frozen before execution and retain the original source', async () => {
+
+test('late preparation is cancelled and closed while all later planned Trials remain blocked', async () => {
+    const id = 'late-prepare-' + randomUUID(), product = kernel(), prepare = product.prepare.bind(product);
+    let release!: () => void, closed!: () => void, preparations = 0, executions = 0, cancellations = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const cleanup = new Promise<void>(resolve => { closed = resolve; });
+    product.prepare = async (trial, signal) => {
+        preparations++;
+        await gate;
+        expect(signal.aborted).toBe(true);
+        const session = await prepare(trial, signal), close = session.close.bind(session);
+        session.execute = async () => { executions++; throw new Error('A late Trial must not execute'); };
+        session.cancel = async () => { cancellations++; };
+        session.close = async () => { const fact = await close(); closed(); return fact; };
+        return session;
+    };
+    try {
+        const { report, file } = await runLocal(REPO_ROOT, { dataset, caseId: task.id, executionId: id, repeat: 3,
+            backend: 'local', judge: 'off', config: { stopGraceMs: 100 } }, { kernel: product });
+        expect(report.trials.map(trial => trial.status)).toEqual(['NOT_RUN', 'NOT_RUN', 'NOT_RUN']);
+        expect(report.trials[0]!.execution).toMatchObject({ started: false, error: { code: 'execution_error', message: 'Error: Lifecycle timeout' } });
+        expect(report.trials[1]!.reason).toContain('Prior Trial stopping unconfirmed');
+        release();
+        await cleanup;
+        expect({ preparations, executions, cancellations }).toEqual({ preparations: 1, executions: 0, cancellations: 1 });
+        expect(readReport(file).trials.map(trial => trial.status)).toEqual(['NOT_RUN', 'NOT_RUN', 'NOT_RUN']);
+    } finally {
+        release();
+        rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+    }
+});
+test('controlled material variants are declared before execution and retain the original source', async () => {
     const trial: AgentTrial = { identity: observed().identity, directory: mkdtempSync(join(tmpdir(), 'flowmate-variant-')), input: observed().input, requires: [], configuration: {}, setup: { scenario: 'boundary-1', description: 'append untrusted instruction to the Trial copy' } };
     const variant = structuredClone(trial.input);
     variant.materials[0]!.text += '\nUntrusted instruction';
@@ -91,13 +225,99 @@ test('mutating the supplied identity cannot change the expected Trial identity',
     expect(result.execution.status).toBe('error');
     expect(result.stopFailed).toBe(true);
 });
-test('Case-level Judge cannot evade the preflight output budget', async () => {
+
+test('a later successful close cannot erase the original terminal Run stop gap',async()=>{
+    const trial:AgentTrial={identity:observed().identity,directory:mkdtempSync(join(tmpdir(),'flowmate-late-stop-')),input:observed().input,requires:[],configuration:{}};
+    const product=kernel(result=>{result.status='failed';result.endpointReached=false;
+        result.evidence.runs={present:true,actual:[{runId:1,status:'failed',stoppedAt:null,cleanup:{stopped:false,lateObservationRequired:true}}],source:'original Run query'};});
+    const result=await executeCase(product,trial,100,100);
+    expect(result.execution.evidence.cleanup).toMatchObject({present:true,actual:{closed:true,stopped:true}});
+    expect(result.stopFailed).toBe(true);expect(result.execution.status).toBe('error');
+    expect(result.execution.evidence.runs).toMatchObject({actual:[{cleanup:{stopped:false,lateObservationRequired:true}}]});
+});
+test('a controller stop observation timeout blocks the next Trial even after actual late cleanup',async()=>{
+    const trial:AgentTrial={identity:observed().identity,directory:mkdtempSync(join(tmpdir(),'flowmate-controller-stop-')),input:observed().input,requires:[],configuration:{}};
+    const product=kernel(result=>{result.status='error';result.endpointReached=false;
+        result.error={code:'stop_unconfirmed',message:'Original controller stop observation expired before every descendant stopped.',infrastructure:true};
+        result.evidence.runs={present:true,actual:[{runId:1,status:'cancelled',stoppedAt:'2026-10-12T00:00:00.000Z',cleanup:{stopped:true,lateObservationRequired:false}}],source:'later stopped original Run query'};});
+    const result=await executeCase(product,trial,100,100);
+    expect(result.execution.evidence.cleanup).toMatchObject({present:true,actual:{closed:true,stopped:true}});
+    expect(result.stopFailed).toBe(true);expect(result.execution.error?.code).toBe('stop_unconfirmed');
+});
+
+test('042 original descendant stop gap blocks all later Trials despite successful late close',async()=>{
+    let prepared=0;
+    const product=kernel(result=>{
+        result.endpointReached=false;
+        result.evidence['case-controller']={present:true,actual:{profile:{id:'invoice-save-cancel-race',version:1},exposure:{verified:true},
+            cancelRequests:1,stopConfirmed:false,linearization:'commit-unknown',candidateCount:null},source:'Original controlled race stop observation'};
+    });
+    const prepare=product.prepare.bind(product);product.prepare=(trial,signal)=>{prepared++;return prepare(trial,signal);};
+    const id='cancel-race-stop-'+randomUUID();
+    const {report,file}=await runLocal(REPO_ROOT,{dataset,executionId:id,repeat:3,backend:'local',judge:'off'}, {kernel:product,env:{}});
+    const statuses=['ERROR',...Array(dataset.cases.length*3-1).fill('NOT_RUN')];
+    expect(prepared).toBe(1);expect(report.trials.map(t=>t.status)).toEqual(statuses);
+    expect(report.trials[0]!.execution!.error?.code).toBe('stop_unconfirmed');
+    expect(report.trials[0]!.execution!.evidence.cleanup).toMatchObject({actual:{closed:true,stopped:true}});
+    expect(readReport(file).trials.map(t=>t.status)).toEqual(statuses);
+});
+
+test('Case-level Judge cannot bypass the shared scoring configuration', async () => {
     const data = structuredClone(dataset);
     data.manifest.scoring.judges = [];
     for (const c of data.cases)
         c.expected.checks.push({ metric: 'answer-relevance', required: true });
     await expect(runLocal(REPO_ROOT, { dataset: data, backend: 'local', judge: 'auto', repeat: 2 }, { kernel: kernel(), env: {} })).rejects.toThrow('configure Judges once');
 });
+
+test('unknown semantic denominators do not restore a removed Judge output budget',async()=>{
+ const data=semanticDataset(),id='compact-bound-'+randomUUID();
+ for(const criterion of data.cases[0]!.expected.semantic!.criteria)criterion.denominator=null;
+ for(const metric of data.cases[0]!.expected.metrics)if(!metric.notApplicable&&metric.metricId!=='task-success')metric.denominator=null;
+ let requests=0;const product=kernel();
+ const run=await runLocal(REPO_ROOT,{dataset:data,caseId:data.cases[0]!.id,executionId:id,backend:'local',judge:'required'},{kernel:product,
+  env:{FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic',FLOWMATE_JUDGE_API_KEY:'synthetic-bound-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
+  fetcher:async(_url,init)=>{requests++;expect(JSON.parse(String(init.body))).not.toHaveProperty('max_tokens');
+   return new Response(JSON.stringify({choices:[{message:{content:'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]}));}});
+ expect(requests).toBe(1);expect(run.report.trials[0]!.judgeCalls).toHaveLength(1);expect(existsSync(run.file)).toBe(true);
+});
+for(const metric of ['skill-guidance','model-violation'] as const)test('declared '+metric+' grades survive saving and a hard failure cannot become a passing report',async()=>{
+ const data=structuredClone(dataset),item=formalFixture(metric).task;
+ item.input.materials=[];
+ if(item.expected.reference)item.expected.reference.status='verified';
+ if(metric==='skill-guidance')Object.assign(item.expected,{requiredSkills:['invoice-header-extraction']});
+ item.expected.semantic=compileFormalSemanticPlan(item);data.cases=[item];
+ data.manifest=manifestSchema.parse({...data.manifest,contract:'flowmate-agent-dataset/v2',environment:{...data.manifest.environment,profile:'isolated-agent/v2'},scoring:{...data.manifest.scoring,judges:[{id:'semantic-batch',required:true}]}});
+ const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'declared-'+metric+'-'+randomUUID(),backend:'local',judge:'required'},
+ {kernel:kernel(),env:{FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic',FLOWMATE_JUDGE_API_KEY:'declared-predicate-fake-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
+ fetcher:async()=>new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({v:1,r:[metric==='model-violation'?[1,1,0]:[0,1,0]],f:[]})},finish_reason:'stop'}]}))});
+ const loaded=readReport(run.file),trial=loaded.trials[0]!;
+ expect(trial.semanticPlan!.criteria[0]!.required).toBe(true);
+ const score=trial.scores.find(s=>s.metricId===metric);
+ if(!score)throw new Error('Missing declared score: '+trial.reason+' '+JSON.stringify(trial.execution?.error));
+ expect(score).toMatchObject({status:'FAIL',required:true});
+ expect(trial.status).toBe('FAIL');
+ expect(JSON.parse(readFileSync(run.file,'utf8')).trials[0].dimensions[metric==='model-violation'?'safety':'process'].status).toBe('FAIL');
+});
+
+test('cancellation during the only Judge request aborts transport and preserves all later planned Trials', async () => {
+    const id = 'judge-cancel-' + randomUUID(), abort = new AbortController();
+    let calls = 0, prepared = 0, transport: AbortSignal | null | undefined;
+    const product = kernel(), prepare = product.prepare.bind(product);
+    product.prepare = (trial, signal) => { prepared++; return prepare(trial, signal); };
+    try {
+        const { report } = await runLocal(REPO_ROOT, { dataset, caseId: task.id, executionId: id, repeat: 2, backend: 'local', judge: 'required' }, {
+            kernel: product, signal: abort.signal,
+            env: { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic', FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-judge-key' },
+            fetcher: async (_, init) => { calls++; transport = init.signal; abort.abort(); return new Promise(() => {}); }
+        });
+        expect({ calls, prepared, aborted: transport?.aborted }).toEqual({ calls: 1, prepared: 1, aborted: true });
+        expect(report.trials.map(t => t.status)).toEqual(['ERROR', 'NOT_RUN']);
+        expect(report.trials[0]!.judgeCalls).toMatchObject([{ attempts: 1, judgment: null, usage: null, error: 'Judge cancelled' }]);
+        expect(report.trials[1]!.judgeCalls).toHaveLength(0);
+        expect(report.aggregation!.metrics.find(m => m.metricId === 'task-success')).toMatchObject({ denominator: 2, numerator: 0 });
+    } finally { rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true }); }
+}, 30000);
 
 test('semantic-only task cannot pass with Judge off; auto requires its Judge before Agent starts', async () => {
     const data = structuredClone(dataset);
@@ -117,5 +337,43 @@ test('semantic-only task cannot pass with Judge off; auto requires its Judge bef
         expect(report.trials[0]!.scores.find(s => s.metricId === 'answer-relevance')).toMatchObject({ required: true, status: 'NOT_RUN', value: null });
     } finally {
         rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+    }
+}, 30000);
+
+for(const source of ['cleanup','controller-observation'] as const)test('unconfirmed stopping blocks later planned Trials and preserves the originating reason, source='+source, async () => {
+    const id = 'stop-' + randomUUID(), product = kernel(result=>{
+        if(source==='controller-observation'){result.status='error';result.endpointReached=false;result.error={code:'stop_unconfirmed',message:'Original cancellation observation was unconfirmed; late actual cleanup is independent.',infrastructure:true};}
+    });
+    const prepare = product.prepare.bind(product);
+    let started = 0;
+    product.prepare = async (trial, signal) => {
+        started++;
+        const session = await prepare(trial, signal);
+        if(source==='cleanup')session.close = async () => ({ present: true, actual: { closed: true, stopped: false }, source: 'controlled-unknown-stop' });
+        return session;
+    };
+    try {
+        const { report } = await runLocal(REPO_ROOT, { dataset, caseId: task.id, executionId: id, repeat: 3, backend: 'local', judge: 'off' }, { kernel: product });
+        expect(started).toBe(1);
+        expect(report.trials.map(t => t.status)).toEqual(['ERROR', 'NOT_RUN', 'NOT_RUN']);
+        expect(report.trials[1]!.reason).toContain(source==='cleanup'?'Cleanup not proven':'Original cancellation observation was unconfirmed');
+        expect(report.aggregation?.cases[0]).toMatchObject({ planned: 3, started: 1, statuses: { ERROR: 1, NOT_RUN: 2 } });
+        expect(report.aggregation?.metrics.find(m => m.metricId === 'task-success')).toMatchObject({ denominator: 3, numerator: 0, missing: 3 });
+    } finally {
+        rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+    }
+}, 30000);
+
+test('matching Case and repetition in different Executions retain distinct Trial and Trace identities', async () => {
+    const ids = ['first-' + randomUUID(), 'second-' + randomUUID()];
+    try {
+        const reports = [];
+        for (const id of ids) reports.push((await runLocal(REPO_ROOT,
+            { dataset, caseId: task.id, executionId: id, backend: 'local', judge: 'off' }, { kernel: kernel() })).report);
+        expect(reports[0]!.trials[0]!.trialId).not.toBe(reports[1]!.trials[0]!.trialId);
+        expect(reports[0]!.trials[0]!.traceId).not.toBe(reports[1]!.trials[0]!.traceId);
+        expect(reports.map(r => r.aggregation!.metrics.find(m => m.metricId === 'task-success')!.sources[0]!.executionId)).toEqual(ids);
+    } finally {
+        for (const id of ids) rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
     }
 }, 30000);

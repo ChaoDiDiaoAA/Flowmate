@@ -4,8 +4,18 @@ import { evaluateAll } from '../../../src/scoring/evaluate.ts';
 import { aggregate } from '../../../src/scoring/aggregate.ts';
 import { EvaluatorRegistry } from '../../../src/scoring/registry.ts';
 import { definitions } from '../../../src/scoring/evaluators/index.ts';
-import type { Check } from '../../../src/datasets/local.ts';
+import type { Check } from '../../../src/dataset-loader/local.ts';
 const check: Check = { metric: 'fact-check', required: true, evidence: 'task-facts', path: ['saved'], equals: true };
+test('explicit started process checks survive cancellation without passing the business task',async()=>{
+    const result=observed();result.status='cancelled';result.endpointReached=false;result.evidence['task-facts']!.actual={saved:true};
+    const process={...check,trigger:'started' as const},business={...check,evidence:'business-facts'};
+    const context={task,result,projected,judge:null};
+    const scored=await evaluateAll(context,[process,business]);expect(scored.scores).toHaveLength(1);expect(scored.scores[0]!.status).toBe('PASS');
+    expect(aggregate(scored.scores,result).status).toBe('UNJUDGEABLE');
+    result.evidence['task-facts']!.actual={saved:false};expect((await evaluateAll(context,[process])).scores[0]!.status).toBe('FAIL');
+    result.evidence['task-facts']!.present=false;expect((await evaluateAll(context,[process])).scores[0]!.status).toBe('UNJUDGEABLE');
+    result.started=false;expect((await evaluateAll(context,[process])).scores).toHaveLength(0);
+});
 test('not-started evidence cannot invoke quality graders even with a contradictory completed flag', async () => {
     const result = observed();
     result.started = false;

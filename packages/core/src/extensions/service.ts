@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { AppErrorSchema, ExtensionManifestSchema, ExtensionSelectionSchema, ExtensionCatalogItemSchema,
-  FrozenExtensionsSchema, canonicalExtensionManifest, extensionRefKey, appError, ok, fail } from '@flowmate/contracts';
-import type { ExtensionCatalogItem, ExtensionSelection, FrozenExtensions, Result, ToolDefinition } from '@flowmate/contracts';
+  FrozenExtensionsSchema, ExtensionEvaluationProfileSchema, canonicalExtensionManifest, extensionRefKey, appError, ok, fail } from '@flowmate/contracts';
+import type { ExtensionCatalogItem, ExtensionSelection, ExtensionEvaluationProfile, FrozenExtensions, Result, ToolDefinition } from '@flowmate/contracts';
 
 function checked<T>(action: () => T): Result<T> {
   try { return ok(action()); }
@@ -13,8 +13,9 @@ function checked<T>(action: () => T): Result<T> {
   }
 }
 export function createExtensionService(options: { resourceRoot: string; sdkVersion: string;
-  registeredTools: readonly Pick<ToolDefinition<any, any>, 'name' | 'version' | 'effect'>[] }) {
+  registeredTools: readonly Pick<ToolDefinition<any, any>, 'name' | 'version' | 'effect'>[]; evaluationProfile?: ExtensionEvaluationProfile }) {
   const root = resolve(options.resourceRoot), files = ['invoice-v1.json', 'subagents-v1.json'] as const;
+  const evaluationProfile = options.evaluationProfile === undefined ? undefined : ExtensionEvaluationProfileSchema.parse(options.evaluationProfile);
   function read(name: typeof files[number]): ExtensionCatalogItem {
     const file = join(root, 'extensions', name);
     const location = relative(realpathSync(root), realpathSync(file)).replaceAll('\\', '/');
@@ -64,6 +65,7 @@ export function createExtensionService(options: { resourceRoot: string; sdkVersi
           ? input.policy === 'p3' && input.activeToolNames.includes('check_invoice_sources')
           : input.activeToolNames.includes('Agent'));
         return FrozenExtensionsSchema.parse({ version: 1, policyVersion: 'p13-managed-extensions-v1', settingsRevision: input.settingsRevision,
+          ...(evaluationProfile ? { evaluationProfile } : {}),
           selected: selection.enabledExtensions, included: items.filter(eligible).map(item => ({ ref: item.ref, manifest: item.manifest })),
           excluded: items.filter(item => !eligible(item)).map(item => ({ ref: item.ref, code: 'tool_not_active' })) });
       });

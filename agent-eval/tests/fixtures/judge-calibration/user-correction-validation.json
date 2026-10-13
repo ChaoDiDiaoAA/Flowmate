@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "user-correction-validation",
+  "instanceId": "user-correction-validation-independent",
+  "sourceGroup": "user-correction-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "user-correction",
+        "version": "v1",
+        "unit": "决策",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个纠正决策核对用户旧值、新值、撤回、实际消费及有效时间；以后来的有效纠正为准，旧摘要或旧模型声明不能覆盖它。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The latest user correction explicitly replaces the old amount with 862.40.",
+      "originalObservation": "The assistant uses 862.40 from the latest user correction.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "user-correction",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

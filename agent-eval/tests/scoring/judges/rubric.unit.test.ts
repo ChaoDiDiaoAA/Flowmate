@@ -26,7 +26,7 @@ test('Judge runs independently of deterministic high/low scores and never receiv
                 expect(data).not.toHaveProperty('expected');
                 expect(data).not.toHaveProperty('steps');
                 expect(data.criteria).toEqual({ success: task.expected.success, failure: task.expected.failure });
-                return new Response(JSON.stringify({ choices: [{ message: { content: '{"score":1,"reason":"mock supported"}' } }] }));
+                return new Response(JSON.stringify({ choices: [{ message: { content: '{"score":1,"reason":"mock supported"}' }, finish_reason: 'stop' }] }));
             } }, [{ metric: 'fact-check', required: true, evidence: 'task-facts', path: ['saved'], equals: true }, { metric: 'answer-relevance', required: false }]);
         expect(calls).toBe(1);
         expect(output.judgeCalls).toHaveLength(1);
@@ -44,6 +44,16 @@ test('missing Judge evidence prevents calls; absent configuration is unmeasured,
     }
     const output = await evaluateAll({ task, result: observed(), projected, judge: null }, [{ metric: 'answer-relevance', required: false }]);
     expect(output.scores[0]!.status).toBe('NOT_RUN');
+});
+
+test('a cancelled semantic check retains its unmeasured status and never invokes the Judge', async () => {
+    const abort = new AbortController(); abort.abort();
+    let calls = 0;
+    const output = await evaluateAll({ task, result: observed(), projected, judge: config, signal: abort.signal,
+        fetcher: async () => { calls++; throw new Error('must not call'); } }, [{ metric: 'answer-relevance', required: true }]);
+    expect(output.scores[0]).toMatchObject({ status: 'NOT_RUN', value: null, version: 5 });
+    expect(output.judgeCalls).toHaveLength(0);
+    expect(calls).toBe(0);
 });
 test('six historical calibration examples are retained as pending references, not successful calibration', () => {
     const files = readdirSync(join(import.meta.dir, '../../fixtures/judges')).filter(f => f.endsWith('.json'));

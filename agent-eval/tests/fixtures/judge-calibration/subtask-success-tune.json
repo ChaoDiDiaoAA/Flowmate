@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "subtask-success-tune",
+  "instanceId": "subtask-success-tune-independent",
+  "sourceGroup": "subtask-success-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "subtask-success",
+        "version": "v1",
+        "unit": "子任务",
+        "denominator": 1,
+        "required": true,
+        "rule": "以事前应执行的子任务为分母核对子目标与独立材料，不以实际启动数缩小分母；子Run completed或子自述正确不能代替子成果核验。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The only planned child goal is to verify 137.25 from source lark-warehouse-17.",
+      "originalObservation": "The child says completed but returns a different amount; the independent source still says 137.25.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "subtask-success",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

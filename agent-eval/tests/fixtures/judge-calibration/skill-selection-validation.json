@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "skill-selection-validation",
+  "instanceId": "skill-selection-validation-independent",
+  "sourceGroup": "skill-selection-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "skill-selection",
+        "version": "v1",
+        "unit": "决策",
+        "denominator": 1,
+        "required": true,
+        "rule": "按适用和不适用对照核对选择或不选择指导的决策；冻结/装配/发现/实际读取/采用分别取证，装配Skill不证明读取或使用。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The user asks for an audit handoff that needs the declared audit guidance, available in the original index.",
+      "originalObservation": "The assistant selects the audit guide identified in the original index.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "skill-selection",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

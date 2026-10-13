@@ -64,11 +64,14 @@ function decodeManifest(path: string): Manifest | null {
 function fileMime(name: string): string {
   if (name.endsWith('.jpg')) return 'image/jpeg';
   if (name.endsWith('.png')) return 'image/png';
+  if (name === 'original.pdf') return 'application/pdf';
+  if (name === 'source.md') return 'text/markdown';
+  if (name === 'source.txt') return 'text/plain';
   return 'application/json';
 }
 
 function validArtifactName(name: string): boolean {
-  return ['original.jpg', 'original.png', 'parsed.json', 'raw-content.json', 'raw-pages.json', 'source.json', 'source.txt', 'source.md'].includes(name);
+  return ['original.jpg', 'original.png', 'original.pdf', 'parsed.json', 'raw-content.json', 'raw-pages.json', 'source.json', 'source.txt', 'source.md'].includes(name);
 }
 
 function invoiceExportPath(paths: Pick<ProductPaths, 'root' | 'outputsDir'>, relativePath: string): string {
@@ -382,7 +385,7 @@ export class FileStore {
       seen.add(file.name);
       return { ...file, bytes: Uint8Array.from(file.bytes) };
     });
-    if (kind === 'original' && (files.length !== 1 || !/^original\.(jpg|png)$/.test(input.primaryName))) throw new Error('invalid_original_artifact');
+    if (kind === 'original' && (files.length !== 1 || !['original.jpg', 'original.png', 'original.pdf', 'source.md'].includes(input.primaryName))) throw new Error('invalid_original_artifact');
     if (kind === 'parsed' && input.primaryName !== 'parsed.json') throw new Error('invalid_parsed_artifact');
     return { ...input, files };
   }

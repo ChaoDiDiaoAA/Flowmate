@@ -1,0 +1,706 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="orgcode" content="619">
+    <meta name="rno" content="Sadashiva Devadiga">
+    <meta name="content-owner" content="Greg Ederer">
+    <meta name="description" content="LAADS DAAC">
+    <title>LAADS DAAC | NASA</title>
+    <link href="/img/favicon-16x16.png" rel="icon" type="image/png" sizes="16x16">
+    <link href="/img/favicon-32x32.png" rel="icon" type="image/png" sizes="32x32">
+    <link href="/img/favicon-57x57.png" rel="icon" type="image/png" sizes="57x57">
+    <link href="/img/favicon-76x76.png" rel="icon" type="image/png" sizes="76x76">
+    <link href="/img/favicon-96x96.png" rel="icon" type="image/png" sizes="96x96">
+    <link href="/img/favicon-128x128.png" rel="icon" type="image/png" sizes="128x128">
+    <link href="/img/favicon-192x192.png" rel="icon" type="image/png" sizes="192x192">
+    <link href="/img/favicon-196x196.png" rel="icon" type="image/png" sizes="196x196">
+    <link href="/img/favicon-228x228.png" rel="icon" type="image/png" sizes="228x228">
+    <link href="/img/apple-touch-icon.png" rel="apple-touch-icon" sizes="180x180">
+    <link href="/assets/index-D3PaZvXv.css" rel="stylesheet">
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="/assets/index-C47W6w0H.js" type="module"></script>
+    <!-- Google Tag Manager -->
+    <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+                new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+            j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+            'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+        })(window,document,'script','dataLayer','GTM-WNP7MLF');</script>
+    <!-- End Google Tag Manager -->
+
+</head>
+<body>
+<header>
+<div id="earthdata-notification-banner"></div>
+<script src="https://status.earthdata.nasa.gov/assets/banner_widget.js"></script>
+
+<nav class="navbar navbar-expand-lg nasa-navbar color-spacesuit-white" role="navigation" aria-label="Primary navigation">
+    <div class="container-fluid">
+        <a class="navbar-brand d-flex align-items-center" href="/" title="LAADS DAAC Home" aria-label="LAADS DAAC Home">
+            <img loading="eager" fetchpriority="high" width="58" height="49" alt="NASA Logo" src="/img/logo.png" class="img-fluid">
+            <span class="ms-4">LAADS DAAC</span>
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarContent"
+                aria-controls="navbarContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="hamburger-icon">
+                <span class="hamburger-bar"></span>
+                <span class="hamburger-bar"></span>
+                <span class="hamburger-bar"></span>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse" id="navbarContent">
+            <ul class="navbar-nav ms-auto align-items-lg-center" role="menubar">
+
+                <!-- Alerts -->
+                <li class="nav-item nav-item-alert" role="none">
+                    <a class="nav-link" href="/alerts-and-issues/" title="System Alerts" aria-label="System Alerts" role="menuitem">
+                        <div class="alert-icon-container" aria-hidden="true">
+                            <i class="fa-solid fa-bullhorn"></i>
+                        </div>
+                        <span class="d-lg-none ms-2">System Alerts</span>
+                    </a>
+                </li>
+
+                <!-- Data Access -->
+                <li class="nav-item dropdown" role="none">
+                    <a class="nav-link dropdown-toggle d-flex align-items-center"
+                       id="dataDropdown" href="/data-access/" data-bs-toggle="dropdown" aria-expanded="false" aria-haspopup="true" role="menuitem">
+                        <i class="fa-solid fa-database nav-icon" aria-hidden="true"></i>
+                        <span>Data Access</span>
+                        <!--<i class="fa-solid fa-caret-down ms-1" aria-hidden="true"></i>-->
+                    </a>
+                    <ul class="dropdown-menu" aria-labelledby="dataDropdown" role="menu">   <li role="none"><a class="dropdown-item" href="/search/" role="menuitem">Find Data</a></li>
+                        <li role="none"><a class="dropdown-item" href="/view-data/" role="menuitem">View Data</a></li>
+                        <li role="none"><a class="dropdown-item" href="/archive/" role="menuitem">Data Archive</a></li>
+                        <li role="none"><a class="dropdown-item" href="/cloud/" role="menuitem">Cloud Access</a></li>
+                        <li role="none"><a class="dropdown-item" href="/tools-and-services/" role="menuitem">Tools & Services</a></li>
+                    </ul>
+                </li>
+
+                <!-- Learn -->
+                <li class="nav-item" role="none">
+                    <a class="nav-link d-flex align-items-center" href="/learn/" role="menuitem">
+                        <i class="fa-solid fa-circle-question nav-icon" aria-hidden="true"></i>
+                        <span>Learn</span>
+                    </a>
+                </li>
+
+                <!-- About -->
+                <li class="nav-item dropdown" role="none">
+                    <a class="nav-link dropdown-toggle d-flex align-items-center"
+                       id="aboutDropdown" href="/about/" data-bs-toggle="dropdown" aria-expanded="false" aria-haspopup="true" role="menuitem">
+                        <i class="fa-solid fa-circle-info nav-icon" aria-hidden="true"></i>
+                        <span>About</span>
+                    </a>
+                    <ul class="dropdown-menu" aria-labelledby="aboutDropdown" role="menu">
+                        <li role="none"><a class="dropdown-item" href="/about/atmosphere/" role="menuitem">Our Atmosphere</a></li>
+                        <li role="none"><a class="dropdown-item" href="/uwg/" role="menuitem">User Working Group</a></li>
+                        <li role="none"><a class="dropdown-item" href="/about/related-sites/" role="menuitem">Related Sites</a></li>
+                        <li role="none"><hr class="dropdown-divider"></li>
+                        <li role="none"><a class="dropdown-item" href="/contact/" role="menuitem">Contact Us</a></li>
+                    </ul>
+                </li>
+
+                <!-- User Profile -->
+                <li class="nav-item dropdown" id="profile-menu-option" role="none">
+                    <button class="nav-link dropdown-toggle d-flex align-items-center border-0 bg-transparent"
+                            id="navbarDropdown" data-bs-toggle="dropdown" aria-expanded="false" aria-haspopup="true" role="menuitem">
+                        <i class="fa-solid fa-user nav-icon" aria-hidden="true"></i>
+                        <span>Sign In</span>
+                    </button>
+                    <ul class="dropdown-menu" aria-labelledby="navbarDropdown" role="menu">
+                        <!-- Populated dynamically -->
+                    </ul>
+                </li>
+
+                <!-- Search Box -->
+                <li class="nav-item nav-item-search" role="none">
+                    <form class="nav-search-form" action="/find" method="get" role="search" aria-label="Search Google">
+                        <div class="input-group">
+                            <input type="text" class="form-control nav-search-input" id="q" name="q" placeholder="Search" aria-label="Search">
+                            <button class="btn nav-search-button" type="submit" aria-label="Submit search">
+                                <i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i>
+                            </button>
+                        </div>
+                    </form>
+                </li>
+            </ul>
+        </div>
+    </div>
+</nav>
+<script>
+    // Ensure the Bootstrap navbar collapse toggles reliably on mobile
+    document.addEventListener('DOMContentLoaded', () => {
+        const toggler = document.querySelector('.navbar .navbar-toggler');
+        const collapseEl = document.getElementById('navbarContent');
+        if (!toggler || !collapseEl) return;
+
+        // Create/get the Collapse instance without auto-toggling on init
+        const collapse = bootstrap.Collapse.getOrCreateInstance(collapseEl, { toggle: false });
+
+        // Force toggle on every click (prevents interference from other handlers)
+        toggler.addEventListener('click', (e) => {
+            e.preventDefault();
+            collapse.toggle();
+        });
+
+        // Optional: close the menu after choosing an item (only on small screens)
+        collapseEl.querySelectorAll('a, button').forEach((el) => {
+            el.addEventListener('click', () => {
+                const togglerVisible = window.getComputedStyle(toggler).display !== 'none';
+                if (togglerVisible) collapse.hide();
+            });
+        });
+
+        // Enable hover for dropdowns on desktop, while retaining click for mobile
+        const isDesktop = () => window.getComputedStyle(toggler).display === 'none';
+
+        document.querySelectorAll('.navbar .nav-item.dropdown').forEach(dropdownEl => {
+            let timeout;
+            const dropdownToggle = dropdownEl.querySelector('.dropdown-toggle');
+            if (!dropdownToggle) return;
+            const dropdown = bootstrap.Dropdown.getOrCreateInstance(dropdownToggle);
+
+            dropdownEl.addEventListener('mouseenter', () => {
+                if (!isDesktop()) return;
+                clearTimeout(timeout);
+                // Delay showing to prevent fly-by openings and ensure user intent
+                timeout = setTimeout(() => {
+                    if (dropdownEl.matches(':hover')) { // Re-check hover state before showing
+                        dropdown.show();
+                    }
+                }, 150);
+            });
+
+            dropdownEl.addEventListener('mouseleave', () => {
+                if (!isDesktop()) return;
+                clearTimeout(timeout);
+                // Delay hiding to allow moving cursor to the menu
+                timeout = setTimeout(() => dropdown.hide(), 200);
+            });
+        });
+
+        // Make top-level dropdown toggles both navigable and togglable
+        collapseEl.querySelectorAll('.nav-item.dropdown > .nav-link.dropdown-toggle[href]').forEach((toggle) => {
+            // On mobile (collapsed navbar), first tap opens dropdown; second tap navigates.
+            // On desktop, click navigates immediately.
+            toggle.addEventListener('click', (e) => {
+                const togglerVisible = window.getComputedStyle(toggler).display !== 'none';
+
+                // Allow modifier/middle clicks to behave normally (new tab/window)
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.which === 2 || e.button === 1) return;
+
+                if (!togglerVisible) {
+                    // Desktop: Bootstrap's dropdown prevents default; force navigation
+                    e.preventDefault();
+                    const href = toggle.getAttribute('href');
+                    if (href) window.location.assign(href);
+                    return;
+                }
+
+                // Mobile: first tap opens, second tap navigates
+                const parentLi = toggle.closest('.nav-item.dropdown');
+                const menu = parentLi ? parentLi.querySelector('.dropdown-menu') : null;
+                const isShown = menu ? menu.classList.contains('show') : false;
+
+                // If Ctrl/Meta/Shift middle-click etc., allow default navigation
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.which === 2 || e.button === 1) return;
+
+                if (!isShown) {
+                    // Prevent navigation and open dropdown
+                    e.preventDefault();
+                    const dd = bootstrap.Dropdown.getOrCreateInstance(toggle, { autoClose: true });
+                    dd.show();
+                }
+                // If already shown, let the default click proceed to navigate
+            });
+
+            // Keyboard support: Enter/Space
+            toggle.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                const togglerVisible = window.getComputedStyle(toggler).display !== 'none';
+
+                if (!togglerVisible) {
+                    // Desktop: navigate
+                    e.preventDefault();
+                    const href = toggle.getAttribute('href');
+                    if (href) window.location.assign(href);
+                    return;
+                }
+
+                // Mobile: first press opens, second navigates
+                const parentLi = toggle.closest('.nav-item.dropdown');
+                const menu = parentLi ? parentLi.querySelector('.dropdown-menu') : null;
+                const isShown = menu ? menu.classList.contains('show') : false;
+                if (!isShown) {
+                    e.preventDefault();
+                    const dd = bootstrap.Dropdown.getOrCreateInstance(toggle, { autoClose: true });
+                    dd.show();
+                }
+                // If shown, allow navigation by not preventing default
+            });
+        });
+    });
+</script>
+
+</header>
+
+<main class="min-h-viewport">
+    <div class="container-xl padding-x-3 padding-y-3">  <!-- begin main content container -->
+        <article class="col-md-10 col-md-offset-1 col-sm-12">
+
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/#level0-level1">Home</a></li>
+
+            <li class="breadcrumb-item"><a href="/missions-and-measurements/science-domain/viirs-L0-L1">VIIRS - Level-1 and Level-0</a></li>
+            <li class="breadcrumb-item active" aria-current="page">VJ202MOD</li>
+    </ol>
+</nav>
+
+
+        
+<h1>VJ202MOD - VIIRS/JPSS2 Moderate Resolution 6-Min L1B Swath 750m</h1>
+
+<div class="product-container">
+    <!-- Collection selector -->
+
+    <!-- Nav tabs -->
+    <ul class="nav nav-tabs" id="myTab" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="overview" data-bs-toggle="tab" data-bs-target="#overview-pane"
+                    type="button" role="tab" aria-controls="overview-pane" aria-selected="true">
+                <i class="fa-solid fa-eye"></i>
+                <span>Overview</span>
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="product-information" data-bs-toggle="tab"
+                    data-bs-target="#product-information-pane"
+                    type="button" role="tab" aria-controls="product-information-pane" aria-selected="false">
+                <i class="fa-solid fa-box"></i>
+                <span>Product Information</span>
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="data-availability" data-bs-toggle="tab" data-bs-target="#data-availability-pane"
+                    type="button" role="tab" aria-controls="data-availability-pane" aria-selected="false">
+                <i class="fa-solid fa-calendar-check"></i>
+                <span>Data Availability</span>
+            </button>
+        </li>
+    </ul>
+
+    <div class="tab-content mt-3">
+        <div class="tab-pane fade" id="overview-pane" role="tabpanel" aria-labelledby="overview">
+                    <p>VJ202MOD is the short-name for the Joint Polar Satellite System-2 (JPSS-2/NOAA-21; referred to hereafter as J2) platform-derived NASA VIIRS L1B calibrated radiances product that contains sixteen moderate-resolution or M-bands, which have a spatial resolution of 750-meters at nadir. These M-bands comprise eleven reflective solar bands (RSB) and five thermal emissive bands (TEB). Each of the M-bands has 16 detectors in the along-track direction with 16 rows of pixels per scan that provide a 750-m resolution. Ranging in wavelengths from 0.402 µm to 12.49 µm, the M-bands are sensitive to visible, near-, shortwave-, mediumwave-, and longwave-infrared wavelengths. Derived from the NASA VIIRS L1A raw radiances, this product includes calibrated and geolocated radiance and reflectance data, quality flags, and granule- and collection-level metadata. In contrast to a MODIS L1B product, which temporally spans 5 minutes, the VIIRS L1B calibrated radiances product contains a nominal temporal duration of 6 minutes. The image dimensions of the 750-m swath product measure 3232 lines by 3200 pixels. The data product described in this landing page is a v2.1 collection and its data record starts from February 10, 2023.</p>
+
+<p><strong><em>Radiometric Calibration-specific changes</em></strong><br>
+The following updates define the changes implemented in the v2.1 collections:</p>
+
+<ol>
+<li>Applied the Total and Spectral Solar Irradiance Sensor-1 (TSIS-1) solar spectral irradiance.</li>
+<li>Improved screen functions derived from yaw maneuvers combined with regular on-orbit solar diffuser calibration data.</li>
+<li>Addressed the time-dependent striping mitigation for Visible Near Infrared bands M1-M3.</li>
+<li>Updated the Delta-C look-up table (LUT) to correct the M4 low-gain error in the pre-launch LUT.</li>
+<li>The recently available Day-Night Band (DNB) Mid-Gain State (MGS) Relative Spectral Response (RSR) is applied to High-Gain State (HGS) and MGS calibration, which previously only used the Low-Gain State (LGS) RSR in the earlier version v3.2.3.x.</li>
+</ol>
+
+<p><strong>Radiometric Accuracy</strong>
+Radiometric accuracy forms a key requirement that enables us to derive good quality L2 retrievals and provide the basis for higher-level products. The v2.1 J2 VIIRS L1 product’s radiometric accuracies for the RSB and TEB spectral band groups are as follows:</p>
+
+<p><strong><em>Reflective Solar Bands:</em></strong> Based on the VIIRS Sensor Specifications, the VIIRS reflective solar bands’ calibration uncertainty for spectral reflectance over a scene with typical radiance is defined at less than 2%.</p>
+
+<p><strong><em>Thermal Emissive Bands:</em></strong> Given a uniform scene with 267 K brightness temperature (for image and emissive bands), the specified calibration uncertainty for spectral radiance is defined at 5% for Image band-4 and 2.5% for Image band-5.</p>
+
+ 
+            <div class="link">
+                <h3>Links</h3>
+                <ul class="linklist">
+                        <li><a href="/search/order/2/VJ202MOD--5201">Search for Product Files</a></li>
+                        <li><a href="/archive/allData/5201/VJ202MOD/">Data Archive</a></li>
+                        <li><a href="/api/v2/content/archives/Document%20Archive/Science%20Data%20Product%20Documentation/NASA_VIIRS_L1B_UG_August_2021.pdf">VIIRS Level-1 Data Product User Guide</a></li>
+                        <li><a href="/api/v2/content/archives/Document%20Archive/Science%20Data%20Product%20Documentation/Product%20Generation%20Algorithms/NASARevisedJPSSVIIRSRadCalATBD2014.pdf">VIIRS Radiometric Calibration Algorithm Theoretical Basis Document</a></li>
+                        <li>DOI: <a href="https://doi.org/10.5067/VIIRS/VJ202MOD.021">10.5067/VIIRS/VJ202MOD.021</a></li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="product-information-pane" role="tabpanel" aria-labelledby="product-information">
+            <div class="table-responsive">
+                <table class="table table-striped table-hover">
+                    <tbody>
+                    <tr>
+                        <td id="shortname"><b>Shortname:</b></td>
+                        <td>VJ202MOD</td>
+                    </tr>
+                    <tr>
+                        <td><b>Platform:</b></td>
+                        <td>JPSS2(NOAA21)</td>
+                    </tr>
+                    <tr>
+                        <td><b>Instrument:</b></td>
+                        <td>VIIRS</td>
+                    </tr>
+                    <tr>
+                        <td><b>Processing Level:</b></td>
+                        <td>Level-1B</td>
+                    </tr>
+                    <tr>
+                        <td><b>Data Format:</b></td>
+                        <td>netCDF4/HDF5</td>
+                    </tr>
+                    <tr>
+                        <td><b>Spatial Resolution:</b></td>
+                        <td>375 m</td>
+                    </tr>
+                    <tr>
+                        <td><b>Temporal Resolution:</b></td>
+                        <td>6 minute</td>
+                    </tr>
+
+                    <tr>
+                        <td><b>ArchiveSet(s):</b></td>
+                        <td>5201</td>
+</tr>
+                    <tr>
+                        <td><b>Collection:</b></td>
+                        <td>NPP and JPSS1 VIIRS data 2.1 (ArchiveSet 5201)</td>
+                    </tr>
+
+                    <tr>
+                        <td><b>PGE Number:</b></td>
+                        <td>PGE502</td>
+                    </tr>
+                    <tr>
+                        <td><b>File Naming Convention:</b></td>
+                        <td>
+                                <p><strong>Syntax:</strong> ESDT.AYYYYDDD.HHMM.CCC.YYYYDDDHHMMSS.Format</p><p><strong>Example:</strong> VJ202MOD.A2023103.0040.002.2023270220512.nc</p>
+                                <table class="table table-borderless table-sm">
+                                        <tr><td><strong>ESDT</strong></td><td>Earth Science Data Type or Shortname</td>
+                                        <tr><td><strong>AYYYYDDD</strong></td><td>Acquisition Year and Day of Year</td>
+                                        <tr><td><strong>HHMM</strong></td><td>Acquisition Hour and Minute</td>
+                                        <tr><td><strong>CCC</strong></td><td>Version ID of the data collection</td>
+                                        <tr><td><strong>YYYYDDDHHMMSS</strong></td><td>Processing year, Day-of-year, UTC time (hour, minutes, seconds)</td>
+                                        <tr><td><strong>Format</strong></td><td>File format suffix, which in the above case represents netCDF4/HDF5</td>
+                                </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><b>Keywords:</b></td>
+                        <td>JPSS-2, NOAA-21, VIIRS, L1B, Moderate resolution, M-bands, Calibrated Radiances</td>
+                    </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="data-availability-pane" role="tabpanel" aria-labelledby="data-availability">
+            <div id="chart" class="chart-container">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span class="date-range-display">Currently Viewing ArchiveSet5201 Dates: Loading...</span>
+                    <div class="chart-controls">
+                        <button id="zoomIn" class="btn btn-sm btn-outline-secondary" title="Zoom In">
+                            <i class="fas fa-search-plus" aria-hidden="true"></i>
+                        </button>
+                        <button id="zoomOut" class="btn btn-sm btn-outline-secondary" title="Zoom Out">
+                            <i class="fas fa-search-minus" aria-hidden="true"></i>
+                        </button>
+                        <button id="resetZoom" class="btn btn-sm btn-outline-secondary" title="Reset View">
+                            <i class="fas fa-undo" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                </div>
+                <div id="loading-chart" class="text-center p-5">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="mt-3">Loading data availability chart...</p>
+                    <p class="text-muted small">Fetching product availability data from the API. This may take a moment.</p>
+                </div>
+                <div id="chart-legend" class="mt-3 p-3 border rounded bg-light">
+                    <h6 class="mb-2 text-center">Data Availability Legend</h6>
+                    <div class="d-flex justify-content-center flex-wrap">
+                        <div class="d-flex align-items-center me-4 mb-2">
+                            <div class="legend-color bg-success"></div>
+                            <span><strong>High</strong>: >75% available</span>
+                        </div>
+                        <div class="d-flex align-items-center me-4 mb-2">
+                            <div class="legend-color bg-warning"></div>
+                            <span><strong>Medium</strong>: 25-75% available</span>
+                        </div>
+                        <div class="d-flex align-items-center mb-2">
+                            <div class="legend-color bg-danger"></div>
+                            <span><strong>Low</strong>: <25% available</span>
+                        </div>
+                    </div>
+                    <p class="text-center text-muted small mb-0 mt-2">The chart displays data availability percentages over time. Click and drag to pan, use buttons to zoom.</p>
+                </div>
+            </div>
+            <div id="optionForm" class="card mt-4">
+                <div class="card-header bg-light">
+                    <h6 class="mb-0">Chart Options</h6>
+                </div>
+                <div class="card-body py-3">
+                    <form id="availabilityOptions" class="row g-3 align-items-end">
+                        <input id="selectProduct" type="hidden" value="VJ202MOD">
+                        <div class="col-md-2 col-sm-6">
+                            <label for="selectArchiveSet" class="form-label small text-muted mb-1">ArchiveSet</label>
+                            <select id="selectArchiveSet" class="form-select form-select-sm">
+                                        <option value="5201" selected>5201</option>
+                                        <option value="5200" >5200</option>
+                            </select>
+                        </div>
+                        <div class="col-md-3 col-sm-6">
+                            <label for="pickStartDate" class="form-label small text-muted mb-1">Start Date</label>
+                            <input type="text" id="pickStartDate" class="form-control form-control-sm" placeholder="2000-01-01">
+                        </div>
+                        <div class="col-md-3 col-sm-6">
+                            <label for="pickEndDate" class="form-label small text-muted mb-1">End Date</label>
+                            <input type="text" id="pickEndDate" class="form-control form-control-sm" placeholder="Today">
+                        </div>
+                        <div class="col-md-4 col-sm-6 text-end">
+                            <button type="button" id="availabilitySubmit" class="btn btn-primary btn-sm">
+                                <i class="fas fa-sync-alt me-1"></i>Update
+                            </button>
+                            <button type="button" id="availabilityReset" class="btn btn-outline-secondary btn-sm">
+                                <i class="fas fa-undo me-1"></i>Reset
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Function to update the title with selected dates
+    function updateTitle() {
+        var startDate = $("#pickStartDate").val();
+        var endDate = $("#pickEndDate").val();
+        var archiveSet = $("#selectArchiveSet").val();
+        var product = $("#selectProduct").val();
+
+        // Format dates for display if they exist
+        if (startDate && endDate) {
+            // Convert dates to more readable format if possible
+            try {
+                const startParts = startDate.split('-');
+                const endParts = endDate.split('-');
+
+                if (startParts.length === 3 && endParts.length === 3) {
+                    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+                    const startMonth = months[parseInt(startParts[1], 10) - 1];
+                    const endMonth = months[parseInt(endParts[1], 10) - 1];
+
+                    const formattedStartDate = `${startMonth} ${parseInt(startParts[2], 10)}, ${startParts[0]}`;
+                    const formattedEndDate = `${endMonth} ${parseInt(endParts[2], 10)}, ${endParts[0]}`;
+
+                    $(".date-range-display").html(`ArchiveSet ${archiveSet}: Data from ${formattedStartDate} to ${formattedEndDate}`);
+
+                    // Store the formatted dates as data attributes to prevent overwriting
+                    $(".date-range-display").data('user-start-date', formattedStartDate);
+                    $(".date-range-display").data('user-end-date', formattedEndDate);
+                } else {
+                    $(".date-range-display").html(`ArchiveSet ${archiveSet}: Data from ${startDate} to ${endDate}`);
+
+                    // Store the dates as data attributes to prevent overwriting
+                    $(".date-range-display").data('user-start-date', startDate);
+                    $(".date-range-display").data('user-end-date', endDate);
+                }
+            } catch (error) {
+                console.error('Error formatting dates:', error);
+                $(".date-range-display").html(`ArchiveSet ${archiveSet}: Data from ${startDate} to ${endDate}`);
+
+                // Store the dates as data attributes even in case of error
+                $(".date-range-display").data('user-start-date', startDate);
+                $(".date-range-display").data('user-end-date', endDate);
+            }
+        }
+    }
+
+    // Update the title when the page loads
+    $(document).ready(function() {
+        // Call updateTitle directly to sync dates when page loads
+        updateTitle();
+    });
+</script>
+
+        </article>
+    </div>  <!-- end main content container -->
+</main>
+<footer class="usa-footer bg-carbon-black-important padding-x-3 padding-y-7">
+    <div class="usa-footer__primary-section bg-carbon-black-important">
+        <div class="grid-container grid-container-widescreen padding-x-0">
+            <img fetchpriority="low" width="63.99" height="53.94" class="width-8 margin-bottom-2" alt="NASA Logo"
+                 src="/img/nasa-logo@2x.png"
+                 srcset="/img/nasa-logo.svg">
+        </div>
+        <div class="grid-container grid-container-widescreen">
+            <div class="grid-row">
+                <div class="grid-col-12 tablet:grid-col-6 desktop:grid-col-4 margin-bottom-2 padding-right-0 tablet:padding-right-2 desktop:margin-bottom-0 color-spacesuit-white">
+                    <div class="hds-footer-details">
+                        <h3 class="heading-22 line-height-md">National Aeronautics and Space Administration</h3>
+                        <p class="p-sm color-carbon-30">NASA explores the unknown in air and space, innovates for the benefit of humanity, and inspires the world through discovery.</p>
+                    </div>
+                </div>
+                <div class="grid-col-12 tablet:grid-col-8 desktop:grid-col-12 padding-top-2 border-top-1px hds-footer-secondary">
+                    <ul class="color-carbon-30-important hds-footer-menu hds-footer-menu-horizontal usa-unstyled-list">
+                        <li>
+                            <a href="https://www.nasa.gov/privacy/" target="_blank" aria-label="Privacy Policy">
+                                <span>Privacy Policy</span></a>
+                        </li>
+                        <li>
+                            <a href="/contact/" aria-label="Contact Us">
+                                <span>Contact Us</span></a>
+                        </li>
+                        <li>
+                            <a href="/internal/" target="_blank" aria-label="Internal">
+                                <span>Internal</span></a>
+                        </li>
+                        <li>
+                            <a href="https://www.nasa.gov/accessibility/" target="_blank" aria-label="Accessibility">
+                                <span>Accessibility</span></a>
+                        </li>
+                    </ul>
+                </div>
+                <div class="desktop:margin-top-0 grid-col-12">
+                    <ul class="color-carbon-40-important hds-footer-menu hds-footer-menu-horizontal hds-menu-meta usa-unstyled-list">
+                        <li class="hds-footer-meta">
+                            <div class="hds-footer-meta-label">Version:</div>
+                            <div class="hds-footer-meta-value">4.0.10</div>
+                        </li>
+                        <li class="hds-footer-meta">
+                            <div class="hds-footer-meta-label">Responsible NASA Official:</div>
+                            <div class="hds-footer-meta-value">Sadashiva Devadiga</div>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</footer>
+
+<div class="modal-components">
+
+    <div id="generate-token-modal" class="modal fade" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <button type="button" class="close" data-bs-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                    <h1 class="modal-title fs-4">&nbsp;Tokens for Downloading LAADS DAAC Data</h1>
+                </div>
+                <div class="modal-body">
+                  <ul>
+                    <li>A LAADS DAAC download token will help make file downloads faster, but is only usable for LAADS DAAC web sites. A LAADS DAAC token
+                        will not work with other Earthdata sites.
+
+                      <div id="generate-token-modal-loading" class="hide">
+                        Generating LAADS DAAC token &hellip; <i class="fas fa-sync icon-refresh-animate"></i>
+                      </div>
+                      <div id="generate-token-modal-complete" class="hide">
+                        <p>Please copy and save the token below for use with any supported LAADS download utilities or scripts.</p>
+                        <pre id="generate-token-modal-display-token" class="wrap"></pre>
+
+                        <p>To test, run the following <code>wget</code> download command in your terminal and see if it successfully downloaded the README text file located at the root of the LAADS archive. See also <a href="/tools-and-services/data-download-scripts/#wget" target="_blank">LAADS documentation on how to use wget</a></p>
+                        <pre id="generate-token-modal-display-wget-sample" class="wrap">wget -e robots=off -m -np -R .html,.tmp -nH --cut-dirs=3 "https://ladsweb.modaps.eosdis.nasa.gov/archive/README" --header "Authorization: Bearer <span id="generate-token-modal-display-wget-sample-token"></span>" -P .</pre>
+                      </div>
+                      <div id="generate-token-modal-error" class="hide">
+                        <div class="alert alert-danger" role="alert"><i class="fas fa-times-circle"></i> We are currently unable to generate a LAADS DAAC token. Please try again later or contact <a href="javascript:feedback.showForm()">MODAPS Support</a> with any questions.</div>
+                      </div>
+                    </li>
+                    <li>An Earthdata Download token (EDL) will work on any Earthdata site including all LAADS DAAC sites, but download performance from the LAADS DAAC can be much slower due to the extra network connections needed to check credentials at Earthdata.
+                        <br>
+                        <button id="edl-token-button" type="button" class="btn btn-primary btn-lg active" role="button" aria-pressed="true">Generate EDL Token</button>
+                    </li>
+                  </ul>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div><!-- /.modal-content -->
+        </div><!-- /.modal-dialog -->
+    </div><!-- /.modal -->
+
+
+
+    <div id="multi-download-modal" class="modal fade bs-example-modal-lg" tabindex="-1" role="dialog">
+        <div class="modal-dialog modal-lg" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <button type="button" class="close" data-bs-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                    <h4 class="modal-title">Confirm Download of Multiple Files</h4>
+                </div>
+                <div class="modal-body">
+                    <div id="multi-file-loading-confirm">
+                        Verifying login status&hellip; <i class="fas fa-sync icon-refresh-animate"></i>
+                    </div>
+                    <div id="multi-file-download-confirm">
+                        <p>Please confirm before starting this batch download of <span id="multi-download-modal-num-files"></span> listed below totaling <span id="multi-download-modal-total-file-size"></span>, one file at a time.</p>
+                        <pre id="multi-download-modal-list-of-files"></pre>
+                        <div class="alert alert-warning" role="alert"><i class="fas fa-exclamation-triangle"></i> Once a batch download begins, your browser may not provide a way to cancel the batch aside from closing the browser entirely or stopping individual downloads one at a time. If in doubt, try selecting a smaller number of files for download. <a href="javascript:feedback.showForm()">MODAPS Support</a> is available to help with any questions.</div>
+                        <div class="alert alert-info" role="alert">
+                            <h3>
+                                <i class="fas fa-globe" aria-hidden="true"></i> 
+                                <strong>Browser configurations</strong>
+                            </h3>
+                            <ol>
+                                <li>Some users might have to approve once (e.g., click "Allow") to allow for future downloads of multiple files.</li>
+                                <li>To avoid a new download prompt for each file, ensure the following settings are configured in your browser:
+                                    <ul>
+                                        <li><i class="fab fa-chrome" aria-hidden="true"></i> Chrome: Settings &gt; Advanced &gt; Ask where to save each file before downloading &gt; <em>Off</em></li>
+                                        <li><i class="fab fa-firefox" aria-hidden="true"></i> Firefox:
+                                            <ol>
+                                                <li>Preferences &gt; Files and Applications &gt; <em>Save files to</em>&hellip;</li>
+                                                <li>Click checkbox &ldquo;Do this automatically for files like this from now on&rdquo;</li>
+                                            </ol>
+                                        </li>
+                                        <li><i class="fab fa-safari" aria-hidden="true"></i> Safari: Preferences &gt; General &gt; File download location &gt; <em>[specified folder]</em></li>
+                                        <li><i class="fab fa-edge" aria-hidden="true"></i> Edge: Settings &gt; Downloads &gt; Ask where to save each file before downloading &gt; <em>Off</em></li>
+                                    </ul>
+                                </li>
+                                <li>Unsupported browsers for multi-file downloads (use <i class="fas fa-download"></i> instead):
+                                    <ul>
+                                        <li><i class="fab fa-internet-explorer" aria-hidden="true"></i> Internet Explorer 11 and below</li>
+                                    </ul>
+                                </li>
+                            </ol>
+                        </div>
+                    </div>
+                    <div id="multi-file-log-in-confirm">
+                        <div class="alert alert-warning" role="alert">
+                            <a href="/oauth/login" target="_blank" rel="noopener noreferrer">
+                                <h2>
+                                    <i class="fas fa-hand-point-right"></i> Please log in and try again
+                                </h2>
+                            </a>
+                        </div>
+                    </div>
+                    <div id="multi-file-error-confirm">
+                        <div class="alert alert-danger" role="alert"><i class="fas fa-times-circle"></i> We are currently having issues verifying your request. Please try again later or contact <a href="javascript:feedback.showForm()">MODAPS Support</a> with any questions.</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-default" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal" id="multi-download-modal-confirm-download"><i class="fas fa-download"></i> Download Files</button>
+                </div>
+            </div><!-- /.modal-content -->
+        </div><!-- /.modal-dialog -->
+    </div><!-- /.modal -->
+
+</div>
+<script src="https://fbm.earthdata.nasa.gov/for/LAADS/feedback.js"></script>
+<script type="text/javascript">
+    $(document).ready(function () {
+        window.feedback.init({showIcon: false});
+    });
+</script>
+<script src="https://cdn.earthdata.nasa.gov/tophat2/tophat2.js" id="earthdata-tophat-script" data-show-status="true" data-show-fbm="false" data-current-daac="LAADS"></script>
+<script src="https://dap.digitalgov.gov/Universal-Federated-Analytics-Min.js?agency=NASA&amp;subagency=GSFC&amp;dclink=true" id="_fed_an_ua_tag"></script>
+
+</body>
+</html>

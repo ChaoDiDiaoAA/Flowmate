@@ -66,13 +66,14 @@ export class HostClient {
   }
 
   public async start(userDataRoot: string, appVersion: string, cwd: string,
-    invoiceSourceRoot = join(cwd, 'data', 'invoices', 'agent-input')): Promise<Result<HostState>> {
+    invoiceSourceRoot = join(cwd, 'data', 'invoices', 'agent-input'),
+    launch?: { executable: string; args: readonly string[] }): Promise<Result<HostState>> {
     this.connectionChangeHandler?.();
     if (this.child) this.failAll('host_replaced', 'Bun Host 连接已更换。');
     const executable = process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun';
     const env = safeChildEnvironment();
     env.FLOWMATE_DESKTOP_VERSION = appVersion;
-    const child = spawn(executable, ['--no-env-file', 'apps/host/main.ts', '--user-data-root', userDataRoot,
+    const child = spawn(launch?.executable ?? executable, launch ? [...launch.args] : ['--no-env-file', 'apps/host/main.ts', '--user-data-root', userDataRoot,
       '--invoice-source-root', invoiceSourceRoot], {
       cwd,
       env,
@@ -323,7 +324,17 @@ export class HostClient {
 
 function matchesRuntimeResponse(command: HostCommand, value: unknown): boolean {
   if (!isRuntimeHostCommand(command.type)) return true;
-  const result = value as { ok: boolean; data?: unknown; error?: { code: string }; context?: import('@flowmate/contracts').RuntimeEventReadContext | null };
+  const result = value as { ok: boolean; data?: unknown; error?: { code: string; runId?: number; sessionId?: number }; runId?: number; context?: import('@flowmate/contracts').RuntimeEventReadContext | null };
+  if (command.type === 'replay_invoice_save') {
+    if (!result.ok) return (result.error?.runId === undefined || result.error.runId === command.input.runId)
+      && (result.error?.sessionId === undefined || result.error.sessionId === command.input.sessionId);
+    const data = result.data as import('zod').z.infer<typeof import('@flowmate/contracts').InvoiceSaveReplayReceiptSchema>;
+    return data.runId === command.input.runId && data.sessionId === command.input.sessionId && data.toolCallId === command.input.toolCallId
+      && data.nativeToolCallId === command.input.nativeToolCallId && data.argumentsHash === command.input.argumentsHash;
+  }
+  if (!result.ok && command.type === 'query_run_tool_evidence') return (result.runId === undefined || result.runId === command.input.runId)
+    && (result.error?.runId === undefined || result.error.runId === command.input.runId)
+    && (result.error?.sessionId === undefined || result.error.sessionId === command.input.sessionId);
   if (!result.ok) return result.context == null || command.type !== 'query_runtime_events'
     || result.context.runId === command.input.runId
       && (result.context.sessionId === command.input.sessionId || result.error?.code === 'event_cursor_invalid');
@@ -355,6 +366,12 @@ function matchesRuntimeResponse(command: HostCommand, value: unknown): boolean {
   if (command.type === 'query_run_tool_call') {
     const tool = result.data as import('@flowmate/contracts').RuntimeToolView;
     return tool.runId === command.input.runId && tool.sessionId === command.input.sessionId && tool.toolCallId === command.input.toolCallId;
+  }
+  if (command.type === 'query_run_tool_evidence') {
+    const page = result.data as import('@flowmate/contracts').ToolEvidencePage;
+    return page.runId === command.input.runId && page.sessionId === command.input.sessionId && page.toolCallId === command.input.toolCallId
+      && page.offset === command.input.offset && Buffer.byteLength(page.chunk) <= command.input.limit
+      && (command.input.expectedHash === undefined || page.sha256 === command.input.expectedHash);
   }
   return true;
 }

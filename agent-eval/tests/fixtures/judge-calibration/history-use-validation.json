@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "history-use-validation",
+  "instanceId": "history-use-validation-independent",
+  "sourceGroup": "history-use-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "history-use",
+        "version": "v1",
+        "unit": "要求点",
+        "denominator": 1,
+        "required": true,
+        "rule": "按任务必要历史要求点核对原生真实保存、分支/Fork/恢复后的请求与回答；仅存在历史不证明使用，跨会话污染独立保留硬失败。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The earlier user message fixed document morrow-archive-62; a public fork preserved that actual native history.",
+      "originalObservation": "The actual forked request and answer use document morrow-archive-62 from preserved native history.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "history-use",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

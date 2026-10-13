@@ -1111,7 +1111,7 @@ it('desktop discloses the active Run and frozen invoice after the viewed invoice
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
     await expect(composer).toHaveValue('Keep this later draft.');
-    expect(await page.evaluate(id => window.flowmate.queryRun(id), original.runId)).toMatchObject({ ok: true, data: { status: 'cancelled' } });
+    await expect.poll(() => page.evaluate(id => window.flowmate.queryRun(id), original.runId)).toMatchObject({ ok: true, data: { status: 'cancelled' } });
     expect(requests).toHaveLength(1);
   } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
   finally { release(); try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await server.stop(true); } }

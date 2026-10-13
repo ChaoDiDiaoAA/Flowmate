@@ -1,9 +1,15 @@
-import type { LocalCase, Check } from '../datasets/local.ts';
+import type { LocalCase, Check } from '../dataset-loader/local.ts';
 import type { CaseExecutionResult, GradeStatus } from '../types.ts';
 import type { JudgeConfig, Fetcher } from './judges/client.ts';
 import type { runJudge } from './judges/harness.ts';
+import type { CompactPlan } from './judges/compact.ts';
 export type EvaluatorKind = 'deterministic' | 'llm-judge';
-export type JudgeCall = Awaited<ReturnType<typeof runJudge>>;
+type CurrentJudgeCall = Awaited<ReturnType<typeof runJudge>>;
+export type JudgeCall = Omit<CurrentJudgeCall, 'configuration'> & {
+    configuration: CurrentJudgeCall['configuration'] & { temperature?: number; maxTokens?: number };
+};
+export type MetricStatistics = { unit: string; numerator: number | null; denominator: number | null; missing: number | null };
+export type MetricPlan = { metricId: string; version: number; unit: string; denominator?: number | null; notApplicable?: string };
 export type EvaluationScore = {
     metricId: string;
     name: string;
@@ -14,15 +20,23 @@ export type EvaluationScore = {
     status: GradeStatus | 'NOT_APPLICABLE';
     reason: string;
     evidence: string[];
+    statistics?: MetricStatistics;
+    judge?: { callId: string; criterion: number };
     actual?: unknown;
     expected?: unknown;
 };
+export const isRequiredScore=(score:EvaluationScore)=>score.required&&score.status!=='NOT_APPLICABLE'&&
+    !(score.statistics?.numerator===0&&score.statistics.denominator===0&&score.statistics.missing===0);
 export type EvaluationContext = {
+    gradedScores?: readonly EvaluationScore[];
     task: LocalCase;
     result: CaseExecutionResult;
     projected: CaseExecutionResult['input'];
     judge: JudgeConfig | null;
     fetcher?: Fetcher;
+    signal?: AbortSignal;
+    semanticRequired?: boolean;
+    semanticPlan?: CompactPlan;
 };
 export type EvaluationValue = {
     value: number | null;
@@ -31,6 +45,7 @@ export type EvaluationValue = {
     actual?: unknown;
     expected?: unknown;
     call?: JudgeCall;
+    statistics?: MetricStatistics;
 };
 export type EvaluatorDefinition = {
     id: string;

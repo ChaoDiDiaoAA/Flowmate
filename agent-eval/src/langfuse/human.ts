@@ -1,11 +1,11 @@
 import { platformClient } from './export.ts';
 import { readReport, reportPath } from '../reports/store.ts';
 import { addFeedback, feedbackStatus } from '../review/local.ts';
-import { hash } from '../datasets/local.ts';
+import { hash } from '../dataset-loader/local.ts';
 import type { LangfuseClient } from '@langfuse/client';
 const NAME = 'Flowmate local run feedback';
 export async function platformReview(repo: string, action: string, executionId?: string, providedClient?: LangfuseClient) {
-    const client = providedClient ?? await platformClient();
+    const client = providedClient ?? await platformClient(repo);
     try {
         const queues = [] as Awaited<ReturnType<typeof client.api.annotationQueues.listQueues>>['data'];
         for (let page = 1;; page++) {
@@ -25,14 +25,19 @@ export async function platformReview(repo: string, action: string, executionId?:
         if (!executionId)
             throw new Error('execution-id required');
         const report = readReport(reportPath(repo, executionId));
+        if (report.executionId !== executionId) throw new Error('Execution identity mismatch');
         if (report.export.status !== 'complete')
             throw new Error('Export this execution successfully before platform review');
         if (action === 'sync') {
-            for (const record of feedbackStatus(repo, executionId).records) {
-                const trial = report.trials.find(t => t.caseId === record.caseId && t.trialId === record.trialId && t.caseHash === record.caseHash);
+            const feedback = feedbackStatus(repo, executionId);
+            if (feedback.stale) throw new Error('Feedback version mismatch');
+            for (const record of feedback.records) {
+                const trial = report.trials.find(t => t.caseId === record.caseId && t.trialId === record.trialId && t.caseVersion===record.caseVersion && (!record.caseHash||t.caseHash === record.caseHash));
                 if (!trial)
                     throw new Error('Feedback version mismatch');
-                client.score.create({ id: hash(['human', record.id]), traceId: trial.traceId, name: '人工反馈 · 运行结果', dataType: 'CATEGORICAL', value: record.verdict, comment: record.note, metadata: { ...record, method: 'human', source: 'local-feedback' } });
+                client.score.create({ id: ['human', report.executionId, record.id].join(':'), traceId: trial.traceId, name: '人工反馈 · 运行结果', dataType: 'CATEGORICAL', value: record.verdict, comment: record.note,
+                    metadata: { feedbackId: record.id, executionId: report.executionId, trialId: trial.trialId, caseId: trial.caseId, caseVersion: 'v1',
+                        reviewer: record.reviewer, at: record.at, method: 'human', source: 'local-feedback' } });
             }
             await client.flush();
             return { synced: true };

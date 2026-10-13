@@ -5,6 +5,7 @@ import type { ToolDefinition, ToolCallContext, ProductToolContext, Result } from
 import type { ResearchRepository } from './repository.ts';
 import type { FileStore } from '../storage/file-store.ts';
 import type { DocumentRepository, ToolCallRepository } from '../storage/repositories.ts';
+import { researchExcerpt } from './source-text.ts';
 
 const usageSchema = z.object({ requestId: z.string().max(256).nullable(), credits: z.number().min(0).nullable() }).strict();
 const bodyReceipt = z.object({ source: SourceSnapshotSchema, excerpt: ResearchLocatorSchema, usage: usageSchema }).strict();
@@ -30,7 +31,9 @@ export function createResearchReadTools(options: { research: ResearchRepository;
     const saved = options.research.saveSource({ researchId: binding.researchId, runId: context.runId, toolCallId, at,
       source: { ...source, ...published.data, fetchedAt: at, publishedAt: null, truncated: false } });
     if (!saved.ok) throw new ToolExecutionFailure(saved.error);
-    return { source: saved.data, excerpt: { start: 0, end: Math.min(text.length, 4000), quote: text.slice(0, 4000) }, usage };
+    const excerpt = researchExcerpt(text, 0, 4000);
+    if (!excerpt.ok) throw new ToolExecutionFailure(excerpt.error);
+    return { source: saved.data, excerpt: excerpt.data.excerpt, usage };
   }
   return [
     { name: 'read_research_local', version: 'p15-v1', label: 'Read selected research material', effect: 'READ', executionMode: 'parallel',

@@ -1,0 +1,338 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "dr06-tune",
+  "instanceId": "dr06-tune-independent-report",
+  "sourceGroup": "dr06-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic report instance; source basis research-005 Gold [omitted]. Existing source/Gold review is historical; current scoring review pending; no human review claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "DR06",
+        "version": "v1",
+        "unit": "必需链",
+        "denominator": 1,
+        "required": true,
+        "rule": "The one required chain needs every original hop, supporting attached evidence and all intermediate entities connected. A correct final conclusion without a hop fails.",
+        "evidence": [
+          "researchFrame"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "researchFrame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": 1,
+      "blocks": [
+        {
+          "kind": "claim",
+          "key": "claim:1",
+          "claimId": 1,
+          "text": "TIRS采集两个热红外波段的数据。"
+        },
+        {
+          "kind": "claim",
+          "key": "claim:2",
+          "claimId": 2,
+          "text": "Collection 2地表温度产品的输入包含Level-1热红外波段。"
+        }
+      ],
+      "links": [
+        {
+          "key": "claim:1:citation:0",
+          "claimId": 1,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "TIRS collects data in two thermal-infrared spectral bands at 100 m spatial resolution.",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 2,
+            "sourceSnapshotId": 2,
+            "locator": {
+              "start": 681,
+              "end": 767,
+              "quote": "TIRS collects data in two thermal-infrared spectral bands at 100 m spatial resolution."
+            }
+          }
+        },
+        {
+          "key": "claim:1:citation:1",
+          "claimId": 1,
+          "evidenceIndex": 1,
+          "relation": "supports",
+          "valid": true,
+          "display": "Advancements on Landsat 9 TIRS Landsat 9 TIRS was designed with additional redundancies to meet requirements for a 5-year design life. Landsat 8 TIRS had a notable problem with stray light reaching the focal plane. In February 2017, an algorithm was implemented to correct the thermal data. In Landsat 9, engineers improved optics inside the sensor to correct this issue, creating a more permanent and comprehensive hardware solution.",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 2,
+            "sourceSnapshotId": 2,
+            "locator": {
+              "start": 245,
+              "end": 679,
+              "quote": "Advancements on Landsat 9 TIRS Landsat 9 TIRS was designed with additional redundancies to meet requirements for a 5-year design life. Landsat 8 TIRS had a notable problem with stray light reaching the focal plane. In February 2017, an algorithm was implemented to correct the thermal data. In Landsat 9, engineers improved optics inside the sensor to correct this issue, creating a more permanent and comprehensive hardware solution."
+            }
+          }
+        },
+        {
+          "key": "claim:2:citation:0",
+          "claimId": 2,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "The Landsat Surface Temperature product is generated from Landsat Collection 2 Level-1 thermal infrared bands,",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 3,
+            "sourceSnapshotId": 3,
+            "locator": {
+              "start": 557,
+              "end": 667,
+              "quote": "The Landsat Surface Temperature product is generated from Landsat Collection 2 Level-1 thermal infrared bands,"
+            }
+          }
+        },
+        {
+          "key": "claim:2:citation:1",
+          "claimId": 2,
+          "evidenceIndex": 1,
+          "relation": "supports",
+          "valid": true,
+          "display": "ASTER Normalized Difference Vegetation Index (NDVI) data, and atmospheric profiles of geopotential height, specific humidity, and air temperature extracted from reanalysis data.",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 3,
+            "sourceSnapshotId": 3,
+            "locator": {
+              "start": 843,
+              "end": 1020,
+              "quote": "ASTER Normalized Difference Vegetation Index (NDVI) data, and atmospheric profiles of geopotential height, specific humidity, and air temperature extracted from reanalysis data."
+            }
+          }
+        }
+      ],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [
+          {
+            "claimId": 1,
+            "evidenceIndex": 0,
+            "valid": true
+          },
+          {
+            "claimId": 1,
+            "evidenceIndex": 1,
+            "valid": true
+          },
+          {
+            "claimId": 2,
+            "evidenceIndex": 0,
+            "valid": true
+          },
+          {
+            "claimId": 2,
+            "evidenceIndex": 1,
+            "valid": true
+          }
+        ],
+        "sourceBindings": [
+          {
+            "sourceSnapshotId": 1,
+            "sample": "landsat9-platform",
+            "file": "source.md"
+          },
+          {
+            "sourceSnapshotId": 2,
+            "sample": "landsat-thermal",
+            "file": "source.md"
+          },
+          {
+            "sourceSnapshotId": 3,
+            "sample": "landsat-surface-temperature",
+            "file": "source.md"
+          }
+        ]
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "mission-payload",
+            "text": "Landsat 9搭载TIRS-2。",
+            "required": true,
+            "acceptable": [
+              "Landsat 9搭载TIRS-2。"
+            ],
+            "conditions": [],
+            "entities": [
+              "landsat-9",
+              "tirs-thermal-sensor"
+            ],
+            "evidence": [
+              {
+                "sample": "landsat9-platform",
+                "start": 424,
+                "end": 463,
+                "quote": "the Thermal Infrared Sensor 2 (TIRS-2).",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "payload-measurement",
+            "text": "TIRS采集两个热红外波段的数据。",
+            "required": true,
+            "acceptable": [
+              "TIRS采集两个热红外波段的数据。"
+            ],
+            "conditions": [],
+            "entities": [
+              "tirs-thermal-sensor",
+              "thermal-infrared-data"
+            ],
+            "evidence": [
+              {
+                "sample": "landsat-thermal",
+                "start": 681,
+                "end": 767,
+                "quote": "TIRS collects data in two thermal-infrared spectral bands at 100 m spatial resolution.",
+                "relation": "support"
+              },
+              {
+                "sample": "landsat-thermal",
+                "start": 245,
+                "end": 679,
+                "quote": "Advancements on Landsat 9 TIRS Landsat 9 TIRS was designed with additional redundancies to meet requirements for a 5-year design life. Landsat 8 TIRS had a notable problem with stray light reaching the focal plane. In February 2017, an algorithm was implemented to correct the thermal data. In Landsat 9, engineers improved optics inside the sensor to correct this issue, creating a more permanent and comprehensive hardware solution.",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "measurement-product",
+            "text": "Collection 2地表温度产品的输入包含Level-1热红外波段。",
+            "required": true,
+            "acceptable": [
+              "Collection 2地表温度产品的输入包含Level-1热红外波段。"
+            ],
+            "conditions": [],
+            "entities": [
+              "thermal-infrared-data",
+              "surface-temperature"
+            ],
+            "evidence": [
+              {
+                "sample": "landsat-surface-temperature",
+                "start": 557,
+                "end": 667,
+                "quote": "The Landsat Surface Temperature product is generated from Landsat Collection 2 Level-1 thermal infrared bands,",
+                "relation": "support"
+              },
+              {
+                "sample": "landsat-surface-temperature",
+                "start": 843,
+                "end": 1020,
+                "quote": "ASTER Normalized Difference Vegetation Index (NDVI) data, and atmospheric profiles of geopotential height, specific humidity, and air temperature extracted from reanalysis data.",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [
+          {
+            "id": "mission-to-product",
+            "claims": [
+              "mission-payload",
+              "payload-measurement",
+              "measurement-product"
+            ],
+            "links": [
+              {
+                "from": "mission-payload",
+                "to": "payload-measurement",
+                "entity": "tirs-thermal-sensor"
+              },
+              {
+                "from": "payload-measurement",
+                "to": "measurement-product",
+                "entity": "thermal-infrared-data"
+              }
+            ]
+          }
+        ],
+        "forbidden": [
+          "省略载荷/测量中间实体只给首尾结论。",
+          "把L2地表温度说成只由仪器直接输出。",
+          "把Kelvin写成摄氏度或把30米产品网格当传感器原生尺度。"
+        ]
+      },
+      "sources": [
+        {
+          "sourceSnapshotId": 1,
+          "text": "# Landsat 9 instrument inventory, 2021 launch article\n\nSource: https://science.nasa.gov/blogs/landsat/2021/09/27/landsat-9-nextgen-of-the-landsat-series/\nFrozen retrieval: 2026-10-11T13:21:50.748219+00:00\nSelected source text; gaps between excerpts are marked. This file is not a live webpage.\n\nLandsat 9 carries two instruments that largely replicate the instruments on Landsat 8: the Operational Land Imager 2 (OLI-2) and the Thermal Infrared Sensor 2 (TIRS-2).\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 1,
+            "sample": "landsat9-platform",
+            "file": "source.md"
+          }
+        },
+        {
+          "sourceSnapshotId": 2,
+          "text": "# Thermal Infrared Sensor spectral measurements\n\nSource: https://science.nasa.gov/mission/landsat/tirs/\nFrozen retrieval: 2026-10-11T13:21:49.391623+00:00\nSelected source text; gaps between excerpts are marked. This file is not a live webpage.\n\nAdvancements on Landsat 9 TIRS Landsat 9 TIRS was designed with additional redundancies to meet requirements for a 5-year design life. Landsat 8 TIRS had a notable problem with stray light reaching the focal plane. In February 2017, an algorithm was implemented to correct the thermal data. In Landsat 9, engineers improved optics inside the sensor to correct this issue, creating a more permanent and comprehensive hardware solution.\n\nTIRS collects data in two thermal-infrared spectral bands at 100 m spatial resolution. Bands 10 (10.6-11.2 μm) and 11 (11.5-12.5 μm) allow the sensor to separate Earth's surface temperature from atmospheric temperature effects. Each focal plane module is covered by spectral filters that transmit the two specified bandwidths, enabling the innovative QWIP arrays to detect these narrow segments of the thermal-infrared spectrum. This represents an advancement over previous Landsat sensors that collected data in only one thermal band, providing enhanced accuracy in land surface temperature measurements. Explore Band Band Width (μm) GSD (m) Band 10 - Thermal-infrared (TIR) 1 10.6-11.2 100 (resampled to 30) Band 11 - Thermal-infrared (TIR) 2 11.5-12.5 100 (resampled to 30) TIRS spectral bands and wavelengths. Spatial resolution is noted as Ground Sample Distance (GSD)—the distance between pixel centers measured on the ground.\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 2,
+            "sample": "landsat-thermal",
+            "file": "source.md"
+          }
+        },
+        {
+          "sourceSnapshotId": 3,
+          "text": "# USGS Landsat Collection 2 surface temperature production\n\nSource: https://www.usgs.gov/centers/eros/science/usgs-eros-archive-landsat-archives-landsat-8-9-olitirs-collection-2-level-2\nFrozen retrieval: 2026-10-11T13:21:55.603050+00:00\nSelected source text; gaps between excerpts are marked. This file is not a live webpage.\n\nSurface Temperature measures the temperature of the surface of the Earth in Kelvin (K). The Surface Temperature products are generated at the Earth Resources Observation and Science (EROS) Center at a 30-meter spatial resolution. The Landsat Surface Temperature product is generated from Landsat Collection 2 Level-1 thermal infrared bands, Top of Atmosphere (TOA) Reflectance, TOA Brightness temperature, Advanced Spaceborne Thermal Emission and Reflection Radiometer (ASTER) Global Emissivity Database (GED) data, ASTER Normalized Difference Vegetation Index (NDVI) data, and atmospheric profiles of geopotential height, specific humidity, and air temperature extracted from reanalysis data.\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 3,
+            "sample": "landsat-surface-temperature",
+            "file": "source.md"
+          }
+        }
+      ],
+      "rule": "Independent synthetic Report and source frame; all sources are declared quality-side reference material. Synthetic native IDs do not claim a real product execution."
+    }
+  },
+  "references": [
+    {
+      "metricId": "DR06",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": true,
+      "citationSupport": null,
+      "reason": "The independently authored observation omits or contradicts a required source condition, link or complete chain."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":17,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":2,\"matchUncertain\":false},{\"block\":1,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":3,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1},{\"atom\":0,\"state\":1},{\"atom\":1,\"state\":1},{\"atom\":1,\"state\":1}],\"chains\":[0]}}"
+}

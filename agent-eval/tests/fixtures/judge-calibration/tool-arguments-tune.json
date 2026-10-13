@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "tool-arguments-tune",
+  "instanceId": "tool-arguments-tune-independent",
+  "sourceGroup": "tool-arguments-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "tool-arguments",
+        "version": "v1",
+        "unit": "请求",
+        "denominator": 1,
+        "required": true,
+        "rule": "以模型原请求为分母，分别检查原始及Hook后最终参数的Schema、语义、对象和来源；最终改参成功不抹去原错误，合法引用指向错误金额仍是错误。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "Only document lark-warehouse-17 is selected and authorized.",
+      "originalObservation": "An otherwise schema-valid request uses a different document.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "tool-arguments",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": true,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

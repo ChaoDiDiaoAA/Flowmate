@@ -21,6 +21,7 @@ function paths() {
   return { root, databaseFile: join(root, 'data', 'test.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
 }
+
 function fixture(legacy = false) {
   const p = paths(), store = need(core.openDatabase(p));
   deferCleanup(() => store.close());

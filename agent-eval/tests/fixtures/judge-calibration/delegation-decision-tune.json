@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "delegation-decision-tune",
+  "instanceId": "delegation-decision-tune-independent",
+  "sourceGroup": "delegation-decision-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "delegation-decision",
+        "version": "v1",
+        "unit": "决策",
+        "denominator": 1,
+        "required": true,
+        "rule": "按独立任务与简单任务对照的应验决策判断委派或不委派是否合理；自主委派允许合法方法，不因实际没委派就删除本应存在的机会。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "Two disjoint large source reviews require independent coverage; read-only roles and sufficient shared budget are available.",
+      "originalObservation": "The assistant delegates both reviews to the same inaccessible source scope and leaves the second unexamined.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "delegation-decision",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

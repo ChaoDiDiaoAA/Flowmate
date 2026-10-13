@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "subtask-success-validation",
+  "instanceId": "subtask-success-validation-independent",
+  "sourceGroup": "subtask-success-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "subtask-success",
+        "version": "v1",
+        "unit": "子任务",
+        "denominator": 1,
+        "required": true,
+        "rule": "以事前应执行的子任务为分母核对子目标与独立材料，不以实际启动数缩小分母；子Run completed或子自述正确不能代替子成果核验。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The only planned child goal is to verify 862.40 from source morrow-archive-62.",
+      "originalObservation": "The child result quotes morrow-archive-62 and correctly returns 862.40 from that source.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "subtask-success",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

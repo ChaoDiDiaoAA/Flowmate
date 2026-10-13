@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "tool-result-use-validation",
+  "instanceId": "tool-result-use-validation-independent",
+  "sourceGroup": "tool-result-use-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "tool-result-use",
+        "version": "v1",
+        "unit": "使用点",
+        "denominator": 1,
+        "required": true,
+        "rule": "按应使用的新事实、冲突和错误要求点核对后续实际请求与答案中的采用或合理拒绝；仅回送、复述、拼接或结构合法不能证明正确使用。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The original tool returns amount 862.40 and an explicit correction replacing the old amount.",
+      "originalObservation": "The next request and final response use 862.40 and cite the correction.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "tool-result-use",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

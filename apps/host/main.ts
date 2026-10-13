@@ -1,12 +1,13 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from './protocol.ts';
 import { isResearchHostCommand, parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchOperations } from '../../packages/contracts/src/research-commands.ts';
 import { createHash, randomUUID } from 'node:crypto';
+import { CaseEvaluationFaultProfileSchema } from '@flowmate/contracts';
 import { createWriteStream } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
 import { RUNTIME_CONFIG, appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest,
-  RuntimeEventsAvailableSchema, EMPTY_RESOURCE_SELECTION, ResourceSelectionSchema, EMPTY_EXTENSION_SELECTION, ExtensionSelectionSchema,
+  RuntimeEventsAvailableSchema, EMPTY_RESOURCE_SELECTION, ResourceSelectionSchema, EMPTY_EXTENSION_SELECTION, ExtensionSelectionSchema, ExtensionEvaluationProfileSchema,
   } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings, validateProductSettings } from '@flowmate/core';
@@ -50,16 +51,28 @@ function startupInvoiceSourceRoot(): string | null {
   return value && isAbsolute(value) ? value : null;
 }
 
+function startupExtensionEvaluationProfile() {
+  const flag = '--eval-extension-profile', occurrences = process.argv.filter(value => value === flag).length;
+  if (occurrences === 0) return undefined;
+  if (occurrences !== 1) return null;
+  try { return ExtensionEvaluationProfileSchema.parse(JSON.parse(process.argv[process.argv.indexOf(flag) + 1] ?? '')); }
+  catch { return null; }
+}
 const root = startupRoot();
 const invoiceSourceRoot = startupInvoiceSourceRoot() ?? join(process.cwd(), 'data', 'invoices', 'agent-input');
-if (!root) {
+const extensionEvaluationProfile = startupExtensionEvaluationProfile();
+const caseEvaluationFaultProfile=(()=>{const flag='--eval-case-fault-profile',count=process.argv.filter(v=>v===flag).length;
+  if(!count)return undefined;if(count!==1)return null;
+  try{return CaseEvaluationFaultProfileSchema.parse(JSON.parse(process.argv[process.argv.indexOf(flag)+1]??''));}catch{return null;}})();
+if (!root || process.argv.some(arg=>['--eval-runtime-fault-profile','--eval-runtime-policy'].includes(arg)) || extensionEvaluationProfile === null || caseEvaluationFaultProfile===null || [extensionEvaluationProfile,caseEvaluationFaultProfile].filter(Boolean).length>1) {
   send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: '' } as Omit<DesktopState, 'modelCredentials'> });
   process.exitCode = 2;
 } else {
-  await runHost(root, invoiceSourceRoot);
+  await runHost(root, invoiceSourceRoot, extensionEvaluationProfile,caseEvaluationFaultProfile);
 }
 
-async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise<void> {
+async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensionEvaluationProfile?: import('@flowmate/contracts').ExtensionEvaluationProfile,
+  caseEvaluationFaultProfile?:import('@flowmate/contracts').CaseEvaluationFaultProfile): Promise<void> {
   const pathsResult = resolveProductPaths(userDataRoot);
   if (!pathsResult.ok) {
     send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: userDataRoot } as Omit<DesktopState, 'modelCredentials'> });
@@ -158,6 +171,9 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
   const created = await createApplication({
     paths,
     invoiceSourceRoot,
+    extensionEvaluationProfile,
+    caseEvaluationFaultProfile,
+    ...(extensionEvaluationProfile || caseEvaluationFaultProfile ? { sampleSource: 'evaluation' as const } : {}),
     provider: new PiProviderAdapter({ credentialsFor }),
     agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir,
       resourceBundleRoot: join(paths.runtimeDir, 'resource-bundles'), promptTrace, tools }),
@@ -361,6 +377,8 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     }
     if (command.type === 'list_run_tool_calls') { runtimeReply(command, await application.listRunToolCalls(command.input)); return; }
     if (command.type === 'query_run_tool_call') { runtimeReply(command, await application.queryRunToolCall(command.input)); return; }
+    if (command.type === 'replay_invoice_save') { runtimeReply(command, await application.replayInvoiceSave(command.input)); return; }
+    if (command.type === 'query_run_tool_evidence') { runtimeReply(command, await application.queryRunToolEvidence(command.input)); return; }
     if (command.type === 'list_context_snapshots') { await contextReply(command, await application.listContextSnapshots(command.input)); return; }
     if (command.type === 'query_context_snapshot') { await contextReply(command, await application.queryContextSnapshot(command.input)); return; }
     if (command.type === 'list_context_requests') { await contextReply(command, await application.listContextRequests(command.input)); return; }
@@ -651,6 +669,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string): Promise
     if (command.type === 'import_invoice_material') {
       send({ version: 1, type: 'response', requestId: command.requestId,
         value: await application.importInvoiceMaterial(command.sourceDirectory) });
+      return;
+    }
+    if (command.type === 'import_prepared_invoice_material') {
+      send({ version: 1, type: 'response', requestId: command.requestId,
+        value: await application.importPreparedInvoiceMaterial(command.input) });
       return;
     }
     if (command.type === 'list_document_pages') {

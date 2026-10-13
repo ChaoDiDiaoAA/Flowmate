@@ -550,6 +550,9 @@ export interface Application extends ResearchQueryApi {
     listener: (wake: import('./events.ts').RuntimeEventsAvailable) => void): Promise<Result<import('./events.ts').RuntimeEventSubscription>>;
   listRunToolCalls(input: import('./events.ts').RunToolCallsRequest): Promise<Result<import('./workspace.ts').Page<import('./events.ts').RuntimeToolView>>>;
   queryRunToolCall(input: import('./events.ts').RunToolCallRequest): Promise<Result<import('./events.ts').RuntimeToolView>>;
+  replayInvoiceSave(input: import('./invoice.ts').InvoiceSaveReplayRequest): Promise<Result<import('zod').z.infer<typeof import('./invoice.ts').InvoiceSaveReplayReceiptSchema>>>;
+  /** Trusted Host controller only; Renderer keeps its metadata projection. */
+  queryRunToolEvidence(input: import('./tool-evidence.ts').ToolEvidenceRequest): Promise<Result<import('./tool-evidence.ts').ToolEvidencePage>>;
   listContextSnapshots(input: import('./context.ts').ContextSnapshotsRequest): Promise<Result<import('./context.ts').ContextSnapshotsPage>>;
   queryContextSnapshot(input: import('./context.ts').ContextSnapshotRequest): Promise<Result<import('./context.ts').ContextSnapshotDetail>>;
   listContextRequests(input: import('./context.ts').ContextRequestsRequest): Promise<Result<import('./context.ts').ContextRequestsPage>>;
@@ -593,6 +596,7 @@ export interface Application extends ResearchQueryApi {
   queryJobCandidate(request: { jobId: DbId; candidateId: DbId }): Promise<Result<import('./workspace.ts').CandidateJobDetail>>;
   listActivity(request: import('./activity.ts').ActivityPageRequest): Promise<Result<import('./workspace.ts').Page<import('./activity.ts').BusinessEventSnapshot>>>;
   importInvoiceMaterial(sourceDirectory: string): Promise<Result<import('./workspace.ts').DocumentSnapshot>>;
+  importPreparedInvoiceMaterial(input: import('./invoice.ts').PreparedInvoiceMaterial): Promise<Result<import('./workspace.ts').DocumentSnapshot>>;
   readDocumentPage(input: import('./invoice.ts').InvoiceToolInput<'read_invoice_document'>): Promise<Result<import('./invoice.ts').InvoiceToolOutput<'read_invoice_document'>>>;
   listDocumentPages(input: import('./invoice.ts').InvoiceToolInput<'list_invoice_pages'>): Promise<Result<import('./invoice.ts').InvoiceToolOutput<'list_invoice_pages'>>>;
   readDocumentOriginal(documentId: DbId, page: number): Promise<Result<import('./workspace.ts').DocumentOriginalImage>>;

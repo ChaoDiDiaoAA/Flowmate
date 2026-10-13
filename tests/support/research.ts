@@ -17,7 +17,7 @@ type Request = { tools?: Array<{ function: { name: string } }>; messages: Array<
 type ToolReply = { tool: string; args: unknown; id: string; note?: string };
 type Reply = { text: string } | ToolReply | { tools: ToolReply[] };
 export async function researchFixture(respond: (request: Request, index: number) => Reply | Promise<Reply>,
-  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults'> & { material?: string; parsedDocument?: string } = {}) {
+  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults' | 'toolDefinitions'> & { material?: string; parsedDocument?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-research-fixture-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), artifactsDir: join(root, 'artifacts'),
     runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') };
@@ -53,7 +53,7 @@ export async function researchFixture(respond: (request: Request, index: number)
     return new Response(text + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   } });
   deferCleanup(() => server.stop(true));
-  const app = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, logger: { write: () => undefined, close: async () => undefined },
+  const app = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, logger: { write: () => undefined, close: async () => undefined },
     agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }) }));
   deferCleanup(() => app.close());

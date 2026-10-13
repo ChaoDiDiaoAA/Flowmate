@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "tool-result-use-tune",
+  "instanceId": "tool-result-use-tune-independent",
+  "sourceGroup": "tool-result-use-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "tool-result-use",
+        "version": "v1",
+        "unit": "使用点",
+        "denominator": 1,
+        "required": true,
+        "rule": "按应使用的新事实、冲突和错误要求点核对后续实际请求与答案中的采用或合理拒绝；仅回送、复述、拼接或结构合法不能证明正确使用。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The original tool returns amount 137.25 and an explicit correction replacing the old amount.",
+      "originalObservation": "The final response uses the old amount despite receiving the correction.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "tool-result-use",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

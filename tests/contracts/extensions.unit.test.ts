@@ -26,6 +26,20 @@ const assembly = { version: 1, sdkVersion: '0.85.1', instances: [{ instanceId, r
   activatedAt: at, registeredTools: ['check_invoice_sources'], registeredCommands: ['invoice-assist'],
   hookEvents: hooks.map(hook => hook.event) }] };
 
+it('freezes only the two closed evaluation profiles on an active P13 invoice extension', () => {
+  for (const id of ['source-quote-trim', 'source-check-denial']) {
+    const evaluationProfile = { id, version: 1 };
+    expect(contracts.ExtensionEvaluationProfileSchema.safeParse(evaluationProfile).success).toBe(true);
+    expect(contracts.FrozenExtensionsSchema.safeParse({ ...frozen, policyVersion: 'p13-managed-extensions-v1', evaluationProfile }).success).toBe(true);
+    expect(contracts.FrozenExtensionsSchema.safeParse({ ...frozen, evaluationProfile }).success).toBe(false);
+    expect(contracts.FrozenExtensionsSchema.safeParse({ ...frozen, policyVersion: 'p13-managed-extensions-v1', evaluationProfile,
+      included: [], excluded: [{ ref, code: 'tool_not_active' }] }).success).toBe(false);
+  }
+  for (const bad of [{ id: 'arbitrary-code', version: 1 }, { id: 'source-quote-trim', version: 2 },
+    { id: 'source-quote-trim', version: 1, script: 'untrusted' }, { id: 'source-check-denial', version: 1, tool: 'save_invoice_candidate' }])
+    expect(contracts.ExtensionEvaluationProfileSchema.safeParse(bad).success).toBe(false);
+});
+
 describe('P12 controlled extension contracts', () => {
   it('[F13-27] keeps two fixed extension ledgers and rejects crossed registration or legacy expansion', () => {
     const subagentRef = { id: 'subagents', version: 'v1', manifestHash: 'b'.repeat(64) };

@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "context-coverage-tune",
+  "instanceId": "context-coverage-tune-independent",
+  "sourceGroup": "context-coverage-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "context-coverage",
+        "version": "v1",
+        "unit": "事实点",
+        "denominator": 1,
+        "required": true,
+        "rule": "按原任务所需且原材料可用的事实点，核对实际发出请求包含的原Snapshot内容；材料不存在不算遗漏，当前UI选择或产品相关性声明不能代替原请求。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The current source contains amount 137.25 and document lark-warehouse-17; both are required for the task.",
+      "originalObservation": "The dispatched original request was not collected. Available task facts alone do not establish actual request inclusion.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "context-coverage",
+      "counts": [
+        0,
+        1,
+        1
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The necessary original wire request is unavailable; the one coverage opportunity remains unknown."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,1]],\"f\":[]}"
+}

@@ -1,0 +1,146 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "dr01-validation",
+  "instanceId": "dr01-validation-independent-report",
+  "sourceGroup": "dr01-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic report instance; source basis research-006 Gold [omitted]. Existing source/Gold review is historical; current scoring review pending; no human review claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "DR01",
+        "version": "v1",
+        "unit": "事实Claim",
+        "denominator": 1,
+        "required": true,
+        "rule": "Verify the one atomic asserted fact against the independent declared source, including conditions and time. Count correct and supported facts; an incorrect source condition fails.",
+        "evidence": [
+          "researchFrame"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "researchFrame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": 1,
+      "blocks": [
+        {
+          "kind": "claim",
+          "key": "claim:1",
+          "claimId": 1,
+          "text": "Migrant Mother系列的摄影者为Dorothea Lange。"
+        }
+      ],
+      "links": [
+        {
+          "key": "claim:1:citation:0",
+          "claimId": 1,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 1,
+            "sourceSnapshotId": 1,
+            "locator": {
+              "start": 213,
+              "end": 305,
+              "quote": "a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children"
+            }
+          }
+        }
+      ],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [
+          {
+            "claimId": 1,
+            "evidenceIndex": 0,
+            "valid": true
+          }
+        ],
+        "sourceBindings": [
+          {
+            "sourceSnapshotId": 1,
+            "sample": "migrant-mother-record",
+            "file": "source.md"
+          }
+        ]
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "work-creator",
+            "text": "Migrant Mother系列的摄影者为Dorothea Lange。",
+            "required": true,
+            "acceptable": [
+              "Migrant Mother系列的摄影者为Dorothea Lange。"
+            ],
+            "conditions": [],
+            "entities": [
+              "migrant-mother",
+              "dorothea-lange"
+            ],
+            "evidence": [
+              {
+                "sample": "migrant-mother-record",
+                "start": 213,
+                "end": 305,
+                "quote": "a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [],
+        "forbidden": [
+          "把作品被摄者Florence Owens Thompson说成摄影者。",
+          "把1942年的WRA雇佣倒填为1936年该作品的拍摄机构。",
+          "凭Pearl Harbor相对表述捏造具体雇佣日，或省略人物/机构中间连接。",
+          "把1944年转归内政部说成1942年成立时的行政归属。"
+        ]
+      },
+      "sources": [
+        {
+          "sourceSnapshotId": 1,
+          "text": "# Library of Congress Migrant Mother collection guide\n\nSource: https://guides.loc.gov/migrant-mother\nRetrieved: 2026-10-11T13:39:42.197464+00:00\n\nThe photograph that has become known as \"Migrant Mother\" is one of a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children in March of 1936 in Nipomo, California. Lange was concluding a month's trip photographing migratory farm labor around the state for what was then the Resettlement Administration.\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 1,
+            "sample": "migrant-mother-record",
+            "file": "source.md"
+          }
+        }
+      ],
+      "rule": "Independent synthetic Report and source frame; all sources are declared quality-side reference material. Synthetic native IDs do not claim a real product execution."
+    }
+  },
+  "references": [
+    {
+      "metricId": "DR01",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent source, fact, citation or complete chain is explicitly present."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":1,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1}],\"chains\":[]}}"
+}

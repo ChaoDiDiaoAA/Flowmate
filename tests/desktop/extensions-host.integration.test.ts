@@ -1,12 +1,30 @@
 import { expect, it } from 'bun:test';
 import { mkdtempSync } from '../support/resources.ts';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { HostClient } from '../../apps/desktop/main/host-client.ts';
 import { parseHostCommand } from '../../apps/host/protocol.ts';
 import { ExtensionCatalogSchema, ResourceSelectionResultSchema } from '@flowmate/contracts';
 import type { Result } from '@flowmate/contracts';
+
+it.each([{ flags: ['--eval-extension-profile', '{'] },
+  { flags: ['--eval-extension-profile', '{"id":"source-quote-trim","version":2}'] },
+  { flags: ['--eval-extension-profile', '{"id":"source-quote-trim","version":1}', '--eval-extension-profile', '{"id":"source-check-denial","version":1}'] },
+  { flags: ['--eval-runtime-fault-profile', '{"id":"unregistered","version":1}'] },
+  { flags: ['--eval-runtime-fault-profile', '{"id":"source-correction","version":1}'] },
+  { flags: ['--eval-runtime-policy', '{"version":"runtime-v1","before":{"budgetAwareness":false},"after":{"statistics":false,"experience":false},"calibration":{"source":"none","groups":[]},"experience":{"items":[]}}'] },
+  { flags: ['--eval-extension-profile', '{"id":"source-quote-trim","version":1}', '--eval-runtime-fault-profile', '{"id":"source-correction","version":1}'] }
+])('rejects invalid evaluation profile startup before opening product data %j', async ({ flags }) => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-profile-rejected-')), client = new HostClient(), repo = resolve(import.meta.dir, '../..');
+  let credentialRequests = 0;
+  client.setCredentialHandler(async () => { credentialRequests++; return { ok: false }; });
+  try {
+    expect(await client.start(root, '0.1.0', repo, undefined, { executable: process.execPath,
+      args: ['--no-env-file', 'apps/host/main.ts', '--user-data-root', root, ...flags] })).toMatchObject({ ok: true, data: { ready: false, host: 'error' } });
+    expect(existsSync(join(root, 'data'))).toBe(false); expect(credentialRequests).toBe(0);
+  } finally { await client.close(); }
+}, 15000);
 
 it('[F12-02/03/19] shares the Host settings CAS between Extensions and Resources without changing P11 responses', async () => {
   expect(parseHostCommand({ version: 1, requestId: 'catalog', type: 'list_extensions' })).not.toBeNull();

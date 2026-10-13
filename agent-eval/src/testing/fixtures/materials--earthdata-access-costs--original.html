@@ -1,0 +1,1897 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="orgcode" content="619">
+    <meta name="rno" content="Sadashiva Devadiga">
+    <meta name="content-owner" content="Greg Ederer">
+    <meta name="description" content="LAADS DAAC">
+    <title>LAADS DAAC | NASA</title>
+    <link href="/img/favicon-16x16.png" rel="icon" type="image/png" sizes="16x16">
+    <link href="/img/favicon-32x32.png" rel="icon" type="image/png" sizes="32x32">
+    <link href="/img/favicon-57x57.png" rel="icon" type="image/png" sizes="57x57">
+    <link href="/img/favicon-76x76.png" rel="icon" type="image/png" sizes="76x76">
+    <link href="/img/favicon-96x96.png" rel="icon" type="image/png" sizes="96x96">
+    <link href="/img/favicon-128x128.png" rel="icon" type="image/png" sizes="128x128">
+    <link href="/img/favicon-192x192.png" rel="icon" type="image/png" sizes="192x192">
+    <link href="/img/favicon-196x196.png" rel="icon" type="image/png" sizes="196x196">
+    <link href="/img/favicon-228x228.png" rel="icon" type="image/png" sizes="228x228">
+    <link href="/img/apple-touch-icon.png" rel="apple-touch-icon" sizes="180x180">
+    <link href="/assets/index-D3PaZvXv.css" rel="stylesheet">
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="/assets/index-C47W6w0H.js" type="module"></script>
+    <!-- Google Tag Manager -->
+    <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+                new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+            j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+            'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+        })(window,document,'script','dataLayer','GTM-WNP7MLF');</script>
+    <!-- End Google Tag Manager -->
+
+</head>
+<body>
+<header>
+<div id="earthdata-notification-banner"></div>
+<script src="https://status.earthdata.nasa.gov/assets/banner_widget.js"></script>
+
+<nav class="navbar navbar-expand-lg nasa-navbar color-spacesuit-white" role="navigation" aria-label="Primary navigation">
+    <div class="container-fluid">
+        <a class="navbar-brand d-flex align-items-center" href="/" title="LAADS DAAC Home" aria-label="LAADS DAAC Home">
+            <img loading="eager" fetchpriority="high" width="58" height="49" alt="NASA Logo" src="/img/logo.png" class="img-fluid">
+            <span class="ms-4">LAADS DAAC</span>
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarContent"
+                aria-controls="navbarContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="hamburger-icon">
+                <span class="hamburger-bar"></span>
+                <span class="hamburger-bar"></span>
+                <span class="hamburger-bar"></span>
+            </span>
+        </button>
+
+        <div class="collapse navbar-collapse" id="navbarContent">
+            <ul class="navbar-nav ms-auto align-items-lg-center" role="menubar">
+
+                <!-- Alerts -->
+                <li class="nav-item nav-item-alert" role="none">
+                    <a class="nav-link" href="/alerts-and-issues/" title="System Alerts" aria-label="System Alerts" role="menuitem">
+                        <div class="alert-icon-container" aria-hidden="true">
+                            <i class="fa-solid fa-bullhorn"></i>
+                        </div>
+                        <span class="d-lg-none ms-2">System Alerts</span>
+                    </a>
+                </li>
+
+                <!-- Data Access -->
+                <li class="nav-item dropdown" role="none">
+                    <a class="nav-link dropdown-toggle d-flex align-items-center"
+                       id="dataDropdown" href="/data-access/" data-bs-toggle="dropdown" aria-expanded="false" aria-haspopup="true" role="menuitem">
+                        <i class="fa-solid fa-database nav-icon" aria-hidden="true"></i>
+                        <span>Data Access</span>
+                        <!--<i class="fa-solid fa-caret-down ms-1" aria-hidden="true"></i>-->
+                    </a>
+                    <ul class="dropdown-menu" aria-labelledby="dataDropdown" role="menu">   <li role="none"><a class="dropdown-item" href="/search/" role="menuitem">Find Data</a></li>
+                        <li role="none"><a class="dropdown-item" href="/view-data/" role="menuitem">View Data</a></li>
+                        <li role="none"><a class="dropdown-item" href="/archive/" role="menuitem">Data Archive</a></li>
+                        <li role="none"><a class="dropdown-item" href="/cloud/" role="menuitem">Cloud Access</a></li>
+                        <li role="none"><a class="dropdown-item" href="/tools-and-services/" role="menuitem">Tools & Services</a></li>
+                    </ul>
+                </li>
+
+                <!-- Learn -->
+                <li class="nav-item" role="none">
+                    <a class="nav-link d-flex align-items-center" href="/learn/" role="menuitem">
+                        <i class="fa-solid fa-circle-question nav-icon" aria-hidden="true"></i>
+                        <span>Learn</span>
+                    </a>
+                </li>
+
+                <!-- About -->
+                <li class="nav-item dropdown" role="none">
+                    <a class="nav-link dropdown-toggle d-flex align-items-center"
+                       id="aboutDropdown" href="/about/" data-bs-toggle="dropdown" aria-expanded="false" aria-haspopup="true" role="menuitem">
+                        <i class="fa-solid fa-circle-info nav-icon" aria-hidden="true"></i>
+                        <span>About</span>
+                    </a>
+                    <ul class="dropdown-menu" aria-labelledby="aboutDropdown" role="menu">
+                        <li role="none"><a class="dropdown-item" href="/about/atmosphere/" role="menuitem">Our Atmosphere</a></li>
+                        <li role="none"><a class="dropdown-item" href="/uwg/" role="menuitem">User Working Group</a></li>
+                        <li role="none"><a class="dropdown-item" href="/about/related-sites/" role="menuitem">Related Sites</a></li>
+                        <li role="none"><hr class="dropdown-divider"></li>
+                        <li role="none"><a class="dropdown-item" href="/contact/" role="menuitem">Contact Us</a></li>
+                    </ul>
+                </li>
+
+                <!-- User Profile -->
+                <li class="nav-item dropdown" id="profile-menu-option" role="none">
+                    <button class="nav-link dropdown-toggle d-flex align-items-center border-0 bg-transparent"
+                            id="navbarDropdown" data-bs-toggle="dropdown" aria-expanded="false" aria-haspopup="true" role="menuitem">
+                        <i class="fa-solid fa-user nav-icon" aria-hidden="true"></i>
+                        <span>Sign In</span>
+                    </button>
+                    <ul class="dropdown-menu" aria-labelledby="navbarDropdown" role="menu">
+                        <!-- Populated dynamically -->
+                    </ul>
+                </li>
+
+                <!-- Search Box -->
+                <li class="nav-item nav-item-search" role="none">
+                    <form class="nav-search-form" action="/find" method="get" role="search" aria-label="Search Google">
+                        <div class="input-group">
+                            <input type="text" class="form-control nav-search-input" id="q" name="q" placeholder="Search" aria-label="Search">
+                            <button class="btn nav-search-button" type="submit" aria-label="Submit search">
+                                <i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i>
+                            </button>
+                        </div>
+                    </form>
+                </li>
+            </ul>
+        </div>
+    </div>
+</nav>
+<script>
+    // Ensure the Bootstrap navbar collapse toggles reliably on mobile
+    document.addEventListener('DOMContentLoaded', () => {
+        const toggler = document.querySelector('.navbar .navbar-toggler');
+        const collapseEl = document.getElementById('navbarContent');
+        if (!toggler || !collapseEl) return;
+
+        // Create/get the Collapse instance without auto-toggling on init
+        const collapse = bootstrap.Collapse.getOrCreateInstance(collapseEl, { toggle: false });
+
+        // Force toggle on every click (prevents interference from other handlers)
+        toggler.addEventListener('click', (e) => {
+            e.preventDefault();
+            collapse.toggle();
+        });
+
+        // Optional: close the menu after choosing an item (only on small screens)
+        collapseEl.querySelectorAll('a, button').forEach((el) => {
+            el.addEventListener('click', () => {
+                const togglerVisible = window.getComputedStyle(toggler).display !== 'none';
+                if (togglerVisible) collapse.hide();
+            });
+        });
+
+        // Enable hover for dropdowns on desktop, while retaining click for mobile
+        const isDesktop = () => window.getComputedStyle(toggler).display === 'none';
+
+        document.querySelectorAll('.navbar .nav-item.dropdown').forEach(dropdownEl => {
+            let timeout;
+            const dropdownToggle = dropdownEl.querySelector('.dropdown-toggle');
+            if (!dropdownToggle) return;
+            const dropdown = bootstrap.Dropdown.getOrCreateInstance(dropdownToggle);
+
+            dropdownEl.addEventListener('mouseenter', () => {
+                if (!isDesktop()) return;
+                clearTimeout(timeout);
+                // Delay showing to prevent fly-by openings and ensure user intent
+                timeout = setTimeout(() => {
+                    if (dropdownEl.matches(':hover')) { // Re-check hover state before showing
+                        dropdown.show();
+                    }
+                }, 150);
+            });
+
+            dropdownEl.addEventListener('mouseleave', () => {
+                if (!isDesktop()) return;
+                clearTimeout(timeout);
+                // Delay hiding to allow moving cursor to the menu
+                timeout = setTimeout(() => dropdown.hide(), 200);
+            });
+        });
+
+        // Make top-level dropdown toggles both navigable and togglable
+        collapseEl.querySelectorAll('.nav-item.dropdown > .nav-link.dropdown-toggle[href]').forEach((toggle) => {
+            // On mobile (collapsed navbar), first tap opens dropdown; second tap navigates.
+            // On desktop, click navigates immediately.
+            toggle.addEventListener('click', (e) => {
+                const togglerVisible = window.getComputedStyle(toggler).display !== 'none';
+
+                // Allow modifier/middle clicks to behave normally (new tab/window)
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.which === 2 || e.button === 1) return;
+
+                if (!togglerVisible) {
+                    // Desktop: Bootstrap's dropdown prevents default; force navigation
+                    e.preventDefault();
+                    const href = toggle.getAttribute('href');
+                    if (href) window.location.assign(href);
+                    return;
+                }
+
+                // Mobile: first tap opens, second tap navigates
+                const parentLi = toggle.closest('.nav-item.dropdown');
+                const menu = parentLi ? parentLi.querySelector('.dropdown-menu') : null;
+                const isShown = menu ? menu.classList.contains('show') : false;
+
+                // If Ctrl/Meta/Shift middle-click etc., allow default navigation
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.which === 2 || e.button === 1) return;
+
+                if (!isShown) {
+                    // Prevent navigation and open dropdown
+                    e.preventDefault();
+                    const dd = bootstrap.Dropdown.getOrCreateInstance(toggle, { autoClose: true });
+                    dd.show();
+                }
+                // If already shown, let the default click proceed to navigate
+            });
+
+            // Keyboard support: Enter/Space
+            toggle.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                const togglerVisible = window.getComputedStyle(toggler).display !== 'none';
+
+                if (!togglerVisible) {
+                    // Desktop: navigate
+                    e.preventDefault();
+                    const href = toggle.getAttribute('href');
+                    if (href) window.location.assign(href);
+                    return;
+                }
+
+                // Mobile: first press opens, second navigates
+                const parentLi = toggle.closest('.nav-item.dropdown');
+                const menu = parentLi ? parentLi.querySelector('.dropdown-menu') : null;
+                const isShown = menu ? menu.classList.contains('show') : false;
+                if (!isShown) {
+                    e.preventDefault();
+                    const dd = bootstrap.Dropdown.getOrCreateInstance(toggle, { autoClose: true });
+                    dd.show();
+                }
+                // If shown, allow navigation by not preventing default
+            });
+        });
+    });
+</script>
+
+</header>
+
+<main class="min-h-viewport">
+    <div class="container-xl padding-x-3 padding-y-3">  <!-- begin main content container -->
+        <article class="col-md-10 col-md-offset-1 col-sm-12">
+
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/">Home</a></li>
+
+            <li class="breadcrumb-item active" aria-current="page"> Cloud</li>
+    </ol>
+</nav>
+
+
+        <h1> Cloud</h1>
+
+<ul>
+    <li><a href="#LADSWEBCloudReleasewebpagetemplate-Ann">Announcements</a></li>
+    <li><a href="#LADSWEBCloudReleasewebpagetemplate-Intr">Introduction</a></li>
+    <li><a href="#LADSWEBCloudReleasewebpagetemplate-Bene">Benefits</a></li>
+    <li><a href="#LADSWEBCloudReleasewebpagetemplate-Migr1">Migration Status</a></li>
+    <li><a href="#LADSWEBCloudReleasewebpagetemplate-How">How-To</a></li>
+    <li><a href="#LADSWEBCloudReleasewebpagetemplate-Res">Resources</a></li>
+    <li><a href="#LADSWEBCloudReleasewebpagetemplate-FAQ">Frequently Asked Questions</a></li>
+</ul>
+
+<h1 id="LADSWEBCloudReleasewebpagetemplate-Ann">Announcements</h1>
+<p>
+    Beginning on July 31, 2024 LAADS DAAC data will be accessed from the Cloud when using
+    <a href="https://search.earthdata.nasa.gov/">Earthdata Search</a> and other services using NASA's Common
+    Metadata Repository (<a href="https://cmr.earthdata.nasa.gov/search">CMR</a>). Data will continue to be
+    available from LAADS DAAC’s on-premise data servers on LAADS DAAC's website, including LAADS DAAC's
+    <a href="https://ladsweb.modaps.eosdis.nasa.gov/archive/">Data Archive</a>, <a
+        href="https://ladsweb.modaps.eosdis.nasa.gov/search/">Find Data</a> and <a
+        href="https://ladsweb.modaps.eosdis.nasa.gov/view-data/">View Data</a>.
+</p>
+
+<h1 id="LADSWEBCloudReleasewebpagetemplate-Intr">Introduction</h1>
+
+<p>As part of NASA’s open-science policy and related goals, the LAADS DAAC is migrating its Level-1 and Atmosphere
+    product collections to the Earthdata Cloud. All these data collections and services remain freely available to the
+    global user community.</p>
+<p>This page, LAADS DAAC in the Cloud, is intended to help users discover and access all LAADS DAAC data collections in
+    the Earthdata Cloud. It addresses the following four topics:</p>
+<ol>
+    <li>
+        What are the <a href="#LADSWEBCloudReleasewebpagetemplate-Bene">benefits</a> of working with Earth science data
+        in the Cloud?
+    </li>
+    <li>
+        What is the <a href="#LADSWEBCloudReleasewebpagetemplate-Migr1">migration status</a> of the LAADS DAAC’s
+        products in the Cloud?
+    </li>
+    <li>
+        <a href="#LADSWEBCloudReleasewebpagetemplate-How">How</a> would a user access and download any desired data
+        product from the Cloud?
+    </li>
+    <li>
+        What are the answers to <a href="#LADSWEBCloudReleasewebpagetemplate-FAQ">frequently asked questions</a>?
+    </li>
+</ol>
+<p>
+    As the Cloud evolves with the addition of new datasets, services, and related functionalities, this page will be
+    updated with new information.
+</p>
+
+<h1 id="LADSWEBCloudReleasewebpagetemplate-Bene">Benefits</h1>
+<ul>
+    <li><strong>Easy access to data:</strong> Data users will be able to access data directly in the cloud, making the
+        need to download volumes of data unnecessary. However, users will still be able to download data if they choose.
+    </li>
+
+    <li><strong>Rapid deployment:</strong> Users can bring their algorithms and processing software to the cloud and
+        work directly with the data in the cloud, simplifying procurement and hardware support while expediting science
+        discovery.
+    </li>
+    <li><strong>Scalability:</strong> The size and use of the archive can expand easily and rapidly as needed.
+    </li>
+    <li><strong>Flexibility:</strong> Mission needs can dictate options for selecting operating systems, programming
+        languages, databases, and other criteria to enable the best use of mission data.
+    </li>
+    <li>
+        <strong>Reduced redundancy:</strong> The use of a common infrastructure with cloud native services will reduce
+        redundant tools and services, enable sharing, and enforce the use of community standards as well as uniform
+        policies and processes.
+    </li>
+    <li>
+        <strong>Cost effectiveness:</strong> NASA pays only for the storage and services used. Along with scalability
+        benefits, this allows the amount of storage or services to be continually adjusted to ensure that data and
+        services are effectively provided at the lowest possible cost to NASA. Under NASA’s full and open data policy,
+        all NASA data will continue to be free to access and download. However, users who wish to store data in their
+        own Amazon Web Services (AWS) cloud instance or cloud storage, are responsible for covering those cost. For more
+        information on this topic, see “<a
+            href="https://cdn.earthdata.nasa.gov/conduit/upload/14964/02_Understanding_and_Managing_Costs_in_the_AWS_Cloud.pdf">Understanding
+            and Managing Costs in the AWS Cloud</a>.”
+    </li>
+</ul>
+<p>
+    <a href="https://www.earthdata.nasa.gov/eosdis/cloud-evolution">Earthdata Cloud</a> also benefits the scientific
+    community that uses NASA Earth science data for research. By making NASA data, algorithmic code, and metadata
+    available in the cloud, the scientific processes of NASA researchers will become more transparent and their results
+    more reproducible, which in turn lends clarity and validity to the scientific process. In addition, the use of
+    standardized software and code makes it easier for new users to learn to interact with the data and become more
+    involved in the scientific process.
+</p>
+
+<h1 id="LADSWEBCloudReleasewebpagetemplate-Migr1">Migration Status</h1>
+
+<p>
+    The LAADS DAAC is currently populating datasets in the <a
+        href="https://www.earthdata.nasa.gov/eosdis/cloud-evolution">Earthdata Cloud</a>.
+</p>
+<p>
+    The following diagram and tables depict the proposed timelines for migrating data products, beginning with a
+    historical selection that includes a set of the most frequently used products. The subsequent migration includes
+    in-production datasets grouped by their popularity. Even as
+    the LAADS DAAC Cloud grows and becomes operational, users may continue to search, access, and download all data
+    products via the on-premises channel as well.
+</p>
+
+<table id="table001" class="table Table-Style-1">
+    <img src="/images/pages/cloud/MigrationRoadmapGantChart2023.svg" alt="Architecture"
+         class="img-responsive">
+</table>
+
+<h2 id="LADSWEBCloudReleasewebpagetemplate-LAAD-Phased">LAADS DAAC Phased Dataset Migration</h2>
+<div class="table-responsive">
+    <table class="table table-striped table-hover table-bordered">
+    <colgroup>
+        <col class="_idGenTableRowColumn-1"/>
+        <col class="_idGenTableRowColumn-2"/>
+        <col class="_idGenTableRowColumn-3"/>
+        <col class="_idGenTableRowColumn-4"/>
+        <col class="_idGenTableRowColumn-5"/>
+    </colgroup>
+    <thead>
+    <tr class="Table-Style-1 _idGenTableRowColumn-5">
+        <td class="Table-Style-1 Cell-Style-2 CellOverride-1 _idGenCellOverride-1" colspan="5">
+            <p class="Basic-Paragraph ParaOverride-1">
+                <span class="Character-Style-1 CharOverride-1" style="font-size: 20px;">LAADS DAAC Phased Dataset Migration</span>
+            </p>
+            <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-4">Updated September 25, 2023</span>
+            </p>
+        </td>
+    </tr>
+    </thead>
+    <tfoot>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1">Total</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1">5,021</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"></p>
+        </td>
+    </tr>
+    </tfoot>
+    <tbody>
+    <tr class="Table-Style-1 _idGenTableRowColumn-7">
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-2">Phase</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-2">Collection</span>
+            </p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-2">Year</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span
+                    class="Character-Style-1 CharOverride-2">Total Volume (TB)</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span
+                    class="Character-Style-1 CharOverride-2">Migration Status</span></p>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">1.1</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS C61 L1, Geolocation and Cloud Mask (Cohort-2)</span>
+            </p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2022</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">1,260</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">1.2</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span
+                    class="CharOverride-4">LAADS DAAC product “Top 50 + 25” List</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2022</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">355</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">1.3</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS C61 L2 and L3 Atmosphere Products</span>
+            </p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2023</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">35</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-3 CellOverride-2 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">2.1</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span
+                    class="CharOverride-4">C2 SNPP VIIRS L1B and Geolocation</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2023</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">562</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+        </td>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">2.2</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">C2.1 J1 VIIRS L1B and Geolocation
+</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2023</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">306</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+        </td>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">2.3</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">SNPP/J1 VIIRS C1/C1.1/C2 Atmosphere Products</span>
+            </p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2023</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">572</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-4 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+        </td>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-5 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">3.1</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-5 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS C61 L2 Land Surface Reflectance
+</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-5 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2023</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-5 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">781</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-5 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+        </td>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">4.1</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">C6 Long Term Data Records from NOAA POES and ESA MetOps</span>
+            </p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2023</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">17</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+        </td>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">4.2</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MERIS, Sentinel 3A, and Sentinel 3B L1 Products</span>
+            </p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2024</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">1,133</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Complete</span></p>
+        </td>
+    </tr>
+    <tr class="Table-Style-1 _idGenTableRowColumn-6">
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3">4.3</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Airborne Data</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">2024</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">0.37</span></p>
+        </td>
+        <td class="Table-Style-1 Cell-Style-6 _idGenCellOverride-1">
+            <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">-</span></p>
+        </td>
+    </tr>
+    </tbody>
+</table>
+</div>
+
+<!-- PHASE 1 -->
+<h2 id="LADSWEBCloudReleasewebpagetemplate-LAAD-Phase1">LAADS DAAC Phase 1</h2>
+<div id="_idContainer000">
+    <div class="table-responsive">
+        <table class="table table-striped table-hover table-bordered">
+        <colgroup>
+            <col class="_idGenTableRowColumn-1"/>
+            <col class="_idGenTableRowColumn-2"/>
+            <col class="_idGenTableRowColumn-3"/>
+            <col class="_idGenTableRowColumn-4"/>
+        </colgroup>
+        <thead>
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td class="Table-Style-1 Cell-Style-2 CellOverride-1" colspan="6">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-1">LAADS DAAC Phase 1 Datasets</span>
+                </p>
+            </td>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-2">Phase</span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Collection</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Archive Set</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Available</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Data Products</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Mission Period</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td rowspan="5" class="Table-Style-1 Cell-Style-3">
+                <p class="Basic-Paragraph ParaOverride-1"><span style="font-size:24px;"
+                                                                class="CharOverride-3">1.1</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS Level 1B Calibrated Radiances</span>
+                </p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">61</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MOD021KM">MOD021KM</a>
+                <br><a href="/missions-and-measurements/products/MOD02HKM">MOD02HKM</a>
+                        <br><a
+                            href="/missions-and-measurements/products/MOD02QKM#overview"> MOD02QKM</a></span>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4">Feb 2000 - Present</span></td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">
+                <a href="/missions-and-measurements/products/MYD021KM">MYD021KM</a>
+                <br><a href="/missions-and-measurements/products/MYD02HKM">MYD02HKM</a>
+                        <br><a
+                            href="/missions-and-measurements/products/MYD02QKM">MYD02QKM</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> April 2002 - present</span></p>
+            </td>
+        <tr class="Table-Style-1">
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS Geolocation</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">61</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1">
+                    <span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MOD03">MOD03</a>
+             <td class="Table-Style-1 Cell-Style-9">
+							<p class="Basic-Paragraph ParaOverride-1"><span
+                                    class=" CharOverride-4"> Feb 2000 - present</span></p>
+                </td>
+                    </span>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MYD03">MYD03</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> April 2002 - present</span></p>
+            </td>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS Cloud Mask and Spectral Test Results</span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">61</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MOD35_L2">MOD35_L2</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> Feb 2000 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td rowspan="6" class="Table-Style-1 Cell-Style-3">
+                <p class="Basic-Paragraph ParaOverride-1"><span style="font-size:24px;"
+                                                                class="CharOverride-3">1.2</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS Cloud Properties</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">61</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MOD06_L2">MOD06_L2</a></span>
+                </p>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> Feb 2000 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MYD06_L2">MYD06_L2</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> April 2002 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS Temperature and Water Vapor Profiles</span>
+                </p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">61</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MOD07_L2">MOD07_L2</a></span>
+                </p>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> Feb 2000 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MYD07_L2">MYD07_L2</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> April 2002 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">VIIRS/NPP Daily Gridded Day/Night Band</span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">5000</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-9"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/VNP46A1">VNP46A1</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> Jan 2012 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">VIIRS/NPP Gap-Filled Lunar BRDF-Adjusted Nighttime Lights Daily L3 Global</span>
+                </p>
+            </td>
+
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">5000</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/VNP46A2">VNP46A2</a></span>
+                </p>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> Jan 2012 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td rowspan="2" class="Table-Style-1 Cell-Style-3">
+                <p class="Basic-Paragraph ParaOverride-1"><span style="font-size:24px;"
+                                                                class="CharOverride-3">1.3</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">MODIS C61 L2 and L3 Atmosphere Products</span>
+                </p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">61</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-9"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MOD08_D3">MOD08_D3</a><br><a
+                            href="/missions-and-measurements/products/MOD08_E3">MOD08_E3</a><br><a
+                            href="/missions-and-measurements/products/MOD08_M3">MOD08_M3</a><br><a
+                            href="/missions-and-measurements/products/MODATML2">MODATML2</a><br></span>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class=" CharOverride-4"> Feb 2000 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MYD08_D3">MYD08_D3</a><br><a
+                            href="/missions-and-measurements/products/MYD08_E3">MYD08_E3</a><br><a
+                            href="/missions-and-measurements/products/MYD08_M3">MYD08_M3</a><br><a
+                            href="/missions-and-measurements/products/MYDATML2">MYDATML2</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class=" CharOverride-4"> April 2002 - present</span></p>
+            </td>
+        </tr>
+        </tbody>
+    </table>
+</div>
+<!-- PHASE 1 -->
+
+
+<!-- PHASE 2 -->
+<h2 id="LADSWEBCloudReleasewebpagetemplate-LAAD-Phase2">LAADS DAAC Phase 2</h2>
+    <div class="table-responsive">
+        <table class="table table-striped table-hover table-bordered">
+        <colgroup>
+            <col width="10%"/>
+            <col width="30%"/>
+            <col width="10%"/>
+            <col width="10%"/>
+            <col width="15%"/>
+            <col width="15%"/>
+        </colgroup>
+        <thead>
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td class="Table-Style-1 Cell-Style-2 CellOverride-1 _idGenCellOverride-1" colspan="6">
+
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-1">LAADS DAAC Phase 2 Datasets</span>
+                </p>
+            </td>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-2">Phase</span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Collection</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Archive Set</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1" style="width: 50px">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Available</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Data Products</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Mission Period</span></p>
+            </td>
+        </tr>
+
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td rowspan="1" class="Table-Style-1 Cell-Style-4">
+                <p class="Basic-Paragraph ParaOverride-1">
+                    <span style="font-size:24px;" class="CharOverride-3">2.1</span>
+                </p>
+            </td>
+            <td rowspan="1" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1">
+                    <span class="CharOverride-4">C2 SNPP VIIRS L1B and Geolocation</span>
+                </p>
+            </td>
+            <td rowspan="1" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">5200</span></p>
+            </td>
+            <td rowspan="1" class="Table-Style-1 Cell-Style-8"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/VNP02MOD">VNP02MOD</a><br>
+              <a href="/missions-and-measurements/products/VNP02IMG">VNP02IMG</a><br>
+              <a href="/missions-and-measurements/products/VNP02DNB">VNP02DNB</a><br>
+            <a href="/missions-and-measurements/products/VNP03MOD">VNP03MOD</a><br>
+            <a href="/missions-and-measurements/products/VNP03IMG">VNP03IMG</a><br>
+            </span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Jan 2012 - Present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td rowspan="1" class="Table-Style-1 Cell-Style-4">
+                <p class="Basic-Paragraph ParaOverride-1"><span style="font-size:24px;"
+                                                                class="CharOverride-3">2.2</span></p>
+            </td>
+            <td rowspan="1" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="CharOverride-4">C2.1 J1 VIIRS L1B and Geolocation</span></p>
+            </td>
+            <td rowspan="1" class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">5201</span></p>
+            </td>
+            <td rowspan="1" class="Table-Style-1 Cell-Style-9" align="center"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/VJ102MOD">VJ102MOD</a><br>
+             <a href="/missions-and-measurements/products/VJ102IMG">VJ102IMG</a><br>
+             <a href="/missions-and-measurements/products/VJ102DNBG">VJ102DNB</a><br>
+            <a href="/missions-and-measurements/products/VJ103MOD">VJ103MOD</a><br>
+             <a href="/missions-and-measurements/products/VJ103IMG">VJ103IMG</a><br>
+          </span>
+                </p>
+            <td class="Table-Style-1 Cell-Style-9">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Jan 2018 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td rowspan="3" class="Table-Style-1 Cell-Style-4">
+                <p class="Basic-Paragraph ParaOverride-1"><span style="font-size:24px;"
+                                                                class="CharOverride-3">2.3</span></p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">SNPP/J1 VIIRS C1.1/C2 Atmosphere Products</span>
+                </p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">5110</span></p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8" align="center"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">&#x2714
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/AERDB_L2_VIIRS_SNPP">AERDB_L2_VIIRS_SNPP</a><br><a
+                            href="/missions-and-measurements/products/AERDB_D3_VIIRS_SNPP">AERDB_D3_VIIRS_SNPP</a><br>
+            <a href="/missions-and-measurements/products/AERDB_M3_VIIRS_SNPP">AERDB_M3_VIIRS_SNPP</a>
+            <a href="/missions-and-measurements/products/AERDT_L2_VIIRS_SNPP">AERDT_L2_VIIRS_SNPP</a>
+            <a href="/missions-and-measurements/products/CLDCR_L2_VIIRS_SNPP">CLDCR_L2_VIIRS_SNPP</a>
+            <a href="/missions-and-measurements/products/CLDMSK_L2_VIIRS_SNPP">CLDMSK_L2_VIIRS_SNPP</a>
+            <a href="/missions-and-measurements/products/CLDPROP_L2_VIIRS_SNPP">CLDPROP_L2_VIIRS_SNPP</a>
+            <a href="/missions-and-measurements/products/FSNRAD_L2_VIIRS_CRIS_SNPP">FSNRAD_L2_VIIRS_CRIS_SNPP</a>
+                    </span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Mar 2012 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1">
+            <span class="CharOverride-4">
+              <a href="/missions-and-measurements/products/CLDMSK_L2_VIIRS_NOAA20">CLDMSK_L2_VIIRS_NOAA20</a><br>
+              <a href="/missions-and-measurements/products/FSNRAD_L2_VIIRS_CRIS_NOAA20">FSNRAD_L2_VIIRS_CRIS_NOAA20</a>
+            </span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Feb 2018 - present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1">
+            <span class="CharOverride-4">
+              <a href="/missions-and-measurements/products/CLDMSK_L2_MODIS_Aqua">CLDMSK_L2_MODIS_Aqua</a><br>
+              <a href="/missions-and-measurements/products/CLDPROP_L2_MODIS_Aqua">CLDPROP_L2_MODIS_Aqua</a>
+            </span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">July 2002 - present</span></p>
+            </td>
+        </tr>
+        </tbody>
+    </table>
+</div>
+<!-- PHASE 2 -->
+
+<!-- PHASE 3 -->
+<h2 id="LADSWEBCloudReleasewebpagetemplate-LAAD-Phase3">LAADS DAAC Phase 3</h2>
+    <div class="table-responsive">
+        <table class="table table-striped table-hover table-bordered">
+        <colgroup>
+            <col width="10%"/>
+            <col width="40%"/>
+            <col width="10%"/>
+            <col width="10%"/>
+            <col width="10%"/>
+            <col width="10%"/>
+        </colgroup>
+        <thead>
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td class="Table-Style-1 Cell-Style-2 CellOverride-1 _idGenCellOverride-1" colspan="6">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-1">LAADS DAAC Phase 3 Datasets</span>
+                </p>
+            </td>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-2">Phase</span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Collection</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Archive Set</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1" style="width: 50px">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Available</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Data Products</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Mission Period</span></p>
+            </td>
+        </tr>
+
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td rowspan="2" class="Table-Style-1 Cell-Style-5">
+                <p class="Basic-Paragraph ParaOverride-1">
+                    <span style="font-size:24px;" class="CharOverride-3">3.0</span>
+                </p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1">
+                    <span class="CharOverride-4">MODIS C61 L2 Land Surface Reflectance</span>
+                </p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">61</span></p>
+            </td>
+            <td rowspan="2" class="Table-Style-1 Cell-Style-8" align="center"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;"><p>&#x2714</p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/MOD09">MOD09</a>
+            </span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Feb 2000 - Present</span></p>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1">
+            <span class="CharOverride-4">
+              <a href="/missions-and-measurements/products/MYD09">MYD09</a>
+            </span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">July 2002 - present</span></p>
+            </td>
+        </tr>
+        </tbody>
+    </table>
+</div>
+<!-- PHASE 3 -->
+
+<!-- PHASE 4 -->
+<h2 id="LADSWEBCloudReleasewebpagetemplate-LAAD-Phase4">LAADS DAAC Phase 4</h2>
+    <div class="table-responsive">
+        <table class="table table-striped table-hover table-bordered">
+        <colgroup>
+            <col width="10%">
+            <col width="50%">
+            <col width="10%">
+            <col width="5%">
+            <col width="15%">
+            <col width="10%">
+        </colgroup>
+        <thead>
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td class="Table-Style-1 Cell-Style-2 CellOverride-1 _idGenCellOverride-1" colspan="6">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-1">LAADS DAAC Phase 4 Datasets</span>
+                </p>
+            </td>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="Character-Style-1 CharOverride-2">Phase</span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Collection</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Archive Set</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1" style="width: 50px">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Available</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Data Products</span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-1">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="Character-Style-1 CharOverride-2">Mission Period</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1 _idGenTableRowColumn-5">
+            <td rowspan="8" class="Table-Style-1 Cell-Style-6">
+                <p class="Basic-Paragraph ParaOverride-1"><span style="font-size:24px;"
+                                                                class="CharOverride-3">4.1</span></p>
+            </td>
+            <td rowspan="8" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">C6 Long Term Data Records from NOAA POES and ESA MetOps</span>
+                </p>
+            </td>
+            <td rowspan="8" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">465</span></p>
+            </td>
+            <td rowspan="8" class="Table-Style-1 Cell-Style-8" align="center"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">
+                <p>&#x2714</p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/N07_AVH02C1">N07_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/N07_AVH09C1">N07_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/N07_AVH13C1">N07_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Jun 1981 - Feb 1985</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/N09_AVH02C1">N09_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/N09_AVH09C1">N09_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/N09_AVH13C1">N09_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Jan 1985 - Nov 1988</span></p>
+            </td>
+        </tr>
+        <tr>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/N11_AVH09C1">N11_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/N11_AVH09C1">N11_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/N11_AVH13C1">N11_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Nov 1988 - Dec 1994</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/N14_AVH09C1">N14_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/N14_AVH09C1">N14_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/N14_AVH13C1">N14_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Jan 1995 - Oct 2000</span></p>
+            </td>
+        </tr>
+        <tr>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/N16_AVH09C1">N16_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/N16_AVH09C1">N16_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/N16_AVH13C1">N16_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Nov 2000 - Dec 2007</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/N18_AVH09C1">N18_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/N18_AVH09C1">N18_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/N18_AVH13C1">N18_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">July 2005 - Dec 2009</span></p>
+            </td>
+        </tr>
+        <tr>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/N19_AVH09C1">N19_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/N19_AVH09C1">N19_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/N19_AVH13C1">N19_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">May 2009 - May 2022</span></p>
+            </td>
+        </tr>
+        <tr>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/M1_AVH02C1">M1_AVH02C1</a><br>
+          <a href="/missions-and-measurements/products/M1_AVH09C1">M1_AVH09C1</a><br>
+          <a href="/missions-and-measurements/products/M1_AVH13C1">M1_AVH13C1</a></span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Jan 2013 - Apr 2023</span></p>
+            </td>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td rowspan="8" class="Table-Style-1 Cell-Style-6">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-3"
+                                                                style="font-size:24px;">4.2</span></p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span
+                        class="CharOverride-4">MERIS Envisat 4th reprocessing</span></p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">489</span></p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8" align="center"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">
+                <p>&#x2714</p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/EN1_MDSI_MER_FRS_1P">EN1_MDSI_MER_FRS_1P</a><br>
+          </span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">May 2002 - Apr 2012</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/EN1_MDSI_MER_FRS_2P">EN1_MDSI_MER_FRS_2P</a></span>
+                </p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Jan 2003 - Apr 2012</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">
+			  <a href="/missions-and-measurements/products/EN1_MDSI_MER_RR__1P">EN1_MDSI_MER_RR__1P</a><br><a
+                            href="/missions-and-measurements/products/EN1_MDSI_MER_RR__2P">EN1_MDSI_MER_RR__2P</a>
+          </span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Apr 2002 - Apr 2012</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">OLCI and SLSTR ESA-Copernicus-Sentinel3 A&B Level 1</span>
+                </p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">450</span></p>
+            </td>
+            <td rowspan="3" class="Table-Style-1 Cell-Style-8" align="center"
+                style="text-align:center; font-size:150%; font-weight:bold; color:#22B463;">
+                <p>&#x2714</p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/S3A_OL_1_EFR">S3A_OL_1_EFR</a><br>
+			  <a href="/missions-and-measurements/products/S3A_OL_1_ERR">S3A_OL_1_ERR</a><br>
+			  <a href="/missions-and-measurements/products/S3A_SL_1_RBT">S3A_SL_1_RBT</a>
+          </span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Apr 2016 - Present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/S3B_OL_1_EFR">S3B_OL_1_EFR</a><br>
+			  <a href="/missions-and-measurements/products/S3B_OL_1_ERR">S3B_OL_1_ERR</a><br>
+			  <a href="/missions-and-measurements/products/S3B_SL_1_RBT">S3B_SL_1_RBT</a>
+          </span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">May 2018 - Present</span></p>
+            </td>
+        </tr>
+        <tr class="Table-Style-1 _idGenTableRowColumn-7">
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4"><a
+                            href="/missions-and-measurements/products/S3B_SY_2_SYN">S3B_SY_2_SYN</a><br>
+			  <a href="/missions-and-measurements/products/S3A_SY_2_SYN">S3A_SY_2_SYN</a>
+          </span></p>
+            </td>
+            <td class="Table-Style-1 Cell-Style-8">
+                <p class="Basic-Paragraph ParaOverride-1"><span class="CharOverride-4">Dec 2019 - Present</span></p>
+            </td>
+        </tr>
+        </tr>
+        </tbody>
+    </table>
+</div>
+<!-- PHASE 4 -->
+
+<h1 id="LADSWEBCloudReleasewebpagetemplate-How">How-To</h1>
+<h2 id="LADSWEBCloudReleasewebpagetemplate-Howd">
+    <strong>How do I access LAADS DAAC data files in the cloud?</strong>
+</h2>
+
+
+<div class="row" style="margin-bottom:24px">
+    <div class="col-sm-4" style="margin-right:24px">
+        <a href="/learn/how-to-access-laads-daac-data-files-using-s3-direct-access/"
+           class="text-center active" data-new-window-icon="false">
+            <div class="science-domain-figure active">
+                <div class="science-domain-thumbnail active"
+                     style="background-image: url(/images/learn/useastcoast_vir_2011326-min.jpg);height: 200px;width:300px;">
+                    <div class="science-domain-caption text-center"
+                         style="padding: 0 12px;line-height: 30px;height:200px; color:#ffffff;font-weight: bold;background-color: rgba(48, 62, 79, 0.5);display: flex;justify-content: center; align-items: center;">
+                        How to Access LAADS DAAC Data Files Using S3 Direct Access
+                    </div>
+                </div>
+            </div>
+        </a>
+    </div>
+    <div class="col-sm-4">
+        <a href="/learn/how-to-access-data-in-the-cloud-with-earthdata-search/"
+           class="text-center active" data-new-window-icon="false">
+            <div class="science-domain-figure active">
+                <div class="science-domain-thumbnail active"
+                     style="background-image: url(/images/learn/meddust_amo_2022115-min.jpg);height: 200px;width:300px;">
+                    <div class="science-domain-caption text-center"
+                         style="padding: 0 12px;line-height: 30px;height:200px; color:#ffffff;font-weight: bold;background-color: rgba(48, 62, 79, 0.5);display: flex;justify-content: center; align-items: center;">
+                        How to Access Data in the Cloud with Earthdata Search
+                    </div>
+                </div>
+            </div>
+        </a>
+    </div>
+    <div class="col-sm-4">
+        <a href="/learn/using-harmony-tools-in-earthdata-search/"
+           class="text-center active" data-new-window-icon="false">
+            <div class="science-domain-figure active">
+                <div class="science-domain-thumbnail active"
+                     style="background-image: url(/images/learn/california_vir_2012019_lrg-min.jpg);height: 200px;width:300px;">
+                    <div class="science-domain-caption text-center"
+                         style="padding: 0 12px;line-height: 30px;height:200px; color:#ffffff;font-weight: bold;background-color: rgba(48, 62, 79, 0.5);display: flex;justify-content: center; align-items: center;">
+                        Using Harmony Tools in Earthdata Search
+                    </div>
+                </div>
+            </div>
+        </a>
+    </div>
+</div>
+
+
+<h1 id="LADSWEBCloudReleasewebpagetemplate-Res">Resources</h1>
+    <div class="table-responsive">
+        <table class="table table-striped table-hover table-bordered">
+<tbody>
+    <tr>
+        <td width="120" style="border:0"><img src="/images/pages/cloud/nasa-openscapes.png"
+                                              width="100" alt=""/></td>
+        <td width="20" style="border:0">&nbsp;</td>
+        <td style="border:0"><strong><a href="https://nasa-openscapes.github.io/">Openscapes</a></strong>
+            <p>
+                NASA Earthdata-Openscapes answers a NASA Earthdata call to support scientific researchers using data
+                from NASA
+                Distributed Active Archive Centers (DAACs) as they migrate workflows to the cloud. Openscapes has
+                multiple resources
+                such as the Earthdata Cloud Cookbook with material to learn how to work with NASA Earthdata in the cloud
+                and
+                documentation for how to contribute to these resources, Cheatsheets, Guides and Slides, tutorials and
+                workshops.
+            </p></td>
+    </tr>
+    <tr style="background:#ffffff">
+        <td style="border:0"><img src="/images/pages/cloud/tops_badge.png" height="160" alt=""/></td>
+        <td style="border:0">&nbsp;</td>
+        <td style="border:0"><strong><a href="https://nasa.github.io/Transform-to-Open-Science/">Transform to Open
+                    Science</a></strong>
+            <p>
+                NASA's Transform to Open Science (TOPS) initiative is designed to transform agencies, organizations, and
+                communities
+                to an inclusive culture of open science. TOPS's first priority is to develop the infrastructure to train
+                scientists
+                and researchers as part of a 5-year program. The open science curriculum introduces those beginning
+                their open
+                science journey to important definitions, tools, and resources; and provide participants at all levels
+                recommendations on best practices.
+            </p></td>
+    </tr>
+    <tr>
+        <td style="border:0"><img src="/images/pages/cloud/earthdata-logo.png" width="120" alt=""/>
+        </td>
+        <td style="border:0">&nbsp;</td>
+        <td style="border:0"><strong><a
+                    href="https://cdn.earthdata.nasa.gov/conduit/upload/14964/02_Understanding_and_Managing_Costs_in_the_AWS_Cloud.pdf">Understanding
+                    and Managing Costs in the AWS Cloud</a></strong>
+            <p>
+                NASA's Earth Observing System Data and Information System (EOSDIS) provides an introductory tutorial for
+                understanding and estimating cost in the cloud. This resource 1) provides an overview of the cost model
+                for NASA
+                EOSDIS - cloud data access and use, 2) highlights several relevant user scenarios using the AWS Pricing
+                Calculator
+                to provide guiding examples and consideration for Earth Observing System (EOS) data users in the cloud,
+                and 3)
+                summarizes AWS resources for budgeting cost in the cloud.
+            </p></td>
+    </tr>
+    </tbody>
+</table>
+    </div>
+
+
+<h1 id="LADSWEBCloudReleasewebpagetemplate-FAQ">Frequently Asked Questions</h1>
+    <div class="table-responsive">
+        <table class="table table-striped table-hover table-bordered">
+        <colgroup>
+            <col style="width: 100.018%;">
+        </colgroup>
+        <tbody>
+        <tr>
+            <td class="confluenceTd">
+                <div class="content-wrapper"><p><strong>What are the advantages of using data from the Earthdata
+                            Cloud?</strong></p>
+
+                    <p>1) Improved performance: Quick access and subsetting of a large volume of data compared to data
+                        and services on-premises.</p>
+                    <p>2) Multiple data access methods: In addition to existing <a
+                            class="external-link" href="/learn/" rel="nofollow"
+                            target="_blank">LAADS DAAC data access methods</a>, a new way to access
+                        data, <a href="#LADSWEBCloudReleasewebpagetemplate-S3Di">S3
+                            access</a>, is available to users in the <a class="external-link"
+                                                                        href="https://docs.aws.amazon.com/general/latest/gr/rande-manage.html"
+                                                                        rel="nofollow" target="_blank">AWS
+                            us-west-2 region</a>.&nbsp;</p>
+                    <p>3) Multidisciplinary data access: Find multidisciplinary NASA data from multiple DAACs in one
+                        place, the <a class="external-link" href="https://www.earthdata.nasa.gov/eosdis/cloud-evolution"
+                                      rel="nofollow" target="_blank">Earthdata Cloud</a>.</p>
+                    <p>4) Analysis next to data: Users in the AWS us-west-2 region can import&nbsp;their algorithms and
+                        processing software and work directly with NASA data in the cloud, expediting science discovery.
+                        Note that users are responsible for procuring their own cloud computing resources.</p>
+                    <p>5) Expanded services: <em>Expanded services, such as <a
+                                class="external-link" href="https://github.com/nasa/cmr-stac" rel="nofollow"
+                                target="_blank">CMR-STAC,</a> <a class="external-link"
+                                                                 href="https://harmony.earthdata.nasa.gov/"
+                                                                 rel="nofollow" target="_blank">Harmony</a>,
+                            and <a class="external-link"
+                                   href="https://nasa-openscapes.github.io/earthdata-cloud-cookbook/external/zarr-eosdis-store.html"
+                                   rel="nofollow" target="_blank">Zarr</a> creation
+                            will be available to users in the future.*</em></p></div>
+            </td>
+        </tr>
+        <tr>
+            <td class="confluenceTd">
+                <a id="LADSWEBCloudReleasewebpagetemplate-WhatIsS3Access"></a>
+                <div class="content-wrapper"><p><strong>What is S3 access?</strong></p>
+                    <p>Amazon's&nbsp;Simple Storage Service (S3) is an object storage service that offers scalability,
+                        data availability, security, and performance. S3 access is a way of accessing AWS cloud data
+                        from S3 storage using cloud native tools.</p>
+                    <p>S3 access (also referred to as "direct S3 access") is only available to users in the same cloud
+                        region as LAADS DAAC data (AWS us-west-2).</p>
+                    <p>Access to LAADS DAAC cloud data on S3 is described in the <a
+                            href="#LADSWEBCloudReleasewebpagetemplate-How">How-To</a> section.</p></div>
+            </td>
+        </tr>
+        <tr>
+            <td class="confluenceTd">
+                <div class="content-wrapper">
+                    <p>
+                        <strong>I am a user with a cloud account, how can I find out which LAADS
+                            DAAC datasets are available for direct S3 access in the Earthdata Cloud?
+                        </strong>
+                    </p>
+                    <p>
+                        The LAADS DAAC <a href="#LADSWEBCloudReleasewebpagetemplate-Migr1">Migration Status</a> Section
+                        describes the LAADS DAAC phased dataset projected release dates.
+                    </p>
+                    <p>
+                        You may also explore LAADS DAAC data through the <a class="external-link"
+                                                                            href="https://search.earthdata.nasa.gov/search?ff=Available%20from%20AWS%20Cloud"
+                                                                            rel="nofollow"
+                                                                            style="text-decoration: none;"
+                                                                            target="_blank">Earthdata Search</a> portal
+                        by filtering. To filter for LAADS DAAC Data in the Cloud, in the left panel under <em>Organizations</em>,
+                        select <em>Level-1 and Atmosphere Archive & Distribution System (LAADS)</em> and under <em>Features</em>,
+                        select
+                        <em>Available from AWS Cloud</em>.
+                    </p>
+                    <p>
+                        Step-by-step instructions for obtaining the S3 bucket URL for a LAADS DAAC collection from
+                        Earthdata Search are found in the <a href="#LADSWEBCloudReleasewebpagetemplate-How">How To</a>
+                        section.
+                    </p>
+                </div>
+            </td>
+        </tr>
+        <tr>
+            <td class="confluenceTd">
+                <div class="content-wrapper"><p><strong>I am a user with a cloud account, how can I access LAADS DAAC
+                            data in the Earthdata Cloud?</strong></p>
+                    <p>LAADS data stored in the Earthdata Cloud can be accessed via <a class="external-link"
+                                                                                       href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingBucket.html"
+                                                                                       rel="nofollow" target="_blank">S3
+                            buckets</a>.</p>
+                    <p>Users in the <a class="external-link"
+                                       href="https://docs.aws.amazon.com/general/latest/gr/rande-manage.html"
+                                       rel="nofollow" target="_blank">AWS us-west-2</a>&nbsp;region
+                        may use "S3 buckets" (bins of files, called objects) to access Earthdata Cloud data from S3
+                        storage using cloud native tools. <a
+                            href="#LADSWEBCloudReleasewebpagetemplate-S3Di">S3
+                            access</a> allows users to use Python and other language libraries to
+                        explicitly access files (or portions of files) in the LAADS DAAC cloud archive, list the
+                        contents
+                        of the bucket, and also interrogate and interact with cloud-native formats.</p>
+                    <p>You will need a URL path to the specific LAADS DAAC collection you would like to access using S3.
+                        The structure for an S3 URL looks like:</p>
+                    <pre>s3://prod-lads/MOD021KM/MOD021KM.A2000055.0000.061.2017171194852.hdf</pre>
+
+                    <p>
+                        An example of an S3 URL for a LAADS DAAC collection is: <span class="mx_EventTile_body">s3://prod-lads/MOD021KM/</span>
+                    </p>
+                    <p>
+                        To learn more, please refer to <a href="#LADSWEBCloudReleasewebpagetemplate-WhatIsS3Access">What
+                            is S3 access?</a>
+                    </p></div>
+            </td>
+        </tr>
+        <tr>
+            <td class="confluenceTd"><p><strong>Do I have to pay to access LAADS DAAC data stored in the Earthdata
+                        Cloud?</strong></p>
+                <p>As part of NASA's commitment to open science, data access will continue to be
+                    <strong>free</strong> to users.</p></td>
+        </tr>
+        <tr>
+            <td class="confluenceTd"><p><strong>Do I have to pay for cloud computing resources?</strong></p>
+                <p>Yes, the user maintains responsibility for their own cloud computing resources. Cost
+                    is variable depending on which cloud compute types you choose. See guidance on <a
+                        class="external-link"
+                        href="https://cdn.earthdata.nasa.gov/conduit/upload/14964/02_Understanding_and_Managing_Costs_in_the_AWS_Cloud.pdf"
+                        rel="nofollow" style="text-decoration: none;" target="_blank">Understanding and Managing Costs
+                        in the AWS Cloud</a>.</p></td>
+        </tr>
+        <tr>
+            <td class="confluenceTd"><p><strong>In which AWS region does LAADS DAAC data reside?</strong></p>
+                <p>LAADS DAAC data are stored in the <a class="external-link"
+                                                        href="https://docs.aws.amazon.com/general/latest/gr/rande-manage.html"
+                                                        rel="nofollow" target="_blank">AWS region</a>
+                    <strong>US West (Oregon)</strong>, or
+                    <strong>us-west-2</strong>.</p></td>
+        </tr>
+        <tr>
+            <td class="confluenceTd">
+                <div class="content-wrapper"><p><strong>Can I access data in AWS regions outside of my geographic
+                            location?</strong>&nbsp;</p>
+                    <p>Yes. The <a class="external-link"
+                                   href="https://docs.aws.amazon.com/general/latest/gr/rande-manage.html"
+                                   rel="nofollow" target="_blank">AWS region</a> refers to the location of servers,
+                        which are accessible via the internet regardless of a user's physical location.</p></div>
+                See the <a href="#LADSWEBCloudReleasewebpagetemplate-How">How-To</a> s3 direct
+                access section.
+            </td>
+        </tr>
+        <tr>
+            <td class="confluenceTd"><p><strong>Can I perform direct S3 access outside of my account's default
+                        region?</strong></p>
+                <p>Yes, but first you will need to <a class="external-link"
+                                                      href="https://docs.aws.amazon.com/general/latest/gr/rande-manage.html"
+                                                      rel="nofollow"
+                                                      style="text-decoration: none;"
+                                                      target="_blank">enable the
+                        region of interest in your AWS account</a>.</p>
+                <p>For example, to acquire LAADS DAAC data using direct S3 access, you will need to
+                    enable the us-west-2 region in your account and then use an AWS service in that region (e.g. EC2
+                    instance, AWS Command Line Interface, Python, Javascript, Java etc. program software development
+                    kits (SDK) or libraries) to access the data.&nbsp;</p></td>
+        </tr>
+        <tr>
+            <td class="confluenceTd">
+                <div class="content-wrapper"><p><strong>How do I obtain credentials to access LAADS DAAC data in S3
+                            storage?</strong></p>
+                    <p>You will need to pass credentials and configuration to AWS in order
+                        to interact with S3 objects.&nbsp;</p>
+                    <p>The <a href="#LADSWEBCloudReleasewebpagetemplate-How">How-To</a> S3 Direct
+                        Access Section describes this process.</p></div>
+            </td>
+        </tr>
+        <tr>
+            <td colspan="1" class="confluenceTd">
+                <div class="content-wrapper"><p><strong>I want to perform direct S3 access in a cloud environment, do I
+                            still need my Earthdata Login?</strong>
+                    <p>Yes, you will still need to store your Earthdata Login credentials in your cloud environment. In
+                        order to access LAADS DAAC data, an Earthdata Login account is required. If you do not have an
+                        Earthdata Login, follow the steps listed <a class="external-link"
+                                                                    href="https://urs.earthdata.nasa.gov/"
+                                                                    rel="nofollow" target="_blank">here</a>&nbsp;to
+                        obtain one.</p>
+                    <p>A short tutorial on how to store your Earthdata Login credentials is found in <a
+                            href="#LADSWEBCloudReleasewebpagetemplate-How">How to</a> S3 Direct Access.</p></div>
+            </td>
+        </tr>
+        <tr>
+            <td class="confluenceTd">
+                <p><strong>With data hosting transitioning to the cloud, will I need to change the
+                        way I access data or services?</strong>
+                </p>
+                <p>
+                    No, existing data access methods and services continue uninterrupted during LAADS
+                    DAAC's cloud migration.
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td class="confluenceTd">
+                <p>
+                    <strong>
+                        With data hosting transitioning to the cloud, can I still download data from LAADS DAAC?
+                    </strong>
+                </p>
+                <p>
+                    Yes, existing on-premises download methods and services are still
+                    available throughout LAADS DAAC's cloud migration.
+                </p>
+            </td>
+        </tr>
+        </tbody>
+    </table>
+</div>
+
+        </article>
+    </div>  <!-- end main content container -->
+</main>
+<footer class="usa-footer bg-carbon-black-important padding-x-3 padding-y-7">
+    <div class="usa-footer__primary-section bg-carbon-black-important">
+        <div class="grid-container grid-container-widescreen padding-x-0">
+            <img fetchpriority="low" width="63.99" height="53.94" class="width-8 margin-bottom-2" alt="NASA Logo"
+                 src="/img/nasa-logo@2x.png"
+                 srcset="/img/nasa-logo.svg">
+        </div>
+        <div class="grid-container grid-container-widescreen">
+            <div class="grid-row">
+                <div class="grid-col-12 tablet:grid-col-6 desktop:grid-col-4 margin-bottom-2 padding-right-0 tablet:padding-right-2 desktop:margin-bottom-0 color-spacesuit-white">
+                    <div class="hds-footer-details">
+                        <h3 class="heading-22 line-height-md">National Aeronautics and Space Administration</h3>
+                        <p class="p-sm color-carbon-30">NASA explores the unknown in air and space, innovates for the benefit of humanity, and inspires the world through discovery.</p>
+                    </div>
+                </div>
+                <div class="grid-col-12 tablet:grid-col-8 desktop:grid-col-12 padding-top-2 border-top-1px hds-footer-secondary">
+                    <ul class="color-carbon-30-important hds-footer-menu hds-footer-menu-horizontal usa-unstyled-list">
+                        <li>
+                            <a href="https://www.nasa.gov/privacy/" target="_blank" aria-label="Privacy Policy">
+                                <span>Privacy Policy</span></a>
+                        </li>
+                        <li>
+                            <a href="/contact/" aria-label="Contact Us">
+                                <span>Contact Us</span></a>
+                        </li>
+                        <li>
+                            <a href="/internal/" target="_blank" aria-label="Internal">
+                                <span>Internal</span></a>
+                        </li>
+                        <li>
+                            <a href="https://www.nasa.gov/accessibility/" target="_blank" aria-label="Accessibility">
+                                <span>Accessibility</span></a>
+                        </li>
+                    </ul>
+                </div>
+                <div class="desktop:margin-top-0 grid-col-12">
+                    <ul class="color-carbon-40-important hds-footer-menu hds-footer-menu-horizontal hds-menu-meta usa-unstyled-list">
+                        <li class="hds-footer-meta">
+                            <div class="hds-footer-meta-label">Version:</div>
+                            <div class="hds-footer-meta-value">4.0.10</div>
+                        </li>
+                        <li class="hds-footer-meta">
+                            <div class="hds-footer-meta-label">Responsible NASA Official:</div>
+                            <div class="hds-footer-meta-value">Sadashiva Devadiga</div>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</footer>
+
+<div class="modal-components">
+
+    <div id="generate-token-modal" class="modal fade" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <button type="button" class="close" data-bs-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                    <h1 class="modal-title fs-4">&nbsp;Tokens for Downloading LAADS DAAC Data</h1>
+                </div>
+                <div class="modal-body">
+                  <ul>
+                    <li>A LAADS DAAC download token will help make file downloads faster, but is only usable for LAADS DAAC web sites. A LAADS DAAC token
+                        will not work with other Earthdata sites.
+
+                      <div id="generate-token-modal-loading" class="hide">
+                        Generating LAADS DAAC token &hellip; <i class="fas fa-sync icon-refresh-animate"></i>
+                      </div>
+                      <div id="generate-token-modal-complete" class="hide">
+                        <p>Please copy and save the token below for use with any supported LAADS download utilities or scripts.</p>
+                        <pre id="generate-token-modal-display-token" class="wrap"></pre>
+
+                        <p>To test, run the following <code>wget</code> download command in your terminal and see if it successfully downloaded the README text file located at the root of the LAADS archive. See also <a href="/tools-and-services/data-download-scripts/#wget" target="_blank">LAADS documentation on how to use wget</a></p>
+                        <pre id="generate-token-modal-display-wget-sample" class="wrap">wget -e robots=off -m -np -R .html,.tmp -nH --cut-dirs=3 "https://ladsweb.modaps.eosdis.nasa.gov/archive/README" --header "Authorization: Bearer <span id="generate-token-modal-display-wget-sample-token"></span>" -P .</pre>
+                      </div>
+                      <div id="generate-token-modal-error" class="hide">
+                        <div class="alert alert-danger" role="alert"><i class="fas fa-times-circle"></i> We are currently unable to generate a LAADS DAAC token. Please try again later or contact <a href="javascript:feedback.showForm()">MODAPS Support</a> with any questions.</div>
+                      </div>
+                    </li>
+                    <li>An Earthdata Download token (EDL) will work on any Earthdata site including all LAADS DAAC sites, but download performance from the LAADS DAAC can be much slower due to the extra network connections needed to check credentials at Earthdata.
+                        <br>
+                        <button id="edl-token-button" type="button" class="btn btn-primary btn-lg active" role="button" aria-pressed="true">Generate EDL Token</button>
+                    </li>
+                  </ul>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div><!-- /.modal-content -->
+        </div><!-- /.modal-dialog -->
+    </div><!-- /.modal -->
+
+
+
+    <div id="multi-download-modal" class="modal fade bs-example-modal-lg" tabindex="-1" role="dialog">
+        <div class="modal-dialog modal-lg" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <button type="button" class="close" data-bs-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                    <h4 class="modal-title">Confirm Download of Multiple Files</h4>
+                </div>
+                <div class="modal-body">
+                    <div id="multi-file-loading-confirm">
+                        Verifying login status&hellip; <i class="fas fa-sync icon-refresh-animate"></i>
+                    </div>
+                    <div id="multi-file-download-confirm">
+                        <p>Please confirm before starting this batch download of <span id="multi-download-modal-num-files"></span> listed below totaling <span id="multi-download-modal-total-file-size"></span>, one file at a time.</p>
+                        <pre id="multi-download-modal-list-of-files"></pre>
+                        <div class="alert alert-warning" role="alert"><i class="fas fa-exclamation-triangle"></i> Once a batch download begins, your browser may not provide a way to cancel the batch aside from closing the browser entirely or stopping individual downloads one at a time. If in doubt, try selecting a smaller number of files for download. <a href="javascript:feedback.showForm()">MODAPS Support</a> is available to help with any questions.</div>
+                        <div class="alert alert-info" role="alert">
+                            <h3>
+                                <i class="fas fa-globe" aria-hidden="true"></i> 
+                                <strong>Browser configurations</strong>
+                            </h3>
+                            <ol>
+                                <li>Some users might have to approve once (e.g., click "Allow") to allow for future downloads of multiple files.</li>
+                                <li>To avoid a new download prompt for each file, ensure the following settings are configured in your browser:
+                                    <ul>
+                                        <li><i class="fab fa-chrome" aria-hidden="true"></i> Chrome: Settings &gt; Advanced &gt; Ask where to save each file before downloading &gt; <em>Off</em></li>
+                                        <li><i class="fab fa-firefox" aria-hidden="true"></i> Firefox:
+                                            <ol>
+                                                <li>Preferences &gt; Files and Applications &gt; <em>Save files to</em>&hellip;</li>
+                                                <li>Click checkbox &ldquo;Do this automatically for files like this from now on&rdquo;</li>
+                                            </ol>
+                                        </li>
+                                        <li><i class="fab fa-safari" aria-hidden="true"></i> Safari: Preferences &gt; General &gt; File download location &gt; <em>[specified folder]</em></li>
+                                        <li><i class="fab fa-edge" aria-hidden="true"></i> Edge: Settings &gt; Downloads &gt; Ask where to save each file before downloading &gt; <em>Off</em></li>
+                                    </ul>
+                                </li>
+                                <li>Unsupported browsers for multi-file downloads (use <i class="fas fa-download"></i> instead):
+                                    <ul>
+                                        <li><i class="fab fa-internet-explorer" aria-hidden="true"></i> Internet Explorer 11 and below</li>
+                                    </ul>
+                                </li>
+                            </ol>
+                        </div>
+                    </div>
+                    <div id="multi-file-log-in-confirm">
+                        <div class="alert alert-warning" role="alert">
+                            <a href="/oauth/login" target="_blank" rel="noopener noreferrer">
+                                <h2>
+                                    <i class="fas fa-hand-point-right"></i> Please log in and try again
+                                </h2>
+                            </a>
+                        </div>
+                    </div>
+                    <div id="multi-file-error-confirm">
+                        <div class="alert alert-danger" role="alert"><i class="fas fa-times-circle"></i> We are currently having issues verifying your request. Please try again later or contact <a href="javascript:feedback.showForm()">MODAPS Support</a> with any questions.</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-default" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal" id="multi-download-modal-confirm-download"><i class="fas fa-download"></i> Download Files</button>
+                </div>
+            </div><!-- /.modal-content -->
+        </div><!-- /.modal-dialog -->
+    </div><!-- /.modal -->
+
+</div>
+<script src="https://fbm.earthdata.nasa.gov/for/LAADS/feedback.js"></script>
+<script type="text/javascript">
+    $(document).ready(function () {
+        window.feedback.init({showIcon: false});
+    });
+</script>
+<script src="https://cdn.earthdata.nasa.gov/tophat2/tophat2.js" id="earthdata-tophat-script" data-show-status="true" data-show-fbm="false" data-current-daac="LAADS"></script>
+<script src="https://dap.digitalgov.gov/Universal-Federated-Analytics-Min.js?agency=NASA&amp;subagency=GSFC&amp;dclink=true" id="_fed_an_ua_tag"></script>
+
+</body>
+</html>

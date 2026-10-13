@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "current-fact-use-validation",
+  "instanceId": "current-fact-use-validation-independent",
+  "sourceGroup": "current-fact-use-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "current-fact-use",
+        "version": "v1",
+        "unit": "使用点",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个当前事实使用点对照有效新旧事实、来源和答案；新信息注入成功不证明采用，旧事实覆盖新纠正判错。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The latest valid original source replaces the old amount with 862.40.",
+      "originalObservation": "The final response uses 862.40 from the latest valid source.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "current-fact-use",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

@@ -103,6 +103,7 @@ describe('P3 Workspace and Run admission', () => {
     const sessionService = new SessionService(opened.data.sessions, sessionAgent, () => stubRuntime.state(), now, opened.data.runs, opened.data.memory);
     const productApplication = { documents: opened.data.documents, jobs: opened.data.jobs, candidates: opened.data.candidates,
       events: opened.data.businessEvents, importInvoiceMaterial: async () => opened.data.documents.get(1),
+      importPreparedInvoiceMaterial: async () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
       readDocumentPage: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
       listDocumentPages: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
       readDocumentOriginal: () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }) };

@@ -1,9 +1,10 @@
 import type { EvidenceFact } from '../types.ts';
+const configuredSecrets = new Set<string>();
+export function registerSecrets(secrets: string[]) { for (const secret of secrets) if (secret) configuredSecrets.add(secret); }
+export function protectedSecrets(): string[] { return [...configuredSecrets, process.env.FLOWMATE_JUDGE_API_KEY, process.env.FLOWMATE_EVAL_AGENT_API_KEY, process.env.FLOWMATE_LLM_API_KEY,
+    process.env.LANGFUSE_SECRET_KEY, process.env.LANGFUSE_PUBLIC_KEY, 'fixture-synthetic-key'].filter((item): item is string => Boolean(item)); }
 /** Keep the scan outcome as evidence, but never write the detected secret itself. */
-export function scanEvidence<T>(value: T, secrets: string[] = [
-    process.env.FLOWMATE_JUDGE_API_KEY, process.env.FLOWMATE_LLM_API_KEY, process.env.LANGFUSE_SECRET_KEY,
-    process.env.LANGFUSE_PUBLIC_KEY, 'fixture-synthetic-key',
-].filter((item): item is string => Boolean(item))): {
+export function scanEvidence<T>(value: T, secrets: string[] = protectedSecrets()): {
     value: T;
     fact: EvidenceFact;
 } {

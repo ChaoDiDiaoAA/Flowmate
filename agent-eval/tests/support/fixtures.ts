@@ -1,6 +1,6 @@
 import type { CaseExecutionResult } from '../../src/types.ts';
 import type { LocalReport } from '../../src/reports/store.ts';
-import { loadDataset, resolveCase, hash } from '../../src/datasets/local.ts';
+import { loadDataset, resolveCase, hash } from '../../src/dataset-loader/local.ts';
 import { afterAll } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,8 +8,9 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { tasks, manifest, material } from '../fixtures/minimal-dataset.ts';
 export const fixtureRepo = mkdtempSync(join(tmpdir(), 'flowmate-facilities-'));
-export const fixtureDirectory = join(fixtureRepo, 'agent-eval/datasets/facility-test');
+export const fixtureDirectory = join(fixtureRepo, 'agent-eval/src/datasets/facility-test');
 mkdirSync(join(fixtureDirectory, 'cases'), { recursive: true });
+writeFileSync(join(fixtureRepo, '.gitignore'), 'agent-eval/runs/\n');
 for (const t of tasks) writeFileSync(join(fixtureDirectory, 'cases', t.id + '.json'), JSON.stringify(t));
 writeFileSync(join(fixtureDirectory, 'dataset.json'), JSON.stringify(manifest));
 const materials = join(fixtureRepo, 'data/invoices/voxel51/000001');
@@ -37,10 +38,12 @@ export function observed(): CaseExecutionResult {
         } };
 }
 export function reportFixture(): LocalReport {
+    const execution = observed();
+    execution.identity = { executionId: 'unit', trialId: 'trial-1', caseId: 'sample', caseVersion: 1 };
     return { contract: 'flowmate-agent-run/v1', executionId: 'unit', dataset: { id: 'test', version: 1, hash: 'hash', subject: 'agent' },
         selection: 'full', environment: 'test', startedAt: '2026-09-23T00:00:00Z', endedAt: '2026-09-23T00:00:01Z', repeat: 1, executionComplete: true, scoring: 'complete',
         manualReview: 'none', formalAcceptance: 'not-assessed', scoringConfiguration: { version: 1, judgeMode: 'off', judgeHash: null }, export: { backend: 'local', status: 'disabled' },
         trials: [{ caseId: 'sample', caseVersion: 1, caseHash: 'casehash', caseName: 'Sample', category: 'invoice-quality', partition: 'smoke', repetition: 1, trialId: 'trial-1',
-                traceId: 'abcdef0123456789abcdef0123456789', status: 'PASS', reason: 'checks passed', counts: { PASS: 1 }, execution: observed(),
+                traceId: 'abcdef0123456789abcdef0123456789', status: 'PASS', reason: 'checks passed', counts: { PASS: 1 }, execution,
                 scores: [{ metricId: 'task-result', name: '任务终点', version: 1, method: 'deterministic', required: true, value: 1, status: 'PASS', reason: 'matches', evidence: ['task-endpoint'] }], judgeCalls: [], feedback: 'none' }] };
 }

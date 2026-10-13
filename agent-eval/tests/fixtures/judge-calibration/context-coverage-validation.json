@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "context-coverage-validation",
+  "instanceId": "context-coverage-validation-independent",
+  "sourceGroup": "context-coverage-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "context-coverage",
+        "version": "v1",
+        "unit": "事实点",
+        "denominator": 1,
+        "required": true,
+        "rule": "按原任务所需且原材料可用的事实点，核对实际发出请求包含的原Snapshot内容；材料不存在不算遗漏，当前UI选择或产品相关性声明不能代替原请求。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The current source contains amount 862.40 and document morrow-archive-62; both are required for the task.",
+      "originalObservation": "The dispatched original request includes both required facts and their source identities.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "context-coverage",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

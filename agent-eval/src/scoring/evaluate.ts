@@ -1,12 +1,35 @@
-import type { Check } from '../datasets/local.ts';
+import type { Check } from '../dataset-loader/local.ts';
 import { EvaluatorRegistry, createRegistry } from './registry.ts';
 import type { EvaluationContext, EvaluationScore, JudgeCall } from './types.ts';
+import { evaluateSemantic } from './evaluators/semantic.ts';
+import { deriveResearchF1 } from './research-f1.ts';
+import {evaluateFormalMetrics} from './evaluators/formal.ts';
+import {formalMetric} from './catalog.ts';
+import { evaluateCaseConstraints } from './case-constraints.ts';
 export async function evaluateAll(context: EvaluationContext, checks: Check[], registry: EvaluatorRegistry = createRegistry()) {
     const scores: EvaluationScore[] = [], judgeCalls: JudgeCall[] = [];
-    if (!context.result.started || context.result.status !== 'completed' || !context.result.endpointReached)
-        return { scores, judgeCalls };
+    if ((context.semanticPlan || 'contract' in context.task && context.task.expected.semantic) && checks.some(check => registry.get(check.metric).kind === 'llm-judge'))
+        throw new Error('Judge may run only once: compact and legacy semantic protocols cannot be combined');
+    const finish = (semantic: Awaited<ReturnType<typeof evaluateSemantic>>) => {
+        const researchGaps:EvaluationScore[]='contract'in context.task?context.task.expected.metrics.flatMap(plan=>{
+            if(!plan.metricId.startsWith('DR')||semantic.scores.some(score=>score.metricId===plan.metricId)||plan.metricId==='DR03'&&!plan.notApplicable)return[];
+            const metric=formalMetric(plan.metricId);
+            return[{metricId:metric.id,name:metric.name,version:metric.version,method:metric.id==='DR03'?'deterministic':'llm-judge',required:!plan.notApplicable,
+                value:null,status:plan.notApplicable?'NOT_APPLICABLE':context.result.error?.infrastructure?'ERROR':'NOT_RUN',reason:plan.notApplicable??'适用研究判据未冻结，独立匹配尚未执行',evidence:['research','gold-research'],
+                statistics:{unit:metric.unit,numerator:null,denominator:plan.denominator??null,missing:plan.denominator??null}}];
+        }):[];
+        const graded = [...scores, ...semantic.scores,...researchGaps, ...evaluateCaseConstraints(context)];
+        const combined = [...graded,...evaluateFormalMetrics({...context,gradedScores:graded})];
+        const measured=combined.filter(s=>!s.metricId.startsWith('fact-check/')).map(s=>s.metricId);
+        if(new Set(measured).size!==measured.length)throw new Error('Duplicate original metric measurement');
+        const f1 = deriveResearchF1('contract' in context.task ? context.task.expected.metrics : undefined, combined, context.result);
+        return { scores: f1 ? [...combined, f1] : combined, judgeCalls: [...judgeCalls, ...semantic.judgeCalls] };
+    };
+    if (!context.result.started)
+        return finish(await evaluateSemantic(context));
     const metricKeys = new Set<string>();
     for (const check of checks) {
+        if((context.result.status!=='completed'||!context.result.endpointReached)&&check.trigger!=='started')continue;
         const def = registry.get(check.metric), id = check.metric === 'fact-check' ? [check.metric, check.evidence, ...(check.path ?? [])].join('/') : check.metric;
         if (metricKeys.has(id))
             throw new Error('Duplicate metric selection: ' + id);
@@ -18,8 +41,8 @@ export async function evaluateAll(context: EvaluationContext, checks: Check[], r
             scores.push({ ...base, value: null, status: 'NOT_APPLICABLE', reason: '指标不适用于本任务输出' });
             continue;
         }
-        if (def.kind === 'llm-judge' && !context.judge) {
-            scores.push({ ...base, value: null, status: 'NOT_RUN', reason: 'Judge 未配置或关闭' });
+        if (def.kind === 'llm-judge' && (!context.judge || context.signal?.aborted)) {
+            scores.push({ ...base, value: null, status: 'NOT_RUN', reason: context.signal?.aborted ? 'Judge 调用前已取消' : 'Judge 未配置或关闭' });
             continue;
         }
         if (refs.some(key => !context.result.evidence[key]?.present || context.result.evidence[key]?.actual === undefined || !context.result.evidence[key]?.source.trim())) {
@@ -38,5 +61,6 @@ export async function evaluateAll(context: EvaluationContext, checks: Check[], r
             scores.push({ ...base, value: null, status: 'ERROR', reason: error instanceof Error ? error.message : String(error) });
         }
     }
-    return { scores, judgeCalls };
+    const semantic = await evaluateSemantic(context);
+    return finish(semantic);
 }

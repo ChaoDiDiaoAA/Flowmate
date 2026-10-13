@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from '../../../tests/support/resources.ts';
-import { discoverDatasets, loadDataset } from '../../src/datasets/local.ts';
+import { discoverDatasets, loadDataset } from '../../src/dataset-loader/local.ts';
 import { findDataset } from '../../src/execution/runner.ts';
 import { main } from '../../src/cli.ts';
 import { reportFixture } from '../support/fixtures.ts';
@@ -11,29 +11,31 @@ import { exportReport, exportEvents } from '../../src/langfuse/export.ts';
 
 function emptyRepo() {
     const repo = mkdtempSync(join(tmpdir(), 'flowmate-empty-dataset-'));
-    mkdirSync(join(repo, 'agent-eval/datasets'), { recursive: true });
-    writeFileSync(join(repo, 'agent-eval/datasets/README.md'), 'No business Dataset yet.');
+    mkdirSync(join(repo, 'agent-eval/src/datasets'), { recursive: true });
+    writeFileSync(join(repo, 'agent-eval/src/datasets/README.md'), 'No business Dataset yet.');
     return repo;
 }
 
 test('empty discovery and missing Dataset explain the deferred creation', () => {
     const repo = emptyRepo();
-    expect(discoverDatasets(join(repo, 'agent-eval/datasets'))).toEqual([]);
-    expect(() => findDataset(repo)).toThrow('尚未制作，等待完整 Agent');
-    expect(() => loadDataset(join(repo, 'agent-eval/datasets/missing'))).toThrow('Dataset 目录不存在');
+    expect(discoverDatasets(join(repo, 'agent-eval/src/datasets'))).toEqual([]);
+    expect(() => findDataset(repo)).toThrow('尚未制作，等待评测工程验收');
+    expect(() => loadDataset(join(repo, 'agent-eval/src/datasets/missing'))).toThrow('Dataset 目录不存在');
 });
 
 test('doctor distinguishes configuration checks from Benchmark readiness', async () => {
+    const exit = process.exitCode;
     const repo = emptyRepo(), output = spyOn(console, 'log').mockImplementation(() => {});
     try {
         await main(['doctor', '--backend', 'local'], repo);
         const value = JSON.parse(String(output.mock.calls.at(-1)![0]));
-        expect(value.ok).toBe(true);
+        expect(value.ok).toBe(false);
+        expect(process.exitCode).toBe(1);
         expect(value.datasets).toEqual([]);
         expect(value.benchmark.ready).toBe(false);
-        expect(value.benchmark.reason).toContain('尚未制作，等待完整 Agent');
+        expect(value.benchmark.reason).toContain('尚未制作，等待评测工程验收');
         expect(existsSync(join(repo, 'agent-eval/runs'))).toBe(false);
-    } finally { output.mockRestore(); }
+    } finally { output.mockRestore(); process.exitCode=exit??0; }
 });
 
 test('missing datasets reject runs and dataset operations before model or execution creation', async () => {
@@ -45,11 +47,11 @@ test('missing datasets reject runs and dataset operations before model or execut
             ['run', '--dataset', 'flowmate-agent-v1', '--selection', 'full', '--judge', 'required', '--backend', 'langfuse'],
             ['status', '--dataset', 'flowmate-agent-v1'],
             ['review', 'status', '--dataset', 'flowmate-agent-v1'],
-        ]) await expect(main(args, repo)).rejects.toThrow('尚未制作，等待完整 Agent');
+        ]) await expect(main(args, repo)).rejects.toThrow('尚未制作，等待评测工程验收');
         await expect(main(['dataset', 'validate', '--dir', join(repo, 'missing')], repo)).rejects.toThrow('Dataset 目录不存在');
         expect(network).not.toHaveBeenCalled();
         expect(existsSync(join(repo, 'agent-eval/runs'))).toBe(false);
-        expect(discoverDatasets(join(repo, 'agent-eval/datasets'))).toEqual([]);
+        expect(discoverDatasets(join(repo, 'agent-eval/src/datasets'))).toEqual([]);
     } finally { network.mockRestore(); }
 });
 
@@ -71,6 +73,6 @@ test('saved reports remain queryable, comparable, reviewable and exportable with
         await exportReport(report, file, async () => {});
         expect(report.export.status).toBe('complete');
         expect(exportEvents(report).map(e => e.id)).toEqual(ids);
-        expect(discoverDatasets(join(repo, 'agent-eval/datasets'))).toEqual([]);
+        expect(discoverDatasets(join(repo, 'agent-eval/src/datasets'))).toEqual([]);
     } finally { output.mockRestore(); process.exitCode = code; }
 });

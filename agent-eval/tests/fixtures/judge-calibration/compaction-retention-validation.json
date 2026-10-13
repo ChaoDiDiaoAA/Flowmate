@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "compaction-retention-validation",
+  "instanceId": "compaction-retention-validation-independent",
+  "sourceGroup": "compaction-retention-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "compaction-retention",
+        "version": "v1",
+        "unit": "事实与来源点",
+        "denominator": 1,
+        "required": true,
+        "rule": "以应保留的关键事实及来源点为分母，核对原生真实摘要保存及后续请求中的事实/引用使用；必须实际发生压缩，不用人工拼接或重复填充冒充。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "Before an actual native compaction, document morrow-archive-62 and its source were explicitly required for the next task.",
+      "originalObservation": "The saved native summary and subsequent request preserve morrow-archive-62 and its source, and the answer uses them.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "compaction-retention",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

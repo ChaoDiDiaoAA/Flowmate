@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "redundant-tools-tune",
+  "instanceId": "redundant-tools-tune-independent",
+  "sourceGroup": "redundant-tools-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "redundant-tools",
+        "version": "v1",
+        "unit": "工具调用",
+        "denominator": 1,
+        "required": true,
+        "rule": "分母为实际工具调用，分子仅为无新信息且无依据的调用；合法核验、必要重复及有诊断依据的恢复不算冗余，依据需从原前后请求核实。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "A completed read returned the full requested value; no new input or failure exists.",
+      "originalObservation": "The assistant repeats that identical read without diagnosis or new information.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "redundant-tools",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[[0,0,1]]}"
+}

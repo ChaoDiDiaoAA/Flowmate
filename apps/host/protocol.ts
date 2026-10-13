@@ -1,6 +1,6 @@
 export { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../packages/contracts/src/input-commands.ts';
 import { InputDefinitionCommandSchema } from '@flowmate/contracts';
-import { ResearchIntentSchema } from '@flowmate/contracts';
+import { ResearchIntentSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema, InvoiceSaveReplayReceiptSchema } from '@flowmate/contracts';
 import { researchOperations } from '../../packages/contracts/src/research-commands.ts';
 import { z } from 'zod';
 export { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure } from '../../packages/contracts/src/extensions.ts';
@@ -19,6 +19,7 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   ResourceFileRequestSchema, ResourceSelectionRequestSchema, ExtensionSelectionRequestSchema, SessionExtensionQuerySchema, RunExtensionQuerySchema, ExtensionCommandRequestSchema, ExtensionDisposeRequestSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema, RuntimeEventsReadResultSchema, RuntimeSubscriptionResultSchema,
   RuntimeSubscriptionReleaseResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
+  ToolEvidenceRequestSchema, ToolEvidenceResultSchema,
   WorkspaceUpdateRequestSchema, WorkspaceSnapshotSchema, WorkspaceRestoreResultSchema, AppErrorSchema, invoiceToolSchemas,
   ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema, ContextRequestsRequestSchema,
   ContextSnapshotsResultSchema, ContextSnapshotResultSchema, ContextRequestsResultSchema,
@@ -82,6 +83,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('unsubscribe_runtime_events'), ownerToken, subscriptionId: RuntimeSubscriptionIdSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_run_tool_calls'), input: RunToolCallsRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_run_tool_call'), input: RunToolCallRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('replay_invoice_save'), input: InvoiceSaveReplayRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_run_tool_evidence'), input: ToolEvidenceRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('submit_session_input'), input: DesktopSessionInputRequestSchema,
     expectedSettingsRevision: dbId.optional(), expectedCredentialRef: credentialRef.optional() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_session_inputs'), input: SessionInputsRequestSchema }).strict(),
@@ -161,6 +164,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     pageInput.extend({ jobId: dbId }), pageInput.extend({ documentId: dbId }),
   ]) }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('import_invoice_material'), sourceDirectory: z.string().min(1).max(4096) }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('import_prepared_invoice_material'), input: PreparedInvoiceMaterialSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('read_document_page'), input: invoiceToolSchemas.read_invoice_document.input }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_document_pages'), input: invoiceToolSchemas.list_invoice_pages.input }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('read_document_original'), documentId: dbId, page: z.literal(1) }).strict(),
@@ -363,11 +367,13 @@ export function matchesHistoryResponse(command: HostCommand, value: unknown): bo
 }
 
 const runtimeResultSchemas = {
+  replay_invoice_save: z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: InvoiceSaveReplayReceiptSchema }).strict(), z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]),
   query_runtime_events: RuntimeEventsReadResultSchema,
   subscribe_runtime_events: RuntimeSubscriptionResultSchema,
   unsubscribe_runtime_events: RuntimeSubscriptionReleaseResultSchema,
   list_run_tool_calls: RuntimeToolPageResultSchema,
   query_run_tool_call: RuntimeToolResultSchema,
+  query_run_tool_evidence: ToolEvidenceResultSchema,
 };
 
 const contextResultSchemas = {

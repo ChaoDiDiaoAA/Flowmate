@@ -4,7 +4,7 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dataset, task, fixtureRepo } from '../support/fixtures.ts';
-import { caseSchema, loadDataset, resolveCase, selectCases } from '../../src/datasets/local.ts';
+import { caseSchema, loadDataset, resolveCase, selectCases } from '../../src/dataset-loader/local.ts';
 test('independent facility dataset resolves synthetic materials and unique smoke references', () => {
     expect(dataset.cases).toHaveLength(3);
     expect(selectCases(dataset, 'smoke')).toHaveLength(2);

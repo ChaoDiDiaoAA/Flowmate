@@ -6,6 +6,7 @@ import type { z } from 'zod';
 import type { ResearchRepository } from './repository.ts';
 import type { FileStore } from '../storage/file-store.ts';
 import type { ToolCallRepository } from '../storage/repositories.ts';
+import { researchExcerpt } from './source-text.ts';
 
 type Dependencies = { research: ResearchRepository; calls: ToolCallRepository; files: FileStore };
 
@@ -22,10 +23,8 @@ export function readResearchEvidence(options: Dependencies, raw: z.input<typeof 
     || original.data.toolName !== 'read_research_local')
     return fail(appError('research_evidence_incomplete', 'tool', 'The source has no successful acquisition receipt.'));
   const body = options.files.readResearchSource(value); if (!body.ok) return body;
-  if (input.data.offset >= body.data.length) return fail(appError('input_invalid', 'input', 'Evidence offset is outside the saved body.'));
-  const end = Math.min(body.data.length, input.data.offset + input.data.limit);
-  return ok({ source: value, excerpt: { start: input.data.offset, end, quote: body.data.slice(input.data.offset, end) },
-    nextOffset: end < body.data.length ? end : null });
+  const excerpt = researchExcerpt(body.data, input.data.offset, input.data.limit);
+  return excerpt.ok ? ok({ source: value, ...excerpt.data }) : excerpt;
 }
 
 export function createResearchSynthesisTools(options: Dependencies & { now(): string }): ToolDefinition<any, any>[] {

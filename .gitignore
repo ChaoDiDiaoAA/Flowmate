@@ -44,6 +44,13 @@ Thumbs.db
 
 # Private Agent evaluation run output
 /agent-eval/runs/
+/agent-eval/calibration-runs/
+/agent-eval/configs/*.json
+/agent-eval/configs/*.jsonc
+!/agent-eval/configs/*.example.jsonc
+/agent-eval/configs/runtime/*.json
+/agent-eval/configs/runtime/*.jsonc
+!/agent-eval/configs/runtime/*.example.jsonc
 /data/invoices/
 
 # Local execution-plan ledger and review artifacts
@@ -57,3 +64,6 @@ Thumbs.db
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
+
+# Local evaluation credentials
+/agent-eval/configs/.env

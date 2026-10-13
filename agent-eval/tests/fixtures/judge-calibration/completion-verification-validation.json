@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "completion-verification-validation",
+  "instanceId": "completion-verification-validation-independent",
+  "sourceGroup": "completion-verification-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "completion-verification",
+        "version": "v1",
+        "unit": "终结机会",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个终结机会核对原目标、必要提交、真实停止和独立成果。按成功/失败条件及Gold核对内容；引用格式有效、Run completed、产品supported或助手自述均不足以证明正确。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The only required total is 862.40, and the original saved receipt is available.",
+      "originalObservation": "The original receipt total is 862.40; original stop is confirmed and the terminal response verifies that amount.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "completion-verification",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

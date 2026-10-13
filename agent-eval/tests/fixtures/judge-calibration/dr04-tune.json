@@ -1,0 +1,145 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "dr04-tune",
+  "instanceId": "dr04-tune-independent-report",
+  "sourceGroup": "dr04-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic report instance; source basis research-005 Gold [omitted]. Existing source/Gold review is historical; current scoring review pending; no human review claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "DR04",
+        "version": "v1",
+        "unit": "引用链接",
+        "denominator": 1,
+        "required": true,
+        "rule": "Check the one attached citation link for exact source/locator ownership and semantic support of its associated assertion. Valid-looking unrelated citations fail.",
+        "evidence": [
+          "researchFrame"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "researchFrame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": 1,
+      "blocks": [
+        {
+          "kind": "claim",
+          "key": "claim:1",
+          "claimId": 1,
+          "text": "The source establishes the opposite of the independently declared assertion."
+        }
+      ],
+      "links": [
+        {
+          "key": "claim:1:citation:0",
+          "claimId": 1,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "the Thermal Infrared Sensor 2 (TIRS-2).",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 1,
+            "sourceSnapshotId": 1,
+            "locator": {
+              "start": 424,
+              "end": 463,
+              "quote": "the Thermal Infrared Sensor 2 (TIRS-2)."
+            }
+          }
+        }
+      ],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [
+          {
+            "claimId": 1,
+            "evidenceIndex": 0,
+            "valid": true
+          }
+        ],
+        "sourceBindings": [
+          {
+            "sourceSnapshotId": 1,
+            "sample": "landsat9-platform",
+            "file": "source.md"
+          }
+        ]
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "mission-payload",
+            "text": "Landsat 9搭载TIRS-2。",
+            "required": true,
+            "acceptable": [
+              "Landsat 9搭载TIRS-2。"
+            ],
+            "conditions": [],
+            "entities": [
+              "landsat-9",
+              "tirs-thermal-sensor"
+            ],
+            "evidence": [
+              {
+                "sample": "landsat9-platform",
+                "start": 424,
+                "end": 463,
+                "quote": "the Thermal Infrared Sensor 2 (TIRS-2).",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [],
+        "forbidden": [
+          "省略载荷/测量中间实体只给首尾结论。",
+          "把L2地表温度说成只由仪器直接输出。",
+          "把Kelvin写成摄氏度或把30米产品网格当传感器原生尺度。"
+        ]
+      },
+      "sources": [
+        {
+          "sourceSnapshotId": 1,
+          "text": "# Landsat 9 instrument inventory, 2021 launch article\n\nSource: https://science.nasa.gov/blogs/landsat/2021/09/27/landsat-9-nextgen-of-the-landsat-series/\nFrozen retrieval: 2026-10-11T13:21:50.748219+00:00\nSelected source text; gaps between excerpts are marked. This file is not a live webpage.\n\nLandsat 9 carries two instruments that largely replicate the instruments on Landsat 8: the Operational Land Imager 2 (OLI-2) and the Thermal Infrared Sensor 2 (TIRS-2).\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 1,
+            "sample": "landsat9-platform",
+            "file": "source.md"
+          }
+        }
+      ],
+      "rule": "Independent synthetic Report and source frame; all sources are declared quality-side reference material. Synthetic native IDs do not claim a real product execution."
+    }
+  },
+  "references": [
+    {
+      "metricId": "DR04",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": true,
+      "citationSupport": false,
+      "reason": "The independently authored observation omits or contradicts a required source condition, link or complete chain."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":74,\"correct\":0,\"needsCitation\":true,\"covered\":0,\"gold\":0,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":0}],\"chains\":[]}}"
+}

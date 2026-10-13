@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "skill-guidance-validation",
+  "instanceId": "skill-guidance-validation-independent",
+  "sourceGroup": "skill-guidance-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "skill-guidance",
+        "version": "v1",
+        "unit": "要求点",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个相关指导要求点核对实际任务和轨迹，允许合法替代方法；读过或模型声称遵循均不证明遵循，内容仍对独立Gold核验。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "The declared guide requires preserving the original document identity before committing.",
+      "originalObservation": "The trace preserves document morrow-archive-62 and its original source hash in the commit.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "skill-guidance",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent original facts satisfy the declared requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+}

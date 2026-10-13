@@ -17,7 +17,7 @@ import type { ContextOwnerCache } from '../context/repository.ts';
 import { buildSubagentContextInTransaction, formatContextPrompt } from '../context/service.ts';
 import { createContextRepository } from '../context/repository.ts';
 import type { WorkspaceVerifier, WorkspaceVerification } from '../workspace/verification.ts';
-import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, emptyResourceJournal, FrozenInputDefinitionsSchema, InputCommandReceiptSchema } from '@flowmate/contracts';
+import { InputRecordV2Schema, UsageRecordV2Schema, ToolRuntimeObservationSchema, ToolCallCleanupSchema, RuntimeStrategySnapshotSchema, TOOL_CONFIG, appError, fail, ok, formatExecutionPrompt, FillInvoiceFormOutputSchema, SessionInputContentSchema, ContextReferenceSchema, FrozenResourcesSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, emptyResourceJournal, FrozenInputDefinitionsSchema, InputCommandReceiptSchema } from '@flowmate/contracts';
 import type {
   AgentRunSnapshot,
   AppError,
@@ -747,31 +747,8 @@ function recordWithOptional(value: unknown, label: string, required: readonly st
 }
 
 const nativeIdSchema = z.string().min(1).max(256).refine((value) => !/[\x00-\x1f\x7f]/.test(value));
-const nativeProcessSchema = z.object({
-  nativeToolCallId: nativeIdSchema, pid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  identity: nativeIdSchema, executable: z.string().min(1).max(4096).refine((value) => !/[\x00-\x1f\x7f]/.test(value)),
-  startedAt: z.string().datetime(), stopped: z.boolean(), stoppedAt: z.string().datetime().optional(),
-  exitCode: z.number().int().nullable().optional(),
-}).strict().superRefine((record, context) => {
-  if (!record.stopped && (record.stoppedAt !== undefined || record.exitCode !== undefined)) {
-    context.addIssue({ code: z.ZodIssueCode.custom, message: 'An active process cannot have terminal facts.' });
-  }
-});
-const nativeOutputSchema = z.object({
-  nativeToolCallId: nativeIdSchema,
-  fileName: z.string().min(1).max(255).refine((value) => !/[\\/:\x00-\x1f\x7f]/.test(value) && value !== '.' && value !== '..'),
-  bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), truncated: z.boolean(),
-  observedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-}).strict().refine((record) => record.observedBytes >= record.bytes);
-
 function readToolCleanup(value: unknown): ToolCallCleanup {
-  const cleanup = recordWithOptional(value, 'tool_call_cleanup', ['version', 'stopReason', 'stopped', 'errors'], ['nativeProcesses', 'nativeOutputs']);
-  if (cleanup.version !== 1 || cleanup.stopReason !== null && typeof cleanup.stopReason !== 'string'
-    || typeof cleanup.stopped !== 'boolean' || !Array.isArray(cleanup.errors)) throw new Error('invalid_tool_call_cleanup');
-  return { version: 1, stopReason: cleanup.stopReason as string | null, stopped: cleanup.stopped,
-    errors: cleanup.errors.map((error) => AppErrorSchema.parse(error)),
-    ...(cleanup.nativeProcesses === undefined ? {} : { nativeProcesses: z.array(nativeProcessSchema).max(24).parse(cleanup.nativeProcesses) }),
-    ...(cleanup.nativeOutputs === undefined ? {} : { nativeOutputs: z.array(nativeOutputSchema).max(24).parse(cleanup.nativeOutputs) }) };
+  return ToolCallCleanupSchema.parse(value);
 }
 
 function artifactMetadata(value: unknown): ArtifactMetadata {

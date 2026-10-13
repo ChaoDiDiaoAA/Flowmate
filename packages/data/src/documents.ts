@@ -9,6 +9,7 @@ import {
   MAX_INVOICE_VERSION_CHARS,
   DocumentRefSchema,
   ContextMaterialRequestSchema,
+  PreparedInvoiceMaterialSchema,
 } from '@flowmate/contracts';
 import type {
   DocumentSnapshot,
@@ -109,6 +110,14 @@ function documentVersion(datasetRevision: string, files: readonly Uint8Array[]):
   return `${datasetRevision}:parsed-v3:${digest.digest('hex')}`;
 }
 
+function preparedOriginal(bytes: Uint8Array, name: string): boolean {
+  if (bytes.byteLength < 1 || bytes.byteLength > MAX_WORKSPACE_ORIGINAL_BYTES) return false;
+  if (name === 'original.pdf') return Buffer.from(bytes).subarray(0, 5).toString('ascii') === '%PDF-'
+    && Buffer.from(bytes).subarray(-1024).toString('ascii').includes('%%EOF');
+  try { return name === 'source.md' && new TextDecoder('utf-8', { fatal: true }).decode(bytes).trim().length > 0; }
+  catch { return false; }
+}
+
 function scopeAllows(scope: RunScope, document: DocumentSnapshot): boolean {
   return scope.allowedDocumentIds.includes(document.documentRef.id)
     && scope.allowedArtifactIds.includes(document.parsedArtifactId);
@@ -126,6 +135,51 @@ export class DocumentService {
   private tail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly options: DocumentServiceOptions) {}
+
+  public importPrepared(raw: unknown, signal?: AbortSignal): Promise<Result<DocumentSnapshot>> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>(resolve => { release = resolve; });
+    return previous.then(() => this.importPreparedLocked(raw, signal)).catch(() =>
+      fail(appError('source_invalid', 'input', 'Prepared invoice source is invalid.'))).finally(release);
+  }
+
+  private async importPreparedLocked(raw: unknown, signal?: AbortSignal): Promise<Result<DocumentSnapshot>> {
+    const checked = PreparedInvoiceMaterialSchema.safeParse(raw);
+    if (!checked.success) return fail(appError('input_invalid', 'input', 'Prepared invoice source is invalid.'));
+    if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
+    const input = checked.data, originalBytes = Buffer.from(input.original.base64, 'base64');
+    if (!preparedOriginal(originalBytes, input.original.name) || originalBytes.toString('base64') !== input.original.base64
+      || createHash('sha256').update(originalBytes).digest('hex') !== input.original.sha256
+      || input.original.name === 'source.md' && new TextDecoder('utf-8', { fatal: true }).decode(originalBytes) !== input.sourceText)
+      return fail(appError('source_invalid', 'input', 'Prepared original differs from its frozen bytes or text.'));
+    const sourceKey = 'prepared-invoice', sourceRecordId = input.sample;
+    const parsed: StoredParsedDocument = { formatVersion: 2, pages: input.pages,
+      completeness: { status: 'complete', checks: ['frozen-prepared-source', 'sequential-pages-and-blocks'], warnings: [] } };
+    const parsedBytes = Buffer.from(JSON.stringify(parsed)), contentBytes = Buffer.from(JSON.stringify(input.sourceText));
+    const pagesBytes = Buffer.from(JSON.stringify(input.pages)), sourceBytes = Buffer.from(JSON.stringify({
+      contract: input.contract, sample: input.sample, original: { name: input.original.name, sha256: input.original.sha256 } }));
+    const version = documentVersion('prepared-v1', [originalBytes, contentBytes, pagesBytes, sourceBytes]);
+    const existing = this.options.repository.findBySource({ sourceKey, sourceRecordId, version });
+    if (!existing.ok) return existing;
+    if (existing.data) return this.sameVersion(existing.data, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, input.original.name);
+    const now = this.options.now();
+    const published = await this.options.files.publish({ sourceKey, sourceRecordId, sourceVersion: version, at: now,
+      original: { kind: 'original', primaryName: input.original.name, files: [{ name: input.original.name, bytes: originalBytes,
+        mimeType: input.original.name === 'original.pdf' ? 'application/pdf' : 'text/markdown' }] },
+      parsed: { kind: 'parsed', primaryName: 'parsed.json', files: [
+        { name: 'parsed.json', bytes: parsedBytes, mimeType: 'application/json' },
+        { name: 'raw-content.json', bytes: contentBytes, mimeType: 'application/json' },
+        { name: 'raw-pages.json', bytes: pagesBytes, mimeType: 'application/json' },
+        { name: 'source.json', bytes: sourceBytes, mimeType: 'application/json' }
+      ] } });
+    if (!published.ok) return published;
+    if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消；已发布文件保留为待核对孤儿。'));
+    return this.options.repository.register({ documentId: published.data.documentId, sourceKey, sourceRecordId, version,
+      originalArtifact: published.data.original, parsedArtifact: published.data.parsed, status: 'available',
+      metadata: { version: 2, pageCount: input.pages.length, warnings: [], allowedUsesClaim: ['frozen-prepared-material'],
+        licenseVerification: 'caller-supplied', unavailableReason: null }, createdAt: now, updatedAt: now });
+  }
 
   public importVoxel51(input: { sourceDirectory: string }, signal?: AbortSignal): Promise<Result<DocumentSnapshot>> {
     const previous = this.tail;
@@ -212,6 +266,8 @@ export class DocumentService {
       ? this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt') : bytes;
     if (bytes.data.byteLength > MAX_WORKSPACE_ORIGINAL_BYTES) return fail(appError('tool_result_too_large', 'runtime', '原图超过桌面读取大小限制。'));
     const mimeType = artifact.data.mimeType;
+    if (artifact.data.metadata.sourceKey === 'prepared-invoice' && preparedOriginal(bytes.data, fileName))
+      return fail(appError('input_unavailable', 'input', 'This prepared original has no image preview; its parsed pages remain available.'));
     if ((mimeType !== 'image/jpeg' && mimeType !== 'image/png') || !isSupportedOriginal(bytes.data, fileName)) {
       return this.unavailableDocument(documentId, 'original_artifact_invalid');
     }
@@ -229,8 +285,8 @@ export class DocumentService {
     const originalBytes = this.options.files.read(original.data, originalName);
     if (!originalBytes.ok) return originalBytes.error.code === 'artifact_unavailable'
       ? this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt') : originalBytes;
-    const extension = originalName.endsWith('.jpg') ? '.jpg' : originalName.endsWith('.png') ? '.png' : '';
-    if (!extension || !isSupportedOriginal(originalBytes.data, originalName)) return this.unavailableDocument(documentId, 'original_artifact_invalid');
+    if (!(original.data.metadata.sourceKey === 'prepared-invoice' ? preparedOriginal(originalBytes.data, originalName)
+      : isSupportedOriginal(originalBytes.data, originalName))) return this.unavailableDocument(documentId, 'original_artifact_invalid');
     const decoded = this.readStoredParsed(document.data, parsed.data);
     if (!decoded.ok) return decoded;
     try {
@@ -328,7 +384,9 @@ export class DocumentService {
       const originalName = original.data.relativePath.slice(original.data.relativePath.lastIndexOf('/') + 1);
       const originalBytes = this.options.files.read(original.data, originalName);
       if (!originalBytes.ok) return originalBytes.error.code === 'artifact_unavailable' ? invalid('artifact_missing_or_invalid') : originalBytes;
-      if ((originalName !== 'original.png' && originalName !== 'original.jpg')
+      if (original.data.metadata.sourceKey === 'prepared-invoice'
+        ? !preparedOriginal(originalBytes.data, originalName) || original.data.mimeType !== (originalName === 'original.pdf' ? 'application/pdf' : 'text/markdown')
+        : (originalName !== 'original.png' && originalName !== 'original.jpg')
         || original.data.mimeType !== (originalName.endsWith('.png') ? 'image/png' : 'image/jpeg')
         || !isSupportedOriginal(originalBytes.data, originalName)) return invalid('artifact_missing_or_invalid');
       // Check every registered file, including sidecars, without altering availability.
@@ -367,6 +425,25 @@ export class DocumentService {
     let decoded: StoredParsedDocument;
     try { decoded = decodeParsed(parseJson(bytes.data)); }
     catch { return invalid('parsed_document_invalid'); }
+    if (artifact.metadata.sourceKey === 'prepared-invoice') {
+      const original = this.options.repository.getArtifact(document.originalArtifactId);
+      if (!original.ok) return original;
+      const originalName = original.data.relativePath.slice(original.data.relativePath.lastIndexOf('/') + 1);
+      const originalBytes = this.options.files.read(original.data, originalName), source = this.options.files.read(artifact, 'source.json');
+      const content = this.options.files.read(artifact, 'raw-content.json'), pages = this.options.files.read(artifact, 'raw-pages.json');
+      if (!originalBytes.ok || !source.ok || !content.ok || !pages.ok) return invalid('prepared_sidecar_missing_or_corrupt');
+      try {
+        const input = PreparedInvoiceMaterialSchema.safeParse({ ...parseJson(source.data) as object,
+          original: { ...(parseJson(source.data) as { original: object }).original, base64: Buffer.from(originalBytes.data).toString('base64') },
+          sourceText: parseJson(content.data), pages: parseJson(pages.data) });
+        if (!input.success || input.data.sample !== artifact.metadata.sourceRecordId || input.data.original.name !== originalName
+          || createHash('sha256').update(originalBytes.data).digest('hex') !== input.data.original.sha256
+          || documentVersion('prepared-v1', [originalBytes.data, content.data, pages.data, source.data]) !== document.documentRef.version
+          || JSON.stringify(decoded.pages) !== JSON.stringify(input.data.pages) || decoded.pages.length !== document.pageCount)
+          return invalid('prepared_document_mismatch');
+        return ok(decoded);
+      } catch { return invalid('prepared_sidecar_invalid'); }
+    }
     if (!/:parsed-v3:[a-f0-9]{64}$/.test(document.documentRef.version)) return ok(decoded);
 
     const content = this.options.files.read(artifact, 'raw-content.json');
@@ -393,7 +470,7 @@ export class DocumentService {
   }
 
   private sameVersion(document: DocumentSnapshot, original: Uint8Array, content: Uint8Array, pages: Uint8Array,
-    parsed: Uint8Array, source: Uint8Array, originalName: 'original.jpg' | 'original.png'): Result<DocumentSnapshot> {
+    parsed: Uint8Array, source: Uint8Array, originalName: 'original.jpg' | 'original.png' | 'original.pdf' | 'source.md'): Result<DocumentSnapshot> {
     const originalArtifact = this.options.repository.getArtifact(document.originalArtifactId);
     const parsedArtifact = this.options.repository.getArtifact(document.parsedArtifactId);
     if (!originalArtifact.ok) return originalArtifact;

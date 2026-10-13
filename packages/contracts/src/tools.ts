@@ -36,7 +36,7 @@ export const NATIVE_TOOL_NAMES = ['read', 'grep', 'find', 'ls', 'edit', 'write',
 export type NativeToolName = typeof NATIVE_TOOL_NAMES[number];
 export type NativeToolAvailability = { name: NativeToolName; available: boolean; reason: string | null };
 
-function isJsonData(value: unknown): boolean {
+export function isJsonData(value: unknown): boolean {
   const pending = [value];
   const seen = new Set<object>();
   while (pending.length) {

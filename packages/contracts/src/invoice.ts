@@ -52,6 +52,20 @@ export const ParsedBlockSchema = z.object({
 }).strict();
 export type ParsedBlock = z.infer<typeof ParsedBlockSchema>;
 
+export const PreparedInvoiceMaterialSchema = z.object({
+  contract: z.literal('flowmate-prepared-invoice/v1'), sample: z.string().regex(/^[a-z0-9][a-z0-9-]{0,127}$/),
+  original: z.object({ name: z.enum(['source.md', 'original.pdf']), sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    base64: z.string().min(4).max(13_981_016).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/) }).strict(),
+  sourceText: z.string().min(1).max(2_097_152),
+  pages: z.array(z.object({ page: pageSchema, blocks: z.array(ParsedBlockSchema).min(1).max(MAX_INVOICE_BLOCKS_PER_PAGE) }).strict()).min(1).max(MAX_INVOICE_PAGES)
+}).strict().superRefine((input, context) => {
+  if (new TextEncoder().encode(input.sourceText).length > 2_097_152 || input.pages.some((page, index) => page.page !== index + 1
+    || page.blocks.some((block, row) => block.id !== 'b' + (row + 1) || block.sourceIndex !== row || block.kind !== 'text'
+      || block.sourceType !== 'prepared-text' || !block.text.trim() || !input.sourceText.includes(block.text))))
+    context.addIssue({ code: 'custom', message: 'Prepared pages must retain sequential source blocks from the frozen text.' });
+});
+export type PreparedInvoiceMaterial = z.infer<typeof PreparedInvoiceMaterialSchema>;
+
 export const ValueStateSchema = z.enum(['present', 'missing', 'ambiguous', 'unreadable', 'not_applicable']);
 export type ValueState = z.infer<typeof ValueStateSchema>;
 
@@ -512,5 +526,15 @@ export const invoiceToolSchemas = {
 } as const;
 
 export type InvoiceToolName = typeof INVOICE_TOOL_NAMES[number];
+export const InvoiceSaveReplayRequestSchema = z.object({
+  runId: idSchema, sessionId: idSchema, toolCallId: idSchema,
+  nativeToolCallId: z.string().min(1).max(256), argumentsHash: z.string().regex(/^[a-f0-9]{64}$/),
+  rawArguments: invoiceToolSchemas.save_invoice_candidate.input,
+  arguments: invoiceToolSchemas.save_invoice_candidate.input,
+}).strict();
+export type InvoiceSaveReplayRequest = z.infer<typeof InvoiceSaveReplayRequestSchema>;
+export const InvoiceSaveReplayReceiptSchema = InvoiceSaveReplayRequestSchema.pick({
+  runId: true, sessionId: true, toolCallId: true, nativeToolCallId: true, argumentsHash: true,
+}).extend({ receipt: CandidateReceiptSchema, created: z.literal(false) }).strict();
 export type InvoiceToolInput<Name extends InvoiceToolName> = z.infer<typeof invoiceToolSchemas[Name]['input']>;
 export type InvoiceToolOutput<Name extends InvoiceToolName> = z.infer<typeof invoiceToolSchemas[Name]['output']>;

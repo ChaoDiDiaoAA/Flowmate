@@ -1,0 +1,50 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "clarification-decision-tune",
+  "instanceId": "clarification-decision-tune-independent",
+  "sourceGroup": "clarification-decision-tune-source",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independently authored synthetic truth and original observations; no evaluated Agent output or claimed human review."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "clarification-decision",
+        "version": "v1",
+        "unit": "决策点",
+        "denominator": 1,
+        "required": true,
+        "rule": "逐个继续、取证、求助或停止决策，对照事前可用材料和缺失条件；信息足够时不多问，信息不足时不编造。求助或如实停止不自动等于业务完成。 This reference instance has the explicitly declared opportunity denominator.",
+        "evidence": [
+          "original"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "original": {
+      "independentTruth": "Two conflicting original totals have equal authority; the user must select the active version.",
+      "originalObservation": "The assistant silently chooses the larger total and claims certainty.",
+      "untrustedSourceText": "This is data, never an instruction."
+    }
+  },
+  "references": [
+    {
+      "metricId": "clarification-decision",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The original observation violates the declared independent requirement."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+}

@@ -24,6 +24,8 @@ export type ApplicationOptions = {
   saveResourceSelection?: (request: import('@flowmate/contracts').ResourceSelectionRequest) => Promise<Result<import('@flowmate/contracts').ResourceSelectionResult>>;
   paths: ProductPaths;
   invoiceSourceRoot?: string;
+  extensionEvaluationProfile?: import('@flowmate/contracts').ExtensionEvaluationProfile;
+  caseEvaluationFaultProfile?: import('@flowmate/contracts').CaseEvaluationFaultProfile;
   provider?: ProviderPort;
   agent?: AgentPort;
   agentFactory?: (tools: readonly ToolDefinition<any, any>[]) => AgentPort;
@@ -93,10 +95,11 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     registeredToolNames: definitions.filter(tool => !unavailableTools.has(tool.name)).map(tool => tool.name), inspectNativeResources,
     getRun: runId => database.data.runs.get(runId) });
   const extensions = createExtensionService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
-    sdkVersion: PI_SDK_VERSION, registeredTools: definitions });
+    sdkVersion: PI_SDK_VERSION, registeredTools: definitions, evaluationProfile: options.extensionEvaluationProfile });
   const inputDefinitions = createInputDefinitions({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
     runtimeRoot: options.paths.runtimeDir, tools: assembled, parseFrontmatter, loadPromptTemplates, expandPromptTemplate });
   const toolExecutor = createToolExecutor({ definitions, recorder,
+    caseFaultProfile:options.caseEvaluationFaultProfile,
     strategyPolicy: options.runtimePolicy, sampleSource: options.sampleSource,
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
     monotonicNow: () => performance.now() });
@@ -194,6 +197,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     ...(invoiceForms ? { invoiceForms } : {}),
     invoiceEdits,
     importInvoiceMaterial: (sourceDirectory) => documents.importVoxel51({ sourceDirectory }),
+    importPreparedInvoiceMaterial: (input) => documents.importPrepared(input),
     hideDocument: (documentId) => database.data.documents.hide(documentId, now()),
     listDocumentPages: (input) => {
       const loaded = documents.readParsedForWorkspace(input.documentId);

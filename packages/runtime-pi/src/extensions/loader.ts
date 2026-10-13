@@ -114,7 +114,7 @@ export async function loadControlledExtensions(input: { frozen: FrozenExtensions
       const scope = scopes[index]!, manifest = selected.manifest;
       const toolName = manifest.tools[0]!.name;
       let sdkTool: ToolDefinition;
-      const factory = manifest.id === 'invoice-assist' ? createInvoiceAssistExtension({ sdkTool: sdkTool = input.sdkToolFor(toolName), scope })
+      const factory = manifest.id === 'invoice-assist' ? createInvoiceAssistExtension({ sdkTool: sdkTool = input.sdkToolFor(toolName), scope, profile: frozen.evaluationProfile })
         : createSubagentExtension({ ...input.subagent, sdkTool: parameters => sdkTool = input.sdkToolFor(toolName, parameters), scope });
       let registrationOpen = true;
       const conflict = () => {

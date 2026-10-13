@@ -40,6 +40,34 @@ async function rejectsProtocol(client: HostClient, command: unknown): Promise<vo
   expect(message).toBe('host_protocol_invalid');
 }
 
+it('HostClient binds raw evidence pages to the original owner, hash, byte offset and request limit', async () => {
+  const fixture = await protocolFixture(`
+if(command.type==='query_run_tool_evidence') {
+ const id=command.input.toolCallId;
+ let data={version:1,runId:1,sessionId:1,toolCallId:id,sha256:'a'.repeat(64),bytes:4,offset:0,chunk:'safe',nextOffset:null};
+ if(id===2)data.runId=2;
+ if(id===3)data.sessionId=2;
+ if(id===4)data.toolCallId=99;
+ if(id===5){data.offset=1;data.bytes=5;}
+ if(id===6)data.sha256='f'.repeat(64);
+ if(id===7){data.chunk='unsafe';data.bytes=6;}
+ if(id===8)data.extra='unexpected';
+ if(id===11)data.nextOffset=4;
+ response(command,id===9?{ok:false,error:{code:'state_conflict',category:'runtime',message:'foreign',retryable:false,runId:2}}
+  :id===10?{ok:false,error:{code:'state_conflict',category:'runtime',message:'foreign',retryable:false},runId:2}
+  :id===12?{ok:false,error:{code:'state_conflict',category:'runtime',message:'foreign',retryable:false,sessionId:2}}:{ok:true,data});
+}
+`);
+  try {
+    expect(await request(fixture.client, { type: 'query_run_tool_evidence', input: { runId: 1, sessionId: 1, toolCallId: 1, limit: 4 } }))
+      .toMatchObject({ ok: true, data: { chunk: 'safe', offset: 0 } });
+    for (const toolCallId of [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+      await rejectsProtocol(fixture.client, { type: 'query_run_tool_evidence', input: { runId: 1, sessionId: 1, toolCallId,
+        expectedHash: 'a'.repeat(64), limit: 4 } });
+    await rejectsProtocol(fixture.client, { type: 'query_run_tool_evidence', input: { runId: 1, sessionId: 1, toolCallId: 1, offset: 1 } });
+  } finally { await fixture.close(); }
+}, 15000);
+
 it('P6 HostClient accepts all five strict results and rejects foreign pages, gaps without context, oversized errors and raw tools', async () => {
   const fixture = await protocolFixture(`
 if(command.type==='query_runtime_events') {

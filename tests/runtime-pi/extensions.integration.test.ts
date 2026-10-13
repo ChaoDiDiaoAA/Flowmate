@@ -573,6 +573,19 @@ it('[F12-20] reuses the actual SDK instance when the fixed combination is identi
   expect(f.native()).toBe(native); expect(need(f.adapter.inspectExtensions(f.sid)).instances[0]).toEqual(first);
 });
 
+it('rebuilds the native extension instance when only its frozen evaluation profile changes', async () => {
+  const f = fixture(), frozen = f.freeze('p3');
+  const prepare = (id: 'source-quote-trim' | 'source-check-denial') => f.adapter.prepare(f.sid, f.config,
+    { timeoutMs: 1000, stopGraceMs: 1000 }, new AbortController().signal,
+    { activeToolNames: ['check_invoice_sources'], extensions: { ...frozen, evaluationProfile: { id, version: 1 } } });
+  need(await prepare('source-quote-trim'));
+  const firstNative = f.native(), first = need(f.adapter.inspectExtensions(f.sid)).instances[0]!;
+  need(await prepare('source-quote-trim'));
+  expect(f.native()).toBe(firstNative); expect(need(f.adapter.inspectExtensions(f.sid)).instances[0]!.instanceId).toBe(first.instanceId);
+  need(await prepare('source-check-denial'));
+  expect(f.native()).not.toBe(firstNative); expect(need(f.adapter.inspectExtensions(f.sid)).instances[0]!.instanceId).not.toBe(first.instanceId);
+});
+
 it('[F12-10] requires an actual startup acknowledgement even when SDK emit returned normally', async () => {
   const injected = changeHooks((name, handler, args) => name === 'session_start' ? undefined : handler(...args));
   try {

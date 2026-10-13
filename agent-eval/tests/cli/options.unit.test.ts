@@ -35,3 +35,8 @@ test('stage and mode interfaces fail explicitly before paid behavior', async () 
     for (const args of [['run', '--stage', 'P1'], ['run', '--mode', 'live']])
         await expect(main(args)).rejects.toThrow('已取消');
 });
+test('calibration CLI requires its exact subcommand, independent-reference directory and new execution identity',async()=>{
+    for(const args of [['judge','accept'],['judge','calibrate'],['judge','calibrate','--dir','missing'],
+        ['judge','calibrate','--backend','langfuse'],['judge','calibrate','--dir','a','--dir','b']])
+        await expect(main(args)).rejects.toThrow();
+});

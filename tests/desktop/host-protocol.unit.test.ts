@@ -2,9 +2,23 @@ import { describe, expect, it } from 'bun:test';
 import { parseHostCommand, parseWorkspaceHostResult } from '../../apps/host/protocol.ts';
 import * as historyProtocol from '../../apps/host/protocol.ts';
 import { randomUUID } from 'node:crypto';
+import type { PreparedInvoiceMaterial } from '@flowmate/contracts';
 import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeEventsReadResultSchema,
   RuntimeEventsWakeSchema, RuntimeSubscriptionResultSchema, RuntimeToolPageResultSchema, RuntimeToolResultSchema,
   RunToolCallsRequestSchema, RunToolCallRequestSchema } from '@flowmate/contracts';
+
+it('prepared invoice import accepts only a bounded frozen source and sequential uniquely identified pages', () => {
+  const input: PreparedInvoiceMaterial = { contract: 'flowmate-prepared-invoice/v1', sample: 'synthetic-text',
+    original: { name: 'source.md', sha256: 'a'.repeat(64), base64: Buffer.from('Synthetic invoice').toString('base64') },
+    sourceText: 'Synthetic invoice', pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text', text: 'Synthetic invoice',
+      sourceIndex: 0, sourceType: 'prepared-text', bbox: null }] }] };
+  const command = { version: 1, requestId: 'prepared-invoice', type: 'import_prepared_invoice_material', input } as const;
+  expect(parseHostCommand(command)).toEqual(command);
+  expect(parseHostCommand({ ...command, input: { ...input, gold: { amount: 42 } } })).toBeNull();
+  expect(parseHostCommand({ ...command, input: { ...input, pages: [{ ...input.pages[0], page: 2 }] } })).toBeNull();
+  expect(parseHostCommand({ ...command, input: { ...input, pages: [{ page: 1, blocks: [input.pages[0]!.blocks[0], input.pages[0]!.blocks[0]] }] } })).toBeNull();
+  expect(parseHostCommand({ ...command, input: { ...input, original: { ...input.original, name: '../gold.json' } } })).toBeNull();
+});
 
 it('P13 validates the three child commands without accepting model-owned identities or replay controls', () => {
   for (const command of [

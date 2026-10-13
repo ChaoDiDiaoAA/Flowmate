@@ -52,8 +52,11 @@ export function canonicalExtensionManifest(value: ExtensionManifest): string {
   return JSON.stringify({ ...manifest, hooks });
 }
 
+export const ExtensionEvaluationProfileSchema = z.object({ id: z.enum(['source-quote-trim', 'source-check-denial']), version: z.literal(1) }).strict().readonly();
+export type ExtensionEvaluationProfile = z.infer<typeof ExtensionEvaluationProfileSchema>;
 export const FrozenExtensionsSchema = z.object({ version: z.literal(1), policyVersion: z.enum(['p12-managed-extensions-v1', 'p13-managed-extensions-v1']),
   settingsRevision: integer, selected: z.array(ExtensionRefSchema).max(2).readonly(),
+  evaluationProfile: ExtensionEvaluationProfileSchema.optional(),
   included: z.array(z.object({ ref: ExtensionRefSchema, manifest: ExtensionManifestSchema }).strict().readonly()).max(2).readonly(),
   excluded: z.array(z.object({ ref: ExtensionRefSchema, code: z.literal('tool_not_active') }).strict().readonly()).max(2).readonly(),
 }).strict().superRefine((value, ctx) => {
@@ -66,6 +69,8 @@ export const FrozenExtensionsSchema = z.object({ version: z.literal(1), policyVe
     || value.policyVersion === 'p12-managed-extensions-v1' && (value.selected.length > 1 || value.selected.some(ref => ref.id !== 'invoice-assist')))
     report(ctx, 'Historical P12 selection cannot expand.');
   if (value.included.length === 2 && value.included[0].ref.id !== 'invoice-assist') report(ctx, 'Assembly order must be invoice-assist then subagents.');
+  if (value.evaluationProfile && (value.policyVersion !== 'p13-managed-extensions-v1' || !value.included.some(item => item.ref.id === 'invoice-assist')))
+    report(ctx, 'An evaluation Hook profile requires the active P13 invoice extension.');
 }).readonly();
 export type FrozenExtensions = z.infer<typeof FrozenExtensionsSchema>;
 const actualTools = z.tuple([z.literal('check_invoice_sources')]).readonly();

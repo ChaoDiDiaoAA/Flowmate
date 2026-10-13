@@ -868,7 +868,7 @@ export class PiAgentAdapter implements AgentPort {
     const extensions = options?.extensions === undefined ? null : FrozenExtensionsSchema.safeParse(options.extensions);
     if (extensions && !extensions.success) return fail(appError('extension_config_invalid', 'input', 'Frozen extensions are invalid.'));
     const frozenExtensions = extensions?.success ? extensions.data : null;
-    const extensionKey = JSON.stringify(frozenExtensions?.included ?? []);
+    const extensionKey = JSON.stringify([frozenExtensions?.included ?? [], frozenExtensions?.evaluationProfile ?? null]);
     if (frozenExtensions?.included.some(item => policy !== 'p3' || (item.ref.id === 'invoice-assist'
       ? !activeToolNames.includes('check_invoice_sources') : !activeToolNames.includes('Agent'))))
       return fail(appError('extension_incompatible', 'extension', 'Extension is not eligible for this Run.'));

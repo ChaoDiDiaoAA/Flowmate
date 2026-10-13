@@ -1,5 +1,6 @@
 import type { InputDefinitions } from './prompt-templates.ts';
-import { ResearchSessionRequestSchema, ResearchSessionResultSchema } from '@flowmate/contracts';
+import { ResearchSessionRequestSchema, ResearchSessionResultSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema } from '@flowmate/contracts';
+import { createHash } from 'node:crypto';
 import {
   appError,
   fail,
@@ -16,6 +17,7 @@ import {
   RunToolCallRequestSchema,
   RuntimeToolViewSchema,
   RuntimeToolPageSchema,
+  ToolEvidenceRequestSchema, ToolEvidencePageSchema, ToolCallSnapshotSchema,
   ContextSnapshotsResultSchema,
   ContextSnapshotResultSchema,
   ContextRequestsResultSchema,
@@ -114,12 +116,13 @@ type ProductApplicationOptions = {
   candidates: CandidateRepository;
   events: BusinessEventRepository;
   runtimeEvents?: EventService;
-  toolCalls?: Pick<ToolCallRepository, 'list' | 'getById'>;
+  toolCalls?: Pick<ToolCallRepository, 'list' | 'getById'> & Partial<Pick<ToolCallRepository, 'request' | 'fixArguments'>>;
   contextService?: Pick<ContextService, 'listContextSnapshots' | 'queryContextSnapshot' | 'listContextRequests'>;
   contextRepository?: Pick<ContextRepository, 'readResourceEvidence'>;
   invoiceForms?: Pick<InvoiceFormService, 'query'>;
   invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'queryOperation'>;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
+  importPreparedInvoiceMaterial: (input: import('@flowmate/contracts').PreparedInvoiceMaterial) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
   hideDocument?: (documentId: DbId) => Result<{ documentId: DbId; affectedChatCount: number }>;
   readDocumentPage: (input: import('@flowmate/contracts').InvoiceToolInput<'read_invoice_document'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'read_invoice_document'>>;
   listDocumentPages: (input: import('@flowmate/contracts').InvoiceToolInput<'list_invoice_pages'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'list_invoice_pages'>>;
@@ -153,7 +156,40 @@ export function makeApplication(
       return parsed.success ? ok(parsed.data) : fail(appError('config_settings_invalid', 'input', 'Resource configuration is invalid.'));
     } catch { return fail(appError('config_settings_invalid', 'input', 'Resource configuration is unavailable.')); }
   };
+  const readRunTool = ({ runId, sessionId, toolCallId }: import('@flowmate/contracts').RunToolCallRequest): Result<ToolCallSnapshot> => {
+    if (!products?.toolCalls) return fail(appError('tool_calls_unavailable', 'storage', 'Run 工具查询尚未组装。', true));
+    const run = runs.get(runId);
+    if (!run.ok) return run;
+    if (run.data.kind === 'provider' || run.data.sessionId !== sessionId)
+      return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.', false, runId));
+    const call = products.toolCalls.getById(toolCallId);
+    if (!call.ok) return call;
+    return call.data.runId === runId && call.data.sessionId === sessionId ? call
+      : fail(appError('state_conflict', 'runtime', 'Tool call does not belong to this Run.', false, runId));
+  };
   return {
+    replayInvoiceSave: async raw => {
+      const parsed = InvoiceSaveReplayRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Original save identity is invalid.'));
+      const input = parsed.data, original = readRunTool(input), repository = products?.toolCalls;
+      if (!original.ok) return original;
+      const call = original.data;
+      const digest = createHash('sha256').update(JSON.stringify({ raw: call.args.raw, final: call.args.final })).digest('hex');
+      const receipt = invoiceToolSchemas.save_invoice_candidate.output.safeParse(call.result?.data);
+      if (call.toolName !== 'save_invoice_candidate' || call.status !== 'succeeded' || !receipt.success ||
+          call.result?.committedCandidateId !== receipt.data.candidateId || call.nativeToolCallId !== input.nativeToolCallId || digest !== input.argumentsHash)
+        return fail(appError('state_conflict', 'runtime', 'Original successful save could not be verified.'));
+      if (!repository?.request || !repository.fixArguments) return fail(appError('tool_calls_unavailable', 'storage', 'Original save replay is unavailable.'));
+      // Re-enter the same idempotency checks as ToolExecutor, without admitting a new logical save.
+      const requested = repository.request({ runId: input.runId, sessionId: input.sessionId, nativeToolCallId: input.nativeToolCallId,
+        toolName: call.toolName, toolVersion: call.toolVersion, effect: call.effect, context: call.context,
+        rawArguments: input.rawArguments, requestedAt: call.requestedAt });
+      if (!requested.ok) return requested;
+      const fixed = repository.fixArguments({ toolCallId: call.toolCallId, finalArguments: input.arguments });
+      if (!fixed.ok) return fixed;
+      return ok({ runId: input.runId, sessionId: input.sessionId, toolCallId: call.toolCallId,
+        nativeToolCallId: input.nativeToolCallId, argumentsHash: digest, receipt: receipt.data, created: false as const });
+    },
     importResearchMaterial: async raw => {
       const parsed = ImportResearchMaterialSchema.safeParse(raw);
       return parsed.success ? contextRead(ResearchMaterialResultSchema, () => products?.importResearchMaterial?.(parsed.data))
@@ -390,17 +426,30 @@ export function makeApplication(
       if (!products?.toolCalls) return fail(appError('tool_calls_unavailable', 'storage', 'Run 工具查询尚未组装。', true));
       const parsed = RunToolCallRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run tool query is invalid.'));
-      const { runId, sessionId, toolCallId } = parsed.data;
-      const run = runs.get(runId);
-      if (!run.ok) return run;
-      if (run.data.kind === 'provider' || run.data.sessionId !== sessionId)
-        return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.', false, runId));
-      const call = products.toolCalls.getById(toolCallId);
+      const call = readRunTool(parsed.data);
       if (!call.ok) return call;
-      if (call.data.runId !== runId || call.data.sessionId !== sessionId)
-        return fail(appError('state_conflict', 'runtime', 'Tool call does not belong to this Run.', false, runId));
       try { return ok(toolView(call.data)); }
       catch { return fail(appError('storage_corrupt', 'storage', 'Run tool could not be projected.')); }
+    },
+    queryRunToolEvidence: async raw => {
+      if (!products?.toolCalls) return fail(appError('tool_calls_unavailable', 'storage', 'Run 工具查询尚未组装。', true));
+      const parsed = ToolEvidenceRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Tool evidence query is invalid.'));
+      try {
+        const input = parsed.data, call = readRunTool(input);
+        if (!call.ok) return call;
+        const bytes = Buffer.from(JSON.stringify(ToolCallSnapshotSchema.parse(call.data)));
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        if (input.expectedHash !== undefined && input.expectedHash !== sha256)
+          return fail(appError('state_conflict', 'runtime', 'Tool evidence changed. Reload the original ToolCall.', false, input.runId));
+        if (input.offset >= bytes.length || (bytes[input.offset]! & 0xc0) === 0x80)
+          return fail(appError('input_invalid', 'input', 'Tool evidence offset is outside a UTF-8 boundary.'));
+        let end = Math.min(bytes.length, input.offset + input.limit);
+        while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
+        return ok(ToolEvidencePageSchema.parse({ version: 1, runId: input.runId, sessionId: input.sessionId, toolCallId: input.toolCallId,
+          sha256, bytes: bytes.length, offset: input.offset, chunk: bytes.subarray(input.offset, end).toString('utf8'),
+          nextOffset: end === bytes.length ? null : end }));
+      } catch { return fail(appError('storage_corrupt', 'storage', 'Original tool evidence could not be read.')); }
     },
     createSession: async (raw = {}) => {
       const normalized = normalizeCreateSessionRequest(raw);
@@ -558,6 +607,12 @@ export function makeApplication(
       }
       return products?.importInvoiceMaterial(sourceDirectory)
         ?? fail(appError('document_service_unavailable', 'storage', 'Document 导入尚未组装。', true));
+    },
+    importPreparedInvoiceMaterial: async raw => {
+      const input = PreparedInvoiceMaterialSchema.safeParse(raw);
+      return !input.success ? fail(appError('input_invalid', 'input', 'Prepared invoice material is invalid.'))
+        : products?.importPreparedInvoiceMaterial(input.data)
+          ?? fail(appError('document_service_unavailable', 'storage', 'Document 导入尚未组装。', true));
     },
     listDocumentPages: async raw => {
       const input = invoiceToolSchemas.list_invoice_pages.input.safeParse(raw);

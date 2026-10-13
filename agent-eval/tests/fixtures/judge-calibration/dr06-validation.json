@@ -1,0 +1,342 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "id": "dr06-validation",
+  "instanceId": "dr06-validation-independent-report",
+  "sourceGroup": "dr06-validation-source",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic report instance; source basis research-006 Gold [omitted]. Existing source/Gold review is historical; current scoring review pending; no human review claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "DR06",
+        "version": "v1",
+        "unit": "必需链",
+        "denominator": 1,
+        "required": true,
+        "rule": "The one required chain needs every original hop, supporting attached evidence and all intermediate entities connected. A correct final conclusion without a hop fails.",
+        "evidence": [
+          "researchFrame"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "researchFrame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": 1,
+      "blocks": [
+        {
+          "kind": "claim",
+          "key": "claim:1",
+          "claimId": 1,
+          "text": "Migrant Mother系列的摄影者为Dorothea Lange。"
+        },
+        {
+          "kind": "claim",
+          "key": "claim:2",
+          "claimId": 2,
+          "text": "战时人物资料说明War Relocation Authority雇佣Lange拍摄日裔社区、处理中心和营地。"
+        },
+        {
+          "kind": "claim",
+          "key": "claim:3",
+          "claimId": 3,
+          "text": "WRA成立时行政归属Office for Emergency Management。"
+        }
+      ],
+      "links": [
+        {
+          "key": "claim:1:citation:0",
+          "claimId": 1,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 1,
+            "sourceSnapshotId": 1,
+            "locator": {
+              "start": 213,
+              "end": 305,
+              "quote": "a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children"
+            }
+          }
+        },
+        {
+          "key": "claim:2:citation:0",
+          "claimId": 2,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "Soon after, the War Relocation Authority hired Lange to photograph Japanese neighborhoods, processing centers, and camp facilities.",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 2,
+            "sourceSnapshotId": 2,
+            "locator": {
+              "start": 441,
+              "end": 572,
+              "quote": "Soon after, the War Relocation Authority hired Lange to photograph Japanese neighborhoods, processing centers, and camp facilities."
+            }
+          }
+        },
+        {
+          "key": "claim:3:citation:0",
+          "claimId": 3,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "Established: In the Office for Emergency Management by EO 9102, March 18, 1942.",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 3,
+            "sourceSnapshotId": 3,
+            "locator": {
+              "start": 224,
+              "end": 303,
+              "quote": "Established: In the Office for Emergency Management by EO 9102, March 18, 1942."
+            }
+          }
+        },
+        {
+          "key": "claim:3:citation:1",
+          "claimId": 3,
+          "evidenceIndex": 1,
+          "relation": "supports",
+          "valid": true,
+          "display": "Records of the War Relocation Authority [WRA]",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 3,
+            "sourceSnapshotId": 3,
+            "locator": {
+              "start": 177,
+              "end": 222,
+              "quote": "Records of the War Relocation Authority [WRA]"
+            }
+          }
+        }
+      ],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [
+          {
+            "claimId": 1,
+            "evidenceIndex": 0,
+            "valid": true
+          },
+          {
+            "claimId": 2,
+            "evidenceIndex": 0,
+            "valid": true
+          },
+          {
+            "claimId": 3,
+            "evidenceIndex": 0,
+            "valid": true
+          },
+          {
+            "claimId": 3,
+            "evidenceIndex": 1,
+            "valid": true
+          }
+        ],
+        "sourceBindings": [
+          {
+            "sourceSnapshotId": 1,
+            "sample": "migrant-mother-record",
+            "file": "source.md"
+          },
+          {
+            "sourceSnapshotId": 2,
+            "sample": "lange-wartime-profile",
+            "file": "source.md"
+          },
+          {
+            "sourceSnapshotId": 3,
+            "sample": "wra-institution-history",
+            "file": "source.md"
+          }
+        ]
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "work-creator",
+            "text": "Migrant Mother系列的摄影者为Dorothea Lange。",
+            "required": true,
+            "acceptable": [
+              "Migrant Mother系列的摄影者为Dorothea Lange。"
+            ],
+            "conditions": [],
+            "entities": [
+              "migrant-mother",
+              "dorothea-lange"
+            ],
+            "evidence": [
+              {
+                "sample": "migrant-mother-record",
+                "start": 213,
+                "end": 305,
+                "quote": "a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "creator-employer",
+            "text": "战时人物资料说明War Relocation Authority雇佣Lange拍摄日裔社区、处理中心和营地。",
+            "required": true,
+            "acceptable": [
+              "战时人物资料说明War Relocation Authority雇佣Lange拍摄日裔社区、处理中心和营地。"
+            ],
+            "conditions": [
+              "1942-wartime-context;exact-hire-day-not-provided"
+            ],
+            "entities": [
+              "dorothea-lange",
+              "war-relocation-authority"
+            ],
+            "evidence": [
+              {
+                "sample": "lange-wartime-profile",
+                "start": 441,
+                "end": 572,
+                "quote": "Soon after, the War Relocation Authority hired Lange to photograph Japanese neighborhoods, processing centers, and camp facilities.",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "agency-parent",
+            "text": "WRA成立时行政归属Office for Emergency Management。",
+            "required": true,
+            "acceptable": [
+              "WRA成立时行政归属Office for Emergency Management。"
+            ],
+            "conditions": [
+              "at-establishment"
+            ],
+            "entities": [
+              "war-relocation-authority",
+              "office-for-emergency-management"
+            ],
+            "evidence": [
+              {
+                "sample": "wra-institution-history",
+                "start": 224,
+                "end": 303,
+                "quote": "Established: In the Office for Emergency Management by EO 9102, March 18, 1942.",
+                "relation": "support"
+              },
+              {
+                "sample": "wra-institution-history",
+                "start": 177,
+                "end": 222,
+                "quote": "Records of the War Relocation Authority [WRA]",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [
+          {
+            "id": "work-person-institution",
+            "claims": [
+              "work-creator",
+              "creator-employer",
+              "agency-parent"
+            ],
+            "links": [
+              {
+                "from": "work-creator",
+                "to": "creator-employer",
+                "entity": "dorothea-lange"
+              },
+              {
+                "from": "creator-employer",
+                "to": "agency-parent",
+                "entity": "war-relocation-authority"
+              }
+            ]
+          }
+        ],
+        "forbidden": [
+          "把作品被摄者Florence Owens Thompson说成摄影者。",
+          "把1942年的WRA雇佣倒填为1936年该作品的拍摄机构。",
+          "凭Pearl Harbor相对表述捏造具体雇佣日，或省略人物/机构中间连接。",
+          "把1944年转归内政部说成1942年成立时的行政归属。"
+        ]
+      },
+      "sources": [
+        {
+          "sourceSnapshotId": 1,
+          "text": "# Library of Congress Migrant Mother collection guide\n\nSource: https://guides.loc.gov/migrant-mother\nRetrieved: 2026-10-11T13:39:42.197464+00:00\n\nThe photograph that has become known as \"Migrant Mother\" is one of a series of photographs that Dorothea Lange made of Florence Owens Thompson and her children in March of 1936 in Nipomo, California. Lange was concluding a month's trip photographing migratory farm labor around the state for what was then the Resettlement Administration.\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 1,
+            "sample": "migrant-mother-record",
+            "file": "source.md"
+          }
+        },
+        {
+          "sourceSnapshotId": 2,
+          "text": "# Library of Congress Dorothea Lange profile excerpt\n\nSource: https://www.loc.gov/exhibits/wcf/wcf0013.html\nRetrieved: 2026-10-11T13:41:42.629556+00:00\n\nLike Esther Bubley, Dorothea Lange (1895-1965) documented the change on the homefront, especially among ethnic groups and workers uprooted by the war. Three months after Pearl Harbor, President Franklin Roosevelt ordered the relocation of Japanese-Americans into armed camps in the West. Soon after, the War Relocation Authority hired Lange to photograph Japanese neighborhoods, processing centers, and camp facilities.\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 2,
+            "sample": "lange-wartime-profile",
+            "file": "source.md"
+          }
+        },
+        {
+          "sourceSnapshotId": 3,
+          "text": "# National Archives WRA administrative history excerpt\n\nSource: https://www.archives.gov/research/guide-fed-records/groups/210.html\nRetrieved: 2026-10-11T13:41:45.253401+00:00\n\nRecords of the War Relocation Authority [WRA]\n\nEstablished: In the Office for Emergency Management by EO 9102, March 18, 1942. Predecessor Agencies: Wartime Civil Control Administration (WCCA), Western Defense Command (1942) Transfers: To the Department of the Interior by EO 9423, February 16, 1944.\n",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 3,
+            "sample": "wra-institution-history",
+            "file": "source.md"
+          }
+        }
+      ],
+      "rule": "Independent synthetic Report and source frame; all sources are declared quality-side reference material. Synthetic native IDs do not claim a real product execution."
+    }
+  },
+  "references": [
+    {
+      "metricId": "DR06",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The independent source, fact, citation or complete chain is explicitly present."
+    }
+  ],
+  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":1,\"matchUncertain\":false},{\"block\":1,\"start\":0,\"length\":54,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":2,\"matchUncertain\":false},{\"block\":2,\"start\":0,\"length\":42,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":3,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1},{\"atom\":1,\"state\":1},{\"atom\":2,\"state\":1},{\"atom\":2,\"state\":1}],\"chains\":[1]}}"
+}

@@ -1,0 +1,230 @@
+{
+  "contract": "flowmate-judge-calibration/v1",
+  "version": "v1",
+  "samples": [
+    {
+      "id": "completion-verification-tune",
+      "file": "completion-verification-tune.json"
+    },
+    {
+      "id": "completion-verification-validation",
+      "file": "completion-verification-validation.json"
+    },
+    {
+      "id": "false-completion-tune",
+      "file": "false-completion-tune.json"
+    },
+    {
+      "id": "false-completion-validation",
+      "file": "false-completion-validation.json"
+    },
+    {
+      "id": "clarification-decision-tune",
+      "file": "clarification-decision-tune.json"
+    },
+    {
+      "id": "clarification-decision-validation",
+      "file": "clarification-decision-validation.json"
+    },
+    {
+      "id": "tool-selection-tune",
+      "file": "tool-selection-tune.json"
+    },
+    {
+      "id": "tool-selection-validation",
+      "file": "tool-selection-validation.json"
+    },
+    {
+      "id": "tool-arguments-tune",
+      "file": "tool-arguments-tune.json"
+    },
+    {
+      "id": "tool-arguments-validation",
+      "file": "tool-arguments-validation.json"
+    },
+    {
+      "id": "tool-result-use-tune",
+      "file": "tool-result-use-tune.json"
+    },
+    {
+      "id": "tool-result-use-validation",
+      "file": "tool-result-use-validation.json"
+    },
+    {
+      "id": "redundant-tools-tune",
+      "file": "redundant-tools-tune.json"
+    },
+    {
+      "id": "redundant-tools-validation",
+      "file": "redundant-tools-validation.json"
+    },
+    {
+      "id": "skill-selection-tune",
+      "file": "skill-selection-tune.json"
+    },
+    {
+      "id": "skill-selection-validation",
+      "file": "skill-selection-validation.json"
+    },
+    {
+      "id": "skill-guidance-tune",
+      "file": "skill-guidance-tune.json"
+    },
+    {
+      "id": "skill-guidance-validation",
+      "file": "skill-guidance-validation.json"
+    },
+    {
+      "id": "progressive-reading-tune",
+      "file": "progressive-reading-tune.json"
+    },
+    {
+      "id": "progressive-reading-validation",
+      "file": "progressive-reading-validation.json"
+    },
+    {
+      "id": "context-coverage-tune",
+      "file": "context-coverage-tune.json"
+    },
+    {
+      "id": "context-coverage-validation",
+      "file": "context-coverage-validation.json"
+    },
+    {
+      "id": "current-fact-use-tune",
+      "file": "current-fact-use-tune.json"
+    },
+    {
+      "id": "current-fact-use-validation",
+      "file": "current-fact-use-validation.json"
+    },
+    {
+      "id": "history-use-tune",
+      "file": "history-use-tune.json"
+    },
+    {
+      "id": "history-use-validation",
+      "file": "history-use-validation.json"
+    },
+    {
+      "id": "user-correction-tune",
+      "file": "user-correction-tune.json"
+    },
+    {
+      "id": "user-correction-validation",
+      "file": "user-correction-validation.json"
+    },
+    {
+      "id": "compaction-retention-tune",
+      "file": "compaction-retention-tune.json"
+    },
+    {
+      "id": "compaction-retention-validation",
+      "file": "compaction-retention-validation.json"
+    },
+    {
+      "id": "post-compaction-success-tune",
+      "file": "post-compaction-success-tune.json"
+    },
+    {
+      "id": "post-compaction-success-validation",
+      "file": "post-compaction-success-validation.json"
+    },
+    {
+      "id": "delegation-decision-tune",
+      "file": "delegation-decision-tune.json"
+    },
+    {
+      "id": "delegation-decision-validation",
+      "file": "delegation-decision-validation.json"
+    },
+    {
+      "id": "subtask-success-tune",
+      "file": "subtask-success-tune.json"
+    },
+    {
+      "id": "subtask-success-validation",
+      "file": "subtask-success-validation.json"
+    },
+    {
+      "id": "subtask-result-use-tune",
+      "file": "subtask-result-use-tune.json"
+    },
+    {
+      "id": "subtask-result-use-validation",
+      "file": "subtask-result-use-validation.json"
+    },
+    {
+      "id": "model-violation-tune",
+      "file": "model-violation-tune.json"
+    },
+    {
+      "id": "model-violation-validation",
+      "file": "model-violation-validation.json"
+    },
+    {
+      "id": "illegal-request-blocking-tune",
+      "file": "illegal-request-blocking-tune.json"
+    },
+    {
+      "id": "illegal-request-blocking-validation",
+      "file": "illegal-request-blocking-validation.json"
+    },
+    {
+      "id": "actual-leakage-tune",
+      "file": "actual-leakage-tune.json"
+    },
+    {
+      "id": "actual-leakage-validation",
+      "file": "actual-leakage-validation.json"
+    },
+    {
+      "id": "legal-request-rejection-tune",
+      "file": "legal-request-rejection-tune.json"
+    },
+    {
+      "id": "legal-request-rejection-validation",
+      "file": "legal-request-rejection-validation.json"
+    },
+    {
+      "id": "dr01-tune",
+      "file": "dr01-tune.json"
+    },
+    {
+      "id": "dr02-tune",
+      "file": "dr02-tune.json"
+    },
+    {
+      "id": "dr04-tune",
+      "file": "dr04-tune.json"
+    },
+    {
+      "id": "dr05-tune",
+      "file": "dr05-tune.json"
+    },
+    {
+      "id": "dr06-tune",
+      "file": "dr06-tune.json"
+    },
+    {
+      "id": "dr01-validation",
+      "file": "dr01-validation.json"
+    },
+    {
+      "id": "dr02-validation",
+      "file": "dr02-validation.json"
+    },
+    {
+      "id": "dr04-validation",
+      "file": "dr04-validation.json"
+    },
+    {
+      "id": "dr05-validation",
+      "file": "dr05-validation.json"
+    },
+    {
+      "id": "dr06-validation",
+      "file": "dr06-validation.json"
+    }
+  ]
+}

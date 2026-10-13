@@ -16,7 +16,7 @@ export const Database = process.versions.bun ? (await import('bun:sqlite')).Data
   close() { this.db.close(); }
 };
 
-export async function createHttpProvider(fetch: (request: Request) => Response | Promise<Response>) {
+export async function createHttpProvider(fetch: (request: Request) => Response | Promise<Response>, hostname = '127.0.0.1') {
   const server = createServer(async (request, response) => {
     const abort = new AbortController();
     response.on('close', () => abort.abort());
@@ -34,7 +34,7 @@ export async function createHttpProvider(fetch: (request: Request) => Response |
       else response.end();
     } catch (error) { if (!response.destroyed) response.destroy(error instanceof Error ? error : new Error(String(error))); }
   });
-  server.listen(0, '127.0.0.1');
+  server.listen(0, hostname);
   await once(server, 'listening');
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Controlled Provider has no port.');

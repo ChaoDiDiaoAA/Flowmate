@@ -90,6 +90,22 @@ export type ToolCallCleanup = {
   nativeOutputs?: NativeOutputRecord[];
 };
 
+const nativeRecordId = z.string().min(1).max(256).refine(value => !/[\x00-\x1f\x7f]/.test(value));
+const nativeProcessSchema = z.object({ nativeToolCallId: nativeRecordId, pid: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  identity: nativeRecordId, executable: z.string().min(1).max(4096).refine(value => !/[\x00-\x1f\x7f]/.test(value)),
+  startedAt: z.string().datetime(), stopped: z.boolean(), stoppedAt: z.string().datetime().optional(),
+  exitCode: z.number().int().nullable().optional() }).strict().superRefine((record, context) => {
+  if (!record.stopped && (record.stoppedAt !== undefined || record.exitCode !== undefined))
+    context.addIssue({ code: 'custom', message: 'An active process cannot have terminal facts.' });
+});
+const nativeOutputSchema = z.object({ nativeToolCallId: nativeRecordId,
+  fileName: z.string().min(1).max(255).refine(value => !/[\\/:\x00-\x1f\x7f]/.test(value) && value !== '.' && value !== '..'),
+  bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), truncated: z.boolean(),
+  observedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict().refine(record => record.observedBytes >= record.bytes);
+export const ToolCallCleanupSchema: z.ZodType<ToolCallCleanup> = z.object({ version: z.literal(1), stopReason: z.string().nullable(),
+  stopped: z.boolean(), errors: z.array(AppErrorSchema), nativeProcesses: z.array(nativeProcessSchema).max(24).optional(),
+  nativeOutputs: z.array(nativeOutputSchema).max(24).optional() }).strict();
+
 const observationConclusion = z.enum(['valid', 'invalid', 'not_applicable', 'unknown']);
 export const ToolRuntimeObservationSchema = z.object({
   version: z.literal(1),

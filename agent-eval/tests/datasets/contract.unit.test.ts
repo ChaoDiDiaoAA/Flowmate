@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { caseSchema, checkSchema, resolveCase } from '../../src/datasets/local.ts';
+import { caseSchema, checkSchema, resolveCase } from '../../src/dataset-loader/local.ts';
 import { evaluateAll } from '../../src/scoring/evaluate.ts';
 import { task, dataset, observed, projected } from '../support/fixtures.ts';
 
