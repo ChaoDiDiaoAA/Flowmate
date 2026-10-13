@@ -19,7 +19,20 @@ export async function evaluateAll(context: EvaluationContext, checks: Check[], r
                 statistics:{unit:metric.unit,numerator:null,denominator:plan.denominator??null,missing:plan.denominator??null}}];
         }):[];
         const graded = [...scores, ...semantic.scores,...researchGaps, ...evaluateCaseConstraints(context)];
-        const combined = [...graded,...evaluateFormalMetrics({...context,gradedScores:graded})];
+        const captureGaps = context.result.evidence['capture-gaps'];
+        const captureFailed = captureGaps?.present === false && Array.isArray(captureGaps.actual) &&
+            captureGaps.actual.some(gap => typeof gap === 'string' && gap.trim());
+        const combined = [...graded,...evaluateFormalMetrics({...context,gradedScores:graded})].map(score => {
+            if (score.status !== 'UNJUDGEABLE') return score;
+            const missing = score.evidence.filter(key => key !== 'research-frame' && !key.startsWith('gold-') && !key.startsWith('judge-') && !context.result.evidence[key]?.present);
+            const failed = missing.some(key => {
+                const actual = context.result.evidence[key]?.actual;
+                return actual !== null && typeof actual === 'object' && 'gap' in actual && typeof actual.gap === 'string' && !!actual.gap.trim();
+            });
+            if (!failed && !(captureFailed && missing.length)) return score;
+            return { ...score, status: 'ERROR' as const, reason: '必要证据采集失败，详见原始采证缺口',
+                evidence: captureFailed ? [...score.evidence, 'capture-gaps'] : score.evidence };
+        });
         const measured=combined.filter(s=>!s.metricId.startsWith('fact-check/')).map(s=>s.metricId);
         if(new Set(measured).size!==measured.length)throw new Error('Duplicate original metric measurement');
         const f1 = deriveResearchF1('contract' in context.task ? context.task.expected.metrics : undefined, combined, context.result);

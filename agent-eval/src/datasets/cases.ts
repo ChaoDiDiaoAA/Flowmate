@@ -1,6 +1,8 @@
 import type { AuthorDataset } from '../dataset-loader/authoring.ts';
 
 // English declarations for the Flowmate v1 benchmark. Answers stay in gold.ts.
+import manualCompactionUserHistory from '../testing/fixtures/manual-compaction-user-history.json';
+
 export const flowmateAgentV1Dataset = {
   version: 'v1',
   cases: [
@@ -784,6 +786,7 @@ export const flowmateAgentV1Dataset = {
     input: {
       prompt: "Read this invoice and remember its number, amounts and sources. I supply USD as the currency. Do not save yet.",
       turns: [
+        ...manualCompactionUserHistory.map(turn => ({ ...turn, role: "user" as const })),
         {"id":"correction","role":"user","content":"The supplied currency is now CNY. Retain its user source and existing document references; do not save yet."},
         {"id":"request","role":"user","content":"Continue with the latest effective history and save the invoice, distinguishing user corrections from document evidence."},
       ],

@@ -6,19 +6,63 @@ import type { ContextEvidenceReason, Result } from '@flowmate/contracts';
 
 export type InclusionFact = { inclusion: 'confirmed'; reason: null } | { inclusion: 'unavailable'; reason: ContextEvidenceReason };
 type ExpectedUser = { texts: string[]; images: string[]; toolIds?: string[]; order?: ('text' | 'image')[] };
-export type PayloadCodec = { api: 'openai-completions' | 'openai-responses'; users: ExpectedUser[]; toolImages: { callId: string; texts: string[]; images: string[] }[] };
+type AnthropicContent = { type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+type AnthropicBlock = AnthropicContent | { type: 'tool_result'; tool_use_id: string; content: string | AnthropicContent[]; is_error: boolean };
+type OpenAIPayloadCodec = { api: 'openai-completions' | 'openai-responses'; users: ExpectedUser[]; toolImages: { callId: string; texts: string[]; images: string[] }[] };
+export type PayloadCodec = OpenAIPayloadCodec
+  | { api: 'anthropic-messages'; users: AnthropicBlock[][] };
 const imageCaption = 'Attached image(s) from tool result:';
 const mismatch = () => fail(appError('context_payload_mismatch', 'runtime', 'The outgoing payload does not preserve the request inputs.'));
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
+const anthropicToolId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+function anthropicContent(block: { type: 'text'; text: string } | { type: 'image'; mimeType: string; data: string }): AnthropicContent {
+  return block.type === 'text' ? { type: 'text', text: sanitizeSurrogates(block.text) }
+    : { type: 'image', source: { type: 'base64', media_type: block.mimeType, data: block.data } };
+}
+function withoutAnthropicCache(raw: unknown): unknown {
+  const block = record(raw); if (!block) return raw;
+  const { cache_control: _cache, ...content } = block;
+  return Array.isArray(content.content) ? { ...content, content: content.content.map(withoutAnthropicCache) } : content;
+}
 
 /** Message boundaries remain intact; identity was established before this text codec. */
 export function preparePayloadCodec(api: string, context: Pick<Context, 'messages'>, supportsImages: boolean): Result<PayloadCodec | undefined> {
   const hasImages = context.messages.some(m => Array.isArray(m.content) && m.content.some(b => b.type === 'image'));
-  if (hasImages && (!supportsImages || !['openai-completions', 'openai-responses'].includes(api))) return mismatch();
+  if (hasImages && (!supportsImages || !['openai-completions', 'openai-responses', 'anthropic-messages'].includes(api))) return mismatch();
+  if (api === 'anthropic-messages') {
+    const users: AnthropicBlock[][] = [], toolIds = new Map<string, string>();
+    for (const message of context.messages) if (message.role === 'assistant') for (const block of message.content) {
+      if (block.type === 'toolCall') toolIds.set(block.id, message.api === api ? block.id : anthropicToolId(block.id));
+    }
+    for (let index = 0; index < context.messages.length; index++) {
+      const message = context.messages[index]!;
+      if (message.role === 'user') {
+        const blocks = typeof message.content === 'string'
+          ? message.content.trim() ? [{ type: 'text' as const, text: sanitizeSurrogates(message.content) }] : []
+          : message.content.map(anthropicContent).filter(block => block.type !== 'text' || block.text.trim());
+        if (blocks.length) users.push(blocks);
+      } else if (message.role === 'toolResult') {
+        const blocks: AnthropicBlock[] = [];
+        while (index < context.messages.length && context.messages[index]!.role === 'toolResult') {
+          const result = context.messages[index]!;
+          if (result.role !== 'toolResult') return mismatch();
+          // shortcut: deferred tool references displace content; require a dedicated codec before confirming them.
+          if (result.addedToolNames?.length) return hasImages ? mismatch() : ok(undefined);
+          const content = result.content.some(block => block.type === 'image') ? result.content.map(anthropicContent)
+            : sanitizeSurrogates(result.content.map(block => block.type === 'text' ? block.text : '').join('\n'));
+          if (Array.isArray(content) && !content.some(block => block.type === 'text')) content.unshift({ type: 'text', text: '(see attached image)' });
+          blocks.push({ type: 'tool_result', tool_use_id: toolIds.get(result.toolCallId) ?? result.toolCallId, content, is_error: result.isError });
+          index++;
+        }
+        index--; users.push(blocks);
+      }
+    }
+    return ok({ api, users });
+  }
   if (api !== 'openai-completions' && api !== 'openai-responses') return ok(undefined);
-  const users: ExpectedUser[] = []; const toolImages: PayloadCodec['toolImages'] = [];
+  const users: ExpectedUser[] = []; const toolImages: OpenAIPayloadCodec['toolImages'] = [];
   for (let index = 0; index < context.messages.length; index++) {
     const message = context.messages[index]!;
     if (message.role === 'user') {
@@ -50,6 +94,24 @@ export function checkPayload(codec: PayloadCodec | undefined, payload: unknown):
   if (!codec) return ok({ inclusion: 'unavailable', reason: 'payload_codec_unavailable' });
   const body = record(payload), messages = body?.[codec.api === 'openai-responses' ? 'input' : 'messages'];
   if (!Array.isArray(messages)) return mismatch();
+  if (codec.api === 'anthropic-messages') {
+    let userIndex = 0;
+    for (let index = 0; index < messages.length; index++) {
+      const message = record(messages[index]); if (!message) return mismatch();
+      if (message.role !== 'user') continue;
+      const expected = codec.users[userIndex++];
+      const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }]
+        : Array.isArray(message.content) ? message.content.map(withoutAnthropicCache) : null;
+      if (!expected || !isDeepStrictEqual(blocks, expected)) return mismatch();
+      const tools = expected.filter(block => block.type === 'tool_result');
+      if (tools.length) {
+        const previous = record(messages[index - 1]), previousBlocks = previous?.content;
+        if (previous?.role !== 'assistant' || !Array.isArray(previousBlocks) || tools.some(tool =>
+          previousBlocks.filter(raw => record(raw)?.type === 'tool_use' && record(raw)?.id === tool.tool_use_id).length !== 1)) return mismatch();
+      }
+    }
+    return userIndex === codec.users.length ? ok({ inclusion: 'confirmed', reason: null }) : mismatch();
+  }
   let userIndex = 0; let toolImageIndex = 0;
   for (let index = 0; index < messages.length; index++) {
     const message = record(messages[index]);
@@ -116,22 +178,44 @@ export type ResourceInclusion = { inclusion: 'confirmed' | 'not-included' | 'unk
 /** Compare only the declared carrier; an assistant quoting a Skill is not input evidence. */
 export function checkResourcePayload(api: string, payload: unknown, expected: readonly ResourcePayloadText[]): ResourceInclusion[] {
   const unknown = (reason: string) => expected.map(() => ({ inclusion: 'unknown' as const, reason }));
-  if (api !== 'openai-completions' && api !== 'openai-responses') return unknown('payload_codec_unavailable');
+  if (api !== 'openai-completions' && api !== 'openai-responses' && api !== 'anthropic-messages') return unknown('payload_codec_unavailable');
   const body = record(payload), messages = body?.[api === 'openai-responses' ? 'input' : 'messages'];
   if (!Array.isArray(messages)) return unknown('payload_shape_unavailable');
-  const carriers = messages.flatMap(raw => {
+  const text = (content: unknown): string | null => {
+    if (typeof content === 'string') return content;
+    if (content === undefined) return '';
+    if (!Array.isArray(content) || content.some(raw => {
+      const block = record(raw);
+      return !block || !['text', 'image', 'tool_result'].includes(String(block.type)) || block.type === 'text' && typeof block.text !== 'string';
+    })) return null;
+    return content.flatMap(block => record(block)?.type === 'text' ? [record(block)!.text as string] : []).join('\n');
+  };
+  const carriers = messages.flatMap<{ role: unknown; text: string | null; toolCallId: unknown }>(raw => {
     const message = record(raw); if (!message) return [];
+    if (api === 'anthropic-messages') {
+      if (message.role !== 'user') return [];
+      const blocks = Array.isArray(message.content) ? message.content : [];
+      return [{ role: 'user', text: text(message.content), toolCallId: undefined }, ...blocks.flatMap(raw => {
+        const block = record(raw);
+        return block?.type === 'tool_result' ? [{ role: 'tool', text: text(block.content), toolCallId: block.tool_use_id }] : [];
+      })];
+    }
     const role = message.type === 'function_call_output' ? 'tool' : message.role === 'developer' ? 'system' : message.role;
     const content = message.type === 'function_call_output' ? message.output : message.content;
     const texts = typeof content === 'string' ? [content] : Array.isArray(content)
       ? content.flatMap(block => typeof record(block)?.text === 'string' ? [record(block)!.text as string] : []) : [];
     return [{ role, text: texts.join('\n'), toolCallId: message.tool_call_id ?? message.call_id }];
   });
-  return expected.map(item => item.text === null ? { inclusion: 'unknown', reason: 'derived-source-only' }
-    : { inclusion: carriers.some(carrier => carrier.role === item.role
-      && (item.toolCallId === undefined || carrier.toolCallId === item.toolCallId.split('|')[0])
-      && (item.role === 'system' || item.contains ? carrier.text.includes(sanitizeSurrogates(item.text!)) : carrier.text === sanitizeSurrogates(item.text!)))
-      ? 'confirmed' : 'not-included', reason: null });
+  if (api === 'anthropic-messages') carriers.push({ role: 'system', text: text(body?.system), toolCallId: undefined });
+  return expected.map(item => {
+    if (item.text === null) return { inclusion: 'unknown', reason: 'derived-source-only' };
+    const matching = carriers.filter(carrier => carrier.role === item.role && (item.toolCallId === undefined ||
+      carrier.toolCallId === (api === 'anthropic-messages' ? anthropicToolId(item.toolCallId) : item.toolCallId.split('|')[0])));
+    if (matching.some(carrier => carrier.text !== null && (item.role === 'system' || item.contains
+      ? carrier.text.includes(sanitizeSurrogates(item.text!)) : carrier.text === sanitizeSurrogates(item.text!)))) return { inclusion: 'confirmed', reason: null };
+    return matching.some(carrier => carrier.text === null) ? { inclusion: 'unknown', reason: 'payload_shape_unavailable' }
+      : { inclusion: 'not-included', reason: null };
+  });
 }
 
 export async function checkResourceWire(api: string, request: RequestInfo | URL, init: RequestInit | undefined,

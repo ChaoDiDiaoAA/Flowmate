@@ -1,3 +1,4 @@
+import { judgeResponse } from '../support/judge-response.ts';
 import { mkdtempSync } from '../../../tests/support/resources.ts';
 import { test, expect } from 'bun:test';
 import { randomUUID } from 'node:crypto';
@@ -79,12 +80,12 @@ test('Runner binds one compact Judge per Trial, distinct ratios and original cou
         return prepare(trial, signal);
     };
     const run = await runLocal(REPO_ROOT, { dataset: data, executionId: id, backend: 'local', judge: 'auto', repeat: 2 }, { kernel: product,
-        env: { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic', FLOWMATE_JUDGE_API_KEY: 'synthetic-batch-key',
+        env: { FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile', FLOWMATE_JUDGE_API_KEY: 'synthetic-batch-key',
             FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1' }, fetcher: async (_, init) => {
-            requests++; const body = JSON.parse(String(init.body)); expect(body).not.toHaveProperty('max_tokens');expect(body).not.toHaveProperty('temperature');
+            requests++; const body = JSON.parse(String(init.body)); expect(body).toHaveProperty('max_completion_tokens', 32768);expect(body).not.toHaveProperty('temperature');
             expect(JSON.parse(body.messages[1].content).plan.criteria).toHaveLength(2);
             expect(JSON.parse(body.messages[1].content).plan.criteria).toEqual(selectedCriteria);
-            return new Response(JSON.stringify({ choices: [{ message: { content: '{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}' }, finish_reason: 'stop' }] }));
+            return judgeResponse({ choices: [{ message: { content: '{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}' }, finish_reason: 'stop' }] });
         } });
     expect(requests).toBe(2);
     expect(run.report.trials.map(t => t.judgeCalls.length)).toEqual([1, 1]);
@@ -106,8 +107,8 @@ test('compact selection and required criteria are checked before Agent preparati
 });
 test('requiring a Judge preserves the Case distinction between optional process metrics and necessary task predicates',async()=>{
     const data=semanticDataset();data.cases[0]!.expected.semantic!.criteria[0]!.required=false;
-    const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'optional-process-'+randomUUID(),backend:'local',judge:'required'},{kernel:kernel(),env:{FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic',FLOWMATE_JUDGE_API_KEY:'synthetic-optional-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
-        fetcher:async()=>new Response(JSON.stringify({choices:[{message:{content:'{"v":1,"r":[[0,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]}))});
+    const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'optional-process-'+randomUUID(),backend:'local',judge:'required'},{kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'synthetic-optional-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
+        fetcher:async()=>judgeResponse({choices:[{message:{content:'{"v":1,"r":[[0,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]})});
     expect(run.report.trials[0]!.scores.find(s=>s.metricId==='tool-selection')).toMatchObject({status:'FAIL',required:false});
     expect(run.report.trials[0]!.status).toBe('PASS');
 });
@@ -276,9 +277,9 @@ test('unknown semantic denominators do not restore a removed Judge output budget
  for(const metric of data.cases[0]!.expected.metrics)if(!metric.notApplicable&&metric.metricId!=='task-success')metric.denominator=null;
  let requests=0;const product=kernel();
  const run=await runLocal(REPO_ROOT,{dataset:data,caseId:data.cases[0]!.id,executionId:id,backend:'local',judge:'required'},{kernel:product,
-  env:{FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic',FLOWMATE_JUDGE_API_KEY:'synthetic-bound-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
-  fetcher:async(_url,init)=>{requests++;expect(JSON.parse(String(init.body))).not.toHaveProperty('max_tokens');
-   return new Response(JSON.stringify({choices:[{message:{content:'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]}));}});
+  env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'synthetic-bound-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
+  fetcher:async(_url,init)=>{requests++;expect(JSON.parse(String(init.body))).toHaveProperty('max_completion_tokens', 32768);
+   return judgeResponse({choices:[{message:{content:'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]});}});
  expect(requests).toBe(1);expect(run.report.trials[0]!.judgeCalls).toHaveLength(1);expect(existsSync(run.file)).toBe(true);
 });
 for(const metric of ['skill-guidance','model-violation'] as const)test('declared '+metric+' grades survive saving and a hard failure cannot become a passing report',async()=>{
@@ -289,8 +290,8 @@ for(const metric of ['skill-guidance','model-violation'] as const)test('declared
  item.expected.semantic=compileFormalSemanticPlan(item);data.cases=[item];
  data.manifest=manifestSchema.parse({...data.manifest,contract:'flowmate-agent-dataset/v2',environment:{...data.manifest.environment,profile:'isolated-agent/v2'},scoring:{...data.manifest.scoring,judges:[{id:'semantic-batch',required:true}]}});
  const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'declared-'+metric+'-'+randomUUID(),backend:'local',judge:'required'},
- {kernel:kernel(),env:{FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic',FLOWMATE_JUDGE_API_KEY:'declared-predicate-fake-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
- fetcher:async()=>new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({v:1,r:[metric==='model-violation'?[1,1,0]:[0,1,0]],f:[]})},finish_reason:'stop'}]}))});
+ {kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'declared-predicate-fake-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
+ fetcher:async()=>judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:[metric==='model-violation'?[1,1,0]:[0,1,0]],f:[]})},finish_reason:'stop'}]})});
  const loaded=readReport(run.file),trial=loaded.trials[0]!;
  expect(trial.semanticPlan!.criteria[0]!.required).toBe(true);
  const score=trial.scores.find(s=>s.metricId===metric);
@@ -308,7 +309,7 @@ test('cancellation during the only Judge request aborts transport and preserves 
     try {
         const { report } = await runLocal(REPO_ROOT, { dataset, caseId: task.id, executionId: id, repeat: 2, backend: 'local', judge: 'required' }, {
             kernel: product, signal: abort.signal,
-            env: { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic', FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-judge-key' },
+            env: { FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile', FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-judge-key' },
             fetcher: async (_, init) => { calls++; transport = init.signal; abort.abort(); return new Promise(() => {}); }
         });
         expect({ calls, prepared, aborted: transport?.aborted }).toEqual({ calls: 1, prepared: 1, aborted: true });

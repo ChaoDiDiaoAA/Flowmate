@@ -1,148 +1,263 @@
 import { expect, test } from 'bun:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { judgeConfig, prepareJudge, requestJudge } from '../../../src/scoring/judges/client.ts';
+import { judgeConfig, prepareJudge, publicJudgeConfig, requestJudge } from '../../../src/scoring/judges/client.ts';
 import { parseJudgment, runJudge } from '../../../src/scoring/judges/harness.ts';
+import { judgeResponse } from '../../support/judge-response.ts';
 
 const emptyRepo = join(tmpdir(), 'flowmate-client-unit-no-config');
-const env = { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'judge',
-    FLOWMATE_JUDGE_BASE_URL: 'https://example.com/v1', FLOWMATE_JUDGE_API_KEY: 'judge-key' };
-const configFor = (provider = 'openai-compatible', timeoutMs = '30000') => judgeConfig({ ...env,
+const env = { FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile', FLOWMATE_JUDGE_BASE_URL: 'https://example.com/v1', FLOWMATE_JUDGE_API_KEY: 'judge-key' };
+const configFor = (provider = 'openai-compatible', timeoutMs = '180000') => judgeConfig({ ...env,
+    FLOWMATE_JUDGE_MODEL: provider === 'anthropic' ? 'claude-haiku-4-5' : env.FLOWMATE_JUDGE_MODEL,
+    FLOWMATE_JUDGE_BASE_URL: provider === 'anthropic' ? 'https://example.com' : env.FLOWMATE_JUDGE_BASE_URL,
     FLOWMATE_JUDGE_PROVIDER: provider, FLOWMATE_JUDGE_TIMEOUT_MS: timeoutMs }, emptyRepo)!;
-const metadata = () => new Response(JSON.stringify({ id: 'canonical-judge', max_tokens: 64000 }));
-const answer = (provider: string, text: string, reason: string | undefined, usage: unknown = { output_tokens: 8 }) =>
-    new Response(JSON.stringify(provider === 'anthropic' ? { content: [{ type: 'text', text }], stop_reason: reason, usage }
-        : { choices: [{ message: { content: text }, finish_reason: reason }], usage }));
+const text = '{"score":1,"reason":"Supported"}';
+const answer = (provider: string, content: string, reason?: string, usage: unknown = { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 }) =>
+    judgeResponse(provider === 'anthropic' ? { content: [{ type: 'text', text: content }], stop_reason: reason, usage }
+        : { choices: [{ message: { content }, finish_reason: reason }], usage });
+const sse = (chunks: unknown[]) => new Response(chunks.map(chunk => 'data: ' + JSON.stringify(chunk) + '\n\n').join('') + 'data: [DONE]\n\n',
+    { headers: { 'content-type': 'text/event-stream' } });
+const abortingFetch = (_url: string, init: RequestInit): Promise<Response> => new Promise((_, reject) => {
+    if (init.signal?.aborted) reject(init.signal.reason);
+    else init.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+});
 
-test('Judge never inherits Agent credentials and rejects partial configuration', () => {
-    expect(judgeConfig({ FLOWMATE_LLM_MODEL: 'agent', FLOWMATE_LLM_API_KEY: 'agent-secret' }, emptyRepo)).toBeNull();
+test('Judge uses only its own required connection and defaults to the SDK completions API', () => {
+    expect(judgeConfig({ OPENAI_API_KEY: 'ambient-key', FLOWMATE_EVAL_AGENT_API_KEY: 'agent-secret' }, emptyRepo)).toBeNull();
     expect(() => judgeConfig({ FLOWMATE_JUDGE_MODEL: 'judge' }, emptyRepo)).toThrow('Incomplete');
+    expect(judgeConfig(env, emptyRepo)).toMatchObject({ api: 'openai-completions', timeoutMs: 180000 });
+    expect(() => judgeConfig({ ...env, FLOWMATE_JUDGE_API_KEY: '' }, emptyRepo)).toThrow('Incomplete');
 });
-test('retired environment variables do not restore temperature or an output budget', () => {
-    const config = judgeConfig({ ...env, FLOWMATE_JUDGE_TEMPERATURE: 'invalid-old-value', FLOWMATE_JUDGE_MAX_TOKENS: '256' }, emptyRepo)!;
-    expect(config).not.toHaveProperty('temperature');
-    expect(config).not.toHaveProperty('maxTokens');
+
+test('explicit Judge API overrides legacy provider mapping and invalid APIs or timeouts fail before dispatch', () => {
+    expect(judgeConfig({ ...env, FLOWMATE_JUDGE_PROVIDER: 'anthropic' }, emptyRepo)?.api).toBe('anthropic-messages');
+    expect(judgeConfig({ ...env, FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_API: 'openai-responses' }, emptyRepo)?.api).toBe('openai-responses');
+    expect(judgeConfig({ ...env, FLOWMATE_JUDGE_PROVIDER: 'retired', FLOWMATE_JUDGE_API: 'anthropic-messages' }, emptyRepo)?.api).toBe('anthropic-messages');
+    expect(judgeConfig({ ...env, FLOWMATE_JUDGE_PROVIDER: 'anthropic', FLOWMATE_JUDGE_API: '  ' }, emptyRepo)?.api).toBe('anthropic-messages');
+    for (const FLOWMATE_JUDGE_TIMEOUT_MS of ['0', '300001', '1.5', 'bad']) expect(() => judgeConfig({ ...env, FLOWMATE_JUDGE_TIMEOUT_MS }, emptyRepo)).toThrow('Invalid');
+    expect(() => judgeConfig({ ...env, FLOWMATE_JUDGE_API: 'unknown' }, emptyRepo)).toThrow('Invalid');
+    expect(judgeConfig({ ...env, FLOWMATE_JUDGE_TIMEOUT_MS: '300000' }, emptyRepo)?.timeoutMs).toBe(300000);
 });
-test('OpenAI-compatible preparation makes no request and generation omits sampling and token overrides', async () => {
-    const config = await prepareJudge(configFor(), async () => { throw Error('Metadata must not be requested'); });
+
+test('SDK completions uses catalog limits, the isolated key and one streamed generation without tools or sampling overrides', async () => {
+    const config = await prepareJudge(configFor(), async () => { throw Error('Preparation must stay offline'); });
     let calls = 0;
     const result = await requestJudge(config, 'rubric', 'untrusted evidence', async (url, init) => {
         calls++;
         expect(url).toBe('https://example.com/v1/chat/completions');
         const body = JSON.parse(String(init.body));
-        for (const field of ['temperature', 'max_tokens', 'max_completion_tokens']) expect(body).not.toHaveProperty(field);
-        expect((init.headers as Record<string, string>).authorization).toBe('Bearer judge-key');
-        return answer('openai-compatible', '{"score":1,"reason":"Supported"}', 'stop', { prompt_tokens: 10, completion_tokens: 8 });
+        expect(body).toMatchObject({ stream: true, max_completion_tokens: 32768, messages: [{ role: 'system', content: 'rubric' }, { role: 'user', content: 'untrusted evidence' }] });
+        for (const field of ['temperature', 'max_tokens', 'tools']) expect(body).not.toHaveProperty(field);
+        expect(new Headers(init.headers).get('authorization')).toBe('Bearer judge-key');
+        return answer('openai-compatible', text, 'stop');
     });
     expect(calls).toBe(1);
-    expect(result.text).toContain('Supported');
+    expect(result).toMatchObject({ text, stopReason: 'stop', rawStopReason: 'stop', responseComplete: true, usageSource: 'sdk', usage: { input: 10, output: 8, totalTokens: 18 } });
+    expect(config.modelCapabilities).toMatchObject({ contextWindow: 131072, maxTokens: 32768, source: 'pi-sdk-model-catalog' });
+    expect(JSON.stringify(publicJudgeConfig(config))).not.toContain('judge-key');
+    expect(publicJudgeConfig(config)).toMatchObject({ api: 'openai-completions', sdk: { ai: '0.85.1', codingAgent: '0.85.1' } });
+    expect(structuredClone(config)).not.toHaveProperty('runtime');
 });
-test('Anthropic prepares model capability once and reuses it for distinct single-attempt generations', async () => {
-    let metadataCalls = 0, generationCalls = 0;
+
+test('Anthropic uses the shared catalog and reuses prepared state for distinct single generations', async () => {
+    let generationCalls = 0;
     const fetcher = async (url: string, init: RequestInit) => {
-        expect((init.headers as Record<string, string>)['x-api-key']).toBe('judge-key');
-        if (init.method === 'GET') {
-            metadataCalls++;
-            expect(url).toBe('https://example.com/v1/models/judge');
-            expect(init.body).toBeUndefined();
-            return metadata();
-        }
         generationCalls++;
-        expect(url).toBe('https://example.com/v1/messages');
+        expect(init.method).toBe('POST');
+        expect(new URL(url).pathname).toBe('/v1/messages');
+        expect(new Headers(init.headers).get('x-api-key')).toBe('judge-key');
         const body = JSON.parse(String(init.body));
         expect(body.max_tokens).toBe(64000);
         expect(body).not.toHaveProperty('temperature');
-        return answer('anthropic', '{"score":1,"reason":"Supported"}', 'end_turn');
+        expect(body).not.toHaveProperty('tools');
+        return answer('anthropic', text, 'end_turn', { input_tokens: 10, output_tokens: 8 });
     };
     const config = await prepareJudge(configFor('anthropic'), fetcher);
-    expect(config.modelCapabilities).toEqual({ modelId: 'canonical-judge', maxOutputTokens: 64000, source: 'anthropic-models-api' });
+    expect(generationCalls).toBe(0);
+    expect(await prepareJudge(config, fetcher)).toBe(config);
     for (let i = 0; i < 2; i++) {
         const call = await runJudge(config, 'rubric', 'data', fetcher);
-        expect(call).toMatchObject({ attempts: 1, error: null, judgment: { score: 1, reason: 'Supported' } });
+        expect(call).toMatchObject({ attempts: 1, stopReason: 'stop', rawStopReason: 'end_turn', error: null, judgment: { score: 1, reason: 'Supported' } });
         expect(call.configuration.modelCapabilities).toEqual(config.modelCapabilities);
     }
-    expect(metadataCalls).toBe(1);
     expect(generationCalls).toBe(2);
 });
-test('Anthropic requires prepared capability instead of inventing a fallback limit', async () => {
+
+test('unknown models fail before generation rather than inventing capabilities', async () => {
     let calls = 0;
-    const result = await runJudge(configFor('anthropic'), 'rubric', 'data', async () => { calls++; return metadata(); });
+    const config = judgeConfig({ ...env, FLOWMATE_JUDGE_MODEL: 'synthetic-unknown-model' }, emptyRepo)!;
+    const result = await runJudge(config, 'rubric', 'data', async () => { calls++; throw Error('must not send'); });
     expect(result).toMatchObject({ attempts: 0, judgment: null });
-    expect(result.error).toContain('prepared model capability');
+    expect(result.error).toContain('catalog');
     expect(calls).toBe(0);
 });
-test('missing, invalid or unavailable Anthropic model capability fails without generation or fallback', async () => {
-    for (const value of [{ id: 'judge' }, { id: '', max_tokens: 8192 }, ...[null, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '8192'].map(max_tokens => ({ id: 'judge', max_tokens }))]) {
+
+test('DeepSeek native capabilities use the existing metadata resolution without a fallback limit', async () => {
+    const config = judgeConfig({ ...env, FLOWMATE_JUDGE_MODEL: 'deepseek-v4-pro', FLOWMATE_JUDGE_API: 'anthropic-messages',
+        FLOWMATE_JUDGE_BASE_URL: 'https://api.deepseek.com/anthropic' }, emptyRepo)!;
+    let calls = 0;
+    const prepared = await prepareJudge(config, async (url, init) => {
+        calls++;
+        expect(url).toBe('https://api.deepseek.com/models');
+        expect(init.method).toBe('GET');
+        expect(new Headers(init.headers).get('authorization')).toBe('Bearer judge-key');
+        return new Response(JSON.stringify({ data: [{ id: 'deepseek-v4-pro', owned_by: 'deepseek', context_window: 1048576,
+            max_output_tokens: 384000, effort: { supported_levels: ['high'] } }] }));
+    });
+    expect(prepared.modelCapabilities).toMatchObject({ contextWindow: 1048576, maxTokens: 384000, source: 'deepseek-models-api' });
+    expect(calls).toBe(1);
+    await expect(prepareJudge({ ...config }, async () => new Response(JSON.stringify({ data: [{ id: 'deepseek-v4-pro' }] })))).rejects.toThrow('no fallback limit');
+});
+
+test('preparation bounds DeepSeek metadata transport and JSON parsing that ignore cancellation', async () => {
+    await prepareJudge(configFor());
+    const config = judgeConfig({ ...env, FLOWMATE_JUDGE_MODEL: 'deepseek-v4-pro', FLOWMATE_JUDGE_API: 'anthropic-messages',
+        FLOWMATE_JUDGE_BASE_URL: 'https://api.deepseek.com/anthropic', FLOWMATE_JUDGE_TIMEOUT_MS: '10' }, emptyRepo)!;
+    for (const fetcher of [async () => new Promise<Response>(() => {}), async () => ({ ok: true, json: () => new Promise(() => {}) }) as Response]) {
+        await expect(Promise.race([prepareJudge(config, fetcher), new Promise((_, reject) => setTimeout(() => reject(Error('Preparation did not return')), 200))])).rejects.toThrow('Judge timeout');
+    }
+    const abort = new AbortController(); let calls = 0;
+    await expect(prepareJudge({ ...config, timeoutMs: 180000 }, async () => { calls++; abort.abort(); return new Promise(() => {}); }, abort.signal)).rejects.toThrow('Judge cancelled');
+    expect(calls).toBe(1);
+});
+
+test('malformed judgment text preserves the actual SDK response and usage', async () => {
+    const result = await runJudge(configFor('anthropic'), 'rubric', 'data', async () => answer('anthropic', 'not JSON', 'end_turn', { input_tokens: 7, output_tokens: 2 }));
+    expect(result).toMatchObject({ judgment: null, raw: 'not JSON', usage: { input: 7, output: 2 }, usageSource: 'sdk', attempts: 1, stopReason: 'stop', responseComplete: true });
+    expect(result.error).not.toBeNull();
+});
+
+test('SDK HTTP errors stay failed, unmeasured and single attempt without retries', async () => {
+    for (const status of [429, 500]) {
         let calls = 0;
-        await expect(prepareJudge(configFor('anthropic'), async (_, init) => {
-            calls++;
-            expect(init.method).toBe('GET');
-            return new Response(JSON.stringify(value));
-        })).rejects.toThrow('model metadata');
+        const result = await runJudge(configFor(), 'rubric', 'data', async () => { calls++; return new Response(JSON.stringify({ error: { message: 'Synthetic provider failure' } }), { status }); });
+        expect(result).toMatchObject({ judgment: null, responseComplete: false, attempts: 1, stopReason: 'error', usageSource: 'unknown' });
+        expect(result.error).toContain(String(status));
         expect(calls).toBe(1);
     }
-    await expect(prepareJudge(configFor('anthropic'), async () => new Response('private provider detail', { status: 404 }))).rejects.toThrow('Judge model metadata HTTP 404');
 });
-test('model metadata obeys timeout and cancellation without retry', async () => {
-    let calls = 0;
-    await expect(prepareJudge(configFor('anthropic', '5'), async () => { calls++; return new Promise(() => {}); })).rejects.toThrow('timeout');
-    expect(calls).toBe(1);
-    const abort = new AbortController(); abort.abort();
-    await expect(prepareJudge(configFor('anthropic'), async () => { throw Error('must not call'); }, abort.signal)).rejects.toThrow('cancelled');
-});
-test('Anthropic malformed output, HTTP errors and timeout retain failed single generation attempts', async () => {
-    const config = await prepareJudge(configFor('anthropic', '5'), async () => metadata());
-    let calls = 0;
-    const malformed = await runJudge(config, 'rubric', 'data', async () => { calls++; return answer('anthropic', 'not JSON', 'end_turn', { output_tokens: 2 }); });
-    expect(malformed).toMatchObject({ judgment: null, raw: 'not JSON', usage: { output_tokens: 2 }, attempts: 1 });
-    expect(calls).toBe(1);
-    const http = await runJudge(config, 'rubric', 'data', async () => new Response('provider detail', { status: 500 }));
-    expect(http).toMatchObject({ error: 'Judge HTTP 500', judgment: null, attempts: 1 });
-    const timeout = await runJudge(config, 'rubric', 'data', async () => new Promise(() => {}));
-    expect(timeout.error).toContain('timeout');
-    expect(timeout.judgment).toBeNull();
-});
-test('strict structured score rejects malformed, out-of-range and empty explanations', () => {
-    expect(parseJudgment('{"score":0.5,"reason":"Partial evidence"}').score).toBe(0.5);
-    for (const text of ['bad', '{}', '{"score":2,"reason":"x"}', '{"score":1,"reason":" "}', '{"score":"1","reason":"x"}'])
-        expect(() => parseJudgment(text)).toThrow();
-});
-test('direct transport rejects retired configuration fields before dispatch', async () => {
-    let calls = 0;
-    const config = Object.assign(configFor(), { maxTokens: 256, temperature: 0.8 });
-    await expect(requestJudge(config, 'rubric', 'data', async () => { calls++; throw Error('must not call'); })).rejects.toThrow();
-    expect(calls).toBe(0);
-});
-test('truncated or incomplete responses retain original text, usage and stop reason without a judgment or retry', async () => {
-    for (const provider of ['openai-compatible', 'anthropic'] as const) {
-        const config = await prepareJudge(configFor(provider), async () => metadata());
-        for (const reason of [provider === 'anthropic' ? 'max_tokens' : 'length', 'unknown-reason', undefined]) {
-            let calls = 0;
-            const text = '{"score":1,"reason":"Looks complete but the provider did not complete."}', usage = { input_tokens: 7, output_tokens: 256 };
-            const result = await runJudge(config, 'rubric', 'data', async () => { calls++; return answer(provider, text, reason, usage); });
-            expect(result).toMatchObject({ judgment: null, raw: text, usage, finishReason: reason ?? null, responseComplete: false, attempts: 1 });
-            expect(result.error).toContain('incomplete');
-            expect(calls).toBe(1);
-        }
+
+test('SDK length, unknown and missing finish reasons never turn parseable partial output into a judgment', async () => {
+    for (const provider of ['openai-compatible', 'anthropic']) for (const reason of [provider === 'anthropic' ? 'max_tokens' : 'length', 'unknown-reason', undefined]) {
+        let calls = 0;
+        const result = await runJudge(configFor(provider), 'rubric', 'data', async () => { calls++; return answer(provider, text, reason,
+            provider === 'anthropic' ? { input_tokens: 7, output_tokens: 9 } : { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 }); });
+        expect(result).toMatchObject({ judgment: null, raw: text, usage: { input: 7, output: 9 }, responseComplete: false, attempts: 1 });
+        expect(result.stopReason).toBe(reason === 'length' || reason === 'max_tokens' ? 'length' : 'error');
+        expect(result.rawStopReason).toBe(reason ?? null);
+        expect(result.error).not.toBeNull();
+        expect(calls).toBe(1);
     }
 });
-test('caller cancellation aborts transport and a pre-cancelled call makes zero requests', async () => {
-    const config = configFor(), abort = new AbortController();
-    let signal: AbortSignal | null | undefined;
-    const result = await runJudge(config, 'rubric', 'data', async (_, init) => { signal = init.signal; abort.abort(); return new Promise(() => {}); }, abort.signal);
-    expect(signal?.aborted).toBe(true);
-    expect(result).toMatchObject({ judgment: null, usage: null, attempts: 1, error: 'Judge cancelled' });
-    let calls = 0;
-    const before = await runJudge(config, 'rubric', 'data', async () => { calls++; throw Error('must not call'); }, abort.signal);
-    expect(before).toMatchObject({ judgment: null, attempts: 0, error: 'Judge cancelled' });
-    expect(calls).toBe(0);
+
+test('truncated SSE and malformed SSE retain partial text and fail without a retry', async () => {
+    for (const suffix of ['', 'data: {bad-json}\n\n']) {
+        let calls = 0;
+        const response = new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: text } }] }) + '\n\n' + suffix, { headers: { 'content-type': 'text/event-stream' } });
+        const result = await runJudge(configFor(), 'rubric', 'data', async () => { calls++; return response; });
+        expect(result).toMatchObject({ judgment: null, raw: text, stopReason: 'error', responseComplete: false, attempts: 1 });
+        expect(result.error).not.toBeNull();
+        expect(calls).toBe(1);
+    }
 });
-test('a stop reason cannot certify a Judge response that also requests a tool', async () => {
-    const config = configFor(), text = '{"score":1,"reason":"Contradictory response."}', usage = { completion_tokens: 9 };
-    for (const extra of [{ tool_calls: [{ id: 'unexpected', type: 'function', function: { name: 'grade', arguments: '{}' } }] },
-        { function_call: { name: 'grade', arguments: '{}' } }]) {
-        const result = await runJudge(config, 'rubric', 'data', async () => new Response(JSON.stringify({ choices: [{ message: { content: text, ...extra }, finish_reason: 'stop' }], usage })));
-        expect(result).toMatchObject({ judgment: null, raw: text, usage, finishReason: 'stop', responseComplete: false, attempts: 1 });
+
+test('tool use is incomplete even when a conflicting SDK stop marker is present', async () => {
+    for (const reason of ['tool_calls', 'stop']) {
+        const result = await runJudge(configFor(), 'rubric', 'data', async () => sse([{ choices: [{ delta: { content: text,
+            tool_calls: [{ index: 0, id: 'unexpected', type: 'function', function: { name: 'grade', arguments: '{}' } }] }, finish_reason: reason }] }]));
+        expect(result).toMatchObject({ judgment: null, raw: text, stopReason: reason === 'tool_calls' ? 'toolUse' : 'stop', responseComplete: false, attempts: 1 });
         expect(result.error).toContain('incomplete');
     }
+});
+
+test('timeout and cancellation abort the SDK transport; a pre-cancelled call sends nothing', async () => {
+    const timeout = await runJudge(await prepareJudge(configFor('openai-compatible', '10')), 'rubric', 'data', abortingFetch);
+    expect(timeout).toMatchObject({ judgment: null, attempts: 1, stopReason: 'aborted', responseComplete: false });
+    expect(timeout.error).toContain('timeout');
+    const abort = new AbortController();
+    let requests = 0;
+    const cancelled = await runJudge(configFor(), 'rubric', 'data', async (url, init) => { requests++; const response = abortingFetch(url, init); abort.abort(); return response; }, abort.signal);
+    expect(cancelled).toMatchObject({ judgment: null, attempts: 1, stopReason: 'aborted', error: 'Judge cancelled' });
+    const before = await runJudge(configFor(), 'rubric', 'data', async () => { requests++; throw Error('must not send'); }, abort.signal);
+    expect(before).toMatchObject({ judgment: null, attempts: 0, error: 'Judge cancelled' });
+    expect(requests).toBe(1);
+});
+
+test('independent prepared runtimes never share keys or inherit an ambient key', async () => {
+    const previous = process.env.OPENAI_API_KEY; process.env.OPENAI_API_KEY = 'ambient-key';
+    try {
+        const configurations = [await prepareJudge(configFor()), await prepareJudge(judgeConfig({ ...env, FLOWMATE_JUDGE_API_KEY: 'other-judge-key' }, emptyRepo)!)];
+        for (const [index, config] of configurations.entries()) {
+            const result = await runJudge(config, 'rubric', 'data', async (_, init) => {
+                expect(new Headers(init.headers).get('authorization')).toBe(index === 0 ? 'Bearer judge-key' : 'Bearer other-judge-key');
+                return answer('openai-compatible', text, 'stop');
+            });
+            expect(result.judgment?.score).toBe(1);
+            expect(JSON.stringify(result)).not.toContain('judge-key');
+            expect(JSON.stringify(result)).not.toContain('ambient-key');
+        }
+    } finally { if (previous === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previous; }
+});
+
+test('an SDK aborted stream retains its partial raw text and token usage', async () => {
+    const abort = new AbortController();
+    const result = await runJudge(configFor(), 'rubric', 'data', async (_, init) => {
+        const body = new ReadableStream({ start(controller) {
+            controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify({ choices: [{ delta: { content: text } }],
+                usage: { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 } }) + '\n\n'));
+            init.signal!.addEventListener('abort', () => controller.error(init.signal!.reason), { once: true });
+            setTimeout(() => abort.abort(), 10);
+        } });
+        return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    }, abort.signal);
+    expect(result).toMatchObject({ raw: text, usage: { input: 7, output: 9 }, usageSource: 'sdk', stopReason: 'aborted',
+        error: 'Judge cancelled', judgment: null, responseComplete: false, attempts: 1 });
+});
+
+test('a JSON-only response never activates a hidden non-SDK generation fallback', async () => {
+    let calls = 0;
+    const result = await runJudge(configFor(), 'rubric', 'data', async () => { calls++; return Response.json({ choices: [{ message: { content: text }, finish_reason: 'stop' }] }); });
+    expect(result).toMatchObject({ judgment: null, stopReason: 'error', responseComplete: false, attempts: 1 });
+    expect(calls).toBe(1);
+});
+
+test('explicit Responses API dispatches through its real SDK adapter', async () => {
+    const config = judgeConfig({ ...env, FLOWMATE_JUDGE_MODEL: 'gpt-4o-mini', FLOWMATE_JUDGE_API: 'openai-responses' }, emptyRepo)!;
+    const item = { type: 'message', id: 'sdk-responses', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] };
+    let calls = 0;
+    const result = await runJudge(config, 'rubric', 'data', async (url, init) => {
+        calls++;
+        expect(url).toBe('https://example.com/v1/responses');
+        expect(JSON.parse(String(init.body))).toMatchObject({ model: 'gpt-4o-mini', stream: true, max_output_tokens: 16384 });
+        return sse([{ type: 'response.created', response: { id: 'controlled-responses' } },
+            { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+            { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: text },
+            { type: 'response.output_item.done', output_index: 0, item },
+            { type: 'response.completed', response: { id: 'controlled-responses', status: 'completed', output: [item],
+                usage: { input_tokens: 10, output_tokens: 8, total_tokens: 18 } } }]);
+    });
+    expect(result).toMatchObject({ judgment: { score: 1 }, stopReason: 'stop', responseComplete: true, usage: { input: 10, output: 8 } });
+    expect(calls).toBe(1);
+});
+
+test('timeout and cancellation bound a fetch implementation that ignores its AbortSignal', async () => {
+    const config = await prepareJudge(configFor('openai-compatible', '10'));
+    const timedOut = await runJudge(config, 'rubric', 'data', async () => new Promise(() => {}));
+    expect(timedOut).toMatchObject({ attempts: 1, error: 'Judge timeout', stopReason: null, usage: null, judgment: null });
+    const abort = new AbortController();
+    const cancelled = await runJudge(configFor(), 'rubric', 'data', async () => { abort.abort(); return new Promise(() => {}); }, abort.signal);
+    expect(cancelled).toMatchObject({ attempts: 1, error: 'Judge cancelled', stopReason: null, usage: null, judgment: null });
+});
+
+test('retired budgets stay absent and direct SDK transport rejects injected retired fields', async () => {
+    const config = judgeConfig({ ...env, FLOWMATE_JUDGE_TEMPERATURE: 'invalid', FLOWMATE_JUDGE_MAX_TOKENS: '256' }, emptyRepo)!;
+    expect(config).not.toHaveProperty('temperature'); expect(config).not.toHaveProperty('maxTokens');
+    let calls = 0;
+    await expect(requestJudge(Object.assign(config, { maxTokens: 256, temperature: 0.8 }), 'rubric', 'data', async () => { calls++; throw Error('must not send'); })).rejects.toThrow();
+    expect(calls).toBe(0);
+});
+
+test('strict structured score rejects malformed, out-of-range and empty explanations', () => {
+    expect(parseJudgment('{"score":0.5,"reason":"Partial evidence"}').score).toBe(0.5);
+    for (const value of ['bad', '{}', '{"score":2,"reason":"x"}', '{"score":1,"reason":" "}', '{"score":"1","reason":"x"}']) expect(() => parseJudgment(value)).toThrow();
 });

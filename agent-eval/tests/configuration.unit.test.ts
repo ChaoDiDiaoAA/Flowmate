@@ -14,7 +14,7 @@ test('one Chinese-commented env file configures Judge and Langfuse; process envi
   mkdirSync(join(root,'agent-eval/configs'),{recursive:true});
   writeFileSync(join(root,'agent-eval/configs/.env'),'# 中文用途\nFLOWMATE_JUDGE_PROVIDER=openai-compatible\nFLOWMATE_JUDGE_MODEL=file-model\nFLOWMATE_JUDGE_BASE_URL=https://unused.invalid/v1\nFLOWMATE_JUDGE_API_KEY=fake-judge-secret\nLANGFUSE_BASE_URL=https://unused.invalid\nLANGFUSE_PUBLIC_KEY=fake-public\nLANGFUSE_SECRET_KEY=fake-secret\n');
   const judge=judgeConfig({FLOWMATE_JUDGE_MODEL:'process-model',FLOWMATE_JUDGE_TEMPERATURE:'0.8',FLOWMATE_JUDGE_MAX_TOKENS:'256'},root);
-  expect(judge).toMatchObject({model:'process-model',timeoutMs:30000});
+  expect(judge).toMatchObject({model:'process-model',api:'openai-completions',timeoutMs:180000});
   expect(judge).not.toHaveProperty('temperature');expect(judge).not.toHaveProperty('maxTokens');
   expect(langfuseConfig(root,{}).publicKey).toBe('fake-public');
   expect(scanEvidence('fake-secret').value).toBe('[REDACTED]');

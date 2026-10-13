@@ -28,12 +28,12 @@ export function validateReceipt(batch: Event[], receipt: Receipt) {
     if (receipt.errors.length || accepted.size !== batch.length)
         throw new Error('Langfuse ingestion receipt is incomplete or contains rejected records');
 }
-function usage(value: unknown) {
+function usage(value: unknown, omitUnprovenZeros = false) {
     if (!value || typeof value !== 'object') return undefined;
-    const allowed = ['input', 'output', 'total', 'inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'cost'];
+    const allowed = ['input', 'output', 'total', 'inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'reasoning', 'cost'];
     return Object.fromEntries(allowed.flatMap(key => {
         const number = (value as Record<string, unknown>)[key];
-        return typeof number === 'number' && Number.isFinite(number) && number >= 0 ? [[key, number]] : [];
+        return typeof number === 'number' && Number.isFinite(number) && number >= 0 && (!omitUnprovenZeros || number > 0) ? [[key, number]] : [];
     }));
 }
 function scoreSummary(score: LocalReport['trials'][number]['scores'][number]) {
@@ -84,13 +84,17 @@ export function exportEvents(report: LocalReport): Event[] {
                     metadata: { ...metadata, ...scoreSummary(score) } });
         }
         for (const call of trial.judgeCalls) {
-            const historical = call.configuration as typeof call.configuration & {temperature?:number;maxTokens?:number};
-            const maximum = call.configuration.modelCapabilities?.maxOutputTokens ?? historical.maxTokens;
+            const sdk = call.configuration.sdk !== undefined;
+            const historical = call.configuration as {temperature?:number;maxTokens?:number;modelCapabilities?:{maxOutputTokens?:number}};
+            const maximum = sdk ? undefined : historical.modelCapabilities?.maxOutputTokens ?? historical.maxTokens;
             add('generation-create', { id: [trial.traceId,call.callId].join(':'), traceId: trial.traceId,
                 name: 'Judge · 回答质量', environment: report.environment, startTime: call.startedAt, endTime: call.endedAt, model: call.configuration.model,
-                modelParameters: { ...(historical.temperature!==undefined?{temperature:historical.temperature}:{}), ...(maximum!==undefined?{max_tokens:maximum}:{}) }, usageDetails: usage(call.usage),
+                modelParameters: { ...(historical.temperature!==undefined?{temperature:historical.temperature}:{}), ...(maximum!==undefined?{max_tokens:maximum}:{}) },
+                // Pi fills absent counters with zero without exposing whether a zero was reported.
+                usageDetails: sdk && call.usageSource !== 'sdk' ? undefined : usage(call.usage, sdk),
                 metadata: { callId: call.callId, method: 'llm-judge', configurationHash: call.configuration.configHash, attempts: call.attempts,
-                    responseComplete: call.responseComplete, finishReason: call.finishReason, errorOccurred: call.error !== null,
+                    responseComplete: call.responseComplete, finishReason: call.finishReason, stopReason: call.stopReason, rawStopReason: call.rawStopReason,
+                    api: call.configuration.api, sdk: call.configuration.sdk, usageSource: call.usageSource, errorOccurred: call.error !== null,
                     modelCapabilities:call.configuration.modelCapabilities,
                     rubricId: call.configuration.rubric?.id, rubricVersion: call.configuration.rubric?.version, rubricHash: call.configuration.rubric?.hash } });
         }

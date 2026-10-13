@@ -5,7 +5,7 @@ import { dataset, task, fixtureRepo, reportFixture } from '../support/fixtures.t
 import type { AgentKernel } from '../../src/adapters/agent.ts';
 import type { EvaluationProgress } from '../../src/execution/runner.ts';
 
-const env = { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic',
+const env = { FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
     FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'fake-batch-judge-key' };
 const kernel: AgentKernel = { readiness: () => ({ready:true,reason:'synthetic'}), prepare: async () => { throw Error('must not generate'); } };
 function datasets() {

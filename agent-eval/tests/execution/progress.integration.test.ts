@@ -7,11 +7,12 @@ import { readReport } from '../../src/reports/store.ts';
 import type { AgentKernel } from '../../src/adapters/agent.ts';
 import { dataset, fixtureRepo, observed } from '../support/fixtures.ts';
 
-function product(execute?: () => Promise<void>): AgentKernel {
+function product(execute?: () => Promise<void>, transform?: (result: ReturnType<typeof observed>) => void): AgentKernel {
     return { readiness: () => ({ ready: true, reason: 'synthetic' }), async prepare(trial) {
         expect(trial).not.toHaveProperty('onProgress');
         expect(trial.input).not.toHaveProperty('onProgress');
         const result = observed(); result.identity = trial.identity; result.input = trial.input;
+        transform?.(result);
         result.evidence.environment!.actual = { ...trial.identity, fresh: true };
         result.evidence['input-projection']!.actual = trial.input;
         return { input: trial.input, async execute() { await execute?.(); return result; }, snapshot: async () => result,
@@ -83,6 +84,28 @@ test('a broken progress observer does not change scoring, cleanup or the saved r
     expect(run.stopped).toBe(false);
     expect(readReport(run.file).trials[0]!.execution!.evidence.cleanup?.actual).toMatchObject({ closed: true, stopped: true });
     expect(run.report.scoring).toBe('complete');
+});
+
+test.each([false, true])('a hard FAIL also exposes the concurrent Judge error when collection error=%s', async collectionError => {
+    const data = singleCase(), events: EvaluationProgress[] = [];
+    data.cases[0]!.expected.checks.push({ metric: 'fact-check', required: true, evidence: 'task-facts', path: ['saved'], equals: false });
+    if (collectionError) data.cases[0]!.expected.checks.push({ metric: 'fact-check', required: true, evidence: 'missing-collection', path: [], equals: true });
+    data.manifest.scoring.judges[0]!.required = true;
+    const run = await runLocal(fixtureRepo, { dataset: data, backend: 'local', judge: 'required', executionId: 'mixed-progress-' + randomUUID() },
+        { kernel: product(undefined, result => {
+            if (collectionError) result.evidence['capture-gaps'] = { present: false, actual: ['Controlled collection read failure'], source: 'Original collection error' };
+        }), env: { FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
+            FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-mixed-judge-key' },
+            fetcher: async () => new Response('controlled judge outage', { status: 503 }), onProgress: event => { events.push(event); } });
+    const trial = run.report.trials[0]!, error = trial.scores.find(score => score.method === 'llm-judge' && score.status === 'ERROR')!;
+    expect(trial.status).toBe('FAIL');
+    expect(error).toBeDefined();
+    expect(trial.judgeCalls[0]!.attempts).toBe(1);
+    const progress = events.find(event => event.type === 'scoring-end')!;
+    expect(progress.status).toBe('FAIL');
+    expect(progress.reason).toContain('评分异常');
+    expect(progress.reason).toContain(error.reason);
+    expect(readReport(run.file).trials[0]!.reason).toBe(trial.reason);
 });
 
 test('a save failure never emits a saved Trial or dataset completion', async () => {

@@ -127,7 +127,7 @@ test('loading retains every constraint and private turn, preserves authorship an
             expect(() => caseV2Schema.parse(broken)).toThrow('Unknown user turn');
         }
     }
-    expect(hints.size).toBe(62); expect(userTurns).toBe(49);
+    expect(hints.size).toBe(62); expect(userTurns).toBe(52);
     for (const id of ['FM-002', 'FM-028']) {
         const task = datasets[0]!.cases.find(c => c.id === id)!;
         expect(task.expected.maxToolCalls).toBe(0); expect(task.expected.mustHaveEvidence).toBe(false);
@@ -135,4 +135,22 @@ test('loading retains every constraint and private turn, preserves authorship an
         for (const metric of ['runtime-admission', 'tool-execution', 'result-delivery'])
             expect(task.expected.metrics.find(item => item.metricId === metric)?.notApplicable).toBeDefined();
     }
+});
+
+test('manual compaction submits distinct source-labelled user history before its correction and native compact step', () => {
+    const declaration = flowmateAgentV1Dataset.cases.find(task => task.id === 'FM-024')!;
+    const scenario = scenariosByName[declaration.input.fixture!.name];
+    const compact = scenario.steps.findIndex((step: { action: string }) => step.action === 'compact-history');
+    const seeds = declaration.input.turns!.filter(turn => turn.id.startsWith('history-'));
+    expect(seeds).toHaveLength(3);
+    expect(seeds.every(turn => Buffer.byteLength(turn.content) < 65000)).toBe(true);
+    // Even the two most recent seed messages exceed the untouched native 20k-token retention window.
+    expect(seeds.slice(1).reduce((size, turn) => size + turn.content.length, 0)).toBeGreaterThan(80000);
+    const rows = seeds.flatMap(turn => [...turn.content.matchAll(/Record (\d+): synthetic item SKU-(\d+)/g)].map(match => match[1]));
+    expect(rows).toHaveLength(1200);
+    expect(new Set(rows).size).toBe(1200);
+    expect(seeds.every(turn => turn.content.includes('user-supplied inventory') && turn.content.includes('not invoice evidence'))).toBe(true);
+    expect(scenario.steps.slice(1, compact).map((step: { turnId: string }) => step.turnId)).toEqual([...seeds.map(turn => turn.id), 'correction']);
+    expect(declaration.input.turns!.find(turn => turn.id === 'correction')!.content).toContain('CNY');
+    expect(() => validateScenarioTurns(declaration, scenario)).not.toThrow();
 });

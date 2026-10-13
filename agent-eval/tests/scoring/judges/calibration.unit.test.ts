@@ -1,3 +1,4 @@
+import { judgeResponse } from '../../support/judge-response.ts';
 import { withoutHashes } from '../../../src/artifacts.ts';
 import {publicVersions} from '../../../src/reports/files.ts';
 import {test,expect} from 'bun:test';
@@ -6,8 +7,8 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {calibrateJudge,loadCalibration} from '../../../src/scoring/judges/calibration.ts';
 
-const env={FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'independent-fixture',FLOWMATE_JUDGE_API_KEY:'independent-fixture-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'};
-const reply=(n:number,finish='stop')=>new Response(JSON.stringify({model:'independent-fixture',choices:[{message:{content:JSON.stringify({v:1,r:[[n,1,0]],f:n?[]:[[0,0,1]]})},finish_reason:finish}],usage:{prompt_tokens:10,completion_tokens:15}}));
+const env={FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'independent-fixture-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'};
+const reply=(n:number,finish='stop')=>judgeResponse({model:'llama-3.3-70b-versatile',choices:[{message:{content:JSON.stringify({v:1,r:[[n,1,0]],f:n?[]:[[0,0,1]]})},finish_reason:finish}],usage:{prompt_tokens:10,completion_tokens:15}});
 function fixture(){
  const root=mkdtempSync(join(tmpdir(),'flowmate-calibration-')),directory=join(root,'references');mkdirSync(directory);
  const criterion={metricId:'tool-arguments',version:1,unit:'请求',denominator:1,required:true,rule:'Check original requested object against the independently authorized object.',evidence:['original'],trigger:'started'};
@@ -68,7 +69,7 @@ test('cancelled calibration, missing independent credentials and secret-bearing 
 });
 test('truncation and malformed responses retain failed attempts and unjudgeable counts without retry',async()=>{
  const f=fixture();try{
-  let calls=0;const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'errors'},{env,fetcher:async()=>{calls++;return calls===1?reply(1,'length'):new Response(JSON.stringify({choices:[{message:{content:'{broken'},finish_reason:'stop'}]}));}});
+  let calls=0;const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'errors'},{env,fetcher:async()=>{calls++;return calls===1?reply(1,'length'):judgeResponse({choices:[{message:{content:'{broken'},finish_reason:'stop'}]});}});
   expect(calls).toBe(2);expect(result.report.samples.every(s=>s.call?.attempts===1&&s.call.error!==null)).toBe(true);
   expect(result.report.criteria.every(c=>c.errors===1&&c.unjudgeable===0&&c.measured===0)).toBe(true);
  }finally{f.close();}
@@ -85,7 +86,7 @@ test('all delivered references round-trip through one controlled Judge attempt e
   const directory=join(import.meta.dir,'../../fixtures/judge-calibration'),kit=loadCalibration(directory);let calls=0;
   const result=await calibrateJudge(f.root,{directory,executionId:'reference-protocol'},{env,fetcher:async(_,init)=>{
    const data=JSON.parse(JSON.parse(String(init.body)).messages[1].content);expect(data.evidence).not.toHaveProperty('referenceWire');expect(data.evidence).not.toHaveProperty('references');
-   const sample=kit.samples[calls++]!;return new Response(JSON.stringify({model:'independent-fixture',choices:[{message:{content:sample.document.referenceWire??JSON.stringify({v:1,r:sample.document.references.map(r=>r.counts),f:[]})},finish_reason:'stop'}],usage:{prompt_tokens:10,completion_tokens:15}}));
+   const sample=kit.samples[calls++]!;return judgeResponse({model:'llama-3.3-70b-versatile',choices:[{message:{content:sample.document.referenceWire??JSON.stringify({v:1,r:sample.document.references.map(r=>r.counts),f:[]})},finish_reason:'stop'}],usage:{prompt_tokens:10,completion_tokens:15}});
   }});
   expect(calls).toBe(56);expect(result.report.criteria.every(c=>c.errors===0&&c.notRun===0&&c.countsCorrect===c.samples)).toBe(true);
   expect(result.report.criteria.some(c=>c.unjudgeable>0)).toBe(true);expect(result.report.samples.every(s=>s.call?.attempts===1)).toBe(true);
@@ -101,25 +102,25 @@ test('cancellation during one original attempt preserves the failed call and all
   expect(JSON.parse(readFileSync(result.file,'utf8'))).toEqual(publicVersions(withoutHashes(result.report)));
  }finally{f.close();}
 });
-test('Anthropic calibration resolves model capability once before its single-attempt samples',async()=>{
+test('Anthropic calibration reuses native SDK capabilities for its single-attempt samples',async()=>{
  const f=fixture();try{
   let metadataCalls=0,generations=0;
-  const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'anthropic-capability'},{env:{...env,FLOWMATE_JUDGE_PROVIDER:'anthropic'},fetcher:async(_,init)=>{
+  const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'anthropic-capability'},{env:{...env,FLOWMATE_JUDGE_API:'anthropic-messages',FLOWMATE_JUDGE_PROVIDER:'anthropic',FLOWMATE_JUDGE_MODEL:'claude-haiku-4-5'},fetcher:async(_,init)=>{
    if(init.method==='GET'){metadataCalls++;return new Response(JSON.stringify({id:'canonical-fixture',max_tokens:64000}));}
    generations++;const body=JSON.parse(String(init.body));expect(body.max_tokens).toBe(64000);expect(body).not.toHaveProperty('temperature');
-   return new Response(JSON.stringify({content:[{type:'text',text:JSON.stringify({v:1,r:[[generations===1?0:1,1,0]],f:[]})}],stop_reason:'end_turn',usage:{output_tokens:15}}));
+   return judgeResponse({content:[{type:'text',text:JSON.stringify({v:1,r:[[generations===1?0:1,1,0]],f:[]})}],stop_reason:'end_turn',usage:{output_tokens:15}});
   }});
-  expect(metadataCalls).toBe(1);expect(generations).toBe(2);expect(result.report.samples.every(s=>s.call?.attempts===1)).toBe(true);
-  expect(result.report.configuration.modelCapabilities).toEqual({modelId:'canonical-fixture',maxOutputTokens:64000,source:'anthropic-models-api'});
+  expect(metadataCalls).toBe(0);expect(generations).toBe(2);expect(result.report.samples.every(s=>s.call?.attempts===1)).toBe(true);
+  expect(result.report.configuration.modelCapabilities).toMatchObject({contextWindow:200000,maxTokens:64000,source:'pi-sdk-model-catalog'});
  }finally{f.close();}
 });
-test('Anthropic metadata failure creates no calibration execution and makes no generation request',async()=>{
+test('an unknown Anthropic model creates no calibration execution or generation request',async()=>{
  const f=fixture();try{
   let calls=0;
-  await expect(calibrateJudge(f.root,{directory:f.directory,executionId:'missing-capability'},{env:{...env,FLOWMATE_JUDGE_PROVIDER:'anthropic'},fetcher:async(_,init)=>{
+  await expect(calibrateJudge(f.root,{directory:f.directory,executionId:'missing-capability'},{env:{...env,FLOWMATE_JUDGE_API:'anthropic-messages',FLOWMATE_JUDGE_PROVIDER:'anthropic',FLOWMATE_JUDGE_MODEL:'unregistered-judge'},fetcher:async(_,init)=>{
    calls++;expect(init.method).toBe('GET');return new Response(JSON.stringify({id:'fixture'}));
-  }})).rejects.toThrow('model metadata');
-  expect(calls).toBe(1);expect(existsSync(join(f.root,'agent-eval/calibration-runs/missing-capability'))).toBe(false);
+  }})).rejects.toThrow('absent from the Pi SDK catalog');
+  expect(calls).toBe(0);expect(existsSync(join(f.root,'agent-eval/calibration-runs/missing-capability'))).toBe(false);
  }finally{f.close();}
 });
 test('reference loading has no sample ceiling inherited from the retired token budget',()=>{

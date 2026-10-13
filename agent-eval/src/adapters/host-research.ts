@@ -52,7 +52,7 @@ const desktopAcceptedSchema = SessionInputAcceptedSchema.extend({ requestId: z.s
 const runSchema = z.object({ runId: id, sessionId: id, kind: z.enum(['agent', 'subagent']), parentRunId: id.nullable().optional(), originToolCallId: id.nullable().optional(),
     status: z.enum(['created', 'running', 'completed', 'failed', 'cancelled']),
     createdAt: z.string().datetime(), startedAt: z.string().datetime().nullable(), endedAt: z.string().datetime().nullable(), stoppedAt: z.string().datetime().nullable(),
-    output: z.record(z.unknown()).nullable(), cleanup: z.record(z.unknown()), tokens: TokenColumnsSchema }).passthrough();
+    output: z.record(z.unknown()).nullable(), error: AppErrorSchema.nullable(), cleanup: z.record(z.unknown()), tokens: TokenColumnsSchema }).passthrough();
 type Command = Parameters<HostClient['request']>[0];
 type InputCommand = Extract<Command, { type: 'submit_session_input' }>;
 type StepReceipt = { stepId: string; turnId?: string; submittedText?: string; action: string; clientSequence: number; requestHash: string; result: unknown };
@@ -338,9 +338,17 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     const execution: CaseExecutionResult = { identity: structuredClone(trial.identity), started: false, status: 'not-started', endpointReached: false,
         input: structuredClone(trial.input), answer: null, artifacts: [], observations: [], evidence: {}, configuration: structuredClone(trial.configuration),
         usage: {}, startedAt: null, endedAt: null };
+    const observedRuns = new Map<number, z.infer<typeof runSchema>>();
+    const stopGaps: unknown[] = [], captureGaps: string[] = [];
+    let controllerFailure: CaseExecutionResult['error'];
+    function rememberStop(run: z.infer<typeof runSchema>) {
+        if (!['created', 'running'].includes(run.status) && (run.stoppedAt === null || run.cleanup.stopped !== true || run.cleanup.lateObservationRequired !== false))
+            stopGaps.push(structuredClone(run));
+    }
     async function readRun(runId: number) {
         const run = await query({ type: 'query_run', runId }, runSchema);
         if (run.runId !== runId || run.sessionId !== runSessions.get(runId) || run.kind !== 'agent') throw new Error('Run belongs to another Trial Session');
+        observedRuns.set(runId, run); rememberStop(run);
         return run;
     }
     async function waitRun(runId: number, running: AbortSignal) {
@@ -517,12 +525,59 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         return false;
     }
     async function capture(): Promise<CaseExecutionResult> {
-        const runs = await Promise.all(runIds.map(readRun));
+        for (const fact of Object.values(execution.evidence)) fact.present = false;
+        const reads = await Promise.allSettled(runIds.map(readRun));
+        for (const [index, read] of reads.entries()) if (read.status === 'rejected')
+            stopGaps.push({ runId: runIds[index], gap: String(read.reason) });
+        const runs = runIds.flatMap(runId => observedRuns.has(runId) ? [observedRuns.get(runId)!] : []);
+        execution.started = runs.some(run => run.startedAt !== null);
+        execution.startedAt = runs.find(run => run.startedAt !== null)?.startedAt ?? null;
+        execution.endedAt = runs.length && runs.every(run => !['created', 'running'].includes(run.status)) ? runs.at(-1)!.endedAt : null;
+        const outcomeRuns = deliveryRecovery?.verified ? runs.filter(run => run.runId !== deliveryRecovery!.originalRunId) : runs;
+        execution.status = outcomeRuns.some(run => run.status === 'failed') ? 'failed' : outcomeRuns.some(run => run.status === 'cancelled') ? 'cancelled'
+            : outcomeRuns.length && outcomeRuns.every(run => run.status === 'completed') ? 'completed' : execution.started ? 'error' : 'not-started';
+        const failed = [...outcomeRuns].reverse().find(run => run.status === 'failed' || run.status === 'cancelled');
+        execution.error = failed?.error ? { code: failed.error.code, message: failed.error.message, infrastructure: false } : controllerFailure;
+        execution.answer = typeof runs.at(-1)?.output?.text === 'string' ? runs.at(-1)!.output!.text as string : null;
+        execution.endpointReached = false;
+        execution.evidence.runs = { present: false, actual: runs, source: 'Original root Host query_run facts; descendant collection pending' };
+        execution.evidence.environment = { present: true, actual: { ...trial.identity, fresh: true, isolation: local.manifest },
+            source: 'Exclusive new local product directory and independent Host process; no OS filesystem sandbox claim' };
+        execution.evidence['material-registration'] = { present: true, actual: isInvoice ? invoiceRegistration : registration,
+            source: isInvoice ? 'Declared selected invoice bytes and original Host import/query_document receipts' : 'Host import_research_material receipts' };
+        execution.evidence['step-results'] = { present: true, actual: structuredClone(receipts), source: 'Host submit_session_input receipts; no model replay on read' };
+        execution.evidence.answer = { present: execution.answer !== null, actual: execution.answer, source: 'Original Host Run output' };
+        execution.observations = runs.map(run => ({ id: trial.identity.trialId + ':run:' + run.runId, kind: 'span', name: (isResearch ? 'research' : 'agent') + ' Run ' + run.runId,
+            startedAt: run.startedAt ?? run.createdAt, endedAt: run.endedAt, output: run.output }));
+        Object.assign(execution.usage, executionUsage(runs, [], false));
+        if (isResearch) {
+            execution.evidence.research = await collectResearchEvidence(client, { sessionId, observedPlanIds: [...planRefs.values()].map(plan => plan.planId) });
+            const saved = z.object({ reports: z.array(ResearchReportSchema) }).passthrough().safeParse(execution.evidence.research.actual);
+            execution.artifacts = saved.success ? saved.data.reports.map(report => ({ id: 'research-' + report.researchId + '-report-' + report.reportId, kind: 'research-report', content: report })) : [];
+        }
+        try { await enrichCapture(runs, reads.every(read => read.status === 'fulfilled')); }
+        catch (error) {
+            captureGaps.push(String(error));
+            execution.evidence['capture-gaps'] = { present: false, actual: [...captureGaps], source: 'Optional Host evidence collection errors; original root and saved business facts retained' };
+        }
+        if (controllerFailure) { execution.status = 'failed'; execution.error = controllerFailure; execution.endpointReached = false; }
+        if (stopGaps.length) {
+            execution.evidence['original-stop-gaps'] = { present: false, actual: structuredClone(stopGaps), source: 'Original Run or descendant stopping gaps; later readback and Host close cannot erase them' };
+            execution.status = 'error'; execution.endpointReached = false;
+            execution.error = { code: 'stop_unconfirmed', message: 'Original root or descendant stopping could not be confirmed.', infrastructure: true };
+        }
+        return structuredClone(execution);
+    }
+    async function enrichCapture(runs: Array<z.infer<typeof runSchema>>, rootsComplete: boolean): Promise<void> {
         if (formApplications.length) execution.evidence['invoice-form'] = { present: true, actual: structuredClone(formApplications), source: 'Owned Electron controls, original Host Fill Run and DOM readback' };
         const manualSnapshots = await Promise.all(compactions.map(async owner => {
-            const snapshot = await query({ type: 'query_session_compaction', input: owner }, SessionCompactionSnapshotSchema);
-            if (snapshot.sessionId !== owner.sessionId || snapshot.operation && snapshot.operation.operationId !== owner.operationId)
-                throw new Error('Foreign compaction operation');
+            let snapshot: z.infer<typeof SessionCompactionSnapshotSchema>;
+            try { snapshot = await query({ type: 'query_session_compaction', input: owner }, SessionCompactionSnapshotSchema); }
+            catch (error) { stopGaps.push({ ...owner, gap: String(error) }); throw error; }
+            if (snapshot.sessionId !== owner.sessionId || !snapshot.operation || snapshot.operation.operationId !== owner.operationId) {
+                stopGaps.push({ ...owner, snapshot }); throw new Error('Original compaction operation is unavailable or foreign');
+            }
+            if (snapshot.operation.phase === 'ended' && !snapshot.operation.stopped) stopGaps.push({ ...owner, snapshot });
             const record = historyOperations.find(item => item.operationId === owner.operationId)!;
             const recorded = SessionCompactionSnapshotSchema.safeParse(record.after);
             if (recorded.success && recorded.data.operation?.phase === 'ended' && recorded.data.operation.stopped) {
@@ -542,31 +597,29 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             source: 'Original public fork/branch CAS, manual compaction and verified same-instance Host restart receipts; queries never execute history operations' };
         const subagents = await collectSubagentEvidence(client, runs.map(r => ({ runId: r.runId, sessionId: r.sessionId })));
         execution.evidence.subagents = subagents;
+        if (!subagents.present) stopGaps.push(structuredClone(subagents));
         const children = z.object({ children: z.array(SubagentDetailSchema) }).passthrough().parse(subagents.actual).children;
+        for (const child of children) if ((!['created', 'running'].includes(child.status) ||
+            runs.some(run => run.runId === child.parentRunId && !['created', 'running'].includes(run.status))) &&
+            (!child.stopConfirmed || child.cleanup.lateObservationRequired === true))
+            stopGaps.push(structuredClone(child));
         const allRuns = [...runs];
+        execution.evidence.runs = { present: rootsComplete && subagents.present && runs.length === runIds.length, actual: allRuns, source: 'Host query_run; original root and child product identities' };
         const childHistory:EvidenceFact[] = [];
         for (const child of children) {
-            const run = await query({ type: 'query_run', runId: child.childRunId }, runSchema);
+            let run: z.infer<typeof runSchema>;
+            try { run = await query({ type: 'query_run', runId: child.childRunId }, runSchema); }
+            catch (error) { execution.evidence.runs!.present = false; stopGaps.push({ childRunId: child.childRunId, gap: String(error) }); throw error; }
             if (run.kind !== 'subagent' || run.runId !== child.childRunId || run.sessionId !== child.childSessionId ||
-                run.parentRunId !== child.parentRunId || run.originToolCallId !== child.originToolCallId) throw new Error('Child Run origin mismatch');
+                run.parentRunId !== child.parentRunId || run.originToolCallId !== child.originToolCallId) {
+                execution.evidence.runs!.present = false; stopGaps.push({ childRunId: child.childRunId, gap: 'Child Run origin mismatch' }); throw new Error('Child Run origin mismatch');
+            }
+            rememberStop(run);
             allRuns.push(run);
             childHistory.push(await collectHistoryEvidence(client, { sessionId: child.childSessionId }));
         }
         execution.evidence['subagent-history'] = { present: subagents.present && childHistory.every(h => h.present), actual: childHistory,
             source: 'Public history queries for each original child Session' };
-        execution.started = runs.some(r => r.startedAt !== null);
-        execution.startedAt = runs.find(r => r.startedAt !== null)?.startedAt ?? null;
-        execution.endedAt = runs.length && runs.every(r => !['created', 'running'].includes(r.status)) ? runs.at(-1)!.endedAt : null;
-        const outcomeRuns=deliveryRecovery?.verified?runs.filter(r=>r.runId!==deliveryRecovery!.originalRunId):runs;
-        execution.status = outcomeRuns.some(r => r.status === 'failed') ? 'failed' : outcomeRuns.some(r => r.status === 'cancelled') ? 'cancelled'
-            : outcomeRuns.length && outcomeRuns.every(r => r.status === 'completed') ? 'completed' : execution.started ? 'error' : 'not-started';
-        execution.answer = typeof runs.at(-1)?.output?.text === 'string' ? runs.at(-1)!.output!.text as string : null;
-        execution.evidence.runs = { present: subagents.present, actual: allRuns, source: 'Host query_run; original root and child product identities' };
-        execution.evidence.environment = { present: true, actual: { ...trial.identity, fresh: true, isolation: local.manifest },
-            source: 'Exclusive new local product directory and independent Host process; no OS filesystem sandbox claim' };
-        execution.evidence['material-registration'] = { present: true, actual: isInvoice ? invoiceRegistration : registration,
-            source: isInvoice ? 'Declared selected invoice bytes and original Host import/query_document receipts' : 'Host import_research_material receipts' };
-        execution.evidence['step-results'] = { present: true, actual: receipts, source: 'Host submit_session_input receipts; no model replay on read' };
         const inputs = (await Promise.all([...sessionIds].map(async sessionId => backward(async beforeInputId => {
             const p = await query({ type: 'list_session_inputs', input: { sessionId, beforeInputId, limit: 100 } }, SessionInputsPageSchema);
             if (p.items.some(i => i.sessionId !== sessionId || i.runId !== null && runSessions.get(i.runId) !== sessionId)) throw new Error('Foreign Session input');
@@ -637,6 +690,23 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             }
         }
         execution.evidence['context-requests'] = { present: subagents.present && context.every(c => c.collected), actual: context, source: 'Host actual SDK/wire inclusion; no inference from UI display' };
+        for (const snapshot of manualSnapshots) {
+            const operation = snapshot.operation;
+            if (operation?.nativeOutcome !== 'succeeded' || !operation.generated || !operation.saved) continue;
+            const record = historyOperations.find(item => item.operationId === operation.operationId)!;
+            const next = steps.slice(steps.findIndex(step => step.id === record.stepId) + 1).map(step => inputRefs.get(step.id)?.accepted)
+                .find(input => input?.sessionId === snapshot.sessionId);
+            const entries = (histories[[...sessionIds].indexOf(snapshot.sessionId)]?.actual as { entries: HistoryEvidenceEntry[] } | undefined)?.entries ?? [];
+            const saved = entries.some(entry => entry.summary.entryId === operation.entryId && entry.fields.type === 'compaction' &&
+                entry.parts.some(part => part.kind === 'summary' && part.text.trim()));
+            const requests = context.find(frame => frame.runId === next?.runId)?.requests ?? [];
+            const included = requests.some(request => request.sdkPayload?.inclusion === 'confirmed' &&
+                request.binding.includedNativeContexts?.some(binding => binding.nativeEntryId === operation.entryId && binding.entryType === 'compaction' && binding.originSessionId === snapshot.sessionId) &&
+                request.attempts.some(attempt => attempt.wireInclusion === 'confirmed' && attempt.responseStatus !== null));
+            const verified = saved && included && histories[[...sessionIds].indexOf(snapshot.sessionId)]?.present === true && execution.evidence['context-requests'].present;
+            record.continuedUse = { verified, runId: next?.runId ?? null, summaryEntryId: operation.entryId, summaryWireInclusion: included ? 'confirmed' : 'unknown' };
+        }
+        execution.evidence['history-operations'].actual = structuredClone(historyOperations);
         execution.evidence.tools = { present: subagents.present, actual: tools, source: 'Host original tool execution/commit/delivery metadata; raw arguments and results are unavailable from this API' };
         execution.evidence['tool-evidence'] = await collectToolEvidence(client, tools);
         if (!subagents.present) {
@@ -817,13 +887,18 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)])) : null, source: 'Original model candidate at the selected version lineage; user corrections never replace model evidence' };
             execution.evidence['candidate-line-items'] = { present: !!original, actual: original?.lines.map(line => Object.fromEntries(Object.entries(line)
                 .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)]))) ?? null, source: 'Original model candidate lines at the selected version lineage; user corrections remain separate' };
-            exports = readInvoiceExports();
+            try { exports = readInvoiceExports(); }
+            catch (error) {
+                execution.evidence['invoice-exports'] = { present: false, actual: structuredClone(invoiceExports), source: 'Original public export references retained; current managed bytes failed verification' };
+                throw error;
+            }
             execution.evidence['invoice-exports'] = { present: true, actual: exports, source: 'Original public export references and managed file bytes rechecked against their size and SHA-256' };
             execution.endpointReached = stepsComplete && execution.status === 'completed' && !!execution.answer?.trim() &&
                 [...requiredCandidateRuns].every(runId => candidates.some(c => c.runId === runId));
         } else if (isResearch) {
             const observedPlanIds = [...planRefs.values()].map(p => p.planId).concat(inputs.flatMap(i => i.content.version === 2 && i.content.research?.binding.plan ? [i.content.research.binding.plan.planId] : []));
-            execution.evidence.research = await collectResearchEvidence(client, { sessionId, observedPlanIds });
+            if (observedPlanIds.some(planId => ![...planRefs.values()].some(plan => plan.planId === planId)))
+                execution.evidence.research = await collectResearchEvidence(client, { sessionId, observedPlanIds });
             execution.evidence['research-integrity'] = inspectResearchEvidence(execution.evidence.research, { runs: execution.evidence.runs!,
                 tools: execution.evidence['tool-evidence'], registration: execution.evidence['material-registration']!, input: execution.input });
             const parsed = z.object({ task: ResearchTaskSchema.nullable(), reports: z.array(ResearchReportSchema) }).passthrough().safeParse(execution.evidence.research.actual);
@@ -834,6 +909,8 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         } else execution.endpointReached = stepsComplete && execution.status === 'completed' && !!execution.answer?.trim();
         if(parentCancellation?.accepted.accepted)execution.endpointReached=false;
         if(saveCancelRace&&cancelRaceEvidence)execution.endpointReached=false;
+        if (historyOperations.some(operation => operation.action === 'compact-history' &&
+            (operation.continuedUse as { verified?: boolean } | undefined)?.verified !== true)) execution.endpointReached = false;
         execution.evidence['task-endpoint'] = { present: isResearch ? execution.evidence.research!.present : execution.answer !== null,
             actual: execution.endpointReached, source: isResearch ? 'Completed controller steps and actual saved Plan/Report identity'
                 : isInvoice ? 'Completed original invoice messages and persisted candidate for every save-candidate Run; quality is scored independently'
@@ -846,7 +923,6 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             ...(r.kind === 'subagent' ? { parentId: trial.identity.trialId + ':run:' + r.parentRunId } : {}), kind: 'span', name: (isResearch ? 'research' : 'agent') + ' Run ' + r.runId,
             startedAt: r.startedAt ?? r.createdAt, endedAt: r.endedAt, output: r.output }));
         Object.assign(execution.usage, executionUsage(allRuns, manualSnapshots, subagents.present));
-        return structuredClone(execution);
     }
     return {
         input: structuredClone(trial.input), snapshot: capture,
@@ -1041,8 +1117,12 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                         if (after.sessionId !== owner.sessionId || !after.operation || after.operation.operationId !== owner.operationId)
                             throw new Error('Original compaction operation is unavailable');
                         if (after.operation.phase === 'ended' && after.operation.stopped) {
-                            if (after.operation.nativeOutcome !== 'succeeded' || !after.operation.generated || !after.operation.saved || !after.operation.mayContinue)
-                                throw new Error('Manual compaction did not save a usable original summary');
+                            if (after.operation.nativeOutcome !== 'succeeded' || !after.operation.generated || !after.operation.saved || !after.operation.mayContinue) {
+                                const error = after.operation.error;
+                                record.outcome = error?.code === 'compaction_not_needed' ? 'no-work' : 'failed';
+                                controllerFailure = { code: error?.code ?? 'compaction_failed', message: error?.message ?? 'Manual compaction did not produce a usable original summary.', infrastructure: false };
+                                return capture();
+                            }
                             break;
                         }
                         await delay(50, undefined, { signal: running });
@@ -1094,8 +1174,8 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 await replayOriginalSave(result.data.runId,running);
                 const run = await waitRun(result.data.runId, running);
                 if(run.status==='failed'&&await recoverDeliveredSave(run.runId,running))continue;
-                if (run.status !== 'completed') throw new Error('Research Run did not complete: ' + run.status);
-                if(run.stoppedAt===null||run.cleanup.stopped!==true)throw new Error('Run stopping is unconfirmed; preserve the original instance');
+                if (run.status !== 'completed' || run.stoppedAt === null || run.cleanup.stopped !== true || run.cleanup.lateObservationRequired === true)
+                    return capture();
                 if(autoProfile){
                     const snapshot=await query({type:'query_session_compaction',input:{sessionId,runId:run.runId}},SessionCompactionSnapshotSchema);
                     if(snapshot.sessionId!==sessionId||hash(snapshot.policy)!==hash(autoInitial!.policy)||snapshot.capacity.contextWindow!==config.modelCapabilities.contextWindow||snapshot.capacity.thresholdTokens!==config.modelCapabilities.contextWindow-autoProfile.reserveTokens)

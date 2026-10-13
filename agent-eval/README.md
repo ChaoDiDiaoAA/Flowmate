@@ -16,16 +16,17 @@ FLOWMATE_EVAL_AGENT_MODEL=
 # 可选：接口协议，默认 openai-completions
 # 支持 openai-completions、openai-responses、anthropic-messages、google-generative-ai
 FLOWMATE_EVAL_AGENT_API=openai-completions
-# 使用 Judge 评分时必填：服务类型，anthropic 或 openai-compatible
-FLOWMATE_JUDGE_PROVIDER=
+# 可选：与主模型相同的接口协议，默认 openai-completions
+# 旧 FLOWMATE_JUDGE_PROVIDER=anthropic / openai-compatible 在未设置 API 时仍兼容
+FLOWMATE_JUDGE_API=openai-completions
 # 使用 Judge 评分时必填：服务接口地址
 FLOWMATE_JUDGE_BASE_URL=
 # 使用 Judge 评分时必填：评分模型名称
 FLOWMATE_JUDGE_MODEL=
 # 使用 Judge 评分时必填：独立评分密钥，不继承 Agent 密钥
 FLOWMATE_JUDGE_API_KEY=
-# 可选：请求超时，单位毫秒，默认 30000
-FLOWMATE_JUDGE_TIMEOUT_MS=30000
+# 可选：请求超时，单位毫秒，默认 180000
+FLOWMATE_JUDGE_TIMEOUT_MS=180000
 # 显式平台操作时必填：Langfuse 地址及项目凭据
 LANGFUSE_BASE_URL=
 LANGFUSE_PUBLIC_KEY=
@@ -64,7 +65,7 @@ Smoke 共14题（业务10＋研究4），Full 共62题（业务50＋研究12）�
 
 终端默认显示全局题目序号、Case ID、环境准备／Agent执行／停止清理／评分／保存阶段。阶段开始以 `▶` 标记，等待时每60秒以 `⏳` 提示当前阶段及已等待时间（60秒、120秒等）；切换阶段后重新计时，结束后停止提示。60秒仅控制日志频率，不改变任务超时。
 
-Agent结束后显示 `✅ Agent执行成功` 或 `❌ Agent执行失败`，超时、取消、未启动分别以 `⚠`、`⏹`、`⏭` 标明。评分结束后显示 `✅ 通过（PASS）`、`❌ 失败（FAIL）`、`❌ 错误（ERROR）`、`⚠ 未判定（UNJUDGEABLE）` 或 `⏭ 未运行（NOT_RUN）`，并保留原因。每题保存成功后以 `💾` 显示状态、耗时和 `evidence/<trial-id>/`，业务组结束立即显示报告路径。进度写入 stderr，原有 JSON 结果仍写入 stdout，重定向 JSON 时不会混入进度。
+Agent结束后显示 `✅ Agent执行成功` 或 `❌ Agent执行失败`，超时、取消、未启动分别以 `⚠`、`⏹`、`⏭` 标明。评分结束后显示 `✅ 通过（PASS）`、`❌ 失败（FAIL）`、`❌ 错误（ERROR）`、`⚠ 未判定（UNJUDGEABLE）` 或 `⏭ 未运行（NOT_RUN）`，并保留原因；业务 FAIL 同时有 Judge ERROR 时追加简短评分异常。每题保存成功后以 `💾` 显示状态、耗时和 `evidence/<trial-id>/`，业务组结束立即显示报告路径。进度写入 stderr；run／Smoke／Full结束不自动打印整段JSON，完整结果保存到report.json，显式status可查看。
 
 ## 查看或上传结果
 
@@ -78,3 +79,5 @@ Smoke／Full 始终本地执行，填写 Langfuse 配置不会触发上传。两
 结果保存在 agent-eval/runs/<execution-id>/：snapshot.json、report.json、evidence/<trial-id>/{trial.json,observation.json,events.jsonl}。artifacts/、review.json 和 export.json 仅在有实际产物、反馈或导出时保存。旧报告保持可读，比较实际声明和参数，不仅比较 v1。
 
 `evidence/` 下每个 Trial 都有独立子目录，多个 Case 和重复尝试不会平铺或共用证据文件。取消、停止不明或运行异常时，终端显示原因及已有报告位置；仍在等待、单题已保存或已有目录均不表示整批评测通过。用 `status` 核对执行与评分状态；`pending` 表示尚未完成评分。
+
+Judge通过Pi SDK provider生成评分。Judge 复用现有 Pi SDK ModelRuntime.completeSimple、模型目录和原生能力解析；模型、凭据与主 Agent 独立，不装配业务工具。FLOWMATE_JUDGE_API 显式优先，未设置时兼容旧 PROVIDER 的 anthropic／openai-compatible 映射，均未设置时默认 openai-completions。默认及本次采用的超时为180000毫秒，可显式覆盖；取消有效，SDK 自动生成重试关闭，每 Trial 最多一次生成。

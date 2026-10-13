@@ -19,6 +19,7 @@ import { executeCase } from '../../src/execution/execute-case.ts';
 import { metricCatalog } from '../../src/scoring/catalog.ts';
 import { evaluateAll } from '../../src/scoring/evaluate.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
+import { judgeResponse } from '../support/judge-response.ts';
 import { caseV2Schema } from '../../src/dataset-loader/schema.ts';
 import { task } from '../support/fixtures.ts';
 import { fixtureRepo } from '../support/fixtures.ts';
@@ -106,9 +107,9 @@ for (const isolation of [undefined] as const) test
             criteria:drIds.map(metricId=>({metricId,version:1,unit:metricCatalog.find(m=>m.id===metricId)!.unit,denominator:metricId==='DR02'?1:null,
                 required:true,rule:'Independently match the actual Report to the declared synthetic source and reference.',evidence:['research-frame','gold-research'],trigger:'started'}))};
         let researchJudgeRequests=0;
-        const scoredResearch=await evaluateAll({task:researchTask,result,projected:trial.input,judge:judgeConfig({FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'independent-fixture',
+        const scoredResearch=await evaluateAll({task:researchTask,result,projected:trial.input,judge:judgeConfig({FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
             FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'independent-fixture-key'}),fetcher:async()=>{
-                researchJudgeRequests++;return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({v:1,r:drIds.map(()=>null),f:[],research:{atoms:[{block:0,start:0,length:frame.blocks[0]!.text.length,correct:1,needsCitation:true,covered:1,gold:1,matchUncertain:false}],links:[{atom:0,state:1}],chains:[]}})},finish_reason:'stop'}]}));
+                researchJudgeRequests++;return judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:drIds.map(()=>null),f:[],research:{atoms:[{block:0,start:0,length:frame.blocks[0]!.text.length,correct:1,needsCitation:true,covered:1,gold:1,matchUncertain:false}],links:[{atom:0,state:1}],chains:[]}})},finish_reason:'stop'}]});
             }},[]);
         expect(researchJudgeRequests,JSON.stringify(scoredResearch.scores.filter(s=>drIds.includes(s.metricId)))).toBe(1);expect(scoredResearch.judgeCalls[0]!.error).toBeNull();
         expect(scoredResearch.scores.filter(s=>s.metricId.startsWith('DR')&&s.metricId!=='DR06').map(s=>s.value)).toEqual([1,1,1,1,1]);
@@ -133,14 +134,14 @@ for (const isolation of [undefined] as const) test
             expected: { ...task.expected, metrics: metricCatalog.map(m => m.id === 'task-success'
                 ? { metricId: m.id, version: m.version, unit: m.unit, denominator: 1 }
                 : { metricId: m.id, version: m.version, unit: m.unit, notApplicable: 'Synthetic Judge transport connection only' }) } }), result, projected: trial.input,
-            judge: judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic-judge',
+            judge: judgeConfig({ FLOWMATE_JUDGE_API: 'openai-completions', FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
                 FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-judge-key' }),
             fetcher: async (_, init) => {
                 judgeRequests++;
                 const data = JSON.parse(JSON.parse(String(init.body)).messages[1].content);
                 expect(data.interactions).toEqual(result.evidence['interaction-history']!.actual);
                 expect(data).not.toHaveProperty('steps');
-                return new Response(JSON.stringify({ choices: [{ message: { content: '{"score":1,"reason":"Synthetic transport only."}' }, finish_reason: 'stop' }] }));
+                return judgeResponse({ choices: [{ message: { content: '{"score":1,"reason":"Synthetic transport only."}' }, finish_reason: 'stop' }] });
             } }, [{ metric: 'answer-relevance', required: true }]);
         expect(judged.scores[0]).toMatchObject({ status: 'PASS', value: 1 });
         expect(judgeRequests).toBe(1);

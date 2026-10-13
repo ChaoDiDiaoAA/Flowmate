@@ -5,7 +5,7 @@ import { dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDataset, resolveCase, discoverDatasets } from './dataset-loader/local.ts';
 import { findDataset, runLocal, runBatch, parseRunConfig, type EvaluationProgress } from './execution/runner.ts';
-import { readReport, reportPath, exitCode, comparison, summary } from './reports/store.ts';
+import { readReport, reportPath, exitCode, comparison } from './reports/store.ts';
 import { addFeedback, feedbackStatus } from './review/local.ts';
 import { judgeConfig, prepareJudge, publicJudgeConfig } from './scoring/judges/client.ts';
 import { scanEvidence } from './execution/evidence-safety.ts';
@@ -211,7 +211,6 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
             const options = { selection: selection as 'smoke' | 'holdout' | 'full', backend: backend as 'local' | 'langfuse', judge: judge as 'auto' | 'off' | 'required', repeat: opt('--repeat') ? Number(opt('--repeat')) : undefined, config };
             const results = all ? await runBatch(repoRoot, { ...options, datasets }, {signal:controller.signal,onProgress:progress.onProgress})
                 : [await runLocal(repoRoot, { ...options, dataset: datasets[0]!, caseId: opt('--case'), executionId: opt('--execution-id') }, {signal:controller.signal,onProgress:progress.onProgress})];
-            for (const result of results) print({ dataset: result.report.dataset.id, executionId: result.report.executionId, report: result.file, summary: summary(result.report), trials: result.report.trials.map(t => ({ caseId: t.caseId, repetition: t.repetition, status: t.status, reason: t.reason, counts: t.counts })), manualReview: result.report.manualReview, export: result.report.export });
             const codes = results.map(r=>exitCode(r.report));
             process.exitCode = results.length !== datasets.length || results.some(r=>r.stopped) || codes.includes(1) ? 1 : codes.includes(2) ? 2 : 0;
         }

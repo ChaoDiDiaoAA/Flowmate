@@ -1,3 +1,4 @@
+import { judgeResponse } from '../support/judge-response.ts';
 import { expect, test } from 'bun:test';
 import { mkdtempSync } from '../../../tests/support/resources.ts';
 import { tmpdir } from 'node:os';
@@ -24,10 +25,10 @@ test('new reports aggregate and save actual Trials without an approval record', 
 test('the previous plain JSON Prompt remains readable with its original scores', async () => {
     const plan: CompactPlan={contract:'flowmate-semantic-plan/v1',criteria:[{metricId:'tool-selection',version:1,unit:'决策点',denominator:1,
         required:false,rule:'One observed decision.',evidence:['answer'],trigger:'started'}]};
-    const config=judgeConfig({FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic-legacy-json',
+    const config=judgeConfig({FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
         FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-legacy-json-key'})!;
     const call=await runCompactJudge(config,plan,{answer:{present:true,actual:'Synthetic answer',source:'synthetic'}},async()=>
-        Response.json({choices:[{message:{content:'{"v":1,"r":[[1,1,0]],"f":[]}'},finish_reason:'stop'}]}));
+        judgeResponse({choices:[{message:{content:'{"v":1,"r":[[1,1,0]],"f":[]}'},finish_reason:'stop'}]}));
     call.request!.system=legacyPlainRubric.prompt;call.request!.hash=hash([call.request!.system,call.request!.data]);
     call.configuration.rubric={id:legacyPlainRubric.id,version:legacyPlainRubric.version,hash:hash(legacyPlainRubric.prompt)};
     const {configHash:_,...parameters}=call.configuration;call.configuration.configHash=hash(parameters);

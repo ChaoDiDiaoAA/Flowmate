@@ -20,7 +20,7 @@ export function extensionIdentity(ref:{id:string;version:string},repo=repository
 export function evaluationEnv(repo: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
     const file = join(repo,'agent-eval/configs/.env');
     const values = existsSync(file) ? parseEnv(readFileSync(file,'utf8')) : {};
-    const allowed = /^(FLOWMATE_EVAL_AGENT_(BASE_URL|API_KEY|MODEL|API)|FLOWMATE_JUDGE_(PROVIDER|BASE_URL|MODEL|API_KEY|TIMEOUT_MS)|LANGFUSE_(BASE_URL|PUBLIC_KEY|SECRET_KEY))$/;
+    const allowed = /^(FLOWMATE_EVAL_AGENT_(BASE_URL|API_KEY|MODEL|API)|FLOWMATE_JUDGE_(API|PROVIDER|BASE_URL|MODEL|API_KEY|TIMEOUT_MS)|LANGFUSE_(BASE_URL|PUBLIC_KEY|SECRET_KEY))$/;
     if (Object.keys(values).some(key=>!allowed.test(key))) throw Error('configs/.env contains an unsupported variable');
     const merged = {...values,...Object.fromEntries(Object.entries(env).filter(([,value])=>value!==undefined))};
     registerSecrets(['FLOWMATE_EVAL_AGENT_API_KEY', 'FLOWMATE_JUDGE_API_KEY', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY']
@@ -78,18 +78,21 @@ export async function prepareAgentConfig(repo: string, env: NodeJS.ProcessEnv = 
     overrides: Parameters<typeof agentConfig>[2] = {}, catalog?: readonly ModelCatalogProvider[],
     deps: { fetcher?: (url: string, init: RequestInit) => Promise<Response>; signal?: AbortSignal } = {}) {
     const selected = agentConfig(repo, env, overrides);
+    const modelCapabilities = await resolveModelCapabilities(selected.configuration, selected.apiKey, catalog, deps);
+    return { ...selected, configuration: { ...selected.configuration, modelCapabilities } };
+}
+export async function resolveModelCapabilities(connection: { model: string; api: string; baseUrl: string }, apiKey: string,
+    catalog?: readonly ModelCatalogProvider[], deps: Parameters<typeof readDeepSeekModelCapabilities>[2] = {}): Promise<AgentModelCapabilities> {
     let models = catalog;
     if (!models) {
         const { createPiModelCatalog } = await import('../../packages/runtime-pi/src/catalog.ts');
         models = await (await createPiModelCatalog()).list();
     }
-    const connection = selected.configuration;
-    let modelCapabilities: AgentModelCapabilities;
     if (!models.some(p => p.models.some(m => m.id === connection.model && m.api === connection.api)) &&
         /^deepseek-/.test(connection.model) && ['openai-completions', 'openai-responses', 'anthropic-messages'].includes(connection.api)) {
-        modelCapabilities = await readDeepSeekModelCapabilities(connection, selected.apiKey, deps);
-    } else modelCapabilities = resolveAgentModel(connection, models);
-    return { ...selected, configuration: { ...connection, modelCapabilities } };
+        return readDeepSeekModelCapabilities(connection, apiKey, deps);
+    }
+    return resolveAgentModel(connection, models);
 }
 const envName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/);
 const langfuseSchema = z.object({ baseUrl: z.string().url(), publicKeyEnv: envName.default('LANGFUSE_PUBLIC_KEY'),

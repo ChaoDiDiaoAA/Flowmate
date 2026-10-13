@@ -7,6 +7,7 @@ import {readReport,comparison} from '../../src/reports/store.ts';
 import {fixtureRepo} from '../support/fixtures.ts';
 import {manifest} from '../fixtures/minimal-dataset.ts';
 import {createHttpProvider} from '../../../tests/support/resources.ts';
+import { judgeResponse } from '../support/judge-response.ts';
 
 test('local CLI readiness does not require a Docker engine or image', () => {
  const originalPath=process.env.PATH;process.env.PATH='';
@@ -26,15 +27,15 @@ test('default CLI runs only independent synthetic data through local Host, one i
  const server=await createHttpProvider(async request=>{
   const body=await request.json() as any;
   if(new URL(request.url).pathname.startsWith('/judge/')){
-   judgeCalls++;expect(request.headers.get('authorization')).toBe('Bearer synthetic-public-judge');expect(body).not.toHaveProperty('max_tokens');expect(body).not.toHaveProperty('temperature');
-   return Response.json({model:'scripted-judge',choices:[{finish_reason:'stop',message:{content:JSON.stringify({score:1,reason:'Independent synthetic reference matches.'})}}],usage:{prompt_tokens:10,completion_tokens:5}});
+   judgeCalls++;expect(request.headers.get('authorization')).toBe('Bearer synthetic-public-judge');expect(body.max_completion_tokens).toBe(32768);expect(body).not.toHaveProperty('temperature');
+   return judgeResponse({model:'llama-3.3-70b-versatile',choices:[{finish_reason:'stop',message:{content:JSON.stringify({score:1,reason:'Independent synthetic reference matches.'})}}],usage:{prompt_tokens:10,completion_tokens:5}});
   }
   agentCalls++;expect(request.headers.get('authorization')).toBe('Bearer synthetic-public-agent');
   const chunk=(delta:unknown,finish:string|null)=>'data: '+JSON.stringify({id:'synthetic-cli',model:'scripted-agent',choices:[{index:0,delta,finish_reason:finish}],...(finish?{usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}:{})})+'\n\n';
   return new Response(chunk({role:'assistant',content:'The synthetic answer is 42.'},null)+chunk({},'stop')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
  },'0.0.0.0');
  const values={FLOWMATE_EVAL_AGENT_API_KEY:'synthetic-public-agent',FLOWMATE_EVAL_AGENT_MODEL:'deepseek-v4-flash',
-  FLOWMATE_EVAL_AGENT_API:'openai-completions',FLOWMATE_EVAL_AGENT_BASE_URL:`http://127.0.0.1:${server.port}/agent`,FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'scripted-judge',
+  FLOWMATE_EVAL_AGENT_API:'openai-completions',FLOWMATE_EVAL_AGENT_BASE_URL:`http://127.0.0.1:${server.port}/agent`,FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
   FLOWMATE_JUDGE_BASE_URL:`http://127.0.0.1:${server.port}/judge`,FLOWMATE_JUDGE_API_KEY:'synthetic-public-judge',FLOWMATE_JUDGE_MAX_TOKENS:'256'};
  const saved=Object.fromEntries(Object.keys(values).map(k=>[k,process.env[k]])),originalCode=process.exitCode,output=spyOn(console,'log').mockImplementation(()=>{});
  Object.assign(process.env,values);

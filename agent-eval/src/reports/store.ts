@@ -13,6 +13,7 @@ import { parseJudgment } from '../scoring/judges/harness.ts';
 import { compactPlanSchema, compactResultSchema, compactRubricFor, parseCompactJudgment,parseLegacyCompactJudgment, compactScores, type CompactPlan } from '../scoring/judges/compact.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { artifactJson, withoutHashes } from '../artifacts.ts';
+import { agentApiSchema, agentModelCapabilitiesSchema } from '../configuration.ts';
 export type TrialReport = {
     caseId: string;
     caseVersion: number;
@@ -97,16 +98,24 @@ const executionSchema = z.object({ identity: z.object({ executionId: text, trial
     startedAt: timestamp.nullable(), endedAt: timestamp.nullable(),
     error: z.object({ code: text, message: z.string(), infrastructure: z.boolean() }).strict().optional() }).strict();
 // Legacy v1 calls lack completion metadata; preserve their fields without inventing a modern completion proof.
-const judgeCallSchema = z.object({ callId: text, configuration: z.object({ provider: z.enum(['anthropic', 'openai-compatible']), model: text,
+const legacyJudgeConfigurationSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatible']), model: text,
     baseUrl: z.string().url(), temperature: z.number().finite().min(0).max(2).optional(), maxTokens: positive.optional(), timeoutMs: positive, configHash: text.optional(),
     modelCapabilities: z.object({modelId:text,maxOutputTokens:positive,source:z.enum(['anthropic-models-api','deepseek-models-api'])}).strict().optional(),
     protocolVersion: text.optional(), rubric: z.object({ id: text, version: positive, hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().optional()
-    }).strict(), startedAt: timestamp, endedAt: timestamp, attempts: integer.max(1),
+    }).strict();
+const judgeCallBase = z.object({ callId: text, startedAt: timestamp, endedAt: timestamp, attempts: integer.max(1),
     usage: z.unknown(), responseModel: z.unknown(), raw: z.string().nullable(), error: z.string().nullable(),
     judgment: z.object({ score: z.number().finite().min(0).max(1), reason: text }).strict().nullable(),
-    finishReason: z.string().nullable().optional(), responseComplete: z.boolean().optional(),
     request: z.object({ system: z.string(), data: z.string(), hash: z.string().regex(/^[a-f0-9]{64}$/).optional(), redacted: z.boolean() }).strict().optional(),
     compact: z.object({ plan: compactPlanSchema, judgment: compactResultSchema.nullable() }).strict().optional() }).strict();
+const judgeCallSchema = z.union([
+    judgeCallBase.extend({ configuration: legacyJudgeConfigurationSchema, finishReason: z.string().nullable().optional(), responseComplete: z.boolean().optional() }),
+    judgeCallBase.extend({ configuration: legacyJudgeConfigurationSchema.omit({ temperature: true, maxTokens: true, modelCapabilities: true }).extend({
+        provider: z.enum(['anthropic', 'openai-compatible']).optional(), api: agentApiSchema,
+        sdk: z.object({ codingAgent: text, ai: text }).strict(), modelCapabilities: agentModelCapabilitiesSchema.optional()
+    }), stopReason: z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']).nullable(),
+        rawStopReason: z.string().nullable(), usageSource: z.enum(['sdk', 'unknown']), responseComplete: z.boolean() })
+]);
 const trialSchema = z.object({ caseId: text, caseVersion: positive, caseHash: text.optional(), caseName: text, category: text, purpose:z.enum(['capability','regression']).optional(),
     partition: z.enum(['smoke', 'holdout']), repetition: positive, trialId: text, traceId: z.string().regex(/^[a-f0-9]{32}$/),
     status, reason: z.string(), counts: z.record(integer), execution: executionSchema.nullable(), scores: z.array(scoreSchema),
@@ -160,9 +169,11 @@ function validateReport(value: unknown): asserts value is LocalReport {
             if (call.request && (call.request.hash && hash([call.request.system, call.request.data]) !== call.request.hash || call.request.redacted &&
                 (call.judgment !== null || call.compact?.judgment != null))) throw new Error('Stored Judge input identity or redaction contradicts its judgment');
             if (report.contract === 'flowmate-agent-run/v2') {
-                if (call.configuration.protocolVersion !== 'flowmate-judge/v2' || call.finishReason === undefined || call.responseComplete === undefined)
+                const sdk = call.configuration.sdk !== undefined;
+                if (call.configuration.protocolVersion !== 'flowmate-judge/v2' || (!sdk && call.finishReason === undefined) || call.responseComplete === undefined)
                     throw new Error('Modern Judge completion metadata is missing or unsupported');
-                const completed = call.configuration.provider === 'anthropic' ? ['end_turn', 'stop_sequence'].includes(call.finishReason ?? '') : call.finishReason === 'stop';
+                const completed = sdk ? call.stopReason === 'stop' : call.configuration.provider === 'anthropic' ? ['end_turn', 'stop_sequence'].includes(call.finishReason ?? '') : call.finishReason === 'stop';
+                if (sdk && call.attempts === 1 && !call.configuration.modelCapabilities) throw Error('SDK Judge native capabilities are missing');
                 if (call.responseComplete && !completed || call.judgment !== null &&
                     (!call.responseComplete || call.attempts !== 1 || call.error !== null || call.raw === null ||
                         JSON.stringify(parseJudgment(call.raw)) !== JSON.stringify(call.judgment)))

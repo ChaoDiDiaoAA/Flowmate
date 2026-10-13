@@ -1,3 +1,4 @@
+import { judgeResponse } from '../support/judge-response.ts';
 import { expect, test } from 'bun:test';
 import { caseV2Schema } from '../../src/dataset-loader/schema.ts';
 import { metricCatalog } from '../../src/scoring/catalog.ts';
@@ -5,7 +6,7 @@ import { evaluateAll } from '../../src/scoring/evaluate.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
 import { observed, task as legacy } from '../support/fixtures.ts';
 
-const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic',
+const config = judgeConfig({ FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
     FLOWMATE_JUDGE_API_KEY: 'synthetic-semantic-key', FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1' })!;
 function candidate() {
     const criteria = [
@@ -26,7 +27,7 @@ function result() {
     r.evidence.requests = { present: true, actual: ['a', 'b', 'c', 'd'], source: 'synthetic original requests' };
     return r;
 }
-const reply = (r: unknown) => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ v: 1, r, f: [] }) }, finish_reason: 'stop' }] }));
+const reply = (r: unknown) => judgeResponse({ choices: [{ message: { content: JSON.stringify({ v: 1, r, f: [] }) }, finish_reason: 'stop' }] });
 const selected=(scores:Awaited<ReturnType<typeof evaluateAll>>['scores'])=>scores.filter(s=>['tool-selection','tool-arguments'].includes(s.metricId));
 
 test('v2 semantic criteria bind the declared metric plan and evaluateAll makes exactly one multi-criterion Judge request', async () => {
@@ -148,6 +149,23 @@ test('independent Gold is Judge-only and an unverified reference cannot be repla
     expect(judged.judgeCalls).toHaveLength(1);
     expect(execution.evidence['gold-reference'].actual).toMatchObject({ fields: { invoiceNumber: 'fake product Gold' } });
     expect(JSON.stringify(execution.input)).not.toContain('independent-gold-marker');
+});
+
+test('pending research Gold stays UNJUDGEABLE when an unrelated product collection fails', async () => {
+    const c = candidate(), criterion = { ...c.expected.semantic.criteria[0]!, metricId: 'DR01', unit: '事实Claim',
+        evidence: ['research-frame', 'gold-research'], denominator: 1 };
+    const task = caseV2Schema.parse({ ...c, expected: { ...c.expected,
+        research: { status: 'pending', claims: [], chains: [], forbidden: [] },
+        semantic: { ...c.expected.semantic, criteria: [criterion] },
+        metrics: metricCatalog.map(metric => ({ metricId: metric.id, version: metric.version, unit: metric.unit,
+            ...(metric.id === 'DR01' || metric.id === 'task-success' ? { denominator: 1 } : { notApplicable: 'Independent pending reference fixture.' }) })) } });
+    const execution = result();
+    execution.evidence.research = { present: true, actual: null, source: 'Confirmed absent research task' };
+    execution.evidence['capture-gaps'] = { present: false, actual: ['query_run_extensions failed'], source: 'Unrelated collection error' };
+    const scored = await evaluateAll({ task, result: execution, projected: execution.input, judge: config,
+        fetcher: async () => { throw Error('Pending independent Gold must not dispatch'); } }, []);
+    expect(scored.scores.find(score => score.metricId === 'DR01')).toMatchObject({ status: 'UNJUDGEABLE', value: null });
+    expect(scored.judgeCalls).toHaveLength(0);
 });
 
 test('a legacy answer Judge cannot be combined with a compact plan in one Trial', async () => {

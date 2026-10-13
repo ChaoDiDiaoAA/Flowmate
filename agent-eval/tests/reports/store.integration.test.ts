@@ -1,5 +1,5 @@
+import { judgeResponse } from '../support/judge-response.ts';
 import { legacyCompactRubric } from '../../src/scoring/judges/packed.ts';
-import { publicJudgeConfig } from '../../src/scoring/judges/client.ts';
 import { mkdtempSync } from '../../../tests/support/resources.ts';
 import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -25,8 +25,8 @@ test('plain research witnesses, independent counts and derived F1 survive report
   const frame=(reference.evidence as any).researchFrame,plan={...reference.plan,criteria:['DR01','DR02','DR04','DR05','DR06'].map(metricId=>({
    ...reference.plan.criteria[0],metricId,unit:formalMetric(metricId).unit,
    denominator:metricId==='DR02'?frame.gold.claims.filter((c:any)=>c.required).length:metricId==='DR06'?frame.gold.chains.length:null}))};
-  const config=judgeConfig({FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'synthetic',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-judge-key'})!;
-  let requests=0;const call=await runCompactJudge(config,plan,{researchFrame:frame},async()=>{requests++;return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({...JSON.parse(reference.referenceWire!),r:plan.criteria.map(()=>null)})},finish_reason:'stop'}]}));});
+  const config=judgeConfig({FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-judge-key'})!;
+  let requests=0;const call=await runCompactJudge(config,plan,{researchFrame:frame},async()=>{requests++;return judgeResponse({choices:[{message:{content:JSON.stringify({...JSON.parse(reference.referenceWire!),r:plan.criteria.map(()=>null)})},finish_reason:'stop'}]});});
   expect(call.error).toBeNull();expect(requests).toBe(1);
   const report=reportFixture();report.contract='flowmate-agent-run/v2';
   const trial=report.trials[0]!;trial.semanticPlan=plan;trial.judgeCalls=[call];trial.scores.push(...compactScores(call));
@@ -36,8 +36,8 @@ test('plain research witnesses, independent counts and derived F1 survive report
   report.scoringConfiguration.judgeHash=call.configuration.configHash;saveReport(file,report);
   const stored=readReport(file);expect(stored.trials[0]!.scores.filter(s=>s.metricId.startsWith('DR')).map(s=>s.value)).toEqual([1,1,1,1,1,1]);
   const partial=structuredClone(stored),partialFrame=structuredClone(frame);partialFrame.complete=false;partialFrame.links[0].valid=false;
-  const partialCall=await runCompactJudge(config,plan,{researchFrame:partialFrame},async()=>new Response(JSON.stringify({choices:[{
-   message:{content:JSON.stringify({v:1,r:plan.criteria.map(()=>null),f:[],research:{atoms:[],links:[],chains:[],unavailable:true}})},finish_reason:'stop'}]})));
+  const partialCall=await runCompactJudge(config,plan,{researchFrame:partialFrame},async()=>judgeResponse({choices:[{
+   message:{content:JSON.stringify({v:1,r:plan.criteria.map(()=>null),f:[],research:{atoms:[],links:[],chains:[],unavailable:true}})},finish_reason:'stop'}]}));
   const partialTrial=partial.trials[0]!;partialTrial.judgeCalls=[partialCall];partialTrial.scores=partialTrial.scores.filter(s=>!s.metricId.startsWith('DR'));
   partialTrial.scores.push(...compactScores(partialCall));partialTrial.scores.push(deriveResearchF1(partialTrial.metricPlan,partialTrial.scores,partialTrial.execution)!);
   Object.assign(partialTrial,aggregate(partialTrial.scores,partialTrial.execution!));
@@ -235,18 +235,18 @@ test('stored modern Judge identity and completion are verified while legacy meta
         const report = reportFixture(); report.contract = 'flowmate-agent-run/v2';
 
         report.trials[0]!.metricPlan = [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 }];
-        const { timeoutMs, ...parameters } = judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic',
+        const { timeoutMs, ...parameters } = judgeConfig({ FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_API:'openai-completions', FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
             FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-judge-key' })!;
         const config = { timeoutMs, ...parameters };
-        report.trials[0]!.judgeCalls = [await runJudge(config, 'rubric', 'data', async () => new Response(JSON.stringify({
-            choices: [{ message: { content: '{"score":1,"reason":"Synthetic record."}' }, finish_reason: 'stop' }] })))];
-        report.scoringConfiguration.judgeHash = report.trials[0]!.judgeCalls[0]!.configuration.configHash;
+        report.trials[0]!.judgeCalls = [await runJudge(config, 'rubric', 'data', async () => judgeResponse({
+            choices: [{ message: { content: '{"score":1,"reason":"Synthetic record."}' }, finish_reason: 'stop' }] }))];
+        report.scoringConfiguration.judgeHash = report.trials[0]!.judgeCalls[0]!.configuration.configHash!;
         saveReport(file, report);
         expect(readReport(file).trials[0]!.judgeCalls[0]!.judgment?.score).toBe(1);
         for (const mutate of [
             (c: any) => { c.configuration.model = 'different-model'; },
-            (c: any) => { c.responseComplete = false; c.finishReason = 'length'; },
-            (c: any) => { delete c.finishReason; delete c.responseComplete; },
+            (c: any) => { c.responseComplete = false; c.stopReason = 'length'; },
+            (c: any) => { delete c.stopReason; delete c.responseComplete; },
             (c: any) => { c.raw = '{"score":0,"reason":"Contradictory original."}'; }
         ]) {
             const changed = JSON.parse(JSON.stringify(report)); mutate(changed.trials[0].judgeCalls[0]);
@@ -258,7 +258,8 @@ test('stored modern Judge identity and completion are verified while legacy meta
         writeFileSync(file, JSON.stringify(contradictoryScore));
         expect(() => readReport(file)).toThrow('Semantic score');
         const legacy = JSON.parse(JSON.stringify(report)); legacy.contract = 'flowmate-agent-run/v1'; delete legacy.aggregation;
-        const call = legacy.trials[0].judgeCalls[0]; delete call.finishReason; delete call.responseComplete; delete call.configuration.protocolVersion;
+        const call = legacy.trials[0].judgeCalls[0]; delete call.stopReason; delete call.rawStopReason; delete call.usageSource;
+        delete call.responseComplete; delete call.configuration.protocolVersion; delete call.configuration.api; delete call.configuration.sdk; delete call.configuration.modelCapabilities;
         const { configHash, ...legacyParameters } = call.configuration; call.configuration.configHash = hash(legacyParameters);
         legacy.scoringConfiguration.judgeHash = call.configuration.configHash;
         const legacyFile = join(dir, 'legacy-summary.json'); saveReport(legacyFile, legacy);
@@ -274,10 +275,10 @@ test('one compact Judge record binds distinct semantic counts to their original 
         { metricId: 'tool-selection', version: 1, unit: '决策点', denominator: 3, required: true, rule: 'Three decisions.', evidence: ['original'], trigger: 'started' as const },
         { metricId: 'tool-arguments', version: 1, unit: '请求', denominator: 4, required: true, rule: 'Four requests.', evidence: ['original'], trigger: 'started' as const }
     ] };
-    const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic',
+    const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_API:'openai-completions', FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
         FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-judge-key' })!;
-    const call = await runCompactJudge(config, plan, { original: 'synthetic' }, async () => new Response(JSON.stringify({
-        choices: [{ message: { content: '{"v":1,"r":[[2,3,0],[1,4,1]],"f":[[1,2,1]]}' }, finish_reason: 'stop' }] })));
+    const call = await runCompactJudge(config, plan, { original: 'synthetic' }, async () => judgeResponse({
+        choices: [{ message: { content: '{"v":1,"r":[[2,3,0],[1,4,1]],"f":[[1,2,1]]}' }, finish_reason: 'stop' }] }));
     const trial = report.trials[0]!;
     trial.semanticPlan = structuredClone(plan);
     trial.judgeCalls = [call]; trial.scores.push(...compactScores(call));
@@ -301,9 +302,9 @@ test('one compact Judge record binds distinct semantic counts to their original 
         (r: typeof report) => { r.trials[0]!.scores[2]!.status = 'UNJUDGEABLE'; },
         (r: typeof report) => { r.trials[0]!.scores[1]!.statistics!.numerator = 3; },
         (r: typeof report) => { r.trials[0]!.judgeCalls[0]!.raw = '{"v":1,"r":[[3,3,0],[4,4,0]],"f":[]}'; },
-        (r: typeof report) => { r.trials[0]!.judgeCalls[0]!.request.data += ' '; },
+        (r: typeof report) => { r.trials[0]!.judgeCalls[0]!.request!.data += ' '; },
         (r: typeof report) => { r.trials[0]!.judgeCalls[0]!.compact!.plan.criteria[0]!.denominator = 4; },
-        (r: typeof report) => { r.trials[0]!.judgeCalls[0]!.request.redacted = true; },
+        (r: typeof report) => { r.trials[0]!.judgeCalls[0]!.request!.redacted = true; },
         (r: typeof report) => {
             const c = r.trials[0]!.judgeCalls[0]!; c.configuration.rubric!.version++;
             const { configHash: _, ...parameters } = c.configuration;
@@ -312,8 +313,8 @@ test('one compact Judge record binds distinct semantic counts to their original 
         ...['rule', 'evidence', 'trigger', 'required'].map(field => (r: typeof report) => {
             const c = r.trials[0]!.judgeCalls[0]!, criterion = c.compact!.plan.criteria[0]!;
             Object.assign(criterion, { [field]: field === 'rule' ? 'Another valid rule.' : field === 'evidence' ? ['another-original'] : field === 'trigger' ? 'completed-endpoint' : false });
-            const input = JSON.parse(c.request.data); input.plan = c.compact!.plan;
-            c.request.data = JSON.stringify(input); c.request.hash = hash([c.request.system, c.request.data]);
+            const input = JSON.parse(c.request!.data); input.plan = c.compact!.plan;
+            c.request!.data = JSON.stringify(input); c.request!.hash = hash([c.request!.system, c.request!.data]);
             r.trials[0]!.scores.splice(1, 2, ...compactScores(c));
             Object.assign(r.trials[0]!, aggregate(r.trials[0]!.scores, r.trials[0]!.execution!));
             r.aggregation = aggregateTrials(r);
@@ -326,8 +327,8 @@ test('one compact Judge record binds distinct semantic counts to their original 
         expect(() => readReport(file)).toThrow();
     }
     for (const reason of ['length', 'stop']) {
-        const failed = await runCompactJudge(config, plan, { original: 'synthetic' }, async () => new Response(JSON.stringify({
-            choices: [{ message: { content: 'incomplete-json' }, finish_reason: reason }] })));
+        const failed = await runCompactJudge(config, plan, { original: 'synthetic' }, async () => judgeResponse({
+            choices: [{ message: { content: 'incomplete-json' }, finish_reason: reason }] }));
         const damaged = structuredClone(report), t = damaged.trials[0]!;
         t.judgeCalls = [failed]; t.scores = [t.scores[0]!, ...compactScores(failed)];
         Object.assign(t, aggregate(t.scores, t.execution!));
@@ -345,7 +346,7 @@ test('report readback rederives same-Trial F1 and rejects copied values or a dro
         { metricId: 'DR01', version: 1, unit: '事实Claim', denominator: 3, required: true, rule: 'Synthetic precision matching.', evidence: ['original'], trigger: 'started' as const },
         { metricId: 'DR02', version: 1, unit: 'Gold Claim', denominator: 2, required: true, rule: 'Synthetic recall matching.', evidence: ['original'], trigger: 'started' as const }
     ] };
-    const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic',
+    const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_API:'openai-completions', FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
         FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-f1-key' })!;
     const reference=loadCalibration(join(import.meta.dir,'../fixtures/judge-calibration')).samples.find(s=>s.id==='dr06-validation')!.document;
     const frame=structuredClone((reference.evidence as any).researchFrame);
@@ -353,13 +354,13 @@ test('report readback rederives same-Trial F1 and rejects copied values or a dro
     frame.blocks=Array.from({length:3},(_,i)=>({...frame.blocks[0],key:'synthetic-f1-'+i,text:'Synthetic original factual statement '+i}));
     const research={atoms:frame.blocks.map((_:unknown,i:number)=>({block:i,start:0,length:10,correct:i===0?1:0,needsCitation:true,covered:i===0?1:0,gold:i<2?i+1:0,matchUncertain:false})),
         links:frame.links.map(()=>({atom:0,state:1})),chains:[]};
-    const call=await runCompactJudge(config,plan,{researchFrame:frame},async()=>Response.json({choices:[{message:{content:JSON.stringify({v:1,r:[null,null],f:[],research})},finish_reason:'stop'}]}));
+    const call=await runCompactJudge(config,plan,{researchFrame:frame},async()=>judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:[null,null],f:[],research})},finish_reason:'stop'}]}));
     const trial = report.trials[0]!; trial.semanticPlan = structuredClone(plan); trial.judgeCalls = [call];
     trial.metricPlan = [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 },
         ...plan.criteria.map(({ metricId, version, unit, denominator }) => ({ metricId, version, unit, denominator })),
         { metricId: 'DR03', version: 1, unit: '派生F1', denominator: null }];
     trial.scores.push(...compactScores(call)); trial.scores.push(deriveResearchF1(trial.metricPlan, trial.scores, trial.execution)!);
-    Object.assign(trial, aggregate(trial.scores, trial.execution!)); report.scoringConfiguration.judgeHash = call.configuration.configHash;
+    Object.assign(trial, aggregate(trial.scores, trial.execution!)); report.scoringConfiguration.judgeHash = call.configuration.configHash!;
     saveReport(file, report);
     expect(readReport(file).trials[0]!.scores.find(s => s.metricId === 'DR03')?.value).toBe(0.4);
     for (const mutate of [
@@ -391,11 +392,13 @@ test('historical compact scalar research reports remain readable without inventi
         { metricId: 'DR01', version: 1, unit: '事实Claim', denominator: 3, required: true, rule: 'Synthetic precision matching.', evidence: ['original'], trigger: 'started' as const },
         { metricId: 'DR02', version: 1, unit: 'Gold Claim', denominator: 2, required: true, rule: 'Synthetic recall matching.', evidence: ['original'], trigger: 'started' as const }
     ] };
-    const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic',
+    const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_API:'openai-completions', FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
         FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-f1-key' })!;
     const raw=JSON.stringify({v:1,r:[[1,3,0],[1,2,0]],f:[]});
     const data=JSON.stringify({plan,evidence:{original:'historical scalar grading record'}});
-    const call:Parameters<typeof compactScores>[0]={callId:'00000000-0000-4000-8000-000000000001',configuration:publicJudgeConfig(config,legacyCompactRubric),
+    const configuration={provider:'openai-compatible' as const,model:'historical-synthetic',baseUrl:config.baseUrl,timeoutMs:30000,protocolVersion:'flowmate-judge/v2',
+        rubric:{id:legacyCompactRubric.id,version:legacyCompactRubric.version,hash:hash(legacyCompactRubric.prompt)}};
+    const call:Parameters<typeof compactScores>[0]={callId:'00000000-0000-4000-8000-000000000001',configuration:{...configuration,configHash:hash(configuration)},
         startedAt:report.startedAt,endedAt:report.endedAt!,attempts:1,usage:null,responseModel:'synthetic',finishReason:'stop',responseComplete:true,
         raw,error:null,judgment:null,request:{system:legacyCompactRubric.prompt,data,redacted:false,hash:hash([legacyCompactRubric.prompt,data])},
         compact:{plan,judgment:{v:1,r:[[1,3,0],[1,2,0]],f:[]}}};
@@ -404,7 +407,7 @@ test('historical compact scalar research reports remain readable without inventi
         ...plan.criteria.map(({ metricId, version, unit, denominator }) => ({ metricId, version, unit, denominator })),
         { metricId: 'DR03', version: 1, unit: '派生F1', denominator: null }];
     trial.scores.push(...compactScores(call)); trial.scores.push(deriveResearchF1(trial.metricPlan, trial.scores, trial.execution)!);
-    Object.assign(trial, aggregate(trial.scores, trial.execution!)); report.scoringConfiguration.judgeHash = call.configuration.configHash;
+    Object.assign(trial, aggregate(trial.scores, trial.execution!)); report.scoringConfiguration.judgeHash = call.configuration.configHash!;
     saveReport(file, report);
     expect(readReport(file).trials[0]!.scores.find(s => s.metricId === 'DR03')?.value).toBe(0.4);
     for (const mutate of [

@@ -1275,6 +1275,9 @@ export const scenariosByName: Record<string, any> = {
         "sample": "000001",
         "goalMode": "answer"
       },
+      { "id": "history-1", "action": "user-message", "turnId": "history-1" },
+      { "id": "history-2", "action": "user-message", "turnId": "history-2" },
+      { "id": "history-3", "action": "user-message", "turnId": "history-3" },
       {
         "id": "correction",
         "action": "user-message",

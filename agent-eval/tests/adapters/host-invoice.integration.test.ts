@@ -224,6 +224,63 @@ for(const scenario of ['running','completed-first','no-read'] as const)test('038
     }finally{release();if(session)expect((await session.close()).present).toBe(true);server.stop(true);}
 },50000);
 
+test('024 commits its declared user history before native manual compaction and saves with the retained current correction', async () => {
+    const f = fixture(false, false, true), declaration = flowmateAgentV1Dataset.cases.find(task => task.id === 'FM-024')!;
+    const scenario = scenariosByName[declaration.input.fixture!.name], requests: Array<Record<string, unknown>> = [];
+    const finalText = declaration.input.turns!.find(turn => turn.id === 'request')!.content;
+    let document: { documentRef: { id: number; version: string }; parsedArtifactId: number }, summaryCalls = 0;
+    const server = await createHttpProvider(async request => {
+        const body = await request.json() as Record<string, unknown>; requests.push(body);
+        const messages = body.messages as Array<{ role: string; content: unknown }>, serialized = JSON.stringify(body);
+        if (requests.length === 1) return response({ role: 'assistant', tool_calls: [{ index: 0, id: 'manual-original-read', type: 'function',
+            function: { name: 'read_invoice_document', arguments: JSON.stringify({ documentId: document.documentRef.id, page: 1, afterBlockId: null, limit: 10 }) } }] }, true);
+        if (serialized.includes('structured context checkpoint') || serialized.includes('context summarization assistant')) {
+            summaryCalls++;
+            return response({ role: 'assistant', content: 'MANUAL_NATIVE_CHECKPOINT: selected invoice total 113.00 and $ are from original block b1. Inventory records are earlier user data, not invoice evidence. Preserve current user corrections.' });
+        }
+        if (JSON.stringify([...messages].reverse().find(message => message.role === 'user')).includes(finalText)) {
+            if (messages.at(-1)?.role === 'tool') return response({ role: 'assistant', content: 'Saved the original invoice with the latest user-supplied CNY correction.' });
+            const fields: Record<string, InvoiceField> = Object.fromEntries(invoiceHeaderFields.map(name => [name,
+                { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] }]));
+            fields.currency = { raw: '$', normalized: 'CNY', state: 'present', alternatives: [], sources: [{ documentId: document.documentRef.id,
+                version: document.documentRef.version, artifactId: document.parsedArtifactId, page: 1, blockId: 'b1', quote: '$' }] };
+            return response({ role: 'assistant', tool_calls: [{ index: 0, id: 'manual-save', type: 'function', function: { name: 'save_invoice_candidate',
+                arguments: JSON.stringify({ documentId: document.documentRef.id, candidate: { fields, lines: [], notes: ['CNY is the latest user correction; inventory is not invoice evidence.'] } }) } }] }, true);
+        }
+        return response({ role: 'assistant', content: 'Read-only user data retained with its original source; no candidate saved.' });
+    });
+    const item: AgentTrial = { identity: { executionId: 'controlled-manual', trialId: 'manual-024', caseId: 'FM-024', caseVersion: 1 },
+        directory: join(f.root, 'trial'), input: { prompt: declaration.input.prompt, materials: f.visible.filter(material => material.sample === '000001') },
+        turns: declaration.input.turns, invoiceSource: { root: f.source, materials: f.materials.filter(material => material.sample === '000001') },
+        requires: scenario.requires, steps: scenario.steps.map((step: { instruction?: string }) => step.instruction === '$input' ? { ...step, instruction: declaration.input.prompt } : step),
+        configuration: { modelCapabilities: syntheticNativeModel, model: 'manual-invoice', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' } };
+    mkdirSync(item.directory); let session: AgentTrialSession | undefined;
+    try {
+        session = await prepareHostTrial(item, new AbortController().signal, { repo: REPO_ROOT, credential: 'synthetic-manual-key' });
+        document = ((await session.snapshot()).evidence['material-registration']!.actual as Array<{ document: typeof document }>)[0]!.document;
+        const result = await session.execute(AbortSignal.timeout(45000));
+        expect({ started: result.started, status: result.status, endpointReached: result.endpointReached, error: result.error })
+            .toMatchObject({ started: true, status: 'completed', endpointReached: true });
+        expect(summaryCalls).toBe(1);
+        const inputs = result.evidence.inputs!.actual as Array<{ content: { text: string }; status: string; nativeEntryId: string | null }>;
+        const seeds = declaration.input.turns!.filter(turn => turn.id.startsWith('history-'));
+        expect(seeds).toHaveLength(3);
+        for (const seed of seeds) expect(inputs.find(input => input.content.text === seed.content)).toMatchObject({ status: 'consumed', nativeEntryId: expect.any(String) });
+        expect(result.evidence['user-turns']).toMatchObject({ present: true, actual: expect.any(Array) });
+        expect(result.evidence['history-operations']).toMatchObject({ present: true, actual: [{ action: 'compact-history', after: { operation: {
+            nativeOutcome: 'succeeded', generated: true, saved: expect.any(Object), stopped: true, capacity: { contextWindow: 131072 }
+        } }, continuedUse: { verified: true, summaryWireInclusion: 'confirmed' } }] });
+        const finalRequest = requests.find(request => JSON.stringify(request).includes(finalText));
+        expect(JSON.stringify(finalRequest)).toContain('MANUAL_NATIVE_CHECKPOINT');
+        expect(JSON.stringify(finalRequest)).toContain('CNY');
+        expect(JSON.stringify(requests[0])).not.toContain('SKU-');
+        expect(JSON.stringify(requests[0])).not.toContain(finalText);
+        expect(result.evidence.invoice).toMatchObject({ actual: { candidates: [{ fields: { currency: { normalized: 'CNY' } } }] } });
+        expect(result.configuration.modelCapabilities).toEqual(syntheticNativeModel);
+        expect(JSON.stringify(result.evidence.history!.actual)).toContain('MANUAL_NATIVE_CHECKPOINT');
+    } finally { if (session) expect((await session.close()).present).toBe(true); await server.stop(); }
+}, 60000);
+
 for(const expose of [true,false])test('025 builds public user turns and only saves after an actual native auto summary, expose='+expose,async()=>{
     const f=fixture(false,false,true),requests:Array<Record<string,unknown>>=[];
     const seed=structuredClone(scenariosByName['compaction-continue-automatic-history'].files['quality-controls/FM-025/history-seed.json'].json);
@@ -327,9 +384,7 @@ for(const mode of ['steer','followUp'] as const)for(const expose of [true,false]
         session=await prepareHostTrial(item,new AbortController().signal,{repo:REPO_ROOT,credential:'synthetic-steer-key'});
         expect(JSON.stringify(session.input)).not.toContain(text);
         document=((await session.snapshot()).evidence['material-registration']!.actual as Array<{document:typeof document}>)[0]!.document;
-        const settled=await session.execute(AbortSignal.timeout(20000)).then(value=>({value,error:null}),error=>({value:null,error}));
-        if(expose&&settled.error)throw settled.error;if(!expose&&mode==='steer')expect(String(settled.error)).toContain('Run did not complete');
-        const result=settled.value??await session.snapshot(),inputs=result.evidence.inputs!.actual as Array<{inputId:number;mode:string;runId:number;status:string;content:{text:string}}>;
+        const result=await session.execute(AbortSignal.timeout(20000)),inputs=result.evidence.inputs!.actual as Array<{inputId:number;mode:string;runId:number;status:string;content:{text:string}}>;
         expect(JSON.stringify(requests[0])).not.toContain(text);expect(JSON.stringify(requests)).not.toContain('quality-controls');
         if(expose){
             expect(requests).toHaveLength(mode==='followUp'?3:4);expect(JSON.stringify(requests[2])).toContain(text);
@@ -451,12 +506,15 @@ for (const isolation of [undefined] as const) test
         const reference = (exports[0]!.content as { reference: { relativePath: string } }).reference;
         const exportedPath = join(item.directory, 'product', reference.relativePath), originalBytes = readFileSync(exportedPath);
         writeFileSync(exportedPath, 'changed export bytes');
-        let snapshotError: unknown;
-        // Bun 1.4.0's rejects matcher times out Host IPC here; await it before asserting.
-        try { await session.snapshot(); } catch (error) { snapshotError = error; }
+        let changed: Awaited<ReturnType<AgentTrialSession['snapshot']>> | undefined;
+        try { changed = await session.snapshot(); }
         finally { writeFileSync(exportedPath, originalBytes); }
-        expect(snapshotError).toBeInstanceOf(Error);
-        expect((snapshotError as Error).message).toContain('Original invoice export bytes are unavailable');
+        expect(changed!.started).toBe(true);
+        expect(changed!.endpointReached).toBe(false);
+        expect(changed!.evidence.runs).toEqual(result.evidence.runs);
+        expect(changed!.evidence['capture-gaps']).toMatchObject({ present: false });
+        expect(JSON.stringify(changed!.evidence['capture-gaps']!.actual)).toContain('Original invoice export bytes are unavailable');
+        expect(changed!.evidence['invoice-exports']!.present).toBe(false);
         expect(requests).toHaveLength(6);
         expect(await session.snapshot()).toMatchObject({ endpointReached: true });
         const copied = join(item.directory, 'runtime', 'invoice-input');

@@ -5,9 +5,16 @@ import type { runJudge } from './judges/harness.ts';
 import type { CompactPlan } from './judges/compact.ts';
 export type EvaluatorKind = 'deterministic' | 'llm-judge';
 type CurrentJudgeCall = Awaited<ReturnType<typeof runJudge>>;
-export type JudgeCall = Omit<CurrentJudgeCall, 'configuration'> & {
-    configuration: CurrentJudgeCall['configuration'] & { temperature?: number; maxTokens?: number };
+type LegacyJudgeCall = Omit<CurrentJudgeCall, 'configuration' | 'stopReason' | 'rawStopReason' | 'usageSource' | 'responseComplete' | 'request' | 'compact'> & {
+    configuration: Omit<CurrentJudgeCall['configuration'], 'api' | 'sdk' | 'modelCapabilities' | 'configHash' | 'protocolVersion'> & {
+        provider: 'anthropic' | 'openai-compatible'; api?: never; sdk?: never; configHash?: string; temperature?: number; maxTokens?: number;
+        protocolVersion?: string;
+        modelCapabilities?: { modelId: string; maxOutputTokens: number; source: 'anthropic-models-api' | 'deepseek-models-api' };
+    };
+    stopReason?: never; rawStopReason?: never; usageSource?: never; finishReason?: string | null; responseComplete?: boolean;
+    request?: CurrentJudgeCall['request']; compact?: CurrentJudgeCall['compact'];
 };
+export type JudgeCall = CurrentJudgeCall & { finishReason?: never } | LegacyJudgeCall;
 export type MetricStatistics = { unit: string; numerator: number | null; denominator: number | null; missing: number | null };
 export type MetricPlan = { metricId: string; version: number; unit: string; denominator?: number | null; notApplicable?: string };
 export type EvaluationScore = {

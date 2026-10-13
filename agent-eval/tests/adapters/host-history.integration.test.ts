@@ -212,3 +212,26 @@ test('executeCase cancellation saves the original manual compaction stop and nev
         await server.stop();
     }
 }, 45000);
+
+test('native manual compaction no-work retains its stopped observation without a save failure or future save turn', async () => {
+    const requests: unknown[] = [];
+    const server = await createHttpProvider(async request => { requests.push(await request.json()); return reply('The original policy is retained.'); });
+    const item = trial(server.port); item.requires.push('compaction');
+    item.steps = [{ id: 'first', action: 'user-message', instruction: item.input.prompt },
+        { id: 'compact', action: 'compact-history' },
+        { id: 'future', action: 'user-message', instruction: 'FUTURE_AFTER_NO_WORK' }];
+    try {
+        const { execution, stopFailed } = await executeCase({ readiness: () => ({ ready: true, reason: 'Controlled Host only.' }),
+            prepare: (item, signal) => prepareHostTrial(item, signal, { repo: REPO_ROOT, credential: 'synthetic-no-work-key' }) }, item, 30000, 10000);
+        expect({ started: execution.started, status: execution.status, endpointReached: execution.endpointReached, error: execution.error })
+            .toMatchObject({ started: true, status: 'failed', endpointReached: false, error: { code: 'compaction_not_needed', infrastructure: false } });
+        expect(stopFailed).toBe(false);
+        expect(execution.evidence['history-operations']).toMatchObject({ present: true, actual: [{ outcome: 'no-work', after: { operation: {
+            phase: 'ended', stopped: true, nativeOutcome: 'failed', generated: false, saved: null, error: { code: 'compaction_not_needed' }
+        } } }] });
+        expect(execution.evidence.cleanup).toMatchObject({ present: true, actual: { stopped: true } });
+        expect(requests).toHaveLength(1);
+        expect(JSON.stringify(requests)).not.toContain('FUTURE_AFTER_NO_WORK');
+        expect(execution.evidence.inputs!.actual).toHaveLength(1);
+    } finally { await server.stop(); }
+}, 45000);

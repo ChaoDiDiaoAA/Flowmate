@@ -11,7 +11,7 @@ async function withConfiguration(action: () => Promise<void>) {
     const exit = process.exitCode;
     const values = { FLOWMATE_EVAL_AGENT_MODEL: 'deepseek-v4-flash', FLOWMATE_EVAL_AGENT_API: 'openai-completions',
         FLOWMATE_EVAL_AGENT_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_EVAL_AGENT_API_KEY: 'synthetic-cli-eval-key',
-        FLOWMATE_JUDGE_PROVIDER: '', FLOWMATE_JUDGE_BASE_URL: '', FLOWMATE_JUDGE_MODEL: '', FLOWMATE_JUDGE_API_KEY: '' };
+        FLOWMATE_JUDGE_API: '', FLOWMATE_JUDGE_PROVIDER: '', FLOWMATE_JUDGE_BASE_URL: '', FLOWMATE_JUDGE_MODEL: '', FLOWMATE_JUDGE_API_KEY: '' };
     const saved = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
     Object.assign(process.env, values);
     try { await action(); }
@@ -20,7 +20,7 @@ async function withConfiguration(action: () => Promise<void>) {
 
 test('doctor reports actual native Agent capacities without generating or changing product settings', async () => {
     await withConfiguration(async () => {
-        Object.assign(process.env, { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic-judge',
+        Object.assign(process.env, { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
             FLOWMATE_JUDGE_BASE_URL: 'https://judge.invalid/v1/synthetic-doctor-judge-key', FLOWMATE_JUDGE_API_KEY: 'synthetic-doctor-judge-key' });
         const settings = join(fixtureRepo, 'data/settings.json'), original = '{"desktop":"must remain unchanged"}\n';
         writeFileSync(settings, original);
@@ -40,7 +40,7 @@ test('doctor reports actual native Agent capacities without generating or changi
     });
 }, 20000);
 
-test('doctor fails required Anthropic Judge metadata preparation without generating text', async () => {
+test('doctor rejects an unknown Anthropic Judge before generating text or querying a provider', async () => {
     await withConfiguration(async()=>{
         Object.assign(process.env,{FLOWMATE_JUDGE_PROVIDER:'anthropic',FLOWMATE_JUDGE_MODEL:'missing-judge',
             FLOWMATE_JUDGE_BASE_URL:'https://judge.invalid/v1',FLOWMATE_JUDGE_API_KEY:'fake-metadata-judge-key'});
@@ -52,8 +52,8 @@ test('doctor fails required Anthropic Judge metadata preparation without generat
         try {
             await main(['doctor','--backend','local'],fixtureRepo);
             const result=JSON.parse(String(logs.mock.calls.at(-1)![0]));
-            expect(reads).toBe(1);expect(result.ok).toBe(false);expect(process.exitCode).toBe(1);
-            expect(result.issues.some((s:string)=>s.includes('metadata'))).toBe(true);
+            expect(reads).toBe(0);expect(result.ok).toBe(false);expect(process.exitCode).toBe(1);
+            expect(result.issues.some((s:string)=>s.includes('absent from the Pi SDK catalog'))).toBe(true);
         } finally {network.mockRestore();logs.mockRestore();}
     });
 },20000);

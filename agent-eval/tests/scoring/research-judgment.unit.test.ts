@@ -1,3 +1,4 @@
+import { judgeResponse } from '../support/judge-response.ts';
 import {test,expect} from 'bun:test';
 import {deriveResearchCounts} from '../../src/scoring/research-judgment.ts';
 import type {ResearchFrame} from '../../src/scoring/research-frame.ts';
@@ -56,7 +57,7 @@ test('atomic selectors, Gold versions, references and chain counts must bind the
   expect(()=>deriveResearchCounts(frame,proof)).toThrow();
  }
 });
-const config=judgeConfig({FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'independent-research-fixture',FLOWMATE_JUDGE_API_KEY:'independent-research-fixture-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'})!;
+const config=judgeConfig({FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'independent-research-fixture-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'})!;
 const packedPlan={contract:'flowmate-semantic-plan/v1' as const,
  criteria:['tool-selection','DR01','DR02','DR04','DR05','DR06'].map(metricId=>({metricId,version:1,unit:formalMetric(metricId).unit,denominator:metricId==='tool-selection'||metricId==='DR06'?1:metricId==='DR02'?2:null,
   required:true,rule:'Independently evaluate this criterion against the declared original frame, without trusting product flags.',evidence:['research-frame','gold-research'],trigger:'started' as const}))};
@@ -77,8 +78,8 @@ test('plain research witnesses exceed legacy fact, block, citation and span limi
 test('one plain JSON Judge request derives five independent research ratios and original semantic scores from original-index witnesses',async()=>{
  const{frame,proof}=fixture();let requests=0;
  const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async(_,init)=>{
-  requests++;const body=JSON.parse(String(init.body));expect(body).not.toHaveProperty('max_tokens');expect(body).not.toHaveProperty('temperature');expect(body.messages[0].content).toContain('plain JSON');
-  return new Response(JSON.stringify({choices:[{message:{content:rawProof(proof)},finish_reason:'stop'}]}));
+  requests++;const body=JSON.parse(String(init.body));expect(body).toHaveProperty('max_completion_tokens', 32768);expect(body).not.toHaveProperty('temperature');expect(body.messages[0].content).toContain('plain JSON');
+  return judgeResponse({choices:[{message:{content:rawProof(proof)},finish_reason:'stop'}]});
  });
  expect(requests).toBe(1);expect(call.error).toBeNull();const scores=compactScores(call);expect(scores).toHaveLength(6);
  expect(scores.every(s=>s.status==='PASS')).toBe(true);expect(scores.find(s=>s.metricId==='DR02')!.statistics).toMatchObject({numerator:2,denominator:2,missing:0});
@@ -86,18 +87,18 @@ test('one plain JSON Judge request derives five independent research ratios and 
 });
 test('plain research scoring retains known partial failure and original count units without invented denominators',async()=>{
  const{frame,proof}=fixture();frame.complete=false;proof.atoms[0]!.correct=0;proof.atoms[0]!.covered=0;
- const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async()=>new Response(JSON.stringify({choices:[{message:{content:rawProof(proof)},finish_reason:'stop'}]})));
+ const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async()=>judgeResponse({choices:[{message:{content:rawProof(proof)},finish_reason:'stop'}]}));
  expect(call.error).toBeNull();expect(compactScores(call).find(s=>s.metricId==='DR01')).toMatchObject({status:'FAIL',value:null,statistics:{unit:'事实Claim',numerator:1,denominator:null,missing:null}});
 });
 test('larger structural witness bounds do not impose an artificial output budget',async()=>{
  const{frame,proof}=fixture();let requests=0;
  const call=await runCompactJudge(config,packedPlan, {researchFrame:frame},async()=>{
-  requests++;return new Response(JSON.stringify({choices:[{message:{content:rawProof(proof)},finish_reason:'stop'}]}));});
+  requests++;return judgeResponse({choices:[{message:{content:rawProof(proof)},finish_reason:'stop'}]});});
  expect(requests).toBe(1);expect(call.error).toBeNull();
 });
 test('unavailable semantic witnesses stays unjudgeable while an independently invalid observed citation still fails',async()=>{
  const{frame}=fixture();frame.links[0]!.valid=false;
- const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async()=>new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({v:1,r:packedPlan.criteria.map(c=>c.metricId==='tool-selection'?[1,1,0]:null),f:[],research:{atoms:[],links:[],chains:[],unavailable:true}})},finish_reason:'stop'}]})));
+ const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async()=>judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:packedPlan.criteria.map(c=>c.metricId==='tool-selection'?[1,1,0]:null),f:[],research:{atoms:[],links:[],chains:[],unavailable:true}})},finish_reason:'stop'}]}));
  expect(call.error).toBeNull();const scores=compactScores(call);
  expect(scores.find(s=>s.metricId==='DR01')).toMatchObject({status:'UNJUDGEABLE',value:null});
  expect(scores.find(s=>s.metricId==='DR04')).toMatchObject({status:'FAIL',value:null,statistics:{denominator:null,missing:null}});

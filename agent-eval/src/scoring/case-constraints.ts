@@ -61,32 +61,46 @@ export function evaluateCaseConstraints({ task, result }: EvaluationContext): Ev
                         ref.originRunId === call.runId && ref.nativeToolCallId === call.nativeToolCallId && isDeepStrictEqual(ref.context, call.context));
                 });
         }));
-        const knownAbsent = complete && !!projected?.present && contexts.success && !!fact('context-requests')?.present;
+        const knownAbsent = complete && !!projected?.present && contexts.success && !!fact('context-requests')?.present &&
+            contexts.data.every(frame => frame.collected && frame.requests.every(request => request.sdkPayload?.inclusion === 'confirmed' &&
+                request.transport === 'observed-fetch' && request.attempts.some(attempt => attempt.enteredAt !== null) &&
+                request.attempts.every(attempt => attempt.wireInclusion === 'confirmed') &&
+                frame.snapshots.some(snapshot => snapshot.snapshot.id === request.binding.snapshotId &&
+                    snapshot.snapshot.runId === frame.runId && snapshot.snapshot.sessionId === request.binding.sessionId)));
         add('case-evidence-required', '实际送达的授权证据', delivered ? true : knownAbsent ? false : undefined,
-            { delivered }, true, ['context-requests', 'tool-evidence']);
+            { delivered: delivered ? true : knownAbsent ? false : null }, true, ['context-requests', 'tool-evidence']);
     }
 
     if (expected.requiredSkills?.length || expected.forbiddenSkills?.length) {
         const resources = z.array(RunResourceViewSchema).safeParse(fact('resources')?.actual);
-        const used = new Set<string>();
+        const used = new Set<string>(), unknown = new Set<string>();
         if (resources.success) for (const run of resources.data) {
             for (const request of run.evidence?.requests ?? []) for (const check of request.contentChecks) {
+                if (check.ref.kind === 'skill' && ['expanded-body', 'tool-output', 'derived-source'].includes(check.scope) &&
+                    check.sdkInclusion !== 'not-included' && check.wireInclusion !== 'not-included' &&
+                    (check.sdkInclusion === 'unknown' || check.wireInclusion === 'unknown')) unknown.add(check.ref.id);
                 if (check.ref.kind === 'skill' && ['expanded-body', 'tool-output'].includes(check.scope) && check.sdkInclusion === 'confirmed' && check.wireInclusion === 'confirmed' &&
                     (run.evidence?.reads.some(read => read.ref.kind === 'skill' && read.ref.id === check.ref.id && read.requestSequence <= request.callSequence) ||
                         run.evidence?.expansions.some(expansion => expansion.skill.id === check.ref.id))) used.add(check.ref.id);
             }
         }
         const attempted = new Set(used);
+        if (resources.success) for (const run of resources.data) {
+            for (const expansion of run.evidence?.expansions ?? []) attempted.add(expansion.skill.id);
+            for (const read of run.evidence?.reads ?? []) if (read.ref.kind === 'skill') attempted.add(read.ref.id);
+        }
         for (const call of calls) {
             const args = z.object({ skill: z.string() }).passthrough().safeParse(call.args.raw);
             if (['read_skill_resource', 'list_skill_resources'].includes(call.toolName) && args.success) attempted.add(args.data.skill);
         }
-        const resourceComplete = resources.success && !!fact('resources')?.present && resources.data.every(r => r.gap === null) && complete;
+        const resourceComplete = resources.success && !!fact('resources')?.present && resources.data.every(r => r.gap === null && r.evidence !== null) && complete;
         if (expected.requiredSkills?.length) add('fact-check/required-skills', '必要 Skill 的实际读取',
-            expected.requiredSkills.every(skill => used.has(skill)) ? true : resourceComplete ? false : undefined,
+            expected.requiredSkills.every(skill => used.has(skill)) ? true : resourceComplete &&
+                expected.requiredSkills.some(skill => !used.has(skill) && !unknown.has(skill)) ? false : undefined,
             [...used], expected.requiredSkills, ['resources', 'tool-evidence']);
         if (expected.forbiddenSkills?.length) add('fact-check/forbidden-skills', '禁止 Skill 的请求或读取',
-            expected.forbiddenSkills.some(skill => attempted.has(skill)) ? false : resourceComplete ? true : undefined,
+            expected.forbiddenSkills.some(skill => attempted.has(skill)) ? false : resourceComplete &&
+                expected.forbiddenSkills.every(skill => !unknown.has(skill)) ? true : undefined,
             [...attempted], expected.forbiddenSkills, ['resources', 'tool-evidence']);
     }
     if (expected.requiredSubagentRoles?.length) {

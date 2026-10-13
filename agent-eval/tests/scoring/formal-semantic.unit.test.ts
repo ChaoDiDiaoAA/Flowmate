@@ -1,3 +1,4 @@
+import { judgeResponse } from '../support/judge-response.ts';
 import {expect,test} from 'bun:test';
 import {metricCatalog} from '../../src/scoring/catalog.ts';
 import {formalRules,compileFormalSemanticPlan} from '../../src/scoring/formal-rules.ts';
@@ -6,7 +7,7 @@ import {task,observed} from '../support/fixtures.ts';
 import {evaluateSemantic} from '../../src/scoring/evaluators/semantic.ts';
 import {judgeConfig} from '../../src/scoring/judges/client.ts';
 
-const judge=judgeConfig({FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'controlled-formal',FLOWMATE_JUDGE_BASE_URL:'http://127.0.0.1:9/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-only'})!;
+const judge=judgeConfig({FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_BASE_URL:'http://127.0.0.1:9/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-only'})!;
 test('original 33 identities, units, methods and evidence are explicit',()=>{
     expect(formalRules).toHaveLength(33);expect(new Set(formalRules.map(r=>r.metricId)).size).toBe(33);
     for(const rule of formalRules){const metric=metricCatalog.find(m=>m.id===rule.metricId)!;expect(rule.unit).toBe(metric.unit);expect(rule.rule.length).toBeGreaterThan(20);expect(rule.evidence.length).toBeGreaterThan(0);}
@@ -26,7 +27,7 @@ test('independent per-material Gold is bound to Judge criteria and never project
         const request=JSON.parse(JSON.parse(String(init.body)).messages[1].content);
         expect(JSON.stringify(request.evidence.facts['gold-materials'])).toContain('SECOND_INDEPENDENT_GOLD');
         expect(JSON.stringify(request.evidence.input)).not.toContain('SECOND_INDEPENDENT_GOLD');
-        return new Response(JSON.stringify({choices:[{message:{content:'{"v":1,"r":[[0,1,0]],"f":[]}'},finish_reason:'stop'}]}));
+        return judgeResponse({choices:[{message:{content:'{"v":1,"r":[[0,1,0]],"f":[]}'},finish_reason:'stop'}]});
     }});expect(judged.judgeCalls).toHaveLength(1);expect(judged.scores[0]!.status).toBe('FAIL');
 });
 test('one controlled judgment retains separate tool choice, wrong amount and blocked model violation counts',async()=>{
@@ -37,10 +38,10 @@ test('one controlled judgment retains separate tool choice, wrong amount and blo
     for(const key of new Set(plan.criteria.flatMap(c=>c.evidence)))if(!key.startsWith('gold-'))result.evidence[key]={present:true,
         actual:{original:true,appropriateRead:true,citationValid:true,amount:'WRONG',modelForbiddenRequest:true,requestBlocked:true},source:'Independent adversarial original records'};
     let calls=0;const judged=await evaluateSemantic({task:item,result,projected:result.input,semanticPlan:plan,judge,fetcher:async(_,init)=>{
-        calls++;const body=JSON.parse(String(init.body));expect(body).not.toHaveProperty('max_tokens');expect(body).not.toHaveProperty('temperature');
+        calls++;const body=JSON.parse(String(init.body));expect(body).toHaveProperty('max_completion_tokens', 32768);expect(body).not.toHaveProperty('temperature');
         const input=JSON.parse(body.messages[1].content);expect(input.plan.criteria).toHaveLength(3);
         expect(input.plan.criteria.find((c:{metricId:string})=>c.metricId==='model-violation').rule).toContain('平台成功拦截不能抹去');
-        return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({v:1,r:plan.criteria.map(c=>[c.metricId==='tool-arguments'?0:1,1,0]),f:[]})},finish_reason:'stop'}]}));
+        return judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:plan.criteria.map(c=>[c.metricId==='tool-arguments'?0:1,1,0]),f:[]})},finish_reason:'stop'}]});
     }});
     expect(calls).toBe(1);expect(judged.scores.map(s=>[s.metricId,s.status,s.statistics!.numerator])).toEqual([
         ['tool-selection','PASS',1],['tool-arguments','FAIL',0],['model-violation','FAIL',1]]);
@@ -55,7 +56,7 @@ for(const rule of formalRules.filter(r=>r.method==='llm-judge'))for(const outcom
     let calls=0;
     const value=outcome==='positive'?(metric.direction==='up'?1:0):(metric.direction==='up'?0:1);
     const response=await evaluateSemantic({task:item,result,projected:result.input,semanticPlan:plan,judge,fetcher:async()=>{
-        calls++;return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({v:1,r:[[value,1,0]],f:[]})},finish_reason:'stop'}]}));
+        calls++;return judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:[[value,1,0]],f:[]})},finish_reason:'stop'}]});
     }});
     expect(calls).toBe(outcome==='missing'?0:1);expect(value).not.toBeNaN();
     expect(response.scores).toHaveLength(1);expect(response.scores[0]!.metricId).toBe(metric.id);

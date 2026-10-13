@@ -1,10 +1,11 @@
+import { judgeResponse } from '../../support/judge-response.ts';
 import { test, expect } from 'bun:test';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { observed, task, projected } from '../../support/fixtures.ts';
 import { evaluateAll } from '../../../src/scoring/evaluate.ts';
 import { judgeConfig } from '../../../src/scoring/judges/client.ts';
-const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'mock', FLOWMATE_JUDGE_API_KEY: 'mock-key', FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1' })!;
+const config = judgeConfig({ FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile', FLOWMATE_JUDGE_API_KEY: 'mock-key', FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1' })!;
 test('required Judge with an empty answer cannot become not-applicable and pass', async () => {
     const result = observed();
     result.answer = null;
@@ -26,7 +27,7 @@ test('Judge runs independently of deterministic high/low scores and never receiv
                 expect(data).not.toHaveProperty('expected');
                 expect(data).not.toHaveProperty('steps');
                 expect(data.criteria).toEqual({ success: task.expected.success, failure: task.expected.failure });
-                return new Response(JSON.stringify({ choices: [{ message: { content: '{"score":1,"reason":"mock supported"}' }, finish_reason: 'stop' }] }));
+                return judgeResponse({ choices: [{ message: { content: '{"score":1,"reason":"mock supported"}' }, finish_reason: 'stop' }] });
             } }, [{ metric: 'fact-check', required: true, evidence: 'task-facts', path: ['saved'], equals: true }, { metric: 'answer-relevance', required: false }]);
         expect(calls).toBe(1);
         expect(output.judgeCalls).toHaveLength(1);

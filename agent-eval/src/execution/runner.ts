@@ -216,7 +216,11 @@ export async function runLocal(repo: string, options: {
         trial.scores = scored.scores;
         trial.judgeCalls = scored.judgeCalls;
         Object.assign(trial, aggregate(trial.scores, result.execution));
-        notify({ type: 'scoring-end', ...identityProgress, status: trial.status, reason: trial.reason });
+        const scoringErrors = [...new Set(trial.scores.filter(score => score.status === 'ERROR')
+            .sort((a, b) => Number(b.method === 'llm-judge') - Number(a.method === 'llm-judge')).map(score => score.reason))];
+        const reason = trial.reason + (trial.status === 'FAIL' && scoringErrors.length
+            ? `；评分异常：${scoringErrors[0]!.slice(0, 180)}${scoringErrors.length > 1 ? `（共${scoringErrors.length}类，详见报告）` : ''}` : '');
+        notify({ type: 'scoring-end', ...identityProgress, status: trial.status, reason });
         finishTrial();
     }
     report.endedAt = new Date().toISOString();
