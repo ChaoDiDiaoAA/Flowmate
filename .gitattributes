@@ -1,2 +1,8 @@
 resources/** text eol=lf
 patches/** text eol=lf whitespace=-blank-at-eol
+agent-eval/src/testing/fixtures/*.md text eol=lf
+agent-eval/src/testing/fixtures/*.txt text eol=lf
+agent-eval/src/testing/fixtures/*.json text eol=lf
+# PDF extracts use original CRLF bodies beneath LF source headers; retain Gold offsets.
+agent-eval/src/testing/fixtures/materials--landsat-c1-guide-v3--source.md -text -eol
+agent-eval/src/testing/fixtures/materials--landsat-c2-guide-v4--source.md -text -eol

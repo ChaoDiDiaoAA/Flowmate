@@ -10,7 +10,7 @@ import { discoverDatasets, hash, caseContentHash, caseFiles, resolveCase, restor
 import { productAgent, createProductAgent, type AgentKernel } from '../adapters/agent.ts';
 import { agentApiSchema, prepareAgentConfig, type AgentModelCapabilities } from '../configuration.ts';
 export {assertModelConfiguration} from '../adapters/agent.ts';
-import { executeCase } from './execute-case.ts';
+import { executeCase, type ExecutionPhase } from './execute-case.ts';
 import { codeIdentity, runtimeSourceConditions } from './source.ts';
 import { scanEvidence } from './evidence-safety.ts';
 import { evaluateAll } from '../scoring/evaluate.ts';
@@ -24,6 +24,21 @@ import { saveReport, safeId, type LocalReport } from '../reports/store.ts';
 import {ResourceSelectionSchema} from '../../../packages/contracts/src/resources.ts';
 import {ExtensionSelectionSchema} from '../../../packages/contracts/src/extensions.ts';
 import {RuntimeBudgetOverridesSchema} from '../../../packages/contracts/src/runtime.ts';
+import type { ExecutionStatus } from '../types.ts';
+type TrialProgress = { index: number; total: number; caseId: string; trialId: string };
+export type EvaluationProgress =
+    | { type: 'preflight' }
+    | { type: 'plan'; selection: 'smoke' | 'holdout' | 'full' | 'case'; total: number; datasets: Array<{ id: string; total: number }> }
+    | { type: 'dataset-start'; datasetId: string; executionId: string; reportPath: string }
+    | TrialProgress & { type: 'trial-phase'; phase: ExecutionPhase | 'restoring' | 'scoring' | 'saving' }
+    | TrialProgress & { type: 'agent-end'; status: ExecutionStatus; reason?: string }
+    | TrialProgress & { type: 'scoring-end'; status: LocalReport['trials'][number]['status']; reason: string }
+    | TrialProgress & { type: 'trial-end'; status: LocalReport['trials'][number]['status']; reason: string; elapsedMs: number; evidenceDirectory: string }
+    | { type: 'dataset-end'; datasetId: string; executionId: string; reportPath: string; stopped: boolean; reason?: string; counts: Record<string, number> };
+type ProgressObserver = (event: EvaluationProgress) => void;
+function notifyProgress(observer: ProgressObserver | undefined, event: EvaluationProgress) {
+    try { observer?.(structuredClone(event)); } catch { /* Progress must not change evaluation results or cleanup. */ }
+}
 export const runConfigSchema = z.object({
     model: z.string().min(1).optional(), baseUrl: z.string().url().optional(), api: agentApiSchema.optional(),
     repeat: z.number().int().min(1).max(20).optional(),
@@ -70,7 +85,10 @@ export async function runLocal(repo: string, options: {
     signal?: AbortSignal;
     preparedAgent?: Awaited<ReturnType<typeof prepareAgentConfig>>;
     preparedJudge?: JudgeConfig | null;
+    onProgress?: ProgressObserver;
 } = {}) {
+    const notify = (event: EvaluationProgress) => notifyProgress(deps.onProgress, event);
+    notify({ type: 'preflight' });
     const isProductAgent = !deps.kernel || deps.kernel === productAgent;
     let kernel = deps.kernel ?? productAgent;
     let config: z.infer<typeof runConfigSchema> & { modelCapabilities?: AgentModelCapabilities } = parseRunConfig(options.config ?? {});
@@ -87,6 +105,8 @@ export async function runLocal(repo: string, options: {
         throw new Error('Repeat must be 1..20');
     const dataset = structuredClone(options.dataset), selected = selectCases(dataset, options.selection, options.caseId);
     if (!selected.length) throw new Error('No Cases in selected partition');
+    notify({ type: 'plan', selection: options.caseId ? 'case' : options.selection ?? 'full', total: selected.length * repeat,
+        datasets: [{ id: dataset.manifest.id, total: selected.length * repeat }] });
     assertSemanticSelection({ manifest: dataset.manifest, cases: selected }, options.judge === 'required');
     if (selected.some(c => c.expected.checks.some(check => check.metric === 'answer-relevance' || dataset.manifest.scoring.required.includes(check.metric))))
         throw new Error('Case cannot override common scoring or select Judge; configure Judges once in dataset.json');
@@ -152,38 +172,52 @@ export async function runLocal(repo: string, options: {
         }
     const file = join(root, 'report.json');
     saveReport(file, report);
+    notify({ type: 'dataset-start', datasetId: dataset.manifest.id, executionId, reportPath: file });
     let stopReason: string | null = null;
-    for (const trial of report.trials) {
+    for (const [index, trial] of report.trials.entries()) {
+        const started = performance.now();
+        const identityProgress = { index: index + 1, total: report.trials.length, caseId: trial.caseId, trialId: trial.trialId };
+        const phase = (value: ExecutionPhase | 'restoring' | 'scoring' | 'saving') => notify({ type: 'trial-phase', ...identityProgress, phase: value });
+        const finishTrial = () => {
+            phase('saving');
+            saveReport(file, report);
+            notify({ type: 'trial-end', ...identityProgress, status: trial.status, reason: trial.reason,
+                elapsedMs: performance.now() - started, evidenceDirectory: `evidence/${trial.trialId}/` });
+        };
         const item = prepared.find(p => p.task.id === trial.caseId)!;
         if (stopReason || deps.signal?.aborted || !item.resolved) {
             trial.reason = item.error ?? stopReason ?? 'Execution stopped before this Trial';
-            saveReport(file, report);
+            finishTrial();
             continue;
         }
+        phase('restoring');
         const identity = { executionId, trialId: trial.trialId, caseId: trial.caseId, caseVersion: trial.caseVersion };
         const scene=mkdtempSync(join(tmpdir(),'flowmate-trial-')),working=join(scene,'host');
         let inputs: ReturnType<typeof restoreCaseInputs>;
         try { inputs = restoreCaseInputs(dataset, item.task, working); }
-        catch (error) { rmSync(scene,{recursive:true,force:true});trial.reason = 'Input restoration failed: ' + String(error); saveReport(file, report); continue; }
+        catch (error) { rmSync(scene,{recursive:true,force:true});trial.reason = 'Input restoration failed: ' + String(error); finishTrial(); continue; }
         const result = await executeCase(kernel, { identity, directory: working, input: item.resolved.projected,
             ...(item.task.input.turns ? {turns:item.task.input.turns} : {}),
             ...(inputs.resourceRoot ? { resourceRoot: inputs.resourceRoot } : {}),
             ...(item.resolved.controllerInput?{controllerInput:item.resolved.controllerInput}:{}),
             ...(item.task.requires.includes('invoice') ? { invoiceSource: { root: inputs.invoiceRoot ?? join(repo, 'data/invoices/agent-input'), localRoot: inputs.localRoot, materials: item.task.input.materials } } : {}),
-            requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,repo),...config} }, config.timeoutMs ?? 120000, config.stopGraceMs ?? 5000, deps.signal);
+            requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,repo),...config} }, config.timeoutMs ?? 120000, config.stopGraceMs ?? 5000, deps.signal, phase);
         if (result.stopFailed) stopReason = 'Prior Trial stopping unconfirmed: ' + (result.execution.error?.message ?? 'Stop evidence missing');
         if(!result.stopFailed)rmSync(scene,{recursive:true,force:true});
         else result.execution.evidence['retained-scene']={present:true,actual:{directory:scene},source:'Controller retains scene until stopping is confirmed'};
         trial.execution = result.execution;
+        notify({ type: 'agent-end', ...identityProgress, status: result.execution.status, reason: result.execution.error?.message });
         const checks: Check[] = [...dataset.manifest.scoring.required.map(metric => ({ metric, required: true })), ...item.task.expected.checks,
             ...dataset.manifest.scoring.judges.flatMap(j => j.id === 'answer-relevance'
                 ? [{ metric: j.id, required: j.required || !!j.requiredFor?.includes(item.task.id) || options.judge === 'required' }] : [])];
+        phase('scoring');
         const scored = await evaluateAll({ task: item.task, result: result.execution, projected: result.projected, judge, fetcher: deps.fetcher, signal: deps.signal,
             semanticPlan: trial.semanticPlan }, checks);
         trial.scores = scored.scores;
         trial.judgeCalls = scored.judgeCalls;
         Object.assign(trial, aggregate(trial.scores, result.execution));
-        saveReport(file, report);
+        notify({ type: 'scoring-end', ...identityProgress, status: trial.status, reason: trial.reason });
+        finishTrial();
     }
     report.endedAt = new Date().toISOString();
     report.scoring = 'complete';
@@ -197,6 +231,10 @@ export async function runLocal(repo: string, options: {
         }
     }
     saveReport(file, report);
+    const counts: Record<string, number> = {};
+    for (const trial of report.trials) counts[trial.status] = (counts[trial.status] ?? 0) + 1;
+    notify({ type: 'dataset-end', datasetId: dataset.manifest.id, executionId, reportPath: file,
+        stopped: !!stopReason || !!deps.signal?.aborted, reason: stopReason ?? (deps.signal?.aborted ? '用户取消评测' : undefined), counts });
     if (options.backend === 'langfuse') {
         const { exportReport } = await import('../langfuse/export.ts');
         await exportReport(report, file, undefined, repo);
@@ -208,6 +246,8 @@ export async function runBatch(repo: string,
     options: Omit<Parameters<typeof runLocal>[1], 'dataset' | 'caseId' | 'executionId'> & { datasets: LocalDataset[] },
     deps: NonNullable<Parameters<typeof runLocal>[2]> & { run?: typeof runLocal } = {}) {
     if (deps.signal?.aborted) return [];
+    const notify = (event: EvaluationProgress) => notifyProgress(deps.onProgress, event);
+    notify({ type: 'preflight' });
     for (const data of options.datasets) {
         const selected = selectCases(data, options.selection);
         if (!selected.length) throw Error('No Cases in selected partition');
@@ -215,6 +255,10 @@ export async function runBatch(repo: string,
         if (options.judge === 'required' && !data.manifest.scoring.judges.length) throw Error('Required Judge must be selected in Dataset');
         for (const task of selected) resolveCase(data, task, repo);
     }
+    const repeat = options.repeat ?? options.config?.repeat ?? 1;
+    const plans = options.datasets.map(data => ({ id: data.manifest.id, total: selectCases(data, options.selection).length * repeat }));
+    const total = plans.reduce((sum, plan) => sum + plan.total, 0);
+    notify({ type: 'plan', selection: options.selection ?? 'full', total, datasets: plans });
     let preparedJudge = options.judge === 'off' ? null : judgeConfig(deps.env ?? process.env, repo);
     if (options.judge === 'required' && !preparedJudge) throw Error('Required Judge is unavailable');
     const preparedAgent = !deps.kernel || deps.kernel === productAgent
@@ -224,10 +268,16 @@ export async function runBatch(repo: string,
     if (preparedJudge) preparedJudge = await prepareJudge(preparedJudge, deps.fetcher, deps.signal);
     const results: Awaited<ReturnType<typeof runLocal>>[] = [];
     const { datasets, ...runOptions } = options;
-    for (const dataset of datasets) {
+    let offset = 0;
+    for (const [index, dataset] of datasets.entries()) {
         if (deps.signal?.aborted) break;
-        const result = await (deps.run ?? runLocal)(repo, { ...runOptions, dataset }, { ...deps, preparedAgent, preparedJudge });
+        const result = await (deps.run ?? runLocal)(repo, { ...runOptions, dataset }, { ...deps, preparedAgent, preparedJudge,
+            onProgress(event) {
+                if (event.type === 'plan') return;
+                notify('index' in event ? { ...event, index: event.index + offset, total } : event);
+            } });
         results.push(result);
+        offset += plans[index]!.total;
         if (result.stopped) break;
     }
     return results;

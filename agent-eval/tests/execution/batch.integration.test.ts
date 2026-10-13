@@ -3,6 +3,7 @@ import * as runner from '../../src/execution/runner.ts';
 import { selectCases } from '../../src/dataset-loader/local.ts';
 import { dataset, task, fixtureRepo, reportFixture } from '../support/fixtures.ts';
 import type { AgentKernel } from '../../src/adapters/agent.ts';
+import type { EvaluationProgress } from '../../src/execution/runner.ts';
 
 const env = { FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_MODEL: 'synthetic',
     FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'fake-batch-judge-key' };
@@ -52,4 +53,38 @@ test('all datasets are checked before the first execution; ordinary failed resul
     const results=await runner.runBatch(fixtureRepo,{datasets:datasets(),selection:'smoke',backend:'local',judge:'required'}, {env,kernel,
         run:async()=>{calls++;const report=reportFixture();report.trials[0]!.status='FAIL';return {report,file:'synthetic-report.json',stopped:false};}});
     expect(results).toHaveLength(2);expect(calls).toBe(2);
+});
+
+test('batch progress uses one plan and global indices for smoke, full and repeated Trials', async () => {
+    for (const [selection, repeat, total] of [['smoke',1,14],['full',1,62],['smoke',2,28]] as const) {
+        const events: EvaluationProgress[] = [];
+        await runner.runBatch(fixtureRepo, { datasets: datasets(), selection, repeat, backend: 'local', judge: 'required' },
+            { env, kernel, onProgress: event => { events.push(event); }, run: async (_, options, deps) => {
+                const items = selectCases(options.dataset, selection), localTotal = items.length * repeat;
+                deps!.onProgress?.({ type: 'plan', selection, total: localTotal, datasets: [{ id: options.dataset.manifest.id, total: localTotal }] });
+                for (let index = 1; index <= localTotal; index++) {
+                    const identity = { index, total: localTotal, caseId: items[(index-1)%items.length]!.id, trialId: 'synthetic-' + index };
+                    deps!.onProgress?.({ type: 'trial-phase', ...identity, phase: 'executing' });
+                    deps!.onProgress?.({ type: 'agent-end', ...identity, status: 'completed' });
+                    deps!.onProgress?.({ type: 'scoring-end', ...identity, status: 'PASS', reason: 'Synthetic.' });
+                }
+                return { report: reportFixture(), file: 'synthetic-report.json', stopped: false };
+            } });
+        expect(events.filter(e => e.type === 'plan')).toEqual([{ type: 'plan' as const, selection, total,
+            datasets: [{ id: 'flowmate-agent-v1', total: (selection === 'full' ? 50 : 10) * repeat },
+                { id: 'flowmate-research-v1', total: (selection === 'full' ? 12 : 4) * repeat }] }]);
+        expect(events.filter(e => e.type === 'trial-phase').map(e => [e.index,e.total]))
+            .toEqual(Array.from({ length: total }, (_,i) => [i+1,total]));
+        for (const completed of [events.filter(e => e.type === 'agent-end'), events.filter(e => e.type === 'scoring-end')])
+            expect(completed.map(e => [e.index,e.total]))
+                .toEqual(Array.from({ length: total }, (_,i) => [i+1,total]));
+    }
+});
+
+test('a progress observer cannot mutate the batch plan and prevent the next dataset', async () => {
+    let calls = 0;
+    const result = await runner.runBatch(fixtureRepo, { datasets: datasets(), selection: 'smoke', backend: 'local', judge: 'required' },
+        { env, kernel, onProgress(event) { if (event.type === 'plan') event.datasets.length = 0; },
+            run: async () => { calls++; return { report: reportFixture(), file: 'synthetic-report.json', stopped: false }; } });
+    expect(calls).toBe(2); expect(result).toHaveLength(2);
 });

@@ -62,6 +62,10 @@ bun run eval:full
 
 Smoke 共14题（业务10＋研究4），Full 共62题（业务50＋研究12）。按业务→研究顺序执行，每题默认一次，两组各保存一个 Execution／报告，并输出对应 ID 和路径。普通失败继续执行；取消或停止未确认则阻断后续 Trial 和下一组。退出码0表示必要自动评分通过，1表示失败／错误／执行不完整，2表示必要评分待判，人工验收独立。
 
+终端默认显示全局题目序号、Case ID、环境准备／Agent执行／停止清理／评分／保存阶段。阶段开始以 `▶` 标记，等待时每60秒以 `⏳` 提示当前阶段及已等待时间（60秒、120秒等）；切换阶段后重新计时，结束后停止提示。60秒仅控制日志频率，不改变任务超时。
+
+Agent结束后显示 `✅ Agent执行成功` 或 `❌ Agent执行失败`，超时、取消、未启动分别以 `⚠`、`⏹`、`⏭` 标明。评分结束后显示 `✅ 通过（PASS）`、`❌ 失败（FAIL）`、`❌ 错误（ERROR）`、`⚠ 未判定（UNJUDGEABLE）` 或 `⏭ 未运行（NOT_RUN）`，并保留原因。每题保存成功后以 `💾` 显示状态、耗时和 `evidence/<trial-id>/`，业务组结束立即显示报告路径。进度写入 stderr，原有 JSON 结果仍写入 stdout，重定向 JSON 时不会混入进度。
+
 ## 查看或上传结果
 
 ```bash
@@ -72,3 +76,5 @@ bun run eval:upload -- --execution-id <ID>
 Smoke／Full 始终本地执行，填写 Langfuse 配置不会触发上传。两组结果按各自 ID 单独上传；重复上传命令只补传已有结果，不重跑 Agent 或 Judge。兼容维护入口 resend --report <绝对路径>，与 --execution-id 二选一。
 
 结果保存在 agent-eval/runs/<execution-id>/：snapshot.json、report.json、evidence/<trial-id>/{trial.json,observation.json,events.jsonl}。artifacts/、review.json 和 export.json 仅在有实际产物、反馈或导出时保存。旧报告保持可读，比较实际声明和参数，不仅比较 v1。
+
+`evidence/` 下每个 Trial 都有独立子目录，多个 Case 和重复尝试不会平铺或共用证据文件。取消、停止不明或运行异常时，终端显示原因及已有报告位置；仍在等待、单题已保存或已有目录均不表示整批评测通过。用 `status` 核对执行与评分状态；`pending` 表示尚未完成评分。

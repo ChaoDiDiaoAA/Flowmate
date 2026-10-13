@@ -17,7 +17,10 @@ const bounded = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
         clearTimeout(timer!);
     }
 };
-export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeoutMs: number, stopGraceMs: number, signal?: AbortSignal) {
+export type ExecutionPhase = 'preparing' | 'executing' | 'cleanup';
+export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeoutMs: number, stopGraceMs: number, signal?: AbortSignal,
+    onPhase?: (phase: ExecutionPhase) => void) {
+    const phase = (value: ExecutionPhase) => { try { onPhase?.(value); } catch { /* Display observers cannot interrupt the lifecycle. */ } };
     const expectedIdentity = structuredClone(trial.identity), original = structuredClone(trial.input);
     let projected = structuredClone(original);
     mkdirSync(trial.directory, { recursive: true });
@@ -34,6 +37,7 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
     try {
         if (controller.signal.aborted)
             throw new Error('Cancelled before preparation');
+        phase('preparing');
         const preparing = kernel.prepare(trial, controller.signal);
         try {
             session = await bounded(preparing, stopGraceMs);
@@ -68,6 +72,7 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
                 reject(new Error('Cancelled'));
         });
         timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+        phase('executing');
         execution = structuredClone(await Promise.race([session.execute(controller.signal), cancelled]));
     }
     catch (error) {
@@ -85,6 +90,7 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
     finally {
         clearTimeout(timer);
         signal?.removeEventListener('abort', abort);
+        phase('cleanup');
         if (session) {
             try {
                 let cancelError: unknown;
