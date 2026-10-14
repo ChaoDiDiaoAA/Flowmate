@@ -9,7 +9,7 @@ import {publicVersions,executionVersions} from '../../reports/files.ts';
 import {safeId} from '../../reports/store.ts';
 import {scanEvidence} from '../../execution/evidence-safety.ts';
 import {formalMetric} from '../catalog.ts';
-import {compactPlanSchema,parseCompactJudgment,compactScores,compactRubricFor} from './compact.ts';
+import {compactPlanSchema,parseCompactJudgment,parseMetricJudgment,compactScores,rubricsFor} from './compact.ts';
 import {runCompactJudge} from './harness.ts';
 import {judgeConfig,prepareJudge,publicJudgeConfig,type Fetcher} from './client.ts';
 import type {JudgeCall} from '../types.ts';
@@ -23,8 +23,10 @@ const documentSchema=z.object({contract:z.literal('flowmate-judge-reference/v1')
   context.addIssue({code:'custom',message:'References must bind every criterion in its original order'});
  try{
   if(document.plan.criteria.some(c=>c.metricId.startsWith('DR'))&&!document.referenceWire)throw Error('Research reference needs independent original-index witnesses');
-  const parsed=parseCompactJudgment(document.referenceWire??JSON.stringify({v:1,r:document.references.map(r=>r.counts),f:[]}),document.plan,
-   (document.evidence as{researchFrame?:unknown})?.researchFrame);
+  const raw=document.referenceWire??JSON.stringify({v:1,r:document.references.map(r=>r.counts),f:[]}), frame=(document.evidence as{researchFrame?:unknown})?.researchFrame;
+  const named=JSON.parse(raw).results!==undefined?parseMetricJudgment(raw,document.plan,frame):undefined;
+  if(named&&Object.keys(named.validationErrors).length)throw Error('Reference contains invalid metrics');
+  const parsed=named?.judgment??parseCompactJudgment(raw,document.plan,frame);
   if(!isDeepStrictEqual(parsed.r,document.references.map(r=>r.counts)))throw Error('Reference witness counts differ');
  }
  catch{context.addIssue({code:'custom',message:'Reference counts contradict the declared plan'});}
@@ -55,7 +57,7 @@ export function loadCalibration(directory:string){
 type CriterionSummary={partition:'tune'|'validation';metricId:string;samples:number;measured:number;countsCorrect:number;falseAccepts:number;falseRejects:number;severeErrorMisses:number;unjudgeable:number;errors:number;notRun:number;citationSamples:number;citationCorrect:number};
 type SampleResult={id:string;instanceId:string;partition:'tune'|'validation';reference:z.infer<typeof documentSchema>;call:JudgeCall|null};
 export type CalibrationReport={contract:'flowmate-judge-calibration-report/v1';executionId:string;kind:'engineering-fixture'|'actual-judge-calibration';acceptance:'not-assessed';
- referenceHash:string;configuration:ReturnType<typeof publicJudgeConfig>;startedAt:string;endedAt:string|null;executionComplete:boolean;samples:SampleResult[];criteria:CriterionSummary[]};
+ referenceHash:string;configuration:ReturnType<typeof publicJudgeConfig>;rubrics:ReturnType<typeof rubricsFor>;startedAt:string;endedAt:string|null;executionComplete:boolean;samples:SampleResult[];criteria:CriterionSummary[]};
 
 function summaries(samples:SampleResult[]):CriterionSummary[]{
  const groups=new Map<string,CriterionSummary>();
@@ -89,7 +91,7 @@ export async function calibrateJudge(repo:string,options:{directory:string;execu
  const kit=loadCalibration(options.directory),configured=judgeConfig(deps.env??process.env,repo,options.judgeConfigFile);
  if(!configured)throw Error('Independent Judge configuration required; no Agent fallback');
  if(deps.signal?.aborted)throw Error('Calibration cancelled before dispatch');
- if(new Set(kit.samples.map(s=>hash(compactRubricFor(s.document.plan)))).size!==1)throw Error('Calibration needs one declared Rubric identity');
+ const rubrics=rubricsFor(kit.samples.map(s=>s.document.plan));
  if((scanEvidence(kit,[configured.apiKey]).fact.actual as{leaked:boolean}).leaked)throw Error('Configured secret in calibration references');
  const executionId=safeId(options.executionId),config=await prepareJudge(configured,deps.fetcher,deps.signal);let directory=realpathSync(repo);
  for(const component of ['agent-eval','calibration-runs']){
@@ -99,7 +101,7 @@ export async function calibrateJudge(repo:string,options:{directory:string;execu
  }
  directory=join(directory,executionId);mkdirSync(directory);const file=join(directory,'summary.json');
  const report:CalibrationReport={contract:'flowmate-judge-calibration-report/v1',executionId,kind:deps.fetcher?'engineering-fixture':'actual-judge-calibration',acceptance:'not-assessed',referenceHash:kit.hash,
-  configuration:publicJudgeConfig(config,compactRubricFor(kit.samples[0]!.document.plan)),startedAt:new Date().toISOString(),endedAt:null,executionComplete:false,
+  configuration:publicJudgeConfig(config),rubrics,startedAt:new Date().toISOString(),endedAt:null,executionComplete:false,
   samples:kit.samples.map(s=>({id:s.id,instanceId:s.document.instanceId,partition:s.document.partition,reference:s.document,call:null})),criteria:[]};
  report.criteria=summaries(report.samples);save(file,report);
  for(const sample of report.samples){

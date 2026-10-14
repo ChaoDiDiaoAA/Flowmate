@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import { ClaimSchema, ResearchPlanSchema, ResearchReportSchema, SourceSnapshotSchema,
-    ResearchLocatorSchema, type ResearchSourcePolicy } from '../../../packages/contracts/src/research.ts';
+    ResearchLocatorSchema, EvidenceRefSchema, type ResearchSourcePolicy } from '../../../packages/contracts/src/research.ts';
 import { ToolCallSnapshotSchema } from '../../../packages/contracts/src/tool-evidence.ts';
 import { collectedResearchSchema } from './research-evidence.ts';
 import { hash } from '../dataset-loader/local.ts';
@@ -15,6 +15,7 @@ const toolsSchema = z.object({ calls: z.array(z.object({ tool: ToolCallSnapshotS
 const registrationSchema = z.array(z.object({ artifactId: id, sample: z.string().min(1), file: z.string().min(1),
     sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict());
 const sourceReadSchema = z.object({ source: SourceSnapshotSchema, excerpt: ResearchLocatorSchema,
+    evidenceRef: EvidenceRefSchema.nullable().optional(),
     usage: z.object({ requestId: z.string().max(256).nullable(), credits: z.number().finite().nonnegative().nullable() }).strict() }).strict();
 const splitsPair = (text: string, at: number) => at > 0 && at < text.length &&
     /[\uD800-\uDBFF]/.test(text[at - 1]!) && /[\uDC00-\uDFFF]/.test(text[at]!);

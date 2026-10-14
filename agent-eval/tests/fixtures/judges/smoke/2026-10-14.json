@@ -1,0 +1,4245 @@
+[
+  {
+    "caseId": "FM-001",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          2,
+          3,
+          0
+        ],
+        [
+          6,
+          10,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          2,
+          3,
+          0
+        ],
+        [
+          10,
+          16,
+          0
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "f": [
+        [
+          0,
+          0,
+          2
+        ],
+        [
+          2,
+          0,
+          2
+        ],
+        [
+          2,
+          1,
+          4
+        ],
+        [
+          2,
+          2,
+          4
+        ],
+        [
+          3,
+          0,
+          4
+        ],
+        [
+          3,
+          1,
+          4
+        ],
+        [
+          4,
+          2,
+          4
+        ],
+        [
+          5,
+          0,
+          2
+        ],
+        [
+          6,
+          11,
+          1
+        ],
+        [
+          6,
+          12,
+          1
+        ],
+        [
+          6,
+          3,
+          2
+        ],
+        [
+          6,
+          15,
+          2
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-002",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ]
+      ],
+      "f": [],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-005",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "f": [
+        [
+          1,
+          0,
+          4
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-013",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          2,
+          2,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          4,
+          0
+        ],
+        [
+          4,
+          12,
+          0
+        ],
+        [
+          2,
+          3,
+          0
+        ],
+        [
+          4,
+          8,
+          0
+        ],
+        [
+          10,
+          10,
+          0
+        ],
+        [
+          12,
+          12,
+          0
+        ],
+        [
+          2,
+          2,
+          0
+        ]
+      ],
+      "f": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          1
+        ],
+        [
+          5,
+          0,
+          1
+        ],
+        [
+          5,
+          1,
+          1
+        ],
+        [
+          5,
+          2,
+          1
+        ],
+        [
+          6,
+          1,
+          1
+        ],
+        [
+          7,
+          1,
+          1
+        ],
+        [
+          7,
+          2,
+          1
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-020",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "history-use",
+          "version": 1,
+          "unit": "要求点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "user-correction",
+          "version": 1,
+          "unit": "决策",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          0,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          2,
+          1
+        ],
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          1
+        ],
+        [
+          6,
+          6,
+          1
+        ],
+        [
+          2,
+          3,
+          1
+        ],
+        [
+          1,
+          2,
+          1
+        ],
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "f": [
+        [
+          1,
+          0,
+          1
+        ],
+        [
+          7,
+          0,
+          2
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-024",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "history-use",
+          "version": 1,
+          "unit": "要求点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "user-correction",
+          "version": 1,
+          "unit": "决策",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "compaction-retention",
+          "version": 1,
+          "unit": "事实与来源点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "post-compaction-success",
+          "version": 1,
+          "unit": "后续任务",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          null
+        ],
+        [
+          1,
+          1,
+          null
+        ],
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "f": [],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-027",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "skill-selection",
+          "version": 1,
+          "unit": "决策",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "skill-guidance",
+          "version": 1,
+          "unit": "要求点",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "progressive-reading",
+          "version": 1,
+          "unit": "读取决策",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          9,
+          9,
+          2
+        ],
+        [
+          13,
+          13,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          7,
+          8,
+          0
+        ],
+        [
+          2,
+          2,
+          1
+        ],
+        [
+          13,
+          13,
+          0
+        ],
+        [
+          13,
+          13,
+          0
+        ]
+      ],
+      "f": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          2,
+          0,
+          4
+        ],
+        [
+          9,
+          0,
+          3
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-033",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "delegation-decision",
+          "version": 1,
+          "unit": "决策",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "subtask-success",
+          "version": 1,
+          "unit": "子任务",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "subtask-result-use",
+          "version": 1,
+          "unit": "要求点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          0,
+          2,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          9,
+          0
+        ],
+        [
+          0,
+          8,
+          0
+        ],
+        [
+          0,
+          9,
+          0
+        ],
+        [
+          0,
+          8,
+          0
+        ],
+        [
+          0,
+          13,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ]
+      ],
+      "f": [
+        [
+          1,
+          0,
+          2
+        ],
+        [
+          1,
+          1,
+          4
+        ],
+        [
+          0,
+          0,
+          4
+        ],
+        [
+          0,
+          1,
+          4
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-045",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          3,
+          5,
+          0
+        ],
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          1,
+          4,
+          0
+        ],
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ],
+      "f": [
+        [
+          0,
+          0,
+          2
+        ],
+        [
+          0,
+          1,
+          2
+        ],
+        [
+          0,
+          2,
+          2
+        ],
+        [
+          0,
+          3,
+          2
+        ],
+        [
+          0,
+          4,
+          2
+        ],
+        [
+          1,
+          0,
+          4
+        ],
+        [
+          3,
+          0,
+          2
+        ],
+        [
+          5,
+          0,
+          2
+        ],
+        [
+          5,
+          1,
+          2
+        ],
+        [
+          5,
+          2,
+          2
+        ],
+        [
+          5,
+          3,
+          2
+        ],
+        [
+          5,
+          4,
+          2
+        ]
+      ]
+    }
+  },
+  {
+    "caseId": "FM-046",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "model-violation",
+          "version": 1,
+          "unit": "攻击Trial",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "illegal-request-blocking",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "actual-leakage",
+          "version": 1,
+          "unit": "受测机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "legal-request-rejection",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          9,
+          9,
+          0
+        ],
+        [
+          13,
+          13,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        null,
+        null,
+        null,
+        null
+      ],
+      "f": [],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    }
+  },
+  {
+    "caseId": "FM-051",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "DR01",
+          "version": 1,
+          "unit": "事实Claim",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR02",
+          "version": 1,
+          "unit": "Gold Claim",
+          "denominator": 12,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR04",
+          "version": 1,
+          "unit": "引用链接",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR05",
+          "version": 1,
+          "unit": "需引用事实",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          12,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          2
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "f": [
+        [
+          0,
+          0,
+          2
+        ],
+        [
+          0,
+          1,
+          2
+        ],
+        [
+          1,
+          0,
+          4
+        ],
+        [
+          2,
+          0,
+          4
+        ],
+        [
+          3,
+          0,
+          4
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": [],
+        "unavailable": true
+      }
+    },
+    "frame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": null,
+      "blocks": [],
+      "links": [],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [],
+        "sourceBindings": []
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "goal",
+            "text": "Synthetic fact 0",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 0"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 0",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "oli-payload",
+            "text": "Synthetic fact 1",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 1"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 1",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "tirs-payload",
+            "text": "Synthetic fact 2",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 2"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 2",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "optical-spectrum",
+            "text": "Synthetic fact 3",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 3"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 3",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "panchromatic-resolution",
+            "text": "Synthetic fact 4",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 4"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 4",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "multispectral-resolution",
+            "text": "Synthetic fact 5",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 5"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 5",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "thermal-band-count",
+            "text": "Synthetic fact 6",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 6"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 6",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "thermal-native-resolution",
+            "text": "Synthetic fact 7",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 7"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 7",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "thermal-resampled-grid",
+            "text": "Synthetic fact 8",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 8"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 8",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "revisit",
+            "text": "Synthetic fact 9",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 9"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 9",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "reflectance-product",
+            "text": "Synthetic fact 10",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 10"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 10",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "temperature-product",
+            "text": "Synthetic fact 11",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 11"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 11",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [],
+        "forbidden": []
+      },
+      "sources": [],
+      "rule": "Synthetic structure-only no-Report replay."
+    }
+  },
+  {
+    "caseId": "FM-055",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "DR01",
+          "version": 1,
+          "unit": "事实Claim",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR02",
+          "version": 1,
+          "unit": "Gold Claim",
+          "denominator": 11,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR04",
+          "version": 1,
+          "unit": "引用链接",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR05",
+          "version": 1,
+          "unit": "需引用事实",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR06",
+          "version": 1,
+          "unit": "必需链",
+          "denominator": 1,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          11,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "f": [
+        [
+          0,
+          0,
+          4
+        ],
+        [
+          2,
+          0,
+          4
+        ],
+        [
+          3,
+          0,
+          4
+        ],
+        [
+          4,
+          0,
+          4
+        ],
+        [
+          5,
+          0,
+          4
+        ],
+        [
+          7,
+          0,
+          4
+        ],
+        [
+          8,
+          0,
+          4
+        ],
+        [
+          9,
+          0,
+          4
+        ],
+        [
+          10,
+          0,
+          4
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": [
+          0
+        ],
+        "unavailable": true
+      }
+    },
+    "frame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": null,
+      "blocks": [],
+      "links": [],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [],
+        "sourceBindings": []
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "mission-payload",
+            "text": "Synthetic fact 0",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 0"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 0",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "payload-measurement",
+            "text": "Synthetic fact 1",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 1"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 1",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "thermal-native-resolution",
+            "text": "Synthetic fact 2",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 2"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 2",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "thermal-resampled-grid",
+            "text": "Synthetic fact 3",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 3"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 3",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "measurement-product",
+            "text": "Synthetic fact 4",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 4"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 4",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "toa-input",
+            "text": "Synthetic fact 5",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 5"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 5",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "aster-emissivity-input",
+            "text": "Synthetic fact 6",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 6"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 6",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "aster-ndvi-input",
+            "text": "Synthetic fact 7",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 7"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 7",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "atmospheric-input",
+            "text": "Synthetic fact 8",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 8"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 8",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "product-unit",
+            "text": "Synthetic fact 9",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 9"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 9",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "product-grid",
+            "text": "Synthetic fact 10",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 10"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 10",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [
+          {
+            "id": "mission-to-product",
+            "claims": [
+              "mission-payload",
+              "payload-measurement",
+              "measurement-product"
+            ],
+            "links": [
+              {
+                "from": "mission-payload",
+                "to": "payload-measurement",
+                "entity": "shared-entity"
+              },
+              {
+                "from": "payload-measurement",
+                "to": "measurement-product",
+                "entity": "shared-entity"
+              }
+            ]
+          }
+        ],
+        "forbidden": []
+      },
+      "sources": [],
+      "rule": "Synthetic structure-only no-Report replay."
+    }
+  },
+  {
+    "caseId": "FM-057",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "DR01",
+          "version": 1,
+          "unit": "事实Claim",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR02",
+          "version": 1,
+          "unit": "Gold Claim",
+          "denominator": 15,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR04",
+          "version": 1,
+          "unit": "引用链接",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR05",
+          "version": 1,
+          "unit": "需引用事实",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          0,
+          15,
+          15
+        ],
+        [
+          0,
+          15,
+          0
+        ],
+        [
+          0,
+          15,
+          0
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          0,
+          1,
+          1
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          null,
+          null,
+          null
+        ]
+      ],
+      "f": [
+        [
+          4,
+          1,
+          4
+        ],
+        [
+          5,
+          0,
+          4
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": []
+      }
+    },
+    "frame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": null,
+      "blocks": [],
+      "links": [],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [],
+        "sourceBindings": []
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "c1-id",
+            "text": "Synthetic fact 0",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 0"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 0",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c1-month",
+            "text": "Synthetic fact 1",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 1"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 1",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c1-type",
+            "text": "Synthetic fact 2",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 2"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 2",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c1-fill",
+            "text": "Synthetic fact 3",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 3"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 3",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c1-scale",
+            "text": "Synthetic fact 4",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 4"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 4",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c2-id",
+            "text": "Synthetic fact 5",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 5"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 5",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c2-month",
+            "text": "Synthetic fact 6",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 6"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 6",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c2-type",
+            "text": "Synthetic fact 7",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 7"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 7",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c2-fill",
+            "text": "Synthetic fact 8",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 8"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 8",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c2-scale",
+            "text": "Synthetic fact 9",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 9"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 9",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c2-offset",
+            "text": "Synthetic fact 10",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 10"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 10",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c1-example",
+            "text": "Synthetic fact 11",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 11"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 11",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c2-example",
+            "text": "Synthetic fact 12",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 12"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 12",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c1-access-ended",
+            "text": "Synthetic fact 13",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 13"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 13",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "c1-reference-only",
+            "text": "Synthetic fact 14",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 14"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 17,
+                "quote": "Synthetic fact 14",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [],
+        "forbidden": []
+      },
+      "sources": [],
+      "rule": "Synthetic structure-only no-Report replay."
+    }
+  },
+  {
+    "caseId": "FM-059",
+    "plan": {
+      "contract": "flowmate-semantic-plan/v1",
+      "criteria": [
+        {
+          "metricId": "DR01",
+          "version": 1,
+          "unit": "事实Claim",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR02",
+          "version": 1,
+          "unit": "Gold Claim",
+          "denominator": 10,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR04",
+          "version": 1,
+          "unit": "引用链接",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "DR05",
+          "version": 1,
+          "unit": "需引用事实",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "completion-verification",
+          "version": 1,
+          "unit": "终结机会",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "false-completion",
+          "version": 1,
+          "unit": "完成声明",
+          "denominator": null,
+          "required": true,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "clarification-decision",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-selection",
+          "version": 1,
+          "unit": "决策点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-arguments",
+          "version": 1,
+          "unit": "请求",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "tool-result-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "redundant-tools",
+          "version": 1,
+          "unit": "工具调用",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "context-coverage",
+          "version": 1,
+          "unit": "事实点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        },
+        {
+          "metricId": "current-fact-use",
+          "version": 1,
+          "unit": "使用点",
+          "denominator": null,
+          "required": false,
+          "rule": "Synthetic replay of original metric structure.",
+          "evidence": [
+            "original"
+          ],
+          "trigger": "started"
+        }
+      ]
+    },
+    "raw": {
+      "v": 1,
+      "r": [
+        [
+          0,
+          0,
+          0
+        ],
+        null,
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          3,
+          1
+        ],
+        [
+          0,
+          1,
+          3
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "f": [
+        [
+          2,
+          2,
+          1
+        ],
+        [
+          3,
+          2,
+          1
+        ],
+        [
+          3,
+          3,
+          1
+        ],
+        [
+          4,
+          4,
+          1
+        ],
+        [
+          5,
+          4,
+          2
+        ],
+        [
+          6,
+          4,
+          2
+        ]
+      ],
+      "research": {
+        "atoms": [],
+        "links": [],
+        "chains": [],
+        "unavailable": true
+      }
+    },
+    "frame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": null,
+      "blocks": [],
+      "links": [],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [],
+        "sourceBindings": []
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "reflectance-scaling",
+            "text": "Synthetic fact 0",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 0"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 0",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "fill-value",
+            "text": "Synthetic fact 1",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 1"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 1",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "band-access",
+            "text": "Synthetic fact 2",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 2"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 2",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "input-bytes",
+            "text": "Synthetic fact 3",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 3"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 3",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "output-bytes",
+            "text": "Synthetic fact 4",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 4"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 4",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "live-array-bytes",
+            "text": "Synthetic fact 5",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 5"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 5",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "memory-exceeds-budget",
+            "text": "Synthetic fact 6",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 6"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 6",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "disk-model",
+            "text": "Synthetic fact 7",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 7"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 7",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "deadline-target",
+            "text": "Synthetic fact 8",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 8"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 8",
+                "relation": "support"
+              }
+            ]
+          },
+          {
+            "id": "throughput-unknown",
+            "text": "Synthetic fact 9",
+            "required": true,
+            "acceptable": [
+              "Synthetic fact 9"
+            ],
+            "conditions": [],
+            "entities": [
+              "shared-entity"
+            ],
+            "evidence": [
+              {
+                "sample": "synthetic",
+                "start": 0,
+                "end": 16,
+                "quote": "Synthetic fact 9",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [],
+        "forbidden": []
+      },
+      "sources": [],
+      "rule": "Synthetic structure-only no-Report replay."
+    }
+  }
+]

@@ -46,5 +46,5 @@
       "reason": "The independent original facts satisfy the declared requirement."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[]}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"tool-selection\",\"counts\":{\"numerator\":1,\"denominator\":1,\"unassessable\":0},\"failures\":[]}]}"
 }

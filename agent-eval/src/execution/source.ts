@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { hash } from '../dataset-loader/local.ts';
 import { artifactJson, withoutHashes } from '../artifacts.ts';
 import { protectedSecrets } from './evidence-safety.ts';
+const manifests = new WeakMap<object, Map<string,string>>();
 export function codeIdentity(repoRoot: string, snapshotFile?: string) {
     const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
     const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: repoRoot, encoding: 'utf8' }).split('\0');
@@ -35,17 +36,31 @@ export function codeIdentity(repoRoot: string, snapshotFile?: string) {
         }
         const contentBase64 = bytes.toString('base64');
         return { path, hash: hash(contentBase64), contentBase64 };
-    });
+    }).filter(file=>file.contentBase64!==null);
     const identity = { release: process.env.FLOWMATE_EVAL_RELEASE || `git:${commit}`, dirty: !!execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8' }).trim(), commit, workspaceHash: hash(source.map(file => [file.path, file.hash])) };
+    manifests.set(identity,new Map(source.map(file=>[file.path,file.hash])));
     if (snapshotFile)
         writeFileSync(snapshotFile, artifactJson({ contract: 'flowmate-source-snapshot/v1', ...identity, runtime: { node: process.version, platform: process.platform, arch: process.arch }, files: source }), { flag: 'wx' });
     return identity;
+}
+export function changedSourcePaths(before: object, after: object) {
+    const first=manifests.get(before), last=manifests.get(after);
+    if(!first || !last)throw Error('Source comparison requires original in-memory conditions');
+    return [...new Set([...first.keys(),...last.keys()])].filter(path=>first.get(path)!==last.get(path)).sort();
 }
 /** Save actual runtime code conditions instead of a persistent source fingerprint. */
 export function runtimeSourceConditions(repo:string) {
     const files=['packages/core/src/tools/executor.ts','packages/core/src/tools/evaluation-fault.ts',
         'packages/contracts/src/ports.ts','packages/contracts/src/runtime.ts','packages/contracts/src/tool-evidence.ts',
-        'packages/runtime-pi/src/session.ts'];
+        'packages/runtime-pi/src/session.ts',
+        'agent-eval/src/scoring/evaluators/invoice-values.ts','agent-eval/src/scoring/evaluators/reference-fields.ts',
+        'agent-eval/src/scoring/evaluators/line-items.ts','agent-eval/src/scoring/evaluators/semantic.ts',
+        'agent-eval/src/scoring/judges/compact.ts','agent-eval/src/scoring/judges/harness.ts',
+        'agent-eval/src/scoring/research-frame.ts','agent-eval/src/scoring/research-judgment.ts',
+        'agent-eval/src/adapters/research-integrity.ts','agent-eval/src/artifacts.ts','packages/shared/src/decimal.ts',
+        'packages/contracts/src/research.ts','packages/core/src/research/source-text.ts',
+        'packages/core/src/research/read-tools.ts','packages/core/src/research/synthesis-tools.ts','packages/runtime-pi/src/tools.ts',
+        'resources/prompts/research/prompt.md','resources/skills/deep-research/SKILL.md'];
     const dependencies=existsSync(join(repo,'package.json'))?JSON.parse(readFileSync(join(repo,'package.json'),'utf8')).dependencies:{};
     return withoutHashes({dependencies:Object.fromEntries(['@earendil-works/pi-ai','@earendil-works/pi-coding-agent'].map(id=>[id,dependencies?.[id]??null])),
         files:files.filter(path=>existsSync(join(repo,path))).map(path=>({path,text:readFileSync(join(repo,path),'utf8')}))});

@@ -1,4 +1,4 @@
-import { judgeResponse } from '../support/judge-response.ts';
+import { judgeResponse, namedJudgment } from '../support/judge-response.ts';
 import { expect, test } from 'bun:test';
 import { caseV2Schema } from '../../src/dataset-loader/schema.ts';
 import { metricCatalog } from '../../src/scoring/catalog.ts';
@@ -27,7 +27,7 @@ function result() {
     r.evidence.requests = { present: true, actual: ['a', 'b', 'c', 'd'], source: 'synthetic original requests' };
     return r;
 }
-const reply = (r: unknown) => judgeResponse({ choices: [{ message: { content: JSON.stringify({ v: 1, r, f: [] }) }, finish_reason: 'stop' }] });
+const reply = (r: unknown) => judgeResponse({ choices: [{ message: { content: namedJudgment(candidate().expected.semantic, { v: 1, r:r as unknown[], f: [] }) }, finish_reason: 'stop' }] });
 const selected=(scores:Awaited<ReturnType<typeof evaluateAll>>['scores'])=>scores.filter(s=>['tool-selection','tool-arguments'].includes(s.metricId));
 
 test('v2 semantic criteria bind the declared metric plan and evaluateAll makes exactly one multi-criterion Judge request', async () => {

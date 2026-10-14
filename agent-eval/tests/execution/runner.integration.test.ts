@@ -1,9 +1,9 @@
-import { judgeResponse } from '../support/judge-response.ts';
+import { judgeResponse, namedJudgment } from '../support/judge-response.ts';
 import { mkdtempSync } from '../../../tests/support/resources.ts';
 import { test, expect } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { existsSync,mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync,mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dataset, observed, task } from '../support/fixtures.ts';
 import { runLocal } from '../../src/execution/runner.ts';
@@ -16,6 +16,7 @@ import { hash } from '../../src/dataset-loader/local.ts';
 import { readReport } from '../../src/reports/store.ts';
 import { formalFixture } from '../support/formal.ts';
 import { compileFormalSemanticPlan } from '../../src/scoring/formal-rules.ts';
+import type { EvaluationProgress } from '../../src/execution/runner.ts';
 function kernel(transform?: (r: ReturnType<typeof observed>) => void): AgentKernel {
     return { readiness: () => ({ ready: true, reason: 'test-only' }), async prepare(trial) {
             expect(trial).not.toHaveProperty('expected');
@@ -29,6 +30,25 @@ function kernel(transform?: (r: ReturnType<typeof observed>) => void): AgentKern
             return { input: trial.input, async execute() { return result; }, async snapshot() { return result; }, async cancel() { }, async close() { return { present: true, actual: { closed: true, stopped: true }, source: 'test-session' }; } };
         } };
 }
+
+test('source drift preserves original scores, records changed paths and announces final invalidation once',async()=>{
+    const path='packages/core/src/drift-'+randomUUID()+'.ts',file=join(REPO_ROOT,path);
+    mkdirSync(join(file,'..'),{recursive:true});writeFileSync(file,'before');
+    const events:EvaluationProgress[]=[];
+    try{
+        const data=structuredClone(dataset);data.cases=[data.cases[0]!];data.manifest.members=['cases/'+data.cases[0]!.id+'.json'];
+        const run=await runLocal(REPO_ROOT,{dataset:data,backend:'local',judge:'off',executionId:'drift-'+randomUUID()},
+            {env:{},kernel:kernel(()=>writeFileSync(file,'after')),onProgress:e=>events.push(e)});
+        expect(run.report.executionComplete).toBe(false);
+        expect(run.report.sourceInvalidation).toMatchObject({paths:[path]});
+        expect(run.report.trials[0]!.status).toBe('ERROR');
+        expect(run.report.trials[0]!.scores.some(s=>s.status==='PASS')).toBe(true);
+        expect(events.filter(e=>e.type==='source-invalidated')).toHaveLength(1);
+        expect(events.at(-1)).toMatchObject({type:'dataset-end',counts:{ERROR:1}});
+        expect(readReport(run.file).sourceInvalidation).toEqual(run.report.sourceInvalidation);
+        expect(readFileSync(run.file,'utf8')).not.toContain('workspaceHash');
+    }finally{unlinkSync(file);}
+});
 
 function semanticDataset() {
     const criteria = [
@@ -49,6 +69,18 @@ function semanticDataset() {
     data.hash = hash({ manifest: data.manifest, cases: data.cases });
     return data;
 }
+
+test('progress reduces Judge validation details to a brief cause while reports keep the full errors',async()=>{
+    const data=semanticDataset(), events:EvaluationProgress[]=[];
+    const run=await runLocal(REPO_ROOT,{dataset:data,backend:'local',judge:'required',executionId:'brief-judge-'+randomUUID()},
+        {kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
+            FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-brief-key'},
+            fetcher:async()=>judgeResponse({choices:[{message:{content:'{"v":1,"results":[]}'},finish_reason:'stop'}]}),onProgress:e=>events.push(e)});
+    const reason=events.find(e=>e.type==='scoring-end')!.reason;
+    expect(reason).toContain('Judge 返回指标缺失');expect(reason).toContain('详见报告');
+    expect(reason).not.toContain('Judge omitted a metric');expect(reason.length).toBeLessThan(180);
+    expect(run.report.trials[0]!.judgeCalls[0]!.compact!.validationErrors).toHaveProperty('tool-arguments','Judge omitted a metric');
+});
 
 test('a simple authored Case without a Fixture executes and saves no placeholder scene', async () => {
     const data = structuredClone(dataset), item = data.cases[0]!;
@@ -85,7 +117,7 @@ test('Runner binds one compact Judge per Trial, distinct ratios and original cou
             requests++; const body = JSON.parse(String(init.body)); expect(body).toHaveProperty('max_completion_tokens', 32768);expect(body).not.toHaveProperty('temperature');
             expect(JSON.parse(body.messages[1].content).plan.criteria).toHaveLength(2);
             expect(JSON.parse(body.messages[1].content).plan.criteria).toEqual(selectedCriteria);
-            return judgeResponse({ choices: [{ message: { content: '{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}' }, finish_reason: 'stop' }] });
+            return judgeResponse({ choices: [{ message: { content: namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}') }, finish_reason: 'stop' }] });
         } });
     expect(requests).toBe(2);
     expect(run.report.trials.map(t => t.judgeCalls.length)).toEqual([1, 1]);
@@ -108,7 +140,7 @@ test('compact selection and required criteria are checked before Agent preparati
 test('requiring a Judge preserves the Case distinction between optional process metrics and necessary task predicates',async()=>{
     const data=semanticDataset();data.cases[0]!.expected.semantic!.criteria[0]!.required=false;
     const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'optional-process-'+randomUUID(),backend:'local',judge:'required'},{kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'synthetic-optional-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
-        fetcher:async()=>judgeResponse({choices:[{message:{content:'{"v":1,"r":[[0,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]})});
+        fetcher:async()=>judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[0,3,0],[4,4,0]],"f":[]}')},finish_reason:'stop'}]})});
     expect(run.report.trials[0]!.scores.find(s=>s.metricId==='tool-selection')).toMatchObject({status:'FAIL',required:false});
     expect(run.report.trials[0]!.status).toBe('PASS');
 });
@@ -279,7 +311,7 @@ test('unknown semantic denominators do not restore a removed Judge output budget
  const run=await runLocal(REPO_ROOT,{dataset:data,caseId:data.cases[0]!.id,executionId:id,backend:'local',judge:'required'},{kernel:product,
   env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'synthetic-bound-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
   fetcher:async(_url,init)=>{requests++;expect(JSON.parse(String(init.body))).toHaveProperty('max_completion_tokens', 32768);
-   return judgeResponse({choices:[{message:{content:'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}'},finish_reason:'stop'}]});}});
+   return judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}')},finish_reason:'stop'}]});}});
  expect(requests).toBe(1);expect(run.report.trials[0]!.judgeCalls).toHaveLength(1);expect(existsSync(run.file)).toBe(true);
 });
 for(const metric of ['skill-guidance','model-violation'] as const)test('declared '+metric+' grades survive saving and a hard failure cannot become a passing report',async()=>{
@@ -291,7 +323,7 @@ for(const metric of ['skill-guidance','model-violation'] as const)test('declared
  data.manifest=manifestSchema.parse({...data.manifest,contract:'flowmate-agent-dataset/v2',environment:{...data.manifest.environment,profile:'isolated-agent/v2'},scoring:{...data.manifest.scoring,judges:[{id:'semantic-batch',required:true}]}});
  const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'declared-'+metric+'-'+randomUUID(),backend:'local',judge:'required'},
  {kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'declared-predicate-fake-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
- fetcher:async()=>judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:[metric==='model-violation'?[1,1,0]:[0,1,0]],f:[]})},finish_reason:'stop'}]})});
+ fetcher:async()=>judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:metric}]},{v:1,r:[metric==='model-violation'?[1,1,0]:[0,1,0]],f:[]})},finish_reason:'stop'}]})});
  const loaded=readReport(run.file),trial=loaded.trials[0]!;
  expect(trial.semanticPlan!.criteria[0]!.required).toBe(true);
  const score=trial.scores.find(s=>s.metricId===metric);

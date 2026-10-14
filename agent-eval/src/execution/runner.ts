@@ -11,12 +11,12 @@ import { productAgent, createProductAgent, type AgentKernel } from '../adapters/
 import { agentApiSchema, prepareAgentConfig, type AgentModelCapabilities } from '../configuration.ts';
 export {assertModelConfiguration} from '../adapters/agent.ts';
 import { executeCase, type ExecutionPhase } from './execute-case.ts';
-import { codeIdentity, runtimeSourceConditions } from './source.ts';
+import { codeIdentity, changedSourcePaths, runtimeSourceConditions } from './source.ts';
 import { scanEvidence } from './evidence-safety.ts';
 import { evaluateAll } from '../scoring/evaluate.ts';
 import { aggregate } from '../scoring/aggregate.ts';
 import { judgeConfig, prepareJudge, publicJudgeConfig, type Fetcher, type JudgeConfig } from '../scoring/judges/client.ts';
-import { compactRubric,compactRubricFor } from '../scoring/judges/compact.ts';
+import { rubricsFor } from '../scoring/judges/compact.ts';
 import {rubric as legacyRubric} from '../scoring/judges/answer-relevance.ts';
 import {formalRules} from '../scoring/formal-rules.ts';
 import {metricCatalog} from '../scoring/catalog.ts';
@@ -34,8 +34,26 @@ export type EvaluationProgress =
     | TrialProgress & { type: 'agent-end'; status: ExecutionStatus; reason?: string }
     | TrialProgress & { type: 'scoring-end'; status: LocalReport['trials'][number]['status']; reason: string }
     | TrialProgress & { type: 'trial-end'; status: LocalReport['trials'][number]['status']; reason: string; elapsedMs: number; evidenceDirectory: string }
+    | {type:'source-invalidated';datasetId:string;executionId:string;reason:string;paths:string[]}
     | { type: 'dataset-end'; datasetId: string; executionId: string; reportPath: string; stopped: boolean; reason?: string; counts: Record<string, number> };
 type ProgressObserver = (event: EvaluationProgress) => void;
+function scoringProgressReason(trial: LocalReport['trials'][number]) {
+    const errors=trial.scores.filter(score=>score.status==='ERROR');
+    if(!errors.length)return trial.reason;
+    const semantic=errors.filter(score=>score.method==='llm-judge');
+    const call=trial.judgeCalls.find(call=>semantic.some(score=>score.judge?.callId===call.callId))??trial.judgeCalls[0];
+    let summary='评分设施异常';
+    if(semantic.length) {
+        if(call?.error) summary=/timeout/i.test(call.error)?'Judge 调用超时':/cancel|abort/i.test(call.error)?'Judge 调用已取消':
+            call.stopReason==='length'?'Judge 返回被截断':call.responseComplete?'Judge 返回格式或指标身份不合法':'Judge 调用失败或返回未完成';
+        else {
+            const reasons=semantic.map(score=>score.reason).join(' ');
+            summary=/omitted/i.test(reasons)?'Judge 返回指标缺失':/duplicate metric/i.test(reasons)?'Judge 返回重复指标':
+                /Research witness/i.test(reasons)?'Judge 研究见证校验失败':/counts|denominator|opportunity/i.test(reasons)?'Judge 返回计数或机会索引不合法':'Judge 返回指标结构不合法';
+        }
+    } else if(errors.some(score=>score.reason.includes('采集失败')))summary='必要证据采集失败';
+    return `${trial.reason}；评分异常：${summary}（${errors.length}项，详见报告）`;
+}
 function notifyProgress(observer: ProgressObserver | undefined, event: EvaluationProgress) {
     try { observer?.(structuredClone(event)); } catch { /* Progress must not change evaluation results or cleanup. */ }
 }
@@ -115,13 +133,13 @@ export async function runLocal(repo: string, options: {
     let judge = options.judge === 'off' ? null : deps.preparedJudge !== undefined ? deps.preparedJudge : judgeConfig(deps.env ?? process.env, repo, options.judgeConfigFile);
     const batch = dataset.manifest.scoring.judges.find(j => j.id === 'semantic-batch');
     const plans=selected.flatMap(task=>'contract'in task&&task.expected.semantic?[task.expected.semantic]:[]);
-    if(new Set(plans.map(plan=>hash(compactRubricFor(plan)))).size>1)throw new Error('Selected semantic plans need one declared Rubric identity');
+    const rubrics = rubricsFor(plans);
     const judgeRequired = options.judge === 'required' || dataset.manifest.scoring.judges.some(j => j.required || selected.some(c => j.requiredFor?.includes(c.id))) ||
         selected.some(c => 'contract' in c && c.expected.semantic?.criteria.some(criterion => criterion.required));
     if (options.judge !== 'off' && judgeRequired && !judge)
         throw new Error('Required Judge is unavailable');
     if (judge && deps.preparedJudge === undefined) judge = await prepareJudge(judge, deps.fetcher, deps.signal);
-    const selectedJudge = judge ? publicJudgeConfig(judge, batch ? plans[0]?compactRubricFor(plans[0]):compactRubric : undefined) : null;
+    const selectedJudge = judge ? publicJudgeConfig(judge) : null;
     const executionId = safeId(options.executionId ?? ('agent-' + Date.now() + '-' + randomUUID().slice(0, 8)));
     let results = realpathSync(repo);
     for (const component of ['agent-eval', 'runs']) {
@@ -148,7 +166,7 @@ export async function runLocal(repo: string, options: {
         gold:authored?Object.fromEntries(selected.map(c=>[c.id,authored.gold[c.id]])):undefined,
         materials:prepared.map(({task,resolved})=>({caseId:task.id,materials:resolved?.projected.materials??[],files:caseFiles(dataset,task)})),
         runtimeSource:runtimeSourceConditions(repo),
-        scoring:{catalog:metricCatalog,rules:formalRules,rubric:batch?plans[0]?compactRubricFor(plans[0]):compactRubric:legacyRubric,
+        scoring:{catalog:metricCatalog,rules:formalRules,...(batch?{rubrics}:{rubric:legacyRubric}),
             plans:selected.map(task=>({caseId:task.id,checks:task.expected.checks,...('contract'in task?{metrics:task.expected.metrics,semantic:task.expected.semantic}:{})}))},
         fixtures:authored?Object.fromEntries(selected.flatMap(c=>{const name=authored.cases.find(d=>d.id===c.id)?.input.fixture?.name;return name?[[name,authored.fixtures[name]]]:[];})):undefined});
     if((snapshot.fact.actual as {leaked:boolean}).leaked)throw Error('Secret in declared configuration; refusing execution');
@@ -158,7 +176,8 @@ export async function runLocal(repo: string, options: {
         dataset: { id: dataset.manifest.id, version: dataset.manifest.version, hash: dataset.hash, subject: 'agent' },
         selection: options.caseId ? 'case' : options.selection ?? 'full', environment: config.environment ?? deps.env?.FLOWMATE_EVAL_ENVIRONMENT ?? process.env.FLOWMATE_EVAL_ENVIRONMENT ?? 'development', userId: deps.env?.FLOWMATE_EVAL_USER_ID ?? process.env.FLOWMATE_EVAL_USER_ID,
         startedAt: new Date().toISOString(), endedAt: null, repeat, executionComplete: false, scoring: 'pending', manualReview: 'none', formalAcceptance: 'not-assessed',
-        scoringConfiguration: { version: dataset.manifest.scoring.version, judgeMode: options.judge, judgeHash: selectedJudge?.configHash ?? null },
+        scoringConfiguration: { version: dataset.manifest.scoring.version, judgeMode: options.judge, judgeHash: selectedJudge?.configHash ?? null,
+            ...(batch?{judge:selectedJudge,rubrics}:{}) },
         trials: [], export: { backend: options.backend, status: options.backend === 'local' ? 'disabled' : 'pending' }
     };
     for (let repetition = 1; repetition <= repeat; repetition++)
@@ -216,10 +235,7 @@ export async function runLocal(repo: string, options: {
         trial.scores = scored.scores;
         trial.judgeCalls = scored.judgeCalls;
         Object.assign(trial, aggregate(trial.scores, result.execution));
-        const scoringErrors = [...new Set(trial.scores.filter(score => score.status === 'ERROR')
-            .sort((a, b) => Number(b.method === 'llm-judge') - Number(a.method === 'llm-judge')).map(score => score.reason))];
-        const reason = trial.reason + (trial.status === 'FAIL' && scoringErrors.length
-            ? `；评分异常：${scoringErrors[0]!.slice(0, 180)}${scoringErrors.length > 1 ? `（共${scoringErrors.length}类，详见报告）` : ''}` : '');
+        const reason = scoringProgressReason(trial);
         notify({ type: 'scoring-end', ...identityProgress, status: trial.status, reason });
         finishTrial();
     }
@@ -229,12 +245,14 @@ export async function runLocal(repo: string, options: {
     const after = codeIdentity(repo);
     if (after.workspaceHash !== code.workspaceHash) {
         report.executionComplete = false;
+        report.sourceInvalidation={reason:'Execution source changed during the experiment',paths:changedSourcePaths(code,after)};
         for (const t of report.trials) {
             t.status = 'ERROR';
             t.reason = 'Execution source changed during the experiment';
         }
     }
     saveReport(file, report);
+    if(report.sourceInvalidation)notify({type:'source-invalidated',datasetId:dataset.manifest.id,executionId,...report.sourceInvalidation});
     const counts: Record<string, number> = {};
     for (const trial of report.trials) counts[trial.status] = (counts[trial.status] ?? 0) + 1;
     notify({ type: 'dataset-end', datasetId: dataset.manifest.id, executionId, reportPath: file,

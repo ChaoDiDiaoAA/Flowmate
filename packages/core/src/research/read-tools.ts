@@ -1,14 +1,14 @@
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
-import { appError, ToolExecutionFailure, SourceSnapshotSchema, ResearchLocatorSchema } from '@flowmate/contracts';
+import { appError, ToolExecutionFailure, SourceSnapshotSchema, ResearchLocatorSchema, EvidenceRefSchema } from '@flowmate/contracts';
 import type { ToolDefinition, ToolCallContext, ProductToolContext, Result } from '@flowmate/contracts';
 import type { ResearchRepository } from './repository.ts';
 import type { FileStore } from '../storage/file-store.ts';
 import type { DocumentRepository, ToolCallRepository } from '../storage/repositories.ts';
-import { researchExcerpt } from './source-text.ts';
+import { researchExcerpt, researchEvidenceRef } from './source-text.ts';
 
 const usageSchema = z.object({ requestId: z.string().max(256).nullable(), credits: z.number().min(0).nullable() }).strict();
-const bodyReceipt = z.object({ source: SourceSnapshotSchema, excerpt: ResearchLocatorSchema, usage: usageSchema }).strict();
+const bodyReceipt = z.object({ source: SourceSnapshotSchema, excerpt: ResearchLocatorSchema, evidenceRef: EvidenceRefSchema.nullable(), usage: usageSchema }).strict();
 const localInput = z.object({ artifactId: z.number().int().positive().nullable(), documentId: z.number().int().positive().nullable() }).strict();
 
 export function createResearchReadTools(options: { research: ResearchRepository; calls: ToolCallRepository; files: FileStore;
@@ -33,11 +33,11 @@ export function createResearchReadTools(options: { research: ResearchRepository;
     if (!saved.ok) throw new ToolExecutionFailure(saved.error);
     const excerpt = researchExcerpt(text, 0, 4000);
     if (!excerpt.ok) throw new ToolExecutionFailure(excerpt.error);
-    return { source: saved.data, excerpt: excerpt.data.excerpt, usage };
+    return { source: saved.data, excerpt: excerpt.data.excerpt, evidenceRef:researchEvidenceRef(binding,saved.data,excerpt.data.excerpt), usage };
   }
   return [
-    { name: 'read_research_local', version: 'p15-v1', label: 'Read selected research material', effect: 'READ', executionMode: 'parallel',
-      description: 'Read exactly one explicitly selected local text/Markdown artifact or parsed document. Set the other ID to null. Saves a body snapshot and returns an exact excerpt.',
+    { name: 'read_research_local', version: 'p15-v2', label: 'Read selected research material', effect: 'READ', executionMode: 'parallel',
+      description: 'Read one selected local artifact or parsed document; set the other ID to null. Saves a body snapshot. In investigation copy the complete returned evidenceRef into claim evidence[].ref; it already has the confirmed plan, original source execution and exact UTF-16 locator. During planning evidenceRef is null; query the saved source after confirmation to get a usable reference.',
       inputSchema: localInput, outputSchema: bodyReceipt,
       execute: async (input, call, context) => {
         const { binding } = identity(call, context);

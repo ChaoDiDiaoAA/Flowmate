@@ -81,3 +81,15 @@ Smoke／Full 始终本地执行，填写 Langfuse 配置不会触发上传。两
 `evidence/` 下每个 Trial 都有独立子目录，多个 Case 和重复尝试不会平铺或共用证据文件。取消、停止不明或运行异常时，终端显示原因及已有报告位置；仍在等待、单题已保存或已有目录均不表示整批评测通过。用 `status` 核对执行与评分状态；`pending` 表示尚未完成评分。
 
 Judge通过Pi SDK provider生成评分。Judge 复用现有 Pi SDK ModelRuntime.completeSimple、模型目录和原生能力解析；模型、凭据与主 Agent 独立，不装配业务工具。FLOWMATE_JUDGE_API 显式优先，未设置时兼容旧 PROVIDER 的 anthropic／openai-compatible 映射，均未设置时默认 openai-completions。默认及本次采用的超时为180000毫秒，可显式覆盖；取消有效，SDK 自动生成重试关闭，每 Trial 最多一次生成。
+
+### 2026-10-14 Smoke 评分协议修订
+
+新生成使用按指标 ID 组织的普通 JSON：results 每项包含 metricId、counts（numerator／denominator／unassessable）及 failures（opportunityIndex／code）。业务、研究使用各自固定模板；研究比例由原始 atoms／links／chains 见证在本地计算。单指标缺项、重复或计数错误仅影响该项；研究见证错误仅影响依赖指标。JSON／根结构不可识别或未知指标身份使本次 Judge 无效。保持分母、范围、来源、计数校验和每 Trial 最多一次生成；旧 r/f、packed 及 HTTP 记录按原格式、原提示身份只读校验。
+
+数值评分复用仓库精确十进制工具，比较合法规范值，1 与 1.00 等价；字段覆盖 quantity、unitPrice、netAmount、taxRate、taxAmount、totalAmount。税率规范值使用百分数，10% 对应 10，不能将 0.1 自动修正。原值、规范值与 present／missing／ambiguous 状态分别保留；原始逗号金额不因替换字符串自动通过，未知格式不猜、缺失不填零。
+
+调查阶段 read／query 返回的完整 evidenceRef 可直接用于 Claim，包含确认计划及原始来源 Run／ToolCall；规划阶段引用为 null，确认后查询取得。工具参数反馈说明必填、允许字段及 UTF-16 要求，模型可在同一预算内纠正并保存 partial 报告。引用与身份仍严格核验。已完整采证且确认无当前 Report 时，本地计算已知缺失；采证不完整保持未知或采证错误。
+
+执行开始冻结文件清单和内容，结束以内存指纹比较；仅 Git 提交／dirty 元数据变化不使执行失效。实际文件变化保留原指标，整组标记失效并保存变化路径与原因；终端一次明确解释最终汇总变化。持久产物继续无 hash／指纹。
+
+先文档、再实现和受控回归；真实 Judge 校准、代表性单题和 Smoke 另行执行并生成新 Execution。协议 ERROR 未解决不进入质量比较，工程夹具通过不证明真实模型遵循率。旧 Execution 保持只读，产品 FAIL、采证缺口与 Judge 故障分别记录。

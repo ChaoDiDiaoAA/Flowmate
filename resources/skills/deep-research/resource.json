@@ -10,12 +10,17 @@
     "证据",
     "报告"
   ],
-  "requires": [{ "kind": "tool", "name": "read_research_local" }],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "read_research_local"
+    }
+  ],
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 2663,
-      "sha256": "3311ecd6c929f0ffb3c846989840ba99046c33ac3d700fb2ba07ef86c0f5a034"
+      "bytes": 3346,
+      "sha256": "6249407320c0c39869dce1b3ec2a5daf9eff7811a03586715cf6bf330bb69ee9"
     }
   ]
 }

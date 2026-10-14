@@ -1,10 +1,11 @@
 import { mkdtempSync } from '../../../tests/support/resources.ts';
 import { expect, test } from 'bun:test';
-import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { codeIdentity } from '../../src/execution/source.ts';
+import * as source from '../../src/execution/source.ts';
 import { hash as contentHash } from '../../src/dataset-loader/local.ts';
 test('source snapshot reconstructs dirty and untracked execution code without environment files', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-source-'));
@@ -39,6 +40,38 @@ test('source snapshot reconstructs dirty and untracked execution code without en
         rmSync(root, { recursive: true, force: true });
     }
 }, 30000);
+
+test('source comparison reports actual added, changed and deleted paths while Git-only commits remain valid',()=>{
+    expect(source.changedSourcePaths).toBeFunction();
+    const root=mkdtempSync(join(tmpdir(),'flowmate-source-diff-'));
+    const git=(...args:string[])=>execFileSync('git',args,{cwd:root,stdio:'pipe'});
+    const commit=()=>git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false','commit','--allow-empty','-qm','fixture');
+    try{
+        git('init');mkdirSync(join(root,'packages/core/src'),{recursive:true});
+        const path='packages/core/src/a.ts';writeFileSync(join(root,path),'initial');git('add','.');commit();
+        const before=codeIdentity(root);commit();
+        expect(source.changedSourcePaths(before,codeIdentity(root))).toEqual([]);
+        writeFileSync(join(root,path),'changed');writeFileSync(join(root,'packages/core/src/b.ts'),'added');
+        expect(source.changedSourcePaths(before,codeIdentity(root))).toEqual([path,'packages/core/src/b.ts']);
+        unlinkSync(join(root,path));const absent=codeIdentity(root);git('add','-A');commit();
+        expect(codeIdentity(root).workspaceHash).toBe(absent.workspaceHash);
+        expect(source.changedSourcePaths(absent,codeIdentity(root))).toEqual([]);
+        expect(JSON.stringify(before)).not.toContain('contentBase64');
+    }finally{rmSync(root,{recursive:true,force:true});}
+},30000);
+
+test('saved actual conditions include decimal scoring and research tool implementations for cross-run comparison',()=>{
+    const root=mkdtempSync(join(tmpdir(),'flowmate-source-conditions-'));
+    const paths=['agent-eval/src/scoring/evaluators/invoice-values.ts','agent-eval/src/scoring/research-frame.ts',
+        'agent-eval/src/scoring/research-judgment.ts','agent-eval/src/adapters/research-integrity.ts','agent-eval/src/artifacts.ts',
+        'packages/shared/src/decimal.ts','packages/core/src/research/source-text.ts'];
+    try{
+        for(const path of paths){mkdirSync(join(root,path,'..'),{recursive:true});writeFileSync(join(root,path),'original implementation');}
+        expect(source.runtimeSourceConditions(root).files.map((f:{path:string})=>f.path)).toEqual(paths);
+        for(const path of paths){const before=source.runtimeSourceConditions(root);writeFileSync(join(root,path),'changed scoring or source rule');
+            expect(source.runtimeSourceConditions(root)).not.toEqual(before);}
+    }finally{rmSync(root,{recursive:true,force:true});}
+});
 
 test('reproduction includes desktop TSX, resource text and SDK patches but excludes quality assets', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-source-assets-'));

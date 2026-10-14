@@ -6,7 +6,10 @@ import { join } from 'node:path';
 import { reportFixture } from '../support/fixtures.ts';
 import { judgeResponse } from '../support/judge-response.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
-import { runJudge } from '../../src/scoring/judges/harness.ts';
+import { hash } from '../../src/dataset-loader/local.ts';
+import { runJudge, runCompactJudge } from '../../src/scoring/judges/harness.ts';
+import { compactScores, compactRubricFor } from '../../src/scoring/judges/compact.ts';
+import { aggregate } from '../../src/scoring/aggregate.ts';
 import { saveReport, readReport } from '../../src/reports/store.ts';
 import { exportEvents } from '../../src/langfuse/export.ts';
 
@@ -18,6 +21,42 @@ function modernReport() {
     report.trials[0]!.metricPlan = [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 }];
     return report;
 }
+
+test('named protocol round-trips valid metrics and individual errors with frozen templates and export diagnostics', async () => {
+    const plan = { contract: 'flowmate-semantic-plan/v1' as const, criteria: [
+        { metricId: 'tool-selection', version: 1, unit: '决策点', denominator: 1, required: true, rule: 'One decision.', evidence: ['original'], trigger: 'started' as const },
+        { metricId: 'tool-arguments', version: 1, unit: '请求', denominator: 1, required: true, rule: 'One request.', evidence: ['original'], trigger: 'started' as const }
+    ] };
+    const call = await runCompactJudge(config(), plan, {}, async () => judgeResponse({ content: [{ type: 'text', text: JSON.stringify({v:1,
+        results:[{metricId:'tool-selection',counts:{numerator:1,denominator:1,unassessable:0},failures:[]},
+            {metricId:'tool-arguments',counts:{numerator:1,denominator:1,unassessable:0},failures:[],hash:'a'.repeat(64)}]}) }], stop_reason:'end_turn' }));
+    const report = modernReport(), trial = report.trials[0]!;
+    trial.semanticPlan = plan; trial.judgeCalls = [call]; trial.scores.push(...compactScores(call));
+    trial.metricPlan!.push(...plan.criteria.map(({metricId,version,unit,denominator})=>({metricId,version,unit,denominator})));
+    Object.assign(trial, aggregate(trial.scores, trial.execution!));
+    const declared=structuredClone(call.configuration);delete declared.rubric;
+    const {configHash:_,...parameters}=declared;declared.configHash=hash(parameters);
+    report.scoringConfiguration.judge=declared;report.scoringConfiguration.rubrics=[compactRubricFor(plan)];
+    const file = join(mkdtempSync(join(tmpdir(), 'judge-metric-report-')), 'report.json');
+    saveReport(file, report);
+    expect(readReport(file).trials[0]!.scores.filter(s=>s.judge)).toMatchObject([{status:'PASS'}, {status:'ERROR'}]);
+    expect(JSON.parse(readReport(file).trials[0]!.judgeCalls[0]!.raw!).results[1]).toHaveProperty('hash','[omitted]');
+    const event = exportEvents(report).find(e=>e.body.name==='Judge · 回答质量')!;
+    expect(event.body.metadata).toHaveProperty('validationErrors.tool-arguments');
+    const forged = structuredClone(report);
+    forged.trials[0]!.judgeCalls[0]!.compact!.validationErrors!['tool-arguments'] = 'changed';
+    expect(()=>saveReport(join(mkdtempSync(join(tmpdir(), 'judge-metric-forged-')), 'report.json'),forged)).toThrow();
+    for(const mutate of [
+        (r:any)=>{r.scoringConfiguration.judge.model='different-model';},
+        (r:any)=>{r.scoringConfiguration.judge.apiKey='must-not-be-stored';},
+        (r:any)=>{r.scoringConfiguration.rubrics[0].prompt='different template';},
+        (r:any)=>{r.scoringConfiguration.rubrics.push(r.scoringConfiguration.rubrics[0]);},
+        (r:any)=>{delete r.trials[0].judgeCalls[0].compact.format;}
+    ]){
+        const changed=structuredClone(report);mutate(changed);
+        expect(()=>saveReport(join(mkdtempSync(join(tmpdir(), 'judge-freeze-forged-')), 'report.json'),changed)).toThrow();
+    }
+});
 
 test('public v1 artifacts round-trip SDK API, native capabilities and normalized stop reasons without runtime or credentials', async () => {
     const report = modernReport(), call = await sdkCall({ input_tokens: 12, output_tokens: 8, cache_read_input_tokens: 3, cache_creation_input_tokens: 2 });

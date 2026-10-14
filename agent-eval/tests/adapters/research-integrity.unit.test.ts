@@ -60,6 +60,15 @@ test('independent research structure binds child source receipts, exact declared
     expect(JSON.stringify(result.actual)).not.toContain('Claim Precision');
 });
 
+test('new plan-bound read receipts preserve the original source integrity checks and accept planning null references',()=>{
+    for(const reference of ['planning','researching']as const){const f=fixture();
+        const calls=(f.tools.actual as {calls:Array<{tool:ToolCallSnapshot}>}).calls;
+        Object.assign(calls.find(c=>c.tool.toolName==='read_research_local')!.tool.result!.data!,
+            {evidenceRef:reference==='planning'?null:f.claim.evidence[0]!.ref});
+        expect(inspect(f)).toMatchObject({present:true,actual:{valid:true,issues:[]}});
+    }
+});
+
 test('source identity, declared bytes, quote offsets and surrogate boundaries are checked independently of supported/full', () => {
     for (const [change, expected] of [
         [(f: ReturnType<typeof fixture>) => { f.claim.evidence[0]!.ref.runId = 999; }, 'reference-origin'],

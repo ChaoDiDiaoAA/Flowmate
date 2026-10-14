@@ -141,5 +141,5 @@
       "reason": "The independently authored observation omits or contradicts a required source condition, link or complete chain."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":82,\"correct\":0,\"needsCitation\":true,\"covered\":0,\"gold\":0,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":0}],\"chains\":[]}}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"DR01\",\"counts\":null,\"failures\":[]}],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":82,\"correct\":0,\"needsCitation\":true,\"covered\":0,\"gold\":0,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":0}],\"chains\":[]}}"
 }

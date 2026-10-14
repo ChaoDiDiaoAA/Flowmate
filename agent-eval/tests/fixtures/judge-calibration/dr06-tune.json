@@ -334,5 +334,5 @@
       "reason": "The independently authored observation omits or contradicts a required source condition, link or complete chain."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":17,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":2,\"matchUncertain\":false},{\"block\":1,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":3,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1},{\"atom\":0,\"state\":1},{\"atom\":1,\"state\":1},{\"atom\":1,\"state\":1}],\"chains\":[0]}}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"DR06\",\"counts\":null,\"failures\":[]}],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":17,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":2,\"matchUncertain\":false},{\"block\":1,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":3,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1},{\"atom\":0,\"state\":1},{\"atom\":1,\"state\":1},{\"atom\":1,\"state\":1}],\"chains\":[0]}}"
 }

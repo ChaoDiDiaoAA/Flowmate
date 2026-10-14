@@ -4,6 +4,17 @@ import { registerSecrets } from '../../src/execution/evidence-safety.ts';
 
 afterEach(() => { jest.useRealTimers(); });
 
+test('final invalidation explains the earlier per-Trial results once and keeps the report path',()=>{
+    const lines:string[]=[],reporter=cli.createProgressReporter(line=>lines.push(line));
+    reporter.onProgress({type:'source-invalidated',datasetId:'flowmate-agent-v1',executionId:'synthetic',
+        reason:'Execution source changed during the experiment',paths:['packages/core/src/example.ts']});
+    reporter.onProgress({type:'dataset-end',datasetId:'flowmate-agent-v1',executionId:'synthetic',reportPath:'D:/synthetic/report.json',stopped:false,counts:{ERROR:10}});
+    expect(lines.join('')).toContain('⚠ [业务]本组执行无效');
+    expect(lines.join('')).toContain('代码条件变化');expect(lines.join('')).toContain('此前逐题结果仅供诊断');
+    expect(lines.filter(line=>line.includes('本组执行无效'))).toHaveLength(1);
+    expect(lines.at(-1)).toContain('D:/synthetic/report.json');reporter.close();
+});
+
 test('terminal progress reports actual stages immediately and waiting every sixty seconds', () => {
     expect(cli.createProgressReporter).toBeFunction();
     jest.useFakeTimers();

@@ -1,4 +1,4 @@
-import { judgeResponse } from '../support/judge-response.ts';
+import { judgeResponse, namedJudgment } from '../support/judge-response.ts';
 import {test,expect} from 'bun:test';
 import {deriveResearchCounts} from '../../src/scoring/research-judgment.ts';
 import type {ResearchFrame} from '../../src/scoring/research-frame.ts';
@@ -7,6 +7,14 @@ import {runCompactJudge} from '../../src/scoring/judges/harness.ts';
 import {compactScores,parseCompactJudgment} from '../../src/scoring/judges/compact.ts';
 import {judgeConfig} from '../../src/scoring/judges/client.ts';
 import {formalMetric} from '../../src/scoring/catalog.ts';
+import {evaluateSemantic} from '../../src/scoring/evaluators/semantic.ts';
+import {task,observed,reportFixture} from '../support/fixtures.ts';
+import {saveReport,readReport,comparison} from '../../src/reports/store.ts';
+import {aggregate} from '../../src/scoring/aggregate.ts';
+import {mkdtempSync} from '../../../tests/support/resources.ts';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {hash} from '../../src/dataset-loader/local.ts';
 
 function fixture(){
  const texts=['Alpha owns Beta.','Beta follows Gamma.'],gold=texts.map((text,i)=>({id:'hop-'+i,text,required:true,acceptable:[text],conditions:[],entities:['Beta'],
@@ -61,7 +69,7 @@ const config=judgeConfig({FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE
 const packedPlan={contract:'flowmate-semantic-plan/v1' as const,
  criteria:['tool-selection','DR01','DR02','DR04','DR05','DR06'].map(metricId=>({metricId,version:1,unit:formalMetric(metricId).unit,denominator:metricId==='tool-selection'||metricId==='DR06'?1:metricId==='DR02'?2:null,
   required:true,rule:'Independently evaluate this criterion against the declared original frame, without trusting product flags.',evidence:['research-frame','gold-research'],trigger:'started' as const}))};
-function rawProof(proof:PackedJudgment){return JSON.stringify({v:1,r:packedPlan.criteria.map(c=>c.metricId==='tool-selection'?[1,1,0]:null),f:[],research:{atoms:proof.atoms,links:proof.links,chains:proof.chains}});}
+function rawProof(proof:PackedJudgment){return namedJudgment(packedPlan,{v:1,r:packedPlan.criteria.map(c=>c.metricId==='tool-selection'?[1,1,0]:null),f:[],research:{atoms:proof.atoms,links:proof.links,chains:proof.chains}});}
 
 test('plain research witnesses exceed legacy fact, block, citation and span limits without copying Judge ratios',async()=>{
  const {frame,proof}=fixture();
@@ -98,8 +106,84 @@ test('larger structural witness bounds do not impose an artificial output budget
 });
 test('unavailable semantic witnesses stays unjudgeable while an independently invalid observed citation still fails',async()=>{
  const{frame}=fixture();frame.links[0]!.valid=false;
- const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async()=>judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:packedPlan.criteria.map(c=>c.metricId==='tool-selection'?[1,1,0]:null),f:[],research:{atoms:[],links:[],chains:[],unavailable:true}})},finish_reason:'stop'}]}));
+ const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async()=>judgeResponse({choices:[{message:{content:namedJudgment(packedPlan,{v:1,r:packedPlan.criteria.map(c=>c.metricId==='tool-selection'?[1,1,0]:null),f:[],research:{atoms:[],links:[],chains:[],unavailable:true}})},finish_reason:'stop'}]}));
  expect(call.error).toBeNull();const scores=compactScores(call);
  expect(scores.find(s=>s.metricId==='DR01')).toMatchObject({status:'UNJUDGEABLE',value:null});
  expect(scores.find(s=>s.metricId==='DR04')).toMatchObject({status:'FAIL',value:null,statistics:{denominator:null,missing:null}});
+});
+
+test('malformed research witnesses affect research metrics while a valid ordinary metric remains measured', async()=>{
+ const {frame,proof}=fixture();proof.chains=[];
+ const call=await runCompactJudge(config,packedPlan,{researchFrame:frame},async()=>judgeResponse({choices:[{message:{content:rawProof(proof)},finish_reason:'stop'}]}));
+ expect(call.error).toBeNull();
+ expect(compactScores(call)[0]).toMatchObject({status:'PASS',value:1});
+ expect(compactScores(call).slice(1).every(s=>s.status==='ERROR'&&s.value===null)).toBe(true);
+});
+
+test('complete evidence of no Report yields local known omissions without a Judge generation', async()=>{
+ const {frame}=fixture(),result=observed();
+ result.status='failed';result.endpointReached=false;
+ result.evidence.research={present:true,actual:null,source:'Original query confirms no research task or Report'};
+ const item={...task,contract:'flowmate-agent-case/v2' as const,expected:{...task.expected,metrics:[],research:frame.gold}};
+ const plan={...packedPlan,criteria:packedPlan.criteria.filter(c=>c.metricId.startsWith('DR'))};let requests=0;
+ const measured=await evaluateSemantic({task:item,result,projected:result.input,semanticPlan:plan,judge:config,
+  fetcher:async()=>{requests++;throw Error('must derive empty Report locally');}});
+ expect(requests).toBe(0);expect(measured.judgeCalls).toHaveLength(0);
+ expect(measured.scores.find(s=>s.metricId==='DR02')).toMatchObject({method:'deterministic',status:'FAIL',statistics:{numerator:0,denominator:2,missing:0}});
+ expect(measured.scores.find(s=>s.metricId==='DR06')).toMatchObject({method:'deterministic',status:'FAIL',statistics:{numerator:0,denominator:1,missing:0}});
+ expect(measured.scores.find(s=>s.metricId==='DR01')).toMatchObject({status:'UNJUDGEABLE',value:null});
+ result.evidence.research={present:false,actual:null,source:'Collection unavailable'};
+ const unknown=await evaluateSemantic({task:item,result,projected:result.input,semanticPlan:plan,judge:null});
+ expect(unknown.scores.every(s=>s.status!=='PASS'&&s.status!=='FAIL')).toBe(true);
+});
+
+test('saved local no-Report scores reject forged counts and keep semantic-plan comparison independent of derivation method',async()=>{
+ const {frame}=fixture(),report=reportFixture();report.contract='flowmate-agent-run/v2';
+ const trial=report.trials[0]!,result=trial.execution!;
+ result.evidence.research={present:true,actual:null,source:'Original query confirms no Report'};
+ const item={...task,contract:'flowmate-agent-case/v2' as const,expected:{...task.expected,metrics:[],research:frame.gold}};
+ const plan={...packedPlan,criteria:packedPlan.criteria.filter(c=>['DR02','DR06'].includes(c.metricId))};
+ const scored=await evaluateSemantic({task:item,result,projected:result.input,semanticPlan:plan,judge:null});
+ trial.semanticPlan=plan;trial.scores.push(...scored.scores);trial.metricPlan=[{metricId:'task-success',version:1,unit:'Trial',denominator:1},
+  ...plan.criteria.map(({metricId,version,unit,denominator})=>({metricId,version,unit,denominator}))];
+ Object.assign(trial,aggregate(trial.scores,result));
+ const file=join(mkdtempSync(join(tmpdir(),'local-research-score-')),'report.json');saveReport(file,report);
+ expect(readReport(file).trials[0]!.scores.find(s=>s.metricId==='DR02')).toMatchObject({status:'FAIL',value:0});
+ const forged=structuredClone(report),score=forged.trials[0]!.scores.find(s=>s.metricId==='DR02')!;
+ score.statistics!.numerator=1;score.value=0.5;
+ expect(()=>saveReport(join(mkdtempSync(join(tmpdir(),'forged-local-research-')),'report.json'),forged)).toThrow();
+ for(const mutate of [
+  (r:typeof report)=>{r.trials[0]!.scores.find(s=>s.metricId==='DR02')!.required=false;},
+  (r:typeof report)=>{r.trials[0]!.scores.find(s=>s.metricId==='DR02')!.version=2;},
+  (r:typeof report)=>{r.trials[0]!.semanticPlan!.criteria[0]!.denominator=3;r.trials[0]!.metricPlan!.find(m=>m.metricId==='DR02')!.denominator=3;},
+  (r:typeof report)=>{r.trials[0]!.semanticPlan!.criteria[0]!.trigger='completed-endpoint';r.trials[0]!.execution!.status='failed';}
+ ]){const changed=structuredClone(report);mutate(changed);
+  expect(()=>{saveReport(join(mkdtempSync(join(tmpdir(),'forged-local-plan-')),'report.json'),changed);}).toThrow();}
+ const alternate=structuredClone(report);alternate.trials[0]!.scores.find(s=>s.metricId==='DR02')!.method='llm-judge';
+ expect(()=>comparison(report,alternate)).not.toThrow();
+});
+
+test('saved no-Report proof remains readable when collected sources lose private digests on disk',async()=>{
+ const {frame}=fixture(),report=reportFixture();report.contract='flowmate-agent-run/v2';
+ const trial=report.trials[0]!,result=trial.execution!,at=report.startedAt,text='Independent synthetic source.';
+ const policy={web:false,domains:[],artifactIds:[3],documentIds:[]};
+ result.evidence.research={present:true,source:'Complete original research pagination',actual:{
+  task:{researchId:1,sessionId:2,title:'Synthetic',sourcePolicy:policy,status:'failed',currentPlanId:null,
+   planConfirmed:false,currentRunId:4,currentReportId:null,createdAt:at,updatedAt:at},
+  plans:[],discoveredPlanIds:[],claims:[],reports:[],reportCount:0,
+  sources:[{sourceSnapshotId:7,researchId:1,runId:4,toolCallId:21,createdAt:at,kind:'local',address:'artifact:3',title:'Synthetic',
+   artifactId:3,documentId:null,fetchedAt:at,publishedAt:null,contentHash:hash(text),relativePath:'artifacts/research/1/'+hash(text)+'.txt',
+   bytes:Buffer.byteLength(text),characters:text.length,truncated:false}],
+  sourceTexts:[{sourceSnapshotId:7,runId:4,toolCallId:21,text,acquisition:'controller-query',modelUse:'requires-original-tool-and-context-evidence'}]}};
+ for(const [key,actual]of Object.entries({runs:[],'tool-evidence':{calls:[]},'material-registration':[]}))
+  result.evidence[key]={present:true,actual,source:'Complete original collection'};
+ const item={...task,contract:'flowmate-agent-case/v2' as const,expected:{...task.expected,metrics:[],research:frame.gold}};
+ const plan={...packedPlan,criteria:packedPlan.criteria.filter(c=>c.metricId==='DR02')};
+ const measured=await evaluateSemantic({task:item,result,projected:result.input,semanticPlan:plan,judge:null});
+ expect(measured.scores[0]).toMatchObject({method:'deterministic',status:'FAIL'});
+ trial.semanticPlan=plan;trial.scores.push(...measured.scores);trial.metricPlan=[{metricId:'task-success',version:1,unit:'Trial',denominator:1},
+  ...plan.criteria.map(({metricId,version,unit,denominator})=>({metricId,version,unit,denominator}))];
+ Object.assign(trial,aggregate(trial.scores,result));
+ const file=join(mkdtempSync(join(tmpdir(),'local-research-sources-')),'report.json');saveReport(file,report);
+ expect(readReport(file).trials[0]!.scores.find(s=>s.metricId==='DR02')).toMatchObject({status:'FAIL',value:0});
 });

@@ -1,4 +1,12 @@
 // Feed controlled provider responses through the real Pi streaming adapters.
+/** Translate historical reference fixtures, never model responses, to the current generation contract. */
+export function namedJudgment(plan: {criteria: readonly {metricId:string}[]}, original: string | {v:number;r:unknown[];f:number[][];research?:unknown}): string {
+    const value = typeof original==='string' ? JSON.parse(original) : original;
+    return JSON.stringify({v:1,results:value.r.map((row:number[]|null,index:number)=>({metricId:plan.criteria[index]!.metricId,
+        counts:plan.criteria[index]!.metricId.startsWith('DR')||row===null?null:{numerator:row[0],denominator:row[1],unassessable:row[2]},
+        failures:value.f.filter((f:number[])=>f[0]===index).map((f:number[])=>({opportunityIndex:f[1],code:f[2]}))})),
+        ...(value.research?{research:value.research}:{})});
+}
 export function judgeResponse(body: Record<string, any>): Response {
     const events: string[] = [];
     const emit = (data: unknown, event?: string) => events.push(`${event ? `event: ${event}\n` : ''}data: ${JSON.stringify(data)}\n\n`);

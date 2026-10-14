@@ -61,7 +61,7 @@ export function exportEvents(report: LocalReport): Event[] {
             executionId: report.executionId, trialId: trial.trialId, dataset: { id: report.dataset.id, version: report.dataset.version, hash: report.dataset.hash },
             caseId: trial.caseId, caseVersion: trial.caseVersion, caseHash: trial.caseHash, partition: trial.partition, category: trial.category,
             repetition: trial.repetition, status: trial.status, contract: report.contract, scoringVersion: report.scoringConfiguration.version,
-            judgeHash: report.scoringConfiguration.judgeHash, agent };
+            judgeHash: report.scoringConfiguration.judgeHash, sourceInvalidation:report.sourceInvalidation, agent };
         add('trace-create', { id: trial.traceId, name: 'Agent · ' + trial.caseName, timestamp: execution?.startedAt ?? report.startedAt, environment: report.environment,
             sessionId: report.executionId, input: { caseId: trial.caseId, caseVersion: trial.caseVersion },
             output: { status: trial.status, answerAvailable: execution?.answer !== null && execution?.answer !== undefined,
@@ -95,6 +95,7 @@ export function exportEvents(report: LocalReport): Event[] {
                 metadata: { callId: call.callId, method: 'llm-judge', configurationHash: call.configuration.configHash, attempts: call.attempts,
                     responseComplete: call.responseComplete, finishReason: call.finishReason, stopReason: call.stopReason, rawStopReason: call.rawStopReason,
                     api: call.configuration.api, sdk: call.configuration.sdk, usageSource: call.usageSource, errorOccurred: call.error !== null,
+                    judgmentFormat: call.compact?.format, validationErrors: call.compact?.validationErrors,
                     modelCapabilities:call.configuration.modelCapabilities,
                     rubricId: call.configuration.rubric?.id, rubricVersion: call.configuration.rubric?.version, rubricHash: call.configuration.rubric?.hash } });
         }

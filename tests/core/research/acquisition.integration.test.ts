@@ -20,6 +20,9 @@ it('captures selected local material via SDK, Executor and Recorder, preserving 
   expect(source.contentHash).toBe(createHash('sha256').update(body).digest('hex'));
   expect(readFileSync(join(f.paths.root, source.relativePath), 'utf8')).toBe(body);
   expect(source.characters).toBe(body.length); expect(source.truncated).toBe(false);
+  const receipt=JSON.parse(String(f.requests[3]!.messages.filter(m=>m.role==='tool').at(-1)!.content));
+  expect(receipt.evidenceRef).toMatchObject({researchId:task.researchId,planId:plan.planId,revision:plan.revision,
+    runId:source.runId,toolCallId:source.toolCallId,sourceSnapshotId:source.sourceSnapshotId,locator:{start:0,end:body.length,quote:body}});
   expect(JSON.stringify(f.requests[3]!.messages)).toContain(body);
   for (const request of f.requests) {
     expect(request.tools?.map(tool => tool.function.name)).not.toContain('search_research_sources');

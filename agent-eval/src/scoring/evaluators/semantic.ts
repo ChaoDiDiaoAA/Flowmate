@@ -4,11 +4,14 @@ import { formalMetric } from '../catalog.ts';
 import { runCompactJudge } from '../judges/harness.ts';
 import { compactScores, type CompactPlan } from '../judges/compact.ts';
 import {buildResearchFrame} from '../research-frame.ts';
+import {unavailableResearchCounts} from '../research-judgment.ts';
 
 export async function evaluateSemantic(context: EvaluationContext): Promise<{ scores: EvaluationScore[]; judgeCalls: JudgeCall[] }> {
     const { task, result } = context, plan = context.semanticPlan ?? ('contract' in task ? task.expected.semantic : undefined);
     if (!plan) return { scores: [], judgeCalls: [] };
     const researchFrame=plan.criteria.some(c=>c.metricId.startsWith('DR'))?buildResearchFrame(context):undefined;
+    const emptyResearch = researchFrame?.complete && researchFrame.reportId===null && !researchFrame.blocks.length && !researchFrame.links.length &&
+        researchFrame.gold.status==='verified' ? unavailableResearchCounts(researchFrame) : undefined;
     const reference = (actual: { status: string } | undefined): EvidenceFact => ({ present: actual?.status === 'verified', actual: actual ?? null,
         source: 'Declared independent Case reference; quality side only' });
     const facts: Record<string, EvidenceFact> = { ...result.evidence, 'gold-reference': reference(task.expected.reference),
@@ -26,6 +29,7 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
             facts[key] = { present: false, actual: null, source: 'Original evidence unavailable' };
     }
     const eligible: CompactPlan['criteria'] = [], scores: EvaluationScore[] = [];
+    let localFrameSaved=false;
     for (const criterion of plan.criteria) {
         const metric = formalMetric(criterion.metricId), required = criterion.required || !!context.semanticRequired;
         const base: EvaluationScore = { metricId: metric.id, name: metric.name, version: metric.version, method: 'llm-judge', required,
@@ -34,6 +38,16 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
         if (result.error?.infrastructure) { base.status = 'ERROR'; base.reason = result.error.message; }
         else if (!result.started || criterion.trigger === 'completed-endpoint' && (result.status !== 'completed' || !result.endpointReached))
             base.reason = '未满足事前冻结的评分触发条件';
+        else if (emptyResearch?.[criterion.metricId]) {
+            const measured = emptyResearch[criterion.metricId]!, row = measured.row;
+            base.method = 'deterministic'; base.statistics = measured.statistics;
+            base.value = row && row[1]>0 && row[2]===0 ? row[0]/row[1] : null;
+            base.status = measured.knownFailure ? 'FAIL' : base.value!==null ? 'PASS' : 'UNJUDGEABLE';
+            base.reason = '完整采证确认未保存研究报告；已知缺失按本地规则计算';
+            base.evidence = ['research','gold-research'];
+            base.actual = {row,opportunities:measured.opportunities,locallyDerived:true,...(localFrameSaved?{}:{researchFrame})};
+            localFrameSaved=true;
+        }
         else if (!context.judge || context.signal?.aborted) base.reason = context.signal?.aborted ? 'Judge 调用前已取消' : 'Judge 未配置或关闭';
         else if (criterion.evidence.some(key => ['gold-reference', 'gold-research','gold-materials'].includes(key) && !facts[key]!.present) ||
             !criterion.evidence.some(key => !key.startsWith('gold-')&&(facts[key]!.present || facts[key]!.actual !== null))) {
@@ -52,7 +66,7 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
             requiredSkills:task.expected.requiredSkills, forbiddenSkills:task.expected.forbiddenSkills, requiredSubagentRoles:task.expected.requiredSubagentRoles,
             requiredResearchDimensions:task.expected.requiredResearchDimensions,
             turnRule:'Judge only actual submitted/accepted/consumed turns. Planned future text is not an executed user instruction.' },
-        facts: Object.fromEntries(selected.map(key => [key, facts[key]])),...(researchFrame?{researchFrame}:{})
+        facts: Object.fromEntries(selected.map(key => [key, facts[key]])),...(eligible.some(c=>c.metricId.startsWith('DR'))?{researchFrame}:{})
     }, context.fetcher, context.signal);
     const measured = compactScores(call);
     return { scores: scores.map(score => measured.find(m => m.metricId === score.metricId) ?? score), judgeCalls: [call] };

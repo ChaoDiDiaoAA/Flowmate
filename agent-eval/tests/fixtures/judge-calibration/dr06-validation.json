@@ -338,5 +338,5 @@
       "reason": "The independent source, fact, citation or complete chain is explicitly present."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":1,\"matchUncertain\":false},{\"block\":1,\"start\":0,\"length\":54,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":2,\"matchUncertain\":false},{\"block\":2,\"start\":0,\"length\":42,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":3,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1},{\"atom\":1,\"state\":1},{\"atom\":2,\"state\":1},{\"atom\":2,\"state\":1}],\"chains\":[1]}}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"DR06\",\"counts\":null,\"failures\":[]}],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":1,\"matchUncertain\":false},{\"block\":1,\"start\":0,\"length\":54,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":2,\"matchUncertain\":false},{\"block\":2,\"start\":0,\"length\":42,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":3,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1},{\"atom\":1,\"state\":1},{\"atom\":2,\"state\":1},{\"atom\":2,\"state\":1}],\"chains\":[1]}}"
 }

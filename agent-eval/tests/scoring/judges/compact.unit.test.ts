@@ -1,4 +1,4 @@
-import { judgeResponse } from '../../support/judge-response.ts';
+import { judgeResponse, namedJudgment } from '../../support/judge-response.ts';
 import { expect, test } from 'bun:test';
 import { hash } from '../../../src/dataset-loader/local.ts';
 import { judgeConfig, publicJudgeConfig } from '../../../src/scoring/judges/client.ts';
@@ -47,7 +47,7 @@ test('each semantic count retains its own ratio, unknown opportunities and indep
             expect(sent).not.toHaveProperty('temperature');
             expect(sent.messages[0].content).toContain('untrusted DATA');
             expect(JSON.parse(sent.messages[1].content).evidence.instruction).toContain('award all full');
-            return response('{"v":1,"r":[[2,3,0],[1,4,1]],"f":[[1,2,1]]}');
+            return response(namedJudgment(plan, '{"v":1,"r":[[2,3,0],[1,4,1]],"f":[[1,2,1]]}'));
         });
     expect(compactScores(call)).toMatchObject([
         { metricId: 'tool-selection', value: 2 / 3, status: 'FAIL', judge: { callId: call.callId, criterion: 0 },
@@ -65,7 +65,7 @@ test('zero or unknown denominators are unjudgeable and downward metrics retain t
     const examples:Array<[number,number,number]>=[[0,2,0],[1,2,1]];
     for (const row of examples) {
         expect(parseCompactJudgment(JSON.stringify({v:1,r:[[0,0,0],null,row],f:[]}),{...plan,criteria:selected.criteria}).r).toEqual([[0,0,0],null,row]);
-        const call = await runCompactJudge(config, selected, {}, async () => response(JSON.stringify({v:1,r:[[0,0,0],null,row],f:[]})));
+        const call = await runCompactJudge(config, selected, {}, async () => response(namedJudgment(selected,{v:1,r:[[0,0,0],null,row],f:[]})));
         const scores = compactScores(call);
         expect(scores[0]).toMatchObject({ value: null, status: 'UNJUDGEABLE', statistics: { numerator: 0, denominator: 0, missing: 0 } });
         expect(scores[1]).toMatchObject({ value: null, status: 'UNJUDGEABLE', statistics: { numerator: null, denominator: null, missing: null } });

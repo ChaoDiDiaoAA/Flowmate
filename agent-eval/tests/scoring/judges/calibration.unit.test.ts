@@ -1,4 +1,4 @@
-import { judgeResponse } from '../../support/judge-response.ts';
+import { judgeResponse, namedJudgment } from '../../support/judge-response.ts';
 import { withoutHashes } from '../../../src/artifacts.ts';
 import {publicVersions} from '../../../src/reports/files.ts';
 import {test,expect} from 'bun:test';
@@ -8,7 +8,7 @@ import {join} from 'node:path';
 import {calibrateJudge,loadCalibration} from '../../../src/scoring/judges/calibration.ts';
 
 const env={FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'independent-fixture-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'};
-const reply=(n:number,finish='stop')=>judgeResponse({model:'llama-3.3-70b-versatile',choices:[{message:{content:JSON.stringify({v:1,r:[[n,1,0]],f:n?[]:[[0,0,1]]})},finish_reason:finish}],usage:{prompt_tokens:10,completion_tokens:15}});
+const reply=(n:number,finish='stop')=>judgeResponse({model:'llama-3.3-70b-versatile',choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-arguments'}]},{v:1,r:[[n,1,0]],f:n?[]:[[0,0,1]]})},finish_reason:finish}],usage:{prompt_tokens:10,completion_tokens:15}});
 function fixture(){
  const root=mkdtempSync(join(tmpdir(),'flowmate-calibration-')),directory=join(root,'references');mkdirSync(directory);
  const criterion={metricId:'tool-arguments',version:1,unit:'请求',denominator:1,required:true,rule:'Check original requested object against the independently authorized object.',evidence:['original'],trigger:'started'};
@@ -108,7 +108,7 @@ test('Anthropic calibration reuses native SDK capabilities for its single-attemp
   const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'anthropic-capability'},{env:{...env,FLOWMATE_JUDGE_API:'anthropic-messages',FLOWMATE_JUDGE_PROVIDER:'anthropic',FLOWMATE_JUDGE_MODEL:'claude-haiku-4-5'},fetcher:async(_,init)=>{
    if(init.method==='GET'){metadataCalls++;return new Response(JSON.stringify({id:'canonical-fixture',max_tokens:64000}));}
    generations++;const body=JSON.parse(String(init.body));expect(body.max_tokens).toBe(64000);expect(body).not.toHaveProperty('temperature');
-   return judgeResponse({content:[{type:'text',text:JSON.stringify({v:1,r:[[generations===1?0:1,1,0]],f:[]})}],stop_reason:'end_turn',usage:{output_tokens:15}});
+   return judgeResponse({content:[{type:'text',text:namedJudgment({criteria:[{metricId:'tool-arguments'}]},{v:1,r:[[generations===1?0:1,1,0]],f:[]})}],stop_reason:'end_turn',usage:{output_tokens:15}});
   }});
   expect(metadataCalls).toBe(0);expect(generations).toBe(2);expect(result.report.samples.every(s=>s.call?.attempts===1)).toBe(true);
   expect(result.report.configuration.modelCapabilities).toMatchObject({contextWindow:200000,maxTokens:64000,source:'pi-sdk-model-catalog'});

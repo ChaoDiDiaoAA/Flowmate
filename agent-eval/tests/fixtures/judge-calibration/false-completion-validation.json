@@ -46,5 +46,5 @@
       "reason": "Original evidence confirms no completion declaration; the rate denominator is zero."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[0,0,0]],\"f\":[]}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"false-completion\",\"counts\":{\"numerator\":0,\"denominator\":0,\"unassessable\":0},\"failures\":[]}]}"
 }

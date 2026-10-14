@@ -19,7 +19,7 @@ function versions(value:any,publish:boolean,parentKey=''):any {
     if(!value||typeof value!=='object')return value;
     const benchmark=benchmarkContract.test(value.contract??'')||typeof value.metricId==='string'||'judgeMode'in value||
         typeof value.id==='string'&&typeof value.group==='string'&&typeof value.unit==='string'&&typeof value.formula==='string'||
-        ['dataset','rubric'].includes(parentKey)||['semantic-batch','answer-relevance'].includes(value.id);
+        ['dataset','rubric','rubrics'].includes(parentKey)||['semantic-batch','answer-relevance'].includes(value.id);
     const opaque=new Set(['actual','expected','evidence','input','output','content','artifacts','gold','fixtures','setup','steps']);
     return Object.fromEntries(Object.entries(value).map(([key,v])=>{
         if(key==='protocolVersion'&&/^flowmate-judge\/v[12]$/.test(String(v)))return[key,publish?'flowmate-judge/v1':'flowmate-judge/v2'];

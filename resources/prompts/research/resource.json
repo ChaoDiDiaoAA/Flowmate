@@ -10,12 +10,17 @@
     "证据",
     "报告"
   ],
-  "requires": [{ "kind": "tool", "name": "read_research_local" }],
+  "requires": [
+    {
+      "kind": "tool",
+      "name": "read_research_local"
+    }
+  ],
   "files": [
     {
       "path": "prompt.md",
-      "bytes": 1024,
-      "sha256": "976aae108a53afe3beebafd87d15aea25db7230e412c781a6d6f4ea1b463ef40"
+      "bytes": 1348,
+      "sha256": "f83afe79172db968ce6b79b16996d24068bc3bb193e676aed460a62e2b0bb056"
     }
   ]
 }

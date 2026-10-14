@@ -19,7 +19,7 @@ import { executeCase } from '../../src/execution/execute-case.ts';
 import { metricCatalog } from '../../src/scoring/catalog.ts';
 import { evaluateAll } from '../../src/scoring/evaluate.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
-import { judgeResponse } from '../support/judge-response.ts';
+import { judgeResponse,namedJudgment } from '../support/judge-response.ts';
 import { caseV2Schema } from '../../src/dataset-loader/schema.ts';
 import { task } from '../support/fixtures.ts';
 import { fixtureRepo } from '../support/fixtures.ts';
@@ -109,7 +109,7 @@ for (const isolation of [undefined] as const) test
         let researchJudgeRequests=0;
         const scoredResearch=await evaluateAll({task:researchTask,result,projected:trial.input,judge:judgeConfig({FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
             FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'independent-fixture-key'}),fetcher:async()=>{
-                researchJudgeRequests++;return judgeResponse({choices:[{message:{content:JSON.stringify({v:1,r:drIds.map(()=>null),f:[],research:{atoms:[{block:0,start:0,length:frame.blocks[0]!.text.length,correct:1,needsCitation:true,covered:1,gold:1,matchUncertain:false}],links:[{atom:0,state:1}],chains:[]}})},finish_reason:'stop'}]});
+                researchJudgeRequests++;return judgeResponse({choices:[{message:{content:namedJudgment(researchTask.expected.semantic!,{v:1,r:drIds.map(()=>null),f:[],research:{atoms:[{block:0,start:0,length:frame.blocks[0]!.text.length,correct:1,needsCitation:true,covered:1,gold:1,matchUncertain:false}],links:[{atom:0,state:1}],chains:[]}})},finish_reason:'stop'}]});
             }},[]);
         expect(researchJudgeRequests,JSON.stringify(scoredResearch.scores.filter(s=>drIds.includes(s.metricId)))).toBe(1);expect(scoredResearch.judgeCalls[0]!.error).toBeNull();
         expect(scoredResearch.scores.filter(s=>s.metricId.startsWith('DR')&&s.metricId!=='DR06').map(s=>s.value)).toEqual([1,1,1,1,1]);

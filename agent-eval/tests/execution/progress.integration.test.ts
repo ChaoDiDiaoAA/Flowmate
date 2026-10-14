@@ -104,7 +104,9 @@ test.each([false, true])('a hard FAIL also exposes the concurrent Judge error wh
     const progress = events.find(event => event.type === 'scoring-end')!;
     expect(progress.status).toBe('FAIL');
     expect(progress.reason).toContain('评分异常');
-    expect(progress.reason).toContain(error.reason);
+    expect(progress.reason).toContain('Judge 调用失败');
+    expect(progress.reason).toContain('详见报告');
+    expect(progress.reason).not.toContain('controlled judge outage');
     expect(readReport(run.file).trials[0]!.reason).toBe(trial.reason);
 });
 

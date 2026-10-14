@@ -46,5 +46,5 @@
       "reason": "The necessary original wire request is unavailable; the one coverage opportunity remains unknown."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[0,1,1]],\"f\":[]}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"context-coverage\",\"counts\":{\"numerator\":0,\"denominator\":1,\"unassessable\":1},\"failures\":[]}]}"
 }

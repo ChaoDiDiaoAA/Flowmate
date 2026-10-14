@@ -6,7 +6,7 @@ import { hash } from '../../src/dataset-loader/local.ts';
 import type { EvaluationContext } from '../../src/scoring/types.ts';
 import { evaluateSemantic } from '../../src/scoring/evaluators/semantic.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
-import { judgeResponse } from '../support/judge-response.ts';
+import { judgeResponse, namedJudgment } from '../support/judge-response.ts';
 import { formalFixture } from '../support/formal.ts';
 import { fixtureRepo } from '../support/fixtures.ts';
 import { compileFormalSemanticPlan } from '../../src/scoring/formal-rules.ts';
@@ -252,7 +252,7 @@ test('the per-case answer hint and functional criteria reach only the Judge', as
         expect(sent.evidence.criteria.expectedAnswerHint).toBe(c.task.expected.expectedAnswerHint);
         expect(sent.evidence.criteria.requiredSkills).toEqual(['invoice-header-extraction']);
         expect(sent.plan.criteria[0].required).toBe(true);
-        return judgeResponse({ choices: [{ message: { content: '{"v":1,"r":[[1,1,0]],"f":[]}' }, finish_reason: 'stop' }] });
+        return judgeResponse({ choices: [{ message: { content: namedJudgment(c.semanticPlan!,'{"v":1,"r":[[1,1,0]],"f":[]}') }, finish_reason: 'stop' }] });
     };
     c.semanticPlan=compileFormalSemanticPlan({...c.task,expected:{...c.task.expected,semantic:c.semanticPlan}} as typeof c.task);
     const measured = await evaluateSemantic(c);

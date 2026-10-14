@@ -46,5 +46,5 @@
       "reason": "The original observation violates the declared independent requirement."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[0,1,0]],\"f\":[[0,0,1]]}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"clarification-decision\",\"counts\":{\"numerator\":0,\"denominator\":1,\"unassessable\":0},\"failures\":[{\"opportunityIndex\":0,\"code\":1}]}]}"
 }

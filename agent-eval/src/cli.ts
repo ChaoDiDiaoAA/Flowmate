@@ -101,6 +101,10 @@ export function createProgressReporter(write: (line: string) => void = line => {
                     line(`[${datasetName(event.datasetId)}]${event.stopped ? '提前停止' : '本组结束'}：${Object.entries(event.counts).map(([status, count]) => `${status}=${count}`).join('，')}${event.reason ? '；' + event.reason : ''}`);
                     line(`[报告]${event.reportPath}`);
                     break;
+                case 'source-invalidated':
+                    stopWaiting();
+                    line(`⚠ [${datasetName(event.datasetId)}]本组执行无效：运行期间代码条件变化（${event.paths.length}个文件，详见报告）；此前逐题结果仅供诊断`);
+                    break;
             }
         },
         close(error?: unknown) {

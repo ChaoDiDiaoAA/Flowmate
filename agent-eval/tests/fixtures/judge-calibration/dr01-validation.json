@@ -142,5 +142,5 @@
       "reason": "The independent source, fact, citation or complete chain is explicitly present."
     }
   ],
-  "referenceWire": "{\"v\":1,\"r\":[[1,1,0]],\"f\":[],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":1,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1}],\"chains\":[]}}"
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"DR01\",\"counts\":null,\"failures\":[]}],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":36,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":1,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1}],\"chains\":[]}}"
 }

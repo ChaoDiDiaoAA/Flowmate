@@ -10,10 +10,12 @@ import type { EvaluationScore, JudgeCall, MetricPlan } from '../scoring/types.ts
 import { aggregateTrials, type TrialAggregation } from '../scoring/aggregate.ts';
 import { hash } from '../dataset-loader/local.ts';
 import { parseJudgment } from '../scoring/judges/harness.ts';
-import { compactPlanSchema, compactResultSchema, compactRubricFor, parseCompactJudgment,parseLegacyCompactJudgment, compactScores, type CompactPlan } from '../scoring/judges/compact.ts';
+import { compactPlanSchema, compactResultSchema, compactRubric, compactRubricFor, parseMetricJudgment, parseCompactJudgment,parseLegacyCompactJudgment, compactScores, type CompactPlan } from '../scoring/judges/compact.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { artifactJson, withoutHashes } from '../artifacts.ts';
 import { agentApiSchema, agentModelCapabilitiesSchema } from '../configuration.ts';
+import {researchFrameSchema,unavailableResearchCounts} from '../scoring/research-judgment.ts';
+import {hasNoResearchReport} from '../scoring/research-frame.ts';
 export type TrialReport = {
     caseId: string;
     caseVersion: number;
@@ -58,6 +60,7 @@ export type LocalReport = {
     endedAt: string | null;
     repeat: number;
     executionComplete: boolean;
+    sourceInvalidation?: {reason:string;paths:string[]};
     scoring: 'pending' | 'complete';
     manualReview: 'none';
     formalAcceptance: 'not-assessed';
@@ -65,6 +68,8 @@ export type LocalReport = {
         version: number;
         judgeMode: 'off' | 'auto' | 'required';
         judgeHash: string | null;
+        judge?: JudgeCall['configuration'] | null;
+        rubrics?: Array<{ id: string; version: number; prompt: string }>;
     };
     trials: TrialReport[];
     export: {
@@ -103,17 +108,19 @@ const legacyJudgeConfigurationSchema = z.object({ provider: z.enum(['anthropic',
     modelCapabilities: z.object({modelId:text,maxOutputTokens:positive,source:z.enum(['anthropic-models-api','deepseek-models-api'])}).strict().optional(),
     protocolVersion: text.optional(), rubric: z.object({ id: text, version: positive, hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().optional()
     }).strict();
+const sdkJudgeConfigurationSchema = legacyJudgeConfigurationSchema.omit({temperature:true,maxTokens:true,modelCapabilities:true}).extend({
+    provider:z.enum(['anthropic','openai-compatible']).optional(),api:agentApiSchema,
+    sdk:z.object({codingAgent:text,ai:text}).strict(),modelCapabilities:agentModelCapabilitiesSchema.optional()
+});
 const judgeCallBase = z.object({ callId: text, startedAt: timestamp, endedAt: timestamp, attempts: integer.max(1),
     usage: z.unknown(), responseModel: z.unknown(), raw: z.string().nullable(), error: z.string().nullable(),
     judgment: z.object({ score: z.number().finite().min(0).max(1), reason: text }).strict().nullable(),
     request: z.object({ system: z.string(), data: z.string(), hash: z.string().regex(/^[a-f0-9]{64}$/).optional(), redacted: z.boolean() }).strict().optional(),
-    compact: z.object({ plan: compactPlanSchema, judgment: compactResultSchema.nullable() }).strict().optional() }).strict();
+    compact: z.object({ plan: compactPlanSchema, judgment: compactResultSchema.nullable(), format: z.literal('metric-id/v1').optional(),
+        validationErrors: z.record(text).optional() }).strict().optional() }).strict();
 const judgeCallSchema = z.union([
     judgeCallBase.extend({ configuration: legacyJudgeConfigurationSchema, finishReason: z.string().nullable().optional(), responseComplete: z.boolean().optional() }),
-    judgeCallBase.extend({ configuration: legacyJudgeConfigurationSchema.omit({ temperature: true, maxTokens: true, modelCapabilities: true }).extend({
-        provider: z.enum(['anthropic', 'openai-compatible']).optional(), api: agentApiSchema,
-        sdk: z.object({ codingAgent: text, ai: text }).strict(), modelCapabilities: agentModelCapabilitiesSchema.optional()
-    }), stopReason: z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']).nullable(),
+    judgeCallBase.extend({ configuration: sdkJudgeConfigurationSchema, stopReason: z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']).nullable(),
         rawStopReason: z.string().nullable(), usageSource: z.enum(['sdk', 'unknown']), responseComplete: z.boolean() })
 ]);
 const trialSchema = z.object({ caseId: text, caseVersion: positive, caseHash: text.optional(), caseName: text, category: text, purpose:z.enum(['capability','regression']).optional(),
@@ -127,8 +134,11 @@ const reportSchema = z.object({ contract: z.enum(['flowmate-agent-run/v1', 'flow
     code: z.object({ commit: text.optional(), workspaceHash: text.optional(), release: text, dirty: z.boolean() }).strict().optional(), userId: text.optional(),
     dataset: z.object({ id: text, version: positive, hash: text.optional(), subject: z.literal('agent') }).strict(), selection: z.enum(['smoke', 'holdout', 'full', 'case']),
     environment: text, startedAt: timestamp, endedAt: timestamp.nullable(), repeat: positive.max(20), executionComplete: z.boolean(),
+    sourceInvalidation: z.object({reason:text,paths:z.array(text).min(1).refine(paths=>new Set(paths).size===paths.length)}).strict().optional(),
     scoring: z.enum(['pending', 'complete']), manualReview: z.literal('none'), formalAcceptance: z.literal('not-assessed'),
-    scoringConfiguration: z.object({ version: positive, judgeMode: z.enum(['off', 'auto', 'required']), judgeHash: text.nullable().optional() }).strict(),
+    scoringConfiguration: z.object({ version: positive, judgeMode: z.enum(['off', 'auto', 'required']), judgeHash: text.nullable().optional(),
+        judge: z.union([sdkJudgeConfigurationSchema,legacyJudgeConfigurationSchema]).nullable().optional(),
+        rubrics: z.array(z.object({id:text,version:positive,prompt:text}).strict()).refine(items=>new Set(items.map(r=>r.id)).size===items.length).optional() }).strict(),
     trials: z.array(trialSchema), export: z.object({ backend: z.enum(['local', 'langfuse']), status: z.enum(['disabled', 'pending', 'complete', 'partial', 'error']),
         progress: z.object({ total: integer, acceptedEventIds: z.array(text), rejectedEventIds: z.array(text) }).strict().refine(p =>
             new Set(p.acceptedEventIds).size === p.acceptedEventIds.length && new Set(p.rejectedEventIds).size === p.rejectedEventIds.length &&
@@ -142,6 +152,8 @@ function validateReport(value: unknown): asserts value is LocalReport {
     if (!isJsonData(value)) throw new Error('Report must contain finite JSON data');
     reportSchema.parse(value);
     const report = value as LocalReport, trials = new Set<string>(), traces = new Set<string>(), members = new Set<string>(), calls = new Set<string>();
+    if(report.sourceInvalidation && (report.executionComplete || report.endedAt===null || report.trials.some(t=>t.status!=='ERROR')))
+        throw Error('Source invalidation contradicts final execution state');
     if (report.selection === 'holdout' && report.trials.some(trial => trial.partition !== 'holdout'))
         throw new Error('Smoke Trial cannot appear in holdout selection');
     safeId(report.executionId);
@@ -160,12 +172,39 @@ function validateReport(value: unknown): asserts value is LocalReport {
                 metric.unit !== criterion.unit || metric.denominator !== criterion.denominator)
                 throw new Error('Declared semantic criterion differs from its metric opportunity plan');
         }
+        const local=trial.scores.filter(s=>s.method==='deterministic'&&trial.semanticPlan?.criteria.some(c=>c.metricId===s.metricId));
+        if(local.length){
+            const frames=local.flatMap(s=>(s.actual as any)?.researchFrame?[(s.actual as any).researchFrame]:[]);
+            if(frames.length!==1||!trial.execution?.started||trial.execution.error?.infrastructure)throw Error('Local research measurement lacks its original frame');
+            const frame=researchFrameSchema.parse(frames[0]);
+            if(!frame.complete||frame.reportId!==null||frame.blocks.length||frame.links.length||
+                !hasNoResearchReport(trial.execution.evidence.research))throw Error('Local no-Report proof differs from original collection');
+            const counts=unavailableResearchCounts(frame);
+            for(const score of local){
+                const measured=counts[score.metricId],actual=score.actual as any,criterion=trial.semanticPlan!.criteria.find(c=>c.metricId===score.metricId)!;
+                if(!measured||actual?.locallyDerived!==true||score.judge)throw Error('Unsupported local semantic measurement');
+                const row=measured.row,value=row&&row[1]>0&&row[2]===0?row[0]/row[1]:null;
+                if(score.version!==criterion.version||score.required!==criterion.required||
+                    criterion.denominator!==null&&row?.[1]!==criterion.denominator||
+                    criterion.trigger==='completed-endpoint'&&(trial.execution.status!=='completed'||!trial.execution.endpointReached))
+                    throw Error('Local research measurement differs from its frozen criterion');
+                const status=measured.knownFailure?'FAIL':value!==null?'PASS':'UNJUDGEABLE';
+                if(!isDeepStrictEqual([score.statistics,actual.row,actual.opportunities,score.value,score.status],
+                    [measured.statistics,row,measured.opportunities,value,status]))throw Error('Local research counts contradict original no-Report evidence');
+            }
+        }
         for (const call of trial.judgeCalls) {
             if (calls.has(call.callId)) throw new Error('Duplicate Judge call identity');
             calls.add(call.callId);
             const { configHash, ...parameters } = call.configuration;
             if (configHash && hash(parameters) !== configHash) throw new Error('Stored Judge configuration hash does not match its parameters');
-            if (report.scoringConfiguration.judgeHash && call.configuration.configHash !== report.scoringConfiguration.judgeHash) throw new Error('Judge differs from declared scoring configuration');
+            if (report.scoringConfiguration.rubrics) {
+                const {rubric:_,configHash:__,...actual} = call.configuration;
+                const {rubric:___,configHash:____,...declared} = report.scoringConfiguration.judge??{};
+                if (!isDeepStrictEqual(actual, declared)) throw Error('Judge differs from frozen connection configuration');
+                if (!report.scoringConfiguration.rubrics.some(r=>r.id===call.configuration.rubric?.id && r.version===call.configuration.rubric?.version && r.prompt===call.request?.system))
+                    throw Error('Judge template is outside the frozen template set');
+            } else if (report.scoringConfiguration.judgeHash && call.configuration.configHash !== report.scoringConfiguration.judgeHash) throw new Error('Judge differs from declared scoring configuration');
             if (call.request && (call.request.hash && hash([call.request.system, call.request.data]) !== call.request.hash || call.request.redacted &&
                 (call.judgment !== null || call.compact?.judgment != null))) throw new Error('Stored Judge input identity or redaction contradicts its judgment');
             if (report.contract === 'flowmate-agent-run/v2') {
@@ -180,15 +219,23 @@ function validateReport(value: unknown): asserts value is LocalReport {
                     throw new Error('Stored Judge judgment contradicts original completion or text');
             }
             if (call.compact) {
-                const rubric=[legacyCompactRubric,legacyPlainRubric].find(r=>call.request?.system===r.prompt)??compactRubricFor(call.compact.plan);
+                const rubric=[legacyCompactRubric,legacyPlainRubric,compactRubric].find(r=>call.request?.system===r.prompt)??compactRubricFor(call.compact.plan);
                 if (report.contract !== 'flowmate-agent-run/v2' || !call.request || call.request.system !== rubric.prompt || call.judgment !== null)
                     throw new Error('Compact Judge needs its original versioned input and exclusive judgment');
                 if (call.configuration.rubric?.hash && !isDeepStrictEqual(call.configuration.rubric, { id: rubric.id, version: rubric.version, hash: hash(call.request.system) }))
                     throw new Error('Compact Judge Rubric differs from declared scoring configuration');
+                const named = rubric.id.startsWith('semantic-metrics-');
+                if (named !== (call.compact.format==='metric-id/v1') || named &&
+                    (call.configuration.rubric?.id!==rubric.id || call.configuration.rubric?.version!==rubric.version || !call.compact.validationErrors) ||
+                    !named && call.compact.validationErrors!==undefined)
+                    throw Error('Judge format or validation errors contradict the original template');
                 const input = JSON.parse(call.request.data);
                 if (!isDeepStrictEqual(input.plan, call.compact.plan)) throw new Error('Compact Judge plan differs from its original request');
+                const parsed = call.compact.judgment!==null && call.raw!==null ? named
+                    ? parseMetricJudgment(call.raw,call.compact.plan,input.evidence?.researchFrame)
+                    : {judgment:call.request.system === legacyCompactRubric.prompt ? parseLegacyCompactJudgment(call.raw,call.compact.plan) : parseCompactJudgment(call.raw,call.compact.plan,input.evidence?.researchFrame),validationErrors:undefined} : null;
                 if (call.compact.judgment !== null && (!call.responseComplete || call.attempts !== 1 || call.error !== null || call.raw === null ||
-                    !isDeepStrictEqual((call.request.system === legacyCompactRubric.prompt ? parseLegacyCompactJudgment(call.raw,call.compact.plan) : parseCompactJudgment(call.raw, call.compact.plan,input.evidence?.researchFrame)), call.compact.judgment)) ||
+                    !isDeepStrictEqual(parsed?.judgment, call.compact.judgment) || named && !isDeepStrictEqual(parsed?.validationErrors,call.compact.validationErrors)) ||
                     call.compact.judgment === null && call.error === null)
                     throw new Error('Stored compact judgment contradicts original completion or text');
                 const measured = compactScores(call);
@@ -289,7 +336,7 @@ export function comparison(left: LocalReport, right: LocalReport) {
     if (indexed.size !== right.trials.length || new Set(left.trials.map(key)).size !== left.trials.length || left.trials.length !== right.trials.length)
         throw new Error('Scoring versions or members differ');
     const scoring = (t: TrialReport) => JSON.stringify({ plan: [...(t.metricPlan ?? [])].sort((a, b) => a.metricId.localeCompare(b.metricId)), semantic: t.semanticPlan,
-        checks: t.scores.map(s => [s.metricId, s.version, s.required, s.method]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))) });
+        checks: t.scores.map(s => [s.metricId, s.version, s.required,t.semanticPlan?.criteria.some(c=>c.metricId===s.metricId)?'semantic-plan':s.method]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))) });
     return left.trials.map(t => {
         const other = indexed.get(key(t));
         if (!other || scoring(t) !== scoring(other)) throw new Error('Scoring versions or members differ');

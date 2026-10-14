@@ -887,6 +887,8 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)])) : null, source: 'Original model candidate at the selected version lineage; user corrections never replace model evidence' };
             execution.evidence['candidate-line-items'] = { present: !!original, actual: original?.lines.map(line => Object.fromEntries(Object.entries(line)
                 .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)]))) ?? null, source: 'Original model candidate lines at the selected version lineage; user corrections remain separate' };
+            execution.evidence['candidate-values'] = {present:!!original,actual:original?{fields:original.fields,lines:original.lines}:null,
+                source:'Original model field states, raw and normalized values at the selected version lineage'};
             try { exports = readInvoiceExports(); }
             catch (error) {
                 execution.evidence['invoice-exports'] = { present: false, actual: structuredClone(invoiceExports), source: 'Original public export references retained; current managed bytes failed verification' };

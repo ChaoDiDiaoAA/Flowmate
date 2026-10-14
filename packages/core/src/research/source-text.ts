@@ -1,4 +1,11 @@
 import { appError, fail, ok } from '@flowmate/contracts';
+import type { EvidenceRef, ResearchRunBinding, ResearchLocatorSchema, SourceSnapshot } from '@flowmate/contracts';
+import type { z } from 'zod';
+
+export function researchEvidenceRef(binding: ResearchRunBinding, source: SourceSnapshot, locator: z.infer<typeof ResearchLocatorSchema>): EvidenceRef | null {
+    return binding.phase==='researching' && binding.plan ? {researchId:binding.researchId,planId:binding.plan.planId,revision:binding.plan.revision,
+        runId:source.runId,toolCallId:source.toolCallId,sourceSnapshotId:source.sourceSnapshotId,locator} : null;
+}
 
 export function researchExcerpt(text: string, offset: number, limit: number) {
     const splitsPair = (at: number) => at > 0 && at < text.length && /[\uD800-\uDBFF]/.test(text[at - 1]!) && /[\uDC00-\uDFFF]/.test(text[at]!);
