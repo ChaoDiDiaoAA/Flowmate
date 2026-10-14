@@ -6,9 +6,10 @@ import {NativeToolOutputSchema,NATIVE_TOOL_NAMES} from '../../../../packages/con
 import {RunScopeSchema} from '../../../../packages/contracts/src/tool-config.ts';
 import {SubagentDetailSchema,SubagentProvenanceSchema} from '../../../../packages/contracts/src/subagents.ts';
 import {FrozenInputDefinitionsSchema} from '../../../../packages/contracts/src/input-commands.ts';
+import {RunResourceViewSchema} from '../../../../packages/contracts/src/resources.ts';
 import {PublicContextRequestEvidenceSchema,ContextSnapshotDetailSchema} from '../../../../packages/contracts/src/context.ts';
 import {hash} from '../../dataset-loader/local.ts';
-import {formalRules} from '../formal-rules.ts';
+import {formalRules,formalMetricMethod} from '../formal-rules.ts';
 import {formalMetric} from '../catalog.ts';
 import type {EvaluationContext,EvaluationScore,MetricPlan} from '../types.ts';
 import {isRequiredScore} from '../types.ts';
@@ -35,6 +36,18 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
     const children=original('subagents',z.object({children:z.array(SubagentDetailSchema)}).passthrough())?.children;
     const controller=original('case-controller',z.object({exposure:z.object({verified:z.boolean()}).passthrough().nullable()}).passthrough());
     function values(metricId:string):Array<boolean|null>|undefined{
+        if(task.expected.maxToolCalls===0&&['tool-selection','skill-selection','progressive-reading'].includes(metricId)){
+            if(!tools||!runs?.some(r=>r.kind==='agent')||tools.some(call=>!runs.some(r=>r.runId===call.runId&&r.sessionId===call.sessionId)))return;
+            if(metricId==='tool-selection'&&tools.length)return[false];
+            const forbidden=context.gradedScores?.find(s=>s.metricId==='fact-check/forbidden-skills');
+            if(metricId!=='tool-selection'&&forbidden?.status==='FAIL')return[false];
+            if(!result.evidence['tool-evidence']?.present||!result.evidence.runs?.present)return;
+            if(metricId==='tool-selection')return[true];
+            const resources=original('resources',z.array(RunResourceViewSchema));
+            if(!result.evidence.resources?.present||!resources||!runs.every(run=>resources.some(r=>r.runId===run.runId&&r.sessionId===run.sessionId&&r.gap===null&&r.evidence!==null))||
+                !resources.every(r=>runs.some(run=>r.runId===run.runId&&r.sessionId===run.sessionId)))return;
+            return forbidden?.status==='PASS'?[true]:undefined;
+        }
         if(metricId==='task-success'){
             if(result.status==='cancelled')return[null];
             if(controller&&controller.exposure?.verified!==true)return;
@@ -166,13 +179,15 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
     }
     return task.expected.metrics.flatMap<EvaluationScore>((plan:MetricPlan)=>{
         const rule=formalRules.find(r=>r.metricId===plan.metricId);if(!rule)return[];
-        const metric=formalMetric(plan.metricId),base={metricId:metric.id,name:metric.name,version:metric.version,method:rule.method,required:metric.id==='task-success',evidence:rule.evidence};
+        const method=formalMetricMethod(task,plan.metricId)!;
+        const metric=formalMetric(plan.metricId),base={metricId:metric.id,name:metric.name,version:metric.version,method,required:metric.id==='task-success',evidence:rule.evidence};
         if(plan.notApplicable)return[{...base,value:null,status:'NOT_APPLICABLE' as const,reason:plan.notApplicable,statistics:{unit:metric.unit,numerator:null,denominator:null,missing:null}}];
         if(task.expected.semantic?.criteria.some(c=>c.metricId===metric.id)||context.semanticPlan?.criteria.some(c=>c.metricId===metric.id))return[];
-        if(rule.method!=='deterministic')return[{...base,required:['completion-verification','false-completion'].includes(metric.id),value:null,status:'NOT_RUN',reason:'适用语义判据尚未声明，不能用通用相关性代替',
+        if(method!=='deterministic')return[{...base,required:['completion-verification','false-completion'].includes(metric.id),value:null,status:'NOT_RUN',reason:'适用语义判据尚未声明，不能用通用相关性代替',
             statistics:{unit:metric.unit,numerator:null,denominator:plan.denominator??null,missing:plan.denominator??null}}];
         const measured=result.started?values(metric.id):undefined;
-        const completeKeys=metric.id==='tool-execution'||metric.id==='runtime-admission'?['tool-evidence','runs']:
+        const completeKeys=task.expected.maxToolCalls===0&&['tool-selection','skill-selection','progressive-reading'].includes(metric.id)?['tool-evidence','runs']:
+            metric.id==='tool-execution'||metric.id==='runtime-admission'?['tool-evidence','runs']:
             metric.id==='result-delivery'||metric.id==='context-delivery'?['tool-evidence','context-requests','runs']:
             metric.id==='retry-compliance'?['tool-evidence','runs','case-controller']:rule.evidence;
         const complete=completeKeys.every(key=>result.evidence[key]?.present);

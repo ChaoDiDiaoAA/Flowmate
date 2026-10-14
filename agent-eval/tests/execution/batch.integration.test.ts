@@ -8,6 +8,16 @@ import type { EvaluationProgress } from '../../src/execution/runner.ts';
 const env = { FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
     FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'fake-batch-judge-key' };
 const kernel: AgentKernel = { readiness: () => ({ready:true,reason:'synthetic'}), prepare: async () => { throw Error('must not generate'); } };
+test('a deterministic-only batch does not parse unused Judge credentials in required mode',async()=>{
+    const pure=structuredClone(dataset);pure.manifest.scoring.judges=[];
+    let executions=0;
+    const results=await runner.runBatch(fixtureRepo,{datasets:[pure],selection:'smoke',backend:'local',judge:'required'},
+        {kernel,env:{FLOWMATE_JUDGE_API:'invalid-unused-api'},run:async(_,options,deps)=>{
+            executions++;expect(options.judge).toBe('required');expect(deps!.preparedJudge).toBeNull();
+            return{report:reportFixture(),file:'synthetic-report.json',stopped:false};
+        }});
+    expect(executions).toBe(1);expect(results).toHaveLength(1);
+});
 function datasets() {
     return [50, 12].map((count, group) => {
         const data = structuredClone(dataset);

@@ -8,6 +8,7 @@ import { regressionOriginsSchema, type RegressionOrigin } from './regression-ori
 import { decodeFile, type FlatDataset } from './flat.ts';
 import {saveDeliveryLossControllerSchema,readExecutionFailureControllerSchema,saveCancelRaceControllerSchema} from './schema.ts';
 import { ExtensionEvaluationProfileSchema } from '../../../packages/contracts/src/extensions.ts';
+import {formalMetricMethod} from '../scoring/formal-rules.ts';
 export const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 export const hash = (v: unknown): string => createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v)).digest('hex');
 import { caseSchema, caseV2Schema, manifestSchema, steerControllerSchema, futureSteerInputSchema, autoCompactionControllerSchema, userHistorySeedSchema, parentCancelControllerSchema, saveReplayControllerSchema, type LocalCase } from './schema.ts';
@@ -114,10 +115,18 @@ export function assertSemanticSelection(dataset: Pick<LocalDataset, 'manifest' |
     for (const task of dataset.cases) {
         const semantic = 'contract' in task ? task.expected.semantic : undefined;
         if (semantic && !batch) throw new Error('A compact Case plan requires the semantic-batch Judge selection');
-        if (batch && (batch.required || requireJudge || batch.requiredFor?.includes(task.id)) && !semantic)
+        const semanticOpportunity='contract'in task&&task.expected.metrics.some(m=>!m.notApplicable&&
+            (formalMetricMethod(task,m.metricId)==='llm-judge'||m.metricId.startsWith('DR')&&m.metricId!=='DR03'));
+        if ((semanticOpportunity || batch?.requiredFor?.includes(task.id)) && !semantic)
             throw new Error('Required semantic-batch Judge needs Case criteria before Agent preparation');
         if (semantic) caseV2Schema.parse(task);
     }
+}
+export function judgeSelection(dataset:Pick<LocalDataset,'manifest'|'cases'>,requireJudge=false){
+    const applicable=dataset.manifest.scoring.judges.filter(j=>j.id==='answer-relevance'||dataset.cases.some(task=>
+        'contract'in task&&task.expected.semantic?.criteria.some(c=>task.expected.metrics.some(m=>m.metricId===c.metricId&&!m.notApplicable))));
+    return{needed:applicable.length>0,required:applicable.some(j=>requireJudge||j.required||dataset.cases.some(task=>j.requiredFor?.includes(task.id)||
+        'contract'in task&&task.expected.semantic?.criteria.some(c=>c.required)))};
 }
 export function discoverDatasets(root: string, repo = REPO_ROOT): LocalDataset[] {
     if (existsSync(join(root,'cases.ts'))) return readDeclarationDatasets(root,repo).map(group=>loadDataset(root,repo,group));

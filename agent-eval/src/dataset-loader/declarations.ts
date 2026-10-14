@@ -92,7 +92,7 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
         const metadata = {contract:'flowmate-agent-dataset/v2',id,version:1,name:id,
             ...(supplemental ? { suite: 'badcase' } : {}),
             environment:{profile:'isolated-agent/v2',source:tag==='research'?'local':'mixed',risks:['Independent human review and real evaluation are pending.']},
-            scoring:{version:1,required:['task-result','input-isolation','environment-isolation','no-secret','closed'],judges:[{id:'semantic-batch',required:true}]}};
+            scoring:{version:1,required:['task-result','input-isolation','environment-isolation','no-secret','closed'],judges:[{id:'semantic-batch',required:false,requiredFor:[] as string[]}]}};
         const resources = fixture.selection.enabledSkills.flatMap((skill:string)=>{
             const prefix=`resources/${assertSafeFixtureName(skill)}/`;
             const manifest=loadFixture<{files:{path:string}[]}>(sampleName(prefix+'resource'),fixtureRoot);
@@ -133,6 +133,7 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
             ...(task.setup?{setup:task.setup}:{}),...(task.steps?{steps:task.steps}:{}),expected:{...task.expected,...expanded.gold.values},review:{status:'pending'}};
         group.inputs[c.id]=[...visible,...task.resourceFiles];
         group.manifest.members.push(member);if(!supplemental && c.tags.includes('smoke'))group.manifest.smoke.push(c.id);
+        if(c.scoring.judge.length)group.manifest.scoring.judges[0]!.requiredFor!.push(c.id);
         if (supplemental) (group.regressionOrigins ??= {})[c.id] = dataset.regressionOrigins![c.id]!;
         for(const file of [...visible,...task.resourceFiles,...task.controllerFiles,...expanded.gold.sources]) {
             if(group.files[file.path]&&group.files[file.path]!.sha256!==file.sha256)throw Error('Conflicting source: '+file.path);

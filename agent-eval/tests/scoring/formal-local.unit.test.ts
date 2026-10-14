@@ -40,6 +40,36 @@ function originalFacts(context:EvaluationContext,tools:ToolCallSnapshot[]){
         stoppedAt:at,cleanup:{stopped:true},config:{runtimeBudget:{maxToolCalls:4}}}],source:'Independent original Run'};
     context.result.evidence['tool-evidence']={present:true,actual:{calls:tools.map(tool=>({tool,sha256:hash(tool),bytes:Buffer.byteLength(JSON.stringify(tool))}))},source:'Independent original ToolCall'};
 }
+test('zero-tool negative controls retain tool and Skill opportunities locally and preserve missing evidence',()=>{
+    const context:EvaluationContext=fixture('tool-selection','skill-selection','progressive-reading');
+    context.task.expected.maxToolCalls=0;
+    context.gradedScores=[{metricId:'fact-check/forbidden-skills',name:'No forbidden Skill read',version:1,method:'deterministic',required:true,value:1,status:'PASS',reason:'Complete original resource observations',evidence:['resources']}];
+    originalFacts(context,[]);
+    context.result.evidence.resources={present:true,actual:[{runId:1,sessionId:1,frozen:null,gap:null,evidence:{version:1,reads:[],expansions:[],requests:[]}}],source:'Original Run resource journal'};
+    for(const id of ['tool-selection','skill-selection','progressive-reading']){
+        const score=evaluateFormalMetrics(context).find(s=>s.metricId===id)!;
+        expect(score).toMatchObject({method:'deterministic',status:'PASS',statistics:{numerator:1,denominator:1,missing:0}});
+    }
+    originalFacts(context,[originalTool()]);
+    expect(evaluateFormalMetrics(context).find(s=>s.metricId==='tool-selection')).toMatchObject({status:'FAIL',value:0});
+    context.result.evidence['tool-evidence']!.present=false;
+    expect(evaluateFormalMetrics(context).find(s=>s.metricId==='tool-selection')).toMatchObject({status:'FAIL'});
+    context.result.evidence['tool-evidence']!.actual=null;
+    expect(evaluateFormalMetrics(context).find(s=>s.metricId==='tool-selection')).toMatchObject({status:'UNJUDGEABLE',value:null});
+});
+test('zero-tool absence never passes without original root and matching resource identities',()=>{
+    const context:EvaluationContext=fixture('tool-selection','skill-selection','progressive-reading');
+    context.task.expected.maxToolCalls=0;
+    context.gradedScores=[{metricId:'fact-check/forbidden-skills',name:'No forbidden Skill read',version:1,method:'deterministic',required:true,value:1,status:'PASS',reason:'Observation',evidence:['resources']}];
+    originalFacts(context,[]);
+    context.result.evidence.runs!.actual=[];
+    expect(evaluateFormalMetrics(context).filter(s=>s.metricId!=='task-success').every(s=>s.status!=='PASS')).toBe(true);
+    originalFacts(context,[]);
+    for(const runId of [null,2]){
+        context.result.evidence.resources={present:true,actual:runId===null?[]:[{runId,sessionId:1,frozen:null,gap:null,evidence:{version:1,reads:[],expansions:[],requests:[]}}],source:'Empty or foreign resource collection'};
+        expect(evaluateFormalMetrics(context).filter(s=>['skill-selection','progressive-reading'].includes(s.metricId)).every(s=>s.status!=='PASS')).toBe(true);
+    }
+});
 for(const status of ['succeeded','failed','missing'] as const)test('tool-execution original protocol '+status,()=>{
     const context=fixture('tool-execution'),tool=originalTool(status==='failed');originalFacts(context,[tool]);
     context.result.evidence['tool-evidence']={present:status!=='missing',actual:status==='missing'?null:{calls:[{tool,sha256:hash(tool),bytes:Buffer.byteLength(JSON.stringify(tool))}]},source:'Independent synthetic original ToolCall'};

@@ -6,7 +6,7 @@ import { artifactJson } from '../artifacts.ts';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { discoverDatasets, hash, caseContentHash, caseFiles, resolveCase, restoreCaseInputs, selectCases, assertSemanticSelection, type LocalDataset, type Check } from '../dataset-loader/local.ts';
+import { discoverDatasets, hash, caseContentHash, caseFiles, resolveCase, restoreCaseInputs, selectCases, assertSemanticSelection, judgeSelection, type LocalDataset, type Check } from '../dataset-loader/local.ts';
 import { productAgent, createProductAgent, type AgentKernel } from '../adapters/agent.ts';
 import { agentApiSchema, prepareAgentConfig, type AgentModelCapabilities } from '../configuration.ts';
 export {assertModelConfiguration} from '../adapters/agent.ts';
@@ -139,14 +139,12 @@ export async function runLocal(repo: string, options: {
     assertSemanticSelection({ manifest: dataset.manifest, cases: selected }, options.judge === 'required');
     if (selected.some(c => c.expected.checks.some(check => check.metric === 'answer-relevance' || dataset.manifest.scoring.required.includes(check.metric))))
         throw new Error('Case cannot override common scoring or select Judge; configure Judges once in dataset.json');
-    if (options.judge === 'required' && !dataset.manifest.scoring.judges.length)
-        throw new Error('Required Judge must be selected in Dataset scoring configuration');
-    let judge = options.judge === 'off' ? null : deps.preparedJudge !== undefined ? deps.preparedJudge : judgeConfig(deps.env ?? process.env, repo, options.judgeConfigFile);
+    const selection=judgeSelection({manifest:dataset.manifest,cases:selected},options.judge==='required');
+    let judge = options.judge === 'off' || !selection.needed ? null : deps.preparedJudge !== undefined ? deps.preparedJudge : judgeConfig(deps.env ?? process.env, repo, options.judgeConfigFile);
     const batch = dataset.manifest.scoring.judges.find(j => j.id === 'semantic-batch');
     const plans=selected.flatMap(task=>'contract'in task&&task.expected.semantic?[task.expected.semantic]:[]);
     const rubrics = rubricsFor(plans);
-    const judgeRequired = options.judge === 'required' || dataset.manifest.scoring.judges.some(j => j.required || selected.some(c => j.requiredFor?.includes(c.id))) ||
-        selected.some(c => 'contract' in c && c.expected.semantic?.criteria.some(criterion => criterion.required));
+    const judgeRequired = selection.required;
     if (options.judge !== 'off' && judgeRequired && !judge)
         throw new Error('Required Judge is unavailable');
     if (judge && deps.preparedJudge === undefined) judge = await prepareJudge(judge, deps.fetcher, deps.signal);
@@ -297,15 +295,15 @@ export async function runBatch(repo: string,
         const selected = selectCases(data, options.selection);
         if (!selected.length) throw Error('No Cases in selected partition');
         assertSemanticSelection({ manifest: data.manifest, cases: selected }, options.judge === 'required');
-        if (options.judge === 'required' && !data.manifest.scoring.judges.length) throw Error('Required Judge must be selected in Dataset');
         for (const task of selected) resolveCase(data, task, repo);
     }
     const plans = options.datasets.map(data => ({ id: data.manifest.id, caseCount: selectCases(data, options.selection).length,
         total: selectCases(data, options.selection).length * repeat }));
     const total = plans.reduce((sum, plan) => sum + plan.total, 0);
     notify({ type: 'plan', selection: options.selection ?? 'full', total, caseCount: plans.reduce((sum,plan)=>sum+plan.caseCount,0), trialsPerCase: repeat, datasets: plans });
-    let preparedJudge = options.judge === 'off' ? null : judgeConfig(deps.env ?? process.env, repo);
-    if (options.judge === 'required' && !preparedJudge) throw Error('Required Judge is unavailable');
+    const selections=options.datasets.map(data=>judgeSelection({manifest:data.manifest,cases:selectCases(data,options.selection)},options.judge==='required'));
+    let preparedJudge = options.judge === 'off' || !selections.some(s=>s.needed) ? null : judgeConfig(deps.env ?? process.env, repo);
+    if (options.judge !== 'off' && selections.some(s=>s.required) && !preparedJudge) throw Error('Required Judge is unavailable');
     const preparedAgent = !deps.kernel || deps.kernel === productAgent
         ? await prepareAgentConfig(repo, deps.env ?? process.env, options.config, undefined, deps) : undefined;
     const ready = (deps.kernel ?? createProductAgent(repo, preparedAgent!.apiKey)).readiness();

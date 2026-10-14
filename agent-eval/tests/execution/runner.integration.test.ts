@@ -70,6 +70,47 @@ function semanticDataset() {
     return data;
 }
 
+function deterministicDataset() {
+    const data = semanticDataset(), item = data.cases[0]!;
+    delete item.expected.semantic;
+    item.expected.metrics = metricCatalog.map(m => ({ metricId: m.id, version: m.version, unit: m.unit,
+        ...(m.id === 'task-success' ? { denominator: 1 } : { notApplicable: 'Exact controlled saved fact only.' }) }));
+    data.manifest.scoring.judges = [{ id: 'semantic-batch', required: false }];
+    data.hash = hash({ manifest: data.manifest, cases: data.cases });
+    return data;
+}
+
+test('required mode executes a deterministic-only Case without reading or preparing Judge configuration', async () => {
+    for (const registered of [true, false]) {
+        const data = deterministicDataset();
+        if (!registered) data.manifest.scoring.judges = [];
+        const run = await runLocal(REPO_ROOT, { dataset: data, backend: 'local', judge: 'required', executionId: 'zero-judge-' + randomUUID() },
+            { kernel: kernel(), env: { FLOWMATE_JUDGE_API: 'invalid-unused-api' },
+                fetcher: async () => { throw Error('Deterministic Case must not contact Judge'); } });
+        expect(run.report.trials[0]!.execution!.started).toBe(true);
+        expect(run.report.trials[0]!.judgeCalls).toHaveLength(0);
+        expect(run.report.trials[0]!.status).toBe('PASS');
+        expect(run.report.scoringConfiguration.judge ?? null).toBeNull();
+    }
+});
+
+test('a mixed Dataset generates only for the Case with declared semantic opportunities', async () => {
+    const data = semanticDataset(), pure = deterministicDataset().cases[0]!;
+    pure.id = 'deterministic-control';
+    data.cases.push(pure);
+    data.manifest.members.push('cases/' + pure.id + '.json');
+    data.manifest.scoring.judges = [{ id: 'semantic-batch', required: false, requiredFor: [data.cases[0]!.id] }];
+    let calls = 0;
+    const run = await runLocal(REPO_ROOT, { dataset: data, backend: 'local', judge: 'required', executionId: 'mixed-judge-' + randomUUID() },
+        { kernel: kernel(), env: { FLOWMATE_JUDGE_API: 'openai-completions', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
+            FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-mixed-key' },
+            fetcher: async () => { calls++; return judgeResponse({ choices: [{ message: { content: namedJudgment(data.cases[0]!.expected.semantic!,
+                { v: 1, r: [[3, 3, 0], [4, 4, 0]], f: [] }) }, finish_reason: 'stop' }] }); } });
+    expect(calls).toBe(1);
+    expect(run.report.trials.map(t => t.judgeCalls.length)).toEqual([1, 0]);
+    expect(run.report.trials.map(t => t.status)).toEqual(['PASS', 'PASS']);
+});
+
 test('progress reduces Judge validation details to a brief cause while reports keep the full errors',async()=>{
     const data=semanticDataset(), events:EvaluationProgress[]=[];
     const run=await runLocal(REPO_ROOT,{dataset:data,backend:'local',judge:'required',executionId:'brief-judge-'+randomUUID()},

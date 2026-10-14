@@ -4740,6 +4740,7 @@ export const goldByCaseId: Record<string, any> = {
       ]
     },
     "checks": [
+      {"metric":"fact-check","required":true,"evidence":"answer","path":[],"equals":"15288019","description":"Exact independent user-supplied number only; prose, wrong numbers and unsupported completion claims fail."},
       {
         "metric": "fact-check",
         "required": true,

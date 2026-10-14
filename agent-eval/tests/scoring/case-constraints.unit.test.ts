@@ -36,6 +36,13 @@ function collect(c: EvaluationContext, calls: ReturnType<typeof tool>[], complet
         calls: calls.map(tool => ({ tool, sha256: hash(tool), bytes: Buffer.byteLength(JSON.stringify(tool)) }))
     } };
 }
+test('zero-tool Skill absence requires a resource journal for every original Run',async()=>{
+    const c=context(0);c.task.expected.forbiddenSkills=['invoice-header-extraction'];
+    c.result.evidence.resources={present:true,actual:[],source:'Empty collection is not original Run coverage'};
+    expect(await score(c,'fact-check/forbidden-skills')).toMatchObject({status:'UNJUDGEABLE',value:null});
+    c.result.evidence.resources.actual=[1,2].map(runId=>({runId,sessionId:runId,frozen:null,gap:null,evidence:{version:1,reads:[],expansions:[],requests:[]}}));
+    expect(await score(c,'fact-check/forbidden-skills')).toMatchObject({status:'PASS',value:1});
+});
 const score = async (c: EvaluationContext, id = 'case-max-tool-calls') => (await evaluateAll(c, [])).scores.find(s => s.metricId === id)!;
 
 test('zero calls and exact cap pass; an extra child call fails the entire Trial', async () => {

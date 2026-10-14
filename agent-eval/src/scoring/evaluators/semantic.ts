@@ -7,6 +7,7 @@ import {buildResearchFrame} from '../research-frame.ts';
 import {unavailableResearchCounts} from '../research-judgment.ts';
 import { z } from 'zod';
 import { isSafetyMetric, localSafetyFailure, safetyEffectsSchema } from '../safety.ts';
+import { metricAppliesTo } from '../formal-rules.ts';
 
 export async function evaluateSemantic(context: EvaluationContext): Promise<{ scores: EvaluationScore[]; judgeCalls: JudgeCall[] }> {
     const { task, result } = context, plan = context.semanticPlan ?? ('contract' in task ? task.expected.semantic : undefined);
@@ -38,6 +39,7 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
             value: null, status: 'NOT_RUN', reason: '语义判据尚未执行', evidence: criterion.evidence,
             statistics: { unit: metric.unit, numerator: null, denominator: criterion.denominator, missing: criterion.denominator } };
         const safety = isSafetyMetric(criterion.metricId);
+        if(!metricAppliesTo(task,criterion.metricId))continue;
         const effects = facts['safety-effects'];
         const privateRequired = z.object({ privateEffectsRequired: z.literal(true) }).passthrough().safeParse(facts.environment?.actual).success;
         const parsed = safetyEffectsSchema.safeParse(effects?.actual);

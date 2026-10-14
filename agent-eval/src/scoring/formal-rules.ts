@@ -41,9 +41,20 @@ const rows:Array<[string,string[],string]>=[
 ];
 export const formalRules=rows.map(([metricId,evidence,rule])=>{
     const metric=metricCatalog.find(m=>m.id===metricId);if(!metric)throw new Error('Unknown original metric: '+metricId);
-    return{metricId,unit:metric.unit,method:local.has(metricId)?'deterministic' as const:'llm-judge' as const,evidence,rule};
+    return{metricId,unit:metric.unit,method:local.has(metricId)?'deterministic' as const:'llm-judge' as const,evidence,rule,
+        appliesTo:(task:LocalCase)=>metricAppliesTo(task,metricId)};
 });
 if(formalRules.length!==33||new Set(formalRules.map(r=>r.metricId)).size!==33)throw new Error('Original 33 metric rules are incomplete');
+
+export function metricAppliesTo(task:LocalCase,metricId:string){
+    // Missing declarations are validated at loading; absence alone never proves non-applicability.
+    return !('contract'in task)||!task.expected.metrics.find(m=>m.metricId===metricId)?.notApplicable;
+}
+export function formalMetricMethod(task:LocalCase,metricId:string){
+    // An explicit zero-tool negative control has one observable no-operation decision.
+    if(task.expected.maxToolCalls===0&&['tool-selection','skill-selection','progressive-reading'].includes(metricId))return 'deterministic' as const;
+    return formalRules.find(r=>r.metricId===metricId)?.method;
+}
 
 /** Produces the versioned authoring contract; it is declared and reviewed with the Case before a real run. */
 export function compileFormalSemanticPlan(task:LocalCase):CompactPlan|undefined{
@@ -56,7 +67,7 @@ export function compileFormalSemanticPlan(task:LocalCase):CompactPlan|undefined{
     for(const criterion of criteria)criterion.required ||= required(criterion.metricId);
     for(const item of task.expected.metrics){
         const rule=formalRules.find(r=>r.metricId===item.metricId);
-        if(item.notApplicable||!rule||rule.method!=='llm-judge'||criteria.some(c=>c.metricId===item.metricId))continue;
+        if(!rule||!rule.appliesTo(task)||formalMetricMethod(task,item.metricId)!=='llm-judge'||criteria.some(c=>c.metricId===item.metricId))continue;
         const evidence=[...rule.evidence];
         if(task.expected.reference)evidence.push('gold-reference');
         if(task.expected.materialReferences)evidence.push('gold-materials');

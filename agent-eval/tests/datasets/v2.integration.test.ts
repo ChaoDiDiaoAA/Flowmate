@@ -56,7 +56,7 @@ test('v1/v2 Case mixing, unknown versions and unregistered metrics are rejected'
     expect(() => loadDataset(f.root)).toThrow();
 });
 
-test('v2 compact scoring selection must match its Case plans and cannot request a required Judge without criteria', () => {
+test('v2 compact selection requires criteria only for applicable semantic opportunities', () => {
     const f = fixture();
     const item = { ...f.item, expected: { ...f.item.expected, semantic: { contract: 'flowmate-semantic-plan/v1', criteria: [
         { metricId: 'tool-selection', version: 1, unit: '决策点', denominator: 3, required: true, rule: 'Three synthetic decisions.',
@@ -69,6 +69,9 @@ test('v2 compact scoring selection must match its Case plans and cannot request 
     writeFileSync(join(f.root, 'dataset.json'), JSON.stringify(data));
     expect(loadDataset(f.root).cases[0]).toHaveProperty('expected.semantic');
     writeFileSync(join(f.root, 'cases/local-research.json'), JSON.stringify(f.item));
+    expect(loadDataset(f.root).cases[0]).not.toHaveProperty('expected.semantic');
+    const {semantic,...expected}=item.expected;
+    writeFileSync(join(f.root, 'cases/local-research.json'), JSON.stringify({...item,expected}));
     expect(() => loadDataset(f.root)).toThrow('criteria');
 });
 

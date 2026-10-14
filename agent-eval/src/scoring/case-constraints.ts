@@ -93,7 +93,10 @@ export function evaluateCaseConstraints({ task, result }: EvaluationContext): Ev
             const args = z.object({ skill: z.string() }).passthrough().safeParse(call.args.raw);
             if (['read_skill_resource', 'list_skill_resources'].includes(call.toolName) && args.success) attempted.add(args.data.skill);
         }
-        const resourceComplete = resources.success && !!fact('resources')?.present && resources.data.every(r => r.gap === null && r.evidence !== null) && complete;
+        const resourceComplete = resources.success && !!fact('resources')?.present && resources.data.every(r => r.gap === null && r.evidence !== null) && complete &&
+            (expected.maxToolCalls!==0||runs.success&&runs.data.some(r=>r.kind==='agent')&&
+                runs.data.every(run=>resources.data.some(r=>r.runId===run.runId&&r.sessionId===run.sessionId))&&
+                resources.data.every(r=>runs.data.some(run=>r.runId===run.runId&&r.sessionId===run.sessionId)));
         if (expected.requiredSkills?.length) add('fact-check/required-skills', '必要 Skill 的实际读取',
             expected.requiredSkills.every(skill => used.has(skill)) ? true : resourceComplete && !result.error?.infrastructure &&
                 expected.requiredSkills.some(skill => !used.has(skill) && !unknown.has(skill)) ? false : undefined,
