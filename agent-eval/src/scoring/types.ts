@@ -4,7 +4,7 @@ import type { JudgeConfig, Fetcher } from './judges/client.ts';
 import type { runJudge } from './judges/harness.ts';
 import type { CompactPlan } from './judges/compact.ts';
 export type EvaluatorKind = 'deterministic' | 'llm-judge';
-type CurrentJudgeCall = Awaited<ReturnType<typeof runJudge>>;
+type CurrentJudgeCall = Omit<Awaited<ReturnType<typeof runJudge>>, 'transportStatus'> & {transportStatus?:number|null};
 type LegacyJudgeCall = Omit<CurrentJudgeCall, 'configuration' | 'stopReason' | 'rawStopReason' | 'usageSource' | 'responseComplete' | 'request' | 'compact'> & {
     configuration: Omit<CurrentJudgeCall['configuration'], 'api' | 'sdk' | 'modelCapabilities' | 'configHash' | 'protocolVersion'> & {
         provider: 'anthropic' | 'openai-compatible'; api?: never; sdk?: never; configHash?: string; temperature?: number; maxTokens?: number;

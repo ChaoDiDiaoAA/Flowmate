@@ -4,6 +4,34 @@ import { registerSecrets } from '../../src/execution/evidence-safety.ts';
 
 afterEach(() => { jest.useRealTimers(); });
 
+test('a long failing reason cannot hide the short concurrent Judge anomaly', () => {
+    const lines: string[] = [], reporter = cli.createProgressReporter(line => lines.push(line));
+    reporter.onProgress({ type: 'scoring-end', index: 1, total: 1, caseId: 'FM-046', trialId: 'mixed-long', status: 'FAIL',
+        reason: '业务判据失败；'.repeat(80) + '评分异常：Judge 返回计数或机会索引不合法（1项，详见报告）' });
+    reporter.close(); expect(lines[0]).toContain('FAIL'); expect(lines[0]).toContain('Judge 返回计数'); expect(lines[0]!.length).toBeLessThan(280);
+});
+
+test('wait durations stay at sixty-second boundaries when the wall clock moves backwards', () => {
+    jest.useFakeTimers();
+    const now = spyOn(Date, 'now').mockReturnValue(60000);
+    const lines: string[] = [], reporter = cli.createProgressReporter(line => lines.push(line));
+    try {
+        reporter.onProgress({ type: 'trial-phase', index: 1, total: 1, caseId: 'FM-001', trialId: 'clock-test', phase: 'executing' });
+        now.mockReturnValue(59999); jest.advanceTimersByTime(60000);
+        expect(lines.at(-1)).toContain('已用时60秒');
+        now.mockReturnValue(59000); jest.advanceTimersByTime(60000);
+        expect(lines.at(-1)).toContain('已用时120秒');
+    } finally { reporter.close(); now.mockRestore(); }
+});
+
+test('completed Run with a missing business endpoint displays a warning once', () => {
+    const lines: string[] = [], reporter = cli.createProgressReporter(line => lines.push(line));
+    const event = { type: 'agent-end' as const, index: 1, total: 1, caseId: 'FM-051', trialId: 'endpoint-test', status: 'completed' as const, endpointReached: false };
+    reporter.onProgress(event); reporter.onProgress(event); reporter.close();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('⚠'); expect(lines[0]).toContain('业务终点未达成'); expect(lines[0]).not.toContain('✅');
+});
+
 test('final invalidation explains the earlier per-Trial results once and keeps the report path',()=>{
     const lines:string[]=[],reporter=cli.createProgressReporter(line=>lines.push(line));
     reporter.onProgress({type:'source-invalidated',datasetId:'flowmate-agent-v1',executionId:'synthetic',
@@ -22,17 +50,17 @@ test('terminal progress reports actual stages immediately and waiting every sixt
     reporter.onProgress({ type:'plan',selection:'smoke',total:14,datasets:[{id:'flowmate-agent-v1',total:10},{id:'flowmate-research-v1',total:4}] });
     reporter.onProgress({ type:'dataset-start',datasetId:'flowmate-agent-v1',executionId:'synthetic',reportPath:'D:/synthetic/report.json' });
     reporter.onProgress({ type:'trial-phase',index:1,total:14,caseId:'FM-001',trialId:'synthetic-FM-001-trial-1',phase:'executing' });
-    expect(lines.at(-1)).toBe('▶ [1/14] FM-001：Agent执行\n');
+    expect(lines.at(-1)).toBe('▶ [1/14] FM-001 · Trial 1/1：Agent执行\n');
     jest.advanceTimersByTime(59999);
     expect(lines.join('')).not.toContain('仍在等待');
     jest.advanceTimersByTime(1);
-    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001：Agent执行；仍在等待，已用时60秒\n');
+    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001 · Trial 1/1：Agent执行；仍在等待，已用时60秒\n');
     const firstWaitCount = lines.length;
     jest.advanceTimersByTime(59999);
     expect(lines).toHaveLength(firstWaitCount);
     jest.advanceTimersByTime(1);
     expect(lines).toHaveLength(firstWaitCount + 1);
-    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001：Agent执行；仍在等待，已用时120秒\n');
+    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001 · Trial 1/1：Agent执行；仍在等待，已用时120秒\n');
     reporter.onProgress({ type:'trial-end',index:1,total:14,caseId:'FM-001',trialId:'synthetic-FM-001-trial-1',status:'FAIL',reason:'Synthetic mismatch',
         elapsedMs:120000,evidenceDirectory:'evidence/synthetic-FM-001-trial-1/' });
     expect(lines.join('')).toContain('FAIL'); expect(lines.join('')).toContain('结果已保存');
@@ -50,7 +78,7 @@ test('switching phases resets the sixty-second wait and clears the previous time
     reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'executing' });
     jest.advanceTimersByTime(45000);
     reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'scoring' });
-    expect(lines.at(-1)).toBe('▶ [1/14] FM-001：评分\n');
+    expect(lines.at(-1)).toBe('▶ [1/14] FM-001 · Trial 1/1：评分\n');
     const count = lines.length;
     jest.advanceTimersByTime(15000);
     expect(lines).toHaveLength(count);
@@ -58,7 +86,7 @@ test('switching phases resets the sixty-second wait and clears the previous time
     expect(lines).toHaveLength(count);
     jest.advanceTimersByTime(1);
     expect(lines).toHaveLength(count + 1);
-    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001：评分；仍在等待，已用时60秒\n');
+    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001 · Trial 1/1：评分；仍在等待，已用时60秒\n');
     reporter.close();
     jest.advanceTimersByTime(60000);
     expect(lines).toHaveLength(count + 1);
@@ -72,11 +100,12 @@ test('Agent and scoring completion display distinct outcomes with symbols and st
         ['completed', '✅', 'Agent执行成功'], ['failed', '❌', 'Agent执行失败'], ['error', '❌', 'Agent执行失败'],
         ['timeout', '⚠', 'Agent执行失败（超时）'], ['cancelled', '⏹', 'Agent执行已取消'], ['not-started', '⏭', 'Agent执行未启动'],
     ] as const) {
+        identity.trialId = 'synthetic-agent-' + status;
         reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'executing' });
         const beforeEnd = lines.length;
         reporter.onProgress({ type: 'agent-end', ...identity, status, reason: 'Synthetic Agent outcome.' });
         expect(lines).toHaveLength(beforeEnd + 1);
-        expect(lines.at(-1)).toBe(`${symbol} [1/14] FM-001：${label}；Synthetic Agent outcome.\n`);
+        expect(lines.at(-1)).toBe(`${symbol} [1/14] FM-001 · Trial 1/1：${label}；Synthetic Agent outcome.\n`);
         const count = lines.length; jest.advanceTimersByTime(60000); expect(lines).toHaveLength(count);
     }
     reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'scoring' });
@@ -86,11 +115,12 @@ test('Agent and scoring completion display distinct outcomes with symbols and st
         ['PASS', '✅', '通过（PASS）'], ['FAIL', '❌', '失败（FAIL）'], ['ERROR', '❌', '错误（ERROR）'],
         ['UNJUDGEABLE', '⚠', '未判定（UNJUDGEABLE）'], ['NOT_RUN', '⏭', '未运行（NOT_RUN）'],
     ] as const) {
+        identity.trialId = 'synthetic-score-' + status;
         reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'scoring' });
         const beforeEnd = lines.length;
         reporter.onProgress({ type: 'scoring-end', ...identity, status, reason: 'Synthetic outcome.' });
         expect(lines).toHaveLength(beforeEnd + 1);
-        expect(lines.at(-1)).toBe(`${symbol} [1/14] FM-001：评分结果：${label}；Synthetic outcome.\n`);
+        expect(lines.at(-1)).toBe(`${symbol} [1/14] FM-001 · Trial 1/1：评分结果：${label}；Synthetic outcome.\n`);
         const count = lines.length; jest.advanceTimersByTime(60000); expect(lines).toHaveLength(count);
     }
     reporter.close();
@@ -116,7 +146,7 @@ test('a broken terminal writer never interrupts evaluation notifications or clea
     const reporter=cli.createProgressReporter(line=>{lines.push(line);throw Error('synthetic closed terminal');});
     expect(()=>reporter.onProgress({type:'trial-phase',index:1,total:1,caseId:'FM-001',trialId:'synthetic-trial',phase:'cleanup'})).not.toThrow();
     expect(()=>jest.advanceTimersByTime(60000)).not.toThrow();
-    expect(lines.at(-1)).toBe('⏳ [1/1] FM-001：确认停止与清理；仍在等待，已用时60秒\n');
+    expect(lines.at(-1)).toBe('⏳ [1/1] FM-001 · Trial 1/1：确认停止与清理；仍在等待，已用时60秒\n');
     expect(()=>reporter.close(Error('synthetic failure'))).not.toThrow();
 });
 
@@ -132,4 +162,11 @@ test('default progress uses stderr without changing JSON stdout or requiring an 
         expect(stderr.mock.calls.map(c=>c[0]).join('')).toContain('NOT_RUN=6');
         expect(stdout).not.toHaveBeenCalled();
     } finally { reporter.close(); stderr.mockRestore(); stdout.mockRestore(); }
+});
+
+test('a failed regression record emits a short warning after original scores are saved', () => {
+    const lines: string[] = [], reporter = cli.createProgressReporter(line => { lines.push(line); });
+    reporter.onProgress({ type: 'regression-record-error', executionId: 'controlled', error: 'Synthetic occupied writer' });
+    expect(lines.join('')).toContain('复测记录'); expect(lines.join('')).toContain('原成绩已保存');
+    reporter.close();
 });

@@ -717,7 +717,8 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
         // Merge only the original logical request. Terminal Run state and its current pointer are untouched.
         const request = structuredClone(original) as { -readonly [Key in keyof typeof original]: (typeof original)[Key] };
         if (update.kind === 'sdk-payload') {
-          const fact = { observedAt: update.at, inclusion: update.inclusion, reason: update.reason };
+          const fact = { observedAt: update.at, inclusion: update.inclusion, reason: update.reason,
+            ...(update.toolDefinitions === undefined ? {} : { toolDefinitions: update.toolDefinitions }) };
           if (request.sdkPayload !== null && !same(request.sdkPayload, fact)) return conflict();
           request.sdkPayload = fact;
         } else if (update.kind === 'attempt-prepared') {
@@ -725,6 +726,7 @@ export function createContextRepository(input: { db: Database; loadHistory(sessi
           const evidence = update.evidence, existing = request.attempts[evidence.attempt - 1];
           if (existing) {
             if (existing.preparedAt !== evidence.preparedAt || existing.wireInclusion !== evidence.wireInclusion || existing.wireReason !== evidence.wireReason
+              || !same(existing.toolDefinitions, evidence.toolDefinitions)
               || evidence.enteredAt !== null || evidence.responseAt !== null || evidence.responseStatus !== null
               || evidence.transportErrorCode !== null || evidence.nativeRequestId !== null) return conflict();
           } else {

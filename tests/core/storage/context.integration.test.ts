@@ -1047,12 +1047,17 @@ describe('P8 Context storage', () => {
     const input = { binding, api: 'openai-responses', transport: 'observed-fetch' as const, at };
     need(f.store.context.bindRequest(input)); need(f.store.context.bindRequest(input));
     expect(need(f.store.context.listContextRequests({ sessionId: f.session.sessionId,runId: f.runId })).items[0]?.sdkPayload).toBeNull();
-    const payload={kind:'sdk-payload' as const,at,inclusion:'confirmed' as const,reason:null};
+    const toolDefinitions=[{toolName:'calculate_invoice_amounts',properties:['operation','values','scale'],required:['operation','scale']}];
+    const payload={kind:'sdk-payload' as const,at,inclusion:'confirmed' as const,reason:null,toolDefinitions};
     need(f.store.context.recordRequest(binding,payload)); need(f.store.context.recordRequest(binding,payload));
+    expect(f.store.context.recordRequest(binding,{...payload,toolDefinitions:[]})).toMatchObject({ok:false,error:{code:'context_binding_conflict'}});
     expect(f.store.context.recordRequest(binding,{...payload,at:later})).toMatchObject({ok:false,error:{code:'context_binding_conflict'}});
     expect(f.store.context.bindRequest({ ...input, api: 'openai-completions' })).toMatchObject({ ok: false, error: { code: 'context_binding_conflict' } });
-    need(f.store.context.recordRequest(binding,{ kind: 'attempt-prepared', evidence: { attempt: 1, preparedAt: at, enteredAt: null,
-      responseAt: null,responseStatus: null,transportErrorCode: null,nativeRequestId: null,wireInclusion: 'confirmed',wireReason: null } }));
+    const prepared={ kind: 'attempt-prepared' as const, evidence: { attempt: 1, preparedAt: at, enteredAt: null,
+      responseAt: null,responseStatus: null,transportErrorCode: null,nativeRequestId: null,wireInclusion: 'confirmed' as const,wireReason: null,toolDefinitions } };
+    need(f.store.context.recordRequest(binding,prepared));need(f.store.context.recordRequest(binding,prepared));
+    expect(f.store.context.recordRequest(binding,{...prepared,evidence:{...prepared.evidence,toolDefinitions:[]}}))
+      .toMatchObject({ok:false,error:{code:'context_binding_conflict'}});
     need(f.store.context.recordRequest(binding,{ kind: 'response', attempt: 1, at: later, status: 200, nativeRequestId: null }));
     need(f.store.context.recordRequest(binding,{ kind: 'response', attempt: 1, at: later, status: 200, nativeRequestId: 'actual-id' }));
     need(f.store.context.recordRequest(binding,{ kind: 'response', attempt: 1, at: later, status: 200, nativeRequestId: null }));
@@ -1062,7 +1067,8 @@ describe('P8 Context storage', () => {
     expect(f.store.context.recordRequest(binding,{ kind: 'attempt-entered', attempt: 1, at }).ok).toBe(false);
     expect(f.store.db.query('SELECT context_observations_json FROM runs').get()).toEqual(before);
     const page = need(f.store.context.listContextRequests({ sessionId: f.session.sessionId, runId: f.runId }));
-    expect(page.items[0]?.attempts[0]).toMatchObject({ enteredAt: null, responseAt: later, nativeRequestId: 'actual-id' });
+    expect(page.items[0]?.sdkPayload?.toolDefinitions).toEqual(toolDefinitions);
+    expect(page.items[0]?.attempts[0]).toMatchObject({ enteredAt: null, responseAt: later, nativeRequestId: 'actual-id',toolDefinitions });
     expect(ContextRequestsResultSchema.safeParse({ ok: true, data: page }).success).toBe(true);
   });
   it('keeps retries and late observations on the original snapshot after Run termination', () => {

@@ -149,6 +149,8 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   rootSessionId = session.sessionId;
   const file = join(paths.runtimeDir, 'subagent-source.txt');
   childCalls = [{ name: 'read', args: { path: file } }, { name: 'read_invoice_document', args: { documentId: docId, page: 1, afterBlockId: null, limit: 10 } }];
+  // Enter the hung action first so unrelated reads do not consume the short delegation deadline.
+  if (options.delegateTimeout) childCalls = childCalls.filter(call => call.name === 'read_invoice_document');
   if (options.pureTools) childCalls = [
     { name: 'normalize_invoice_values', args: { items: [{ kind: 'decimal', raw: ' 113.00 ' }] } },
     { name: 'calculate_invoice_amounts', args: { operation: 'sum', values: ['100', '13'], scale: 2 } },

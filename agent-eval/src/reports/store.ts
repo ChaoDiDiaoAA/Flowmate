@@ -1,4 +1,4 @@
-import { legacyCompactRubric, legacyPlainRubric } from '../scoring/judges/packed.ts';
+import { legacyCompactRubric, legacyPlainRubric, legacyPackedRubric } from '../scoring/judges/packed.ts';
 import { atomicJson, publicVersions, publicReport, readPublicReport, saveEvidence } from './files.ts';
 import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -10,20 +10,26 @@ import type { EvaluationScore, JudgeCall, MetricPlan } from '../scoring/types.ts
 import { aggregateTrials, type TrialAggregation } from '../scoring/aggregate.ts';
 import { hash } from '../dataset-loader/local.ts';
 import { parseJudgment } from '../scoring/judges/harness.ts';
-import { compactPlanSchema, compactResultSchema, compactRubric, compactRubricFor, parseMetricJudgment, parseCompactJudgment,parseLegacyCompactJudgment, compactScores, type CompactPlan } from '../scoring/judges/compact.ts';
+import { compactPlanSchema, compactResultSchema, compactRubric, metricRubrics, metricPolicyFor, metricParsePolicy, normalizeMetricJson, parseStrictMetricJudgment, parseMetricJudgment, parseCompactJudgment,parseLegacyCompactJudgment, compactScores, type CompactPlan } from '../scoring/judges/compact.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { artifactJson, withoutHashes } from '../artifacts.ts';
 import { agentApiSchema, agentModelCapabilitiesSchema } from '../configuration.ts';
 import {researchFrameSchema,unavailableResearchCounts} from '../scoring/research-judgment.ts';
 import {hasNoResearchReport} from '../scoring/research-frame.ts';
+import { safeId } from './paths.ts';
+import { isSafetyMetric, localSafetyFailure } from '../scoring/safety.ts';
+import { regressionOriginListSchema, type RegressionOrigin } from '../dataset-loader/regression-origin.ts';
+import { deriveTrialStatistics, type TrialStatistics } from './trial-statistics.ts';
+export { safeId, reportPath } from './paths.ts';
 export type TrialReport = {
+    regressionOrigins?: RegressionOrigin[];
     caseId: string;
     caseVersion: number;
     caseHash: string;
     purpose?: 'capability'|'regression';
     caseName: string;
     category: string;
-    partition: 'smoke' | 'holdout';
+    partition: 'smoke' | 'holdout' | 'badcase';
     repetition: number;
     trialId: string;
     traceId: string;
@@ -38,8 +44,10 @@ export type TrialReport = {
     feedback: 'none';
 };
 export type LocalReport = {
+    executionKind?: 'controlled' | 'model';
     contract: 'flowmate-agent-run/v1' | 'flowmate-agent-run/v2';
     aggregation?: TrialAggregation;
+    trialStatistics?: TrialStatistics;
     executionId: string;
     code?: {
         commit: string;
@@ -103,34 +111,38 @@ const executionSchema = z.object({ identity: z.object({ executionId: text, trial
     startedAt: timestamp.nullable(), endedAt: timestamp.nullable(),
     error: z.object({ code: text, message: z.string(), infrastructure: z.boolean() }).strict().optional() }).strict();
 // Legacy v1 calls lack completion metadata; preserve their fields without inventing a modern completion proof.
-const legacyJudgeConfigurationSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatible']), model: text,
+export const legacyJudgeConfigurationSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatible']), model: text,
     baseUrl: z.string().url(), temperature: z.number().finite().min(0).max(2).optional(), maxTokens: positive.optional(), timeoutMs: positive, configHash: text.optional(),
     modelCapabilities: z.object({modelId:text,maxOutputTokens:positive,source:z.enum(['anthropic-models-api','deepseek-models-api'])}).strict().optional(),
     protocolVersion: text.optional(), rubric: z.object({ id: text, version: positive, hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().optional()
     }).strict();
-const sdkJudgeConfigurationSchema = legacyJudgeConfigurationSchema.omit({temperature:true,maxTokens:true,modelCapabilities:true}).extend({
+export const sdkJudgeConfigurationSchema = legacyJudgeConfigurationSchema.omit({temperature:true,maxTokens:true,modelCapabilities:true}).extend({
     provider:z.enum(['anthropic','openai-compatible']).optional(),api:agentApiSchema,
     sdk:z.object({codingAgent:text,ai:text}).strict(),modelCapabilities:agentModelCapabilitiesSchema.optional()
 });
 const judgeCallBase = z.object({ callId: text, startedAt: timestamp, endedAt: timestamp, attempts: integer.max(1),
     usage: z.unknown(), responseModel: z.unknown(), raw: z.string().nullable(), error: z.string().nullable(),
+    transportStatus:z.number().int().min(100).max(599).nullable().optional(),
     judgment: z.object({ score: z.number().finite().min(0).max(1), reason: text }).strict().nullable(),
     request: z.object({ system: z.string(), data: z.string(), hash: z.string().regex(/^[a-f0-9]{64}$/).optional(), redacted: z.boolean() }).strict().optional(),
     compact: z.object({ plan: compactPlanSchema, judgment: compactResultSchema.nullable(), format: z.literal('metric-id/v1').optional(),
-        validationErrors: z.record(text).optional() }).strict().optional() }).strict();
-const judgeCallSchema = z.union([
+        validationErrors: z.record(text).optional(),parsePolicy:z.literal(metricParsePolicy).optional(),
+        normalization:z.enum(['none','markdown-fence']).optional() }).strict().optional() }).strict();
+export const judgeCallSchema = z.union([
     judgeCallBase.extend({ configuration: legacyJudgeConfigurationSchema, finishReason: z.string().nullable().optional(), responseComplete: z.boolean().optional() }),
     judgeCallBase.extend({ configuration: sdkJudgeConfigurationSchema, stopReason: z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']).nullable(),
         rawStopReason: z.string().nullable(), usageSource: z.enum(['sdk', 'unknown']), responseComplete: z.boolean() })
 ]);
 const trialSchema = z.object({ caseId: text, caseVersion: positive, caseHash: text.optional(), caseName: text, category: text, purpose:z.enum(['capability','regression']).optional(),
-    partition: z.enum(['smoke', 'holdout']), repetition: positive, trialId: text, traceId: z.string().regex(/^[a-f0-9]{32}$/),
+    partition: z.enum(['smoke', 'holdout', 'badcase']), regressionOrigins: regressionOriginListSchema.optional(), repetition: positive, trialId: text, traceId: z.string().regex(/^[a-f0-9]{32}$/),
     status, reason: z.string(), counts: z.record(integer), execution: executionSchema.nullable(), scores: z.array(scoreSchema),
     metricPlan: z.array(z.object({ metricId: text, version: positive, unit: text, denominator: integer.nullable().optional(),
         notApplicable: text.optional() }).strict()).optional(), semanticPlan: compactPlanSchema.optional(),
     judgeCalls: z.array(judgeCallSchema).max(1), feedback: z.literal('none') }).strict();
 const reportSchema = z.object({ contract: z.enum(['flowmate-agent-run/v1', 'flowmate-agent-run/v2']), executionId: text,
+    executionKind: z.enum(['controlled', 'model']).optional(),
     aggregation: z.unknown().optional(),
+    trialStatistics: z.unknown().optional(),
     code: z.object({ commit: text.optional(), workspaceHash: text.optional(), release: text, dirty: z.boolean() }).strict().optional(), userId: text.optional(),
     dataset: z.object({ id: text, version: positive, hash: text.optional(), subject: z.literal('agent') }).strict(), selection: z.enum(['smoke', 'holdout', 'full', 'case']),
     environment: text, startedAt: timestamp, endedAt: timestamp.nullable(), repeat: positive.max(20), executionComplete: z.boolean(),
@@ -158,6 +170,8 @@ function validateReport(value: unknown): asserts value is LocalReport {
         throw new Error('Smoke Trial cannot appear in holdout selection');
     safeId(report.executionId);
     for (const trial of report.trials) {
+        if (trial.regressionOrigins && !report.executionKind) throw Error('Regression origins require an execution kind');
+        if ((trial.partition === 'badcase') !== !!trial.regressionOrigins) throw Error('Supplemental partition requires its original regression links');
         const member = JSON.stringify([trial.caseId, trial.caseVersion, trial.caseHash, trial.repetition]);
         if (trials.has(trial.trialId) || traces.has(trial.traceId) || members.has(member) || trial.repetition > report.repeat)
             throw new Error('Duplicate or out-of-plan Trial identity');
@@ -172,7 +186,13 @@ function validateReport(value: unknown): asserts value is LocalReport {
                 metric.unit !== criterion.unit || metric.denominator !== criterion.denominator)
                 throw new Error('Declared semantic criterion differs from its metric opportunity plan');
         }
-        const local=trial.scores.filter(s=>s.method==='deterministic'&&trial.semanticPlan?.criteria.some(c=>c.metricId===s.metricId));
+        const deterministic=trial.scores.filter(s=>s.method==='deterministic'&&trial.semanticPlan?.criteria.some(c=>c.metricId===s.metricId));
+        for(const score of deterministic.filter(s=>isSafetyMetric(s.metricId))){
+            const criterion=trial.semanticPlan!.criteria.find(c=>c.metricId===score.metricId)!;
+            const original=trial.execution&&localSafetyFailure(criterion,trial.execution);
+            if(!original||!isDeepStrictEqual(score,original))throw Error('Local safety measurement contradicts its original scoped effects');
+        }
+        const local=deterministic.filter(s=>!isSafetyMetric(s.metricId));
         if(local.length){
             const frames=local.flatMap(s=>(s.actual as any)?.researchFrame?[(s.actual as any).researchFrame]:[]);
             if(frames.length!==1||!trial.execution?.started||trial.execution.error?.infrastructure)throw Error('Local research measurement lacks its original frame');
@@ -196,6 +216,9 @@ function validateReport(value: unknown): asserts value is LocalReport {
         for (const call of trial.judgeCalls) {
             if (calls.has(call.callId)) throw new Error('Duplicate Judge call identity');
             calls.add(call.callId);
+            if(call.transportStatus!==undefined&&(call.attempts===0&&call.transportStatus!==null||
+                call.transportStatus!==null&&call.transportStatus>=400&&(call.responseComplete||call.error===null)))
+                throw Error('Judge transport status contradicts its original attempt or completion');
             const { configHash, ...parameters } = call.configuration;
             if (configHash && hash(parameters) !== configHash) throw new Error('Stored Judge configuration hash does not match its parameters');
             if (report.scoringConfiguration.rubrics) {
@@ -219,12 +242,17 @@ function validateReport(value: unknown): asserts value is LocalReport {
                     throw new Error('Stored Judge judgment contradicts original completion or text');
             }
             if (call.compact) {
-                const rubric=[legacyCompactRubric,legacyPlainRubric,compactRubric].find(r=>call.request?.system===r.prompt)??compactRubricFor(call.compact.plan);
-                if (report.contract !== 'flowmate-agent-run/v2' || !call.request || call.request.system !== rubric.prompt || call.judgment !== null)
+                const rubric=[legacyCompactRubric,legacyPlainRubric,legacyPackedRubric,compactRubric,...metricRubrics].find(r=>call.request?.system===r.prompt);
+                if (report.contract !== 'flowmate-agent-run/v2' || !call.request || !rubric || call.judgment !== null)
                     throw new Error('Compact Judge needs its original versioned input and exclusive judgment');
                 if (call.configuration.rubric?.hash && !isDeepStrictEqual(call.configuration.rubric, { id: rubric.id, version: rubric.version, hash: hash(call.request.system) }))
                     throw new Error('Compact Judge Rubric differs from declared scoring configuration');
                 const named = rubric.id.startsWith('semantic-metrics-');
+                const parsePolicy=metricPolicyFor(rubric);
+                const normalization=call.raw!==null&&call.responseComplete?normalizeMetricJson(call.raw).normalization:'none';
+                if(call.compact.parsePolicy!==parsePolicy||(parsePolicy?
+                    call.compact.normalization!==normalization||call.transportStatus===undefined:call.compact.normalization!==undefined))
+                    throw Error('Judge parsing policy or normalization contradicts the original template and response');
                 if (named !== (call.compact.format==='metric-id/v1') || named &&
                     (call.configuration.rubric?.id!==rubric.id || call.configuration.rubric?.version!==rubric.version || !call.compact.validationErrors) ||
                     !named && call.compact.validationErrors!==undefined)
@@ -232,7 +260,7 @@ function validateReport(value: unknown): asserts value is LocalReport {
                 const input = JSON.parse(call.request.data);
                 if (!isDeepStrictEqual(input.plan, call.compact.plan)) throw new Error('Compact Judge plan differs from its original request');
                 const parsed = call.compact.judgment!==null && call.raw!==null ? named
-                    ? parseMetricJudgment(call.raw,call.compact.plan,input.evidence?.researchFrame)
+                    ? (parsePolicy?parseStrictMetricJudgment:parseMetricJudgment)(call.raw,call.compact.plan,input.evidence?.researchFrame)
                     : {judgment:call.request.system === legacyCompactRubric.prompt ? parseLegacyCompactJudgment(call.raw,call.compact.plan) : parseCompactJudgment(call.raw,call.compact.plan,input.evidence?.researchFrame),validationErrors:undefined} : null;
                 if (call.compact.judgment !== null && (!call.responseComplete || call.attempts !== 1 || call.error !== null || call.raw === null ||
                     !isDeepStrictEqual(parsed?.judgment, call.compact.judgment) || named && !isDeepStrictEqual(parsed?.validationErrors,call.compact.validationErrors)) ||
@@ -264,13 +292,9 @@ function validateReport(value: unknown): asserts value is LocalReport {
         throw new Error('Legacy v1 report cannot claim inferred v2 aggregation');
     if (report.contract === 'flowmate-agent-run/v2' && JSON.stringify(withoutHashes(report.aggregation)) !== JSON.stringify(withoutHashes(aggregateTrials(value as LocalReport))))
         throw new Error('Stored aggregation differs from original Trial records');
+    if (report.trialStatistics !== undefined && !isDeepStrictEqual(withoutHashes(report.trialStatistics), withoutHashes(deriveTrialStatistics(value as LocalReport))))
+        throw new Error('Trial statistics differ from original Trial records');
 }
-export function safeId(value: string) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value))
-        throw new Error('Invalid execution ID');
-    return value;
-}
-export function reportPath(repo: string, id: string) { const root=join(repo,'agent-eval/runs',safeId(id));return existsSync(join(root,'report.json'))?join(root,'report.json'):join(root,'summary.json'); }
 export function saveReport(path: string, report: LocalReport) {
     if (report.contract === 'flowmate-agent-run/v2') report.aggregation = aggregateTrials(report);
     JSON.stringify(report, (_, value) => {
@@ -284,7 +308,7 @@ export function saveReport(path: string, report: LocalReport) {
         const bytes=readFileSync(path,'utf8'),prior=JSON.parse(bytes);
         if (removeLegacyMetadata(prior)) throw Error('Historical reports are read-only');
         if(prior.endedAt===null&&reportRevisions.has(report)&&reportRevisions.get(report)!.hash!==hash(bytes))throw Error('Stale open report');
-        const plan=(r:any)=>JSON.stringify({dataset:r.dataset,selection:r.selection,environment:r.environment,startedAt:r.startedAt,repeat:r.repeat,scoring:r.scoringConfiguration,members:r.trials.map((t:any)=>[t.caseId,t.caseVersion,t.repetition,t.trialId,t.traceId,t.metricPlan,t.semanticPlan])});
+        const plan=(r:any)=>JSON.stringify({dataset:r.dataset,executionKind:r.executionKind,selection:r.selection,environment:r.environment,startedAt:r.startedAt,repeat:r.repeat,scoring:r.scoringConfiguration,members:r.trials.map((t:any)=>[t.caseId,t.caseVersion,t.repetition,t.trialId,t.traceId,t.metricPlan,t.semanticPlan,t.partition,t.regressionOrigins])});
         if(plan(prior)!==plan(record))throw Error('Declared report identity or Trial plan cannot be overwritten');
         if(prior.endedAt!==null&&JSON.stringify(prior)!==JSON.stringify(record))throw Error('Completed report facts are immutable');
         if(prior.endedAt!==null){
@@ -326,6 +350,7 @@ export function summary(report: LocalReport) {
     return { capability: count(report.trials.filter(t=>t.purpose==='capability')), regression: count(report.trials.filter(t=>t.purpose==='regression')), all: count(report.trials), smoke: count(report.trials.filter(t => t.partition === 'smoke')), holdout: count(report.trials.filter(t => t.partition === 'holdout')) };
 }
 export function comparison(left: LocalReport, right: LocalReport) {
+    if (left.executionKind !== right.executionKind) throw Error('Comparison requires identical execution kind');
     const declaration=(report:LocalReport)=>{const root=reportRevisions.get(report)?.path;if(!root)return undefined;const file=join(dirname(root),'snapshot.json');return existsSync(file)?JSON.parse(readFileSync(file,'utf8')):undefined;};
     const l=declaration(left),r=declaration(right);if((l||r)&&!isDeepStrictEqual(l,r))throw Error('Comparison requires identical snapshot declarations and parameters');
     if (left.contract !== right.contract || left.dataset.hash !== right.dataset.hash || left.repeat !== right.repeat || left.environment !== right.environment ||

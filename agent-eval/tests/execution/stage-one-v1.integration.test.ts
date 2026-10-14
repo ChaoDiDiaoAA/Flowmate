@@ -20,7 +20,7 @@ test('v1 output uses references, cleans a stopped scene and saves optional recei
   return {input:trial.input,execute:async()=>e,snapshot:async()=>e,cancel:async()=>{},close:async()=>({present:true,actual:{closed:true,stopped:true},source:'synthetic-stop'})};
  }}});
  const root=dirname(run.file),t=run.report.trials[0]!,evidence=join(root,'evidence',t.trialId);
- expect(readdirSync(root).sort()).toEqual(['evidence','report.json','snapshot.json']);
+ expect(readdirSync(root).sort()).toEqual(['badcases.json','badcases.md','evidence','report.json','snapshot.json']);
  expect(readdirSync(evidence).sort()).toEqual(['events.jsonl','observation.json','trial.json']);
  expect(existsSync(dirname(working))).toBe(false);expect(platformCalls).toBe(0);
  const disk=JSON.parse(readFileSync(run.file,'utf8'));expect(disk.dataset.version).toBe('v1');

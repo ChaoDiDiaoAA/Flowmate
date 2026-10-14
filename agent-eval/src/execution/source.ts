@@ -52,9 +52,9 @@ export function changedSourcePaths(before: object, after: object) {
 export function runtimeSourceConditions(repo:string) {
     const files=['packages/core/src/tools/executor.ts','packages/core/src/tools/evaluation-fault.ts',
         'packages/contracts/src/ports.ts','packages/contracts/src/runtime.ts','packages/contracts/src/tool-evidence.ts',
-        'packages/runtime-pi/src/session.ts',
+        'packages/runtime-pi/src/session.ts','packages/runtime-pi/src/schema.ts','packages/employee-invoice/src/tools/calculate_invoice_amounts.ts',
         'agent-eval/src/scoring/evaluators/invoice-values.ts','agent-eval/src/scoring/evaluators/reference-fields.ts',
-        'agent-eval/src/scoring/evaluators/line-items.ts','agent-eval/src/scoring/evaluators/semantic.ts',
+        'agent-eval/src/scoring/evaluators/line-items.ts','agent-eval/src/scoring/evaluators/semantic.ts','agent-eval/src/scoring/safety.ts',
         'agent-eval/src/scoring/judges/compact.ts','agent-eval/src/scoring/judges/harness.ts',
         'agent-eval/src/scoring/research-frame.ts','agent-eval/src/scoring/research-judgment.ts',
         'agent-eval/src/adapters/research-integrity.ts','agent-eval/src/artifacts.ts','packages/shared/src/decimal.ts',

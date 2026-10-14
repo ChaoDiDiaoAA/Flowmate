@@ -1472,8 +1472,8 @@ describe('PiAgentAdapter', () => {
     expect(app.requests).toHaveLength(1);
     expect(outcome.error).toMatchObject({ code: 'provider_request_rejected', category: 'provider', retryable: false });
     expect(outcome.error?.message).toContain('HTTP 400');
-    expect(outcome.error?.message).toContain('fixture failure');
-    expect(outcome.error?.message).toContain('Bearer [REDACTED]');
+    expect(outcome.error?.message).not.toContain('fixture failure');
+    expect(outcome.error?.message).not.toContain('Bearer');
     expect(outcome.error?.message).not.toContain('top-secret');
     expect(outcome.error?.message).not.toContain('sk-abcdefghijklmnopqrstuvwxyz0123456789');
   });

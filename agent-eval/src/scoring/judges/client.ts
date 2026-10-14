@@ -85,17 +85,20 @@ export async function requestJudge(config: JudgeConfig, system: string, data: st
     config = await prepareJudge(config, fetcher, signal);
     const { observedFetch, normalizeUsage } = await import('../../../../packages/runtime-pi/src/model-runtime.ts');
     const { runtime, model } = prepared.get(config)!.model;
-    return withJudgeTimeout(config, signal, async signal => {
+    let transportStatus:number|null=null;
+    try{return await withJudgeTimeout(config, signal, async signal => {
         const message = await runtime.completeSimple(model, { systemPrompt: system,
             messages: [{ role: 'user', content: data, timestamp: Date.now() }] }, {
             signal, timeoutMs: config.timeoutMs, maxRetries: 0,
-            fetch: observedFetch(config.api, (url, init) => fetcher(String(url), init ?? {})) });
+            fetch: observedFetch(config.api, async (url, init) => {
+                const response=await fetcher(String(url),init??{});transportStatus=response.status;return response;
+            }) });
         const blocks = message.content.filter(block => block.type === 'text');
         const responseComplete = message.stopReason === 'stop' && !message.errorMessage && !message.content.some(block => block.type === 'toolCall');
         return { text: blocks.length ? blocks.map(block => block.text).join('') : null, usage: message.usage,
             usageSource: normalizeUsage(message, { attempts: 1, complete: responseComplete }, false).usage.source === 'sdk' ? 'sdk' as const : 'unknown' as const,
             responseModel: message.responseModel ?? null, stopReason: message.stopReason,
-            rawStopReason: message.rawStopReason ?? null, responseComplete,
+            rawStopReason: message.rawStopReason ?? null, responseComplete,transportStatus,
             error: signal.aborted ? (signal.reason as Error).message : message.errorMessage ?? null };
-    });
+    });}catch(error){throw Object.assign(error instanceof Error?error:Error(String(error)),{transportStatus});}
 }

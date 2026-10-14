@@ -240,6 +240,19 @@ describe('P8 Context strict contracts', () => {
       sdkPayload: { observedAt: at, inclusion: 'unavailable', reason: 'payload_codec_unavailable' } }).success).toBe(true);
   });
 
+  it('keeps old tool definition observations absent and accepts only bounded strict independent witnesses', () => {
+    const validator=schema('ContextRequestEvidenceSchema');
+    expect(validator.parse(request)).toEqual(request);
+    const toolDefinitions=[{toolName:'calculate_invoice_amounts',properties:['operation','scale'],required:['operation','scale']}];
+    expect(validator.safeParse({...request,sdkPayload:{observedAt:at,inclusion:'confirmed',reason:null,toolDefinitions},
+      attempts:[{...attempt,toolDefinitions}]}).success).toBe(true);
+    for(const bad of [[{...toolDefinitions[0],required:['unknown']}],[{...toolDefinitions[0],properties:['operation','operation']}],
+      [{...toolDefinitions[0],schema:{private:'body'}}],Array.from({length:129},()=>toolDefinitions[0])]) {
+      expect(validator.safeParse({...request,attempts:[{...attempt,toolDefinitions:bad}]}).success).toBe(false);
+    }
+    expect(schema('ContextSafeErrorCodeSchema').safeParse('provider_billing_failed').success).toBe(true);
+  });
+
   it('separates prepared entered response and transport failure facts', () => {
     const validator = schema('ContextTransportEvidenceSchema');
     expect(validator.safeParse(attempt).success).toBe(true);

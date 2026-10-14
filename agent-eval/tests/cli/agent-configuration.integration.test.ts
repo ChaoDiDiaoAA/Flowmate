@@ -66,7 +66,7 @@ test('an unknown CLI model override fails before execution records, Judge or pla
             await expect(main(['run', '--dataset', dataset.manifest.id, '--model', 'unregistered-evaluation-alias',
                 '--execution-id', 'unknown-native-model', '--judge', 'off'], fixtureRepo)).rejects.toThrow('absent from the Pi SDK catalog');
             expect(requests).toBe(0);
-            expect(existsSync(join(fixtureRepo, 'agent-eval/runs/unknown-native-model'))).toBe(false);
+            expect(existsSync(join(fixtureRepo, 'agent-eval/runs/business/unknown-native-model'))).toBe(false);
         } finally { network.mockRestore(); }
     });
 }, 20000);
@@ -97,5 +97,5 @@ test('a fresh CLI process never echoes a file-only key in an invalid API overrid
         expect(result.stderr).toMatch(/api|argument/i);
         expect(result.stderr + result.stdout).not.toContain(key);
     }
-    expect(existsSync(join(fixtureRepo, 'agent-eval/runs/file-only-error'))).toBe(false);
+    expect(existsSync(join(fixtureRepo, 'agent-eval/runs/business/file-only-error'))).toBe(false);
 }, 25000);

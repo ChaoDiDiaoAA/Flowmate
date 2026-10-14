@@ -169,7 +169,7 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
         const metric=formalMetric(plan.metricId),base={metricId:metric.id,name:metric.name,version:metric.version,method:rule.method,required:metric.id==='task-success',evidence:rule.evidence};
         if(plan.notApplicable)return[{...base,value:null,status:'NOT_APPLICABLE' as const,reason:plan.notApplicable,statistics:{unit:metric.unit,numerator:null,denominator:null,missing:null}}];
         if(task.expected.semantic?.criteria.some(c=>c.metricId===metric.id)||context.semanticPlan?.criteria.some(c=>c.metricId===metric.id))return[];
-        if(rule.method!=='deterministic')return[{...base,required:['completion-verification','false-completion'].includes(metric.id),value:null,status:'NOT_RUN',reason:'适用语义判据未冻结，不能用通用相关性代替',
+        if(rule.method!=='deterministic')return[{...base,required:['completion-verification','false-completion'].includes(metric.id),value:null,status:'NOT_RUN',reason:'适用语义判据尚未声明，不能用通用相关性代替',
             statistics:{unit:metric.unit,numerator:null,denominator:plan.denominator??null,missing:plan.denominator??null}}];
         const measured=result.started?values(metric.id):undefined;
         const completeKeys=metric.id==='tool-execution'||metric.id==='runtime-admission'?['tool-evidence','runs']:
@@ -181,8 +181,10 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
         const mismatch=measured!==undefined&&denominator!==null&&measured.length>denominator;
         const missing=denominator===null?null:measured?Math.max(0,denominator-measured.length)+measured.filter(v=>v===null).length:denominator;
         const failure=measured?.some(v=>v===false)??false;
-        const status:EvaluationScore['status']=!result.started?'NOT_RUN':result.error?.infrastructure?'ERROR':mismatch?'ERROR':failure?'FAIL':missing===0&&denominator!==null&&denominator>0?'PASS':'UNJUDGEABLE';
-        return[{...base,status,value:status==='PASS'||status==='FAIL'&&missing===0?numerator!/denominator!:null,reason:mismatch?'原机会数超过冻结分母':'原单位逐项核对；已知失败保留，缺证与未暴露不记成功',
+        const witnessedFailure=failure&&(metric.id!=='task-success'||context.gradedScores?.some(s=>isRequiredScore(s)&&s.status==='FAIL'));
+        const knownSuccess=missing===0&&denominator!==null&&denominator>0&&!failure;
+        const status:EvaluationScore['status']=!result.started?'NOT_RUN':mismatch?'ERROR':witnessedFailure?'FAIL':knownSuccess?'PASS':result.error?.infrastructure?'ERROR':failure?'FAIL':'UNJUDGEABLE';
+        return[{...base,status,value:status==='PASS'||status==='FAIL'&&missing===0?numerator!/denominator!:null,reason:mismatch?'原机会数超过事前声明分母':'原单位逐项核对；已知失败保留，缺证与未暴露不记成功',
             ...(mismatch?{actual:{observedOpportunities:measured!.length,observedNumerator:numerator,expectedDenominator:denominator}}:{}),
             statistics:{unit:metric.unit,numerator:mismatch?null:numerator,denominator,missing:mismatch?denominator:missing}}];
     });

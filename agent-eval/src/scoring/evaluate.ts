@@ -15,7 +15,7 @@ export async function evaluateAll(context: EvaluationContext, checks: Check[], r
             if(!plan.metricId.startsWith('DR')||semantic.scores.some(score=>score.metricId===plan.metricId)||plan.metricId==='DR03'&&!plan.notApplicable)return[];
             const metric=formalMetric(plan.metricId);
             return[{metricId:metric.id,name:metric.name,version:metric.version,method:metric.id==='DR03'?'deterministic':'llm-judge',required:!plan.notApplicable,
-                value:null,status:plan.notApplicable?'NOT_APPLICABLE':context.result.error?.infrastructure?'ERROR':'NOT_RUN',reason:plan.notApplicable??'适用研究判据未冻结，独立匹配尚未执行',evidence:['research','gold-research'],
+                value:null,status:plan.notApplicable?'NOT_APPLICABLE':context.result.error?.infrastructure?'ERROR':'NOT_RUN',reason:plan.notApplicable??'适用研究判据尚未声明，独立匹配尚未执行',evidence:['research','gold-research'],
                 statistics:{unit:metric.unit,numerator:null,denominator:plan.denominator??null,missing:plan.denominator??null}}];
         }):[];
         const graded = [...scores, ...semantic.scores,...researchGaps, ...evaluateCaseConstraints(context)];

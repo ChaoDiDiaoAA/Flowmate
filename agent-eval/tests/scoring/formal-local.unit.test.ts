@@ -65,6 +65,16 @@ test('incomplete collection retains known execution failure without inventing it
     const context=fixture('tool-execution');originalFacts(context,[originalTool(true)]);context.result.evidence['tool-evidence']!.present=false;
     expect(evaluateFormalMetrics(context).find(s=>s.metricId==='tool-execution')).toMatchObject({status:'FAIL',value:null,statistics:{numerator:0,denominator:null,missing:null}});
 });
+test('a later provider billing failure does not erase an independently witnessed tool failure',()=>{
+    const context=fixture('tool-execution');originalFacts(context,[originalTool(true)]);
+    context.result.error={code:'provider_billing_failed',message:'Provider billing unavailable',infrastructure:true};
+    expect(evaluateFormalMetrics(context).find(s=>s.metricId==='tool-execution')).toMatchObject({status:'FAIL',value:0});
+});
+test('a later provider billing failure preserves an independently completed successful tool measurement',()=>{
+    const context=fixture('tool-execution');originalFacts(context,[originalTool()]);
+    context.result.error={code:'provider_billing_failed',message:'Provider billing unavailable',infrastructure:true};
+    expect(evaluateFormalMetrics(context).find(s=>s.metricId==='tool-execution')).toMatchObject({status:'PASS',value:1});
+});
 test('observed opportunities exceeding a declared denominator are an explicit grading error with valid counts',()=>{
     const context=fixture('tool-execution');context.task.expected.metrics.find(m=>m.metricId==='tool-execution')!.denominator=1;
     const second=originalTool();second.toolCallId=2;second.nativeToolCallId='second';originalFacts(context,[originalTool(),second]);

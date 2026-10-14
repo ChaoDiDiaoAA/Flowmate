@@ -278,7 +278,7 @@ test('one compact Judge record binds distinct semantic counts to their original 
     const config = judgeConfig({ FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_API:'openai-completions', FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
         FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-judge-key' })!;
     const call = await runCompactJudge(config, plan, { original: 'synthetic' }, async () => judgeResponse({
-        choices: [{ message: { content: namedJudgment(plan,'{"v":1,"r":[[2,3,0],[1,4,1]],"f":[[1,2,1]]}') }, finish_reason: 'stop' }] }));
+        choices: [{ message: { content: namedJudgment(plan,'{"v":1,"r":[[2,3,0],[1,4,1]],"f":[[0,2,1],[1,2,1],[1,3,4]]}') }, finish_reason: 'stop' }] }));
     const trial = report.trials[0]!;
     trial.semanticPlan = structuredClone(plan);
     trial.judgeCalls = [call]; trial.scores.push(...compactScores(call));

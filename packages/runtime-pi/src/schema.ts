@@ -129,6 +129,18 @@ export function toPiParameters(schema: z.ZodTypeAny): TSchema {
   const def = nodeDefinition(schema);
   if (def.typeName !== 'ZodUnion') return parameters;
   if (!def.options?.every((option) => nodeDefinition(option).typeName === 'ZodObject')) return unsupported();
-  // Object unions need an explicit root type for Responses APIs; anyOf still enforces each branch.
-  return { ...parameters, type: 'object' } as TSchema;
+  const branches = (parameters as TSchema & { anyOf: Array<TSchema & { properties: Record<string, TSchema>; required?: string[] }> }).anyOf;
+  const variants = new Map<string, TSchema[]>();
+  for (const branch of branches) {
+    for (const [key, property] of Object.entries(branch.properties)) {
+      const values = variants.get(key) ?? [];
+      if (!values.some(value => JSON.stringify(value) === JSON.stringify(property))) values.push(property);
+      variants.set(key, values);
+    }
+  }
+  const properties = Object.fromEntries([...variants].map(([key, values]) => [key, values.length === 1 ? values[0]!
+    : Type.Union(values as [TSchema, TSchema, ...TSchema[]])]));
+  const required = ((branches[0]!.required ?? []) as string[]).filter(key => branches.every(branch => (branch.required ?? []).includes(key)));
+  // Anthropic's non-strict converter reads only root properties/required; local Zod still enforces each branch.
+  return { ...parameters, type: 'object', properties, required, additionalProperties: false } as TSchema;
 }

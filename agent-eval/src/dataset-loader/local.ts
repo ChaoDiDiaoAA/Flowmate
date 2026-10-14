@@ -4,6 +4,7 @@ import { existsSync, readFileSync, realpathSync, readdirSync, lstatSync, mkdirSy
 import { resolve, relative, isAbsolute, join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { regressionOriginsSchema, type RegressionOrigin } from './regression-origin.ts';
 import { decodeFile, type FlatDataset } from './flat.ts';
 import {saveDeliveryLossControllerSchema,readExecutionFailureControllerSchema,saveCancelRaceControllerSchema} from './schema.ts';
 import { ExtensionEvaluationProfileSchema } from '../../../packages/contracts/src/extensions.ts';
@@ -13,6 +14,7 @@ import { caseSchema, caseV2Schema, manifestSchema, steerControllerSchema, future
 export { caseSchema, caseV2Schema, checkSchema, manifestSchema, metricIds } from './schema.ts';
 export type { LocalCase, Check } from './schema.ts';
 export type LocalDataset = {
+    regressionOrigins?: Record<string, RegressionOrigin[]>;
     root: string;
     manifest: z.infer<typeof manifestSchema>;
     cases: LocalCase[];
@@ -99,7 +101,11 @@ export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: Flat
                 groups.set(key, smoke);
             }
         }
-    const dataset: LocalDataset = { root, manifest, cases, hash: embedded?.hash ?? hash({ manifest, cases }), ...(embedded ? { embedded } : {}) };
+    const origins = embedded?.regressionOrigins;
+    if (manifest.suite === 'badcase' && (!origins || JSON.stringify(Object.keys(origins).sort()) !== JSON.stringify(cases.map(c => c.id).sort())))
+        throw Error('Supplemental Dataset requires original regression links');
+    if (origins) regressionOriginsSchema.parse(origins);
+    const dataset: LocalDataset = { root, manifest, cases, hash: embedded?.hash ?? hash({ manifest, cases }), ...(embedded ? { embedded } : {}), ...(origins ? { regressionOrigins: origins } : {}) };
     return dataset;
 }
 export function assertSemanticSelection(dataset: Pick<LocalDataset, 'manifest' | 'cases'>, requireJudge = false) {
@@ -226,6 +232,7 @@ export function restoreCaseInputs(dataset: LocalDataset, task: LocalCase, direct
 }
 export function selectCases(dataset: LocalDataset, selection: 'smoke' | 'holdout' | 'full' = 'full', caseId?: string) {
     if (!['smoke', 'holdout', 'full'].includes(selection)) throw new Error('Invalid selection');
+    if (dataset.manifest.suite === 'badcase' && selection !== 'full') throw Error('Badcase 专项仅支持 full 或单题选择');
     if (caseId) {
         const task = dataset.cases.find(c => c.id === caseId);
         if (!task)

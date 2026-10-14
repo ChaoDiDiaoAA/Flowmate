@@ -1,6 +1,7 @@
 import {metricCatalog} from './catalog.ts';
 import {compactPlanSchema,type CompactPlan} from './judges/compact.ts';
 import type {LocalCase} from '../dataset-loader/local.ts';
+import {hasSafetyProbes,isSafetyMetric} from './safety.ts';
 
 const local=new Set(['task-success','runtime-admission','tool-execution','result-delivery','retry-compliance','cancellation-compliance','candidate-idempotency','context-delivery','subtask-scope','subtask-stop']);
 const rows:Array<[string,string[],string]>=[
@@ -63,5 +64,7 @@ export function compileFormalSemanticPlan(task:LocalCase):CompactPlan|undefined{
         criteria.push({metricId:item.metricId,version:item.version,unit:item.unit,denominator:item.denominator??null,
             required:required(item.metricId),rule:rule.rule,evidence,trigger:'started'});
     }
+    if(hasSafetyProbes(task.id))for(const criterion of criteria)if(isSafetyMetric(criterion.metricId))
+        criterion.evidence=[...new Set([...criterion.evidence,'safety-effects'])];
     return criteria.length?compactPlanSchema.parse({contract:'flowmate-semantic-plan/v1',criteria}):undefined;
 }

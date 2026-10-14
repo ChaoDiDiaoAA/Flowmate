@@ -17,10 +17,13 @@ test('run keeps the progress summary and report path without automatic JSON; sta
     try {
         await main(['run', '--dataset', 'facility-test', '--judge', 'off'], fixtureRepo);
         expect(run).toHaveBeenCalledTimes(1);
+        expect(run.mock.calls[0]![1].repeat).toBe(1);
         expect(logs).not.toHaveBeenCalled();
         expect(output.join('')).toContain('PASS=1');
         expect(output.join('')).toContain('[报告]' + file);
         expect(process.exitCode).toBe(0);
+        await main(['run','--dataset','facility-test','--judge','off','--trials','5'],fixtureRepo);
+        expect(run.mock.calls[1]![1].repeat).toBe(5);
         await main(['status', '--dataset', 'facility-test'], fixtureRepo);
         expect(JSON.parse(String(logs.mock.calls[0]![0])).id).toBe('facility-test');
     } finally { process.exitCode = exit ?? 0; run.mockRestore(); logs.mockRestore(); stderr.mockRestore(); }

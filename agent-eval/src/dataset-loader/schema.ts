@@ -53,7 +53,7 @@ export const caseSchema = caseBase.superRefine((value,context)=>{
 });
 const manifestV1 = z.object({
     contract: z.literal('flowmate-agent-dataset/v1'), id, version: z.number().int().positive(), name: z.string().min(1),
-    members: z.array(z.string().min(1)).min(1), smoke: z.array(id).min(1),
+    members: z.array(z.string().min(1)).min(1), smoke: z.array(id), suite: z.enum(['baseline', 'badcase']).optional(),
     environment: z.object({ profile: z.literal('isolated-agent/v1'), source: z.literal('voxel51'), risks: z.array(z.string().min(1)).min(1) }).strict(),
     scoring: z.object({ version: z.number().int().positive(), required: z.array(z.enum(metricIds)), judges: z.array(z.object({ id: z.literal('answer-relevance'), required: z.boolean(), requiredFor: z.array(id).optional() }).strict()).max(1) }).strict()
 }).strict();
@@ -266,6 +266,7 @@ const manifestV2 = manifestV1.extend({ contract: z.literal('flowmate-agent-datas
         required: z.boolean(), requiredFor: z.array(id).optional() }).strict()).max(1) }),
     environment: z.object({ profile: z.literal('isolated-agent/v2'), source: z.enum(['voxel51', 'local', 'mixed']), risks: z.array(text).min(1) }).strict()
 });
-export const manifestSchema = z.discriminatedUnion('contract', [manifestV1, manifestV2]);
+export const manifestSchema = z.discriminatedUnion('contract', [manifestV1, manifestV2]).refine(value =>
+    value.suite === 'badcase' ? value.smoke.length === 0 : value.smoke.length > 0, 'Only a supplemental suite has an empty smoke partition');
 export type LocalCase = z.infer<typeof caseSchema> | z.infer<typeof caseV2Schema>;
 export type Check = z.infer<typeof checkSchema>;

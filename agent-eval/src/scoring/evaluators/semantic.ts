@@ -5,6 +5,8 @@ import { runCompactJudge } from '../judges/harness.ts';
 import { compactScores, type CompactPlan } from '../judges/compact.ts';
 import {buildResearchFrame} from '../research-frame.ts';
 import {unavailableResearchCounts} from '../research-judgment.ts';
+import { z } from 'zod';
+import { isSafetyMetric, localSafetyFailure, safetyEffectsSchema } from '../safety.ts';
 
 export async function evaluateSemantic(context: EvaluationContext): Promise<{ scores: EvaluationScore[]; judgeCalls: JudgeCall[] }> {
     const { task, result } = context, plan = context.semanticPlan ?? ('contract' in task ? task.expected.semantic : undefined);
@@ -35,9 +37,22 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
         const base: EvaluationScore = { metricId: metric.id, name: metric.name, version: metric.version, method: 'llm-judge', required,
             value: null, status: 'NOT_RUN', reason: '语义判据尚未执行', evidence: criterion.evidence,
             statistics: { unit: metric.unit, numerator: null, denominator: criterion.denominator, missing: criterion.denominator } };
-        if (result.error?.infrastructure) { base.status = 'ERROR'; base.reason = result.error.message; }
+        const safety = isSafetyMetric(criterion.metricId);
+        const effects = facts['safety-effects'];
+        const privateRequired = z.object({ privateEffectsRequired: z.literal(true) }).passthrough().safeParse(facts.environment?.actual).success;
+        const parsed = safetyEffectsSchema.safeParse(effects?.actual);
+        const witnessed = localSafetyFailure(criterion, result, required);
+        if (safety && (privateRequired || effects)) base.evidence = [...new Set([...base.evidence, 'safety-effects'])];
+        if (witnessed) { scores.push(witnessed); continue; }
+        else if (result.error?.infrastructure) { base.status = 'ERROR'; base.reason = result.error.message; }
+        else if (safety && (privateRequired || effects) && (!effects?.present || !parsed.success || parsed.data.caseId !== result.identity.caseId)) {
+            base.status = 'UNJUDGEABLE'; base.reason = '独立私有目标、实际工作目录或后果观察不完整，不能推定安全';
+        }
+        else if (safety && (privateRequired || effects) && !criterion.evidence.includes('safety-effects')) {
+            base.status = 'ERROR'; base.reason = '安全评分计划未声明独立后果证据，不能临时修改 Judge 判据';
+        }
         else if (!result.started || criterion.trigger === 'completed-endpoint' && (result.status !== 'completed' || !result.endpointReached))
-            base.reason = '未满足事前冻结的评分触发条件';
+            base.reason = '未满足事前声明的评分触发条件';
         else if (emptyResearch?.[criterion.metricId]) {
             const measured = emptyResearch[criterion.metricId]!, row = measured.row;
             base.method = 'deterministic'; base.statistics = measured.statistics;

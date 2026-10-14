@@ -127,12 +127,17 @@ test('two independent local invoice Trials do not inherit candidates, native his
                 const before = await session.snapshot();
                 document = (before.evidence['material-registration']!.actual as Array<{ document: typeof document }>)[0]!.document;
                 expect(before.evidence.invoice).toMatchObject({ present: true, actual: { jobs: [], candidates: [], workspace: { jobId: null, candidateRef: null } } });
+                expect(before.evidence['new-candidates']).toMatchObject({ present: true, actual: [] });
                 expect(JSON.stringify(before.evidence.history)).not.toContain('PRIVATE_TRIAL_1');
                 for (const file of ['previous-trial.txt', 'experience.json']) expect(existsSync(join(directory, 'product/runtime', file))).toBe(false);
                 const result = await session.execute(new AbortController().signal);
                 expect(result).toMatchObject({ status: 'completed', endpointReached: true, evidence: { invoice: { present: true,
                     actual: { candidates: [{ candidateId: 1, jobId: 1, notes: ['PRIVATE_TRIAL_' + repetition] }] } } } });
                 expect((result.evidence.invoice!.actual as { candidates: unknown[] }).candidates).toHaveLength(1);
+                expect(result.evidence.invoice).toMatchObject({ actual: { workspace: { candidateRef: null } } });
+                expect(result.evidence['candidate-fields']).toMatchObject({ present: true, actual: { totalAmount: '113.00' } });
+                expect(result.evidence['candidate-values']).toMatchObject({ present: true, actual: { fields: { totalAmount: { normalized: '113.00', state: 'present' } } } });
+                expect(result.evidence['new-candidates']).toMatchObject({ present: true, actual: [{ candidateId: 1, runId: 1 }] });
                 if (repetition === 2) expect(JSON.stringify(requests.slice(3))).not.toContain('PRIVATE_TRIAL_1');
                 writeFileSync(join(directory, 'product/runtime/previous-trial.txt'), 'PRIVATE_TRIAL_' + repetition);
                 writeFileSync(join(directory, 'product/runtime/experience.json'), JSON.stringify({ private: 'PRIVATE_TRIAL_' + repetition }));
@@ -141,6 +146,36 @@ test('two independent local invoice Trials do not inherit candidates, native his
         expect(requests).toHaveLength(6);
     } finally { await server.stop(); }
 }, 65000);
+
+test('a stale UI selection cannot replace the original candidate committed by the last saving Run', async () => {
+    const f=fixture(); let requestCount=0;
+    let document:{documentRef:{id:number;version:string};parsedArtifactId:number};
+    const server=await createHttpProvider(async()=>{
+        const stage=requestCount++%3;
+        if(stage===2)return response({role:'assistant',content:'Saved the synthetic invoice.'});
+        const missing:InvoiceField={raw:null,normalized:null,state:'missing',alternatives:[],sources:[]};
+        const fields=Object.fromEntries(invoiceHeaderFields.map(name=>[name,structuredClone(missing)]));
+        fields.totalAmount={raw:'113.00',normalized:'113.00',state:'present',alternatives:[],sources:[{documentId:document.documentRef.id,
+            version:document.documentRef.version,artifactId:document.parsedArtifactId,page:1,blockId:'b1',quote:'Total 113.00'}]};
+        const name=stage===0?'read_invoice_document':'save_invoice_candidate';
+        const args=stage===0?{documentId:document.documentRef.id,page:1,afterBlockId:null,limit:10}:{documentId:document.documentRef.id,candidate:{fields,lines:[],notes:[]}};
+        return response({role:'assistant',tool_calls:[{index:0,id:'stale-selection-'+requestCount,type:'function',function:{name,arguments:JSON.stringify(args)}}]},true);
+    });
+    const prompt='Read and save this synthetic invoice.', item:AgentTrial={identity:{executionId:'selection-engineering',trialId:'stale',caseId:'synthetic-selection',caseVersion:1},
+        directory:join(f.root,'trial'),requires:['agent','invoice','workspace'],input:{prompt,materials:f.visible},invoiceSource:{root:f.source,materials:f.materials},
+        steps:[{id:'first',action:'invoice-message',instruction:prompt,sample:'000001',goalMode:'save-candidate'},
+            {id:'select-first',action:'select-candidate',fromStep:'first',ordinal:1},
+            {id:'second',action:'invoice-message',instruction:'Save a new original candidate for the same invoice.',sample:'000001',goalMode:'save-candidate'}],
+        configuration:{modelCapabilities:syntheticNativeModel,model:'selection-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'}};
+    mkdirSync(item.directory);let session:AgentTrialSession|undefined;
+    try{
+        session=await prepareHostTrial(item,new AbortController().signal,{repo:REPO_ROOT,credential:'synthetic-selection-key'});
+        document=((await session.snapshot()).evidence['material-registration']!.actual as Array<{document:typeof document}>)[0]!.document;
+        const result=await session.execute(new AbortController().signal);
+        expect(result.evidence.invoice).toMatchObject({actual:{workspace:{candidateRef:{id:1}},candidates:[{candidateId:1,runId:1},{candidateId:2,runId:2}]}});
+        expect(result.evidence['original-candidate']).toMatchObject({present:true,actual:{candidateId:2,runId:2}});
+    }finally{if(session)expect(await session.close()).toMatchObject({present:true,actual:{stopped:true}});await server.stop();}
+},45000);
 
 for(const scenario of ['running','completed-first','no-read'] as const)test('038 cancels an actual parent only after both children have original read evidence, scenario='+scenario,async()=>{
     const expose=scenario!=='no-read';
@@ -392,7 +427,8 @@ for(const mode of ['steer','followUp'] as const)for(const expose of [true,false]
             expect(result.evidence['user-turns']).toMatchObject({present:true,actual:[{turnId:'currency-correction',submitted:true,accepted:true,consumed:true,status:'consumed'}]});
             expect(inputs.filter(input=>input.mode==='prompt')).toHaveLength(1);expect(new Set(inputs.map(input=>input.runId)).size).toBe(1);
             expect(result.evidence['case-controller']).toMatchObject({present:true,actual:{profile,exposure:{verified:true,deliveries:1,consumed:true,wireInclusion:'confirmed'}}});
-            expect(result.evidence['candidate-fields']).toMatchObject({present:false});
+            expect(result.evidence['candidate-fields']).toMatchObject({present:mode==='steer'});
+            if(mode==='steer')expect(result.evidence['candidate-fields']!.actual).toMatchObject({currency:'USD',totalAmount:'113.00'});
             if(mode==='followUp')expect(result.evidence.invoice!.actual).toMatchObject({candidates:[]});
             else expect(result.evidence.invoice!.actual).toMatchObject({candidates:[{runId:inputs[0]!.runId,fields:{currency:{raw:'$',normalized:'USD'}}}]});
             expect(result.evidence['interaction-history']).toMatchObject({present:true});

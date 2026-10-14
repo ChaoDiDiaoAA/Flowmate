@@ -51,6 +51,21 @@ function stop(f: ReturnType<typeof fixture>, runId: number) {
   f.store.db.query(`UPDATE runs SET status='completed',output_json='{}',ended_at=?,stopped_at=? WHERE id=?`).run(at, at, runId);
 }
 
+it.each([['unknown', 'gap', 'partial', 'research_coverage_invalid', 'coverage'],
+  ['cost-1', 'gap', 'full', 'research_evidence_incomplete', 'covered'],
+  ['cost-1', 'covered', 'partial', 'research_coverage_invalid', 'supported']] as const)
+  ('reports bounded domain constraints for %s %s %s without changing report completeness', (questionId, status, completeness, code, constraint) => {
+    const f=fixture(),planning=run(f,'planning'),plan=need(savePlan(f,planning,call(f,planning,'save_research_plan'))); stop(f,planning);
+    const runId=run(f,'researching',plan),toolCallId=call(f,runId,'save_research_report');
+    const result=f.store.research.saveReport({researchId:f.task.researchId,runId,toolCallId,at,report:{answer:'Evidence is incomplete.',
+      sections:[{title:'Cost',text:'No supported claims yet.',claimIds:[]}],completeness,conflicts:[],limitations:[],unresolvedQuestions:[],
+      coverage:[{questionId,claimIds:[],status,reason:'No supported claims yet.'}]}});
+    expect(result).toMatchObject({ok:false,error:{code}});
+    if(result.ok)throw new Error('Invalid report unexpectedly committed.');
+    expect(result.error.message).toContain(constraint);expect(result.error.message.length).toBeLessThanOrEqual(4000);
+    expect(need(f.store.research.get(f.task.researchId)).currentReportId).toBeNull();
+  });
+
 function legacy18(p: ReturnType<typeof paths>) {
   mkdirSync(join(p.root, 'data'), { recursive: true });
   const db = new Database(p.databaseFile); db.exec('PRAGMA foreign_keys=ON');

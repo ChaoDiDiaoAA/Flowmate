@@ -27,7 +27,7 @@ function result() {
     r.evidence.requests = { present: true, actual: ['a', 'b', 'c', 'd'], source: 'synthetic original requests' };
     return r;
 }
-const reply = (r: unknown) => judgeResponse({ choices: [{ message: { content: namedJudgment(candidate().expected.semantic, { v: 1, r:r as unknown[], f: [] }) }, finish_reason: 'stop' }] });
+const reply = (r: unknown, f: number[][] = []) => judgeResponse({ choices: [{ message: { content: namedJudgment(candidate().expected.semantic, { v: 1, r:r as unknown[], f }) }, finish_reason: 'stop' }] });
 const selected=(scores:Awaited<ReturnType<typeof evaluateAll>>['scores'])=>scores.filter(s=>['tool-selection','tool-arguments'].includes(s.metricId));
 
 test('v2 semantic criteria bind the declared metric plan and evaluateAll makes exactly one multi-criterion Judge request', async () => {
@@ -40,7 +40,7 @@ test('v2 semantic criteria bind the declared metric plan and evaluateAll makes e
             expect(data.plan.criteria).toHaveLength(2);
             expect(data.evidence.facts.decisions.actual).toEqual(['read', 'verify', 'save']);
             expect(data.evidence).not.toHaveProperty('steps');
-            return reply([[2, 3, 0], [4, 4, 0]]);
+            return reply([[2, 3, 0], [4, 4, 0]],[[0,2,1]]);
         } }, []);
     expect(requests).toBe(1);
     expect(scored.judgeCalls).toHaveLength(1);
@@ -53,7 +53,7 @@ test('started process criteria survive a failed endpoint while outcome-only crit
     const task = caseV2Schema.parse(candidate()), execution = result(); execution.status = 'failed'; execution.endpointReached = false;
     let requests = 0;
     const scored = await evaluateAll({ task, result: execution, projected: execution.input, judge: config,
-        fetcher: async () => { requests++; return reply([[2, 3, 0]]); } }, []);
+        fetcher: async () => { requests++; return reply([[2, 3, 0]],[[0,2,1]]); } }, []);
     expect(requests).toBe(1);
     expect(selected(scored.scores)).toMatchObject([{ metricId: 'tool-selection', status: 'FAIL', value: 2 / 3 },
         { metricId: 'tool-arguments', status: 'NOT_RUN', value: null, statistics: { denominator: 4, missing: 4 } }]);
@@ -82,7 +82,7 @@ test('partial original records retain known failures and explicit missing opport
                 expect(facts.decisions.actual).toEqual(execution.evidence.decisions.actual);
                 if (gap === 'missing-peer') expect(facts['missing-decision']).toMatchObject({ present: false, actual: null });
                 else expect(facts.decisions.present).toBe(false);
-                return reply([[0, 3, 2]]);
+                return reply([[0, 3, 2]],[[0,0,1]]);
             } }, []);
         expect(requests).toBe(1);
         expect(scored.scores[0]).toMatchObject({ status: 'FAIL', value: null, statistics: { numerator: 0, denominator: 3, missing: 2 } });
@@ -109,7 +109,7 @@ test('an original query confirming absence is usable evidence while an uncollect
         fetcher: async (_, init) => {
             requests++;
             expect(JSON.parse(JSON.parse(String(init.body)).messages[1].content).evidence.facts.decisions).toEqual(execution.evidence.decisions);
-            return reply([[0, 3, 0]]);
+            return reply([[0, 3, 0]],[[0,0,4],[0,1,4],[0,2,4]]);
         } }, []);
     expect(requests).toBe(1);
     expect(scored.scores[0]).toMatchObject({ status: 'FAIL', value: 0, statistics: { numerator: 0, denominator: 3, missing: 0 } });
@@ -144,7 +144,7 @@ test('independent Gold is Judge-only and an unverified reference cannot be repla
             const data = JSON.parse(JSON.parse(String(init.body)).messages[1].content);
             expect(data.evidence.facts['gold-reference'].actual.fields.invoiceNumber).toBe('independent-gold-marker');
             expect(JSON.stringify(data.evidence.input)).not.toContain('independent-gold-marker');
-            return reply([[2, 3, 0]]);
+            return reply([[2, 3, 0]],[[0,2,1]]);
         } }, []);
     expect(judged.judgeCalls).toHaveLength(1);
     expect(execution.evidence['gold-reference'].actual).toMatchObject({ fields: { invoiceNumber: 'fake product Gold' } });

@@ -5,6 +5,7 @@ import { SKILL_RESOURCE_TOOL_NAMES } from '../../../packages/contracts/src/resou
 import { RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES } from '../../../packages/contracts/src/research.ts';
 import { SUBAGENT_ROLE } from '../../../packages/contracts/src/subagents.ts';
 import { metricCatalog } from '../scoring/catalog.ts';
+import { regressionOriginsSchema } from './regression-origin.ts';
 
 const text = z.string().trim().min(1);
 const userInput = z.string().refine(value => value.trim().length > 0, 'User input must contain text');
@@ -54,6 +55,11 @@ export const authorCaseSchema = z.object({
     if (/\p{Script=Han}/u.test(JSON.stringify(value))) context.addIssue({ code: 'custom', message: 'Authored Case text must be English' });
 });
 export type AuthorCase = z.infer<typeof authorCaseSchema>;
-export type AuthorDataset = { version: 'v1'; cases: AuthorCase[] };
-export const authorDatasetSchema = z.object({ version: z.literal('v1'), cases: z.array(authorCaseSchema).min(1) }).strict()
-    .refine(dataset => new Set(dataset.cases.map(task => task.id)).size === dataset.cases.length, 'Duplicate Case identity');
+export const authorDatasetSchema = z.object({ version: z.literal('v1'), cases: z.array(authorCaseSchema),
+    suite: z.enum(['baseline', 'badcase']).optional(), regressionOrigins: regressionOriginsSchema.optional() }).strict()
+    .refine(dataset => dataset.cases.length > 0 || dataset.suite === 'badcase', 'Empty baseline Dataset')
+    .refine(dataset => new Set(dataset.cases.map(task => task.id)).size === dataset.cases.length, 'Duplicate Case identity')
+    .refine(dataset => dataset.suite === 'badcase' ? !!dataset.regressionOrigins &&
+        JSON.stringify(Object.keys(dataset.regressionOrigins).sort()) === JSON.stringify(dataset.cases.map(c => c.id).sort()) : !dataset.regressionOrigins,
+        'Regression origins must bind exactly the supplemental members');
+export type AuthorDataset = z.infer<typeof authorDatasetSchema>;

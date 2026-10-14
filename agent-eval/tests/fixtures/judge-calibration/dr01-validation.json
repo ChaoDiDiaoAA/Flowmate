@@ -1,5 +1,6 @@
 {
   "contract": "flowmate-judge-reference/v1",
+  "parsePolicy": "metric-json-fence-strict-counts/v1",
   "id": "dr01-validation",
   "instanceId": "dr01-validation-independent-report",
   "sourceGroup": "dr01-validation-source",

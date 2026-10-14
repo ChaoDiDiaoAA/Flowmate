@@ -8,9 +8,12 @@ import type { LocalReport } from './store.ts';
 import {dimensions} from '../scoring/aggregate.ts';
 
 export function atomicJson(file: string, value: unknown) {
+    atomicText(file, artifactJson(value));
+}
+export function atomicText(file: string, value: string) {
     if(realpathSync(dirname(file)).toLowerCase()!==resolve(dirname(file)).toLowerCase()||lstatSync(file,{throwIfNoEntry:false})?.isSymbolicLink())throw Error('Linked output path rejected');
     const temporary=file+'.'+randomUUID()+'.tmp';let fd:number|undefined;
-    try {fd=openSync(temporary,'wx',0o600);writeFileSync(fd,artifactJson(value));fsyncSync(fd);closeSync(fd);fd=undefined;renameSync(temporary,file);}
+    try {fd=openSync(temporary,'wx',0o600);writeFileSync(fd,value);fsyncSync(fd);closeSync(fd);fd=undefined;renameSync(temporary,file);}
     finally {if(fd!==undefined)closeSync(fd);if(existsSync(temporary))unlinkSync(temporary);}
 }
 const benchmarkContract=/^flowmate-(?:agent-(?:run|dataset|case)|eval-(?:case|gold|review)|trial-aggregation|semantic-plan|packed-judgment|judge-(?:reference|calibration(?:-report)?))\/v\d+$/;

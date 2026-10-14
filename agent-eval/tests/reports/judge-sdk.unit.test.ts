@@ -121,3 +121,34 @@ test('SDK records reject normalized completion contradictions or a removed SDK d
         expect(() => saveReport(join(mkdtempSync(join(tmpdir(), 'judge-sdk-invalid-')), 'report.json'), changed)).toThrow();
     }
 });
+
+test('current parsing policy, normalization and HTTP status round-trip without trusting forged parse metadata', async () => {
+    const plan={contract:'flowmate-semantic-plan/v1' as const,criteria:[{metricId:'tool-arguments',version:1,unit:'请求',denominator:1,
+        required:true,rule:'One authorized request.',evidence:['original'],trigger:'started' as const}]};
+    const call=await runCompactJudge(config(),plan,{},async()=>judgeResponse({content:[{type:'text',text:JSON.stringify({v:1,
+        results:[{metricId:'tool-arguments',counts:{numerator:1,denominator:1,unassessable:0},failures:[]}]})}],stop_reason:'end_turn'}));
+    Object.assign(call.compact!,{parsePolicy:'metric-json-fence-strict-counts/v1',normalization:'none'});
+    Object.assign(call,{transportStatus:200});
+    const report=modernReport(),trial=report.trials[0]!;
+    trial.semanticPlan=plan;trial.judgeCalls=[call];trial.scores.push(...compactScores(call));
+    trial.metricPlan!.push({metricId:'tool-arguments',version:1,unit:'请求',denominator:1});
+    Object.assign(trial,aggregate(trial.scores,trial.execution!));
+    const declared=structuredClone(call.configuration);delete declared.rubric;
+    const {configHash:_,...parameters}=declared;declared.configHash=hash(parameters);
+    report.scoringConfiguration.judge=declared;report.scoringConfiguration.rubrics=[compactRubricFor(plan)];
+    const file=join(mkdtempSync(join(tmpdir(),'judge-policy-report-')),'report.json');
+    saveReport(file,report);
+    expect(readReport(file).trials[0]!.judgeCalls[0]).toMatchObject({transportStatus:200,compact:{
+        parsePolicy:'metric-json-fence-strict-counts/v1',normalization:'none'}});
+    const event=exportEvents(report).find(e=>e.body.name==='Judge · 回答质量')!;
+    expect(event.body.metadata).toMatchObject({transportStatus:200,parsePolicy:'metric-json-fence-strict-counts/v1',normalization:'none'});
+    for(const mutate of [
+        (c:any)=>{delete c.compact.parsePolicy;},
+        (c:any)=>{c.compact.parsePolicy='unknown-policy';},
+        (c:any)=>{c.compact.normalization='markdown-fence';},
+        (c:any)=>{c.transportStatus=402;}
+    ]){
+        const changed=structuredClone(report);mutate(changed.trials[0]!.judgeCalls[0]);
+        expect(()=>saveReport(join(mkdtempSync(join(tmpdir(),'judge-policy-forged-')),'report.json'),changed)).toThrow();
+    }
+});

@@ -52,7 +52,7 @@ export const CONTEXT_SAFE_ERROR_CODES = [
   'agent_mechanical_check_failed', 'agent_model_call_budget', 'agent_model_image_unsupported', 'agent_model_switch_failed', 'agent_output_limit',
   'agent_port_closed', 'agent_runtime_error', 'agent_runtime_init_failed', 'agent_session_busy', 'agent_session_init_failed',
   'agent_session_missing', 'agent_session_unavailable', 'agent_session_unusable', 'agent_stop_unconfirmed', 'agent_timeout',
-  'agent_unavailable', 'agent_unbound_execution', 'agent_unexpected_continuation', 'agent_unexpected_tool_call', 'provider_auth_failed', 'provider_cancelled',
+  'agent_unavailable', 'agent_unbound_execution', 'agent_unexpected_continuation', 'agent_unexpected_tool_call', 'provider_auth_failed', 'provider_billing_failed', 'provider_cancelled',
   'provider_close_failed', 'provider_error', 'provider_incomplete_response', 'provider_model_limits_missing',
   'provider_model_not_found', 'provider_network_error', 'provider_rate_limited', 'provider_request_rejected',
   'provider_runtime_error', 'provider_runtime_init_failed', 'provider_stop_unconfirmed', 'provider_stream_interrupted',
@@ -233,7 +233,14 @@ const inclusionShape = { inclusion: z.enum(['confirmed', 'unavailable']), reason
 function checkInclusion(value: { inclusion: string; reason: string | null }, context: z.RefinementCtx) {
   if ((value.inclusion === 'confirmed') !== (value.reason === null)) report(context, 'Inclusion requires an explicit and consistent evidence reason.');
 }
-export const ContextSdkPayloadEvidenceSchema = z.object({ observedAt: time.nullable(), ...inclusionShape }).strict()
+const toolFieldName = z.string().min(1).max(128).regex(/^[A-Za-z_][A-Za-z0-9_-]*$/);
+export const ContextToolDefinitionsEvidenceSchema = z.array(z.object({ toolName: toolFieldName,
+  properties: z.array(toolFieldName).max(128), required: z.array(toolFieldName).max(128),
+}).strict().refine(value => unique(value.properties) && unique(value.required) && value.required.every(key => value.properties.includes(key))))
+  .max(128).refine(value => unique(value.map(tool => tool.toolName))).readonly();
+export type ContextToolDefinitionsEvidence = z.infer<typeof ContextToolDefinitionsEvidenceSchema>;
+export const ContextSdkPayloadEvidenceSchema = z.object({ observedAt: time.nullable(), ...inclusionShape,
+  toolDefinitions: ContextToolDefinitionsEvidenceSchema.optional() }).strict()
   .superRefine((value, context) => {
     checkInclusion(value, context);
     if (value.inclusion === 'confirmed' && value.observedAt === null) report(context, 'Confirmed payload requires observation time.');
@@ -241,7 +248,7 @@ export const ContextSdkPayloadEvidenceSchema = z.object({ observedAt: time.nulla
 export const ContextTransportEvidenceSchema = z.object({ attempt: id.max(2), preparedAt: time, enteredAt: time.nullable(),
   responseAt: time.nullable(), responseStatus: z.number().int().min(100).max(599).nullable(),
   transportErrorCode: ContextSafeErrorCodeSchema.nullable(), nativeRequestId: opaqueId.nullable(),
-  wireInclusion: inclusionShape.inclusion, wireReason: inclusionShape.reason,
+  wireInclusion: inclusionShape.inclusion, wireReason: inclusionShape.reason, toolDefinitions: ContextToolDefinitionsEvidenceSchema.optional(),
 }).strict().superRefine((value, context) => {
   checkInclusion({ inclusion: value.wireInclusion, reason: value.wireReason }, context);
   if ((value.responseAt === null) !== (value.responseStatus === null) || value.nativeRequestId !== null && value.responseAt === null
@@ -315,7 +322,7 @@ export function readContextObservations(raw: unknown, historyPolicyVersion?: 'p9
     message: 'Public native context evidence is invalid.', retryable: false } };
 }
 export const ContextEvidenceUpdateSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('sdk-payload'), at: time, ...inclusionShape }).strict(),
+  z.object({ kind: z.literal('sdk-payload'), at: time, ...inclusionShape, toolDefinitions: ContextToolDefinitionsEvidenceSchema.optional() }).strict(),
   z.object({ kind: z.literal('attempt-prepared'), evidence: ContextTransportEvidenceSchema }).strict(),
   z.object({ kind: z.literal('attempt-entered'), attempt: id.max(2), at: time }).strict(),
   z.object({ kind: z.literal('response'), attempt: id.max(2), at: time,

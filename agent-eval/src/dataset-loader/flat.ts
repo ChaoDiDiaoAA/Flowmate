@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import type { RegressionOrigin } from './regression-origin.ts';
 
 export const fileSchema = z.object({ path: z.string().min(1).refine(path => !path.includes('\\') &&
     path.split('/').every(part => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part) && part !== '.' && part !== '..')),
@@ -12,5 +13,5 @@ export function decodeFile(value: unknown): { file: EmbeddedFile; bytes: Buffer 
         throw new Error('Embedded material bytes or hash changed: ' + file.path);
     return { file, bytes };
 }
-export type FlatDataset = { authored?: {version:'v1';cases:any[];gold:Record<string,any>;reviews:Record<string,any>;fixtures:Record<string,any>}; manifest: any; tasks: Record<string, any>; files: Record<string, EmbeddedFile>;
+export type FlatDataset = { regressionOrigins?: Record<string, RegressionOrigin[]>; authored?: {version:'v1';cases:any[];gold:Record<string,any>;reviews:Record<string,any>;fixtures:Record<string,any>}; manifest: any; tasks: Record<string, any>; files: Record<string, EmbeddedFile>;
     inputs: Record<string, EmbeddedFile[]>; reviews: Record<string, any>; hash: string };

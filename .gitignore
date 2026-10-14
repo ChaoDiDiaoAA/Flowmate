@@ -45,6 +45,7 @@ Thumbs.db
 # Private Agent evaluation run output
 /agent-eval/runs/
 /agent-eval/calibration-runs/
+/agent-eval/records/
 /agent-eval/configs/*.json
 /agent-eval/configs/*.jsonc
 !/agent-eval/configs/*.example.jsonc

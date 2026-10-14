@@ -41,8 +41,8 @@ export interface ResearchRepository {
   listReports(input: ResearchPageRequest & { researchId: number }): Result<{ items: ResearchReport[]; nextBeforeId: number | null }>;
 }
 
-class ResearchFault extends Error { constructor(readonly code: string) { super(code); } }
-function requireFact(condition: unknown, code = 'research_identity_conflict'): asserts condition { if (!condition) throw new ResearchFault(code); }
+class ResearchFault extends Error { constructor(readonly code: string, message = 'Research identity or state is unavailable.') { super(message); } }
+function requireFact(condition: unknown, code = 'research_identity_conflict', message?: string): asserts condition { if (!condition) throw new ResearchFault(code, message); }
 const validId = (value: number) => Number.isSafeInteger(value) && value > 0;
 const validAt = (value: string) => z.string().datetime().safeParse(value).success;
 function parseInput<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, raw: unknown): T {
@@ -59,7 +59,7 @@ export function createResearchRepository(db: Database): ResearchRepository {
   function operation<T>(write: boolean, work: () => T): Result<T> {
     try { return ok(write ? db.inTransaction ? work() : db.transaction(work).immediate() : readTransaction(db, work)); }
     catch (error) {
-      if (error instanceof ResearchFault) return fail(appError(error.code, error.code === 'input_invalid' ? 'input' : 'runtime', 'Research identity or state is unavailable.'));
+      if (error instanceof ResearchFault) return fail(appError(error.code, error.code === 'input_invalid' ? 'input' : 'runtime', error.message));
       return fail(appError(write ? 'research_write_failed' : 'research_read_failed', 'storage', 'Research storage is unavailable.', true));
     }
   }
@@ -289,16 +289,25 @@ export function createResearchRepository(db: Database): ResearchRepository {
     saveReport: input => operation(true, () => {
       const report = parseInput(ResearchReportBodySchema, input.report), found = duplicate('report', input, report); if (found) return found;
       const value = execution(input, 'save_research_report', true), plan = currentPlan(value), questions = questionIds(plan);
-      requireFact(report.coverage.length === questions.length && report.coverage.every(c => questions.includes(c.questionId)), 'research_coverage_invalid');
+      requireFact(report.coverage.length === questions.length && report.coverage.every(c => questions.includes(c.questionId)), 'research_coverage_invalid',
+        'coverage must contain exactly one record for every confirmed plan questionId, with no missing or unknown questions.');
       const ids = new Set([...report.sections.flatMap(s => s.claimIds), ...report.coverage.flatMap(c => c.claimIds)]);
       const claims = new Map([...ids].map(id => [id, record('claim', input.researchId, id)]));
       requireFact([...claims.values()].every(c => c.planId === plan.planId));
-      requireFact(report.coverage.every(c => c.claimIds.every(id => claims.get(id)!.questionId === c.questionId)), 'research_coverage_invalid');
+      requireFact(report.coverage.every(c => c.claimIds.every(id => claims.get(id)!.questionId === c.questionId)), 'research_coverage_invalid',
+        'Each coverage.claimIds entry must reference a saved Claim for that same questionId and confirmed plan.');
       requireFact(report.coverage.every(c => c.status !== 'covered' || c.claimIds.length > 0
         && c.claimIds.every(id => claims.get(id)!.verification.status === 'supported')),
-        report.completeness === 'full' ? 'research_evidence_incomplete' : 'research_coverage_invalid');
-      if (report.completeness === 'full') requireFact(report.coverage.every(c => c.status === 'covered' && c.claimIds.length > 0)
-        && [...claims.values()].every(c => c.verification.status === 'supported') && report.unresolvedQuestions.length === 0, 'research_evidence_incomplete');
+        report.completeness === 'full' ? 'research_evidence_incomplete' : 'research_coverage_invalid',
+        'coverage.status=covered requires non-empty claimIds with every Claim verification.status=supported. Use gap or conflict for unsupported coverage.');
+      if (report.completeness === 'full') {
+        requireFact(report.coverage.every(c => c.status === 'covered' && c.claimIds.length > 0), 'research_evidence_incomplete',
+          'completeness=full requires every planned question coverage.status=covered and non-empty claimIds. Correct the evidence or explicitly submit partial with gaps within the remaining budget.');
+        requireFact([...claims.values()].every(c => c.verification.status === 'supported'), 'research_evidence_incomplete',
+          'completeness=full requires every referenced Claim verification.status=supported. Preserve unsupported findings in an explicit partial report.');
+        requireFact(report.unresolvedQuestions.length === 0, 'research_evidence_incomplete',
+          'completeness=full requires unresolvedQuestions=[]. Resolve the questions with supported evidence or explicitly submit partial with the unresolved questions within the remaining budget.');
+      }
       const row = db.query('INSERT INTO research_reports(research_id,plan_id,revision,run_id,tool_call_id,body_json,created_at) VALUES (?,?,?,?,?,?,?)')
         .run(input.researchId, plan.planId, plan.revision, input.runId, input.toolCallId, JSON.stringify(report), input.at);
       const id = Number(row.lastInsertRowid);

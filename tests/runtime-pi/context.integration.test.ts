@@ -180,6 +180,18 @@ async function begin(app: Application, input: SessionInputRequest) {
   const accepted = need(await app.submitInput(input, { onEvent(event) { if (event.type === 'run_finished') finish(event); } }));
   return { accepted, terminal };
 }
+
+it.each([[402, 'provider_billing_failed'], [401, 'provider_auth_failed'], [403, 'provider_auth_failed'],
+  [429, 'provider_rate_limited'], [400, 'provider_request_rejected']] as const)
+  ('classifies structured HTTP %s without exposing Provider error bodies', async (status, code) => {
+    const f = await evidenceFixture({ response: () => new Response(JSON.stringify({ error: { message: 'PRIVATE_BILLING_BODY_AND_ACCOUNT' } }),
+      { status, headers: { 'content-type': 'application/json' } }) });
+    const run = await f.start('Controlled Provider failure.');
+    const terminal = await run.terminal;
+    expect(terminal.result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true, error: { code } } });
+    expect(JSON.stringify(terminal.result)).not.toContain('PRIVATE_BILLING_BODY');
+    expect(f.journal(run.accepted.runId).requests[0]!.attempts[0]!.responseStatus).toBe(status);
+  });
 it('T10 F8-12 reopens a real Application and SQLite without query replay, then seeds exact branch identities for new input', async () => {
   let builds = 0;
   const build = ContextService.prototype.build;
@@ -284,7 +296,7 @@ it('T10 F8-12 reopens a real Application and SQLite without query replay, then s
   expect(after.snapshots).toEqual(before.snapshots); expect(after.fk).toEqual([]);
 });
 async function fixture(onRequest: (ordinal: number) => Promise<Response> | Response = () => reply(), beforeTool?: () => Promise<void>,
-  toolFault?: 'error-terminal' | 'error-result' | 'aborted-result' | 'tool-result' | 'binding-lost') {
+  toolFault?: 'error-terminal' | 'error-result' | 'aborted-result' | 'tool-result' | 'binding-lost', api = 'openai-completions') {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p8-context-sdk-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
@@ -295,7 +307,7 @@ async function fixture(onRequest: (ordinal: number) => Promise<Response> | Respo
   deferCleanup(() => server.stop(true));
   const config: ProviderConfig = { version: 1, name: 'P8 controlled SDK', revision: 1,
     modelRef: { provider: 'p8-context-fixture', model: 'p8-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
-    connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
+    connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api, contextWindow: 64_000, maxTokens: 16_384 },
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
   let adapter!: PiAgentAdapter, executions = 0;
   const app = need(await createApplication({ paths, logger: { write() {}, async close() {} },
@@ -649,6 +661,7 @@ describe('T06 actual payload and transport evidence', () => {
     expect(f.payloads).toHaveLength(wire === 'remove-user' ? 0 : 1);
     if (wire !== 'remove-user') expect(request.attempts[0]).toMatchObject(wire === 'opaque'
       ? { wireInclusion: 'unavailable', wireReason: 'body_unavailable' } : { wireInclusion: 'confirmed', wireReason: null });
+    if (wire === 'opaque') expect(request.attempts[0]?.toolDefinitions).toBeUndefined();
   });
   it.each(['same', 'null-then-id', 'status', 'identity', 'missing-slot'] as const)('checks the SDK success slot at the controlled %s callback boundary', async sdkCallback => {
     const f = await evidenceFixture({ sdkCallback }); const run = await f.start(); const end = await run.terminal;
@@ -694,6 +707,8 @@ describe('T06 actual payload and transport evidence', () => {
     expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
     const request = f.journal(run.accepted.runId).requests[0]!;
     expect(request.sdkPayload).toMatchObject({ inclusion: 'unavailable', reason: 'payload_codec_unavailable' });
+    expect(request.sdkPayload?.toolDefinitions).toBeUndefined();
+    expect(request.attempts[0]?.toolDefinitions).toBeUndefined();
     expect(f.payloads).toHaveLength(1);
     if (api === 'google-generative-ai') { expect(request.transport).toBe('not-observable'); expect(request.attempts).toEqual([]); }
     else expect(request.attempts).toEqual([expect.objectContaining({ responseStatus: 200, nativeRequestId: null,
@@ -815,6 +830,29 @@ describe('T06 public SDK codec conversion', () => {
 });
 
 describe('P8 actual Pi request context', () => {
+  it.each(['anthropic-messages', 'openai-responses'])('records original SDK and wire tool definitions through actual %s transport', async api => {
+    const f = await fixture(() => {
+      if (api === 'openai-responses') return responsesReply();
+      const events = [{type:'message_start',message:{id:'offline',type:'message',role:'assistant',content:[],model:'p8-model',
+        stop_reason:null,stop_sequence:null,usage:{input_tokens:1,output_tokens:0}}},
+        {type:'content_block_start',index:0,content_block:{type:'text',text:''}},
+        {type:'content_block_delta',index:0,delta:{type:'text_delta',text:'Controlled answer.'}}, {type:'content_block_stop',index:0},
+        {type:'message_delta',delta:{stop_reason:'end_turn',stop_sequence:null},usage:{output_tokens:1}},{type:'message_stop'}];
+      return new Response(events.map(event=>`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),{headers:{'content-type':'text/event-stream'}});
+    }, undefined, undefined, api);
+    const workspace=need(await f.app.readWorkspace());
+    const started=await begin(f.app,{...f.prompt(1),workspace:{revision:workspace.revision,sessionId:f.session.sessionId,documentRef:null,jobId:null,candidateRef:null}});
+    expect((await started.terminal).result).toMatchObject({ok:true,data:{status:'completed',stopped:true}});
+    need(await f.app.close());
+    const request=f.journal(started.accepted.runId).requests[0]!;
+    const expected={toolName:'calculate_invoice_amounts',properties:['operation','values','scale','quantity','unitPrice','netAmount','taxRate'],required:['operation','scale']};
+    expect(request.binding.runId).toBe(started.accepted.runId);
+    expect(request.sdkPayload?.toolDefinitions).toContainEqual(expected);expect(request.attempts[0]?.toolDefinitions).toContainEqual(expected);
+    const body=f.payloads[0] as any;
+    const sent=api==='anthropic-messages'?body.tools.find((tool:any)=>tool.name==='calculate_invoice_amounts').input_schema
+      :body.tools.find((tool:any)=>tool.name==='calculate_invoice_amounts').parameters;
+    expect(Object.keys(sent.properties)).toEqual(expected.properties);expect(sent.required).toEqual(expected.required);
+  });
   it.each(['error-terminal', 'error-result', 'aborted-result', 'binding-lost'] as const)('refuses P8 tool execution with %s despite actual SDK HTTP', async fault => {
     const raw = { operation: 'sum', values: ['0.1', '0.2'], scale: 2 };
     const response = () => new Response('data: ' + JSON.stringify({ id: 'untrusted-terminal', choices: [{ index: 0,
@@ -862,6 +900,10 @@ describe('P8 actual Pi request context', () => {
     expect(journal.requests[1]!.binding.includedToolResults).toEqual([{ nativeToolCallId: 'fallback-call', toolCallId: tools[0]!.toolCallId,
       originRunId: accepted.accepted.runId, context: { snapshotId: input.contextSnapshotId!, requestSequence: 1 } }]);
     expect(journal.requests.map(request => request.attempts[0]?.responseStatus)).toEqual([200, 200]);
+    const delivered = { toolName: 'calculate_invoice_amounts', properties: ['operation', 'values', 'scale', 'quantity', 'unitPrice', 'netAmount', 'taxRate'],
+      required: ['operation', 'scale'] };
+    expect((journal.requests[0]!.sdkPayload as any).toolDefinitions).toContainEqual(delivered);
+    expect((journal.requests[0]!.attempts[0] as any).toolDefinitions).toContainEqual(delivered);
   });
   it('keeps the generating tool request after newer input admission and returns the original call after completion', async () => {
     const entered = barrier(), release = barrier();

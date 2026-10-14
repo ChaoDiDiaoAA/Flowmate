@@ -1,5 +1,5 @@
 import { atomicJson, publicVersions } from '../reports/files.ts';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { hash, caseContentHash, caseFiles, type LocalDataset } from '../dataset-loader/local.ts';
@@ -7,6 +7,7 @@ import { readReport, reportPath, type LocalReport, type TrialReport } from '../r
 import { z } from 'zod';
 import { scanEvidence } from '../execution/evidence-safety.ts';
 import { artifactJson, withoutHashes } from '../artifacts.ts';
+import { caseReviewDirectory } from '../reports/paths.ts';
 export type Feedback = {
     id: string;
     kind: 'case-quality' | 'run-feedback';
@@ -36,7 +37,7 @@ function caseConditions(dataset:LocalDataset,caseId:string) {
     const task=dataset.cases.find(c=>c.id===caseId);
     return publicVersions(withoutHashes({task,files:task?caseFiles(dataset,task):[],environment:dataset.manifest.environment,scoring:dataset.manifest.scoring}));
 }
-export function feedbackDirectory(repo: string, executionId?: string) { return executionId ? dirname(reportPath(repo, executionId)) : join(repo, 'agent-eval/runs/case-reviews'); }
+export function feedbackDirectory(repo: string, executionId?: string) { return executionId ? dirname(reportPath(repo, executionId)) : caseReviewDirectory(repo); }
 export function addFeedback(repo: string, input: {
     dataset?: LocalDataset;
     executionId?: string;
@@ -81,7 +82,7 @@ export function addFeedback(repo: string, input: {
         leaked: boolean;
     }).leaked)
         throw new Error('Feedback contains configured secret');
-    const directory=feedbackDirectory(repo,input.executionId);mkdirSync(directory,{recursive:true});
+    const directory=input.executionId?feedbackDirectory(repo,input.executionId):caseReviewDirectory(repo,true);
     const file=join(directory,'review.json');
     const records:Feedback[]=existsSync(file)?JSON.parse(readFileSync(file,'utf8')).records.map((r:any)=>({...r,caseVersion:1})):[];
     const prior=records.find(r=>r.id===record.id);

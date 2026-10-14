@@ -56,7 +56,7 @@ test('all datasets are checked before the first execution; ordinary failed resul
 });
 
 test('batch progress uses one plan and global indices for smoke, full and repeated Trials', async () => {
-    for (const [selection, repeat, total] of [['smoke',1,14],['full',1,62],['smoke',2,28]] as const) {
+    for (const [selection, repeat, total] of [['smoke',1,14],['full',1,62],['smoke',2,28],['smoke',5,70],['full',5,310]] as const) {
         const events: EvaluationProgress[] = [];
         await runner.runBatch(fixtureRepo, { datasets: datasets(), selection, repeat, backend: 'local', judge: 'required' },
             { env, kernel, onProgress: event => { events.push(event); }, run: async (_, options, deps) => {
@@ -71,8 +71,9 @@ test('batch progress uses one plan and global indices for smoke, full and repeat
                 return { report: reportFixture(), file: 'synthetic-report.json', stopped: false };
             } });
         expect(events.filter(e => e.type === 'plan')).toEqual([{ type: 'plan' as const, selection, total,
-            datasets: [{ id: 'flowmate-agent-v1', total: (selection === 'full' ? 50 : 10) * repeat },
-                { id: 'flowmate-research-v1', total: (selection === 'full' ? 12 : 4) * repeat }] }]);
+            caseCount: selection === 'full' ? 62 : 14, trialsPerCase: repeat,
+            datasets: [{ id: 'flowmate-agent-v1', caseCount: selection === 'full' ? 50 : 10, total: (selection === 'full' ? 50 : 10) * repeat },
+                { id: 'flowmate-research-v1', caseCount: selection === 'full' ? 12 : 4, total: (selection === 'full' ? 12 : 4) * repeat }] }]);
         expect(events.filter(e => e.type === 'trial-phase').map(e => [e.index,e.total]))
             .toEqual(Array.from({ length: total }, (_,i) => [i+1,total]));
         for (const completed of [events.filter(e => e.type === 'agent-end'), events.filter(e => e.type === 'scoring-end')])

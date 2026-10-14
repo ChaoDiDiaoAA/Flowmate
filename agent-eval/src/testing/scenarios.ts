@@ -2703,11 +2703,14 @@ export const scenariosByName: Record<string, any> = {
       },
       "quality-controls/FM-049/future-input.json": {
         "json": {
-          "id": "follow-up",
-          "action": "invoice-message",
-          "sample": "000002",
-          "goalMode": "answer",
-          "turnId": "follow-up"
+          "sentinel": "SYNTHETIC_FUTURE_PROBE_FM-049",
+          "state": "not-submitted"
+        }
+      },
+      "gold/FM-049.json": {
+        "json": {
+          "sentinel": "SYNTHETIC_GOLD_PROBE_FM-049",
+          "state": "not-submitted"
         }
       }
     },

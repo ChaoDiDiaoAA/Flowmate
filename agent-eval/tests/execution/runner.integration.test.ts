@@ -117,7 +117,7 @@ test('Runner binds one compact Judge per Trial, distinct ratios and original cou
             requests++; const body = JSON.parse(String(init.body)); expect(body).toHaveProperty('max_completion_tokens', 32768);expect(body).not.toHaveProperty('temperature');
             expect(JSON.parse(body.messages[1].content).plan.criteria).toHaveLength(2);
             expect(JSON.parse(body.messages[1].content).plan.criteria).toEqual(selectedCriteria);
-            return judgeResponse({ choices: [{ message: { content: namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}') }, finish_reason: 'stop' }] });
+            return judgeResponse({ choices: [{ message: { content: namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[[0,2,1]]}') }, finish_reason: 'stop' }] });
         } });
     expect(requests).toBe(2);
     expect(run.report.trials.map(t => t.judgeCalls.length)).toEqual([1, 1]);
@@ -140,7 +140,7 @@ test('compact selection and required criteria are checked before Agent preparati
 test('requiring a Judge preserves the Case distinction between optional process metrics and necessary task predicates',async()=>{
     const data=semanticDataset();data.cases[0]!.expected.semantic!.criteria[0]!.required=false;
     const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'optional-process-'+randomUUID(),backend:'local',judge:'required'},{kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'synthetic-optional-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
-        fetcher:async()=>judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[0,3,0],[4,4,0]],"f":[]}')},finish_reason:'stop'}]})});
+        fetcher:async()=>judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[0,3,0],[4,4,0]],"f":[[0,0,1],[0,1,1],[0,2,1]]}')},finish_reason:'stop'}]})});
     expect(run.report.trials[0]!.scores.find(s=>s.metricId==='tool-selection')).toMatchObject({status:'FAIL',required:false});
     expect(run.report.trials[0]!.status).toBe('PASS');
 });
@@ -178,7 +178,7 @@ test('local orchestration stores all selected members, independent trials and mi
         await expect(runLocal(REPO_ROOT, { dataset: data, executionId: id, backend: 'local', judge: 'off' }, { kernel: kernel() })).rejects.toThrow();
     }
     finally {
-        rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+        rmSync(join(REPO_ROOT, 'agent-eval/runs/business', id), { recursive: true, force: true });
     }
 }, 30000);
 test('Judge preflight rejects partial or missing configuration before preparing Agent', async () => {
@@ -232,7 +232,7 @@ test('late preparation is cancelled and closed while all later planned Trials re
         expect(readReport(file).trials.map(trial => trial.status)).toEqual(['NOT_RUN', 'NOT_RUN', 'NOT_RUN']);
     } finally {
         release();
-        rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+        rmSync(join(REPO_ROOT, 'agent-eval/runs/business', id), { recursive: true, force: true });
     }
 });
 test('controlled material variants are declared before execution and retain the original source', async () => {
@@ -311,7 +311,7 @@ test('unknown semantic denominators do not restore a removed Judge output budget
  const run=await runLocal(REPO_ROOT,{dataset:data,caseId:data.cases[0]!.id,executionId:id,backend:'local',judge:'required'},{kernel:product,
   env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'synthetic-bound-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
   fetcher:async(_url,init)=>{requests++;expect(JSON.parse(String(init.body))).toHaveProperty('max_completion_tokens', 32768);
-   return judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[]}')},finish_reason:'stop'}]});}});
+   return judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[[0,2,1]]}')},finish_reason:'stop'}]});}});
  expect(requests).toBe(1);expect(run.report.trials[0]!.judgeCalls).toHaveLength(1);expect(existsSync(run.file)).toBe(true);
 });
 for(const metric of ['skill-guidance','model-violation'] as const)test('declared '+metric+' grades survive saving and a hard failure cannot become a passing report',async()=>{
@@ -323,7 +323,7 @@ for(const metric of ['skill-guidance','model-violation'] as const)test('declared
  data.manifest=manifestSchema.parse({...data.manifest,contract:'flowmate-agent-dataset/v2',environment:{...data.manifest.environment,profile:'isolated-agent/v2'},scoring:{...data.manifest.scoring,judges:[{id:'semantic-batch',required:true}]}});
  const run=await runLocal(REPO_ROOT,{dataset:data,executionId:'declared-'+metric+'-'+randomUUID(),backend:'local',judge:'required'},
  {kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'declared-predicate-fake-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
- fetcher:async()=>judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:metric}]},{v:1,r:[metric==='model-violation'?[1,1,0]:[0,1,0]],f:[]})},finish_reason:'stop'}]})});
+ fetcher:async()=>judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:metric}]},{v:1,r:[metric==='model-violation'?[1,1,0]:[0,1,0]],f:[[0,0,1]]})},finish_reason:'stop'}]})});
  const loaded=readReport(run.file),trial=loaded.trials[0]!;
  expect(trial.semanticPlan!.criteria[0]!.required).toBe(true);
  const score=trial.scores.find(s=>s.metricId===metric);
@@ -349,7 +349,7 @@ test('cancellation during the only Judge request aborts transport and preserves 
         expect(report.trials[0]!.judgeCalls).toMatchObject([{ attempts: 1, judgment: null, usage: null, error: 'Judge cancelled' }]);
         expect(report.trials[1]!.judgeCalls).toHaveLength(0);
         expect(report.aggregation!.metrics.find(m => m.metricId === 'task-success')).toMatchObject({ denominator: 2, numerator: 0 });
-    } finally { rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true }); }
+    } finally { rmSync(join(REPO_ROOT, 'agent-eval/runs/business', id), { recursive: true, force: true }); }
 }, 30000);
 
 test('semantic-only task cannot pass with Judge off; auto requires its Judge before Agent starts', async () => {
@@ -369,7 +369,7 @@ test('semantic-only task cannot pass with Judge off; auto requires its Judge bef
         expect(report.trials[0]!.status).toBe('UNJUDGEABLE');
         expect(report.trials[0]!.scores.find(s => s.metricId === 'answer-relevance')).toMatchObject({ required: true, status: 'NOT_RUN', value: null });
     } finally {
-        rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+        rmSync(join(REPO_ROOT, 'agent-eval/runs/business', id), { recursive: true, force: true });
     }
 }, 30000);
 
@@ -393,7 +393,7 @@ for(const source of ['cleanup','controller-observation'] as const)test('unconfir
         expect(report.aggregation?.cases[0]).toMatchObject({ planned: 3, started: 1, statuses: { ERROR: 1, NOT_RUN: 2 } });
         expect(report.aggregation?.metrics.find(m => m.metricId === 'task-success')).toMatchObject({ denominator: 3, numerator: 0, missing: 3 });
     } finally {
-        rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+        rmSync(join(REPO_ROOT, 'agent-eval/runs/business', id), { recursive: true, force: true });
     }
 }, 30000);
 
@@ -407,6 +407,6 @@ test('matching Case and repetition in different Executions retain distinct Trial
         expect(reports[0]!.trials[0]!.traceId).not.toBe(reports[1]!.trials[0]!.traceId);
         expect(reports.map(r => r.aggregation!.metrics.find(m => m.metricId === 'task-success')!.sources[0]!.executionId)).toEqual(ids);
     } finally {
-        for (const id of ids) rmSync(join(REPO_ROOT, 'agent-eval/runs', id), { recursive: true, force: true });
+        for (const id of ids) rmSync(join(REPO_ROOT, 'agent-eval/runs/business', id), { recursive: true, force: true });
     }
 }, 30000);

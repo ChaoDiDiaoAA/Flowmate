@@ -4,22 +4,24 @@ import { scanEvidence, protectedSecrets } from '../../execution/evidence-safety.
 import { requestJudge, prepareJudge, publicJudgeConfig, type JudgeConfig, type Fetcher } from './client.ts';
 import type { StopReason } from '@earendil-works/pi-ai';
 import { hash } from '../../dataset-loader/local.ts';
-import { compactPlanSchema, parseCompactJudgment, parseMetricJudgment, compactRubric, compactRubricFor, type CompactPlan, type CompactJudgment } from './compact.ts';
+import { compactPlanSchema, parseCompactJudgment, parseMetricJudgment, parseStrictMetricJudgment, normalizeMetricJson, metricPolicyFor, metricRubrics, compactRubric, compactRubricFor, type CompactPlan, type CompactJudgment } from './compact.ts';
 import {researchFrameSchema} from '../research-judgment.ts';
 export function parseJudgment(text: string) { return z.object({ score: z.number().min(0).max(1), reason: z.string().trim().min(1) }).strict().parse(JSON.parse(text)); }
 export async function runJudge(config: JudgeConfig, system: string, data: string, fetcher?: Fetcher, signal?: AbortSignal, plan?: CompactPlan,frame?:unknown) {
     if (plan) plan = compactPlanSchema.parse(plan);
-    const rubric = plan ? [compactRubric, compactRubricFor(plan)].find(r=>r.prompt===system) ?? {id:'semantic-batch',version:1,prompt:system} : undefined;
+    const rubric = plan ? [compactRubric, ...metricRubrics, compactRubricFor(plan)].find(r=>r.prompt===system) ?? {id:'semantic-batch',version:1,prompt:system} : undefined;
     const named = rubric?.id.startsWith('semantic-metrics-');
+    const parsePolicy=rubric?metricPolicyFor(rubric):undefined;
     const secrets = [config.apiKey, ...protectedSecrets()];
     const input = scanEvidence({ system, data }, secrets);
     const record = { callId: randomUUID(), configuration: publicJudgeConfig(config, rubric), startedAt: new Date().toISOString(), endedAt: '', attempts: 0, usage: null as unknown,
         responseModel: null as unknown, stopReason: null as StopReason | null, rawStopReason: null as string | null, responseComplete: false,
-        usageSource: 'unknown' as 'sdk' | 'unknown',
+        usageSource: 'unknown' as 'sdk' | 'unknown', transportStatus:null as number|null,
         raw: null as string | null, error: null as string | null, judgment: null as ReturnType<typeof parseJudgment> | null,
         request: { ...input.value, hash: hash([input.value.system, input.value.data]), redacted: (input.fact.actual as { leaked: boolean }).leaked },
         compact: plan ? { plan, judgment: null as CompactJudgment | null,
-            ...(named ? {format:'metric-id/v1' as const, validationErrors:{} as Record<string,string>} : {}) } : undefined };
+            ...(named ? {format:'metric-id/v1' as const, validationErrors:{} as Record<string,string>} : {}),
+            ...(parsePolicy?{parsePolicy,normalization:'none' as 'none'|'markdown-fence'}:{}) } : undefined };
     try {
         if (record.request.redacted) throw new Error('Judge input contained configured secret; redacted');
         config = await prepareJudge(config, fetcher, signal);
@@ -33,16 +35,22 @@ export async function runJudge(config: JudgeConfig, system: string, data: string
         record.stopReason = result.stopReason;
         record.rawStopReason = result.rawStopReason;
         record.responseComplete = result.responseComplete;
+        record.transportStatus=result.transportStatus;
         if (result.error) throw new Error(result.error);
         if (!result.responseComplete) throw new Error('Judge response incomplete (' + result.stopReason + ')');
         if (result.text === null) throw new Error('Judge response text unavailable');
         if (record.compact) {
-            if (record.compact.format) Object.assign(record.compact, parseMetricJudgment(result.text, record.compact.plan, frame));
+            if (record.compact.parsePolicy){
+                record.compact.normalization=normalizeMetricJson(result.text).normalization;
+                Object.assign(record.compact,parseStrictMetricJudgment(result.text,record.compact.plan,frame));
+            }
+            else if (record.compact.format) Object.assign(record.compact, parseMetricJudgment(result.text, record.compact.plan, frame));
             else record.compact.judgment = parseCompactJudgment(result.text, record.compact.plan,frame);
         }
         else record.judgment = parseJudgment(result.text);
     }
     catch (error) {
+        if(error instanceof Error&&'transportStatus'in error)record.transportStatus=error.transportStatus as number|null;
         record.error = error instanceof Error ? error.message : String(error);
     }
     record.endedAt = new Date().toISOString();

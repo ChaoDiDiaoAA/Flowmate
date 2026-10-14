@@ -1,6 +1,11 @@
 import { expect, test } from 'bun:test';
 import { parseOptions } from '../../src/cli.ts';
 import { main } from '../../src/cli.ts';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 async function offlineMain(args: string[]) {
     const key = process.env.LANGFUSE_PUBLIC_KEY;
     process.env.LANGFUSE_PUBLIC_KEY = '';
@@ -39,4 +44,35 @@ test('calibration CLI requires its exact subcommand, independent-reference direc
     for(const args of [['judge','accept'],['judge','calibrate'],['judge','calibrate','--dir','missing'],
         ['judge','calibrate','--backend','langfuse'],['judge','calibrate','--dir','a','--dir','b']])
         await expect(main(args)).rejects.toThrow();
+});
+
+test('trials rejects retired, missing, duplicate and invalid counts before dataset or model preparation', async () => {
+    const originalFetch=globalThis.fetch;let requests=0;
+    globalThis.fetch=Object.assign(async()=>{requests++;throw Error('Network forbidden in CLI parameter tests');},originalFetch);
+    try {
+    await expect(main(['run', '--dataset', 'absent', '--repeat', '5'])).rejects.toThrow('--trials');
+    for (const value of ['0', '-1', '1.5', '21', 'abc', 'Infinity'])
+        await expect(main(['run', '--dataset', 'absent', '--trials', value])).rejects.toThrow('1–20');
+    await expect(main(['run', '--trials'])).rejects.toThrow('Missing');
+    await expect(main(['run', '--trials', '2', '--trials', '3'])).rejects.toThrow('Duplicate');
+    for (const value of ['1', '5', '20'])
+        await expect(main(['run', '--dataset', 'absent', '--trials', value])).rejects.toThrow('不存在');
+    expect(requests).toBe(0);
+    } finally { globalThis.fetch=originalFetch; }
+});
+
+test('Smoke and Full shortcuts forward --trials to the CLI before any paid preparation', () => {
+    const guardDirectory=mkdtempSync(join(tmpdir(),'flowmate-cli-offline-')),guard=join(guardDirectory,'guard.mjs');
+    writeFileSync(guard,"import { Socket } from 'node:net'; globalThis.fetch=()=>{throw Error('Network forbidden');}; Socket.prototype.connect=function(){throw Error('Network forbidden');};");
+    try {
+    for (const script of ['eval:smoke', 'eval:full']) {
+        const child = spawnSync(process.execPath, ['--no-env-file', 'run', script, '--trials', '0'], {
+            cwd: new URL('../../../', import.meta.url), encoding: 'utf8', timeout: 15000,
+            env:{...process.env,NODE_OPTIONS:'--import='+pathToFileURL(guard).href} });
+        expect(child.error).toBeUndefined();
+        expect(child.status).toBe(1);
+        expect(child.stderr).toContain('1–20');
+        expect(child.stdout).toBe('');
+    }
+    } finally { unlinkSync(guard);rmdirSync(guardDirectory); }
 });

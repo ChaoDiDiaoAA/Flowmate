@@ -22,7 +22,7 @@ import {
   type AgentSession,
   type AgentToolResult, type LoadExtensionsResult,
 } from '@earendil-works/pi-coding-agent';
-import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema, ContextToolDefinitionsEvidenceSchema } from '@flowmate/contracts';
 import { loadControlledExtensions, extensionAssembly, type LoadedExtensionSet } from './extensions/loader.ts';
 import type { DelegateExecution } from './extensions/subagents.ts';
 import type { ManagedChildControl } from '@tintinweb/pi-subagents/dist/agent-runner.js';
@@ -358,6 +358,31 @@ function traceInteger(value: unknown): string {
 
 function safeTraceStopReason(value: unknown): 'stop' | 'length' | 'error' | 'aborted' | 'pending' | null {
   return value === 'stop' || value === 'length' || value === 'error' || value === 'aborted' || value === 'pending' ? value : null;
+}
+
+function deliveredToolDefinitions(api: string, payload: unknown) {
+  if (!['anthropic-messages', 'openai-completions', 'openai-responses'].includes(api)) return undefined;
+  const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+  const body = object(payload);
+  if (!body || body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.length > 128)) return undefined;
+  const definitions = [];
+  for (const raw of (body.tools ?? []) as unknown[]) {
+    const entry = object(raw), tool = api === 'openai-completions' ? object(entry?.function) : entry;
+    if (!tool || api !== 'anthropic-messages' && entry?.type !== 'function') return undefined;
+    const parameters = object(api === 'anthropic-messages' ? tool.input_schema : tool.parameters);
+    if (!parameters || parameters.properties !== undefined && !object(parameters.properties)) return undefined;
+    definitions.push({ toolName: tool.name, properties: Object.keys(object(parameters.properties) ?? {}), required: parameters.required ?? [] });
+  }
+  const parsed = ContextToolDefinitionsEvidenceSchema.safeParse(definitions);
+  return parsed.success ? parsed.data : undefined;
+}
+
+async function wireToolDefinitions(api: string, request: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) {
+  try {
+    const body = typeof init?.body === 'string' ? init.body : request instanceof Request ? await request.clone().text() : undefined;
+    return body === undefined ? undefined : deliveredToolDefinitions(api, JSON.parse(body));
+  } catch { return undefined; }
 }
 
 export class PiAgentAdapter implements AgentPort {
@@ -2493,10 +2518,12 @@ export class PiAgentAdapter implements AgentPort {
       }
       if (!this.observeOutgoingToolResults(record, active, context)) throw new Error('tool_result_delivery_failed');
       if (resources) saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
+      const toolDefinitions = requestBinding ? await wireToolDefinitions(model.api, request, init) : undefined;
       const attempt = ++localAttempt;
       if (requestBinding) requireEvidence({ kind: 'attempt-prepared', evidence: { attempt, preparedAt: now().at,
         enteredAt: null, responseAt: null, responseStatus: null, transportErrorCode: null, nativeRequestId: null,
-        wireInclusion: wire.data.inclusion, wireReason: wire.data.reason } });
+        wireInclusion: wire.data.inclusion, wireReason: wire.data.reason,
+        ...(toolDefinitions === undefined ? {} : { toolDefinitions }) } });
       const reserved = active.input.reserveModelRequest?.();
       if (reserved && !reserved.ok) { this.failToolRun(record, active, reserved.error); throw new Error(reserved.error.code); }
       active.attempts += 1;
@@ -2538,7 +2565,9 @@ export class PiAgentAdapter implements AgentPort {
       if (requestBinding) {
         const inclusion = checkPayload(codec, outgoing);
         if (!inclusion.ok) { failStream(inclusion.error); throw new Error(inclusion.error.code); }
-        const fact = { kind: 'sdk-payload' as const, at: sdkPayloadFact?.at ?? now().at, ...inclusion.data };
+        const toolDefinitions = deliveredToolDefinitions(model.api, outgoing);
+        const fact = { kind: 'sdk-payload' as const, at: sdkPayloadFact?.at ?? now().at, ...inclusion.data,
+          ...(toolDefinitions === undefined ? {} : { toolDefinitions }) };
         requireEvidence(fact); sdkPayloadFact ??= fact;
       }
       if (resources) saveResources('sdk', checkResourcePayload(model.api, outgoing, resources.texts));
@@ -2789,15 +2818,10 @@ export class PiAgentAdapter implements AgentPort {
   private providerError(active: ActiveExecution, error: unknown, transportFailed = false): ReturnType<typeof appError> {
     if (active.signal.aborted) return appError('agent_cancelled', 'runtime', 'Agent 执行已取消。');
     if (active.responseStatus === 401 || active.responseStatus === 403) return appError('provider_auth_failed', 'provider', 'Provider 认证失败。');
+    if (active.responseStatus === 402) return appError('provider_billing_failed', 'provider', 'Provider 计费或余额不足。');
     if (active.responseStatus === 429) return appError('provider_rate_limited', 'provider', 'Provider 请求受到限流。', true);
     if (active.responseStatus !== null && active.responseStatus >= 400 && active.responseStatus < 500) {
-      const raw = error instanceof Error ? error.message
-        : typeof error === 'object' && error !== null && 'errorMessage' in error && typeof error.errorMessage === 'string'
-          ? error.errorMessage : '';
-      const detail = raw.replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
-        .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]').trim().slice(0, 300);
-      return appError('provider_request_rejected', 'provider',
-        `Provider 拒绝了 Agent 请求（HTTP ${active.responseStatus}）${detail ? `：${detail}` : '。'}`);
+      return appError('provider_request_rejected', 'provider', `Provider 拒绝了 Agent 请求（HTTP ${active.responseStatus}）。`);
     }
     if (!active.responseStarted) return transportFailed ? appError('provider_network_error', 'provider', 'Provider 请求未建立响应。', true)
       : appError('provider_error', 'provider', 'Provider 请求失败。', true);

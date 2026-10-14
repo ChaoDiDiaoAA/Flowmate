@@ -41,11 +41,22 @@ export const metricResearchRubric = { id: 'semantic-metrics-research', version: 
 For DR criteria set counts:null and failures:[]; ratios are computed locally from research witnesses, never generated counts. Add research:{atoms:[],links:[],chains:[]} at the root, or research:{atoms:[],links:[],chains:[],unavailable:true} when witnesses cannot be established. Unavailable must have no partial witnesses.
 Enumerate every factual statement in researchFrame.blocks, including final Report statements; deduplicate semantic repetitions and split compound assertions. atoms are {block,start,length,correct,needsCitation,covered,gold,matchUncertain}, in original block/UTF-16 span order, non-overlapping. correct/covered:0=false,1=true,2=unknown; needsCitation/matchUncertain:boolean. gold:one-based required Gold index,0=no match; each Gold matches at most one atom. Retain entities, dates, conditions and conflicts; correct extra facts may have source support without Gold membership.
 links has exactly one {atom,state} per original citation, atom:zero-based or -1=unattached, state:0/1/2. An address alone does not prove support. Coverage requires the attached citation group and every necessary hop; unlinked or report-external evidence is insufficient. chains has one 0/1/2 state per declared Gold chain, checking connected intermediate entities, all expressed hops and actual citations. Never omit facts to fit a quota or invent witnesses.` };
+export const metricParsePolicy = 'metric-json-fence-strict-counts/v1' as const;
+const strictNamedInstructions = namedInstructions.replace('"numerator":0', '"numerator":1') + `
+Return the complete JSON object, optionally inside one complete exterior markdown fence (json or no language). Never wrap it in explanatory text. All count and index values are JSON numbers, never strings. For every non-null counts object, failures must enumerate exactly all assessed failed opportunities: denominator-numerator-unassessable for an upward metric, numerator for a downward metric. Keep declared opportunity indexes; never omit a known failure or invent one for an unknown opportunity.`;
+const currentMetricBusinessRubric = {id:'semantic-metrics-business-v2',version:1,prompt:strictNamedInstructions};
+const currentMetricResearchRubric = {id:'semantic-metrics-research-v2',version:1,prompt:strictNamedInstructions +
+    metricResearchRubric.prompt.slice(namedInstructions.length) + `
+Typed witness shape example only: {"atoms":[{"block":0,"start":0,"length":1,"correct":1,"needsCitation":true,"covered":1,"gold":0,"matchUncertain":false}],"links":[{"atom":0,"state":1}],"chains":[1,0,2]}
+block/start/length/gold and links[].atom are JSON integer numbers. chains contains numeric states, never objects or strings; the example shows allowed states, not a required chain count. Use the actual frame's spans, citation indexes and one state per actual Gold chain.`};
+export const metricRubrics = [metricBusinessRubric,metricResearchRubric,currentMetricBusinessRubric,currentMetricResearchRubric];
+export const metricPolicyFor = (rubric:{id:string;prompt:string}) =>
+    [currentMetricBusinessRubric,currentMetricResearchRubric].some(r=>r.id===rubric.id&&r.prompt===rubric.prompt)?metricParsePolicy:undefined;
 export const compactRubricFor=(plan:CompactPlan)=>plan.encoding?legacyPackedRubric:
-    plan.criteria.some(c=>c.metricId.startsWith('DR'))?metricResearchRubric:metricBusinessRubric;
+    plan.criteria.some(c=>c.metricId.startsWith('DR'))?currentMetricResearchRubric:currentMetricBusinessRubric;
 export function rubricsFor(plans: readonly CompactPlan[]) {
     const selected = plans.flatMap(plan=>[compactRubricFor(plan),
-        ...(plan.criteria.some(c=>c.metricId.startsWith('DR')) && plan.criteria.some(c=>!c.metricId.startsWith('DR')) ? [metricBusinessRubric] : [])]);
+        ...(plan.criteria.some(c=>c.metricId.startsWith('DR')) && plan.criteria.some(c=>!c.metricId.startsWith('DR')) ? [currentMetricBusinessRubric] : [])]);
     return [...new Map(selected.map(r=>[r.id,r])).values()];
 }
 
@@ -103,6 +114,26 @@ export function parseMetricJudgment(raw: string, input: CompactPlan, frame?: unk
         }
     }
     return { judgment, validationErrors };
+}
+
+export function normalizeMetricJson(raw:string) {
+    const fence=/^```(?:json)?[\t ]*\r?\n([\s\S]*?)\r?\n```$/.exec(raw.trim());
+    return {text:fence?fence[1]!:raw,normalization:fence?'markdown-fence' as const:'none' as const};
+}
+
+/** The explicit current policy keeps historical named counts and raw JSON parsing unchanged. */
+export function parseStrictMetricJudgment(raw:string,input:CompactPlan,frame?:unknown) {
+    const {judgment,validationErrors}=parseMetricJudgment(normalizeMetricJson(raw).text,input,frame);
+    for(const [index,criterion] of input.criteria.entries()){
+        const row=judgment.r[index];
+        if(!row||criterion.metricId.startsWith('DR'))continue;
+        const expected=formalMetric(criterion.metricId).direction==='up'?row[1]-row[0]-row[2]:row[0];
+        if(judgment.f.filter(f=>f[0]===index).length!==expected){
+            validationErrors[criterion.metricId]='Metric failure witnesses must match its assessed failure count ('+expected+')';
+            judgment.r[index]=null;judgment.f=judgment.f.filter(f=>f[0]!==index);
+        }
+    }
+    return{judgment,validationErrors};
 }
 
 function parseCompact(raw: string, input: CompactPlan,frame?:unknown, legacyCounts=false): CompactJudgment {

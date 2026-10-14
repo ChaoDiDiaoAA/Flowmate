@@ -6,6 +6,10 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,existsSync} from
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {calibrateJudge,loadCalibration} from '../../../src/scoring/judges/calibration.ts';
+import * as calibration from '../../../src/scoring/judges/calibration.ts';
+import {runJudge} from '../../../src/scoring/judges/harness.ts';
+import {judgeConfig} from '../../../src/scoring/judges/client.ts';
+import {metricBusinessRubric} from '../../../src/scoring/judges/compact.ts';
 
 const env={FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'independent-fixture-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'};
 const reply=(n:number,finish='stop')=>judgeResponse({model:'llama-3.3-70b-versatile',choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-arguments'}]},{v:1,r:[[n,1,0]],f:n?[]:[[0,0,1]]})},finish_reason:finish}],usage:{prompt_tokens:10,completion_tokens:15}});
@@ -132,5 +136,54 @@ test('reference loading has no sample ceiling inherited from the retired token b
    f.manifest.samples.push({id,file});
   }
   f.save();expect(loadCalibration(f.directory).samples).toHaveLength(59);
+ }finally{f.close();}
+});
+
+test('references explicitly select strict parsing without changing the behavior of historical references',()=>{
+ const f=fixture();try{
+  const file=join(f.directory,'tune.json'),document=JSON.parse(readFileSync(file,'utf8'));
+  document.parsePolicy='metric-json-fence-strict-counts/v1';
+  document.referenceWire=JSON.stringify({v:1,results:[{metricId:'tool-arguments',counts:{numerator:0,denominator:1,unassessable:0},
+   failures:[{opportunityIndex:0,code:1}]}]});
+  writeFileSync(file,JSON.stringify(document));
+  expect(()=>loadCalibration(f.directory)).not.toThrow();
+  document.referenceWire=JSON.stringify({v:1,results:[{metricId:'tool-arguments',counts:{numerator:0,denominator:1,unassessable:0},failures:[]}]});
+  writeFileSync(file,JSON.stringify(document));
+  expect(()=>loadCalibration(f.directory)).toThrow('Reference counts contradict');
+  delete document.parsePolicy;writeFileSync(file,JSON.stringify(document));
+  expect(()=>loadCalibration(f.directory)).not.toThrow();
+ }finally{f.close();}
+});
+
+test('calibration status reads and validates original current or old named calls without writes or regrading',async()=>{
+ const f=fixture();try{
+  let index=0;const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'read-only-calibration'},{env,fetcher:async()=>reply(index++)});
+  expect(calibration).toHaveProperty('readCalibrationReport',expect.any(Function));
+  const read=(calibration as any).readCalibrationReport as (file:string)=>typeof result.report;
+  const bytes=readFileSync(result.file,'utf8'),restored=read(result.file);
+  expect(restored.criteria).toEqual(result.report.criteria);expect(readFileSync(result.file,'utf8')).toBe(bytes);
+  expect(restored.samples[0]!.call!.compact).toMatchObject({parsePolicy:'metric-json-fence-strict-counts/v1'});
+  writeFileSync(result.file,JSON.stringify(result.report));
+  expect(()=>read(result.file)).not.toThrow();
+  for(const mutate of [
+   (r:any)=>{r.criteria[0].countsCorrect++;},
+   (r:any)=>{delete r.samples[0].call.compact.parsePolicy;},
+   (r:any)=>{r.samples[0].call.raw='Explanation: '+r.samples[0].call.raw;},
+   (r:any)=>{r.samples[1].id=r.samples[0].id;},
+   (r:any)=>{r.samples[0].call.request.data=JSON.stringify({plan:r.samples[0].reference.plan,evidence:{forged:true}});}
+  ]){
+   const forged=JSON.parse(bytes);mutate(forged);writeFileSync(result.file,JSON.stringify(forged));
+   expect(()=>read(result.file)).toThrow();
+  }
+  const legacy=structuredClone(result.report);legacy.rubrics=[metricBusinessRubric];
+  for(const [i,sample]of legacy.samples.entries()){
+   const raw=JSON.stringify({v:1,results:[{metricId:'tool-arguments',counts:{numerator:i,denominator:1,unassessable:0},failures:[]}]});
+   sample.call=await runJudge(judgeConfig(env,f.root)!,metricBusinessRubric.prompt,JSON.stringify({plan:sample.reference.plan,evidence:sample.reference.evidence}),async()=>judgeResponse({choices:[{message:{content:raw},finish_reason:'stop'}]}),undefined,sample.reference.plan);
+   delete sample.call.transportStatus;
+  }
+  writeFileSync(result.file,JSON.stringify(publicVersions(withoutHashes(legacy))));
+  expect(read(result.file).criteria).toEqual(result.report.criteria);
+  expect(read(result.file).samples[0]!.call!.compact).not.toHaveProperty('parsePolicy');
+  expect(read(result.file).samples[0]!.call).not.toHaveProperty('transportStatus');
  }finally{f.close();}
 });

@@ -6,6 +6,7 @@ import { expandHarness, assertNoHashes } from './harness.ts';
 import { byteHash, type FlatDataset } from './flat.ts';
 import { assertSafeFixtureName, loadFixture } from '../testing/load-fixture.ts';
 import { authorDatasetSchema, type AuthorCase } from './authoring.ts';
+import { isDeepStrictEqual } from 'node:util';
 
 export function validateScenarioTurns(task: AuthorCase, scenario: any) {
     const turns = new Map(task.input.turns?.map(turn => [turn.id, turn])), used = new Set<string>();
@@ -39,16 +40,33 @@ export function validateScenarioTurns(task: AuthorCase, scenario: any) {
 export function readDeclarationDatasets(root: string, repo: string): FlatDataset[] {
     const require = createRequire(import.meta.url);
     for(const name of ['cases.ts','gold.ts','review.ts'])delete require.cache[require.resolve(inside(root,name))];
-    const { flowmateAgentV1Dataset: declaration } = require(inside(root, 'cases.ts'));
+    const declarations = require(inside(root, 'cases.ts'));
+    const declaration = declarations.flowmateBadcaseDataset ?? declarations.flowmateAgentV1Dataset;
     const dataset = authorDatasetSchema.parse(declaration);
     const { goldByCaseId: gold } = require(inside(root, 'gold.ts'));
     const { reviewByCaseId: reviews } = require(inside(root, 'review.ts'));
-    const testingRoot = join(root, '../testing'), fixtureRoot = join(testingRoot, 'fixtures');
+    const supplemental = dataset.suite === 'badcase';
+    if (supplemental) {
+        const base = join(repo, 'agent-eval/src/datasets');
+        const canonical = require(inside(base, 'cases.ts')).flowmateAgentV1Dataset.cases as AuthorCase[];
+        const originalGold = require(inside(base, 'gold.ts')).goldByCaseId, originalReviews = require(inside(base, 'review.ts')).reviewByCaseId;
+        const added: number[] = [];
+        for (const c of dataset.cases) {
+            const prior = canonical.find(old => old.id === c.id);
+            if (prior && (!isDeepStrictEqual(prior, c) || !isDeepStrictEqual(originalGold[c.id], gold[c.id]) || !isDeepStrictEqual(originalReviews[c.id], reviews[c.id])))
+                throw Error('Referenced Case/Gold/Review changed: ' + c.id);
+            if (!prior) added.push(Number(c.id.slice(3)));
+        }
+        const next = Math.max(...canonical.map(c => Number(c.id.slice(3)))) + 1;
+        if (added.sort((a,b) => a-b).some((id, index) => id !== next + index)) throw Error('Independent Case identities must be consecutive from FM-' + next);
+    }
+    const testingRoot = supplemental ? join(repo, 'agent-eval/src/testing') : join(root, '../testing'), fixtureRoot = join(testingRoot, 'fixtures');
     const scenarioPath = inside(testingRoot, 'scenarios.ts');
     delete require.cache[require.resolve(scenarioPath)];
     const { scenariosByName } = require(scenarioPath);
     [dataset, gold, reviews].forEach(assertNoHashes);
     if (dataset.version !== 'v1' || new Set(dataset.cases.map((c:any)=>c.id)).size !== dataset.cases.length ||
+        dataset.cases.some(c => !gold[c.id] || !reviews[c.id]) ||
         JSON.stringify(Object.keys(gold).sort()) !== JSON.stringify(dataset.cases.map((c:any)=>c.id).sort()) ||
         JSON.stringify(Object.keys(reviews).sort()) !== JSON.stringify(Object.keys(gold).sort())) throw Error('Invalid Case/Gold/Review pairing');
     const sampleName = (virtual:string) => {
@@ -66,10 +84,13 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
         assertNoHashes(fixture);
         validateScenarioTurns(c,fixture);
         if(gold[c.id].checks.some((check:any)=>!c.scoring.deterministic.includes(check.metric)))throw Error('Unselected deterministic check: '+c.id);
+        if (dataset.regressionOrigins?.[c.id]?.some(origin => origin.metricIds.some(metric => ![...c.scoring.deterministic, ...c.scoring.judge].includes(metric))))
+            throw Error('Unselected regression metric: ' + c.id);
         const tag = c.tags.includes('business') ? 'agent' : c.tags.includes('research') ? 'research' : undefined;
         if(!tag)throw Error('Unknown dataset membership: '+c.id);
-        const id = `flowmate-${tag}-v1`;
+        const id = supplemental ? `flowmate-badcase-${tag === 'agent' ? 'business' : 'research'}-v1` : `flowmate-${tag}-v1`;
         const metadata = {contract:'flowmate-agent-dataset/v2',id,version:1,name:id,
+            ...(supplemental ? { suite: 'badcase' } : {}),
             environment:{profile:'isolated-agent/v2',source:tag==='research'?'local':'mixed',risks:['Independent human review and real evaluation are pending.']},
             scoring:{version:1,required:['task-result','input-isolation','environment-isolation','no-secret','closed'],judges:[{id:'semantic-batch',required:true}]}};
         const resources = fixture.selection.enabledSkills.flatMap((skill:string)=>{
@@ -98,7 +119,7 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
         };
         for(const key of Object.keys(c.expected))if(Object.hasOwn(gold[c.id].values,key))throw Error('Gold must not overwrite Case constraint: '+c.id+'/'+key);
         const raw={contract:'flowmate-eval-case/v4',version:1,id:c.id,name:c.name,category:c.category,purpose:c.purpose,
-            source:{type:'controlled-workflow',basis:'Reviewed product workflows; controlled setup, not a real evaluation result.'},dataset:id,smoke:c.tags.includes('smoke'),tags:c.tags,
+            source:{type:'controlled-workflow',basis:'Reviewed product workflows; controlled setup, not a real evaluation result.'},dataset:id,smoke:!supplemental && c.tags.includes('smoke'),tags:c.tags,
             requires:fixture.requires,input:{prompt:c.input.prompt,...(c.input.turns?{turns:c.input.turns}:{}),materials:fixture.materials},environment:'isolated',setup:fixture.setup,steps:fixture.steps,
             expected:{...c.expected,checks:gold[c.id].checks},scoring:{methods:['deterministic','llm-judge','human-review'],metrics:Object.fromEntries(Object.entries(gold[c.id].opportunities).filter(([id])=>id==='task-success'||c.scoring.judge.includes(id)||c.scoring.deterministic.includes(id))),humanReview:c.scoring.manual},risks:c.risks};
         const expanded=expandHarness(raw,{contract:'flowmate-eval-gold/v4',caseId:c.id,version:1,...gold[c.id]},
@@ -111,7 +132,8 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
         group.tasks[member]={contract:'flowmate-agent-case/v2',id:c.id,version:1,name:c.name,category:c.category,difficulty:c.difficulty,purpose:c.purpose,source:c.source,tags:c.tags,requires:task.requires,input,
             ...(task.setup?{setup:task.setup}:{}),...(task.steps?{steps:task.steps}:{}),expected:{...task.expected,...expanded.gold.values},review:{status:'pending'}};
         group.inputs[c.id]=[...visible,...task.resourceFiles];
-        group.manifest.members.push(member);if(c.tags.includes('smoke'))group.manifest.smoke.push(c.id);
+        group.manifest.members.push(member);if(!supplemental && c.tags.includes('smoke'))group.manifest.smoke.push(c.id);
+        if (supplemental) (group.regressionOrigins ??= {})[c.id] = dataset.regressionOrigins![c.id]!;
         for(const file of [...visible,...task.resourceFiles,...task.controllerFiles,...expanded.gold.sources]) {
             if(group.files[file.path]&&group.files[file.path]!.sha256!==file.sha256)throw Error('Conflicting source: '+file.path);
             group.files[file.path]=file;

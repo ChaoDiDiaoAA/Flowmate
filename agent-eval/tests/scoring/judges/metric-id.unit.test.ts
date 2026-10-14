@@ -24,7 +24,7 @@ async function judge(results: unknown[], extra = {}) {
 }
 
 test('new generation binds named counts by metric ID in any order with a business-only prompt', async () => {
-    const call = await judge([result('tool-arguments', 4, 4), result('tool-selection', 2, 3)]);
+    const call = await judge([result('tool-arguments', 4, 4), {...result('tool-selection', 2, 3),failures:[{opportunityIndex:2,code:1}]}]);
     expect(call.error).toBeNull();
     expect(call.compact).toMatchObject({ format: 'metric-id/v1', validationErrors: {} });
     expect(compactScores(call)).toMatchObject([{ metricId: 'tool-selection', status: 'FAIL', value: 2 / 3 },
@@ -57,9 +57,9 @@ test('unknown metric identity and business research payload invalidate the envel
 
 test('named failures preserve declared opportunity identities and partial known failure', async () => {
     const call = await judge([result('tool-selection', 3, 3), { ...result('tool-arguments', 1, 4, 1),
-        failures: [{ opportunityIndex: 2, code: 1 }] }]);
+        failures: [{ opportunityIndex: 2, code: 1 },{opportunityIndex:3,code:4}] }]);
     expect(compactScores(call)[1]).toMatchObject({ status: 'FAIL', value: null,
-        statistics: { numerator: 1, denominator: 4, missing: 1 }, actual: { failures: [[1, 2, 1]] } });
+        statistics: { numerator: 1, denominator: 4, missing: 1 }, actual: { failures: [[1, 2, 1],[1,3,4]] } });
 });
 
 test('all fourteen structural Smoke failures reproduce under the frozen old parser and are not accepted as named results',()=>{

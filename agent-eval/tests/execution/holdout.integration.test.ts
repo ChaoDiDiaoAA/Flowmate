@@ -69,5 +69,5 @@ test('empty holdout cannot create an Execution or prepare an Agent', async () =>
     await expect(runLocal(fixtureRepo, { dataset: data, selection: 'holdout', executionId: id, backend: 'local', judge: 'off' }, { kernel }))
         .rejects.toThrow('No Cases in selected');
     expect(prepared).toBe(0);
-    expect(existsSync(join(fixtureRepo, 'agent-eval/runs', id))).toBe(false);
+    expect(existsSync(join(fixtureRepo, 'agent-eval/runs/business', id))).toBe(false);
 });

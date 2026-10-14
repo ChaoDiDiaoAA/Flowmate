@@ -76,6 +76,9 @@ test('each Case and repetition keeps a separate evidence directory and matching 
     }
     expect(readReport(run.file).trials).toHaveLength(4);
     expect(events.filter(e => e.type === 'trial-end').map(e => [e.index, e.total])).toEqual([[1,4],[2,4],[3,4],[4,4]]);
+    expect(events.filter(e => e.type === 'trial-end').map(e => [e.trialIndex,e.trialsPerCase])).toEqual([[1,2],[1,2],[2,2],[2,2]]);
+    expect(run.report.trialStatistics).toBeDefined();
+    expect(events.at(-1)).toMatchObject({type:'dataset-end',statistics:readReport(run.file).trialStatistics});
 });
 
 test('a broken progress observer does not change scoring, cleanup or the saved report', async () => {

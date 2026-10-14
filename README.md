@@ -43,7 +43,7 @@ Skills 主页面与 Settings → Skills 共用紧凑列表、英文介绍、依�
 bun install --frozen-lockfile
 ```
 
-模型在桌面 **Models** 或 **Settings → LLM** 配置，两处复用同一设置。选择 Pi 内置供应商和模型后，在页面填写并保存 API Key；现行桌面不使用环境变量或旧 OAuth 凭据代替该 Key。明确选择 **Custom model** 才填写 Base URL、Pi API 类型和实际模型能力。凭据保存在系统加密存储中。评测用的 Judge、Langfuse 可单独配置 [.env.example](.env.example)。
+模型在桌面 **Models** 或 **Settings → LLM** 配置，两处复用同一设置。选择 Pi 内置供应商和模型后，在页面填写并保存 API Key；现行桌面不使用环境变量或旧 OAuth 凭据代替该 Key。明确选择 **Custom model** 才填写 Base URL、Pi API 类型和实际模型能力。凭据保存在系统加密存储中。评测专用 Agent、Judge 和 Langfuse 使用 `agent-eval/configs/.env`，具体配置见[评测 README](agent-eval/README.md)。
 
 ## 启动与使用
 

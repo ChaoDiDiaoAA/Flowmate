@@ -3,7 +3,7 @@ import {mkdirSync,writeFileSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {main} from '../../src/cli.ts';
 import {productAgent, createProductAgent} from '../../src/adapters/agent.ts';
-import {readReport,comparison} from '../../src/reports/store.ts';
+import {readReport,reportPath,comparison} from '../../src/reports/store.ts';
 import {fixtureRepo} from '../support/fixtures.ts';
 import {manifest} from '../fixtures/minimal-dataset.ts';
 import {createHttpProvider} from '../../../tests/support/resources.ts';
@@ -47,13 +47,13 @@ test('default CLI runs only independent synthetic data through local Host, one i
  try{
   expect(productAgent.readiness().ready).toBe(true);
   await main(['run','--dataset','public-synthetic','--execution-id','public-synthetic-a','--judge','required','--backend','local'],fixtureRepo);
-  const file=join(fixtureRepo,'agent-eval/runs/public-synthetic-a/report.json'),report=readReport(file);
+  const file=reportPath(fixtureRepo,'public-synthetic-a'),report=readReport(file);
   if(report.trials[0]!.status!=='PASS')throw new Error(JSON.stringify({reason:report.trials[0]!.reason,error:report.trials[0]!.execution?.error,scores:report.trials[0]!.scores}));
   expect(report.trials[0]!.status).toBe('PASS');expect(report.trials[0]!.judgeCalls).toHaveLength(1);
   expect(report.trials[0]!.execution!.evidence.environment!.present).toBe(true);expect(report.executionComplete).toBe(true);
   expect(comparison(report,readReport(file))).toBeDefined();await main(['compare','--left','public-synthetic-a','--right','public-synthetic-a'],fixtureRepo);
   expect(agentCalls).toBe(1);expect(judgeCalls).toBe(1);expect(process.exitCode).toBe(0);
   await expect(main(['run','--dataset','public-synthetic','--model','REPLACE_WITH_AGENT_MODEL','--execution-id','unfilled-model','--judge','required'],fixtureRepo)).rejects.toThrow('FLOWMATE_EVAL_AGENT_MODEL');
-  expect(existsSync(join(fixtureRepo,'agent-eval/runs/unfilled-model'))).toBe(false);expect(agentCalls).toBe(1);expect(judgeCalls).toBe(1);
+  expect(existsSync(join(fixtureRepo,'agent-eval/runs/business/unfilled-model'))).toBe(false);expect(agentCalls).toBe(1);expect(judgeCalls).toBe(1);
  }finally{output.mockRestore();process.exitCode=originalCode;for(const[k,v]of Object.entries(saved))if(v===undefined)delete process.env[k];else process.env[k]=v;await server.stop();}
 },90000);

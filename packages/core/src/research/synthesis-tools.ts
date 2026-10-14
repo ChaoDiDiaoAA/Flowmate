@@ -64,7 +64,7 @@ export function createResearchSynthesisTools(options: Dependencies & { now(): st
         return {...result.data,evidenceRef:researchEvidenceRef(binding,result.data.source,result.data.excerpt)!};
       } },
     { name: 'save_research_claim', version: 'p15-v1', label: 'Save research claim', effect: 'LOCAL_WRITE', executionMode: 'sequential',
-      description: 'Save one atomic claim: {questionId:<ID from confirmed plan>,text:<claim>,dependencies:[<numeric saved Claim IDs>],evidence:[{relation:"supports",ref:<complete returned evidenceRef>}],verification:{status:"insufficient",reasons:[<specific reason>]}}. Copy evidenceRef unchanged from a read/query receipt. Compare entities, conditions, dates and support/refutation before selecting supported, contradicted or insufficient. Reasons belong inside verification. Semantic verification is the Agent judgment; service validation checks saved bodies, identity and chain structure. Preserve unresolved gaps.',
+      description: 'Save one atomic claim: {questionId:<ID from confirmed plan>,text:<claim>,dependencies:[<numeric saved Claim IDs>],evidence:[{relation:"supports",ref:<complete returned evidenceRef>}],verification:{status:"insufficient",reasons:[<specific reason>]}}. Copy evidenceRef unchanged from a read/query receipt. Compare entities, conditions, dates and support/refutation before selecting supported, refuted or insufficient. Reasons belong inside verification. Semantic verification is the Agent judgment; service validation checks saved bodies, identity and chain structure. Preserve unresolved gaps.',
       inputSchema: ResearchClaimBodySchema, outputSchema: ClaimSchema,
       execute: async (claim, call, context) => {
         const { binding, toolCallId } = identity(call, context, true), bodies = new Map<number, string>();
@@ -73,7 +73,7 @@ export function createResearchSynthesisTools(options: Dependencies & { now(): st
         if (!result.ok) throw new ToolExecutionFailure(result.error); return result.data;
       } },
     { name: 'save_research_report', version: 'p15-v1', label: 'Save research report', effect: 'LOCAL_WRITE', executionMode: 'sequential',
-      description: 'Save an immutable report for the confirmed plan, referencing saved claims and covering every planned question. Include conflicts, limitations and unresolved questions. Full requires supported claims and complete dependencies; otherwise save partial with explicit gaps. A completed Run does not imply a full report. Verified does not guarantee truth.',
+      description: 'Save an immutable report for the confirmed plan. coverage needs exactly one record per planned questionId; covered requires non-empty claimIds for that question with verification.status=supported. completeness=full additionally requires every coverage record covered, all referenced Claims and dependencies supported, and unresolvedQuestions=[]. Include conflicts and limitations. If evidence remains incomplete, explicitly submit partial with gap/conflict records and unresolved questions within the remaining budget; the service never downgrades full automatically. A completed Run does not imply a full report. Verified does not guarantee truth.',
       inputSchema: ResearchReportBodySchema, outputSchema: ResearchReportSchema,
       execute: async (report, call, context) => {
         const { binding, toolCallId } = identity(call, context, true), seen = new Set<number>(), bodies = new Map<number, string>();
@@ -85,7 +85,7 @@ export function createResearchSynthesisTools(options: Dependencies & { now(): st
           if (seen.size % 16 === 0) await setImmediate(); identity(call, context, true);
           const claim = options.research.getClaim({ researchId: binding.researchId, claimId: id }); if (!claim.ok) throw new ToolExecutionFailure(claim.error);
           if (claim.data.planId !== binding.plan!.planId || report.completeness === 'full' && claim.data.verification.status !== 'supported')
-            throw new ToolExecutionFailure(appError('research_evidence_incomplete', 'tool', 'The report contains an incomplete evidence chain.'));
+            throw new ToolExecutionFailure(appError('research_evidence_incomplete', 'tool', 'Report Claims and dependencies must belong to the confirmed plan; completeness=full requires every verification.status=supported. Correct the evidence or explicitly submit partial with gaps within the remaining budget.'));
           for (const evidence of claim.data.evidence) verify(evidence.ref, binding, bodies);
           pending.push(...claim.data.dependencies);
         }

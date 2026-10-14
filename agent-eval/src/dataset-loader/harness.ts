@@ -86,7 +86,7 @@ export function expandHarness(raw:any,gold:any,review:any,registry:any,repo:stri
     const metrics=metricCatalog.map(m=>({metricId:m.id,version:m.version,unit:m.unit,...(Object.hasOwn(task.scoring.metrics,m.id)?
         {denominator:task.scoring.metrics[m.id]}:{notApplicable:'本题未设计该能力机会；已选指标缺证据仍计未知。'})}));
     const expected={...task.expected,...values,metrics};
-    const semantic=compileFormalSemanticPlan({contract:'flowmate-agent-case/v2',expected} as any);
+    const semantic=compileFormalSemanticPlan({contract:'flowmate-agent-case/v2',id:task.id,expected} as any);
     if(semantic)expected.semantic=semantic;
     const resourceFiles=task.requires.includes('skill')||task.requires.includes('invoice')&&Number(task.id.slice(3))<=50?(registry.resources as string[]).map(load):[];
     const unique=(list:EmbeddedFile[])=>[...new Map(list.map(f=>[f.path,f])).values()];

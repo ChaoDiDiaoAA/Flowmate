@@ -141,6 +141,9 @@ for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel'
         expect(requests).toHaveLength(committed&&loss?4:committed&&!race ? 3 : 2);
         if (committed) {
             expect(result.evidence.invoice).toMatchObject({ actual: { candidates: mode==='cancel-before-commit'?[]:[{ candidateId: 1, sequence: 1, fields: { invoiceNumber: { raw: 'SYN-REPLAY-1' } } }] } });
+            if (mode === 'commit-before-cancel') {
+                expect(result.evidence['candidate-fields']).toMatchObject({ present: true, actual: { invoiceNumber: 'SYN-REPLAY-1' } });
+            }
             if(race){expect(cancelRequests).toBe(1);expect(result.endpointReached).toBe(false);expect(replayInput).toBeUndefined();}
             else if(loss){
                 const calls=(result.evidence['tool-evidence']!.actual as {calls:Array<{tool:{toolName:string;status:string;delivery:{state:string};result:{committedCandidateId:number}}}>}).calls;

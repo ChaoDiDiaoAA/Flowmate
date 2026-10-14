@@ -39,7 +39,7 @@ export function evaluateCaseConstraints({ task, result }: EvaluationContext): Ev
     if (expected.maxToolCalls !== undefined) add('case-max-tool-calls', '工具调用上限',
         calls.length > expected.maxToolCalls ? false : complete ? true : undefined, calls.length, expected.maxToolCalls, ['tool-evidence', 'runs']);
     if (expected.requiredCapabilities?.length) add('case-required-capabilities', '必要工具调用',
-        expected.requiredCapabilities.every(name => calls.some(call => call.toolName === name)) ? true : complete ? false : undefined,
+        expected.requiredCapabilities.every(name => calls.some(call => call.toolName === name)) ? true : complete && !result.error?.infrastructure ? false : undefined,
         [...new Set(calls.map(call => call.toolName))], expected.requiredCapabilities, ['tool-evidence', 'runs']);
     if (expected.forbiddenCapabilities?.length) add('case-forbidden-capabilities', '禁止工具请求',
         calls.some(call => expected.forbiddenCapabilities!.includes(call.toolName)) ? false : complete ? true : undefined,
@@ -95,7 +95,7 @@ export function evaluateCaseConstraints({ task, result }: EvaluationContext): Ev
         }
         const resourceComplete = resources.success && !!fact('resources')?.present && resources.data.every(r => r.gap === null && r.evidence !== null) && complete;
         if (expected.requiredSkills?.length) add('fact-check/required-skills', '必要 Skill 的实际读取',
-            expected.requiredSkills.every(skill => used.has(skill)) ? true : resourceComplete &&
+            expected.requiredSkills.every(skill => used.has(skill)) ? true : resourceComplete && !result.error?.infrastructure &&
                 expected.requiredSkills.some(skill => !used.has(skill) && !unknown.has(skill)) ? false : undefined,
             [...used], expected.requiredSkills, ['resources', 'tool-evidence']);
         if (expected.forbiddenSkills?.length) add('fact-check/forbidden-skills', '禁止 Skill 的请求或读取',
@@ -107,7 +107,7 @@ export function evaluateCaseConstraints({ task, result }: EvaluationContext): Ev
         const children = z.object({ children: z.array(z.object({ role: z.string(), childRunId: z.number().int().positive() }).passthrough()) }).passthrough().safeParse(fact('subagents')?.actual);
         const roles = children.success ? children.data.children.map(child => child.role) : [];
         add('fact-check/required-subagent-roles', '必要子 Agent 角色', expected.requiredSubagentRoles.every(role => roles.includes(role)) ? true :
-            children.success && !!fact('subagents')?.present ? false : undefined, roles, expected.requiredSubagentRoles, ['subagents']);
+            children.success && !!fact('subagents')?.present && !result.error?.infrastructure ? false : undefined, roles, expected.requiredSubagentRoles, ['subagents']);
     }
     return scores;
 }

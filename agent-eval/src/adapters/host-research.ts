@@ -46,6 +46,7 @@ import { saveReplayControllerSchema,saveDeliveryLossControllerSchema,readExecuti
 import { cancelOriginalSave } from './invoice-cancel-race.ts';
 import {RuntimeRequestOverridesSchema} from '../../../packages/contracts/src/runtime.ts';
 import { resolveUserSteps, userTurn, observeUserTurns } from './user-turns.ts';
+import { observeSafetyProbes } from '../execution/safety-probes.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const desktopAcceptedSchema = SessionInputAcceptedSchema.extend({ requestId: z.string().min(1).max(128) });
@@ -174,6 +175,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     const invoiceRegistration: Array<{ sample: string; files: Array<{ name: string; sha256: string }>; document: z.infer<typeof documentSchema> }> = [];
     const invoiceJobs = new Map<number, { sample: string; sessionId: number; documentRef: z.infer<typeof DocumentRefSchema> }>();
     const invoiceOperations: Array<Record<string, unknown>> = [], requiredCandidateRuns = new Set<number>();
+    let originalSelectionCandidateId: number | undefined;
     const humanCandidates = new Map<number, number>(), invoiceExports: Array<z.infer<typeof invoiceExportSchema>> = [];
     const editedCandidates = new Map<string, { jobId: number; candidateId: number; sequence: number }>();
     async function invoiceWorkspace(sample: string, goal: string, mode: 'start-task' | 'selected-document' | 'new-session' = 'start-task', stepId?: string) {
@@ -537,11 +539,13 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         execution.status = outcomeRuns.some(run => run.status === 'failed') ? 'failed' : outcomeRuns.some(run => run.status === 'cancelled') ? 'cancelled'
             : outcomeRuns.length && outcomeRuns.every(run => run.status === 'completed') ? 'completed' : execution.started ? 'error' : 'not-started';
         const failed = [...outcomeRuns].reverse().find(run => run.status === 'failed' || run.status === 'cancelled');
-        execution.error = failed?.error ? { code: failed.error.code, message: failed.error.message, infrastructure: false } : controllerFailure;
+        execution.error = failed?.error ? { code: failed.error.code, message: failed.error.message, infrastructure: failed.error.category === 'provider' } : controllerFailure;
         execution.answer = typeof runs.at(-1)?.output?.text === 'string' ? runs.at(-1)!.output!.text as string : null;
         execution.endpointReached = false;
+        if (!isResearch) execution.evidence['new-candidates'] = { present: false, actual: null, source: 'Original public Job/candidate pagination has not completed' };
         execution.evidence.runs = { present: false, actual: runs, source: 'Original root Host query_run facts; descendant collection pending' };
-        execution.evidence.environment = { present: true, actual: { ...trial.identity, fresh: true, isolation: local.manifest },
+        execution.evidence.environment = { present: true, actual: { ...trial.identity, fresh: true, isolation: local.manifest,
+            ...(trial.privateEffects ? { privateEffectsRequired: true } : {}) },
             source: 'Exclusive new local product directory and independent Host process; no OS filesystem sandbox claim' };
         execution.evidence['material-registration'] = { present: true, actual: isInvoice ? invoiceRegistration : registration,
             source: isInvoice ? 'Declared selected invoice bytes and original Host import/query_document receipts' : 'Host import_research_material receipts' };
@@ -560,6 +564,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             captureGaps.push(String(error));
             execution.evidence['capture-gaps'] = { present: false, actual: [...captureGaps], source: 'Optional Host evidence collection errors; original root and saved business facts retained' };
         }
+        if (trial.privateEffects) execution.evidence['safety-effects'] = observeSafetyProbes(trial.privateEffects, execution);
         if (controllerFailure) { execution.status = 'failed'; execution.error = controllerFailure; execution.endpointReached = false; }
         if (stopGaps.length) {
             execution.evidence['original-stop-gaps'] = { present: false, actual: structuredClone(stopGaps), source: 'Original Run or descendant stopping gaps; later readback and Host close cannot erase them' };
@@ -644,9 +649,13 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             source: 'Original consumed public Session inputs in inputId order and their root Run outputs; rejected/replayed requests add no turns' };
         execution.evidence['user-turns'] = { present: histories.every(h => h.present), actual: observeUserTurns(trial.turns ?? [], receipts, inputs),
             source: 'Declared later user turn IDs, actual public submission receipts and original consumed Input identities; planned turns were not sent' };
-        const first = inputs.find(i => i.sessionId === initialSessionId && i.clientSequence === 1);
-        execution.evidence['input-projection'] = { present: first?.content.text === trial.input.prompt && first.status === 'consumed',
-            actual: execution.input, source: 'Consumed initial Input and imported material content hashes; later steps sent separately' };
+        const firstRef = inputRefs.get(steps[0]!.id)?.accepted;
+        const first = inputs.find(i => firstRef ? i.inputId === firstRef.inputId && i.sessionId === firstRef.sessionId && i.runId === firstRef.runId
+            : i.sessionId === initialSessionId && i.clientSequence === 1);
+        execution.evidence['initial-input'] = { present: !!first, actual: first ?? null, source: 'Original first submitted Input identity and actual rendered attachment text' };
+        execution.evidence['input-projection'] = { present: first?.status === 'consumed',
+            actual: first && first.content.text !== initialText ? { ...execution.input, prompt: first.content.text, materials: [] } : execution.input,
+            source: 'Consumed original first Input compared with the full rendered prompt and authorized attachments; observed mismatches remain present' };
         const context = [], tools = [], resources = [], eventPages = [], extensionRuns = [];
         for (const run of allRuns) {
             const sessionId = run.sessionId;
@@ -878,17 +887,40 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             }
             execution.evidence.invoice = { present: true, actual: { workspace, jobs, candidates, operations: invoiceOperations },
                 source: 'Original public Workspace/task CAS operations and complete paged candidate details, bound to actual Document/Run identities' };
+            execution.evidence['new-candidates'] = { present: true,
+                actual: candidates.map(({ candidateId, jobId, runId, sequence, origin }) => ({ candidateId, jobId, runId, sequence, origin })),
+                source: 'Complete public list_job_candidates pagination for every owned Trial Job, including an observed empty ledger' };
             const current = candidates.find(c => c.candidateId === workspace.candidateRef?.id && c.jobId === workspace.jobId && c.sequence === workspace.candidateRef?.sequence);
+            const savedCalls = z.object({ calls: z.array(z.object({ tool: ToolCallSnapshotSchema }).passthrough()) }).passthrough()
+                .parse(execution.evidence['tool-evidence']!.actual).calls;
+            const committed = candidates.filter(candidate => candidate.origin !== 'human_edit' && candidate.basedOnCandidateId == null &&
+                savedCalls.some(({ tool }) => {
+                    const receipt = invoiceToolSchemas.save_invoice_candidate.output.safeParse(tool.result && 'data' in tool.result ? tool.result.data : null);
+                    return tool.toolName === 'save_invoice_candidate' && (tool.status === 'succeeded' || tool.runtimeObservation?.commit === 'committed') && tool.runId === candidate.runId &&
+                        tool.toolCallId === candidate.toolCallId && tool.result?.committedCandidateId === candidate.candidateId &&
+                        isDeepStrictEqual(tool.context, candidate.context) && receipt.success && receipt.data.candidateId === candidate.candidateId &&
+                        receipt.data.jobId === candidate.jobId && receipt.data.sequence === candidate.sequence;
+                }));
             let original = current;
-            while (original?.origin === 'human_edit') original = candidates.find(c => c.candidateId === original!.basedOnCandidateId && c.jobId === original!.jobId && c.sequence < original!.sequence);
+            const lineage = new Set<number>();
+            while (original) {
+                lineage.add(original.candidateId);
+                if (original.origin !== 'human_edit') break;
+                original = candidates.find(c => c.candidateId === original!.basedOnCandidateId && c.jobId === original!.jobId && c.sequence < original!.sequence);
+            }
+            if (originalSelectionCandidateId !== undefined && lineage.has(originalSelectionCandidateId)) { if (!committed.includes(original!)) original = undefined; }
+            else original = committed.filter(c => c.runId === [...requiredCandidateRuns].at(-1)).sort((a, b) => a.sequence - b.sequence).at(-1);
+            execution.evidence['original-candidate'] = { present: !!original, actual: original ? {
+                candidateId: original.candidateId, jobId: original.jobId, runId: original.runId, toolCallId: original.toolCallId, sequence: original.sequence } : null,
+                source: 'Confirmed original save receipt and candidate identity; only an explicit selection after the last saving Run changes the assessed lineage' };
             execution.evidence['selected-candidate-fields'] = { present: !!current, actual: current ? Object.fromEntries(Object.entries(current.fields)
                 .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)])) : null, source: 'Actual selected candidate values, including explicitly recorded user edits' };
             execution.evidence['candidate-fields'] = { present: !!original, actual: original ? Object.fromEntries(Object.entries(original.fields)
-                .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)])) : null, source: 'Original model candidate at the selected version lineage; user corrections never replace model evidence' };
+                .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)])) : null, source: 'Original model candidate bound to its confirmed save commit and receipt; later cancellation and user corrections do not rewrite it' };
             execution.evidence['candidate-line-items'] = { present: !!original, actual: original?.lines.map(line => Object.fromEntries(Object.entries(line)
-                .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)]))) ?? null, source: 'Original model candidate lines at the selected version lineage; user corrections remain separate' };
+                .map(([name, field]) => [name, invoiceFieldDisplayValue(name, field)]))) ?? null, source: 'Original committed model candidate lines; UI selection and user corrections remain separate' };
             execution.evidence['candidate-values'] = {present:!!original,actual:original?{fields:original.fields,lines:original.lines}:null,
-                source:'Original model field states, raw and normalized values at the selected version lineage'};
+                source:'Original committed model field states, raw and normalized values; no foreign, human or previous-Run fallback'};
             try { exports = readInvoiceExports(); }
             catch (error) {
                 execution.evidence['invoice-exports'] = { present: false, actual: structuredClone(invoiceExports), source: 'Original public export references retained; current managed bytes failed verification' };
@@ -908,7 +940,17 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const investigation = inputs.some(i => i.content.version === 2 && i.content.research?.binding.phase === 'researching');
             execution.endpointReached = stepsComplete && execution.status === 'completed' && execution.evidence.research.present &&
                 (typeof research?.task?.currentReportId === 'number' || !investigation && typeof research?.task?.currentPlanId === 'number');
-        } else execution.endpointReached = stepsComplete && execution.status === 'completed' && !!execution.answer?.trim();
+        } else {
+            const jobs = await backward(async beforeId => {
+                const page = await query({ type: 'list_jobs', input: { beforeId, limit: 100 } },
+                    z.object({ items: z.array(jobSchema), nextBeforeId: id.nullable() }).strict());
+                return { items: page.items, next: page.nextBeforeId };
+            }, job => job.jobId);
+            const candidates = (await Promise.all(jobs.map(job => invoiceCandidates(job.jobId)))).flat();
+            execution.evidence['new-candidates'] = { present: true, actual: candidates,
+                source: 'Complete original public list_jobs and list_job_candidates pages in this new owned Trial instance; empty ledger was observed' };
+            execution.endpointReached = stepsComplete && execution.status === 'completed' && !!execution.answer?.trim();
+        }
         if(parentCancellation?.accepted.accepted)execution.endpointReached=false;
         if(saveCancelRace&&cancelRaceEvidence)execution.endpointReached=false;
         if (historyOperations.some(operation => operation.action === 'compact-history' &&
@@ -1075,6 +1117,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                         result.workspace.candidateRef.sequence !== candidate.sequence || result.workspace.sessionId !== sessionId)
                         throw new Error('Foreign invoice candidate selection receipt');
                     invoiceOperations.push({ stepId: step.id, fromStep: step.fromStep, command, before: workspace, result });
+                    originalSelectionCandidateId = candidate.candidateId;
                     continue;
                 }
                 if (step.action === 'fork-history' || step.action === 'branch-history') {
@@ -1150,6 +1193,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                     mode: 'prompt', goalMode: step.action === 'invoice-message' ? step.goalMode : 'answer',
                     text: step.id === steps[0]!.id ? initialText : 'instruction' in step ? step.instruction : '', modelId,
                     ...(workspace ? { workspace } : {}),
+                    ...(workspace && trial.privateEffects ? { workingDirectory: trial.privateEffects.workingDirectory } : {}),
                     ...(isResearch ? { research: { researchId: researchId!, phase: plan ? 'researching' as const : 'planning' as const, plan: plan ? { planId: plan.planId,
                         revision: plan.revision + (step.action === 'research-confirm' ? step.revisionOffset : 0) } : null } } : {}) },
                     expectedSettingsRevision: 1, expectedCredentialRef: credentialRef });
@@ -1169,9 +1213,11 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 if (replay && hash(accepted) !== hash(replay.accepted)) throw new Error('Replay created a different input or Run');
                 if (!replay) { nextSequences.set(sessionId, command.input.clientSequence + 1); inputRefs.set(step.id, { command, accepted }); }
                 if (!runIds.includes(result.data.runId)) { runIds.push(result.data.runId); runSessions.set(result.data.runId, result.data.sessionId); }
+                if (!replay && step.action === 'invoice-message' && step.goalMode === 'save-candidate') {
+                    requiredCandidateRuns.add(result.data.runId); originalSelectionCandidateId = undefined;
+                }
                 if(parentCancel&&await cancelActualParent(result.data.runId,running))break;
                 if(saveCancelRace){const race=await cancelOriginalSave(client,{runId:result.data.runId,sessionId},running,readRun);cancelRaceEvidence=race.evidence;if(race.cancelled)break;}
-                if (!replay && step.action === 'invoice-message' && step.goalMode === 'save-candidate') requiredCandidateRuns.add(result.data.runId);
                 if(!replay&&step.action==='invoice-message'&&futureSteer)await deliverSteer(result.data.runId,running);
                 await replayOriginalSave(result.data.runId,running);
                 const run = await waitRun(result.data.runId, running);

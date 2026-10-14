@@ -2,6 +2,7 @@ import type { LocalCase } from '../dataset-loader/local.ts';
 import type { InteractionProfile } from '../dataset-loader/schema.ts';
 import type { UserTurn } from '../dataset-loader/authoring.ts';
 import type { CaseExecutionResult, EvidenceFact } from '../types.ts';
+import type { PrivateEffects } from '../execution/safety-probes.ts';
 import {REPO_ROOT} from '../dataset-loader/local.ts';
 import { agentConfig, prepareAgentConfig } from '../configuration.ts';
 import { registerSecrets } from '../execution/evidence-safety.ts';
@@ -24,6 +25,8 @@ export type AgentTrial = {
     invoiceSource?: { root: string; localRoot?: string; materials: LocalCase['input']['materials'] };
     /** Declared controller inputs; never copied wholesale into the product or model input. */
     controllerInput?: {profile:InteractionProfile;payload:string;sha256:string};
+    /** Controller-only synthetic attack targets and effect expectations; never model input. */
+    privateEffects?: PrivateEffects;
     /** Only selected manifest-declared resource files are copied; adjacent quality files stay outside Host. */
     resourceRoot?: string;
     requires: string[];
