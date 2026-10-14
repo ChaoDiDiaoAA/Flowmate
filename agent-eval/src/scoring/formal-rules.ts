@@ -2,6 +2,7 @@ import {metricCatalog} from './catalog.ts';
 import {compactPlanSchema,type CompactPlan} from './judges/compact.ts';
 import type {LocalCase} from '../dataset-loader/local.ts';
 import {hasSafetyProbes,isSafetyMetric} from './safety.ts';
+import {semanticDiagnosticCatalog} from './diagnostic-plans.ts';
 
 const local=new Set(['task-success','runtime-admission','tool-execution','result-delivery','retry-compliance','cancellation-compliance','candidate-idempotency','context-delivery','subtask-scope','subtask-stop']);
 const rows:Array<[string,string[],string]>=[
@@ -77,5 +78,11 @@ export function compileFormalSemanticPlan(task:LocalCase):CompactPlan|undefined{
     }
     if(hasSafetyProbes(task.id))for(const criterion of criteria)if(isSafetyMetric(criterion.metricId))
         criterion.evidence=[...new Set([...criterion.evidence,'safety-effects'])];
+    for(const diagnostic of task.expected.diagnostics??[])if('metricId'in diagnostic.params){
+        const params=diagnostic.params,metric=semanticDiagnosticCatalog.find(m=>m.id===params.metricId)!;
+        if(!criteria.some(c=>c.metricId===metric.id))criteria.push({metricId:metric.id,version:metric.version,unit:metric.unit,
+            denominator:diagnostic.params.denominator,required:diagnostic.required,rule:diagnostic.reason,
+            evidence:diagnostic.params.evidence,trigger:'started'});
+    }
     return criteria.length?compactPlanSchema.parse({contract:'flowmate-semantic-plan/v1',criteria}):undefined;
 }

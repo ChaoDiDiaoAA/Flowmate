@@ -80,6 +80,26 @@ function deterministicDataset() {
     return data;
 }
 
+test('a necessary semantic specialist check survives Runner, formal aggregation and report round trip',async()=>{
+    const data=deterministicDataset(),item=data.cases[0]!;
+    item.expected.diagnostics=[{evaluatorId:'task-judge',required:true,reason:'Disclose the independently recorded partial failure',
+        params:{metricId:'diagnostic-partial-failure-explanation',denominator:1,evidence:['answer','task-facts']}}];
+    item.expected.semantic=compileFormalSemanticPlan(item);
+    data.cases[0]=caseV2Schema.parse(item);
+    let generations=0;
+    const run=await runLocal(REPO_ROOT,{dataset:data,backend:'local',judge:'required',executionId:'specialist-'+randomUUID()},
+        {kernel:kernel(),env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',
+            FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-specialist-key'},
+            fetcher:async()=>{generations++;return judgeResponse({choices:[{message:{content:namedJudgment(item.expected.semantic!,{v:1,r:[[0,1,0]],f:[[0,0,1]]})},finish_reason:'stop'}]});}});
+    const report=readReport(run.file),trial=report.trials[0]!;
+    expect(generations).toBe(1);
+    expect(trial.evaluatorPlan?.find(p=>p.evaluatorId==='task-judge')).toMatchObject({applicable:true});
+    expect(trial.scores.find(s=>s.metricId==='diagnostic-partial-failure-explanation')).toMatchObject({evaluatorId:'task-judge',category:'diagnostic',status:'FAIL',required:true});
+    expect(trial.scores.find(s=>s.metricId==='task-success')).toMatchObject({status:'FAIL'});
+    expect(report.aggregation!.metrics).toHaveLength(39);
+    expect(report.aggregation!.metrics.some(m=>m.metricId.startsWith('diagnostic-'))).toBe(false);
+});
+
 test('required mode executes a deterministic-only Case without reading or preparing Judge configuration', async () => {
     for (const registered of [true, false]) {
         const data = deterministicDataset();

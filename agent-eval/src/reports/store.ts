@@ -7,6 +7,9 @@ import { z } from 'zod';
 import { isJsonData } from '../../../packages/contracts/src/tools.ts';
 import type { CaseExecutionResult, GradeStatus } from '../types.ts';
 import type { EvaluationScore, JudgeCall, MetricPlan } from '../scoring/types.ts';
+import {scoreMeasurement} from '../scoring/types.ts';
+import type {EvaluatorPlanEntry} from '../scoring/evaluator-plan.ts';
+import {scoringMetric} from '../scoring/diagnostic-plans.ts';
 import { aggregateTrials, type TrialAggregation } from '../scoring/aggregate.ts';
 import { hash } from '../dataset-loader/local.ts';
 import { parseJudgment } from '../scoring/judges/harness.ts';
@@ -40,6 +43,7 @@ export type TrialReport = {
     scores: EvaluationScore[];
     metricPlan?: MetricPlan[];
     semanticPlan?: CompactPlan;
+    evaluatorPlan?: EvaluatorPlanEntry[];
     judgeCalls: JudgeCall[];
     feedback: 'none';
 };
@@ -93,6 +97,7 @@ const reportRevisions = new WeakMap<LocalReport, { path: string; hash: string }>
 const timestamp = z.string().datetime(), status = z.enum(['PASS', 'FAIL', 'UNJUDGEABLE', 'ERROR', 'NOT_RUN']);
 const inputSchema = z.object({ prompt: z.string(), materials: z.array(z.object({ sample: text, file: text, text: z.string() }).strict()) }).strict();
 const scoreSchema = z.object({ metricId: text, name: text, version: positive, method: z.enum(['deterministic', 'llm-judge']), required: z.boolean(),
+    evaluatorId:text.optional(),evaluatorVersion:positive.optional(),category:z.enum(['formal','diagnostic','guardrail']).optional(),applicabilityReason:text.optional(),
     value: z.number().finite().min(0).max(1).nullable(), status: z.enum([...status.options, 'NOT_APPLICABLE']), reason: z.string(), evidence: z.array(text),
     statistics: z.object({ unit: text, numerator: integer.nullable(), denominator: integer.nullable(), missing: integer.nullable() }).strict().optional(),
     judge: z.object({ callId: text, criterion: integer }).strict().optional(),
@@ -138,6 +143,8 @@ const trialSchema = z.object({ caseId: text, caseVersion: positive, caseHash: te
     status, reason: z.string(), counts: z.record(integer), execution: executionSchema.nullable(), scores: z.array(scoreSchema),
     metricPlan: z.array(z.object({ metricId: text, version: positive, unit: text, denominator: integer.nullable().optional(),
         notApplicable: text.optional() }).strict()).optional(), semanticPlan: compactPlanSchema.optional(),
+    evaluatorPlan:z.array(z.object({evaluatorId:text,version:positive,kind:z.enum(['deterministic','llm-judge']),applicable:z.boolean(),reason:text,
+        outputs:z.array(z.object({metricId:text,category:z.enum(['formal','diagnostic','guardrail']),applicable:z.boolean(),reason:text,required:z.boolean(),denominator:integer.nullable().optional()}).strict())}).strict()).optional(),
     judgeCalls: z.array(judgeCallSchema).max(1), feedback: z.literal('none') }).strict();
 const reportSchema = z.object({ contract: z.enum(['flowmate-agent-run/v1', 'flowmate-agent-run/v2']), executionId: text,
     executionKind: z.enum(['controlled', 'model']).optional(),
@@ -181,6 +188,13 @@ function validateReport(value: unknown): asserts value is LocalReport {
             throw new Error('Original execution identity differs from its Trial');
         if (new Set(trial.scores.map(s => s.metricId)).size !== trial.scores.length) throw new Error('Duplicate score identity');
         for (const criterion of trial.semanticPlan?.criteria ?? []) {
+            if(criterion.metricId.startsWith('diagnostic-')){
+                const declared=trial.evaluatorPlan?.flatMap(e=>e.outputs).find(o=>o.metricId===criterion.metricId),metric=scoringMetric(criterion.metricId);
+                if(!declared?.applicable||declared.category!=='diagnostic'||declared.denominator!==criterion.denominator||
+                    declared.required!==criterion.required||criterion.version!==metric.version||criterion.unit!==metric.unit)
+                    throw Error('Semantic diagnostic differs from its frozen evaluator plan');
+                continue;
+            }
             const metric = trial.metricPlan?.find(m => m.metricId === criterion.metricId);
             if (report.contract !== 'flowmate-agent-run/v2' || !metric || metric.notApplicable || metric.version !== criterion.version ||
                 metric.unit !== criterion.unit || metric.denominator !== criterion.denominator)
@@ -190,7 +204,7 @@ function validateReport(value: unknown): asserts value is LocalReport {
         for(const score of deterministic.filter(s=>isSafetyMetric(s.metricId))){
             const criterion=trial.semanticPlan!.criteria.find(c=>c.metricId===score.metricId)!;
             const original=trial.execution&&localSafetyFailure(criterion,trial.execution);
-            if(!original||!isDeepStrictEqual(score,original))throw Error('Local safety measurement contradicts its original scoped effects');
+            if(!original||!isDeepStrictEqual(scoreMeasurement(score),scoreMeasurement(original)))throw Error('Local safety measurement contradicts its original scoped effects');
         }
         const local=deterministic.filter(s=>!isSafetyMetric(s.metricId));
         if(local.length){
@@ -278,7 +292,7 @@ function validateReport(value: unknown): asserts value is LocalReport {
                         throw new Error('Compact criterion differs from the complete declared semantic plan');
                     previous = position;
                     const expected = measured[index];
-                    if (!isDeepStrictEqual(trial.scores.find(s => s.judge?.callId === call.callId && s.judge.criterion === index), expected))
+                    if (!isDeepStrictEqual(scoreMeasurement(trial.scores.find(s => s.judge?.callId === call.callId && s.judge.criterion === index)), scoreMeasurement(expected)))
                         throw new Error('Semantic score differs from its original compact criterion counts');
                 }
             }
@@ -308,7 +322,7 @@ export function saveReport(path: string, report: LocalReport) {
         const bytes=readFileSync(path,'utf8'),prior=JSON.parse(bytes);
         if (removeLegacyMetadata(prior)) throw Error('Historical reports are read-only');
         if(prior.endedAt===null&&reportRevisions.has(report)&&reportRevisions.get(report)!.hash!==hash(bytes))throw Error('Stale open report');
-        const plan=(r:any)=>JSON.stringify({dataset:r.dataset,executionKind:r.executionKind,selection:r.selection,environment:r.environment,startedAt:r.startedAt,repeat:r.repeat,scoring:r.scoringConfiguration,members:r.trials.map((t:any)=>[t.caseId,t.caseVersion,t.repetition,t.trialId,t.traceId,t.metricPlan,t.semanticPlan,t.partition,t.regressionOrigins])});
+        const plan=(r:any)=>JSON.stringify({dataset:r.dataset,executionKind:r.executionKind,selection:r.selection,environment:r.environment,startedAt:r.startedAt,repeat:r.repeat,scoring:r.scoringConfiguration,members:r.trials.map((t:any)=>[t.caseId,t.caseVersion,t.repetition,t.trialId,t.traceId,t.metricPlan,t.semanticPlan,t.evaluatorPlan,t.partition,t.regressionOrigins])});
         if(plan(prior)!==plan(record))throw Error('Declared report identity or Trial plan cannot be overwritten');
         if(prior.endedAt!==null&&JSON.stringify(prior)!==JSON.stringify(record))throw Error('Completed report facts are immutable');
         if(prior.endedAt!==null){
@@ -360,7 +374,7 @@ export function comparison(left: LocalReport, right: LocalReport) {
     const indexed = new Map(right.trials.map(t => [key(t), t]));
     if (indexed.size !== right.trials.length || new Set(left.trials.map(key)).size !== left.trials.length || left.trials.length !== right.trials.length)
         throw new Error('Scoring versions or members differ');
-    const scoring = (t: TrialReport) => JSON.stringify({ plan: [...(t.metricPlan ?? [])].sort((a, b) => a.metricId.localeCompare(b.metricId)), semantic: t.semanticPlan,
+    const scoring = (t: TrialReport) => JSON.stringify({ plan: [...(t.metricPlan ?? [])].sort((a, b) => a.metricId.localeCompare(b.metricId)), semantic: t.semanticPlan,evaluators:t.evaluatorPlan,
         checks: t.scores.map(s => [s.metricId, s.version, s.required,t.semanticPlan?.criteria.some(c=>c.metricId===s.metricId)?'semantic-plan':s.method]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))) });
     return left.trials.map(t => {
         const other = indexed.get(key(t));

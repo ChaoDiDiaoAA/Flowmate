@@ -21,6 +21,8 @@ import { rubricsFor } from '../scoring/judges/compact.ts';
 import {rubric as legacyRubric} from '../scoring/judges/answer-relevance.ts';
 import {formalRules} from '../scoring/formal-rules.ts';
 import {metricCatalog} from '../scoring/catalog.ts';
+import {compileEvaluatorPlan} from '../scoring/evaluator-plan.ts';
+import {createRegistry} from '../scoring/registry.ts';
 import { saveReport, safeId, type LocalReport } from '../reports/store.ts';
 import { createRunDirectory, datasetScope } from '../reports/paths.ts';
 import { deriveBadcases, saveBadcases } from '../reports/badcases.ts';
@@ -166,7 +168,7 @@ export async function runLocal(repo: string, options: {
         gold:authored?Object.fromEntries(selected.map(c=>[c.id,authored.gold[c.id]])):undefined,
         materials:prepared.map(({task,resolved})=>({caseId:task.id,materials:resolved?.projected.materials??[],files:caseFiles(dataset,task)})),
         runtimeSource:runtimeSourceConditions(repo), ...(dataset.regressionOrigins ? { regressionOrigins: dataset.regressionOrigins } : {}),
-        scoring:{catalog:metricCatalog,rules:formalRules,...(batch?{rubrics}:{rubric:legacyRubric}),
+        scoring:{catalog:metricCatalog,rules:formalRules,evaluators:createRegistry().list().map(({id,name,kind,version,outputs,rubric})=>({id,name,kind,version,outputs,rubric})),...(batch?{rubrics}:{rubric:legacyRubric}),
             plans:selected.map(task=>({caseId:task.id,checks:task.expected.checks,...('contract'in task?{metrics:task.expected.metrics,semantic:task.expected.semantic}:{})}))},
         fixtures:authored?Object.fromEntries(selected.flatMap(c=>{const name=authored.cases.find(d=>d.id===c.id)?.input.fixture?.name;return name?[[name,authored.fixtures[name]]]:[];})):undefined});
     if((snapshot.fact.actual as {leaked:boolean}).leaked)throw Error('Secret in declared configuration; refusing execution');
@@ -189,6 +191,7 @@ export async function runLocal(repo: string, options: {
                 ...(dataset.regressionOrigins?.[task.id] ? { regressionOrigins: structuredClone(dataset.regressionOrigins[task.id]) } : {}),
                 status: 'NOT_RUN', reason: 'Planned', counts: {}, execution: null, scores: [], judgeCalls: [], feedback: 'none',
                 metricPlan: 'contract' in task ? structuredClone(task.expected.metrics) : [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 }],
+                evaluatorPlan:compileEvaluatorPlan(task,[...dataset.manifest.scoring.required.map(metric=>({metric,required:true})),...task.expected.checks]),
                 ...('contract' in task && task.expected.semantic ? { semanticPlan: structuredClone(task.expected.semantic) } : {}) });
         }
     const file = join(root, 'report.json');

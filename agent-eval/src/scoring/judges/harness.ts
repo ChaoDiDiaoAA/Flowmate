@@ -6,6 +6,7 @@ import type { StopReason } from '@earendil-works/pi-ai';
 import { hash } from '../../dataset-loader/local.ts';
 import { compactPlanSchema, parseCompactJudgment, parseMetricJudgment, parseStrictMetricJudgment, normalizeMetricJson, metricPolicyFor, metricRubrics, compactRubric, compactRubricFor, type CompactPlan, type CompactJudgment } from './compact.ts';
 import {researchFrameSchema} from '../research-judgment.ts';
+import {evaluatorEvidence} from './evaluators.ts';
 export function parseJudgment(text: string) { return z.object({ score: z.number().min(0).max(1), reason: z.string().trim().min(1) }).strict().parse(JSON.parse(text)); }
 export async function runJudge(config: JudgeConfig, system: string, data: string, fetcher?: Fetcher, signal?: AbortSignal, plan?: CompactPlan,frame?:unknown) {
     if (plan) plan = compactPlanSchema.parse(plan);
@@ -71,5 +72,5 @@ export function runCompactJudge(config: JudgeConfig, plan: CompactPlan, evidence
     plan = compactPlanSchema.parse(plan);
     if (plan.encoding) throw Error('Legacy packed plans are read-only; regenerate the current plain JSON plan');
     const frame=plan.criteria.some(c=>c.metricId.startsWith('DR'))?researchFrameSchema.parse((evidence as{researchFrame?:unknown})?.researchFrame):undefined;
-    return runJudge(config, compactRubricFor(plan).prompt, JSON.stringify({ plan, evidence }), fetcher, signal, plan,frame);
+    return runJudge(config, compactRubricFor(plan).prompt, JSON.stringify({ plan, evidence:evaluatorEvidence(plan,evidence) }), fetcher, signal, plan,frame);
 }

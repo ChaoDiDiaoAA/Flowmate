@@ -38,6 +38,7 @@ function usage(value: unknown, omitUnprovenZeros = false) {
 }
 function scoreSummary(score: LocalReport['trials'][number]['scores'][number]) {
     return { metricId: score.metricId, version: score.version, method: score.method, required: score.required, status: score.status, value: score.value,
+        evaluatorId:score.evaluatorId,evaluatorVersion:score.evaluatorVersion,category:score.category,applicabilityReason:score.applicabilityReason,
         statistics: score.statistics ? { unit: score.statistics.unit, numerator: score.statistics.numerator, denominator: score.statistics.denominator,
             missing: score.statistics.missing } : undefined, evidenceCount: score.evidence.length };
 }
@@ -63,6 +64,7 @@ export function exportEvents(report: LocalReport): Event[] {
             repetition: trial.repetition, trialIndex: trial.repetition, trialsPerCase: report.repeat,
             status: trial.status, contract: report.contract, scoringVersion: report.scoringConfiguration.version,
             judgeHash: report.scoringConfiguration.judgeHash, sourceInvalidation:report.sourceInvalidation, agent,
+            evaluatorPlan:trial.evaluatorPlan,judgeGenerations:trial.judgeCalls.filter(c=>c.attempts>0).length,
             ...(trial.regressionOrigins ? { executionKind: report.executionKind, regressionOrigins: trial.regressionOrigins.map(({ verification: _, ...identity }) => identity) } : {}) };
         add('trace-create', { id: trial.traceId, name: 'Agent · ' + trial.caseName, timestamp: execution?.startedAt ?? report.startedAt, environment: report.environment,
             sessionId: report.executionId, input: { caseId: trial.caseId, caseVersion: trial.caseVersion },

@@ -1,5 +1,6 @@
 import type { EvaluatorDefinition } from './types.ts';
-import { definitions } from './evaluators/index.ts';
+import { deterministicEvaluatorDefinitions } from './evaluators/registered.ts';
+import { semanticEvaluatorDefinitions } from './judges/evaluators.ts';
 import { answerRelevance } from './judges/answer-relevance.ts';
 export class EvaluatorRegistry {
     private items = new Map<string, EvaluatorDefinition>();
@@ -9,6 +10,8 @@ export class EvaluatorRegistry {
         this.items.set(def.id, def);
     }
     get(id: string) {
+        // Explicit old dataset selections keep their original Judge without adding it to the active catalog.
+        if(id==='answer-relevance'&&!this.items.has(id))return answerRelevance;
         const def = this.items.get(id);
         if (!def)
             throw new Error('Unknown metric: ' + id);
@@ -18,7 +21,7 @@ export class EvaluatorRegistry {
 }
 export function createRegistry() {
     const r = new EvaluatorRegistry();
-    for (const def of [...definitions, answerRelevance])
+    for (const def of [...deterministicEvaluatorDefinitions, ...semanticEvaluatorDefinitions])
         r.register(def);
     return r;
 }

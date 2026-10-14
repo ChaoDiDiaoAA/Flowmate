@@ -27,6 +27,25 @@ function fixture(){
  const save=()=>writeFileSync(join(directory,'calibration.json'),JSON.stringify(manifest));save();
  return{root,directory,manifest,save,close:()=>rmSync(root,{recursive:true,force:true})};
 }
+
+test('semantic specialist diagnostics retain independent rubrics and per-criterion calibration without changing the formal catalog',async()=>{
+ const f=fixture();try{
+  for(const name of ['tune','validation']){
+   const path=join(f.directory,name+'.json'),document=JSON.parse(readFileSync(path,'utf8'));
+   Object.assign(document.plan.criteria[0],{metricId:'diagnostic-partial-failure-explanation',unit:'披露机会'});
+   document.references[0].metricId='diagnostic-partial-failure-explanation';writeFileSync(path,JSON.stringify(document));
+  }
+  let calls=0;
+  const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'specialist-calibration'},{env,fetcher:async(_url,init)=>{
+   const request=JSON.parse(JSON.parse(String(init.body)).messages[1].content);
+   expect(request.evidence.evaluatorRubrics.map((r:{id:string})=>r.id)).toEqual(['task-judge']);
+   return judgeResponse({choices:[{message:{content:namedJudgment(request.plan,{v:1,r:[[calls++?1:0,1,0]],f:calls===1?[[0,0,1]]:[]})},finish_reason:'stop'}]});
+  }});
+  expect(result.report.criteria.every(c=>c.metricId==='diagnostic-partial-failure-explanation')).toBe(true);
+  expect(result.report.criteria.map(c=>c.countsCorrect)).toEqual([1,1]);
+  expect(calibration.readCalibrationReport(result.file).criteria).toEqual(result.report.criteria);
+ }finally{f.close();}
+});
 test('calibration preserves tune and validation references, every original attempt and per-criterion error counts without real acceptance',async()=>{
  const f=fixture();try{
   let calls=0;const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'controlled-calibration'},{env,fetcher:async()=>reply(++calls===1?1:0)});

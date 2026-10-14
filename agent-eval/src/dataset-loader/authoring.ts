@@ -6,6 +6,7 @@ import { RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES } from 
 import { SUBAGENT_ROLE } from '../../../packages/contracts/src/subagents.ts';
 import { metricCatalog } from '../scoring/catalog.ts';
 import { regressionOriginsSchema } from './regression-origin.ts';
+import {caseDiagnosticsSchema} from '../scoring/diagnostic-plans.ts';
 
 const text = z.string().trim().min(1);
 const userInput = z.string().refine(value => value.trim().length > 0, 'User input must contain text');
@@ -23,6 +24,7 @@ const skill = z.enum(['invoice-header-extraction', 'eval-date-guide-long', 'invo
 const metric = text.refine(name => ['fact-check', 'reference-fields', 'line-items'].includes(name) || metricCatalog.some(item => item.id === name), 'Unknown scoring metric');
 const unique = <T extends z.ZodTypeAny>(item: T) => z.array(item).min(1).refine(values => new Set(values).size === values.length, 'Duplicate constraint values');
 export const constraintShape = {
+    diagnostics:caseDiagnosticsSchema.optional(),
     maxToolCalls: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     mustHaveEvidence: z.boolean().optional(),
     requiredCapabilities: unique(tool).optional(), optionalCapabilities: unique(tool).optional(), forbiddenCapabilities: unique(tool).optional(),

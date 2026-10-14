@@ -9,6 +9,8 @@ import {publicVersions,executionVersions} from '../../reports/files.ts';
 import {safeId,judgeCallSchema,sdkJudgeConfigurationSchema,legacyJudgeConfigurationSchema} from '../../reports/store.ts';
 import {scanEvidence} from '../../execution/evidence-safety.ts';
 import {formalMetric} from '../catalog.ts';
+import {scoringMetric} from '../diagnostic-plans.ts';
+import {evaluatorEvidence} from './evaluators.ts';
 import {compactPlanSchema,parseCompactJudgment,parseLegacyCompactJudgment,parseMetricJudgment,parseStrictMetricJudgment,metricParsePolicy,metricRubrics,metricPolicyFor,normalizeMetricJson,compactRubric,compactScores,rubricsFor} from './compact.ts';
 import {legacyCompactRubric,legacyPlainRubric,legacyPackedRubric} from './packed.ts';
 import {isJsonData} from '../../../../packages/contracts/src/tools.ts';
@@ -79,7 +81,7 @@ function summaries(samples:SampleResult[]):CriterionSummary[]{
    if(score.status==='ERROR'){row.errors++;return;}
    if(score.status==='UNJUDGEABLE'){row.unjudgeable++;return;}if(!['PASS','FAIL'].includes(score.status)){row.notRun++;return;}
    row.measured++;
-   const expected=reference.counts,up=formalMetric(reference.metricId).direction==='up';
+   const expected=reference.counts,up=scoringMetric(reference.metricId).direction==='up';
    const expectedFailure=expected!==null&&(up?expected[1]-expected[0]-expected[2]>0:expected[0]>0),expectedPass=expected!==null&&expected[1]>0&&expected[2]===0&&!expectedFailure;
    if(expectedFailure&&score.status==='PASS')row.falseAccepts++;
    if(expectedPass&&score.status==='FAIL')row.falseRejects++;
@@ -121,7 +123,8 @@ export function readCalibrationReport(path:string):CalibrationReport {
   if(!template||!call.request||!call.compact||call.judgment!==null||!isDeepStrictEqual(call.compact.plan,sample.reference.plan))throw Error('Calibration call lacks its original template and plan');
   if(call.request.hash&&call.request.hash!==hash([call.request.system,call.request.data])||call.request.redacted&&call.compact.judgment!==null)throw Error('Calibration request identity or redaction contradicts its judgment');
   const input=JSON.parse(call.request.data);
-  if(!isDeepStrictEqual(input.plan,sample.reference.plan)||!isDeepStrictEqual(input.evidence,sample.reference.evidence))throw Error('Calibration request differs from its original reference');
+  const expectedEvidence=template.id.endsWith('-v3')?evaluatorEvidence(sample.reference.plan,sample.reference.evidence):sample.reference.evidence;
+  if(!isDeepStrictEqual(input.plan,sample.reference.plan)||!isDeepStrictEqual(input.evidence,expectedEvidence))throw Error('Calibration request differs from its original reference');
   const policy=metricPolicyFor(template),named=template.id.startsWith('semantic-metrics-');
   if(call.compact.parsePolicy!==policy||(policy?call.compact.normalization!==(call.raw!==null&&call.responseComplete?normalizeMetricJson(call.raw).normalization:'none')||call.transportStatus===undefined:call.compact.normalization!==undefined)||
    named!==(call.compact.format==='metric-id/v1')||(named?!call.compact.validationErrors:call.compact.validationErrors!==undefined))throw Error('Calibration parsing policy differs from its original template');

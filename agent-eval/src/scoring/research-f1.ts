@@ -2,6 +2,7 @@ import type { CaseExecutionResult } from '../types.ts';
 import type { EvaluationScore, MetricPlan } from './types.ts';
 import { formalMetric } from './catalog.ts';
 import { isDeepStrictEqual } from 'node:util';
+import {scoreMeasurement} from './types.ts';
 
 export function claimF1(precision: number, recall: number): number {
     if (![precision, recall].every(v => Number.isFinite(v) && v >= 0 && v <= 1)) throw new Error('Invalid Claim precision or recall');
@@ -13,7 +14,7 @@ export function assertResearchF1(plan: readonly MetricPlan[] | undefined, scores
     const original = scores.find(s => s.metricId === 'DR03');
     if (original?.status === 'NOT_APPLICABLE' && plan?.find(m => m.metricId === 'DR03')?.notApplicable) return;
     const expected = deriveResearchF1(plan, scores, execution);
-    if ((original || expected && (execution !== null || scores.length > 0)) && !isDeepStrictEqual(original, expected))
+    if ((original || expected && (execution !== null || scores.length > 0)) && !isDeepStrictEqual(scoreMeasurement(original), scoreMeasurement(expected)))
         throw new Error('Trial F1 differs from its same-Trial original precision/recall counts or is missing');
 }
 

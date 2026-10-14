@@ -23,7 +23,7 @@ test('new calls normalize one complete exterior JSON fence and retain the origin
         expect(requests).toBe(1);
         expect(call.raw).toBe(raw);
         expect(call.error).toBeNull();
-        expect(call.configuration.rubric?.id).toBe('semantic-metrics-business-v2');
+        expect(call.configuration.rubric?.id).toBe('semantic-metrics-business-v3');
         expect(call.compact).toMatchObject({ parsePolicy: 'metric-json-fence-strict-counts/v1',
             normalization: raw===json?'none':'markdown-fence', validationErrors:{} });
         expect(compactScores(call).map(s=>s.status)).toEqual(['PASS','PASS']);
@@ -72,7 +72,7 @@ test('research witnesses with string offsets remain errors only for dependent re
     const call=await runCompactJudge(config,selected,sample.evidence,async()=>response(JSON.stringify(wire)));
     expect(call.error).toBeNull();
     expect(compactScores(call).map(s=>s.status)).toEqual(['ERROR','PASS']);
-    expect(call.configuration.rubric?.id).toBe('semantic-metrics-research-v2');
+    expect(call.configuration.rubric?.id).toBe('semantic-metrics-research-v3');
 });
 
 test('actual transport statuses distinguish billing and auth rejection from model text without retry', async () => {

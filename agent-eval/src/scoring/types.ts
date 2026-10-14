@@ -18,6 +18,10 @@ export type JudgeCall = CurrentJudgeCall & { finishReason?: never } | LegacyJudg
 export type MetricStatistics = { unit: string; numerator: number | null; denominator: number | null; missing: number | null };
 export type MetricPlan = { metricId: string; version: number; unit: string; denominator?: number | null; notApplicable?: string };
 export type EvaluationScore = {
+    evaluatorId?: string;
+    evaluatorVersion?: number;
+    category?: 'formal' | 'diagnostic' | 'guardrail';
+    applicabilityReason?: string;
     metricId: string;
     name: string;
     version: number;
@@ -34,6 +38,12 @@ export type EvaluationScore = {
 };
 export const isRequiredScore=(score:EvaluationScore)=>score.required&&score.status!=='NOT_APPLICABLE'&&
     !(score.statistics?.numerator===0&&score.statistics.denominator===0&&score.statistics.missing===0);
+/** Evaluator provenance is additive; original wire/count validators compare the measurement itself. */
+export function scoreMeasurement(score:EvaluationScore|undefined){
+    if(!score)return score;
+    const {evaluatorId:_,evaluatorVersion:__,category:___,applicabilityReason:____,...measurement}=score;
+    return measurement;
+}
 export type EvaluationContext = {
     gradedScores?: readonly EvaluationScore[];
     task: LocalCase;
@@ -59,6 +69,12 @@ export type EvaluatorDefinition = {
     name: string;
     kind: EvaluatorKind;
     version: number;
+    outputs?: readonly string[];
+    phase?: 'checks' | 'local' | 'semantic' | 'derived' | 'final';
+    evaluateMany?: (context: EvaluationContext) => EvaluationScore[] | Promise<EvaluationScore[]>;
+    rubric?: { id: string; version: number; instructions: string };
+    prepare?: (context: EvaluationContext) => CompactPlan['criteria'];
+    parse?: (scores: readonly EvaluationScore[]) => EvaluationScore[];
     appliesTo?: (context: EvaluationContext, check: Check) => boolean;
     evidence: (check: Check, context: EvaluationContext) => string[];
     evaluate: (context: EvaluationContext, check: Check) => EvaluationValue | Promise<EvaluationValue>;

@@ -2,27 +2,42 @@ import type { Check } from '../dataset-loader/local.ts';
 import { EvaluatorRegistry, createRegistry } from './registry.ts';
 import type { EvaluationContext, EvaluationScore, JudgeCall } from './types.ts';
 import { evaluateSemantic } from './evaluators/semantic.ts';
-import { deriveResearchF1 } from './research-f1.ts';
-import {evaluateFormalMetrics} from './evaluators/formal.ts';
-import {formalMetric} from './catalog.ts';
-import { evaluateCaseConstraints } from './case-constraints.ts';
+import {metricCatalog} from './catalog.ts';
+import {evaluatorForMetric,compileEvaluatorPlan} from './evaluator-plan.ts';
 export async function evaluateAll(context: EvaluationContext, checks: Check[], registry: EvaluatorRegistry = createRegistry()) {
     const scores: EvaluationScore[] = [], judgeCalls: JudgeCall[] = [];
+    const executionPlan=compileEvaluatorPlan(context.task,checks);
+    let explicitScoreCount=0;
     if ((context.semanticPlan || 'contract' in context.task && context.task.expected.semantic) && checks.some(check => registry.get(check.metric).kind === 'llm-judge'))
         throw new Error('Judge may run only once: compact and legacy semantic protocols cannot be combined');
-    const finish = (semantic: Awaited<ReturnType<typeof evaluateSemantic>>) => {
-        const researchGaps:EvaluationScore[]='contract'in context.task?context.task.expected.metrics.flatMap(plan=>{
-            if(!plan.metricId.startsWith('DR')||semantic.scores.some(score=>score.metricId===plan.metricId)||plan.metricId==='DR03'&&!plan.notApplicable)return[];
-            const metric=formalMetric(plan.metricId);
-            return[{metricId:metric.id,name:metric.name,version:metric.version,method:metric.id==='DR03'?'deterministic':'llm-judge',required:!plan.notApplicable,
-                value:null,status:plan.notApplicable?'NOT_APPLICABLE':context.result.error?.infrastructure?'ERROR':'NOT_RUN',reason:plan.notApplicable??'适用研究判据尚未声明，独立匹配尚未执行',evidence:['research','gold-research'],
-                statistics:{unit:metric.unit,numerator:null,denominator:plan.denominator??null,missing:plan.denominator??null}}];
-        }):[];
-        const graded = [...scores, ...semantic.scores,...researchGaps, ...evaluateCaseConstraints(context)];
+    const runPhase=async(phase:NonNullable<ReturnType<typeof registry.get>['phase']>,graded:EvaluationScore[])=>{
+        for(const def of registry.list().filter(d=>d.phase===phase&&d.evaluateMany)){
+            const selected=executionPlan.find(p=>p.evaluatorId===def.id);
+            if(!selected?.applicable){
+                for(const output of selected?.outputs.filter(o=>o.category==='formal'&&!o.applicable)??[]){
+                    if(graded.some(s=>s.metricId===output.metricId))continue;
+                    const metric=metricCatalog.find(m=>m.id===output.metricId)!;
+                    graded.push({metricId:metric.id,name:metric.name,version:metric.version,method:def.kind,required:false,
+                        value:null,status:'NOT_APPLICABLE',reason:output.reason,evidence:[],statistics:{unit:metric.unit,numerator:null,denominator:null,missing:null}});
+                }
+                continue;
+            }
+            const produced=await def.evaluateMany!({...context,gradedScores:graded});
+            for(const score of produced){
+                if(graded.some(s=>s.metricId===score.metricId))throw Error('Duplicate original metric measurement: '+score.metricId);
+                graded.push(score);
+            }
+        }
+    };
+    const finish = async (semantic: Awaited<ReturnType<typeof evaluateSemantic>>) => {
+        const graded=[...scores.slice(0,explicitScoreCount),...semantic.scores,...scores.slice(explicitScoreCount)];
+        await runPhase('semantic',graded);
+        await runPhase('derived',graded);
+        await runPhase('final',graded);
         const captureGaps = context.result.evidence['capture-gaps'];
         const captureFailed = captureGaps?.present === false && Array.isArray(captureGaps.actual) &&
             captureGaps.actual.some(gap => typeof gap === 'string' && gap.trim());
-        const combined = [...graded,...evaluateFormalMetrics({...context,gradedScores:graded})].map(score => {
+        const combined = graded.map(score => {
             if (score.status !== 'UNJUDGEABLE') return score;
             const missing = score.evidence.filter(key => key !== 'research-frame' && !key.startsWith('gold-') && !key.startsWith('judge-') && !context.result.evidence[key]?.present);
             const failed = missing.some(key => {
@@ -35,11 +50,18 @@ export async function evaluateAll(context: EvaluationContext, checks: Check[], r
         });
         const measured=combined.filter(s=>!s.metricId.startsWith('fact-check/')).map(s=>s.metricId);
         if(new Set(measured).size!==measured.length)throw new Error('Duplicate original metric measurement');
-        const f1 = deriveResearchF1('contract' in context.task ? context.task.expected.metrics : undefined, combined, context.result);
-        return { scores: f1 ? [...combined, f1] : combined, judgeCalls: [...judgeCalls, ...semantic.judgeCalls] };
+        return { scores: combined.map(score=>{
+            const evaluatorId=evaluatorForMetric(context.task,score.metricId),def=registry.get(evaluatorId);
+            const plan='contract'in context.task?context.task.expected.metrics.find(m=>m.metricId===score.metricId):undefined;
+            return{...score,evaluatorId,evaluatorVersion:def.version,
+                category:metricCatalog.some(m=>m.id===score.metricId)?'formal' as const:score.metricId.startsWith('diagnostic-')?'diagnostic' as const:'guardrail' as const,
+                applicabilityReason:score.applicabilityReason??plan?.notApplicable??(score.status==='NOT_APPLICABLE'?score.reason:'Selected by declared Case requirements')};
+        }), judgeCalls: [...judgeCalls, ...semantic.judgeCalls] };
     };
-    if (!context.result.started)
-        return finish(await evaluateSemantic(context));
+    if (!context.result.started){
+        await runPhase('local',scores);
+        return finish(await evaluateSemantic({...context,gradedScores:scores}));
+    }
     const metricKeys = new Set<string>();
     for (const check of checks) {
         if((context.result.status!=='completed'||!context.result.endpointReached)&&check.trigger!=='started')continue;
@@ -74,6 +96,8 @@ export async function evaluateAll(context: EvaluationContext, checks: Check[], r
             scores.push({ ...base, value: null, status: 'ERROR', reason: error instanceof Error ? error.message : String(error) });
         }
     }
-    const semantic = await evaluateSemantic(context);
+    explicitScoreCount=scores.length;
+    await runPhase('local',scores);
+    const semantic = await evaluateSemantic({...context,gradedScores:scores});
     return finish(semantic);
 }

@@ -113,18 +113,21 @@ export function assertSemanticSelection(dataset: Pick<LocalDataset, 'manifest' |
     manifestSchema.parse(dataset.manifest);
     const batch = dataset.manifest.scoring.judges.find(j => j.id === 'semantic-batch');
     for (const task of dataset.cases) {
+        if('contract'in task)caseV2Schema.parse(task);
         const semantic = 'contract' in task ? task.expected.semantic : undefined;
         if (semantic && !batch) throw new Error('A compact Case plan requires the semantic-batch Judge selection');
         const semanticOpportunity='contract'in task&&task.expected.metrics.some(m=>!m.notApplicable&&
             (formalMetricMethod(task,m.metricId)==='llm-judge'||m.metricId.startsWith('DR')&&m.metricId!=='DR03'));
-        if ((semanticOpportunity || batch?.requiredFor?.includes(task.id)) && !semantic)
+        const semanticDiagnostic=task.expected.diagnostics?.some(d=>'metricId'in d.params);
+        if ((semanticOpportunity || semanticDiagnostic || batch?.requiredFor?.includes(task.id)) && !semantic)
             throw new Error('Required semantic-batch Judge needs Case criteria before Agent preparation');
         if (semantic) caseV2Schema.parse(task);
     }
 }
 export function judgeSelection(dataset:Pick<LocalDataset,'manifest'|'cases'>,requireJudge=false){
     const applicable=dataset.manifest.scoring.judges.filter(j=>j.id==='answer-relevance'||dataset.cases.some(task=>
-        'contract'in task&&task.expected.semantic?.criteria.some(c=>task.expected.metrics.some(m=>m.metricId===c.metricId&&!m.notApplicable))));
+        'contract'in task&&task.expected.semantic?.criteria.some(c=>task.expected.metrics.some(m=>m.metricId===c.metricId&&!m.notApplicable)||
+            task.expected.diagnostics?.some(d=>'metricId'in d.params&&d.params.metricId===c.metricId))));
     return{needed:applicable.length>0,required:applicable.some(j=>requireJudge||j.required||dataset.cases.some(task=>j.requiredFor?.includes(task.id)||
         'contract'in task&&task.expected.semantic?.criteria.some(c=>c.required)))};
 }

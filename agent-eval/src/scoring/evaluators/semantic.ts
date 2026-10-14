@@ -8,10 +8,16 @@ import {unavailableResearchCounts} from '../research-judgment.ts';
 import { z } from 'zod';
 import { isSafetyMetric, localSafetyFailure, safetyEffectsSchema } from '../safety.ts';
 import { metricAppliesTo } from '../formal-rules.ts';
+import {semanticEvaluatorDefinitions} from '../judges/evaluators.ts';
+import {scoringMetric} from '../diagnostic-plans.ts';
 
 export async function evaluateSemantic(context: EvaluationContext): Promise<{ scores: EvaluationScore[]; judgeCalls: JudgeCall[] }> {
     const { task, result } = context, plan = context.semanticPlan ?? ('contract' in task ? task.expected.semantic : undefined);
     if (!plan) return { scores: [], judgeCalls: [] };
+    const selectedEvaluators=semanticEvaluatorDefinitions.filter(def=>def.appliesTo?.(context,{metric:'answer-relevance',required:false}));
+    const ownedCriteria=selectedEvaluators.flatMap(def=>def.prepare!(context));
+    if(plan.criteria.some(c=>!ownedCriteria.some(o=>o.metricId===c.metricId)&&metricAppliesTo(task,c.metricId)))
+        throw Error('Semantic criterion has no selected independent evaluator');
     const researchFrame=plan.criteria.some(c=>c.metricId.startsWith('DR'))?buildResearchFrame(context):undefined;
     const emptyResearch = researchFrame?.complete && researchFrame.reportId===null && !researchFrame.blocks.length && !researchFrame.links.length &&
         researchFrame.gold.status==='verified' ? unavailableResearchCounts(researchFrame) : undefined;
@@ -34,7 +40,7 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
     const eligible: CompactPlan['criteria'] = [], scores: EvaluationScore[] = [];
     let localFrameSaved=false;
     for (const criterion of plan.criteria) {
-        const metric = formalMetric(criterion.metricId), required = criterion.required || !!context.semanticRequired;
+        const metric = scoringMetric(criterion.metricId), required = criterion.required || !!context.semanticRequired;
         const base: EvaluationScore = { metricId: metric.id, name: metric.name, version: metric.version, method: 'llm-judge', required,
             value: null, status: 'NOT_RUN', reason: '语义判据尚未执行', evidence: criterion.evidence,
             statistics: { unit: metric.unit, numerator: null, denominator: criterion.denominator, missing: criterion.denominator } };
@@ -85,7 +91,7 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
             turnRule:'Judge only actual submitted/accepted/consumed turns. Planned future text is not an executed user instruction.' },
         facts: Object.fromEntries(selected.map(key => [key, facts[key]])),...(eligible.some(c=>c.metricId.startsWith('DR'))?{researchFrame}:{})
     }, context.fetcher, context.signal);
-    const measured = compactScores(call);
+    const measured = selectedEvaluators.flatMap(def=>def.parse!(compactScores(call)));
     return { scores: scores.map(score => measured.find(m => m.metricId === score.metricId) ?? score), judgeCalls: [call] };
     }catch(error){
         return{scores:scores.map(score=>eligible.some(c=>c.metricId===score.metricId)?{...score,status:'ERROR' as const,reason:error instanceof Error?error.message:String(error)}:score),judgeCalls:[]};

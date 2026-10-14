@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { metricCatalog } from '../scoring/catalog.ts';
 import { compactPlanSchema } from '../scoring/judges/compact.ts';
+import {scoringMetric} from '../scoring/diagnostic-plans.ts';
 import {researchGoldSchema as researchGold} from './research-gold.ts';
 import { InvoiceFormDraftSchema, InvoiceFormLineOriginsSchema } from '../../../packages/contracts/src/invoice.ts';
 import { ExtensionEvaluationProfileSchema, ExtensionRefSchema } from '../../../packages/contracts/src/extensions.ts';
@@ -242,9 +243,23 @@ export const caseV2Schema = caseBase.extend({
         ['DR01', 'DR02'].some(id => v.expected.metrics.find(m => m.metricId === id)?.notApplicable))
         c.addIssue({ code: 'custom', message: 'Applicable DR03 requires precision and recall applicability' });
     for (const criterion of v.expected.semantic?.criteria ?? []) {
+        const diagnostic=v.expected.diagnostics?.find(d=>'metricId'in d.params&&d.params.metricId===criterion.metricId);
+        if(diagnostic&&'metricId'in diagnostic.params){
+            const metric=scoringMetric(criterion.metricId),params=diagnostic.params;
+            if(criterion.version!==metric.version||criterion.unit!==metric.unit||criterion.denominator!==params.denominator||
+                criterion.required!==diagnostic.required||criterion.rule!==diagnostic.reason||criterion.trigger!=='started'||
+                JSON.stringify(criterion.evidence)!==JSON.stringify(params.evidence))
+                c.addIssue({code:'custom',message:'Semantic diagnostic differs from its independent declaration'});
+            continue;
+        }
         const declared = v.expected.metrics.find(m => m.metricId === criterion.metricId);
         if (!declared || declared.notApplicable || declared.version !== criterion.version || declared.unit !== criterion.unit || declared.denominator !== criterion.denominator)
             c.addIssue({ code: 'custom', message: 'Semantic criterion must match the declared metric opportunity plan' });
+    }
+    for(const diagnostic of v.expected.diagnostics??[])if('metricId'in diagnostic.params){
+        const params=diagnostic.params;
+        if(!v.expected.semantic?.criteria.some(criterion=>criterion.metricId===params.metricId))
+            c.addIssue({code:'custom',message:'Declared semantic diagnostic requires its matching criterion'});
     }
     if (v.requires.includes('research') && v.steps?.[0]?.action !== 'research-plan')
         c.addIssue({ code: 'custom', message: 'Research capability requires an explicit initial research-plan step' });
