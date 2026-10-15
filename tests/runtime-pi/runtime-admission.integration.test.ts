@@ -46,6 +46,7 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
     for (const [artifactId, filename, bytes] of [[2 * id - 1, 'original.png', original], [2 * id, 'parsed.json', parsed]] as const) {
       mkdirSync(join(paths.artifactsDir, String(artifactId)), { recursive: true });
       writeFileSync(join(paths.artifactsDir, String(artifactId), filename), bytes);
+      store.contents.remember({ ownerKind: 'artifact', ownerId: String(artifactId), relativePath: filename }, bytes);
     }
     const metadata = { version: 1 as const, sourceKey: 'synthetic', sourceRecordId: `runtime-invoice-${id}`, sourceVersion: 'v1',
       files: [{ relativePath: 'original.png', bytes: original.byteLength, mimeType: 'image/png' }] };

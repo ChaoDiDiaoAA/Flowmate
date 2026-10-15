@@ -1,12 +1,12 @@
 import { fixtureSelection } from '../dataset-loader/selection.ts';
 import { atomicJson, publicVersions } from '../reports/files.ts';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { artifactJson } from '../artifacts.ts';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { discoverDatasets, hash, caseContentHash, caseFiles, resolveCase, restoreCaseInputs, selectCases, assertSemanticSelection, judgeSelection, type LocalDataset, type Check } from '../dataset-loader/local.ts';
+import { discoverDatasets, REPO_ROOT, caseConditions, caseFiles, resolveCase, restoreCaseInputs, selectCases, assertSemanticSelection, judgeSelection, type LocalDataset, type Check } from '../dataset-loader/local.ts';
 import { productAgent, createProductAgent, type AgentKernel } from '../adapters/agent.ts';
 import { agentApiSchema, prepareAgentConfig, type AgentModelCapabilities } from '../configuration.ts';
 export {assertModelConfiguration} from '../adapters/agent.ts';
@@ -153,7 +153,9 @@ export async function runLocal(repo: string, options: {
     const selectedJudge = judge ? publicJudgeConfig(judge) : null;
     const executionId = safeId(options.executionId ?? ('agent-' + Date.now() + '-' + randomUUID().slice(0, 8)));
     const root = createRunDirectory(repo, executionId, datasetScope(dataset));
-    const code = codeIdentity(repo);
+    const sourceRoot=isProductAgent&&!existsSync(join(repo,'apps/host/main.ts'))?REPO_ROOT:repo;
+    const code = codeIdentity(sourceRoot);
+    const runtimeSource=runtimeSourceConditions(sourceRoot,code);
     const prepared = selected.map(task => {
         try {
             return { task, resolved: resolveCase(dataset, task, repo), error: null };
@@ -166,27 +168,27 @@ export async function runLocal(repo: string, options: {
     const snapshot=scanEvidence({version:'v1',dataset:dataset.manifest.id,repeat,selection:options.selection??'full',configuration:config,judge:selectedJudge,
         cases:authored?authored.cases.filter(c=>selected.some(t=>t.id===c.id)):selected,
         gold:authored?Object.fromEntries(selected.map(c=>[c.id,authored.gold[c.id]])):undefined,
-        materials:prepared.map(({task,resolved})=>({caseId:task.id,materials:resolved?.projected.materials??[],files:caseFiles(dataset,task)})),
-        runtimeSource:runtimeSourceConditions(repo), ...(dataset.regressionOrigins ? { regressionOrigins: dataset.regressionOrigins } : {}),
+        materials:prepared.map(({task,resolved})=>({caseId:task.id,materials:resolved?.projected.materials??[],files:resolved?caseFiles(dataset,task):[]})),
+        ...(dataset.regressionOrigins ? { regressionOrigins: dataset.regressionOrigins } : {}),
         scoring:{catalog:metricCatalog,rules:formalRules,evaluators:createRegistry().list().map(({id,name,kind,version,outputs,rubric})=>({id,name,kind,version,outputs,rubric})),...(batch?{rubrics}:{rubric:legacyRubric}),
             plans:selected.map(task=>({caseId:task.id,checks:task.expected.checks,...('contract'in task?{metrics:task.expected.metrics,semantic:task.expected.semantic}:{})}))},
         fixtures:authored?Object.fromEntries(selected.flatMap(c=>{const name=authored.cases.find(d=>d.id===c.id)?.input.fixture?.name;return name?[[name,authored.fixtures[name]]]:[];})):undefined});
     if((snapshot.fact.actual as {leaked:boolean}).leaked)throw Error('Secret in declared configuration; refusing execution');
-    atomicJson(join(root,'snapshot.json'),publicVersions(snapshot.value));
+    atomicJson(join(root,'snapshot.json'),publicVersions({...snapshot.value,runtimeSource}));
     const report: LocalReport = {
         contract: 'flowmate-agent-run/v2', executionId, code,
         ...(dataset.manifest.suite === 'badcase' ? { executionKind: isProductAgent && !deps.fetcher ? 'model' as const : 'controlled' as const } : {}),
-        dataset: { id: dataset.manifest.id, version: dataset.manifest.version, hash: dataset.hash, subject: 'agent' },
+        dataset: { id: dataset.manifest.id, version: dataset.manifest.version,  subject: 'agent' },
         selection: options.caseId ? 'case' : options.selection ?? 'full', environment: config.environment ?? deps.env?.FLOWMATE_EVAL_ENVIRONMENT ?? process.env.FLOWMATE_EVAL_ENVIRONMENT ?? 'development', userId: deps.env?.FLOWMATE_EVAL_USER_ID ?? process.env.FLOWMATE_EVAL_USER_ID,
         startedAt: new Date().toISOString(), endedAt: null, repeat, executionComplete: false, scoring: 'pending', manualReview: 'none', formalAcceptance: 'not-assessed',
-        scoringConfiguration: { version: dataset.manifest.scoring.version, judgeMode: options.judge, judgeHash: selectedJudge?.configHash ?? null,
-            ...(batch?{judge:selectedJudge,rubrics}:{}) },
+        scoringConfiguration: { version: dataset.manifest.scoring.version, judgeMode: options.judge,
+            judge:selectedJudge,...(batch?{rubrics}:{}) },
         trials: [], export: { backend: options.backend, status: options.backend === 'local' ? 'disabled' : 'pending' }
     };
     for (let repetition = 1; repetition <= repeat; repetition++)
-        for (const { task } of prepared) {
+        for (const { task,resolved } of prepared) {
             const trialId = executionId + '-' + task.id + '-trial-' + repetition;
-            report.trials.push({ caseId: task.id, caseVersion: task.version, caseHash: caseContentHash(dataset, task), caseName: task.name, category: task.category, purpose: dataset.embedded?.authored?.cases.find(c=>c.id===task.id)?.purpose??'regression',
+            report.trials.push({ caseId: task.id, caseVersion: task.version, caseConditions: resolved?caseConditions(dataset, task):{task,unavailable:true}, caseName: task.name, category: task.category, purpose: dataset.embedded?.authored?.cases.find(c=>c.id===task.id)?.purpose??'regression',
                 partition: dataset.manifest.suite === 'badcase' ? 'badcase' : dataset.manifest.smoke.includes(task.id) ? 'smoke' : 'holdout', repetition, trialId, traceId: randomUUID().replaceAll('-',''),
                 ...(dataset.regressionOrigins?.[task.id] ? { regressionOrigins: structuredClone(dataset.regressionOrigins[task.id]) } : {}),
                 status: 'NOT_RUN', reason: 'Planned', counts: {}, execution: null, scores: [], judgeCalls: [], feedback: 'none',
@@ -226,7 +228,7 @@ export async function runLocal(repo: string, options: {
             ...(item.task.input.turns ? {turns:item.task.input.turns} : {}),
             ...(inputs.resourceRoot ? { resourceRoot: inputs.resourceRoot } : {}),
             ...(item.resolved.controllerInput?{controllerInput:item.resolved.controllerInput}:{}),
-            ...(item.task.requires.includes('invoice') ? { invoiceSource: { root: inputs.invoiceRoot ?? join(repo, 'data/invoices/agent-input'), localRoot: inputs.localRoot, materials: item.task.input.materials } } : {}),
+            ...(item.task.requires.includes('invoice') ? { invoiceSource: { root: inputs.invoiceRoot ?? join(repo, 'data/invoices/agent-input'), localRoot: inputs.localRoot, materials: item.task.input.materials,files:caseFiles(dataset,item.task) } } : {}),
             requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,repo),...config} }, config.timeoutMs ?? 120000, config.stopGraceMs ?? 5000, deps.signal, phase);
         if (result.stopFailed) stopReason = 'Prior Trial stopping unconfirmed: ' + (result.execution.error?.message ?? 'Stop evidence missing');
         const cleanup = result.execution.evidence.cleanup;
@@ -256,8 +258,8 @@ export async function runLocal(repo: string, options: {
     report.endedAt = new Date().toISOString();
     report.scoring = 'complete';
     report.executionComplete = report.trials.every(t => t.execution && !['not-started', 'cancelled'].includes(t.execution.status));
-    const after = codeIdentity(repo);
-    if (after.workspaceHash !== code.workspaceHash) {
+    const after = codeIdentity(sourceRoot);
+    if (changedSourcePaths(code,after).length) {
         report.executionComplete = false;
         report.sourceInvalidation={reason:'Execution source changed during the experiment',paths:changedSourcePaths(code,after)};
         for (const t of report.trials) {

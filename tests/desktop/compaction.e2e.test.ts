@@ -61,7 +61,7 @@ for (const mode of ['manual', 'threshold', 'overflow', 'cancel', 'auto-cancel'] 
     let opened = await open(root); app = opened.app; let page = opened.page;
     const sessionId = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
-      const saved = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p10-ui', credentialRef: 'p10_ui_controlled_key',
+      const saved = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p10-ui', credentialRef: '00000000000000000000000000000001',
         name: 'P10 controlled', kind: 'custom', providerId: null, baseUrl, model: 'p10-ui', api: 'openai-completions',
         contextWindow: 64000, maxTokens: 16384, reasoning: false }], defaultModelId: 'p10-ui' },
         { modelId: 'p10-ui', apiKey: 'synthetic-p10-ui-key' });

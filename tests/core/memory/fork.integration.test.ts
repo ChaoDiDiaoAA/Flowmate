@@ -79,9 +79,9 @@ function appendOwnedInput(f: ReturnType<typeof fixture>, sessionId: number, entr
   const snapshot = need(f.store.runtimeEventStore.withTransaction(() => f.store.context.appendInTransaction({ runId, sessionId, jobId: null, json, at })));
   const content = { version: 2, text: entryId, promptText: entryId, workspaceContext: null, workspaceInput: null,
     allowedDocumentIds: [], allowedArtifactIds: [] };
-  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
+  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,
     context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
-    VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`).run(sessionId, 'a'.repeat(64), runId, snapshot.id, JSON.stringify(content), at, at).lastInsertRowid);
+    VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`).run(sessionId, '{}', runId, snapshot.id, JSON.stringify(content), at, at).lastInsertRowid);
   const saved = need(f.store.memory.load(sessionId))!;
   need(f.store.memory.commit({ sessionId, expected: saved.commit, header: saved.history.header,
     appendEntries: [user(entryId, saved.history.leafId)], leafId: entryId, unusable: false, contexts: [{ entryId, runId, inputId }] }));

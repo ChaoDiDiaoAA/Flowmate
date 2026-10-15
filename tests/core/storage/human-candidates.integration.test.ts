@@ -10,7 +10,6 @@ import { createInvoiceEditService } from '../../../packages/core/src/invoice-edi
 import { createFileStore } from '../../../packages/core/src/storage/file-store.ts';
 import { DocumentService } from '../../../packages/data/src/documents.ts';
 import { validateHumanInvoiceCandidate } from '../../../packages/employee-invoice/src/validation.ts';
-import { createHash } from 'node:crypto';
 
 function required<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 function request(store: ReturnType<typeof makeSelectedCandidate>) {
@@ -33,8 +32,8 @@ describe('human candidate transactions', () => {
       draft: { fields: Object.fromEntries(Object.entries(input.draft.fields).sort(([left], [right]) => left.localeCompare(right))),
         lines: input.draft.lines.map(line => Object.fromEntries(Object.entries(line).sort(([left], [right]) => left.localeCompare(right)))), notes: input.draft.notes },
       expectedCandidateId: input.expectedCandidateId, expectedRevision: input.expectedRevision, jobId: input.jobId, operationRef: input.operationRef };
-    const hash = createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
-    store.db.query("UPDATE invoice_candidates SET fields_json=json_set(fields_json,'$.editRequestHash',?) WHERE id=?").run(hash, saved.candidate.candidateId);
+    const requestFacts = JSON.stringify(canonical);
+    store.db.query("UPDATE invoice_candidates SET fields_json=json_set(fields_json,'$.editRequestFacts',?) WHERE id=?").run(requestFacts, saved.candidate.candidateId);
     required(store.workspace.selectCandidate({ jobId: store.jobId, candidateId: store.candidateId,
       expectedCandidateId: saved.candidate.candidateId, expectedRevision: saved.workspace.revision, at: store.stamp }));
     expect(store.candidates.queryOperation({ kind: 'save', request: input, at: store.stamp }))
@@ -106,14 +105,15 @@ describe('human candidate transactions', () => {
     expect(legacy.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 9 });
     legacy.close();
     const store = required(openDatabase(paths)); deferCleanup(() => store.close());
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
     expect({ candidate: store.db.query(candidateSql).all(), jobs: store.db.query('SELECT * FROM jobs').all(),
       artifacts: store.db.query('SELECT * FROM artifacts').all(), events: store.db.query('SELECT * FROM business_events').all() }).toEqual(before);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(store.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     const input = request({ ...legacy, candidates: store.candidates }); input.draft.notes = ['Migrated human note.'];
-    expect(required(store.candidates.saveHuman({ ...input, at: legacy.stamp, validate: () => ({ ok: true, data: { checks: [], issues: [] } }) })))
-      .toMatchObject({ changed: true, candidate: { runId: null, toolCallId: null, origin: 'human_edit' } });
+    expect(store.candidates.saveHuman({ ...input, at: legacy.stamp, validate: () => ({ ok: true, data: { checks: [], issues: [] } }) }))
+      .toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+    expect(store.db.query(candidateSql).all()).toEqual(before.candidate);
   });
 
   it('rolls back all table replacements if migration 010 cannot commit its marker', () => {

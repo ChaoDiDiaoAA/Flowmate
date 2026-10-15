@@ -1,5 +1,4 @@
 import {z} from 'zod';
-import {createHash} from 'node:crypto';
 import {EvidenceRefSchema} from '../../../packages/contracts/src/research.ts';
 import {researchGoldSchema} from '../dataset-loader/research-gold.ts';
 import {formalMetric} from './catalog.ts';
@@ -14,7 +13,7 @@ export const researchProofSchema = z.object({
 });
 export type ResearchProof = z.infer<typeof researchProofSchema>;
 
-const id=z.number().int().positive().max(Number.MAX_SAFE_INTEGER),sha=z.string().regex(/^[a-f0-9]{64}$/);
+const id=z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const researchFrameSchema=z.object({contract:z.literal('flowmate-research-frame/v1'),complete:z.boolean(),reportId:id.nullable(),
  blocks:z.array(z.object({kind:z.enum(['claim','report-answer','report-section']),key:z.string().min(1),claimId:id.nullable(),text:z.string()}).strict()),
  links:z.array(z.object({key:z.string().min(1),claimId:id.nullable(),evidenceIndex:z.number().int().nonnegative().nullable(),ref:EvidenceRefSchema.nullable(),
@@ -22,8 +21,8 @@ export const researchFrameSchema=z.object({contract:z.literal('flowmate-research
  integrity:z.object({valid:z.boolean().nullable(),issues:z.array(z.object({kind:z.string(),id:id.nullable(),code:z.string(),severity:z.enum(['invalid','unknown'])}).passthrough()),
   links:z.array(z.object({claimId:id,evidenceIndex:z.number().int().nonnegative(),sourceSnapshotId:id.optional(),valid:z.boolean().nullable()}).strict()),
   sourceBindings:z.array(z.object({sourceSnapshotId:id,sample:z.string(),file:z.string()}).strict())}).passthrough(),
- gold:researchGoldSchema,sources:z.array(z.object({sourceSnapshotId:id,text:z.string(),sha256:sha.optional(),modelRead:z.literal(false),
-  binding:z.object({sourceSnapshotId:id,sample:z.string(),file:z.string()}).strict().nullable()}).strict()),proofHash:sha.optional(),rule:z.string().min(1)
+ gold:researchGoldSchema,sources:z.array(z.object({sourceSnapshotId:id,text:z.string(),modelRead:z.literal(false),
+  binding:z.object({sourceSnapshotId:id,sample:z.string(),file:z.string()}).strict().nullable()}).strict()),rule:z.string().min(1)
 }).strict();
 const splitPair=(text:string,offset:number)=>offset>0&&offset<text.length&&/[\uD800-\uDBFF]/.test(text[offset-1]!)&&/[\uDC00-\uDFFF]/.test(text[offset]!);
 export type ResearchCount={row:[number,number,number]|null;knownFailure:boolean;statistics:MetricStatistics;opportunities:unknown[]};
@@ -59,7 +58,7 @@ export function deriveResearchCounts(input:unknown,proof:Pick<ResearchProof,'ato
   const original=frame.links[i]!,state=original.valid===false||original.relation==='unbound'?0:original.valid===null?link.state===0?0:2:link.state;
   return{...link,state,original};
  });
- const uniqueLinks=[...new Map(effectiveLinks.map(link=>[JSON.stringify([link.atom,createHash('sha256').update(JSON.stringify(link.original.ref??link.original.display)).digest('hex')]),link])).values()];
+ const uniqueLinks=[...new Map(effectiveLinks.map(link=>[JSON.stringify([link.atom,link.original.ref??link.original.display]),link])).values()];
  const coverage=proof.atoms.map((atom,index)=>{
   const links=effectiveLinks.filter(l=>l.atom===index);
   return atom.covered===1&&!links.some(l=>l.state===1)?frame.complete&&!links.some(l=>l.state===2)?0:2:atom.covered;

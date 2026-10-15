@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-line-item-extraction",
   "version": "v1",
@@ -40,13 +40,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1390,
-      "sha256": "f48ec9f09eb9901b2a0eb2c9af05299a02f8e321831c9fb0fe9f93d757abf729"
+      "bytes": 1390
     },
     {
       "path": "references/guide.md",
-      "bytes": 881,
-      "sha256": "fb5dc263a84aa14e4ad4ab154eaf1a250fe3519f65c14b60420c96fa1f1fa16e"
+      "bytes": 881
     }
   ]
 }

@@ -1,6 +1,5 @@
 import { _electron as electron } from 'playwright';
 import { expect, test as it } from '@playwright/test';
-import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { CandidateDraftSchema } from '@flowmate/contracts';
 import { join, resolve } from 'node:path';
@@ -108,12 +107,8 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     sourceRecordId: 'desktop-form-invoice', datasetRevision: 'rev-1', qualityStatus: 'complete', allowedUsesClaim: ['local review'],
     licenseVerification: 'not_verified', files: [{ path: 'original.png', bytes: png.length }, { path: 'content.json', bytes: Buffer.byteLength(content) },
       { path: 'pages.json', bytes: Buffer.byteLength(pages) }] }));
-  const digest = createHash('sha256');
-  for (const name of ['original.png', 'content.json', 'pages.json', 'metadata.json']) {
-    const bytes = readFileSync(join(source, name)); const length = Buffer.alloc(8); length.writeBigUInt64BE(BigInt(bytes.length)); digest.update(length).update(bytes);
-  }
   const missing = { raw: null, normalized: null, state: 'missing' as const, alternatives: [], sources: [] };
-  const documentVersion = `rev-1:parsed-v3:${digest.digest('hex')}`;
+  const documentVersion = 'pending-import';
   const candidate = CandidateDraftSchema.parse({ fields: Object.fromEntries(['invoiceNumber', 'issueDate', 'sellerName', 'sellerTaxId', 'buyerName', 'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount']
     .map(name => [name, name === 'invoiceNumber' ? { raw: 'INV-FORM-1', normalized: 'INV-FORM-1', state: 'present', alternatives: [],
       sources: [{ documentId: 1, version: documentVersion, artifactId: 2, page: 1, blockId: 'b1', quote: 'INV-FORM-1' }] } : missing])), lines: [], notes: [] });
@@ -154,12 +149,15 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
     const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
     await app.evaluate(({ dialog }, path) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] }); }, source);
-    expect((await page.evaluate(() => window.flowmate.chooseAndImportInvoice())).ok).toBe(true);
+    const imported = await page.evaluate(() => window.flowmate.chooseAndImportInvoice());
+    if (!imported.ok || !imported.data) throw new Error('Invoice import failed');
+    for (const field of [...Object.values(candidate.fields), ...candidate.lines.flatMap(line => Object.values(line))])
+      for (const sourceRef of field.sources) sourceRef.version = imported.data.documentRef.version;
     const prepared = await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error('Settings unavailable');
       const saved = await window.flowmate.saveSettings({ ...state.data.settings,
         runtime: { budget: { maxModelCalls: 32, maxToolCalls: 40, toolTimeoutMs: 20_000 }, timeoutMs: 90_000, stopGraceMs: 500 },
-        models: [{ id: 'form-model', credentialRef: 'form_fixture_credential',
+        models: [{ id: 'form-model', credentialRef: '00000000000000000000000000000027',
         name: 'Form fixture', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'form-fixture', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'form-model' }, { modelId: 'form-model', apiKey: 'synthetic-form-key' });
       if (!saved.ok) throw new Error('Settings failed');
@@ -821,7 +819,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
         .toMatchObject({ ok: false, error: { code: 'state_conflict', message: expect.stringContaining('Managed export registered') } });
       expect(readFileSync(conflictPath, 'utf8')).toBe('keep');
       expect(await page.evaluate(() => window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request: { operationRef: 'native-conflict', candidateId: 2, format: 'json' } })))
-        .toMatchObject({ ok: true, data: { candidateId: 2, sha256: expect.any(String) } });
+        .toMatchObject({ ok: true, data: { candidateId: 2 } });
       const stalePath = join(userData, 'stale.csv');
       await app.evaluate(({ dialog }) => {
         delete (globalThis as typeof globalThis & { releaseInvoiceDialog?: unknown }).releaseInvoiceDialog;

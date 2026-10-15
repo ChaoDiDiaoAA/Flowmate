@@ -90,7 +90,7 @@ describe('accepted invoice export', () => {
     required(store.edits.accept({ operationRef: 'accept-path', jobId: store.jobId, candidateId: store.candidateId,
       expectedCandidateId: store.candidateId, expectedRevision: store.selectedWorkspace.revision, dirty: false }));
     const input = { operationRef: 'foreign-path', candidateId: store.candidateId, format: 'json' as const,
-      relativePath: 'outputs/invoice-999-result-999.json', bytes: 1, sha256: 'a'.repeat(64), at: store.stamp };
+      relativePath: 'outputs/invoice-999-result-999.json', bytes: 1, at: store.stamp };
     expect(store.candidates.registerExport(input)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     const request = { operationRef: 'export-path', candidateId: store.candidateId, format: 'json' };
     const exported = required(store.edits.export(request));

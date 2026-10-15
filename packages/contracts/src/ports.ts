@@ -146,9 +146,7 @@ export const RuntimeStrategySnapshotSchema = z.object({
 }).strict().refine(value => value.experience.items.every(item => value.calibration.groups.some(group => group.toolName === item.toolName)),
 'Experience must use a frozen allowed tool.');
 export type RuntimeStrategySnapshot = z.infer<typeof RuntimeStrategySnapshotSchema>;
-export const RuntimeStrategyPolicySchema=z.object({budgetAwareness:z.boolean(),statistics:z.boolean(),experience:z.boolean(),
-  frozenStrategy:RuntimeStrategySnapshotSchema.optional(),frozenStrategies:z.array(RuntimeStrategySnapshotSchema).max(128).optional()}).strict()
-  .refine(value=>!(value.frozenStrategy&&value.frozenStrategies),'Select one frozen strategy representation');
+export const RuntimeStrategyPolicySchema = z.object({ budgetAwareness: z.boolean(), statistics: z.boolean(), experience: z.boolean() }).strict();
 export type RuntimeStrategyPolicy = z.infer<typeof RuntimeStrategyPolicySchema>;
 
 export type AgentFacts = { nativeSessionId: string; turnCount: number; modelCallCount: number; candidateIds?: DbId[];

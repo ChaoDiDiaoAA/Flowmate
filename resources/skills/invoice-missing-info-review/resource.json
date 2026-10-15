@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-missing-info-review",
   "version": "v1",
@@ -28,13 +28,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1290,
-      "sha256": "1212631711a7ca24a73d55feae61b194a50d04a470d4b93a6a4ba634ccf4c44c"
+      "bytes": 1290
     },
     {
       "path": "references/guide.md",
-      "bytes": 865,
-      "sha256": "0bf378de0b212a0a6525f8304880645eb636bedf412c9e19da380f3554aeba64"
+      "bytes": 865
     }
   ]
 }

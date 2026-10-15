@@ -1,7 +1,6 @@
 import { z } from 'zod';
 import type { Message } from '@earendil-works/pi-ai';
 import { type SessionEntry } from '@earendil-works/pi-coding-agent';
-import { createHash } from 'node:crypto';
 import { ResourceBindingSchema, ResourceExpansionEvidenceSchema, resourceRefKey } from '@flowmate/contracts';
 import type { ResourceBinding, ResourceExpansionEvidence } from '@flowmate/contracts';
 import { appError, fail, ok, InputRecordV2Schema, invoiceToolSchemas, INVOICE_TOOL_NAMES,
@@ -148,9 +147,9 @@ export function projectMessageView(message: unknown, context: MessageViewContext
         const required = product.data.resourceBinding?.requiredSkill, receipt = product.data.resourceExpansion;
         if (required) {
           if (!receipt || context.persistence !== 'saved' || context.entryId !== receipt.nativeEntryId
-            || receipt.inputId !== product.data.inputId || receipt.bundleHash !== product.data.resourceBinding?.bundleHash
+            || receipt.inputId !== product.data.inputId || receipt.bundleId !== product.data.resourceBinding?.bundleId
             || resourceRefKey(receipt.skill) !== resourceRefKey(required)
-            || receipt.expandedTextHash !== createHash('sha256').update(visible).digest('hex')) return invalid();
+            || receipt.expandedText !== visible) return invalid();
         } else if (receipt || product.data.promptText !== visible) return invalid();
         visible = product.data.text; origin = 'product-input';
       } else if (context.runInput !== undefined) {

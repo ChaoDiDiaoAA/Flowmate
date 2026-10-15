@@ -10,6 +10,9 @@ function parsedFixture(f: ReturnType<typeof makeSelectedCandidate>, pages: Array
     blocks: page.blocks.map(block => ({ ...block, kind: 'text', text: 'Controlled source', sourceIndex: 0, sourceType: 'synthetic', bbox: null })) })),
     completeness: { status: 'complete', checks: [], warnings: [] } }));
   writeFileSync(join(f.root, 'artifacts', '2', 'parsed.json'), bytes);
+  // This setup authors a replacement synthetic fixture before exercising locator validation.
+  f.db.query("DELETE FROM managed_file_contents WHERE owner_kind='artifact' AND owner_id='2' AND relative_path='parsed.json'").run();
+  f.documents.contents!.remember({ ownerKind: 'artifact', ownerId: '2', relativePath: 'parsed.json' }, bytes);
   const artifact = f.documents.getArtifact(2), document = f.documents.get(1);
   if (!artifact.ok || !document.ok) throw new Error('fixture_material_missing');
   f.db.query('UPDATE artifacts SET bytes=?,metadata_json=? WHERE id=2').run(bytes.length,

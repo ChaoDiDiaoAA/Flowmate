@@ -57,6 +57,10 @@ Thumbs.db
 # Local execution-plan ledger and review artifacts
 .superpowers/
 
+# Project-local code analysis databases and generated indexes
+/.codebase-memory/
+/.codegraph/
+
 # Archived v0 material is retained locally only; current v1 specifications
 # and Pn plans must remain versionable.
 /docs/v0/

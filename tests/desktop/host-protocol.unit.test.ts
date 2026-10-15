@@ -9,7 +9,7 @@ import { RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, Runti
 
 it('prepared invoice import accepts only a bounded frozen source and sequential uniquely identified pages', () => {
   const input: PreparedInvoiceMaterial = { contract: 'flowmate-prepared-invoice/v1', sample: 'synthetic-text',
-    original: { name: 'source.md', sha256: 'a'.repeat(64), base64: Buffer.from('Synthetic invoice').toString('base64') },
+    original: { name: 'source.md', base64: Buffer.from('Synthetic invoice').toString('base64') },
     sourceText: 'Synthetic invoice', pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text', text: 'Synthetic invoice',
       sourceIndex: 0, sourceType: 'prepared-text', bbox: null }] }] };
   const command = { version: 1, requestId: 'prepared-invoice', type: 'import_prepared_invoice_material', input } as const;
@@ -34,7 +34,7 @@ it('P13 validates the three child commands without accepting model-owned identit
 });
 
 it('P11 validates all five resource commands, results and original owner identity', () => {
-  const ref = { kind: 'prompt', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) }, owner = { sessionId: 1, runId: 2 };
+  const ref = { kind: 'prompt', id: 'invoice', version: 'v1' }, owner = { sessionId: 1, runId: 2 };
   const file = { ref, path: 'prompt.md' }, commands = [
     { type: 'list_resources' }, { type: 'read_resource_file', input: file },
     { type: 'update_resource_selection', input: { expectedRevision: 1, selection: { prompt: ref, enabledSkills: [] } } },
@@ -114,7 +114,7 @@ describe('versioned desktop Host protocol', () => {
       { type: 'submit_invoice_form_input', input: { modelId: 'model', clientSequence: 4, target: { formInstanceId: 'form-1', expectedRevision: 0 }, workspace, ...overrides } },
     ];
     for (const command of commands) {
-      const envelope = { version: 1, requestId: 'budget-input', expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234', ...command };
+      const envelope = { version: 1, requestId: 'budget-input', expectedSettingsRevision: 4, expectedCredentialRef: '00000000000000000000000000000020', ...command };
       expect(parseHostCommand(envelope)).not.toBeNull();
       expect(parseHostCommand({ ...envelope, input: { ...command.input, budget: { maxModelCalls: 65 } } })).toBeNull();
       expect(parseHostCommand({ ...envelope, input: { ...command.input, timeoutMs: 1_800_001 } })).toBeNull();
@@ -125,10 +125,10 @@ describe('versioned desktop Host protocol', () => {
   it('validates stable ordinary and active inputs without allowing active configuration changes', () => {
     const prompt = { version: 1, requestId: 'input-prompt', type: 'submit_session_input',
       input: { sessionId: 12, clientSequence: 4, mode: 'prompt', text: 'First input', modelId: 'profile-1', goalMode: 'answer' },
-      expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' } as const;
+      expectedSettingsRevision: 4, expectedCredentialRef: '00000000000000000000000000000020' } as const;
     expect(parseHostCommand(prompt)).toEqual(prompt);
     expect(parseHostCommand({ ...prompt, expectedSettingsRevision: undefined, expectedCredentialRef: undefined })).not.toBeNull();
-    expect(parseHostCommand({ ...prompt, input: { ...prompt.input, desktopRequestHash: 'a'.repeat(64) } })).toBeNull();
+    expect(parseHostCommand({ ...prompt, input: { ...prompt.input, desktopRequestIdentity: 'forged request' } })).toBeNull();
     for (const mode of ['steer', 'followUp'] as const) {
       const active = { version: 1, requestId: `input-${mode}`, type: 'submit_session_input',
         input: { sessionId: 12, clientSequence: 5, mode, runId: 21, text: 'Additional input' } } as const;
@@ -136,7 +136,7 @@ describe('versioned desktop Host protocol', () => {
       for (const field of [{ modelId: 'profile-2' }, { goalMode: 'answer' }, { timeoutMs: 1000 },
         { stopGraceMs: 1000 }, { workingDirectory: 'D:\\work' }, { config: {} }, { formTarget: {} }])
         expect(parseHostCommand({ ...active, input: { ...active.input, ...field } })).toBeNull();
-      expect(parseHostCommand({ ...active, expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' })).toBeNull();
+      expect(parseHostCommand({ ...active, expectedSettingsRevision: 4, expectedCredentialRef: '00000000000000000000000000000020' })).toBeNull();
     }
     expect(parseHostCommand({ ...prompt, input: { ...prompt.input, clientSequence: 0 } })).toBeNull();
     expect(parseHostCommand({ ...prompt, input: { ...prompt.input, mode: 'steer' } })).toBeNull();
@@ -182,7 +182,7 @@ describe('versioned desktop Host protocol', () => {
     const input = { modelId: 'profile-1', clientSequence: 3, target: { formInstanceId: 'form-1', expectedRevision: 0 },
       workspace: { revision: 2, documentRef: { id: 4, version: 'v1' }, jobId: 7, candidateRef: { id: 9, sequence: 1 }, sessionId: 12 } };
     const command = { version: 1, requestId: 'fill-1', type: 'submit_invoice_form_input', input,
-      expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' } as const;
+      expectedSettingsRevision: 4, expectedCredentialRef: '00000000000000000000000000000020' } as const;
     expect(parseHostCommand(command)).toEqual(command);
     expect(parseHostCommand({ ...command, input: { ...input, goalMode: 'answer' } })).toBeNull();
     expect(parseHostCommand({ ...command, input: { ...input, candidate: {} } })).toBeNull();
@@ -206,7 +206,7 @@ describe('versioned desktop Host protocol', () => {
       sessionId: 5, text: 'Read this directory.', modelId: 'profile-1', goalMode: 'answer',
       workspace: { revision: 0, documentRef: null, jobId: null, candidateRef: null, sessionId: 5 },
       workingDirectory: 'D:\\work',
-    }, expectedSettingsRevision: 4, expectedCredentialRef: 'credential_reference_1234' } as const;
+    }, expectedSettingsRevision: 4, expectedCredentialRef: '00000000000000000000000000000020' } as const;
     expect(parseHostCommand(request)).toEqual(request);
     for (const input of [
       { ...request.input, goalMode: 'unknown' },
@@ -277,7 +277,7 @@ describe('versioned desktop Host protocol', () => {
         workspace: { revision: 0, documentRef: null, jobId: null, candidateRef: null, sessionId: 5 }, goalMode: 'answer',
       },
       expectedSettingsRevision: 4,
-      expectedCredentialRef: 'credential_reference_1234',
+      expectedCredentialRef: '00000000000000000000000000000020',
     } as const;
     expect(parseHostCommand(start)).toEqual(start);
     expect(parseHostCommand({ ...start, apiKey: 'synthetic-test-key' })).toBeNull();
@@ -411,7 +411,7 @@ it('P10 Host commands retain compaction identity and refuse renderer-supplied na
   };
   for (const [type, input] of Object.entries(inputs)) {
     const command = { version: 1, requestId: randomUUID(), type, input,
-      ...(type === 'compact_session' ? { expectedSettingsRevision: 2, expectedCredentialRef: 'a'.repeat(16) } : {}) };
+      ...(type === 'compact_session' ? { expectedSettingsRevision: 2, expectedCredentialRef: '00000000000000000000000000000025' } : {}) };
     expect(JSON.stringify(parseHostCommand(command))).toBe(JSON.stringify(command));
     for (const patch of [{ config: {} }, { nativeSessionId: 'forged' }, { saved: {} }, { operationId: 'invalid' }])
       expect(parseHostCommand({ ...command, input: { ...input, ...patch } })).toBeNull();
@@ -431,7 +431,7 @@ it('P10 Host commands retain compaction identity and refuse renderer-supplied na
 
 
 it('P11 necessary Skill references cross every input command without allowing a Prompt reference or native facts', () => {
-  const requiredSkill = { kind: 'skill', id: 'invoice', version: 'v1', contentHash: 'a'.repeat(64) } as const;
+  const requiredSkill = { kind: 'skill', id: 'invoice', version: 'v1' } as const;
   const workspace = { revision: 1, documentRef: { id: 3, version: 'v1' }, jobId: 4, candidateRef: { id: 5, sequence: 1 }, sessionId: 7 };
   const inputs = [
     { type: 'start_run', input: { sessionId: 7, text: 'invoice', modelId: 'invoice', goalMode: 'answer', requiredSkill } },
@@ -441,7 +441,7 @@ it('P11 necessary Skill references cross every input command without allowing a 
   ];
   for (const value of inputs) {
     const command = { version: 1, requestId: randomUUID(), ...value, ...(value.type === 'submit_session_input' && 'mode' in value.input && value.input.mode !== 'prompt' ? {}
-      : { expectedSettingsRevision: 2, expectedCredentialRef: 'a'.repeat(16) }) };
+      : { expectedSettingsRevision: 2, expectedCredentialRef: '00000000000000000000000000000025' }) };
     expect(parseHostCommand(command)).toMatchObject({ input: { requiredSkill } });
     expect(parseHostCommand({ ...command, input: { ...command.input, requiredSkill: { ...requiredSkill, kind: 'prompt' } } })).toBeNull();
     expect(parseHostCommand({ ...command, input: { ...command.input, resourceExpansion: {} } })).toBeNull();

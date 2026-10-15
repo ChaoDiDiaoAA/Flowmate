@@ -107,7 +107,7 @@ export function Subagents(props: Props) {
       <div><dt>Child input / output tokens</dt><dd>{detail.tokens.inputTokens ?? 'Unknown'} / {detail.tokens.outputTokens ?? 'Unknown'} · {detail.tokens.usageComplete ? 'Complete' : 'Incomplete'}</dd></div>
       <div><dt>Child cost</dt><dd>{detail.tokens.cost ?? 'Unknown'}</dd></div>
       <div><dt>Read-only tools</dt><dd>{detail.scope.allowedTools.join(', ')}</dd></div>
-      <div><dt>Frozen documents / artifacts</dt><dd>{detail.scope.allowedDocumentIds.join(', ') || 'None'} / {detail.scope.allowedArtifactIds.join(', ') || 'None'}</dd></div>
+      <div><dt>Authorized documents / artifacts</dt><dd>{detail.scope.allowedDocumentIds.join(', ') || 'None'} / {detail.scope.allowedArtifactIds.join(', ') || 'None'}</dd></div>
     </dl><p className="activity-note">Read-only file tools can read paths permitted by the operating system. Tool selection does not create a path sandbox.</p>
       {detail.error && <p className="notice bad" role="status">Child issue: {detail.error.code}</p>}
       {!detail.historyUsable && <p className="notice bad" role="status">Recovery is blocked for this child. Refresh reads saved facts and does not resume execution.</p>}

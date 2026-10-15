@@ -6,8 +6,8 @@ import type { CompactPlan } from './judges/compact.ts';
 export type EvaluatorKind = 'deterministic' | 'llm-judge';
 type CurrentJudgeCall = Omit<Awaited<ReturnType<typeof runJudge>>, 'transportStatus'> & {transportStatus?:number|null};
 type LegacyJudgeCall = Omit<CurrentJudgeCall, 'configuration' | 'stopReason' | 'rawStopReason' | 'usageSource' | 'responseComplete' | 'request' | 'compact'> & {
-    configuration: Omit<CurrentJudgeCall['configuration'], 'api' | 'sdk' | 'modelCapabilities' | 'configHash' | 'protocolVersion'> & {
-        provider: 'anthropic' | 'openai-compatible'; api?: never; sdk?: never; configHash?: string; temperature?: number; maxTokens?: number;
+    configuration: Omit<CurrentJudgeCall['configuration'], 'api' | 'sdk' | 'modelCapabilities' | 'protocolVersion'> & {
+        provider: 'anthropic' | 'openai-compatible'; api?: never; sdk?: never;  temperature?: number; maxTokens?: number;
         protocolVersion?: string;
         modelCapabilities?: { modelId: string; maxOutputTokens: number; source: 'anthropic-models-api' | 'deepseek-models-api' };
     };

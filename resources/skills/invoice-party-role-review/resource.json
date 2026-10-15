@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-party-role-review",
   "version": "v1",
@@ -37,13 +37,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1458,
-      "sha256": "f5a9464b5a5891ca9165266dba139c42230d75e23f1368ac1d7048e15373fbd0"
+      "bytes": 1458
     },
     {
       "path": "references/guide.md",
-      "bytes": 1067,
-      "sha256": "1dc75530d937935d5b009d58cd4c840b8d5080607408132d197d10f6987a0951"
+      "bytes": 1067
     }
   ]
 }

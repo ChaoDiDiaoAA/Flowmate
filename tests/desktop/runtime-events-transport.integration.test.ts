@@ -1,3 +1,4 @@
+import { defaultProductSettings } from '@flowmate/core';
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -237,8 +238,8 @@ it('P6 actual Host drops only wake hints at measured stdout pressure and retains
         observedLines = observedLines.slice(newline + 1);
       }
     });
-    expect(await client.request({ type: 'save_settings', settings: { version: 3, revision: 0, runtime: {},
-      profile: { displayName: 'P6 pressure', theme: 'system' }, models: [{ id: 'pressure-model', credentialRef: 'pressure_model_credential',
+    expect(await client.request({ type: 'save_settings', settings: { ...defaultProductSettings(), version: 6, revision: 0, runtime: {},
+      profile: { displayName: 'P6 pressure', theme: 'system' }, models: [{ id: 'pressure-model', credentialRef: '00000000000000000000000000000034',
         name: 'Controlled pressure', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`,
         model: 'pressure-model', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }],
       defaultModelId: 'pressure-model', updatedAt: '2026-10-03T00:00:00.000Z' } })).toMatchObject({ ok: true });

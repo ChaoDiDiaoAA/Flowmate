@@ -1,6 +1,6 @@
+import { isDeepStrictEqual } from 'node:util';
 import type { HostClient } from '../../../apps/desktop/main/host-client.ts';
 import { SubagentPageResultSchema, SubagentDetailResultSchema, type SubagentDetail } from '../../../packages/contracts/src/subagents.ts';
-import { hash } from '../dataset-loader/local.ts';
 import type { EvidenceFact } from '../types.ts';
 
 /** Child detail proves saved execution and delivery facts; parent adoption requires original parent requests. */
@@ -30,7 +30,7 @@ export async function collectSubagentEvidence(host: Pick<HostClient, 'request'>,
                     const origin = ({ childRunId, childSessionId, childNativeSessionId, parentRunId, parentSessionId, originToolCallId,
                         parentNativeToolCallId, pluginAgentId, role }: typeof summary) => ({ childRunId, childSessionId, childNativeSessionId,
                             parentRunId, parentSessionId, originToolCallId, parentNativeToolCallId, pluginAgentId, role });
-                    if (hash(origin(summary)) !== hash(origin(detail.data))) throw new Error('Child detail origin changed');
+                    if (!isDeepStrictEqual(origin(summary),origin(detail.data))) throw new Error('Child detail origin changed');
                     actual.children.push(detail.data);
                     if (!detail.data.stopConfirmed) actual.stopUnconfirmed.push(detail.data.childRunId);
                 }

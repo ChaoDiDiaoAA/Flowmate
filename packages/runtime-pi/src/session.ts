@@ -6,7 +6,7 @@ import {
   type AssistantMessage,
 } from '@earendil-works/pi-ai';
 import { isAbsolute, join } from 'node:path';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { isContextOverflow } from '@earendil-works/pi-ai/utils/overflow';
 import { isDeepStrictEqual } from 'node:util';
 import {
@@ -31,7 +31,7 @@ import type { ToolExecutionContext, DelegateArgs, NativeToolOutput, SubagentCall
 import { FrozenExtensionsSchema, matchesExtensionAssembly, type NativeExtensionView } from '@flowmate/contracts';
 import { createRunResourceLoader, verifySkillExpansion, verifyManagedReadOutput, verifySkillToolOutput } from './resources/loader.ts';
 import { matchesResourceBinding, resourceContentKey, ResourceRequestEvidenceSchema } from '@flowmate/contracts';
-import type { ResourceRef, ResourceBinding, ResourceExpansionEvidence, ResourceRequestEvidence, ResourceContentEvidence, ResourceReadEvidence } from '@flowmate/contracts';
+import type { ResourceRef, ResourceBinding, ResourceExpansionEvidence, ResourceRequestEvidence, ResourceContentEvidence, ResourceReadEvidence, ManagedFileContents } from '@flowmate/contracts';
 import type {
   AgentConfigFacts,
   AgentObservation,
@@ -99,7 +99,6 @@ const maxContextBytes = RUNTIME_CONFIG.llmPayload.maxChatContextBytes;
 const maxOutputBytes = RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
 const maxAssistantContentBytes = RUNTIME_CONFIG.llmPayload.maxAssistantContentBytes;
 const encoder = new TextEncoder();
-const resourceTextHash = (text: string) => createHash('sha256').update(text).digest('hex');
 function refineResourceEvidence(value: ResourceRequestEvidence, layer: 'sdk' | 'wire', facts: readonly ResourceInclusion[]): ResourceRequestEvidence {
   return { ...value, contentChecks: value.contentChecks.map((item, index) => {
     const fact = facts[index]!;
@@ -388,7 +387,7 @@ async function wireToolDefinitions(api: string, request: Parameters<FetchLike>[0
 export class PiAgentAdapter implements AgentPort {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
-    resourceBundleRoot?: string;
+    resourceBundleRoot?: string; resourceContents?: Pick<ManagedFileContents, 'read'>;
     sessionSetup?: (session: AgentSession) => void };
   private readonly toolsByName: ReadonlyMap<string, ToolDefinition<any, any>>;
   private closed = false;
@@ -396,7 +395,7 @@ export class PiAgentAdapter implements AgentPort {
   private subagentCallbacks?: SubagentCallbacks;
 
   public constructor(dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
-    resourceBundleRoot?: string;
+    resourceBundleRoot?: string; resourceContents?: Pick<ManagedFileContents, 'read'>;
     sessionSetup?: (session: AgentSession) => void } = {}) {
     this.dependencies = dependencies;
     this.toolsByName = new Map((dependencies.tools ?? []).map((tool) => [tool.name, tool]));
@@ -805,7 +804,7 @@ export class PiAgentAdapter implements AgentPort {
         const expanded = skill && body !== null && body !== undefined ? verifySkillExpansion({ text, skill,
           expectedBody: body, expectedUserMessage: state.promptText }) : fail(appError('resource_expansion_mismatch', 'runtime', 'Required native Skill is unavailable.'));
         if (!expanded.ok) { this.failToolRun(record, active, expanded.error); throw expanded.error; }
-        state.expansion = { skill: required, bundleHash: state.resourceBinding!.bundleHash, expandedTextHash: expanded.data.expandedTextHash, at: now().at };
+        state.expansion = { skill: required, bundleId: state.resourceBinding!.bundleId, expandedText: expanded.data.expandedText, at: now().at };
       }
       state.message = users[0]!;
       active.inputMessages.set(users[0]!, slot.inputId);
@@ -899,15 +898,13 @@ export class PiAgentAdapter implements AgentPort {
       return fail(appError('extension_incompatible', 'extension', 'Extension is not eligible for this Run.'));
     const resources = options?.resources ?? null;
     const inputDefinitions = options?.inputDefinitions ? FrozenInputDefinitionsSchema.parse(options.inputDefinitions) : null;
-    if (inputDefinitions && createHash('sha256').update(JSON.stringify({ roles: inputDefinitions.roles, templates: inputDefinitions.templates })).digest('hex') !== inputDefinitions.hash)
-      return fail(appError('input_invalid', 'input', 'Frozen role index changed.'));
-    const resourceKey = JSON.stringify([resources?.bundleHash ?? null, resources?.skillIndex?.hash ?? null, inputDefinitions?.hash ?? null, options?.chatDelegation ?? false, options?.researchPhase ?? null, [...activeToolNames].sort()]);
+    const resourceKey = JSON.stringify([resources?.bundleId ?? null, resources?.skillIndex ?? null, inputDefinitions, options?.chatDelegation ?? false, options?.researchPhase ?? null, [...activeToolNames].sort()]);
     const roleIndex = activeToolNames.includes('Agent') && inputDefinitions ? inputDefinitions.roles.map(role => '- '+role.id+': '+role.description.slice(0,160)+'; '+(role.tools.every(name=>activeToolNames.includes(name)) ? 'available' : 'unavailable: required tools missing')).join('\n') : undefined;
-    const loader = createRunResourceLoader({ fixedSystemPrompt: options?.researchPhase ? options.researchPhase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
+    const loader = createRunResourceLoader({ contents: this.dependencies.resourceContents, fixedSystemPrompt: options?.researchPhase ? options.researchPhase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
       : policy === 'p3' && !options?.chatDelegation ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT, frozen: resources,
       activeToolNames,
       roleIndex, templates: inputDefinitions?.templates,
-      bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleHash ?? '') });
+      bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleId ?? '') });
     if (!loader.ok) return loader;
     if (record.session && !record.session.isIdle) return fail(appError('agent_session_busy', 'session', 'The native Session has not stopped.'));
 
@@ -986,9 +983,9 @@ export class PiAgentAdapter implements AgentPort {
           }
           extensionResult = loaded.result;
         }
-        const assembledLoader = createRunResourceLoader({ fixedSystemPrompt: loader.data.getSystemPrompt()!, frozen: resources,
+        const assembledLoader = createRunResourceLoader({ contents: this.dependencies.resourceContents, fixedSystemPrompt: loader.data.getSystemPrompt()!, frozen: resources,
           activeToolNames, roleIndex, templates: inputDefinitions?.templates,
-          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleHash ?? ''), extensionResult });
+          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleId ?? ''), extensionResult });
         if (!assembledLoader.ok) return assembledLoader;
         sessionCreationStarted = true;
         const created = await createAgentSession({
@@ -1082,7 +1079,7 @@ export class PiAgentAdapter implements AgentPort {
         try { await command.handler(args, session.extensionRunner.createCommandContext());
           const receipt = scope.finishInputCommand(); if (!receipt || !isDeepStrictEqual(receipt, owner)) throw new Error('Input command has no bound receipt.');
           inputCommandReceipt = InputCommandReceiptSchema.parse({ ...receipt, nativeSessionId, instanceId: scope.view.instanceId,
-            originalHash: createHash('sha256').update(inputDefinitions.command.originalText).digest('hex'), role: inputDefinitions.command.requiredRoles[0] });
+            originalText: inputDefinitions.command.originalText, role: inputDefinitions.command.requiredRoles[0] });
         } finally { scope.finishInputCommand(); }
       }
       const snapshot = modelRuntimeSnapshot(config, limits, model, authSource);
@@ -1472,7 +1469,7 @@ export class PiAgentAdapter implements AgentPort {
           reject(appError('resource_evidence_conflict', 'runtime', 'Previous summary provenance is unavailable.'));
         try { resources = this.resourceRequest(record, context, { callSequence: modelCallIndex, includedBindings,
           includedToolResults, includedNativeContexts }, operation.observation.operationId, previous?.id ?? null);
-          if (resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleHashes.length === 0) resources = undefined;
+          if (resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleIds.length === 0) resources = undefined;
           saveResources(); }
         catch { reject(operation.failure ?? appError('resource_evidence_conflict', 'runtime', 'Actual summary resource provenance is unavailable.')); }
       }
@@ -2152,9 +2149,9 @@ export class PiAgentAdapter implements AgentPort {
           || !parent.model || !parent.runtime || !parent.config || parent.active?.runId !== child.parentRunId)
           throw appError('subagent_origin_invalid', 'runtime', 'Child history or parent model is not bound.');
         const cwd = child.config.workingDirectory ?? parent.workingDirectory!;
-        const loader = createRunResourceLoader({ fixedSystemPrompt: child.config.agent.systemPrompt,
+        const loader = createRunResourceLoader({ contents: this.dependencies.resourceContents, fixedSystemPrompt: child.config.agent.systemPrompt,
           frozen: child.input.resources ?? null, activeToolNames: child.scope.allowedTools, visibleSkillRefs: child.input.visibleSkillRefs, child: true,
-          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), child.input.resources?.bundleHash ?? '') });
+          bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), child.input.resources?.bundleId ?? '') });
         if (!loader.ok) throw loader.error;
         const definitions = child.scope.allowedTools.map(name => this.toolsByName.get(name));
         if (definitions.some(tool => !tool || !['PURE', 'READ'].includes(tool.effect) || tool.name === 'Agent')
@@ -2182,7 +2179,7 @@ export class PiAgentAdapter implements AgentPort {
             record.runtime = parent.runtime; record.model = parent.model; record.config = structuredClone(parent.config!);
             record.snapshot = { ...child.config, agent: { ...child.config.agent, systemPrompt: session.systemPrompt } };
             record.policy = 'p3'; record.workingDirectory = cwd; record.resourceLoader = loader.data;
-            record.resourceKey = child.input.resources?.bundleHash ?? null; record.sessionInputs = true;
+            record.resourceKey = child.input.resources?.bundleId ?? null; record.sessionInputs = true;
             this.installExecutionHooks(record, session, child.scope.allowedTools);
             const seeded = this.reseedContext(record); if (!seeded.ok) throw seeded.error;
             const started = child.start(session.systemPrompt); if (!started.ok) throw started.error;
@@ -2267,17 +2264,17 @@ export class PiAgentAdapter implements AgentPort {
     }
     if (result.status === 'succeeded' && (definition.name === 'list_skill_resources' || definition.name === 'read_skill_resource')) {
       const owner = binding.queryCall?.(nativeToolCallId);
-      const verified = active.input.resources && record.resourceLoader
-        ? verifySkillToolOutput(active.input.resources, record.resourceLoader, definition.name, input, result.data) : null;
+      const verified = active.input.resources && record.resourceLoader && this.dependencies.resourceContents
+        ? verifySkillToolOutput(active.input.resources, record.resourceLoader, this.dependencies.resourceContents, definition.name, input, result.data) : null;
       if (!verified?.ok || !owner?.ok || !request.requestBinding || !active.input.contextHooks?.recordResourceRead) {
         const failure = verified && !verified.ok ? verified.error
           : appError('resource_evidence_conflict', 'runtime', 'Original Skill read identity is unavailable.');
         this.failToolRun(record, active, failure); throw failure;
       }
-      const deliveredHash = resourceTextHash(JSON.stringify(request.feedback!.content));
+      const deliveredContent = JSON.stringify(request.feedback!.content);
       const receipts = verified.data.map(file => ({ toolCallId: owner.data.toolCallId, nativeToolCallId,
-        requestSequence: request.requestBinding!.requestSequence, ref: file.ref, bundleHash: active.input.resources!.bundleHash,
-        path: file.path, fileHash: file.fileHash, deliveredHash, operation: definition.name as 'list_skill_resources' | 'read_skill_resource',
+        requestSequence: request.requestBinding!.requestSequence, ref: file.ref, bundleId: active.input.resources!.bundleId,
+        path: file.path, deliveredContent, operation: definition.name as 'list_skill_resources' | 'read_skill_resource',
         fullBody: file.fullBody, nativeEntryId: null, at: now().at }));
       request.resourceReads = receipts;
       for (const receipt of receipts) {
@@ -2303,10 +2300,10 @@ export class PiAgentAdapter implements AgentPort {
               const verified = verifyManagedReadOutput(file, args, text);
               if (!verified.ok) { this.failToolRun(record, active, verified.error); throw verified.error; }
             }
-            const deliveredHash = resourceTextHash(JSON.stringify(native.data.content));
+            const deliveredContent = JSON.stringify(native.data.content);
             request.resourceReads = managed.filter(file => nativeFileResultIncludes(operation, file.relativePath, text)).map(file => ({
               toolCallId: owner.data.toolCallId, nativeToolCallId, requestSequence: request.requestBinding!.requestSequence,
-              ref: file.ref, bundleHash: active.input.resources!.bundleHash, path: file.path, fileHash: file.fileHash, deliveredHash, operation,
+              ref: file.ref, bundleId: active.input.resources!.bundleId, path: file.path, deliveredContent, operation,
               fullBody: operation !== 'read' ? false : file.text === null ? null : text === file.text,
               nativeEntryId: null, at: now().at,
             }));
@@ -2366,10 +2363,10 @@ export class PiAgentAdapter implements AgentPort {
     evidence: ResourceRequestEvidence; texts: ResourcePayloadText[];
   } {
     const checks: ResourceContentEvidence[] = [], texts: ResourcePayloadText[] = [], bundles = new Set<string>();
-    const add = (check: Omit<ResourceContentEvidence, 'expectedTextHash' | 'sdkInclusion' | 'wireInclusion' | 'reason'>,
+    const add = (check: Omit<ResourceContentEvidence, 'expectedText' | 'sdkInclusion' | 'wireInclusion' | 'reason'>,
       expected: ResourcePayloadText) => {
       if (checks.some(item => resourceContentKey(item) === resourceContentKey(check))) return;
-      checks.push({ ...check, expectedTextHash: expected.text === null ? null : resourceTextHash(expected.text),
+      checks.push({ ...check, expectedText: expected.text === null ? null : expected.text,
         sdkInclusion: 'unknown', wireInclusion: 'unknown', reason: expected.text === null ? 'derived-source-only' : 'awaiting_sdk_payload' });
       texts.push(expected);
     };
@@ -2379,9 +2376,9 @@ export class PiAgentAdapter implements AgentPort {
       const prefix = record.manager.getBranch(entry.parentId ?? undefined), cut = prefix.findIndex(item => item.id === entry.firstKeptEntryId);
       return cut > 0 ? [{ nativeEntryId, covered: new Set(prefix.slice(0, cut).map(item => item.id)) }] : [];
     });
-    const addDerived = (ref: ResourceRef, bundleHash: string, path: string, originalEntryId: string) => {
+    const addDerived = (ref: ResourceRef, bundleId: string, path: string, originalEntryId: string) => {
       for (const source of compacted) if (source.covered.has(originalEntryId)) {
-        bundles.add(bundleHash);
+        bundles.add(bundleId);
         add({ ref, scope: 'derived-source', path, nativeEntryId: source.nativeEntryId }, { role: 'user', text: null });
       }
     };
@@ -2409,29 +2406,29 @@ export class PiAgentAdapter implements AgentPort {
         const entry = record.manager.getEntry(receipt.nativeEntryId);
         const text = entry?.type === 'message' && entry.message.role === 'user' ? typeof entry.message.content === 'string'
           ? entry.message.content : entry.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') : null;
-        if (text === null || resourceTextHash(text) !== receipt.expandedTextHash) throw new Error('Original expanded input is unavailable.');
-        bundles.add(receipt.bundleHash);
+        if (text === null || text !== receipt.expandedText) throw new Error('Original expanded input is unavailable.');
+        bundles.add(receipt.bundleId);
         add({ ref: receipt.skill, scope: 'expanded-body', path: 'SKILL.md', nativeEntryId: receipt.nativeEntryId }, { role: 'user', text, contains: compactionOperationId !== null });
-      } else addDerived(receipt.skill, receipt.bundleHash, 'SKILL.md', receipt.nativeEntryId);
+      } else addDerived(receipt.skill, receipt.bundleId, 'SKILL.md', receipt.nativeEntryId);
     }
     const reads = [...(record.recoverySeed?.resourceReads ?? []),
       ...[...(record.active?.toolRequests.values() ?? [])].flatMap(request => request.resourceReads ?? [])];
     for (const receipt of reads) {
       if (receipt.nativeEntryId === null) continue;
       if (!binding.includedToolResults.some(source => source.toolCallId === receipt.toolCallId && source.nativeToolCallId === receipt.nativeToolCallId)) {
-        addDerived(receipt.ref, receipt.bundleHash, receipt.path, receipt.nativeEntryId); continue;
+        addDerived(receipt.ref, receipt.bundleId, receipt.path, receipt.nativeEntryId); continue;
       }
       const entry = record.manager.getEntry(receipt.nativeEntryId);
       if (entry?.type !== 'message' || entry.message.role !== 'toolResult'
-        || resourceTextHash(JSON.stringify(entry.message.content)) !== receipt.deliveredHash) throw new Error('Original resource output is unavailable.');
+        || JSON.stringify(entry.message.content) !== receipt.deliveredContent) throw new Error('Original resource output is unavailable.');
       const text = entry.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-      bundles.add(receipt.bundleHash);
+      bundles.add(receipt.bundleId);
       add({ ref: receipt.ref, scope: 'tool-output', path: receipt.path, nativeEntryId: receipt.nativeEntryId },
         compactionOperationId === null ? { role: 'tool', text, toolCallId: receipt.nativeToolCallId } : { role: 'user', text, contains: true });
     }
     return { texts, evidence: ResourceRequestEvidenceSchema.parse({ purpose: compactionOperationId === null ? 'answer' : 'compaction', callSequence: binding.callSequence,
-      compactionOperationId, bundleHash: compactionOperationId === null ? frozen?.bundleHash ?? null : null, referencedBundleHashes: [...bundles],
-      systemPromptHash: resourceTextHash(context.systemPrompt ?? ''), inputIds: binding.includedBindings.flatMap(source => source.inputId === null ? [] : [source.inputId]),
+      compactionOperationId, bundleId: compactionOperationId === null ? frozen?.bundleId ?? null : null, referencedBundleIds: [...bundles],
+      systemPrompt: context.systemPrompt ?? '', inputIds: binding.includedBindings.flatMap(source => source.inputId === null ? [] : [source.inputId]),
       toolCallIds: binding.includedToolResults.map(source => source.toolCallId), contentChecks: checks, at: now().at }) };
   }
 
@@ -2489,7 +2486,7 @@ export class PiAgentAdapter implements AgentPort {
     };
     if (requestBinding && active.input.contextHooks?.recordResourceRequest) {
       try { resources = this.resourceRequest(record, context, requestBinding);
-        if (resources.evidence.bundleHash === null && resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleHashes.length === 0) resources = undefined;
+        if (resources.evidence.bundleId === null && resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleIds.length === 0) resources = undefined;
         saveResources(); }
       catch { if (!active.failure) failStream(appError('resource_evidence_conflict', 'runtime', 'Actual resource request provenance is unavailable.')); return; }
     }

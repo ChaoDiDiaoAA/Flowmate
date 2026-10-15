@@ -1,7 +1,6 @@
 import { copyFileSync, cpSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'bun:test';
 import { appError, fail, ok } from '@flowmate/contracts';
 import { createDocumentService } from '../../packages/data/src/documents.ts';
@@ -67,7 +66,7 @@ it('prepared text and three-page PDF register immutable public Documents with re
   const sourceText = 'Page one synthetic item A\nPage two synthetic item B\nPage three synthetic total 3.00';
   const original = readFileSync(new URL('../fixtures/eval-prepared-invoice/three-pages.pdf', import.meta.url));
   const input = { contract: 'flowmate-prepared-invoice/v1', sample: 'synthetic-three-page',
-    original: { name: 'original.pdf', sha256: createHash('sha256').update(original).digest('hex'), base64: original.toString('base64') }, sourceText,
+    original: { name: 'original.pdf', base64: original.toString('base64') }, sourceText,
     pages: sourceText.split('\n').map((text, index) => ({ page: index + 1, blocks: [{ id: 'b1', kind: 'text', text,
       sourceIndex: 0, sourceType: 'prepared-text', bbox: null }] })) };
   const register = service.importPrepared;
@@ -86,11 +85,11 @@ it('prepared text and three-page PDF register immutable public Documents with re
   if (!changed.ok) throw new Error('Changed synthetic registration failed');
   expect(changed.data.documentRef).not.toEqual(first.data.documentRef);
   expect(service.inspectForWorkspace(first.data.documentRef)).toMatchObject({ ok: true, data: { kind: 'valid' } });
-  expect(await register.call(service, { ...input, original: { ...input.original, sha256: '0'.repeat(64) } }))
-    .toMatchObject({ ok: false, error: { code: 'source_invalid' } });
+  expect(await register.call(service, { ...input, original: { ...input.original, base64: 'not-base64' } }))
+    .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
   const textOriginal = Buffer.from(sourceText);
   const text = await register.call(service, { ...input, sample: 'synthetic-local-text',
-    original: { name: 'source.md', sha256: createHash('sha256').update(textOriginal).digest('hex'), base64: textOriginal.toString('base64') } });
+    original: { name: 'source.md', base64: textOriginal.toString('base64') } });
   expect(text).toMatchObject({ ok: true, data: { pageCount: 3 } });
   expect(await register.call(service, { ...input, sourceText: 'UNRELATED_GOLD', pages: input.pages }))
     .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
@@ -102,9 +101,9 @@ function sample() {
       sampleId: '000001', sourceRecordId: 'synthetic-1', datasetRevision: 'rev-1', parserKey: 'mineru@3.4.5;model=pipeline', qualityStatus: 'complete',
       allowedUsesClaim: ['local review'], licenseVerification: 'not_verified',
       files: [
-        { path: 'original.jpg', bytes: 10, sha256: 'must-not-copy' },
-        { path: 'content.json', bytes: 200, sha256: 'must-not-copy' },
-        { path: 'pages.json', bytes: 20, sha256: 'must-not-copy' },
+        { path: 'original.jpg', bytes: 10 },
+        { path: 'content.json', bytes: 200 },
+        { path: 'pages.json', bytes: 20 },
       ],
     },
     content: [
@@ -204,7 +203,7 @@ describe('P3 controlled document input', () => {
     const imported = await service.importVoxel51({ sourceDirectory });
     expect(imported.ok).toBe(true);
     if (!imported.ok) return;
-    expect(imported.data.documentRef.version).toMatch(/^rev-1:parsed-v3:[a-f0-9]{64}$/);
+    expect(imported.data.documentRef.version).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
     expect(imported.data.displayName).toBe('Invoice 000001');
     expect(imported.data).not.toHaveProperty('parser');
     const artifact = opened.documents.getArtifact(imported.data.parsedArtifactId);
@@ -249,7 +248,7 @@ describe('P3 controlled document input', () => {
     const tampered = Buffer.from(saved);
     tampered[0] = tampered[0] === 123 ? 91 : 123;
     writeFileSync(managedPath, tampered);
-    expect(await service.importVoxel51({ sourceDirectory })).toMatchObject({ ok: false, error: { code: 'document_version_conflict' } });
+    expect(await service.importVoxel51({ sourceDirectory })).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
     expect(opened.documents.get(documentId)).toMatchObject({ ok: true, data: { isHidden: true } });
     writeFileSync(managedPath, saved);
     expect(await service.importVoxel51({ sourceDirectory })).toMatchObject({ ok: true,
@@ -288,7 +287,7 @@ describe('P3 controlled document input', () => {
         : checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents);
       expect(result).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
       expect(opened.documents.get(documentId)).toMatchObject({ ok: true,
-        data: { documentRef: document.documentRef, status: 'unavailable', unavailableReason: 'parsed_document_mismatch' } });
+        data: { documentRef: document.documentRef, status: 'unavailable', unavailableReason: 'parsed_artifact_missing_or_corrupt' } });
       expect(checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents))
         .toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
       expect(service.restoreDocument(documentId)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
@@ -306,7 +305,7 @@ describe('P3 controlled document input', () => {
     });
   }
 
-  for (const [fileName, attempt] of [['original.png', 1], ['raw-content.json', 2], ['source.json', 1]] as const) {
+  for (const [fileName, attempt] of [['original.png', 1], ['raw-content.json', 1], ['source.json', 1]] as const) {
     it(`preserves availability on a transient restore read of ${fileName} at attempt ${attempt}`, async () => {
       const root = mkdtempSync(join(tmpdir(), 'flowmate-restore-transient-'));
       const sourceDirectory = join(root, 'source', '000001');
@@ -475,7 +474,7 @@ describe('P3 controlled document input', () => {
     writeSample(sourceDirectory);
     const { opened, files, service, productPaths } = serviceFor(root);
     const imported = await service.importVoxel51({ sourceDirectory });
-    expect(imported).toMatchObject({ ok: true, data: { documentRef: { id: 1, version: expect.stringMatching(/^rev-1:parsed-v3:[a-f0-9]{64}$/) }, pageCount: 1, status: 'available' } });
+    expect(imported).toMatchObject({ ok: true, data: { documentRef: { id: 1, version: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/) }, pageCount: 1, status: 'available' } });
     if (!imported.ok) return;
     const context = { runId: 100, sessionId: 7, scope: { version: 2 as const, allowedTools: ['list_invoice_pages', 'read_invoice_document', 'search_invoice_document', 'list_invoice_tables'],
       allowedDocumentIds: [imported.data.documentRef.id], allowedArtifactIds: [imported.data.parsedArtifactId], allowedResourcePaths: [] } };

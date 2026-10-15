@@ -6,15 +6,14 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
 import { createHttpProvider, mkdtempSync, waitFor } from '../../../tests/support/resources.ts';
 import { prepareHostTrial } from '../../src/adapters/host-research.ts';
 import { REPO_ROOT } from '../../src/dataset-loader/local.ts';
 import type { AgentTrial, AgentTrialSession } from '../../src/adapters/agent.ts';
 import { invoiceHeaderFields, type InvoiceField } from '../../../packages/contracts/src/invoice.ts';
 import { executeCase } from '../../src/execution/execute-case.ts';
-import { canonicalResourceManifest, ResourceManifestSchema } from '../../../packages/contracts/src/resources.ts';
-import { canonicalExtensionManifest, ExtensionManifestSchema } from '../../../packages/contracts/src/extensions.ts';
+import { ResourceManifestSchema } from '../../../packages/contracts/src/resources.ts';
+import { ExtensionManifestSchema } from '../../../packages/contracts/src/extensions.ts';
 import type { ToolCallSnapshot } from '../../../packages/contracts/src/activity.ts';
 import { tasks as facilityCases } from '../fixtures/minimal-dataset.ts';
 import { evaluateAll } from '../../src/scoring/evaluate.ts';
@@ -22,11 +21,10 @@ import { aggregate } from '../../src/scoring/aggregate.ts';
 import {formalFixture} from '../support/formal.ts';
 import {evaluateFormalMetrics} from '../../src/scoring/evaluators/formal.ts';
 
-const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 function fixture(paginated=false,semantic=false,currency=false) {
     const root = mkdtempSync(join(tmpdir(), 'eval-invoice-host-')), source = join(root, 'source');
-    const materials: Array<{ source: 'voxel51'; sample: string; file: 'content.json' | 'pages.json'; sha256: string; originalSha256: string }> = [];
-    const visible: AgentTrial['input']['materials'] = [];
+    const materials: Array<{ source: 'voxel51'; sample: string; file: 'content.json' | 'pages.json';   }> = [];
+    const visible: AgentTrial['input']['materials'] = [],sourceFiles:NonNullable<NonNullable<AgentTrial['invoiceSource']>['files']>=[];
     for (const [sample, amount] of [['000001', '113.00'], ['000002', '226.00']] as const) {
         const directory = join(source, sample); mkdirSync(directory, { recursive: true });
         const files = { 'original.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64'),
@@ -38,13 +36,14 @@ function fixture(paginated=false,semantic=false,currency=false) {
         writeFileSync(join(directory, 'metadata.json'), JSON.stringify({ schemaVersion: 1, sampleId: sample, datasetId: 'voxel51-hq-invoice-ocr',
             sourceRecordId: 'synthetic-' + sample, datasetRevision: 'engineering-invoice', qualityStatus: 'not_checked',
             allowedUsesClaim: ['development'], licenseVerification: 'not_verified', files: Object.entries(files).map(([path, bytes]) => ({ path, bytes: bytes.length })) }));
+        for(const name of [...Object.keys(files),'metadata.json']){const bytes=readFileSync(join(directory,name));sourceFiles.push({path:'invoice-input/'+sample+'/'+name,encoding:'base64',content:bytes.toString('base64'),bytes:bytes.length});}
         for (const file of ['content.json', 'pages.json'] as const) {
-            materials.push({ source: 'voxel51', sample, file, sha256: digest(files[file]), originalSha256: digest(files['original.png']) });
+            materials.push({ source: 'voxel51', sample, file,  });
             visible.push({ sample, file, text: files[file].toString('utf8') });
         }
     }
     mkdirSync(join(source, '000003')); writeFileSync(join(source, '000003', 'gold.json'), 'UNSELECTED_QUALITY_CANARY');
-    return { root, source, materials, visible };
+    return { root, source, materials, visible,files:sourceFiles };
 }
 function response(delta: object, tool = false, usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }) {
     const chunk = (delta: object, finish: string | null) => `data: ${JSON.stringify({ id: 'invoice-fixture', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
@@ -66,7 +65,7 @@ for (const action of ['branch-history', 'fork-history', 'compact-history'] as co
     const prompt = 'ORIGINAL_INVOICE_POLICY: read the selected invoice only.', item: AgentTrial = {
         identity: { executionId: 'invoice-history-engineering', trialId: action, caseId: 'synthetic-history', caseVersion: 1 },
         directory: join(f.root, 'trial'), requires: ['agent', 'invoice', 'workspace', action === 'compact-history' ? 'compaction' : 'history'],
-        input: { prompt, materials: f.visible }, invoiceSource: { root: f.source, materials: f.materials },
+        input: { prompt, materials: f.visible }, invoiceSource: { root: f.source,files:f.files, materials: f.materials },
         configuration: { modelCapabilities: syntheticNativeModel, model: 'history-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' },
         steps: [
             { id: 'original', action: 'invoice-message', instruction: prompt, sample: '000001', goalMode: 'answer' },
@@ -118,7 +117,7 @@ test('two independent local invoice Trials do not inherit candidates, native his
             const item: AgentTrial = {
                 identity: { executionId: 'invoice-independent-engineering', trialId: 'trial-' + repetition, caseId: 'synthetic', caseVersion: 1 },
                 directory, requires: ['agent', 'invoice', 'workspace'],
-                input: { prompt: 'Read and save this synthetic invoice.', materials: f.visible }, invoiceSource: { root: f.source, materials: f.materials },
+                input: { prompt: 'Read and save this synthetic invoice.', materials: f.visible }, invoiceSource: { root: f.source,files:f.files, materials: f.materials },
                 steps: [{ id: 'save', action: 'invoice-message', instruction: 'Read and save this synthetic invoice.', sample: '000001', goalMode: 'save-candidate' }],
                 configuration: { modelCapabilities: syntheticNativeModel, model: 'independent-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' }
             };
@@ -162,7 +161,7 @@ test('a stale UI selection cannot replace the original candidate committed by th
         return response({role:'assistant',tool_calls:[{index:0,id:'stale-selection-'+requestCount,type:'function',function:{name,arguments:JSON.stringify(args)}}]},true);
     });
     const prompt='Read and save this synthetic invoice.', item:AgentTrial={identity:{executionId:'selection-engineering',trialId:'stale',caseId:'synthetic-selection',caseVersion:1},
-        directory:join(f.root,'trial'),requires:['agent','invoice','workspace'],input:{prompt,materials:f.visible},invoiceSource:{root:f.source,materials:f.materials},
+        directory:join(f.root,'trial'),requires:['agent','invoice','workspace'],input:{prompt,materials:f.visible},invoiceSource:{root:f.source,files:f.files,materials:f.materials},
         steps:[{id:'first',action:'invoice-message',instruction:prompt,sample:'000001',goalMode:'save-candidate'},
             {id:'select-first',action:'select-candidate',fromStep:'first',ordinal:1},
             {id:'second',action:'invoice-message',instruction:'Save a new original candidate for the same invoice.',sample:'000001',goalMode:'save-candidate'}],
@@ -183,7 +182,7 @@ for(const scenario of ['running','completed-first','no-read'] as const)test('038
     const control=structuredClone(scenariosByName['subagent-cancel-preserve-commits'].files['quality-controls/FM-038/controller.json'].json);
     control.handlerStatus='implemented-controlled-host';control.profile=profile;
     const extension=ExtensionManifestSchema.parse(JSON.parse(readFileSync(join(REPO_ROOT,'resources/extensions/subagents-v1.json'),'utf8')));
-    control.extensionRef={id:extension.id,version:extension.version,manifestHash:digest(Buffer.from(canonicalExtensionManifest(extension)))};const payload=JSON.stringify(control);
+    control.extensionRef={id:extension.id,version:extension.version};const payload=JSON.stringify(control);
     let document:{documentRef:{id:number;version:string};parsedArtifactId:number},parentRequests=0,release!:()=>void;
     const hold=new Promise<void>(resolve=>release=resolve);
     const server=await createHttpProvider(async request=>{
@@ -204,10 +203,10 @@ for(const scenario of ['running','completed-first','no-read'] as const)test('038
     });
     const prompt='Use two restricted children to inspect this invoice read-only. I may stop the work; do not create an invoice job or save.';
     const item:AgentTrial={identity:{executionId:'controlled-parent-cancel',trialId:expose?'exposed':'not-exposed',caseId:'FM-038',caseVersion:1},directory:join(f.root,'trial'),
-        input:{prompt,materials:f.visible.filter(m=>m.sample==='000001')},invoiceSource:{root:f.source,materials:f.materials.filter(m=>m.sample==='000001')},requires:['agent','invoice','workspace','subagent'],
-        setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/FM-038/controller.json',sha256:digest(Buffer.from(payload))}},controllerInput:{profile,payload,sha256:digest(Buffer.from(payload))},
+        input:{prompt,materials:f.visible.filter(m=>m.sample==='000001')},invoiceSource:{root:f.source,files:f.files,materials:f.materials.filter(m=>m.sample==='000001')},requires:['agent','invoice','workspace','subagent'],
+        setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/FM-038/controller.json'}},controllerInput:{profile,payload},
         steps:[{id:'request',action:'invoice-message',instruction:prompt,sample:'000001',goalMode:'answer',workspaceMode:'selected-document'}],
-        configuration:{modelCapabilities: syntheticNativeModel, model:'invoice-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions',extensions:{enabledExtensions:[{id:extension.id,version:extension.version,manifestHash:digest(Buffer.from(canonicalExtensionManifest(extension)))}]}}};
+        configuration:{modelCapabilities: syntheticNativeModel, model:'invoice-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions',extensions:{enabledExtensions:[{id:extension.id,version:extension.version}]}}};
     mkdirSync(item.directory);let session:AgentTrialSession|undefined;
     try{
         session=await prepareHostTrial(item,new AbortController().signal,{repo:REPO_ROOT,credential:'synthetic-parent-cancel-key'});
@@ -286,7 +285,7 @@ test('024 commits its declared user history before native manual compaction and 
     });
     const item: AgentTrial = { identity: { executionId: 'controlled-manual', trialId: 'manual-024', caseId: 'FM-024', caseVersion: 1 },
         directory: join(f.root, 'trial'), input: { prompt: declaration.input.prompt, materials: f.visible.filter(material => material.sample === '000001') },
-        turns: declaration.input.turns, invoiceSource: { root: f.source, materials: f.materials.filter(material => material.sample === '000001') },
+        turns: declaration.input.turns, invoiceSource: { root: f.source,files:f.files, materials: f.materials.filter(material => material.sample === '000001') },
         requires: scenario.requires, steps: scenario.steps.map((step: { instruction?: string }) => step.instruction === '$input' ? { ...step, instruction: declaration.input.prompt } : step),
         configuration: { modelCapabilities: syntheticNativeModel, model: 'manual-invoice', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' } };
     mkdirSync(item.directory); let session: AgentTrialSession | undefined;
@@ -353,8 +352,8 @@ for(const expose of [true,false])test('025 builds public user turns and only sav
     const prompt='Start a read-only review; wait for my explicit final saving request.';
     const item:AgentTrial={identity:{executionId:'controlled-auto',trialId:expose?'exposed':'not-exposed',caseId:'FM-025',caseVersion:1},directory:join(f.root,'trial'),input:{prompt,materials:f.visible.filter(m=>m.sample==='000001')},
         turns:[...seedTurns,{id:'final-save',role:'user',content:finalRequest}],
-        invoiceSource:{root:f.source,materials:f.materials.filter(m=>m.sample==='000001')},requires:['agent','invoice','workspace','history','compaction'],
-        setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/FM-025/controller.json',sha256:'a'.repeat(64)}},controllerInput:{profile,payload,sha256:digest(Buffer.from(payload))},
+        invoiceSource:{root:f.source,files:f.files,materials:f.materials.filter(m=>m.sample==='000001')},requires:['agent','invoice','workspace','history','compaction'],
+        setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/FM-025/controller.json'}},controllerInput:{profile,payload},
         steps:[{id:'request',action:'invoice-message',instruction:prompt,sample:'000001',goalMode:'answer'}],configuration:{modelCapabilities: {...syntheticNativeModel,contextWindow:expose?40960:262144,maxTokens:16384}, model:'invoice-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'}};
     mkdirSync(item.directory);let session:AgentTrialSession|undefined;
     try{
@@ -410,9 +409,9 @@ for(const mode of ['steer','followUp'] as const)for(const expose of [true,false]
     const initialPrompt=mode==='followUp'?'Read the invoice without saving. I may provide a later currency correction.':'Read and save the invoice. I may provide a currency correction while it runs.';
     const item:AgentTrial={identity:{executionId:'controlled-steer',trialId:expose?'exposed':'not-exposed',caseId:'synthetic-steer',caseVersion:1},directory:join(f.root,'trial'),
         turns:[{id:'currency-correction',role:'user',content:text,mode}],
-        input:{prompt:initialPrompt,materials:f.visible.filter(m=>m.sample==='000001')},invoiceSource:{root:f.source,materials:f.materials.filter(m=>m.sample==='000001')},
-        requires:['agent','invoice','workspace'],setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/synthetic-steer/controller.json',sha256:'a'.repeat(64)}},
-        controllerInput:{profile,payload,sha256:digest(Buffer.from(payload))},configuration:{modelCapabilities: syntheticNativeModel, model:'invoice-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'},
+        input:{prompt:initialPrompt,materials:f.visible.filter(m=>m.sample==='000001')},invoiceSource:{root:f.source,files:f.files,materials:f.materials.filter(m=>m.sample==='000001')},
+        requires:['agent','invoice','workspace'],setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/synthetic-steer/controller.json'}},
+        controllerInput:{profile,payload},configuration:{modelCapabilities: syntheticNativeModel, model:'invoice-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'},
         steps:[{id:'request',action:'invoice-message',instruction:initialPrompt,sample:'000001',goalMode:mode==='followUp'?'answer':'save-candidate'}]};
     mkdirSync(item.directory);let session:AgentTrialSession|undefined;
     try{
@@ -439,9 +438,9 @@ for(const mode of ['steer','followUp'] as const)for(const expose of [true,false]
                 for(const frame of missing.evidence['context-requests']!.actual as Array<{snapshots:Array<{snapshot:{json:{modelProjection:{fragments:unknown[];candidate:null|unknown}}}}>}>){
                     for(const snapshot of frame.snapshots){snapshot.snapshot.json.modelProjection.fragments=[];snapshot.snapshot.json.modelProjection.candidate=null;}
                 }
-                for(const record of (missing.evidence['tool-evidence']!.actual as {calls:Array<{tool:ToolCallSnapshot;sha256:string;bytes:number}>}).calls){
+                for(const record of (missing.evidence['tool-evidence']!.actual as {calls:Array<{tool:ToolCallSnapshot;bytes:number}>}).calls){
                     if(record.tool.result?.status==='succeeded')record.tool.result.data=empty;
-                    record.sha256=digest(Buffer.from(JSON.stringify(record.tool)));record.bytes=Buffer.byteLength(JSON.stringify(record.tool));
+                    record.bytes=Buffer.byteLength(JSON.stringify(record.tool));
                 }
                 expect((await evaluateAll({task:evidenceTask,result:missing,projected:missing.input,judge:null},[])).scores.find(s=>s.metricId==='case-evidence-required')).toMatchObject({status:'FAIL'});
             }
@@ -485,7 +484,7 @@ for (const isolation of [undefined] as const) test
         directory: join(f.root, 'trial'), input: { prompt: 'Read and save the selected invoice.', materials: f.visible }, requires: ['agent', 'invoice', 'workspace'],
         configuration: { modelCapabilities: syntheticNativeModel, model: 'invoice-fixture', baseUrl: `http://${isolation ? '127.0.0.1' : '127.0.0.1'}:${server.port}/v1`, api: 'openai-completions' } };
     mkdirSync(item.directory);
-    Object.assign(item, { invoiceSource: { root: f.source, materials: f.materials }, steps: [
+    Object.assign(item, { invoiceSource: { root: f.source,files:f.files, materials: f.materials }, steps: [
         { id: 'first', action: 'invoice-message', instruction: item.input.prompt, sample: '000001', goalMode: 'save-candidate' },
         { id: 'second', action: 'invoice-message', instruction: 'Switch to the second invoice and save its own candidate.', sample: '000002', goalMode: 'save-candidate' },
         { id: 'select', action: 'select-candidate', fromStep: 'second', ordinal: 1 },
@@ -556,7 +555,7 @@ for (const isolation of [undefined] as const) test
         const copied = join(item.directory, 'runtime', 'invoice-input');
         expect(readdirSync(copied).sort()).toEqual(['000001', '000002']);
         expect(readdirSync(join(copied, '000001')).sort()).toEqual(['content.json', 'metadata.json', 'original.png', 'pages.json']);
-        expect(digest(readFileSync(join(copied, '000001', 'original.png')))).toBe(f.materials[0]!.originalSha256);
+        expect(readFileSync(join(copied, '000001', 'original.png'))).toEqual(readFileSync(join(f.source,'000001/original.png')));
         expect(await session.close()).toMatchObject({ present: true, actual: { stopped: true } });
     } finally { if (session) await session.close(); await server.stop(); }
 }, 45000);
@@ -571,7 +570,7 @@ test('invoice registration rejects unbound files and changed source bytes before
         if (change === 'extra-file') writeFileSync(join(f.source, '000001', 'gold.json'), 'QUALITY_CANARY');
         const item: AgentTrial = { identity: { executionId: 'invoice-negative', trialId: change, caseId: 'invoice-negative', caseVersion: 1 },
             directory, input: { prompt: 'Selected invoice.', materials: f.visible }, requires: ['agent', 'invoice', 'workspace'], configuration: {} };
-        Object.assign(item, { invoiceSource: { root: f.source, materials: f.materials }, steps: [
+        Object.assign(item, { invoiceSource: { root: f.source,files:f.files, materials: f.materials }, steps: [
             { id: 'first', action: 'invoice-message', instruction: item.input.prompt, sample: '000001', goalMode: 'answer' }
         ] });
         await expect(prepareHostTrial(item, new AbortController().signal, { repo: REPO_ROOT, credential: 'synthetic' })).rejects.toThrow('Invoice');
@@ -585,7 +584,7 @@ test('an invoice answer claiming a save cannot replace a persisted candidate or 
     const item: AgentTrial = { identity: { executionId: 'invoice-no-save', trialId: 'invoice-no-save-1', caseId: 'invoice-no-save', caseVersion: 1 },
         directory: join(f.root, 'trial'), input: { prompt: 'Save the selected invoice candidate.', materials: f.visible.filter(m => m.sample === '000001') },
         requires: ['agent', 'invoice', 'workspace'], configuration: { modelCapabilities: syntheticNativeModel, model: 'invoice-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' } };
-    Object.assign(item, { invoiceSource: { root: f.source, materials: f.materials.filter(m => m.sample === '000001') }, steps: [
+    Object.assign(item, { invoiceSource: { root: f.source,files:f.files, materials: f.materials.filter(m => m.sample === '000001') }, steps: [
         { id: 'first', action: 'invoice-message', instruction: item.input.prompt, sample: '000001', goalMode: 'save-candidate' }
     ] });
     try {
@@ -602,7 +601,7 @@ test('an invoice answer claiming a save cannot replace a persisted candidate or 
 for (const profile of ['source-quote-trim', 'source-check-denial'] as const) test('actual registered invoice Hook profile ' + profile + ' preserves final admission and legal reading', async () => {
     const f = fixture(), requests: unknown[] = [], denial = profile === 'source-check-denial';
     const manifest = ExtensionManifestSchema.parse(JSON.parse(readFileSync(join(REPO_ROOT, 'resources/extensions/invoice-v1.json'), 'utf8')));
-    const ref = { id: manifest.id, version: manifest.version, manifestHash: digest(Buffer.from(canonicalExtensionManifest(manifest))) };
+    const ref = { id: manifest.id, version: manifest.version };
     let document: { documentRef: { id: number; version: string }; parsedArtifactId: number };
     const server = await createHttpProvider(async request => {
         requests.push(await request.json());
@@ -623,7 +622,7 @@ for (const profile of ['source-quote-trim', 'source-check-denial'] as const) tes
     });
     const item: AgentTrial = { identity: { executionId: 'invoice-hooks', trialId: profile, caseId: 'invoice-hook', caseVersion: 1 },
         directory: join(f.root, 'trial'), input: { prompt: denial ? 'Read the selected invoice without saving and report any actual restriction.' : 'Check the sources and save the selected invoice.', materials: f.visible.filter(m => m.sample === '000001') },
-        invoiceSource: { root: f.source, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace', 'extension'],
+        invoiceSource: { root: f.source,files:f.files, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace', 'extension'],
         configuration: { modelCapabilities: syntheticNativeModel, model: 'invoice-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', extensions: { enabledExtensions: [ref] } } };
     mkdirSync(item.directory);
     Object.assign(item, { setup: { extensionProfile: { id: profile, version: 1 } }, steps: [{ id: 'request', action: 'invoice-message', instruction: item.input.prompt,
@@ -666,7 +665,7 @@ for (const profile of ['source-quote-trim', 'source-check-denial'] as const) tes
 test('a selected Skill with a genuinely absent candidate dependency leaves legal invoice reading available', async () => {
     const f = fixture(), requests: unknown[] = [];
     const manifest = ResourceManifestSchema.parse(JSON.parse(readFileSync(join(REPO_ROOT, 'resources/skills/invoice-review-handoff/resource.json'), 'utf8')));
-    const ref = { kind: 'skill' as const, id: manifest.id, version: manifest.version, contentHash: digest(Buffer.from(canonicalResourceManifest(manifest))) };
+    const ref = { kind: 'skill' as const, id: manifest.id, version: manifest.version };
     let document: { documentRef: { id: number; version: string }; parsedArtifactId: number };
     const server = await createHttpProvider(async request => {
         requests.push(await request.json());
@@ -676,7 +675,7 @@ test('a selected Skill with a genuinely absent candidate dependency leaves legal
     });
     const item: AgentTrial = { identity: { executionId: 'skill-missing-dependency', trialId: 'skill-dependency-1', caseId: 'skill-dependency', caseVersion: 1 },
         directory: join(f.root, 'trial'), input: { prompt: 'Use invoice-review-handoff for this selected invoice; read only, without creating a task or candidate.', materials: f.visible.filter(m => m.sample === '000001') },
-        invoiceSource: { root: f.source, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace'],
+        invoiceSource: { root: f.source,files:f.files, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace'],
         configuration: { modelCapabilities: syntheticNativeModel, model: 'invoice-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', resources: { prompt: null, enabledSkills: [ref] } } };
     mkdirSync(item.directory);
     Object.assign(item, { steps: [{ id: 'read', action: 'invoice-message', instruction: item.input.prompt, sample: '000001', goalMode: 'answer', workspaceMode: 'selected-document' }] });
@@ -694,7 +693,7 @@ test('a selected Skill with a genuinely absent candidate dependency leaves legal
         expect(request.tools.some(t => t.function.name === 'get_invoice_candidate')).toBe(false);
         expect(request.tools.some(t => t.function.name === 'read_invoice_document')).toBe(true);
         expect(JSON.stringify(result.evidence.resources!.actual)).toContain('resource_dependency_missing');
-        expect(JSON.stringify(result.evidence.resources!.actual)).toContain(ref.contentHash);
+        expect(JSON.stringify(result.evidence.resources!.actual)).toContain(ref.version);
         expect(result.evidence.tools).toMatchObject({ present: true, actual: [{ toolName: 'read_invoice_document', status: 'succeeded' }] });
         expect((await session.snapshot()).evidence.resources).toEqual(result.evidence.resources);
         expect(requests).toHaveLength(2);
@@ -717,7 +716,7 @@ test('invoice correction survives an actual Host restart before the explicit sav
     });
     const item: AgentTrial = { identity: { executionId: 'invoice-restart', trialId: 'invoice-restart-1', caseId: 'invoice-restart', caseVersion: 1 },
         directory: join(f.root, 'trial'), input: { prompt: 'Browse the selected invoice only; my preliminary total is 112.00.', materials: f.visible.filter(m => m.sample === '000001') },
-        invoiceSource: { root: f.source, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace', 'history'],
+        invoiceSource: { root: f.source,files:f.files, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace', 'history'],
         configuration: { modelCapabilities: syntheticNativeModel, model: 'invoice-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' } };
     mkdirSync(item.directory);
     Object.assign(item, { steps: [
@@ -772,7 +771,7 @@ for (const startTask of [false, true]) test('New Session preserves the invoice w
     });
     const item: AgentTrial = { identity: { executionId: 'workspace-new-session', trialId: 'workspace-' + startTask, caseId: 'workspace-case', caseVersion: 1 },
         directory: join(f.root, 'trial'), input: { prompt: 'Start a new chat and answer the selected invoice total without saving.', materials: f.visible.filter(m => m.sample === '000001') },
-        invoiceSource: { root: f.source, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace'],
+        invoiceSource: { root: f.source,files:f.files, materials: f.materials.filter(m => m.sample === '000001') }, requires: ['agent', 'invoice', 'workspace'],
         configuration: { modelCapabilities: syntheticNativeModel, model: 'invoice-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' } };
     mkdirSync(item.directory);
     Object.assign(item, { steps: [

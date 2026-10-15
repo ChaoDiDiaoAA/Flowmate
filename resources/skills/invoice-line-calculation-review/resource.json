@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-line-calculation-review",
   "version": "v1",
@@ -45,13 +45,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1652,
-      "sha256": "335139130915121bf0aadca8eefed4967f723bc5cbc29398022d17a75c720273"
+      "bytes": 1652
     },
     {
       "path": "references/guide.md",
-      "bytes": 1373,
-      "sha256": "cad488e3c83f2ba56f98128d71eabc190341035d669d06a29a2613f12d0fb530"
+      "bytes": 1373
     }
   ]
 }

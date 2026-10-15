@@ -36,9 +36,9 @@ test('explicit platform projection contains all 39 metric identities without pri
     trial.scores = metricCatalog.map(m => ({ metricId: m.id, name: m.name, version: m.version, method: 'deterministic', required: false,
         value: 1, status: 'PASS', reason: 'PRIVATE_GOLD_REASON', evidence: [], actual: 'PRIVATE_ACTUAL', expected: 'PRIVATE_EXPECTED',
         statistics: { unit: m.unit, numerator: 1, denominator: 1, missing: 0 } }));
-    trial.judgeCalls = [{ callId: randomUUID(), configuration: { provider: 'openai-compatible', model: 'fixture', baseUrl: 'https://unused.invalid', temperature: 0, maxTokens: 256, timeoutMs: 1, configHash: 'judge-hash', protocolVersion: 'fixture' },
+    trial.judgeCalls = [{ callId: randomUUID(), configuration: { provider: 'openai-compatible', model: 'fixture', baseUrl: 'https://unused.invalid', temperature: 0, maxTokens: 256, timeoutMs: 1,  protocolVersion: 'fixture' },
         startedAt: report.startedAt, endedAt: report.endedAt!, attempts: 1, usage: { output: 12 }, responseModel: 'fixture', raw: 'PRIVATE_JUDGE_RAW', error: null, judgment: null,
-        request: { system: 'PRIVATE_JUDGE_SYSTEM', data: 'PRIVATE_JUDGE_GOLD', hash: 'a'.repeat(64), redacted: false }, finishReason: 'stop', responseComplete: true, compact: undefined }];
+        request: { system: 'PRIVATE_JUDGE_SYSTEM', data: 'PRIVATE_JUDGE_GOLD',  redacted: false }, finishReason: 'stop', responseComplete: true, compact: undefined }];
     const events = exportEvents(report), wire = JSON.stringify(events);
     assert.equal(wire.includes('PRIVATE_'), false);
     assert.equal(wire.includes('hidden'), false);

@@ -1,7 +1,7 @@
 import {z} from 'zod';
 
 const id=z.string().regex(/^[a-z0-9][a-z0-9-]*$/),text=z.string().trim().min(1),integer=z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const evidence=z.object({sample:id,sha256:z.string().regex(/^[a-f0-9]{64}$/).optional(),start:integer,end:integer,quote:z.string().min(1),
+const evidence=z.object({sample:id,start:integer,end:integer,quote:z.string().min(1),
  relation:z.enum(['support','contradiction'])}).strict().refine(v=>v.end>v.start&&v.end-v.start===v.quote.length,'Gold uses exact UTF-16 offsets');
 export const researchGoldSchema=z.object({status:z.enum(['pending','verified']),claims:z.array(z.object({id,text,required:z.boolean(),acceptable:z.array(text).min(1),
  conditions:z.array(text),entities:z.array(text),evidence:z.array(evidence).min(1)}).strict()),chains:z.array(z.object({id,claims:z.array(id).min(2),

@@ -1,8 +1,7 @@
-import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { AppErrorSchema, ExtensionManifestSchema, ExtensionSelectionSchema, ExtensionCatalogItemSchema,
-  FrozenExtensionsSchema, ExtensionEvaluationProfileSchema, canonicalExtensionManifest, extensionRefKey, appError, ok, fail } from '@flowmate/contracts';
+  FrozenExtensionsSchema, ExtensionEvaluationProfileSchema, extensionRefKey, appError, ok, fail } from '@flowmate/contracts';
 import type { ExtensionCatalogItem, ExtensionSelection, ExtensionEvaluationProfile, FrozenExtensions, Result, ToolDefinition } from '@flowmate/contracts';
 
 function checked<T>(action: () => T): Result<T> {
@@ -32,12 +31,11 @@ export function createExtensionService(options: { resourceRoot: string; sdkVersi
       text = new TextDecoder('utf-8', { fatal: true }).decode(data.subarray(0, size));
     } finally { closeSync(fd); }
     const manifest = ExtensionManifestSchema.parse(JSON.parse(text));
-    const manifestHash = createHash('sha256').update(canonicalExtensionManifest(manifest)).digest('hex');
     if (manifest.id !== (name === 'invoice-v1.json' ? 'invoice-assist' : 'subagents')) throw new Error('manifest identity');
     const code = options.sdkVersion !== manifest.sdkVersion ? 'sdk_version_mismatch' as const
       : manifest.tools.some(required => !options.registeredTools.some(tool => tool.name === required.name
         && tool.version === required.version && tool.effect === 'READ')) ? 'tool_definition_incompatible' as const : null;
-    return ExtensionCatalogItemSchema.parse({ ref: { id: manifest.id, version: manifest.version, manifestHash }, manifest,
+    return ExtensionCatalogItemSchema.parse({ ref: { id: manifest.id, version: manifest.version }, manifest,
       compatibility: { available: code === null, code } });
   }
   function selected(input: ExtensionSelection): ExtensionCatalogItem[] {

@@ -3,7 +3,7 @@ import { reviewByCaseId } from '../../src/datasets/review.ts';
 import {test,expect} from 'bun:test';
 import {readFileSync} from 'node:fs';
 import {join} from 'node:path';
-import {REPO_ROOT,discoverDatasets,hash} from '../../src/dataset-loader/local.ts';
+import {REPO_ROOT,discoverDatasets} from '../../src/dataset-loader/local.ts';
 import {formalRules,formalMetricMethod} from '../../src/scoring/formal-rules.ts';
 import {caseV2Schema} from '../../src/dataset-loader/schema.ts';
 import {evaluateAll} from '../../src/scoring/evaluate.ts';

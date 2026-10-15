@@ -93,7 +93,7 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
     expect(requests).toHaveLength(0);
     const saved = await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'native-model', credentialRef: 'desktop_native_credential',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'native-model', credentialRef: '00000000000000000000000000000028',
         name: 'Native fixture', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'desktop-native-model',
         api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'native-model' },
         { modelId: 'native-model', apiKey: 'synthetic-desktop-native-key' });

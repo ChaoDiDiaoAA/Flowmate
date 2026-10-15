@@ -94,8 +94,8 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
         if (run.kind === 'subagent') { if (!options.delegateTimeout) cancellations.push(await app.cancelSubagent({ parentRunId: run.parentRunId, childRunId: run.runId })); await heldHttp; }
         return result;
       } }),
-    agentFactory: tools => {
-      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+    agentFactory: (tools, resourceContents) => {
+      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
         ...(options.hang ? { fetch: (request, init) => globalThis.fetch(request, { ...init, signal: undefined }) } : {}),
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p13-loopback-only', sessionSetup: session => {
           if (options.lateTool && session.systemPrompt.startsWith('Verify invoice evidence')) session.subscribe(event => {
@@ -137,7 +137,7 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   refs = need(await app.listExtensions()).items.map(item => item.ref);
   if (options.pureTools) {
     const role = need(await app.getSubagentDefinition({ id: 'invoice-evidence-checker' }));
-    need(await app.saveSubagentDefinition({ id: role.id, expectedHash: role.hash,
+    need(await app.saveSubagentDefinition({ id: role.id, expectedContent: role.content,
       content: '---\nname: invoice-evidence-checker\ndescription: Read-only calculations\ntools: [normalize_invoice_values, calculate_invoice_amounts]\n---\nVerify invoice evidence with exact decimal calculations.' }));
   }
   if (options.resources) {
@@ -356,7 +356,7 @@ it('[F11-31/32] a real child indexes only READ-ready Skills and records dedicate
   const child = need(await f.app.listSubagents({ parentRunId: f.accepted.runId, parentSessionId: f.session.sessionId })).items[0]!;
   const rootResources = need(await f.app.queryRunResources({ sessionId: f.session.sessionId, runId: f.accepted.runId }));
   const childResources = need(await f.app.queryRunResources({ sessionId: child.childSessionId, runId: child.childRunId }));
-  expect(childResources.frozen?.bundleHash).toBe(rootResources.frozen?.bundleHash);
+  expect(childResources.frozen?.bundleId).toBe(rootResources.frozen?.bundleId);
   expect(childResources.frozen?.discoveredSkills).toEqual(rootResources.frozen?.discoveredSkills);
   const childPayloads = f.payloads.filter(payload => payload.messages[0]?.content.startsWith('Verify invoice evidence'));
   expect(f.elapsedMs).toBeLessThan(30000);
@@ -592,10 +592,10 @@ it('[F13-11/15/20] original completion may repeat but conflicting or foreign cal
   for (const inputTokens of [NaN, Infinity, -Infinity]) expect(await callbacks.finish(first.runId,
     { ...first.outcome, tokens: { ...first.outcome.tokens, inputTokens } }))
     .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
-  const { subagentCompletionHash } = await import('../../../packages/core/src/storage/repositories.ts');
-  const hashWithTokens = (inputTokens: number | null) => subagentCompletionHash({ ...first.outcome, tokens: { ...first.outcome.tokens, inputTokens } });
-  expect(new Set([null, NaN, Infinity, -Infinity, 0, -0].map(hashWithTokens)).size).toBe(6);
-  expect(subagentCompletionHash(Object.assign({ agent: first.outcome.agent }, first.outcome))).toBe(subagentCompletionHash(first.outcome));
+  const { serializeSubagentCompletion } = await import('../../../packages/core/src/storage/repositories.ts');
+  const serializedWithTokens = (inputTokens: number | null) => serializeSubagentCompletion({ ...first.outcome, tokens: { ...first.outcome.tokens, inputTokens } });
+  expect(new Set([null, NaN, Infinity, -Infinity, 0, -0].map(serializedWithTokens)).size).toBe(6);
+  expect(serializeSubagentCompletion(Object.assign({ agent: first.outcome.agent }, first.outcome))).toBe(serializeSubagentCompletion(first.outcome));
   const foreignArray = structuredClone(first.outcome.agent.modelCalls ?? []);
   Object.setPrototypeOf(foreignArray, null);
   expect(await callbacks.finish(first.runId, { ...first.outcome, agent: { ...first.outcome.agent, modelCalls: foreignArray } }))

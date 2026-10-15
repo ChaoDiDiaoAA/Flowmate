@@ -113,7 +113,6 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
           {!summary && <details className="plugin-details"><summary>Plugin details</summary><p>Pi {item.manifest.sdkVersion} · Settings revision {configuration.revision}</p>
           <p>Tools: {item.manifest.tools.map(tool => tool.name).join(', ')} · Command: {item.manifest.commands.join(', ')}</p>
           <p>Hooks: {item.manifest.hooks.map(hook => `${hook.event} (${hook.policy})`).join(', ')}</p>
-          <p>Manifest SHA-256 {item.ref.manifestHash}</p>
           </details>}</article>;
       })}
       {selected.enabledExtensions.some(ref => !catalog.state.data?.items.some(item => extensionRefKey(item.ref) === extensionRefKey(ref)))
@@ -144,7 +143,7 @@ export function ExtensionsPage({ hostEpoch, ready, settings, selectedSessionId, 
       <label>Extension Run<select aria-label="Extension Run" value={runId ?? ''} disabled={!ready || !sessionId}
         onChange={event => setRunId(event.target.value ? Number(event.target.value) : null)}><option value="">Choose a Run</option>
         {runs.state.data?.items.map(item => <option key={item.runId} value={item.runId}>Run {item.runId} · {item.status}</option>)}</select></label>
-      {history.state.data && <><p>Fixed settings revision: {history.state.data.frozen?.settingsRevision ?? 'Not recorded'}</p>
+      {history.state.data && <><p>Settings revision used: {history.state.data.frozen?.settingsRevision ?? 'Not recorded'}</p>
         <p>Included: {history.state.data.frozen?.included.map(item => `${item.ref.id} ${item.ref.version}`).join(', ') || 'None recorded'}</p>
         {history.state.data.frozen?.excluded.map(item => <p key={extensionRefKey(item.ref)}>Excluded {item.ref.id} · {item.code}</p>)}
         <p>Assembly: {history.state.data.assembly?.instances.map(item => item.instanceId).join(', ') || 'None recorded'}</p>

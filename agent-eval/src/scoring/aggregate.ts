@@ -20,7 +20,7 @@ export type MetricTotal = {
 };
 export type TrialAggregation = {
     contract: 'flowmate-trial-aggregation/v1'; executionId: string;
-    cases: Array<{ caseId: string; caseVersion: number; caseHash: string;
+    cases: Array<{ caseId: string; caseVersion: number; caseConditions?: Record<string,unknown>;
         planned: number; started: number; statuses: Record<GradeStatus, number>;
         trials: Array<{ executionId: string; trialId: string; repetition: number; status: GradeStatus; reason: string }>;
         metrics: MetricTotal[] }>;
@@ -99,10 +99,10 @@ export function aggregateTrials(report: LocalReport): TrialAggregation {
         plan.forEach(validatePlan);
         assertResearchF1(plan, trial.scores, trial.execution);
         if (new Set(plan.map(p => p.metricId)).size !== plan.length) throw new Error('Duplicate metric opportunity plan');
-        const key = JSON.stringify([trial.caseId, trial.caseVersion, trial.caseHash, [...plan].sort((a, b) => a.metricId.localeCompare(b.metricId))]);
+        const key = JSON.stringify([trial.caseId, trial.caseVersion, trial.caseConditions, [...plan].sort((a, b) => a.metricId.localeCompare(b.metricId))]);
         let group = groups.get(key);
         if (!group) {
-            group = { caseId: trial.caseId, caseVersion: trial.caseVersion, caseHash: trial.caseHash,
+            group = { caseId: trial.caseId, caseVersion: trial.caseVersion, caseConditions: trial.caseConditions,
                 planned: 0, started: 0, statuses: Object.fromEntries(statuses.map(s => [s, 0])) as Record<GradeStatus, number>, trials: [], metrics: [] };
             groups.set(key, group);
         }

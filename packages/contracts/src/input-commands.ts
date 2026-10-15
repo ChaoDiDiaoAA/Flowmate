@@ -2,29 +2,28 @@ import { z } from 'zod';
 import { AppErrorSchema } from './runtime.ts';
 
 export const InputDefinitionIdSchema = z.string().regex(/^[a-z][a-z0-9-]{0,63}$/);
-const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const content = z.string().min(1).refine(value => new TextEncoder().encode(value).byteLength <= 65536, 'Definition exceeds 64 KiB.');
 export const SubagentDefinitionSchema = z.object({ id: InputDefinitionIdSchema, description: z.string().min(1).max(512),
-  tools: z.array(z.string().min(1).max(128)).max(64), systemPrompt: content, content, hash,
+  tools: z.array(z.string().min(1).max(128)).max(64), systemPrompt: content, content,
   source: z.enum(['builtin', 'user']) }).strict().readonly();
 export type SubagentDefinition = z.infer<typeof SubagentDefinitionSchema>;
 export const GetSubagentDefinitionSchema = z.object({ id: InputDefinitionIdSchema }).strict();
-export const SaveSubagentDefinitionSchema = z.object({ id: InputDefinitionIdSchema, expectedHash: hash.nullable(), content }).strict();
+export const SaveSubagentDefinitionSchema = z.object({ id: InputDefinitionIdSchema, expectedContent: content.nullable(), content }).strict();
 export type SaveSubagentDefinition = z.infer<typeof SaveSubagentDefinitionSchema>;
 export const FrozenInputCommandSchema = z.object({ kind: z.enum(['template', 'subagent']), name: InputDefinitionIdSchema,
-  originalText: content, sourceHash: hash, expandedText: content, expandedHash: hash,
+  originalText: content, expandedText: content,
   requiredRoles: z.array(InputDefinitionIdSchema).max(4) }).strict();
 export type FrozenInputCommand = z.infer<typeof FrozenInputCommandSchema>;
 export const FrozenPromptTemplateSchema = z.object({ name: InputDefinitionIdSchema, description: z.string().max(512),
-  content, filePath: z.string().min(1).max(4096), hash }).strict();
+  content, filePath: z.string().min(1).max(4096) }).strict();
 export const FrozenInputDefinitionsSchema = z.object({ roles: z.array(SubagentDefinitionSchema).max(64),
-  templates: z.array(FrozenPromptTemplateSchema).max(64), hash,
+  templates: z.array(FrozenPromptTemplateSchema).max(64),
   command: FrozenInputCommandSchema.nullable() }).strict();
 export type FrozenInputDefinitions = z.infer<typeof FrozenInputDefinitionsSchema>;
 export const InputCommandOwnerSchema = z.object({ inputId: z.number().int().positive(), runId: z.number().int().positive(),
   sessionId: z.number().int().positive() }).strict();
 export const InputCommandReceiptSchema = InputCommandOwnerSchema.extend({ nativeSessionId: z.string().min(1).max(256),
-  instanceId: z.string().uuid(), originalHash: hash, role: InputDefinitionIdSchema }).strict();
+  instanceId: z.string().uuid(), originalText: content, role: InputDefinitionIdSchema }).strict();
 export const InputCommandItemSchema = z.object({ group: z.enum(['Skills', 'Subagents', 'Prompt Templates', 'Extension Commands']),
   name: z.string().min(1).max(128), text: z.string().min(1).max(256), description: z.string().max(512),
   available: z.boolean(), reason: z.string().max(2048).nullable(), assembled: z.boolean() }).strict();

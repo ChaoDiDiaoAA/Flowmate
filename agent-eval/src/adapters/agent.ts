@@ -1,3 +1,4 @@
+import type { EmbeddedFile } from '../dataset-loader/flat.ts';
 import type { LocalCase } from '../dataset-loader/local.ts';
 import type { InteractionProfile } from '../dataset-loader/schema.ts';
 import type { UserTurn } from '../dataset-loader/authoring.ts';
@@ -22,9 +23,9 @@ export type AgentTrial = {
     /** Private future user script. Submit only the currently eligible turn to the product. */
     turns?: UserTurn[];
     /** Trusted controller source; never part of the product input or model request. */
-    invoiceSource?: { root: string; localRoot?: string; materials: LocalCase['input']['materials'] };
+    invoiceSource?: { root: string; localRoot?: string; materials: LocalCase['input']['materials']; files?: EmbeddedFile[] };
     /** Declared controller inputs; never copied wholesale into the product or model input. */
-    controllerInput?: {profile:InteractionProfile;payload:string;sha256:string};
+    controllerInput?: {profile:InteractionProfile;payload:string};
     /** Controller-only synthetic attack targets and effect expectations; never model input. */
     privateEffects?: PrivateEffects;
     /** Only selected manifest-declared resource files are copied; adjacent quality files stay outside Host. */

@@ -47,10 +47,10 @@ test('opportunity counts sum to 2/4 and missing/NOT_RUN opportunities stay in th
     expect(aggregateTrials(firstTwo).metrics.find(m => m.metricId === 'tool-selection')).toMatchObject({ numerator: 2, denominator: 4, value: 0.5 });
     expect(aggregateTrials(r).metrics.find(m => m.metricId === 'tool-selection')).toMatchObject({ numerator: 2, denominator: 7, value: 2 / 7, missing: 3 });
 });
-test('Case versions, hashes and declared metric plans separate groups; duplicate Trial IDs are rejected', () => {
+test('Case versions, actual conditions and declared metric plans separate groups; duplicate Trial IDs are rejected', () => {
     const r = report();
     r.trials[1]!.caseVersion++;
-    r.trials[2]!.caseHash = 'different';
+    r.trials[2]!.caseConditions = {task:'different'};
     r.trials[3]!.metricPlan!.push({ metricId: 'tool-selection', version: 1, unit: '决策点', denominator: 1 });
     expect(aggregateTrials(r).cases).toHaveLength(4);
     r.trials[4]!.trialId = r.trials[0]!.trialId;

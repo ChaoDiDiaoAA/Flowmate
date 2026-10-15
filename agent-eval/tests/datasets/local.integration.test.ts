@@ -15,15 +15,15 @@ test('independent facility dataset resolves synthetic materials and unique smoke
         expect(c.review.status).toBe('pending');
     }
     expect(dataset.cases.some(c => !c.input.materials.length && !c.expected.reference)).toBe(true);
-    const materialIds = dataset.cases.flatMap(c => c.input.materials.map(m => m.originalSha256));
+    const materialIds = dataset.cases.flatMap(c => c.input.materials.map(m => m.source+'/'+m.sample+'/'+m.file));
     expect(new Set(materialIds).size).toBe(materialIds.length);
 });
 test('strict Case contract rejects extra fields, missing standards, bad materials and leakage', () => {
     expect(() => caseSchema.parse({ ...task, stage: 'P1' })).toThrow();
     expect(() => caseSchema.parse({ ...task, expected: { ...task.expected, success: [] } })).toThrow();
-    const corrupt = structuredClone(task);
-    corrupt.input.materials[0]!.sha256 = '0'.repeat(64);
-    expect(() => resolveCase(dataset, corrupt, fixtureRepo)).toThrow('hash');
+    const corrupt = structuredClone(task);corrupt.input.materials[0]!.file = 'missing.md' as any;
+
+    expect(() => resolveCase(dataset, corrupt, fixtureRepo)).toThrow();
     const root = mkdtempSync(join(tmpdir(), 'flowmate-dataset-'));
     mkdirSync(join(root, 'cases'));
     const other = { ...task, id: 'duplicate-source' };
@@ -31,8 +31,8 @@ test('strict Case contract rejects extra fields, missing standards, bad material
     writeFileSync(join(root, 'cases', other.id + '.json'), JSON.stringify(other));
     const manifest = { ...dataset.manifest, members: ['cases/' + task.id + '.json', 'cases/' + other.id + '.json'], smoke: [task.id] };
     writeFileSync(join(root, 'dataset.json'), JSON.stringify(manifest));
-    expect(() => loadDataset(root)).toThrow('required Judge Case references');
+    expect(() => loadDataset(root,fixtureRepo)).toThrow('required Judge Case references');
     manifest.scoring = { ...manifest.scoring, judges: [{ id: 'answer-relevance', required: false }] };
     writeFileSync(join(root, 'dataset.json'), JSON.stringify(manifest));
-    expect(() => loadDataset(root)).toThrow('leakage');
+    expect(() => loadDataset(root,fixtureRepo)).toThrow('leakage');
 });

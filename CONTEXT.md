@@ -96,6 +96,12 @@
 | Invoice Candidate | 不可变发票字段/明细/来源/问题候选；010保留旧model身份，human_edit依据同Job已有候选、Run/ToolCall双空。实际差异由可信人工命令追加新版本/当前指针/revision/Activity；无差异无新版本，Save不等于Accept；原操作查询纯读，不按后来现场改原事实 |
 | Accepted Candidate | 用户接受的指定候选；接受是产品事实，不自动证明 Gold 正确性 |
 | Artifact | 受控文件产物，以整数 ID 和实际内容/路径关联，不使用自定义摘要身份 |
+| ResourceRef | Prompt／Skill的逻辑引用，只含kind、id、version；运行的实际内容另由原副本保留 |
+| ExtensionRef | 扩展的逻辑引用，只含id、version；声明与实际加载分别确认 |
+| Bundle | 某次运行保存的资源内容组合，以UUID关联；作者变化不替换旧运行依据 |
+| Request Identity | 原业务键下已保存的完整请求事实；相同事实查原结果，异内容冲突，缺事实保持未知 |
+| Managed File Content | 与业务对象和相对路径关联的权威文件字节；用于比较实际内容及解释原运行依据 |
+| Legacy Evidence Gap | 旧记录无法取得原始字节时的缺口；旧资料需重新导入，旧资源会话保留历史但不可续跑，研究材料／来源明确显示核验缺口 |
 | Prompt / Skill | 作者行为指导及原生发现/读取资源；阶段工程核固定版本、选用、装配、读取和请求证据，模型遵循效果在完整产品后统一评测 |
 | Extension | P12 复用 Pi 扩展/Hook，是受信代码；实例 loading/active/load_failed/disposed 与 enabled 配置分开，结束实例不复活，新装配创建新实例，不是操作系统沙箱 |
 | State Transition | 按具体对象定义当前状态、真实触发、前置条件、负责人、动作、新状态和保存边界；Run/ToolCall/Delivery、P4 生成/保存、P5 投递/处理、P10 压缩、P12 实例、P13 子执行各自冻结必要合法/拒绝边，不合成统一消息状态机 |

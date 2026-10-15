@@ -31,7 +31,7 @@ const modelSchema = z.object({
 }, 'baseUrl must be a credential-free HTTP URL');
 
 const settingsSchema = z.object({
-  version: z.literal(5),
+  version: z.literal(6),
   revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   profile: z.object({
     displayName: z.string().trim().min(1).max(80),
@@ -51,7 +51,7 @@ const settingsSchema = z.object({
 }, 'model IDs must be unique and the default must exist');
 
 export function defaultProductSettings(now = new Date().toISOString()): ProductSettings {
-  return { version: 5, revision: 0, profile: { displayName: 'Local user', theme: 'system' }, models: [], defaultModelId: null,
+  return { version: 6, revision: 0, profile: { displayName: 'Local user', theme: 'system' }, models: [], defaultModelId: null,
     runtime: {}, resources: EMPTY_RESOURCE_SELECTION, extensions: EMPTY_EXTENSION_SELECTION, updatedAt: now };
 }
 
@@ -68,7 +68,19 @@ export function validateProductSettings(value: unknown): Result<ProductSettings>
   const withExtensions = upgraded !== null && typeof upgraded === 'object' && !Array.isArray(upgraded)
     && (upgraded as { version?: unknown }).version === 4 && !('extensions' in upgraded)
     ? { ...upgraded, version: 5, extensions: EMPTY_EXTENSION_SELECTION } : upgraded;
-  const parsed = settingsSchema.safeParse(withExtensions);
+  const legacy = withExtensions !== null && typeof withExtensions === 'object' && !Array.isArray(withExtensions)
+    && (withExtensions as { version?: unknown }).version === 5 ? withExtensions as Record<string, any> : null;
+  const stripRef = (ref: any) => {
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return ref;
+    const { contentHash: _content, manifestHash: _manifest, ...actual } = ref;
+    return actual;
+  };
+  const current = legacy ? { ...legacy, version: 6,
+    resources: legacy.resources && { ...legacy.resources, prompt: stripRef(legacy.resources.prompt),
+      enabledSkills: Array.isArray(legacy.resources.enabledSkills) ? legacy.resources.enabledSkills.map(stripRef) : legacy.resources.enabledSkills },
+    extensions: legacy.extensions && { ...legacy.extensions,
+      enabledExtensions: Array.isArray(legacy.extensions.enabledExtensions) ? legacy.extensions.enabledExtensions.map(stripRef) : legacy.extensions.enabledExtensions } } : withExtensions;
+  const parsed = settingsSchema.safeParse(current);
   return parsed.success
     ? ok(parsed.data)
     : fail(appError('config_settings_invalid', 'input', 'Model/Profile 配置无效。'));
@@ -98,7 +110,21 @@ export async function readProductSettings(file: string): Promise<Result<ProductS
   try { parsed = JSON.parse(raw) as unknown; }
   catch { return fail(appError('config_settings_invalid', 'storage', 'Model/Profile 配置不是有效 JSON。')); }
   const validated = validateProductSettings(parsed);
-  return validated.ok ? validated : fail(appError('config_settings_invalid', 'storage', 'Model/Profile 配置无效。'));
+  if (!validated.ok) return fail(appError('config_settings_invalid', 'storage', 'Model/Profile 配置无效。'));
+  if ((parsed as { version?: unknown })?.version !== 6) {
+    const temporary = `${file}.${randomUUID()}.tmp`;
+    try {
+      const backup = await open(`${file}.pre-v6.${randomUUID()}.json`, 'wx', 0o600);
+      try { await backup.writeFile(raw); await backup.sync(); } finally { await backup.close(); }
+      const pending = await open(temporary, 'wx', 0o600);
+      try { await pending.writeFile(`${JSON.stringify(validated.data, null, 2)}\n`); await pending.sync(); } finally { await pending.close(); }
+      await rename(temporary, file);
+    } catch {
+      try { await rm(temporary, { force: true }); } catch { /* preserve the upgrade failure */ }
+      return fail(appError('config_settings_write_failed', 'storage', 'Settings upgrade could not be saved; original settings remain available.', true));
+    }
+  }
+  return validated;
 }
 
 export async function saveProductSettings(file: string, value: unknown, now = new Date().toISOString()): Promise<Result<ProductSettings>> {

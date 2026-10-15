@@ -3,12 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dataset, fixtureRepo, observed } from '../support/fixtures.ts';
-import { hash, selectCases } from '../../src/dataset-loader/local.ts';
+import { selectCases } from '../../src/dataset-loader/local.ts';
 import { main } from '../../src/cli.ts';
 import { runLocal } from '../../src/execution/runner.ts';
 import { readReport } from '../../src/reports/store.ts';
 import type { AgentKernel } from '../../src/adapters/agent.ts';
-import {withoutHashes} from '../../src/artifacts.ts';
 import {publicVersions} from '../../src/reports/files.ts';
 
 test('explicit Case selection cannot cross the declared Smoke and holdout boundary', () => {
@@ -32,7 +31,7 @@ test('CLI accepts holdout but does not bypass absent data or production readines
 test('holdout repeat preserves successful, failed and infrastructure-error Trials and report readback', async () => {
     const data = structuredClone(dataset), held = data.cases.find(task => !data.manifest.smoke.includes(task.id))!;
     held.expected.checks = [{ metric: 'fact-check', required: true, evidence: 'task-facts', path: ['saved'], equals: true }];
-    data.hash = hash({ manifest: data.manifest, cases: data.cases });
+
     const prepared: string[] = [];
     const kernel: AgentKernel = { readiness: () => ({ ready: true, reason: 'synthetic-only' }), async prepare(trial) {
         prepared.push(trial.identity.caseId);
@@ -51,7 +50,7 @@ test('holdout repeat preserves successful, failed and infrastructure-error Trial
     expect(run.report.trials.map(trial => trial.partition)).toEqual(['holdout', 'holdout', 'holdout']);
     expect(run.report.trials.map(trial => trial.repetition)).toEqual([1, 2, 3]);
     expect(run.report.trials.map(trial => trial.status)).toEqual(['PASS', 'FAIL', 'ERROR']);
-    expect(publicVersions(readReport(run.file))).toEqual(publicVersions(JSON.parse(JSON.stringify(withoutHashes(run.report)))));
+    expect(publicVersions(readReport(run.file))).toEqual(publicVersions(JSON.parse(JSON.stringify((run.report)))));
     const snapshot = JSON.parse(readFileSync(join(run.file, '..', 'snapshot.json'), 'utf8'));
     expect(snapshot.selection).toBe('holdout');
     expect(snapshot.cases.map((task: { id: string }) => task.id)).toEqual([held.id]);

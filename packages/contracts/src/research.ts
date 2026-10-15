@@ -51,7 +51,7 @@ export const CreateResearchTaskSchema = z.object({ sessionId: id, title: label, 
 export type CreateResearchTaskRequest = z.infer<typeof CreateResearchTaskSchema>;
 export const ImportResearchMaterialSchema = z.object({ title: label, format: z.enum(['text', 'markdown']), text: boundedText(2_000_000) }).strict();
 export const ResearchMaterialSchema = z.object({ artifactId: id, title: label, format: z.enum(['text', 'markdown']),
-  contentHash: z.string().regex(/^[a-f0-9]{64}$/), bytes: z.number().int().min(1).max(2_000_000) }).strict();
+  bytes: z.number().int().min(1).max(2_000_000), verificationGap: z.literal('legacy-original-unavailable').optional() }).strict();
 export type ImportResearchMaterialRequest = z.infer<typeof ImportResearchMaterialSchema>;
 export type ResearchMaterial = z.infer<typeof ResearchMaterialSchema>;
 // SDK parameters stay plain Zod; domain validation checks UTF-8, uniqueness and permissions at commit.
@@ -69,8 +69,9 @@ export const ResearchPlanSchema = z.object({ planId: id, researchId: id, revisio
   body: ResearchPlanBodySchema, createdAt: z.string().datetime() }).strict();
 const sourceData = z.object({ kind: z.enum(['local', 'document']), address: boundedText(4096), title: label,
   artifactId: id.nullable(), documentId: id.nullable(), fetchedAt: z.string().datetime(), publishedAt: z.string().datetime().nullable(),
-  contentHash: z.string().regex(/^[a-f0-9]{64}$/), relativePath: z.string().regex(/^artifacts\/research\/[1-9]\d*\/[a-f0-9]{64}\.txt$/),
+  relativePath: z.string().regex(/^artifacts\/research\/[1-9]\d*\/source-[1-9]\d*\.txt$/),
   bytes: z.number().int().min(1).max(2_000_000), characters: z.number().int().min(1).max(2_000_000), truncated: z.boolean(),
+  verificationGap: z.literal('legacy-original-unavailable').optional(),
 }).strict();
 export const ResearchSourceDataSchema = sourceData.refine(value => value.kind === 'local' ? value.artifactId !== null && value.documentId === null : value.documentId !== null,
 'Local sources require a selected material identity.');
@@ -143,7 +144,7 @@ export const ResearchMaterialsResultSchema = result(ResearchMaterialsPageSchema)
 export const ResearchEvidenceResultSchema = result(ResearchEvidenceSchema);
 export const ResearchExportSchema = z.object({ researchId: id, reportId: id,
   filename: z.string().regex(/^research-[1-9]\d*-report-[1-9]\d*\.md$/),
-  markdown: boundedText(2_000_000), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+  markdown: boundedText(2_000_000), bytes: z.number().int().positive() }).strict();
 export type ResearchExport = z.infer<typeof ResearchExportSchema>;
 export const ResearchExportResultSchema = result(ResearchExportSchema);
 export interface ResearchQueryApi {

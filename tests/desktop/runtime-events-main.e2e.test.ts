@@ -271,7 +271,7 @@ it('P6 real Main releases a subscription when its actual IPC wake delivery throw
     await assertCapacity(page, input);
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'main-wake', credentialRef: 'p6_main_fault_key',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'main-wake', credentialRef: '00000000000000000000000000000032',
         name: 'Controlled Main wake', kind: 'custom', providerId: null, baseUrl, model: 'main-wake', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'main-wake' },
       { modelId: 'main-wake', apiKey: 'synthetic-p6-main-key' });
@@ -352,7 +352,7 @@ it('T08 real Main preserves original Context evidence and rejects trust, malform
   try {
     expect(await page.evaluate(async baseUrl=>{
       const state=await window.flowmate.getState();if(!state.ok)return state;
-      return window.flowmate.saveSettings({...state.data.settings,models:[{id:'t08-main',credentialRef:'t08_main_controlled_key',name:'T08 Main',kind:'custom',providerId:null,
+      return window.flowmate.saveSettings({...state.data.settings,models:[{id:'t08-main',credentialRef:'00000000000000000000000000000033',name:'T08 Main',kind:'custom',providerId:null,
         baseUrl,model:'t08-main',api:'openai-completions',contextWindow:64000,maxTokens:16384,reasoning:false}],defaultModelId:'t08-main'},
         {modelId:'t08-main',apiKey:'synthetic-t08-main-key'});
     },`http://127.0.0.1:${server.port}/v1`)).toMatchObject({ok:true});

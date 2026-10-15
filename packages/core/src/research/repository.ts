@@ -18,7 +18,7 @@ type TaskRow = { id: number; session_id: number; title: string; source_policy_js
   current_run_id: number | null; current_report_id: number | null; created_at: string; updated_at: string };
 
 export interface ResearchRepository {
-  findMaterial(input: Pick<ResearchMaterial, 'title' | 'format' | 'contentHash'>): Result<ResearchMaterial | null>;
+  findMaterials(input: Pick<ResearchMaterial, 'title' | 'format'>): Result<ResearchMaterial[]>;
   registerMaterial(input: PublishedArtifact): Result<ResearchMaterial>;
   listMaterials(input: ResearchPageRequest): Result<{ items: ResearchMaterial[]; nextBeforeId: number | null }>;
   create(input: { sessionId: number; title: string; sourcePolicy: ResearchSourcePolicy; at: string }): Result<ResearchTask>;
@@ -156,18 +156,19 @@ export function createResearchRepository(db: Database): ResearchRepository {
   function material(row: { id: number; bytes: number; mime_type: string; metadata_json: string }): ResearchMaterial {
     const metadata = JSON.parse(row.metadata_json);
     requireFact(metadata.sourceKey === 'research-local-v1');
-    return ResearchMaterialSchema.parse({ artifactId: row.id, title: metadata.sourceRecordId, contentHash: metadata.sourceVersion,
-      bytes: row.bytes, format: row.mime_type === 'text/markdown' ? 'markdown' : 'text' });
+    return ResearchMaterialSchema.parse({ artifactId: row.id, title: metadata.sourceRecordId,
+      bytes: row.bytes, format: row.mime_type === 'text/markdown' ? 'markdown' : 'text',
+      ...(metadata.verificationGap === undefined ? {} : { verificationGap: metadata.verificationGap }) });
   }
   function checkSource(source: SourceSnapshot | z.infer<typeof ResearchSourceDataSchema>, policy: ResearchSourcePolicy) {
     if (source.kind === 'local') requireFact(source.artifactId && policy.artifactIds.includes(source.artifactId), 'research_source_denied');
     else requireFact(source.documentId && policy.documentIds.includes(source.documentId), 'research_source_denied');
   }
   return {
-    findMaterial: input => operation(false, () => {
-      const row = db.query("SELECT id,bytes,mime_type,metadata_json FROM artifacts WHERE kind='original' AND json_extract(metadata_json,'$.sourceKey')='research-local-v1' AND json_extract(metadata_json,'$.sourceRecordId')=? AND json_extract(metadata_json,'$.sourceVersion')=? AND mime_type=? ORDER BY id LIMIT 1")
-        .get(input.title, input.contentHash, input.format === 'markdown' ? 'text/markdown' : 'text/plain') as Parameters<typeof material>[0] | null;
-      return row ? material(row) : null;
+    findMaterials: input => operation(false, () => {
+      const rows = db.query("SELECT id,bytes,mime_type,metadata_json FROM artifacts WHERE kind='original' AND json_extract(metadata_json,'$.sourceKey')='research-local-v1' AND json_extract(metadata_json,'$.sourceRecordId')=? AND mime_type=? ORDER BY id")
+        .all(input.title, input.format === 'markdown' ? 'text/markdown' : 'text/plain') as Parameters<typeof material>[0][];
+      return rows.map(material);
     }),
     registerMaterial: input => operation(true, () => {
       const name = input.mimeType === 'text/markdown' ? 'source.md' : 'source.txt';
@@ -257,7 +258,7 @@ export function createResearchRepository(db: Database): ResearchRepository {
       const source = parseInput(ResearchSourceDataSchema, input.source), found = duplicate('source', input, source); if (found) return found;
       const value = execution(input, 'read_research_local', false);
       checkSource(source, value.sourcePolicy);
-      requireFact(source.relativePath === `artifacts/research/${input.researchId}/${source.contentHash}.txt`);
+      requireFact(source.relativePath === `artifacts/research/${input.researchId}/source-${input.toolCallId}.txt`);
       const row = db.query('INSERT INTO research_sources(research_id,run_id,tool_call_id,artifact_id,document_id,body_json,created_at) VALUES (?,?,?,?,?,?,?)')
         .run(input.researchId, input.runId, input.toolCallId, source.artifactId, source.documentId, JSON.stringify(source), input.at);
       return record('source', input.researchId, Number(row.lastInsertRowid));

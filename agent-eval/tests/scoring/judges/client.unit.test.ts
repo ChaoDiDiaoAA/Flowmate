@@ -171,7 +171,8 @@ test('tool use is incomplete even when a conflicting SDK stop marker is present'
 });
 
 test('timeout and cancellation abort the SDK transport; a pre-cancelled call sends nothing', async () => {
-    const timeout = await runJudge(await prepareJudge(configFor('openai-compatible', '10')), 'rubric', 'data', abortingFetch);
+    const config=await prepareJudge(configFor());config.timeoutMs=10;
+    const timeout = await runJudge(config, 'rubric', 'data', abortingFetch);
     expect(timeout).toMatchObject({ judgment: null, attempts: 1, stopReason: 'aborted', responseComplete: false });
     expect(timeout.error).toContain('timeout');
     const abort = new AbortController();
@@ -241,7 +242,7 @@ test('explicit Responses API dispatches through its real SDK adapter', async () 
 });
 
 test('timeout and cancellation bound a fetch implementation that ignores its AbortSignal', async () => {
-    const config = await prepareJudge(configFor('openai-compatible', '10'));
+    const config = await prepareJudge(configFor());config.timeoutMs=10;
     const timedOut = await runJudge(config, 'rubric', 'data', async () => new Promise(() => {}));
     expect(timedOut).toMatchObject({ attempts: 1, error: 'Judge timeout', stopReason: null, usage: null, judgment: null });
     const abort = new AbortController();

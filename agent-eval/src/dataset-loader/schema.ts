@@ -7,7 +7,7 @@ import { InvoiceFormDraftSchema, InvoiceFormLineOriginsSchema } from '../../../p
 import { ExtensionEvaluationProfileSchema, ExtensionRefSchema } from '../../../packages/contracts/src/extensions.ts';
 import { constraintShape, validateConstraints, userTurnSchema, turnIdSchema, difficultySchema, caseSourceSchema } from './authoring.ts';
 
-const id = z.string().regex(/^(?:[a-z0-9][a-z0-9-]*|FM-\d{3})$/), sha = z.string().regex(/^[a-f0-9]{64}$/);
+const id = z.string().regex(/^(?:[a-z0-9][a-z0-9-]*|FM-\d{3})$/);
 const text = z.string().trim().min(1);
 const instruction = z.string().refine(value => value.trim().length > 0, 'Instruction must contain text');
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -25,9 +25,9 @@ export const checkSchema = z.object({
         c.addIssue({ code: z.ZodIssueCode.custom, message: 'Comparison options only apply to fact-check' });
     if(v.trigger&&v.metric!=='fact-check')c.addIssue({code:'custom',message:'Started process checks must be deterministic fact-checks'});
 });
-export const materialSchema = z.object({ source: z.literal('voxel51'), sample: z.string().regex(/^\d{6}$/), file: z.enum(['content.md', 'content.json', 'pages.json']), sha256: sha, originalSha256: sha }).strict();
+export const materialSchema = z.object({ source: z.literal('voxel51'), sample: z.string().regex(/^\d{6}$/), file: z.enum(['content.md', 'content.json', 'pages.json']) }).strict();
 export const caseMaterialSchema = z.union([materialSchema, z.object({ source: z.literal('local-text'), sample: id,
-    file: relativeFile.refine(file => /\.(txt|md)$/.test(file), 'Only declared text or Markdown'), sha256: sha, originalSha256: sha,
+    file: relativeFile.refine(file => /\.(txt|md)$/.test(file), 'Only declared text or Markdown'),
     originalFile: relativeFile.optional() }).strict()]);
 const caseBase = z.object({
     id, version: z.number().int().positive(), name: z.string().min(1), category: id, tags: z.array(id).min(1), requires: z.array(id).min(1),
@@ -136,7 +136,7 @@ function stepReferences(steps: Array<z.infer<typeof controllerStepSchema> | z.in
     }
 }
 export const controllerStepsSchema = z.array(controllerStepSchema).min(1).superRefine(stepReferences);
-const controllerBindingSchema=z.object({relativePath:z.string().regex(/^quality-controls\/(?:[a-z0-9-]+|FM-\d{3})\/controller\.json$/),sha256:sha}).strict();
+const controllerBindingSchema=z.object({relativePath:z.string().regex(/^quality-controls\/(?:[a-z0-9-]+|FM-\d{3})\/controller\.json$/)}).strict();
 export const interactionProfileSchema=z.discriminatedUnion('id',[
     z.object({id:z.literal('invoice-save-replay'),version:z.literal(1)}).strict(),
     z.object({id:z.literal('invoice-save-delivery-loss'),version:z.literal(1)}).strict(),
@@ -173,7 +173,7 @@ export const saveReplayControllerSchema=z.object({contract:z.literal('flowmate-c
     identityResolution:z.object({from:z.literal('this-trial-original-public-receipts'),preallocatedProductIds:z.literal(false)}).strict(),
     notExposedOutcome:z.literal('UNJUDGEABLE'),
     trigger:z.object({phase:z.literal('first-actual-successful-save-commit'),tool:z.literal('save_invoice_candidate'),maxWaitMs:z.literal(30000)}).strict(),
-    replay:z.object({reuse:z.tuple([z.literal('nativeToolCallId'),z.literal('runId'),z.literal('sessionId'),z.literal('argumentsHash')]),resends:z.literal(1),newLogicalSaveAllowed:z.literal(false),
+    replay:z.object({reuse:z.tuple([z.literal('nativeToolCallId'),z.literal('runId'),z.literal('sessionId'),z.literal('rawArguments'),z.literal('arguments')]),resends:z.literal(1),newLogicalSaveAllowed:z.literal(false),
         beforeReplay:z.literal('query-original-commit-and-candidate'),afterReplay:z.literal('query-same-original-commit-and-entire-candidate-history'),handlerRegistered:z.literal(true)}).strict()}).passthrough();
 export const parentCancelControllerSchema=z.object({contract:z.literal('flowmate-case-controller-spec/v1'),version:z.literal(1),caseId:id,
     handlerStatus:z.literal('implemented-controlled-host'),profile:z.object({id:z.literal('invoice-parent-cancel'),version:z.literal(1)}).strict(),
@@ -192,7 +192,7 @@ export const userHistorySeedSchema=z.object({contract:z.literal('flowmate-user-h
 export const autoCompactionControllerSchema=z.object({contract:z.literal('flowmate-case-controller-spec/v1'),version:z.literal(1),caseId:id,
     handlerStatus:z.literal('implemented-controlled-host'),history:z.object({relativePath:z.string().regex(/^quality-controls\/(?:[a-z0-9-]+|FM-\d{3})\/history-seed\.json$/),
         maxUserTurns:z.literal(16),injectAssistantHistory:z.literal(false),duplicatePaddingAllowed:z.literal(false),manualCompactFallback:z.literal(false),
-        finalRequestAfterActualAutoCompactionOnly:z.literal(true),sha256:sha}).strict(),
+        finalRequestAfterActualAutoCompactionOnly:z.literal(true)}).strict(),
     compaction:z.object({kind:z.literal('native-auto'),capacitySource:z.literal('native-model-capabilities'),thresholdSource:z.literal('native-effective-context-window-minus-reserveTokens'),
         effectiveReserveTokens:z.literal(16384),effectiveKeepRecentTokens:z.literal(20000),
         requireActualCapacityAndTriggerAndSavedSummary:z.literal(true),preserveOriginalSummaryUsage:z.literal(true)}).strict(),
@@ -202,7 +202,7 @@ export const futureSteerInputSchema=z.object({contract:z.literal('flowmate-futur
     delivery:z.literal('only-after-observed-live-run-before-save'),actualDelivery:z.literal('not-run')}).strict();
 export const steerControllerSchema=z.object({contract:z.literal('flowmate-case-controller-spec/v1'),version:z.literal(1),caseId:id,
     handlerStatus:z.literal('implemented-controlled-host'),trigger:z.object({phase:z.literal('active-root-run-before-first-save'),requireObservedActualRead:z.literal(true),rootStatus:z.literal('running'),maxWaitMs:z.literal(30000)}).strict(),
-    steer:z.object({command:z.literal('submit_input'),mode:z.enum(['steer','followUp']),relativePath:z.string().regex(/^quality-controls\/(?:[a-z0-9-]+|FM-\d{3})\/future-steer\.json$/),sha256:sha,
+    steer:z.object({command:z.literal('submit_input'),mode:z.enum(['steer','followUp']),relativePath:z.string().regex(/^quality-controls\/(?:[a-z0-9-]+|FM-\d{3})\/future-steer\.json$/),
         maxDeliveries:z.literal(1),requireAcceptedAndConsumed:z.literal(true),preserveOriginalInputIdentity:z.literal(true)}).strict()}).passthrough();
 export const caseV2Schema = caseBase.extend({
     contract: z.literal('flowmate-agent-case/v2'),

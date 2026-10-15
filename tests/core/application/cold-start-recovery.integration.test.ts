@@ -35,8 +35,8 @@ it('P9 T05 preserves unknown input gaps and independent Workspace when complete 
     contexts: [], leafId: 'legacy-60', unusable: false }).ok).toBe(true);
   const content = { version: 1, text: 'Unknown delivery must never be replayed.', workspaceContext: { formatVersion: 1, revision: 0, sessionId,
     documentRef: null, jobId: null, candidateRef: null, activeView: 'original', selection: null }, allowedDocumentIds: [], allowedArtifactIds: [] };
-  store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
-    VALUES(?,1,'prompt','answer',?,?,?,'delivery_unknown','failed',?,?)`).run(sessionId, 'a'.repeat(64), runId, JSON.stringify(content), stamp, stamp);
+  store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,content_json,status,processing_status,created_at,updated_at)
+    VALUES(?,1,'prompt','answer',?,?,?,'delivery_unknown','failed',?,?)`).run(sessionId, '{}', runId, JSON.stringify(content), stamp, stamp);
   store.db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.parentId','missing-parent') WHERE entry_id='legacy-60'").run();
   const facts = (db: Database) => ({ header: db.query('SELECT * FROM session_native_history').all(), entries: db.query('SELECT * FROM session_native_entries').all(),
     inputs: db.query('SELECT * FROM session_inputs').all(), runs: db.query('SELECT * FROM runs').all() });

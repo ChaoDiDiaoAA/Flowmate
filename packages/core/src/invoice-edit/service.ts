@@ -2,7 +2,8 @@ import { appError, fail, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandida
   RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields } from '@flowmate/contracts';
 import type { CandidateSnapshot, DocumentRef, ExportInvoiceCandidateRequest, InvoiceExportReference, Result,
   SaveInvoiceCandidateResponse, InvoiceCandidateDecisionResponse } from '@flowmate/contracts';
-import { InvoiceCandidateOperationQuerySchema } from '@flowmate/contracts';
+import { InvoiceCandidateOperationQuerySchema, InvoiceExportReadRequestSchema } from '@flowmate/contracts';
+import type { InvoiceExportPage } from '@flowmate/contracts';
 import type { InvoiceCandidateOperationResult } from '@flowmate/contracts';
 import type { InvoiceEditRepository, ValidateHumanInvoice } from '../storage/repositories.ts';
 import type { FileStore } from '../storage/file-store.ts';
@@ -52,6 +53,22 @@ export class InvoiceEditService {
       jobId: saved.data.candidate.jobId, sequence: saved.data.candidate.sequence, format: input.format, bytes });
     if (!published.ok) return published;
     return this.options.candidates.registerExport({ ...input, ...published.data, at: this.options.now() });
+  }
+  public readExport(raw: unknown): Result<InvoiceExportPage> {
+    const parsed = InvoiceExportReadRequestSchema.safeParse(raw);
+    if (!parsed.success) return fail(appError('input_invalid', 'input', 'Export read parameters are invalid.'));
+    const { offset, limit, ...request } = parsed.data;
+    const prior = this.options.candidates.findExport(request);
+    if (!prior.ok) return prior;
+    if (!prior.data) return fail(appError('artifact_unavailable', 'storage', 'The original export operation is unavailable.'));
+    const read = this.options.files.readInvoiceExport(prior.data);
+    if (!read.ok) return read;
+    if (offset >= read.data.byteLength) return fail(appError('input_invalid', 'input', 'Export byte cursor is out of range.'));
+    const end = Math.min(offset + limit, read.data.byteLength);
+    return { ok: true, data: { artifactId: prior.data.artifactId, candidateId: prior.data.candidateId,
+      format: prior.data.format, relativePath: prior.data.relativePath, bytes: read.data.byteLength, offset,
+      chunkBase64: Buffer.from(read.data.subarray(offset, end)).toString('base64'),
+      nextOffset: end === read.data.byteLength ? null : end } };
   }
 }
 export function createInvoiceEditService(options: InvoiceEditServiceOptions): InvoiceEditService { return new InvoiceEditService(options); }

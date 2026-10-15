@@ -44,7 +44,7 @@ describe('native tools through the public Application', () => {
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
     const launch = () => createApplication({ paths, logger: { write() {}, close: async () => {} },
-      agentFactory: definitions => {
+      agentFactory: (definitions, resourceContents) => {
         expect(definitions.map(tool => tool.name).slice(-8)).toEqual([...NATIVE_TOOL_NAMES]);
         const researchNames = new Set<string>([...RESEARCH_PLANNING_TOOL_NAMES, ...RESEARCH_INVESTIGATION_TOOL_NAMES]);
         expect(new Set(definitions.map(tool => tool.name)).size).toBe(definitions.length);
@@ -52,7 +52,7 @@ describe('native tools through the public Application', () => {
         expect(definitions.filter(tool => tool.name === 'Agent')).toHaveLength(1);
         expect(definitions.filter(tool => tool.name === 'list_skill_resources')).toHaveLength(1);
         expect(definitions.filter(tool => tool.name === 'read_skill_resource')).toHaveLength(1);
-        return new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools: definitions,
+        return new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools: definitions, resourceContents,
           credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-native-key' });
       } });
     let opened = await launch();

@@ -201,7 +201,7 @@ function createVersion3InvoiceDatabase(paths: ReturnType<typeof makePaths>) {
     (41,'original','artifacts/41/original.png',1,'image/png','{}',?),
     (42,'parsed','artifacts/42/parsed.json',1,'application/json','{}',?)`).run(stamp, stamp);
   const metadata = JSON.stringify({ version: 1, pageCount: 1, parserConfiguration: 'legacy-private-setting',
-    warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'not_verified', unavailableReason: null });
+    warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'not_verified', unavailableReason: expect.stringContaining('Re-import') });
   db.query(`INSERT INTO documents(id,source_key,source_record_id,version,original_artifact_id,parsed_artifact_id,
     parser_name,parser_version,status,metadata_json,created_at,updated_at)
     VALUES (43,'voxel51','legacy-invoice','legacy-v1',41,42,'legacy-parser','1','available',?,?,?)`).run(metadata, stamp, stamp);
@@ -221,7 +221,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -229,11 +229,11 @@ describe('P3 invoice storage migration', () => {
       .not.toContain('parser_version');
     expect(db.query('SELECT id,document_id FROM jobs WHERE id=44').get()).toEqual({ id: 44, document_id: 43 });
     expect(opened.data.documents.get(43)).toMatchObject({ ok: true,
-      data: { documentRef: { id: 43, version: 'legacy-v1' }, pageCount: 1, displayName: 'Invoice imported Sep 28, 2026' } });
+      data: { documentRef: { id: 43, version: 'legacy-v1' }, pageCount: 1, displayName: 'Invoice imported Sep 28, 2026', status: 'unavailable' } });
     expect(opened.data.documents.get(43)).not.toHaveProperty('data.parser');
     const row = db.query('SELECT metadata_json FROM documents WHERE id=43').get() as { metadata_json: string };
     expect(JSON.parse(row.metadata_json)).toEqual({ version: 2, pageCount: 1,
-      warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'not_verified', unavailableReason: null });
+      warnings: [], allowedUsesClaim: ['review'], licenseVerification: 'not_verified', unavailableReason: expect.stringContaining('Re-import') });
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 
@@ -298,7 +298,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -306,7 +306,7 @@ describe('P3 invoice storage migration', () => {
     expect(db.query('SELECT job_id FROM runs ORDER BY id').all()).toEqual([{ job_id: null }, { job_id: null }]);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
-      .toHaveLength(22);
+      .toHaveLength(23);
     expect(db.query('PRAGMA table_info(runs)').all()).toHaveLength(30);
     expect(db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs ORDER BY id').all())
       .toEqual([{ parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);

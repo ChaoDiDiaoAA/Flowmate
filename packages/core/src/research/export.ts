@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { appError, fail, ok, ResearchReportRequestSchema, ResearchExportSchema } from '@flowmate/contracts';
 import type { Claim, ResearchExport, Result } from '@flowmate/contracts';
 import type { ResearchRepository } from './repository.ts';
@@ -28,12 +27,12 @@ export function exportResearchReport(options: { research: ResearchRepository; fi
       if (source.runId !== ref.runId || source.toolCallId !== ref.toolCallId
         || body.data.slice(ref.locator.start, ref.locator.end) !== ref.locator.quote)
         return fail(appError('research_evidence_mismatch', 'tool', 'The report quote cannot be verified against saved evidence.'));
-      passages.push(`### Claim ${claimId} / Source ${source.sourceSnapshotId} (${relation})\n\n${source.title}\n\n${source.address}\n\nFetched: ${source.fetchedAt}; published: ${source.publishedAt ?? 'unknown'}; SHA-256: ${source.contentHash}\n\nRun ${source.runId} / ToolCall ${source.toolCallId}; offsets ${ref.locator.start}–${ref.locator.end}\n\n${ref.locator.quote.split('\n').map(line => `> ${line}`).join('\n')}`);
+      passages.push(`### Claim ${claimId} / Source ${source.sourceSnapshotId} (${relation})\n\n${source.title}\n\n${source.address}\n\nFetched: ${source.fetchedAt}; published: ${source.publishedAt ?? 'unknown'}\n\nRun ${source.runId} / ToolCall ${source.toolCallId}; offsets ${ref.locator.start}–${ref.locator.end}\n\n${ref.locator.quote.split('\n').map(line => `> ${line}`).join('\n')}`);
     }
   }
   const list = (items: string[]) => items.length ? items.map(item => `- ${item}`).join('\n') : 'None recorded.';
   const markdown = `# ${task.data.title}\n\nResearch ${report.researchId}; report ${report.reportId}; plan ${report.planId} revision ${report.revision}; saved ${report.createdAt}\n\nCompleteness: ${report.completeness}. Verification records show the Agent judgment and its evidence; they do not guarantee every conclusion is true.\n\n${report.answer}\n\n${report.sections.map(section => `## ${section.title}\n\n${section.text}\n\nClaims: ${section.claimIds.join(', ') || 'none'}`).join('\n\n')}\n\n## Coverage\n\n${report.coverage.map(row => `- ${row.questionId}: ${row.status}; claims ${row.claimIds.join(', ') || 'none'}; ${row.reason}`).join('\n')}\n\n## Conflicts\n\n${list(report.conflicts)}\n\n## Limitations\n\n${list(report.limitations)}\n\n## Unresolved questions\n\n${list(report.unresolvedQuestions)}\n\n## Claim verification\n\n${[...claims.values()].map(claim => `### Claim ${claim.claimId}: ${claim.verification.status}\n\n${claim.text}\n\n${list(claim.verification.reasons)}\n\nDependencies: ${claim.dependencies.join(', ') || 'none'}`).join('\n\n')}\n\n## Evidence\n\n${passages.join('\n\n')}\n`;
   const value = ResearchExportSchema.safeParse({ researchId: report.researchId, reportId: report.reportId,
-    filename: `research-${report.researchId}-report-${report.reportId}.md`, markdown, sha256: createHash('sha256').update(markdown).digest('hex') });
+    filename: `research-${report.researchId}-report-${report.reportId}.md`, markdown, bytes: Buffer.byteLength(markdown) });
   return value.success ? ok(value.data) : fail(appError('research_export_too_large', 'storage', 'The report exceeds the Markdown export limit.'));
 }

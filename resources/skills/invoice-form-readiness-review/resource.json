@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-form-readiness-review",
   "version": "v1",
@@ -40,13 +40,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1456,
-      "sha256": "9e5154e5689a8b7fd20aac2123fee576d6f16fc00a09a914a5dbd7116fb65f4e"
+      "bytes": 1456
     },
     {
       "path": "references/guide.md",
-      "bytes": 849,
-      "sha256": "cc0e04e04cf60f3e578ca034617e918a8c60522c5a2c96fad22bc474b422b26e"
+      "bytes": 849
     }
   ]
 }

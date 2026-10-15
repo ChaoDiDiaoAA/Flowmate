@@ -117,7 +117,7 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
       const state = await window.flowmate.getState();
       if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, defaultModelId: 'dev-model', models: [{
-        id: 'dev-model', credentialRef: 'dev_fixture_credential', name: 'Dev model', kind: 'custom', providerId: null,
+        id: 'dev-model', credentialRef: '00000000000000000000000000000011', name: 'Dev model', kind: 'custom', providerId: null,
         baseUrl: `http://127.0.0.1:${port}/v1`, model: 'dev-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false,
       }] }, { modelId: 'dev-model', apiKey: 'synthetic-dev-key' });

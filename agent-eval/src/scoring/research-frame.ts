@@ -1,6 +1,5 @@
 import {collectedResearchSchema} from '../adapters/research-evidence.ts';
 import {inspectResearchEvidence} from '../adapters/research-integrity.ts';
-import {hash} from '../dataset-loader/local.ts';
 import type {EvaluationContext} from './types.ts';
 import {ResearchTaskSchema,ResearchReportSchema,type EvidenceRef} from '../../../packages/contracts/src/research.ts';
 import type {EvidenceFact} from '../types.ts';
@@ -39,16 +38,16 @@ export function buildResearchFrame(context:EvaluationContext){
   (data.task.currentReportId===null||report!==undefined)&&requested.every(id=>claims.filter(c=>c.claimId===id).length===1);
  return{contract:'flowmate-research-frame/v1' as const,complete,reportId:report?.reportId??null,blocks,links,integrity,
   gold:structuredClone(task.expected.research),
-  sources:data.sourceTexts.map(s=>({sourceSnapshotId:s.sourceSnapshotId,text:s.text,sha256:hash(s.text),modelRead:false as const,
+  sources:data.sourceTexts.map(s=>({sourceSnapshotId:s.sourceSnapshotId,text:s.text,modelRead:false as const,
    binding:integrity.sourceBindings.find(b=>b.sourceSnapshotId===s.sourceSnapshotId)??null})),
-  proofHash:hash({research:evidence,proof,gold:task.expected.research}),
+
   rule:'Number atomic asserted facts from the ordered original blocks, including new Report facts. Deduplicate semantically equivalent facts across blocks. Split compound assertions; preserve conditions, dates and intermediate entities. Do not treat product verification/full flags or controller source acquisition as independent semantic truth. Report omissions remain missing Gold facts. Unlinked or report-external evidence cannot cover a reported fact.'};
 }
 export type ResearchFrame=NonNullable<ReturnType<typeof buildResearchFrame>>;
 
 const reportCollection=z.object({task:ResearchTaskSchema,reports:z.array(ResearchReportSchema),
  reportCount:z.number().int().nonnegative(),gap:z.string().optional()}).passthrough();
-/** Absence depends on complete Report pagination, not source digests removed from public artifacts. */
+/** Absence depends on complete Report pagination, not source metadata. */
 export function hasNoResearchReport(evidence:EvidenceFact|undefined){
  if(!evidence?.present||!evidence.source.trim())return false;
  if(evidence.actual===null)return true;

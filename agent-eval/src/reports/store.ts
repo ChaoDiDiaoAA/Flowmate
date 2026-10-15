@@ -11,11 +11,12 @@ import {scoreMeasurement} from '../scoring/types.ts';
 import type {EvaluatorPlanEntry} from '../scoring/evaluator-plan.ts';
 import {scoringMetric} from '../scoring/diagnostic-plans.ts';
 import { aggregateTrials, type TrialAggregation } from '../scoring/aggregate.ts';
-import { hash } from '../dataset-loader/local.ts';
 import { parseJudgment } from '../scoring/judges/harness.ts';
 import { compactPlanSchema, compactResultSchema, compactRubric, metricRubrics, metricPolicyFor, metricParsePolicy, normalizeMetricJson, parseStrictMetricJudgment, parseMetricJudgment, parseCompactJudgment,parseLegacyCompactJudgment, compactScores, type CompactPlan } from '../scoring/judges/compact.ts';
 import { isDeepStrictEqual } from 'node:util';
-import { artifactJson, withoutHashes } from '../artifacts.ts';
+import { artifactJson } from '../artifacts.ts';
+import { scanEvidence, protectedSecrets } from '../execution/evidence-safety.ts';
+import { inside } from '../dataset-loader/local.ts';
 import { agentApiSchema, agentModelCapabilitiesSchema } from '../configuration.ts';
 import {researchFrameSchema,unavailableResearchCounts} from '../scoring/research-judgment.ts';
 import {hasNoResearchReport} from '../scoring/research-frame.ts';
@@ -28,7 +29,7 @@ export type TrialReport = {
     regressionOrigins?: RegressionOrigin[];
     caseId: string;
     caseVersion: number;
-    caseHash: string;
+    caseConditions?: Record<string,unknown>;
     purpose?: 'capability'|'regression';
     caseName: string;
     category: string;
@@ -48,6 +49,7 @@ export type TrialReport = {
     feedback: 'none';
 };
 export type LocalReport = {
+    history?: {verification:'unverified';gaps:string[]};
     executionKind?: 'controlled' | 'model';
     contract: 'flowmate-agent-run/v1' | 'flowmate-agent-run/v2';
     aggregation?: TrialAggregation;
@@ -55,7 +57,7 @@ export type LocalReport = {
     executionId: string;
     code?: {
         commit: string;
-        workspaceHash: string;
+
         release: string;
         dirty: boolean;
     };
@@ -63,7 +65,7 @@ export type LocalReport = {
     dataset: {
         id: string;
         version: number;
-        hash: string;
+
         subject: 'agent';
     };
     selection: 'smoke' | 'holdout' | 'full' | 'case';
@@ -79,7 +81,7 @@ export type LocalReport = {
     scoringConfiguration: {
         version: number;
         judgeMode: 'off' | 'auto' | 'required';
-        judgeHash: string | null;
+
         judge?: JudgeCall['configuration'] | null;
         rubrics?: Array<{ id: string; version: number; prompt: string }>;
     };
@@ -93,7 +95,7 @@ export type LocalReport = {
     };
 };
 const text = z.string().min(1), integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), positive = integer.positive();
-const reportRevisions = new WeakMap<LocalReport, { path: string; hash: string }>();
+const reportRevisions = new WeakMap<LocalReport, { path: string; bytes: string }>();
 const timestamp = z.string().datetime(), status = z.enum(['PASS', 'FAIL', 'UNJUDGEABLE', 'ERROR', 'NOT_RUN']);
 const inputSchema = z.object({ prompt: z.string(), materials: z.array(z.object({ sample: text, file: text, text: z.string() }).strict()) }).strict();
 const scoreSchema = z.object({ metricId: text, name: text, version: positive, method: z.enum(['deterministic', 'llm-judge']), required: z.boolean(),
@@ -117,9 +119,9 @@ const executionSchema = z.object({ identity: z.object({ executionId: text, trial
     error: z.object({ code: text, message: z.string(), infrastructure: z.boolean() }).strict().optional() }).strict();
 // Legacy v1 calls lack completion metadata; preserve their fields without inventing a modern completion proof.
 export const legacyJudgeConfigurationSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatible']), model: text,
-    baseUrl: z.string().url(), temperature: z.number().finite().min(0).max(2).optional(), maxTokens: positive.optional(), timeoutMs: positive, configHash: text.optional(),
+    baseUrl: z.string().url(), temperature: z.number().finite().min(0).max(2).optional(), maxTokens: positive.optional(), timeoutMs: positive,
     modelCapabilities: z.object({modelId:text,maxOutputTokens:positive,source:z.enum(['anthropic-models-api','deepseek-models-api'])}).strict().optional(),
-    protocolVersion: text.optional(), rubric: z.object({ id: text, version: positive, hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().optional()
+    protocolVersion: text.optional(), rubric: z.object({ id: text, version: positive }).strict().optional()
     }).strict();
 export const sdkJudgeConfigurationSchema = legacyJudgeConfigurationSchema.omit({temperature:true,maxTokens:true,modelCapabilities:true}).extend({
     provider:z.enum(['anthropic','openai-compatible']).optional(),api:agentApiSchema,
@@ -129,7 +131,7 @@ const judgeCallBase = z.object({ callId: text, startedAt: timestamp, endedAt: ti
     usage: z.unknown(), responseModel: z.unknown(), raw: z.string().nullable(), error: z.string().nullable(),
     transportStatus:z.number().int().min(100).max(599).nullable().optional(),
     judgment: z.object({ score: z.number().finite().min(0).max(1), reason: text }).strict().nullable(),
-    request: z.object({ system: z.string(), data: z.string(), hash: z.string().regex(/^[a-f0-9]{64}$/).optional(), redacted: z.boolean() }).strict().optional(),
+    request: z.object({ system: z.string(), data: z.string(),  redacted: z.boolean() }).strict().optional(),
     compact: z.object({ plan: compactPlanSchema, judgment: compactResultSchema.nullable(), format: z.literal('metric-id/v1').optional(),
         validationErrors: z.record(text).optional(),parsePolicy:z.literal(metricParsePolicy).optional(),
         normalization:z.enum(['none','markdown-fence']).optional() }).strict().optional() }).strict();
@@ -138,7 +140,7 @@ export const judgeCallSchema = z.union([
     judgeCallBase.extend({ configuration: sdkJudgeConfigurationSchema, stopReason: z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']).nullable(),
         rawStopReason: z.string().nullable(), usageSource: z.enum(['sdk', 'unknown']), responseComplete: z.boolean() })
 ]);
-const trialSchema = z.object({ caseId: text, caseVersion: positive, caseHash: text.optional(), caseName: text, category: text, purpose:z.enum(['capability','regression']).optional(),
+const trialSchema = z.object({ caseId: text, caseVersion: positive, caseConditions: z.record(z.unknown()).optional(), caseName: text, category: text, purpose:z.enum(['capability','regression']).optional(),
     partition: z.enum(['smoke', 'holdout', 'badcase']), regressionOrigins: regressionOriginListSchema.optional(), repetition: positive, trialId: text, traceId: z.string().regex(/^[a-f0-9]{32}$/),
     status, reason: z.string(), counts: z.record(integer), execution: executionSchema.nullable(), scores: z.array(scoreSchema),
     metricPlan: z.array(z.object({ metricId: text, version: positive, unit: text, denominator: integer.nullable().optional(),
@@ -148,14 +150,15 @@ const trialSchema = z.object({ caseId: text, caseVersion: positive, caseHash: te
     judgeCalls: z.array(judgeCallSchema).max(1), feedback: z.literal('none') }).strict();
 const reportSchema = z.object({ contract: z.enum(['flowmate-agent-run/v1', 'flowmate-agent-run/v2']), executionId: text,
     executionKind: z.enum(['controlled', 'model']).optional(),
+    history:z.object({verification:z.literal('unverified'),gaps:z.array(text).min(1)}).strict().optional(),
     aggregation: z.unknown().optional(),
     trialStatistics: z.unknown().optional(),
-    code: z.object({ commit: text.optional(), workspaceHash: text.optional(), release: text, dirty: z.boolean() }).strict().optional(), userId: text.optional(),
-    dataset: z.object({ id: text, version: positive, hash: text.optional(), subject: z.literal('agent') }).strict(), selection: z.enum(['smoke', 'holdout', 'full', 'case']),
+    code: z.object({ commit: text.optional(),  release: text, dirty: z.boolean() }).strict().optional(), userId: text.optional(),
+    dataset: z.object({ id: text, version: positive,  subject: z.literal('agent') }).strict(), selection: z.enum(['smoke', 'holdout', 'full', 'case']),
     environment: text, startedAt: timestamp, endedAt: timestamp.nullable(), repeat: positive.max(20), executionComplete: z.boolean(),
     sourceInvalidation: z.object({reason:text,paths:z.array(text).min(1).refine(paths=>new Set(paths).size===paths.length)}).strict().optional(),
     scoring: z.enum(['pending', 'complete']), manualReview: z.literal('none'), formalAcceptance: z.literal('not-assessed'),
-    scoringConfiguration: z.object({ version: positive, judgeMode: z.enum(['off', 'auto', 'required']), judgeHash: text.nullable().optional(),
+    scoringConfiguration: z.object({ version: positive, judgeMode: z.enum(['off', 'auto', 'required']),
         judge: z.union([sdkJudgeConfigurationSchema,legacyJudgeConfigurationSchema]).nullable().optional(),
         rubrics: z.array(z.object({id:text,version:positive,prompt:text}).strict()).refine(items=>new Set(items.map(r=>r.id)).size===items.length).optional() }).strict(),
     trials: z.array(trialSchema), export: z.object({ backend: z.enum(['local', 'langfuse']), status: z.enum(['disabled', 'pending', 'complete', 'partial', 'error']),
@@ -179,7 +182,7 @@ function validateReport(value: unknown): asserts value is LocalReport {
     for (const trial of report.trials) {
         if (trial.regressionOrigins && !report.executionKind) throw Error('Regression origins require an execution kind');
         if ((trial.partition === 'badcase') !== !!trial.regressionOrigins) throw Error('Supplemental partition requires its original regression links');
-        const member = JSON.stringify([trial.caseId, trial.caseVersion, trial.caseHash, trial.repetition]);
+        const member = JSON.stringify([trial.caseId, trial.caseVersion, trial.caseConditions, trial.repetition]);
         if (trials.has(trial.trialId) || traces.has(trial.traceId) || members.has(member) || trial.repetition > report.repeat)
             throw new Error('Duplicate or out-of-plan Trial identity');
         trials.add(trial.trialId); traces.add(trial.traceId); members.add(member);
@@ -233,16 +236,18 @@ function validateReport(value: unknown): asserts value is LocalReport {
             if(call.transportStatus!==undefined&&(call.attempts===0&&call.transportStatus!==null||
                 call.transportStatus!==null&&call.transportStatus>=400&&(call.responseComplete||call.error===null)))
                 throw Error('Judge transport status contradicts its original attempt or completion');
-            const { configHash, ...parameters } = call.configuration;
-            if (configHash && hash(parameters) !== configHash) throw new Error('Stored Judge configuration hash does not match its parameters');
+            if(report.scoringConfiguration.judge){
+                const {rubric:_,...actual}=call.configuration,{rubric:__,...declared}=report.scoringConfiguration.judge;
+                if(!isDeepStrictEqual(actual,declared))throw Error('Judge differs from declared scoring configuration');
+            }
             if (report.scoringConfiguration.rubrics) {
-                const {rubric:_,configHash:__,...actual} = call.configuration;
-                const {rubric:___,configHash:____,...declared} = report.scoringConfiguration.judge??{};
+                const {rubric:_,...actual} = call.configuration;
+                const {rubric:___,...declared} = report.scoringConfiguration.judge??{};
                 if (!isDeepStrictEqual(actual, declared)) throw Error('Judge differs from frozen connection configuration');
                 if (!report.scoringConfiguration.rubrics.some(r=>r.id===call.configuration.rubric?.id && r.version===call.configuration.rubric?.version && r.prompt===call.request?.system))
                     throw Error('Judge template is outside the frozen template set');
-            } else if (report.scoringConfiguration.judgeHash && call.configuration.configHash !== report.scoringConfiguration.judgeHash) throw new Error('Judge differs from declared scoring configuration');
-            if (call.request && (call.request.hash && hash([call.request.system, call.request.data]) !== call.request.hash || call.request.redacted &&
+            }
+            if (call.request && (call.request.redacted &&
                 (call.judgment !== null || call.compact?.judgment != null))) throw new Error('Stored Judge input identity or redaction contradicts its judgment');
             if (report.contract === 'flowmate-agent-run/v2') {
                 const sdk = call.configuration.sdk !== undefined;
@@ -259,7 +264,7 @@ function validateReport(value: unknown): asserts value is LocalReport {
                 const rubric=[legacyCompactRubric,legacyPlainRubric,legacyPackedRubric,compactRubric,...metricRubrics].find(r=>call.request?.system===r.prompt);
                 if (report.contract !== 'flowmate-agent-run/v2' || !call.request || !rubric || call.judgment !== null)
                     throw new Error('Compact Judge needs its original versioned input and exclusive judgment');
-                if (call.configuration.rubric?.hash && !isDeepStrictEqual(call.configuration.rubric, { id: rubric.id, version: rubric.version, hash: hash(call.request.system) }))
+                if (call.configuration.rubric && !isDeepStrictEqual(call.configuration.rubric, { id: rubric.id, version: rubric.version }))
                     throw new Error('Compact Judge Rubric differs from declared scoring configuration');
                 const named = rubric.id.startsWith('semantic-metrics-');
                 const parsePolicy=metricPolicyFor(rubric);
@@ -272,6 +277,7 @@ function validateReport(value: unknown): asserts value is LocalReport {
                     !named && call.compact.validationErrors!==undefined)
                     throw Error('Judge format or validation errors contradict the original template');
                 const input = JSON.parse(call.request.data);
+                if(call.request.data!==JSON.stringify(input))throw Error('Compact Judge request encoding differs from its original data');
                 if (!isDeepStrictEqual(input.plan, call.compact.plan)) throw new Error('Compact Judge plan differs from its original request');
                 const parsed = call.compact.judgment!==null && call.raw!==null ? named
                     ? (parsePolicy?parseStrictMetricJudgment:parseMetricJudgment)(call.raw,call.compact.plan,input.evidence?.researchFrame)
@@ -304,12 +310,14 @@ function validateReport(value: unknown): asserts value is LocalReport {
     }
     if (report.contract === 'flowmate-agent-run/v1' && (report.aggregation !== undefined))
         throw new Error('Legacy v1 report cannot claim inferred v2 aggregation');
-    if (report.contract === 'flowmate-agent-run/v2' && JSON.stringify(withoutHashes(report.aggregation)) !== JSON.stringify(withoutHashes(aggregateTrials(value as LocalReport))))
+    if (report.contract === 'flowmate-agent-run/v2' && JSON.stringify((report.aggregation)) !== JSON.stringify((aggregateTrials(value as LocalReport))))
         throw new Error('Stored aggregation differs from original Trial records');
-    if (report.trialStatistics !== undefined && !isDeepStrictEqual(withoutHashes(report.trialStatistics), withoutHashes(deriveTrialStatistics(value as LocalReport))))
+    if (report.trialStatistics !== undefined && !isDeepStrictEqual((report.trialStatistics), (deriveTrialStatistics(value as LocalReport))))
         throw new Error('Trial statistics differ from original Trial records');
 }
 export function saveReport(path: string, report: LocalReport) {
+    if(report.history)throw Error('Historical reports are read-only; original facts cannot be verified');
+    if(report.scoringConfiguration.judge===undefined){const call=report.trials.flatMap(t=>t.judgeCalls)[0];if(call){const{rubric,...connection}=call.configuration;report.scoringConfiguration.judge=connection;}}
     if (report.contract === 'flowmate-agent-run/v2') report.aggregation = aggregateTrials(report);
     JSON.stringify(report, (_, value) => {
         if (typeof value === 'number' && !Number.isFinite(value)) throw new Error('Report must contain finite JSON data');
@@ -321,7 +329,7 @@ export function saveReport(path: string, report: LocalReport) {
         if(lstatSync(path).isSymbolicLink())throw Error('Linked report rejected');
         const bytes=readFileSync(path,'utf8'),prior=JSON.parse(bytes);
         if (removeLegacyMetadata(prior)) throw Error('Historical reports are read-only');
-        if(prior.endedAt===null&&reportRevisions.has(report)&&reportRevisions.get(report)!.hash!==hash(bytes))throw Error('Stale open report');
+        if(prior.endedAt===null&&reportRevisions.has(report)&&reportRevisions.get(report)!.bytes!==bytes)throw Error('Stale open report');
         const plan=(r:any)=>JSON.stringify({dataset:r.dataset,executionKind:r.executionKind,selection:r.selection,environment:r.environment,startedAt:r.startedAt,repeat:r.repeat,scoring:r.scoringConfiguration,members:r.trials.map((t:any)=>[t.caseId,t.caseVersion,t.repetition,t.trialId,t.traceId,t.metricPlan,t.semanticPlan,t.evaluatorPlan,t.partition,t.regressionOrigins])});
         if(plan(prior)!==plan(record))throw Error('Declared report identity or Trial plan cannot be overwritten');
         if(prior.endedAt!==null&&JSON.stringify(prior)!==JSON.stringify(record))throw Error('Completed report facts are immutable');
@@ -333,21 +341,28 @@ export function saveReport(path: string, report: LocalReport) {
     }
     saveEvidence(root,report);atomicJson(path,record);const stored=readReport(path);reportRevisions.set(report,reportRevisions.get(stored)!);return stored;
 }
-// Historical fields are accepted only while reading, never required by a new execution.
-function removeLegacyMetadata(report: any) {
-    if (report.frozenConditions !== undefined) {
-        z.object({configurationHash:text.optional(),strategyGroup:text,producer:z.enum(['productAgent','engineering-fixture']).optional()}).strict().parse(report.frozenConditions);
-        delete report.frozenConditions;
-        return true;
-    }
-    return false;
+// Legacy identity metadata is discarded only at its documented positions; original scores stay unchanged.
+function removeLegacyMetadata(report:any) {
+    let legacy=report.frozenConditions!==undefined;
+    delete report.frozenConditions;
+    const drop=(record:any,keys:string[])=>{if(!record||typeof record!=='object')return;for(const key of keys)if(Object.hasOwn(record,key)){delete record[key];legacy=true;}};
+    drop(report.code,['workspaceHash']);drop(report.dataset,['hash']);drop(report.scoringConfiguration,['judgeHash']);
+    const configuration=(c:any)=>{drop(c,['configHash']);drop(c?.rubric,['hash']);};
+    configuration(report.scoringConfiguration?.judge);
+    for(const t of report.trials??[]){drop(t,['caseHash']);for(const call of t.judgeCalls??[]){configuration(call.configuration);drop(call.request,['hash']);}}
+    for(const c of report.aggregation?.cases??[])drop(c,['caseHash']);
+    if(legacy||(report.trials??[]).some((t:any)=>!t.caseConditions))report.history={verification:'unverified',gaps:['Original content conditions are unavailable; historical identity metadata cannot establish equivalence.']};
+    return !!report.history;
 }
 export function readReport(path: string): LocalReport {
-    const bytes=readFileSync(path,'utf8'), raw=JSON.parse(bytes);
-    if(raw.artifactFormat==='flowmate-eval-public/v1'&&raw.dataset?.version==='v1'){const report=readPublicReport(path,raw);removeLegacyMetadata(report);validateReport(report);reportRevisions.set(report,{path:resolve(path),hash:hash(bytes)});return report;}
-    // Legacy files retain their original validation and remain readable.
-    if(raw.artifactFormat)delete raw.artifactFormat;
-    removeLegacyMetadata(raw);validateReport(raw);reportRevisions.set(raw,{path:resolve(path),hash:hash(bytes)});return raw;
+    const bytes=readFileSync(path,'utf8'),raw=JSON.parse(bytes);
+    const report=raw.artifactFormat==='flowmate-eval-public/v1'&&raw.dataset?.version==='v1'?readPublicReport(path,raw):raw;
+    delete report.artifactFormat;
+    if(removeLegacyMetadata(report)){
+        if(!isJsonData(report))throw Error('Historical report must contain finite JSON data');
+        reportSchema.parse(report);
+    }else validateReport(report);
+    reportRevisions.set(report,{path:resolve(path),bytes});return report;
 }
 
 export function exitCode(report: LocalReport) {
@@ -364,21 +379,37 @@ export function summary(report: LocalReport) {
     return { capability: count(report.trials.filter(t=>t.purpose==='capability')), regression: count(report.trials.filter(t=>t.purpose==='regression')), all: count(report.trials), smoke: count(report.trials.filter(t => t.partition === 'smoke')), holdout: count(report.trials.filter(t => t.partition === 'holdout')) };
 }
 export function comparison(left: LocalReport, right: LocalReport) {
+    if(left.history||right.history||left.trials.some(t=>!t.caseConditions||t.caseConditions.unavailable)||right.trials.some(t=>!t.caseConditions||t.caseConditions.unavailable))throw Error('Comparison requires verified original content conditions');
     if (left.executionKind !== right.executionKind) throw Error('Comparison requires identical execution kind');
-    const declaration=(report:LocalReport)=>{const root=reportRevisions.get(report)?.path;if(!root)return undefined;const file=join(dirname(root),'snapshot.json');return existsSync(file)?JSON.parse(readFileSync(file,'utf8')):undefined;};
-    const l=declaration(left),r=declaration(right);if((l||r)&&!isDeepStrictEqual(l,r))throw Error('Comparison requires identical snapshot declarations and parameters');
-    if (left.contract !== right.contract || left.dataset.hash !== right.dataset.hash || left.repeat !== right.repeat || left.environment !== right.environment ||
+    if (left.contract !== right.contract || !isDeepStrictEqual(left.dataset,right.dataset) || left.repeat !== right.repeat || left.environment !== right.environment ||
         JSON.stringify(left.scoringConfiguration) !== JSON.stringify(right.scoringConfiguration))
         throw new Error('Comparison requires identical data, scoring configuration, environment and repeat plan');
-    const key = (t: TrialReport) => JSON.stringify([t.caseId, t.caseVersion, t.caseHash, t.repetition]);
+    const key = (t: TrialReport) => JSON.stringify([t.caseId, t.caseVersion, t.caseConditions, t.repetition]);
     const indexed = new Map(right.trials.map(t => [key(t), t]));
     if (indexed.size !== right.trials.length || new Set(left.trials.map(key)).size !== left.trials.length || left.trials.length !== right.trials.length)
         throw new Error('Scoring versions or members differ');
     const scoring = (t: TrialReport) => JSON.stringify({ plan: [...(t.metricPlan ?? [])].sort((a, b) => a.metricId.localeCompare(b.metricId)), semantic: t.semanticPlan,evaluators:t.evaluatorPlan,
         checks: t.scores.map(s => [s.metricId, s.version, s.required,t.semanticPlan?.criteria.some(c=>c.metricId===s.metricId)?'semantic-plan':s.method]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))) });
-    return left.trials.map(t => {
+    const compared=left.trials.map(t => {
         const other = indexed.get(key(t));
         if (!other || scoring(t) !== scoring(other)) throw new Error('Scoring versions or members differ');
         return { caseId: t.caseId, repetition: t.repetition, before: t.status, after: other.status };
     });
+    const conditions=z.object({configuration:z.object({model:text,api:agentApiSchema,baseUrl:z.string().url(),modelCapabilities:agentModelCapabilitiesSchema}).passthrough(),
+        runtimeSource:z.object({contract:z.literal('flowmate-execution-source/v1'),runtime:z.object({node:text,platform:text,arch:text}).strict(),
+            dependencies:z.record(z.string().nullable()),files:z.array(z.object({path:text,text:z.string()}).strict()).min(1)
+            .refine(files=>new Set(files.map(file=>file.path)).size===files.length)}).strict()}).passthrough();
+    const declaration=(report:LocalReport)=>{
+        const path=reportRevisions.get(report)?.path,file=path?join(dirname(path),'snapshot.json'):undefined;
+        if(!path||!file||!existsSync(file))throw Error('Comparison requires original execution conditions: saved source and Agent configuration facts are unavailable');
+        const facts=JSON.parse(readFileSync(inside(dirname(path),'snapshot.json'),'utf8'));
+        if(!conditions.safeParse(facts).success)throw Error('Comparison requires original execution conditions: complete source and Agent configuration facts are unavailable');
+        const {runtimeSource,...parameters}=facts;
+        if((scanEvidence(parameters).fact.actual as {leaked:boolean}).leaked||
+            (scanEvidence(runtimeSource,protectedSecrets().filter(secret=>secret!=='fixture-synthetic-key')).fact.actual as {leaked:boolean}).leaked)
+            throw Error('Configured credential in execution conditions; refusing comparison');
+        return facts;
+    };
+    if(!isDeepStrictEqual(declaration(left),declaration(right)))throw Error('Comparison requires identical snapshot declarations and parameters');
+    return compared;
 }

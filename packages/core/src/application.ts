@@ -1,6 +1,6 @@
 import type { InputDefinitions } from './prompt-templates.ts';
 import { ResearchSessionRequestSchema, ResearchSessionResultSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema } from '@flowmate/contracts';
-import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import {
   appError,
   fail,
@@ -120,7 +120,7 @@ type ProductApplicationOptions = {
   contextService?: Pick<ContextService, 'listContextSnapshots' | 'queryContextSnapshot' | 'listContextRequests'>;
   contextRepository?: Pick<ContextRepository, 'readResourceEvidence'>;
   invoiceForms?: Pick<InvoiceFormService, 'query'>;
-  invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'queryOperation'>;
+  invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'readExport' | 'queryOperation'>;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
   importPreparedInvoiceMaterial: (input: import('@flowmate/contracts').PreparedInvoiceMaterial) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
   hideDocument?: (documentId: DbId) => Result<{ documentId: DbId; affectedChatCount: number }>;
@@ -174,10 +174,9 @@ export function makeApplication(
       const input = parsed.data, original = readRunTool(input), repository = products?.toolCalls;
       if (!original.ok) return original;
       const call = original.data;
-      const digest = createHash('sha256').update(JSON.stringify({ raw: call.args.raw, final: call.args.final })).digest('hex');
       const receipt = invoiceToolSchemas.save_invoice_candidate.output.safeParse(call.result?.data);
       if (call.toolName !== 'save_invoice_candidate' || call.status !== 'succeeded' || !receipt.success ||
-          call.result?.committedCandidateId !== receipt.data.candidateId || call.nativeToolCallId !== input.nativeToolCallId || digest !== input.argumentsHash)
+          call.result?.committedCandidateId !== receipt.data.candidateId || call.nativeToolCallId !== input.nativeToolCallId || !isDeepStrictEqual(call.args.raw, input.rawArguments) || !isDeepStrictEqual(call.args.final, input.arguments))
         return fail(appError('state_conflict', 'runtime', 'Original successful save could not be verified.'));
       if (!repository?.request || !repository.fixArguments) return fail(appError('tool_calls_unavailable', 'storage', 'Original save replay is unavailable.'));
       // Re-enter the same idempotency checks as ToolExecutor, without admitting a new logical save.
@@ -188,7 +187,7 @@ export function makeApplication(
       const fixed = repository.fixArguments({ toolCallId: call.toolCallId, finalArguments: input.arguments });
       if (!fixed.ok) return fixed;
       return ok({ runId: input.runId, sessionId: input.sessionId, toolCallId: call.toolCallId,
-        nativeToolCallId: input.nativeToolCallId, argumentsHash: digest, receipt: receipt.data, created: false as const });
+        nativeToolCallId: input.nativeToolCallId, receipt: receipt.data, created: false as const });
     },
     importResearchMaterial: async raw => {
       const parsed = ImportResearchMaterialSchema.safeParse(raw);
@@ -256,7 +255,7 @@ export function makeApplication(
       if (request.sessionId) { const loaded = await this.querySessionExtensions({ sessionId: request.sessionId });
         if (!loaded.ok) return loaded; actual = loaded.data.instances.filter(item => item.state === 'active').flatMap(item => [...item.registeredCommands]); }
       const subagents = extensions.data.items.find(item => item.ref.id === 'subagents');
-      const enabled = (item: import('@flowmate/contracts').ExtensionCatalogItem) => extensions.data.selection.enabledExtensions.some(ref => ref.id === item.ref.id && ref.manifestHash === item.ref.manifestHash);
+      const enabled = (item: import('@flowmate/contracts').ExtensionCatalogItem) => extensions.data.selection.enabledExtensions.some(ref => ref.id === item.ref.id && ref.version === item.ref.version);
       const canDelegate = !!subagents && enabled(subagents) && subagents.compatibility.available;
       return ok([...resources.data.items.filter(item => item.ref.kind === 'skill').map(item => ({ group: 'Skills' as const,
         name: item.ref.id, text: '/skill:'+item.ref.id+' ', description: item.description, available: item.enabled && item.available,
@@ -439,15 +438,15 @@ export function makeApplication(
         const input = parsed.data, call = readRunTool(input);
         if (!call.ok) return call;
         const bytes = Buffer.from(JSON.stringify(ToolCallSnapshotSchema.parse(call.data)));
-        const sha256 = createHash('sha256').update(bytes).digest('hex');
-        if (input.expectedHash !== undefined && input.expectedHash !== sha256)
+        const evidenceRevision = call.data.evidenceRevision ?? 0;
+        if (input.expectedRevision !== undefined && input.expectedRevision !== evidenceRevision)
           return fail(appError('state_conflict', 'runtime', 'Tool evidence changed. Reload the original ToolCall.', false, input.runId));
         if (input.offset >= bytes.length || (bytes[input.offset]! & 0xc0) === 0x80)
           return fail(appError('input_invalid', 'input', 'Tool evidence offset is outside a UTF-8 boundary.'));
         let end = Math.min(bytes.length, input.offset + input.limit);
         while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
-        return ok(ToolEvidencePageSchema.parse({ version: 1, runId: input.runId, sessionId: input.sessionId, toolCallId: input.toolCallId,
-          sha256, bytes: bytes.length, offset: input.offset, chunk: bytes.subarray(input.offset, end).toString('utf8'),
+        return ok(ToolEvidencePageSchema.parse({ version: 2, runId: input.runId, sessionId: input.sessionId, toolCallId: input.toolCallId,
+          evidenceRevision, bytes: bytes.length, offset: input.offset, chunk: bytes.subarray(input.offset, end).toString('utf8'),
           nextOffset: end === bytes.length ? null : end }));
       } catch { return fail(appError('storage_corrupt', 'storage', 'Original tool evidence could not be read.')); }
     },
@@ -530,6 +529,8 @@ export function makeApplication(
     rejectInvoiceCandidate: async request => products?.invoiceEdits?.reject(request)
       ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice rejection is unavailable.')),
     exportInvoiceCandidate: async request => products?.invoiceEdits?.export(request)
+      ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice export is unavailable.')),
+    readInvoiceExport: async request => products?.invoiceEdits?.readExport(request)
       ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice export is unavailable.')),
     queryInvoiceCandidateOperation: async request => products?.invoiceEdits?.queryOperation(request)
       ?? fail(appError('invoice_edit_unavailable', 'runtime', 'Invoice operation lookup is unavailable.')),

@@ -78,7 +78,7 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
     await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
-      const saved = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p13-ui', credentialRef: 'p13_ui_synthetic', name: 'P13 UI',
+      const saved = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p13-ui', credentialRef: '00000000000000000000000000000035', name: 'P13 UI',
         kind: 'custom', providerId: null, baseUrl, model: 'p13-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }], defaultModelId: 'p13-ui' },
         { modelId: 'p13-ui', apiKey: 'synthetic-p13-ui-key' });
       if (!saved.ok) return saved;

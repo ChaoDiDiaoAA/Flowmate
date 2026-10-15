@@ -2,7 +2,6 @@ import { _electron as electron } from 'playwright';
 import { expect, test as it } from '@playwright/test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { invoiceHeaderFields, invoiceLineFields } from '@flowmate/contracts';
@@ -165,10 +164,6 @@ async function fixture(sparse = false, failCleanup = false, secondDocument = fal
     sourceRecordId: 'p7-controlled', datasetRevision: 'rev-1', qualityStatus: 'complete', allowedUsesClaim: ['local review'],
     licenseVerification: 'not_verified', files: [{ path: 'original.png', bytes: png.length }, { path: 'content.json', bytes: Buffer.byteLength(content) },
       { path: 'pages.json', bytes: Buffer.byteLength(pages) }] }));
-  const digest = createHash('sha256');
-  for (const name of ['original.png', 'content.json', 'pages.json', 'metadata.json']) {
-    const bytes = readFileSync(join(source, name)); const length = Buffer.alloc(8); length.writeBigUInt64BE(BigInt(bytes.length)); digest.update(length).update(bytes);
-  }
   const version = 'p7-legacy-v1';
   const parsed = { formatVersion: 2, pages: [{ page: sparse ? 2 : 1, blocks: Array.from({ length: 52 }, (_, index) => ({ id: `b${index + 1}`,
     kind: 'text', text: `Fixture block ${index + 1}`, sourceIndex: index, sourceType: 'controlled', bbox: null })) },
@@ -351,7 +346,7 @@ it('P7 real Workspace selects every saved field and line, pages sources, freezes
     const prepared = await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error('Missing settings');
       const settings = await window.flowmate.saveSettings({ ...state.data.settings,
-        runtime: { timeoutMs: 90_000, stopGraceMs: 500 }, models: [{ id: 'p7-model', credentialRef: 'p7_fixture_credential',
+        runtime: { timeoutMs: 90_000, stopGraceMs: 500 }, models: [{ id: 'p7-model', credentialRef: '00000000000000000000000000000037',
           name: 'Controlled P7', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'p7-fixture', api: 'openai-completions',
           contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p7-model' }, { modelId: 'p7-model', apiKey: 'synthetic-p7-key' });
       if (!settings.ok) throw new Error('Settings failed');
@@ -560,7 +555,7 @@ it(`P7 public Workspace recovery distinguishes ${fault} without replay`, async (
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
     expect(await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p7-recovery', credentialRef: 'p7_recovery_credential', name: 'Recovery fixture',
+      const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p7-recovery', credentialRef: '00000000000000000000000000000038', name: 'Recovery fixture',
         kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'p7-recovery', api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384, reasoning: false }],
         defaultModelId: 'p7-recovery' }, { modelId: 'p7-recovery', apiKey: 'synthetic-recovery-key' });
       if (!settings.ok) return settings;

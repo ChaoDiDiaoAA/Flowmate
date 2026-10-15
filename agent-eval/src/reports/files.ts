@@ -2,7 +2,7 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {isDeepStrictEqual} from 'node:util';
-import { artifactJson, withoutHashes } from '../artifacts.ts';
+import { artifactJson } from '../artifacts.ts';
 import { inside } from '../dataset-loader/local.ts';
 import type { LocalReport } from './store.ts';
 import {dimensions} from '../scoring/aggregate.ts';
@@ -41,7 +41,7 @@ export const publicVersions=(value:any)=>versions(value,true);
 export const executionVersions=(value:any)=>versions(value,false);
 export function publicReport(report: LocalReport) {
     const {export:_,...rest}=report;
-    return publicVersions(withoutHashes({...rest,artifactFormat:'flowmate-eval-public/v1',trials:report.trials.map(t=>{
+    return publicVersions(({...rest,artifactFormat:'flowmate-eval-public/v1',trials:report.trials.map(t=>{
         const {execution,judgeCalls,...summary}=t;
         return {...summary,dimensions:dimensions(t.scores,!!t.execution?.started),scores:t.scores.map(({actual,expected,...score})=>score),evidence:{trial:`evidence/${t.trialId}/trial.json`,observation:`evidence/${t.trialId}/observation.json`,events:`evidence/${t.trialId}/events.jsonl`}};
     })}));
@@ -62,7 +62,7 @@ export function saveEvidence(root:string, report:LocalReport) {
         else atomicJson(join(directory,'trial.json'),{version:'v1',status:'not-started',identity:{executionId:report.executionId,trialId:t.trialId,caseId:t.caseId,caseVersion:'v1'}});
         atomicJson(join(directory,'observation.json'),publicVersions({version:'v1',evidence:e?.evidence??{},judgeCalls:t.judgeCalls,
             scoringFacts:t.scores.map(({metricId,actual,expected})=>({metricId,actual,expected}))}));
-        const events=(e?.observations??[]).map(o=>JSON.stringify(publicVersions(withoutHashes(o))));
+        const events=(e?.observations??[]).map(o=>JSON.stringify(publicVersions((o))));
         const file=join(directory,'events.jsonl'), prior=existsSync(file)?readFileSync(file,'utf8'):'';
         if(lstatSync(file,{throwIfNoEntry:false})?.isSymbolicLink())throw Error('Linked events rejected');
         const next=events.map(line=>line+'\n').join('');

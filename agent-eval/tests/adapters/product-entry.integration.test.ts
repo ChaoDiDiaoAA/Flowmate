@@ -1,6 +1,8 @@
 import {test,expect,spyOn} from 'bun:test';
-import {mkdirSync,writeFileSync,existsSync} from 'node:fs';
-import {join} from 'node:path';
+import {mkdirSync,writeFileSync,existsSync,readFileSync} from 'node:fs';
+import {join,dirname} from 'node:path';
+import {REPO_ROOT} from '../../src/dataset-loader/local.ts';
+import {exportEvents} from '../../src/langfuse/export.ts';
 import {main} from '../../src/cli.ts';
 import {productAgent, createProductAgent} from '../../src/adapters/agent.ts';
 import {readReport,reportPath,comparison} from '../../src/reports/store.ts';
@@ -51,6 +53,11 @@ test('default CLI runs only independent synthetic data through local Host, one i
   if(report.trials[0]!.status!=='PASS')throw new Error(JSON.stringify({reason:report.trials[0]!.reason,error:report.trials[0]!.execution?.error,scores:report.trials[0]!.scores}));
   expect(report.trials[0]!.status).toBe('PASS');expect(report.trials[0]!.judgeCalls).toHaveLength(1);
   expect(report.trials[0]!.execution!.evidence.environment!.present).toBe(true);expect(report.executionComplete).toBe(true);
+  const snapshot=JSON.parse(readFileSync(join(dirname(file),'snapshot.json'),'utf8'));
+  expect(snapshot.runtimeSource.files).toContainEqual({path:'apps/host/main.ts',text:readFileSync(join(REPO_ROOT,'apps/host/main.ts'),'utf8')});
+  expect(snapshot.runtimeSource.files).toContainEqual({path:'agent-eval/src/execution/source.ts',text:readFileSync(join(REPO_ROOT,'agent-eval/src/execution/source.ts'),'utf8')});
+  expect(JSON.stringify(exportEvents(report))).not.toContain('runtimeSource');
+  expect(JSON.stringify(exportEvents(report))).not.toContain(readFileSync(join(REPO_ROOT,'agent-eval/src/execution/source.ts'),'utf8'));
   expect(comparison(report,readReport(file))).toBeDefined();await main(['compare','--left','public-synthetic-a','--right','public-synthetic-a'],fixtureRepo);
   expect(agentCalls).toBe(1);expect(judgeCalls).toBe(1);expect(process.exitCode).toBe(0);
   await expect(main(['run','--dataset','public-synthetic','--model','REPLACE_WITH_AGENT_MODEL','--execution-id','unfilled-model','--judge','required'],fixtureRepo)).rejects.toThrow('FLOWMATE_EVAL_AGENT_MODEL');

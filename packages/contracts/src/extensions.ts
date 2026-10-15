@@ -17,10 +17,9 @@ export type ExtensionHookEvent = z.infer<typeof ExtensionHookEventSchema>;
 export const EXTENSION_ERROR_CODES = ['extension_config_invalid', 'extension_incompatible', 'extension_registration_conflict',
   'extension_load_failed', 'extension_hook_failed', 'extension_command_failed', 'extension_cleanup_failed',
   'extension_instance_conflict', 'extension_not_loaded'] as const;
-export const ExtensionRefSchema = z.object({ id: ResourceIdSchema, version: ResourceIdSchema,
-  manifestHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict().readonly();
+export const ExtensionRefSchema = z.object({ id: ResourceIdSchema, version: ResourceIdSchema }).strict().readonly();
 export type ExtensionRef = z.infer<typeof ExtensionRefSchema>;
-export function extensionRefKey(ref: ExtensionRef): string { return JSON.stringify([ref.id, ref.version, ref.manifestHash]); }
+export function extensionRefKey(ref: ExtensionRef): string { return JSON.stringify([ref.id, ref.version]); }
 export const ExtensionSelectionSchema = z.object({ enabledExtensions: z.array(ExtensionRefSchema).max(2).readonly() }).strict()
   .refine(value => new Set(value.enabledExtensions.map(ref => ref.id)).size === value.enabledExtensions.length, 'Duplicate extension identity.').readonly();
 export type ExtensionSelection = z.infer<typeof ExtensionSelectionSchema>;
@@ -28,7 +27,7 @@ export const EMPTY_EXTENSION_SELECTION: ExtensionSelection = ExtensionSelectionS
 export const AssemblySelectionSnapshotSchema = z.object({ revision: integer, selection: ResourceSelectionSchema,
   extensions: ExtensionSelectionSchema.default(EMPTY_EXTENSION_SELECTION) }).strict().readonly();
 export type AssemblySelectionSnapshot = z.infer<typeof AssemblySelectionSnapshotSchema>;
-const manifestCommon = { schemaVersion: z.literal(1), kind: z.literal('extension'),
+const manifestCommon = { schemaVersion: z.literal(2), kind: z.literal('extension'),
   hooks: z.array(z.object({ event: ExtensionHookEventSchema, policy: z.enum(['critical', 'observer']) }).strict().readonly()).length(5).readonly() };
 export const ExtensionManifestSchema = z.discriminatedUnion('id', [z.object({ ...manifestCommon,
   id: z.literal('invoice-assist'), version: z.literal('v1'), sdkVersion: z.literal('0.85.1'), entryId: z.literal('invoice-assist-v1'),
@@ -36,13 +35,12 @@ export const ExtensionManifestSchema = z.discriminatedUnion('id', [z.object({ ..
   commands: z.tuple([z.literal('invoice-assist')]).readonly(),
 }).strict(), z.object({ ...manifestCommon, id: z.literal('subagents'), version: z.literal('v1'), sdkVersion: z.literal('0.85.1'),
   entryId: z.literal('pi-subagents-managed-v1'), pluginVersion: z.literal('0.19.0'), patchVersion: z.enum(['flowmate-p13.1', 'flowmate-p13.2']),
-  patchHash: z.enum(['a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a', '3e6ee0d9cf2f45ba37be90eebbd3edbdfa838de85958c139b62b37371a1b8ebe']),
   tools: z.tuple([z.object({ name: z.literal('Agent'), version: z.enum(['0.19.0-p13.1', '0.19.0-p13.2']) }).strict().readonly()]).readonly(),
   commands: z.array(z.literal('subagent')).max(1).readonly(),
 }).strict()]).superRefine((value, ctx) => {
   if (value.id === 'subagents' && (value.patchVersion === 'flowmate-p13.1'
-    ? value.patchHash !== 'a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a' || value.tools[0].version !== '0.19.0-p13.1' || value.commands.length !== 0
-    : value.patchHash !== '3e6ee0d9cf2f45ba37be90eebbd3edbdfa838de85958c139b62b37371a1b8ebe' || value.tools[0].version !== '0.19.0-p13.2' || value.commands[0] !== 'subagent')) report(ctx, 'Managed patch, Tool and Command declarations differ.');
+    ? value.tools[0].version !== '0.19.0-p13.1' || value.commands.length !== 0
+    : value.tools[0].version !== '0.19.0-p13.2' || value.commands[0] !== 'subagent')) report(ctx, 'Managed patch, Tool and Command declarations differ.');
   if (value.hooks.some((hook, index) => hook.event !== EXTENSION_HOOKS[index].event || hook.policy !== EXTENSION_HOOKS[index].policy))
     report(ctx, 'Hook declarations must match the supported extension and their required policies.');
 }).readonly();

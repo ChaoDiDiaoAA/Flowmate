@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
-import { createHash } from 'node:crypto';
 import { ToolCallSnapshotSchema } from '../../../packages/contracts/src/tool-evidence.ts';
 import { invoiceToolSchemas } from '../../../packages/contracts/src/invoice.ts';
 import { isJsonData } from '../../../packages/contracts/src/tools.ts';
@@ -82,14 +81,13 @@ function originals(context: EvaluationContext) {
     const evidence = context.result.evidence;
     const runs = z.array(z.object({ runId: z.number().int().positive(), sessionId: z.number().int().positive(),
         scope: z.object({ allowedTools: z.array(z.string()), allowedDocumentIds: z.array(z.number()), allowedArtifactIds: z.array(z.number()).optional() }).passthrough().optional() }).passthrough()).safeParse(evidence.runs?.actual);
-    const collection = z.object({ calls: z.array(z.object({ tool: z.unknown(), sha256: z.string(), bytes: z.number() }).passthrough()) }).passthrough().safeParse(evidence['tool-evidence']?.actual);
+    const collection = z.object({ calls: z.array(z.object({ tool: z.unknown(),  bytes: z.number() }).passthrough()) }).passthrough().safeParse(evidence['tool-evidence']?.actual);
     const calls = new Map<number, Tool>(), conflicting = new Set<number>();
     let valid = runs.success && runs.data.length > 0 && new Set(runs.data.map(run => run.runId)).size === runs.data.length &&
         collection.success && !!evidence.runs?.source.trim() && !!evidence['tool-evidence']?.source.trim();
     if (collection.success && runs.success && evidence.runs?.source.trim() && evidence['tool-evidence']?.source.trim()) for (const record of collection.data.calls) {
         const parsed = ToolCallSnapshotSchema.safeParse(record.tool);
-        if (!parsed.success || createHash('sha256').update(JSON.stringify(record.tool)).digest('hex') !== record.sha256 ||
-            Buffer.byteLength(JSON.stringify(record.tool)) !== record.bytes || !runs.success ||
+        if (!parsed.success || Buffer.byteLength(JSON.stringify(record.tool)) !== record.bytes || !runs.success ||
             !runs.data.some(run => run.runId === parsed.data.runId && run.sessionId === parsed.data.sessionId)) { valid = false; continue; }
         if (conflicting.has(parsed.data.toolCallId)) continue;
         const prior = calls.get(parsed.data.toolCallId);

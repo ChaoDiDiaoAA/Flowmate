@@ -1,14 +1,15 @@
+import { createManagedFileContents } from '../../packages/core/src/storage/managed-file-contents.ts';
+import { openDatabase } from '@flowmate/core';
 import { describe, expect, it, spyOn } from 'bun:test';
 import * as fsPromises from 'node:fs/promises';
 import { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync, existsSync, readFileSync, renameSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, readFileSync, renameSync, readdirSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { formatSkillsForPrompt, createReadToolDefinition, type AgentSession } from '@earendil-works/pi-coding-agent';
-import { canonicalResourceManifest, ResourceManifestSchema, ResourceRefSchema, INVOICE_TOOLS_SYSTEM_PROMPT, ok } from '@flowmate/contracts';
+import { canonicalResourceManifest, FrozenResourcesSchema, ResourceManifestSchema, ResourceRefSchema, INVOICE_TOOLS_SYSTEM_PROMPT, ok } from '@flowmate/contracts';
 import type { AgentRunEvent, ResourceSelection, Result } from '@flowmate/contracts';
 import { createApplication } from '../../apps/composition.ts';
 import { resolveProductPaths } from '../../packages/shared/src/paths.ts';
@@ -19,24 +20,24 @@ import { checkResourcePayload, checkResourceWire } from '../../packages/runtime-
 import { verifyManagedReadOutput, verifySkillToolOutput } from '../../packages/runtime-pi/src/resources/loader.ts';
 import { createHttpProvider, deferCleanup, mkdtempSync } from '../support/resources.ts';
 
-const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 function need<T>(value: Result<T>): T { if (!value.ok) throw new Error(value.error.code); return value.data; }
 function packs(prefix = 'flowmate-p11-sdk-') {
   const root = mkdtempSync(join(tmpdir(), prefix)), resourceRoot = join(root, 'author'); mkdirSync(resourceRoot);
   const paths = need(resolveProductPaths(join(root, 'product'))), bundleRoot = join(paths.runtimeDir, 'resource-bundles');
+  const storage = need(openDatabase(need(resolveProductPaths(join(root, 'fixture-storage'))))); deferCleanup(() => storage.close()); const contents = storage.contents;
   function pack(kind: 'prompt' | 'skill', version = 'v1', disabled = false, extraFiles: Array<{ path: string; text: string }> = []) {
     const dir = join(resourceRoot, kind === 'prompt' ? 'prompts' : 'skills', 'invoice'); mkdirSync(dir, { recursive: true });
     const text = kind === 'prompt' ? `Business invoice constraints ${version}.` : `---\nname: invoice\ndescription: Invoice fields ${version}\ndisable-model-invocation: ${disabled}\n---\nInvoice SOP ${version}.`;
     const path = kind === 'prompt' ? 'prompt.md' : 'SKILL.md';
     const files = [{ path, text }, ...extraFiles];
-    const manifest = ResourceManifestSchema.parse({ schemaVersion: 1, kind, id: 'invoice', version, bodyFile: path,
-      keywords: ['invoice'], requires: [], files: files.map(file => ({ path: file.path, bytes: Buffer.byteLength(file.text), sha256: hash(file.text) })) });
+    const manifest = ResourceManifestSchema.parse({ schemaVersion: 2, kind, id: 'invoice', version, bodyFile: path,
+      keywords: ['invoice'], requires: [], files: files.map(file => ({ path: file.path, bytes: Buffer.byteLength(file.text) })) });
     for (const file of files) { mkdirSync(dirname(join(dir, file.path)), { recursive: true }); writeFileSync(join(dir, file.path), file.text); }
     writeFileSync(join(dir, 'resource.json'), JSON.stringify(manifest));
-    return { ref: ResourceRefSchema.parse({ kind, id: 'invoice', version, contentHash: hash(canonicalResourceManifest(manifest)) }), dir, text };
+    return { ref: ResourceRefSchema.parse({ kind, id: 'invoice', version }), dir, text };
   }
-  const hub = createResourceService({ resourceRoot, bundleRoot, registeredToolNames: ['read'], inspectNativeResources: pi.inspectNativeResources });
-  return { root, paths, resourceRoot, bundleRoot, pack, hub };
+  const hub = createResourceService({ resourceRoot, bundleRoot, contents, registeredToolNames: ['read'], inspectNativeResources: pi.inspectNativeResources });
+  return { root, paths, resourceRoot, bundleRoot, pack, hub, contents, storage };
 }
 function reply() {
   const chunk = (delta: unknown, finish: string | null) => `data: ${JSON.stringify({ id: 'p11', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
@@ -66,22 +67,23 @@ describe('P11 controlled native resources', () => {
     const f = packs(), skill = f.pack('skill', 'v1', false, [{ path: 'references/guide.md', text: '中文 reference' },
       { path: 'references/controls.bin', text: controls }]);
     const frozen = need(f.hub.freeze({ selection: { prompt: null, enabledSkills: [skill.ref] }, settingsRevision: 1, activeToolNames: ['read'], requiredSkill: null }))!;
-    const loader = need(pi.createRunResourceLoader({ fixedSystemPrompt: 'Skill test', frozen, bundleDirectory: frozen.bundleDirectory,
+    const loader = need(pi.createRunResourceLoader({ contents: f.contents, fixedSystemPrompt: 'Skill test', frozen, bundleDirectory: frozen.bundleDirectory,
       activeToolNames: ['list_skill_resources', 'read_skill_resource'] }));
     const args = { skill: 'invoice', path: 'references/guide.md', limit: 6 };
-    const page = { ...need(f.hub.readFrozenFile(frozen, { path: args.path, limit: args.limit, ref: skill.ref })), bundleHash: frozen.bundleHash };
-    expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', args, page)).toMatchObject({ ok: true, data: [{ fullBody: false, text: '中文 reference' }] });
+    const page = { ...need(f.hub.readFrozenFile(frozen, { path: args.path, limit: args.limit, ref: skill.ref })), bundleId: frozen.bundleId };
+    loader.filesForOperation = () => { throw new Error('Structured feedback must not read the filesystem again.'); };
+    expect(verifySkillToolOutput(frozen, loader, f.contents, 'read_skill_resource', args, page)).toMatchObject({ ok: true, data: [{ fullBody: false, text: '中文 reference' }] });
     for (const changed of [{ text: 'different' }, { path: 'SKILL.md' }, { offset: 3 }, { nextOffset: null }, { totalBytes: 6 },
-      { bundleHash: 'f'.repeat(64) }, { ref: { ...skill.ref, version: 'v2' } }])
-      expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', args, { ...page, ...changed })).toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
-    expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', { ...args, sessionId: 1 }, page).ok).toBe(false);
-    expect(verifySkillToolOutput(frozen, loader, 'read_skill_resource', { skill: 'invoice', path: 'references/controls.bin' },
-      { ref: skill.ref, bundleHash: frozen.bundleHash, path: 'references/controls.bin', sha256: hash(controls),
+      { bundleId: 'f'.repeat(64) }, { ref: { ...skill.ref, version: 'v2' } }])
+      expect(verifySkillToolOutput(frozen, loader, f.contents, 'read_skill_resource', args, { ...page, ...changed })).toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
+    expect(verifySkillToolOutput(frozen, loader, f.contents, 'read_skill_resource', { ...args, sessionId: 1 }, page).ok).toBe(false);
+    expect(verifySkillToolOutput(frozen, loader, f.contents, 'read_skill_resource', { skill: 'invoice', path: 'references/controls.bin' },
+      { ref: skill.ref, bundleId: frozen.bundleId, path: 'references/controls.bin',
         offset: 0, text: controls, nextOffset: null, totalBytes: Buffer.byteLength(controls) }))
       .toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
     const files = [...frozen.manifests[0]!.manifest.files].sort((a, b) => a.path < b.path ? -1 : 1);
-    expect(verifySkillToolOutput(frozen, loader, 'list_skill_resources', { skill: 'invoice' }, { ref: skill.ref, bundleHash: frozen.bundleHash, files })).toMatchObject({ ok: true });
-    expect(verifySkillToolOutput(frozen, loader, 'list_skill_resources', { skill: 'invoice' }, { ref: skill.ref, bundleHash: frozen.bundleHash, files: files.slice(0, 1) }).ok).toBe(false);
+    expect(verifySkillToolOutput(frozen, loader, f.contents, 'list_skill_resources', { skill: 'invoice' }, { ref: skill.ref, bundleId: frozen.bundleId, files })).toMatchObject({ ok: true });
+    expect(verifySkillToolOutput(frozen, loader, f.contents, 'list_skill_resources', { skill: 'invoice' }, { ref: skill.ref, bundleId: frozen.bundleId, files: files.slice(0, 1) }).ok).toBe(false);
   });
   it.each([false, true])('uses the dedicated Skill tools without native readers and preserves owned receipts (receipt fault=%s)', async receiptFault => {
     const f = packs(), marker = join(f.root, 'skill-script-executed');
@@ -100,7 +102,7 @@ describe('P11 controlled native resources', () => {
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
       toolDefinitions: definitions => definitions.filter(tool => !['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'].includes(tool.name)),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir,
         tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
@@ -150,7 +152,7 @@ describe('P11 controlled native resources', () => {
   it('classifies the path spellings accepted by the actual installed native read tool', async () => {
     const f = packs('flowmate p11-sdk-'), extra = { path: 'references/note.md', text: 'Pinned reference text.' }, skill = f.pack('skill', 'v1', false, [extra]);
     const frozen = need(f.hub.freeze({ selection: { prompt: null, enabledSkills: [skill.ref] }, settingsRevision: 1, activeToolNames: ['read'], requiredSkill: null }))!;
-    const loader = need(pi.createRunResourceLoader({ fixedSystemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT, frozen, bundleDirectory: frozen.bundleDirectory }));
+    const loader = need(pi.createRunResourceLoader({ contents: f.contents, fixedSystemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT, frozen, bundleDirectory: frozen.bundleDirectory }));
     const path = join(frozen.bundleDirectory, 'skills', 'invoice', 'v1', extra.path), slash = path.replaceAll('\\', '/');
     const paths = ['@' + path, pathToFileURL(path).href, relative(f.paths.runtimeDir, path), path.replace('flowmate p11', 'flowmate\u202fp11')];
     const homePath = relative(homedir(), path); if (!/^[a-z]:/i.test(homePath)) paths.push('~/' + homePath.replaceAll('\\', '/'));
@@ -162,7 +164,7 @@ describe('P11 controlled native resources', () => {
       const result = await read.execute('path-spelling', { path: accepted }, undefined, undefined, undefined as never);
       expect(result.content).toEqual([{ type: 'text', text: extra.text }]);
       expect(loader.filesForOperation(accepted, f.paths.runtimeDir, 'read')).toEqual([{ ref: skill.ref, path: extra.path,
-        fileHash: hash(extra.text), text: extra.text, relativePath: '' }]);
+        text: extra.text, relativePath: '' }]);
     }
   });
   it('retains only published content on failed admission, revalidates after restart and uses an explicitly saved older version without replay', async () => {
@@ -172,7 +174,7 @@ describe('P11 controlled native resources', () => {
     const server = await createHttpProvider(async request => { payloads.push(await request.json()); return reply(); }); deferCleanup(() => server.stop());
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: settings.revision, selection: settings.resources! }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Explicit resource fallback' })); need(await app.close());
@@ -184,12 +186,15 @@ describe('P11 controlled native resources', () => {
         connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16384 }, parameters: { maxRetries: 0, maxRetryDelayMs: 100 } } };
     expect(await app.submitInput(request)).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
     expect(need(await app.querySessionInput({ sessionId: session.sessionId, clientSequence: 1 })).input).toBeNull(); expect(payloads).toHaveLength(0);
-    const publishedHash = hash(JSON.stringify([selected.ref])), bundle = join(f.bundleRoot, publishedHash, 'bundle.json'), originalBundle = readFileSync(bundle, 'utf8');
-    const fixed = { version: 1 as const, policyVersion: 'p11-resources-v1' as const, bundleHash: publishedHash, settingsRevision: settings.revision,
-      bundleDirectory: join(f.bundleRoot, publishedHash), manifests: JSON.parse(originalBundle).resources,
+    const publishedId = readdirSync(f.bundleRoot).find(name => !name.startsWith('.'))!, bundle = join(f.bundleRoot, publishedId, 'bundle.json'), originalBundle = readFileSync(bundle, 'utf8');
+    const fixed = { version: 2 as const, policyVersion: 'p11-resources-v1' as const, bundleId: publishedId, settingsRevision: settings.revision,
+      bundleDirectory: join(f.bundleRoot, publishedId), manifests: JSON.parse(originalBundle).resources, skillIndex: JSON.parse(originalBundle).skillIndex,
       prompt: null, selectedSkills: [selected.ref], discoveredSkills: [selected.ref], excludedSkills: [] };
-    expect(need(f.hub.verifyFrozen(fixed))).toBeUndefined(); need(await app.close());
-    db = new Database(dbFile); expect(db.query('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 0 }); db.exec('DROP TRIGGER p11_admission_fault'); db.close();
+    need(await app.close());
+    db = new Database(dbFile);
+    const originalContents = createManagedFileContents(db);
+    expect(createResourceService({ resourceRoot: f.resourceRoot, bundleRoot: f.bundleRoot, contents: originalContents, registeredToolNames: ['read'], inspectNativeResources: pi.inspectNativeResources }).verifyFrozen(fixed).ok).toBe(true);
+    expect(db.query('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 0 }); db.exec('DROP TRIGGER p11_admission_fault'); db.close();
     app = need(await open());
     const execute = async (input: typeof request) => {
       let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
@@ -219,8 +224,7 @@ describe('P11 controlled native resources', () => {
     const server = await createHttpProvider(async request => {
       const payload = await request.json(); payloads.push(payload);
       if (payloads.length !== 1) return reply();
-      const path = join(f.bundleRoot, need(f.hub.freeze({ selection: { prompt: null, enabledSkills: [skill.ref] }, settingsRevision: 1,
-        activeToolNames: ['read'], requiredSkill: skill.ref }))!.bundleHash, 'skills', 'invoice', 'v1', 'SKILL.md');
+      const path = join(FrozenResourcesSchema.parse(need(await app.queryRun(1)).config.resources).bundleDirectory, 'skills', 'invoice', 'v1', 'SKILL.md');
       const response = toolReply([{ name: 'read', args: { path } }]);
       const text = (await response.text()).replace('"role":"assistant"', `"role":"assistant","content":${JSON.stringify('x'.repeat(100000))}`)
         .replace('data: [DONE]', 'data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 50000, completion_tokens: 1, total_tokens: 50001 } }) + '\n\ndata: [DONE]');
@@ -228,7 +232,7 @@ describe('P11 controlled native resources', () => {
     }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) })); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Resource auto summary' }));
     const w = need(await app.readWorkspace()); need(await app.updateWorkspace({ expectedRevision: w.revision, change: { kind: 'session', sessionId: session.sessionId } }));
@@ -243,11 +247,11 @@ describe('P11 controlled native resources', () => {
     const view = need(await app.queryRunResources({ sessionId: session.sessionId, runId: accepted.runId }));
     expect(payloads).toHaveLength(3);
     expect(view.evidence?.requests.map(request => [request.purpose, request.callSequence])).toEqual([['answer', 1], ['compaction', 2], ['answer', 2]]);
-    expect(view.evidence?.requests.find(request => request.purpose === 'compaction')).toMatchObject({ bundleHash: null,
+    expect(view.evidence?.requests.find(request => request.purpose === 'compaction')).toMatchObject({ bundleId: null,
       compactionOperationId: expect.any(String), contentChecks: expect.arrayContaining([expect.objectContaining({ ref: skill.ref,
         scope: 'expanded-body', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' })]) });
     expect(view.evidence?.requests.at(-1)?.contentChecks).toContainEqual(expect.objectContaining({ scope: 'derived-source',
-      ref: skill.ref, expectedTextHash: null, sdkInclusion: 'unknown', wireInclusion: 'unknown', reason: 'derived-source-only' }));
+      ref: skill.ref, expectedText: null, sdkInclusion: 'unknown', wireInclusion: 'unknown', reason: 'derived-source-only' }));
   });
   it.each([false, true])('retains actual read and prior-summary provenance after repeated native compaction (explicit=%s)', async explicit => {
     const f = packs(), skill = f.pack('skill', 'v1', true), payloads: unknown[] = [];
@@ -257,8 +261,7 @@ describe('P11 controlled native resources', () => {
       if (payload.messages.some(message => message.role === 'system' && message.content.startsWith('You are a context summarization assistant.'))) return reply();
       answers++;
       if (answers > 2) return reply();
-      const path = join(f.bundleRoot, need(f.hub.freeze({ selection: { prompt: null, enabledSkills: [skill.ref] }, settingsRevision: 1,
-        activeToolNames: ['read'], requiredSkill: skill.ref }))!.bundleHash, 'skills', 'invoice', 'v1', 'SKILL.md');
+      const path = join(FrozenResourcesSchema.parse(need(await app.queryRun(1)).config.resources).bundleDirectory, 'skills', 'invoice', 'v1', 'SKILL.md');
       const response = answers === 1 ? toolReply([{ name: 'read', args: { path } }]) : reply();
       const text = (await response.text()).replace('"role":"assistant"', `"role":"assistant","content":${JSON.stringify('x'.repeat(100000))}`)
         .replace('Controlled answer.', 'y'.repeat(100000))
@@ -267,7 +270,7 @@ describe('P11 controlled native resources', () => {
     }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: session => { natives.push(session); } }) })); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Resource auto summary' }));
     const w = need(await app.readWorkspace()); need(await app.updateWorkspace({ expectedRevision: w.revision, change: { kind: 'session', sessionId: session.sessionId } }));
@@ -292,8 +295,8 @@ describe('P11 controlled native resources', () => {
     const nextView = need(await app.queryRunResources({ sessionId: session.sessionId, runId: next.runId }));
     expect(view.evidence?.requests.filter(request => request.purpose === 'compaction').at(-1)?.contentChecks).toContainEqual(expect.objectContaining({ ref: skill.ref, scope: 'tool-output', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }));
     if (explicit) expect(view.evidence?.requests.filter(request => request.purpose === 'compaction').at(-1)?.contentChecks).toContainEqual(expect.objectContaining({
-      ref: skill.ref, scope: 'derived-source', expectedTextHash: null, sdkInclusion: 'unknown', wireInclusion: 'unknown', reason: 'derived-source-only' }));
-    expect(nextView.evidence?.requests.at(-1)?.contentChecks).toContainEqual(expect.objectContaining({ ref: skill.ref, scope: 'derived-source', expectedTextHash: null }));
+      ref: skill.ref, scope: 'derived-source', expectedText: null, sdkInclusion: 'unknown', wireInclusion: 'unknown', reason: 'derived-source-only' }));
+    expect(nextView.evidence?.requests.at(-1)?.contentChecks).toContainEqual(expect.objectContaining({ ref: skill.ref, scope: 'derived-source', expectedText: null }));
   });
   it.each([false, true])('records real native full/partial reads and exact enumeration against the original tool and request (aliases=%s)', async aliases => {
     const f = packs(), marker = join(f.root, 'script-executed');
@@ -315,7 +318,7 @@ describe('P11 controlled native resources', () => {
     let selection: ResourceSelection = { prompt: null, enabledSkills: [skill.ref] };
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Real resource read' }));
@@ -357,23 +360,23 @@ describe('P11 controlled native resources', () => {
     const restoredView = need(await app.queryRunResources({ sessionId: session.sessionId, runId: restoredRun.runId }));
     expect(restoredView.frozen).toBeNull();
     expect(restoredView.evidence?.reads).toEqual([]);
-    expect(restoredView.evidence?.requests[0]?.referencedBundleHashes).toEqual([view.frozen!.bundleHash]);
+    expect(restoredView.evidence?.requests[0]?.referencedBundleIds).toEqual([view.frozen!.bundleId]);
     expect(restoredView.evidence?.requests[0]?.contentChecks.filter(check => check.scope === 'tool-output')).toHaveLength(7);
     expect(payloads).toHaveLength(3);
     need(await app.close());
     const originalDb = new Database(f.paths.databaseFile);
     const original = originalDb.query<{ context_observations_json: string }, [number]>('SELECT context_observations_json FROM runs WHERE id=?').get(accepted.runId)!.context_observations_json;
     originalDb.close();
-    for (const fault of ['read-owner', 'request-owner', 'request-content', 'partial-file-hash', 'partial-file-path', 'partial-other-file', 'original-tool-target'] as const) {
+    for (const fault of ['read-owner', 'request-owner', 'request-content', 'partial-file-content', 'partial-file-path', 'partial-other-file', 'original-tool-target'] as const) {
       const db = new Database(f.paths.databaseFile), changed = JSON.parse(original);
       const partial = changed.resources.reads.find((item: { nativeToolCallId: string }) => item.nativeToolCallId === 'p11-read-1');
       const toolArgs = db.query<{ args_json: string }, [number]>('SELECT args_json FROM tool_calls WHERE id=?').get(partial.toolCallId)!.args_json;
       if (fault === 'read-owner') changed.resources.reads[0].nativeToolCallId = 'another-tool';
       if (fault === 'request-owner') changed.resources.requests[1].inputIds = [999999];
-      if (fault === 'request-content') changed.resources.requests[1].contentChecks.find((item: { scope: string }) => item.scope === 'tool-output').expectedTextHash = 'b'.repeat(64);
-      if (fault === 'partial-file-hash') partial.fileHash = 'b'.repeat(64);
+      if (fault === 'request-content') changed.resources.requests[1].contentChecks.find((item: { scope: string }) => item.scope === 'tool-output').expectedText = 'b'.repeat(64);
+      if (fault === 'partial-file-content') partial.fileContent = 'b'.repeat(64);
       if (fault === 'partial-file-path') partial.path = 'never-registered.txt';
-      if (fault === 'partial-other-file') { partial.path = 'not-SKILL.md'; partial.fileHash = hash('Only overlapping marker mentions SKILL.md and scripts/check.ts.'); }
+      if (fault === 'partial-other-file') { partial.path = 'not-SKILL.md'; partial.fileContent = Buffer.from('Only overlapping marker mentions SKILL.md and scripts/check.ts.').toString('base64'); }
       if (fault === 'partial-file-path' || fault === 'partial-other-file')
         for (const check of changed.resources.requests[1].contentChecks) if (check.nativeEntryId === partial.nativeEntryId && check.scope === 'tool-output') check.path = partial.path;
       if (fault === 'original-tool-target') { const forged = JSON.parse(toolArgs); forged.final = { ...forged.final, path: join(f.root, 'unrelated-file.txt') };
@@ -396,7 +399,7 @@ describe('P11 controlled native resources', () => {
     for (const file of files) {
       const args = { path: join(skill.dir, file.path) }, result = await read.execute('native-truncation', args, undefined, undefined, undefined as never);
       const text = result.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-      const managed = { ref: skill.ref, path: file.path, fileHash: hash(file.text), text: file.text, relativePath: file.path };
+      const managed = { ref: skill.ref, path: file.path, text: file.text, relativePath: file.path };
       expect(verifyManagedReadOutput(managed, args, text)).toEqual({ ok: true, data: undefined }); expect(text).not.toBe(file.text);
       expect(verifyManagedReadOutput(managed, args, text + 'unrelated')).toMatchObject({ ok: false, error: { code: 'resource_version_changed' } });
     }
@@ -421,7 +424,7 @@ describe('P11 controlled native resources', () => {
     }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) })); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Changed actual read' })), original = need(await app.readWorkspace());
     const workspace = need(await app.updateWorkspace({ expectedRevision: original.revision, change: { kind: 'session', sessionId: session.sessionId } }));
@@ -445,7 +448,7 @@ describe('P11 controlled native resources', () => {
     let selection: ResourceSelection = { prompt: null, enabledSkills: [skill.ref] };
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection }),
-      agentFactory: definitions => adapter = new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => adapter = new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Explicit Skill' })), text = '/skill:invoice Explain missing values.';
@@ -462,7 +465,7 @@ describe('P11 controlled native resources', () => {
     expect(input.content).toMatchObject({ text, promptText: text, resourceBinding: { requiredSkill: skill.ref } });
     const resources = need(await app.queryRunResources({ sessionId: session.sessionId, runId: accepted.runId }));
     expect(resources.evidence?.expansions).toContainEqual(expect.objectContaining({ inputId: accepted.inputId,
-      nativeEntryId: input.nativeEntryId, skill: skill.ref, bundleHash: resources.frozen!.bundleHash }));
+      nativeEntryId: input.nativeEntryId, skill: skill.ref, bundleId: resources.frozen!.bundleId }));
     expect(resources.evidence?.requests).toContainEqual(expect.objectContaining({ purpose: 'answer', inputIds: [accepted.inputId],
       contentChecks: expect.arrayContaining([expect.objectContaining({ ref: skill.ref, scope: 'expanded-body',
         nativeEntryId: input.nativeEntryId, sdkInclusion: 'confirmed', wireInclusion: 'confirmed' })]) }));
@@ -482,7 +485,7 @@ describe('P11 controlled native resources', () => {
     expect((await nextDone).result).toMatchObject({ ok: true, data: { status: 'completed' } });
     const restoredResources = need(await app.queryRunResources({ sessionId: session.sessionId, runId: next.runId }));
     expect(restoredResources.frozen).toBeNull();
-    expect(restoredResources.evidence?.requests[0]).toMatchObject({ bundleHash: null, referencedBundleHashes: [resources.frozen!.bundleHash],
+    expect(restoredResources.evidence?.requests[0]).toMatchObject({ bundleId: null, referencedBundleIds: [resources.frozen!.bundleId],
       contentChecks: expect.arrayContaining([expect.objectContaining({ ref: skill.ref, nativeEntryId: input.nativeEntryId,
         scope: 'expanded-body', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' })]) });
     expect(restoredResources.evidence?.expansions).toEqual([]); expect(payloads).toHaveLength(2);
@@ -490,7 +493,7 @@ describe('P11 controlled native resources', () => {
     need(await app.close());
     const db = new Database(f.paths.databaseFile);
     const row = db.query<{ context_observations_json: string }, [number]>('SELECT context_observations_json FROM runs WHERE id=?').get(accepted.runId)!;
-    const changed = JSON.parse(row.context_observations_json); changed.resources.expansions[0].expandedTextHash = 'b'.repeat(64);
+    const changed = JSON.parse(row.context_observations_json); changed.resources.expansions[0].expandedText = 'b'.repeat(64);
     db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify(changed), accepted.runId);
     db.close(); app = need(await open());
     expect((await app.listSessionMessages({ sessionId: session.sessionId })).ok).toBe(false);
@@ -515,7 +518,7 @@ describe('P11 controlled native resources', () => {
     const server = await createHttpProvider(() => { requests++; return reply(); }); deferCleanup(() => server.stop());
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: sdk => {
           if (fault !== 'sdk-read-fallback') return;
           const prompt = sdk.prompt.bind(sdk);
@@ -561,7 +564,7 @@ describe('P11 controlled native resources', () => {
       return toolReply([{ name: 'read', args: { path } }]); }); deferCleanup(() => server.stop());
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close()); need(await app.close());
     const db = new Database(f.paths.databaseFile); db.exec("CREATE TRIGGER p11_read_failure BEFORE UPDATE OF context_observations_json ON runs WHEN json_array_length(NEW.context_observations_json,'$.resources.reads')>0 BEGIN SELECT RAISE(ABORT,'P11 read receipt failure'); END;"); db.close(); app = need(await open());
@@ -594,7 +597,7 @@ describe('P11 controlled native resources', () => {
     const inputMode = mode === 'cancel' || mode === 'followUp-fallback' ? 'followUp' : mode === 'steer-fallback' ? 'steer' : mode;
     let native!: AgentSession, attemptedExpansion = 0;
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot, resourceDefaults: () => ok({ revision, selection }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: session => {
           native = session;
           if (!mode.endsWith('-fallback')) return;
@@ -663,8 +666,8 @@ describe('P11 controlled native resources', () => {
       activeToolNames: ['read'], requiredSkill: null })); if (!frozen) throw new Error('No frozen bundle');
     const create = Reflect.get(pi, 'createRunResourceLoader'); expect(typeof create).toBe('function');
     if (typeof create !== 'function') throw new Error('Controlled resource loader missing');
-    const loader = need<import('@earendil-works/pi-coding-agent').ResourceLoader>(create({ fixedSystemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT,
-      frozen, bundleDirectory: join(f.bundleRoot, frozen.bundleHash) }));
+    const loader = need<import('@earendil-works/pi-coding-agent').ResourceLoader>(create({ contents: f.contents, fixedSystemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT,
+      frozen, bundleDirectory: join(f.bundleRoot, frozen.bundleId) }));
     expect(loader.getSystemPrompt()).toBe(INVOICE_TOOLS_SYSTEM_PROMPT);
     expect(loader.getAppendSystemPrompt()).toEqual([prompt.text, expect.stringContaining('readiness: Ready (0/0 capabilities); No requirements')]);
     expect(loader.getSkills().skills.map(item => item.name)).toEqual(['invoice']);
@@ -672,8 +675,8 @@ describe('P11 controlled native resources', () => {
     expect(loader.getPrompts()).toEqual({ prompts: [], diagnostics: [] }); expect(loader.getAgentsFiles()).toEqual({ agentsFiles: [] });
     expect(loader.getThemes()).toEqual({ themes: [], diagnostics: [] }); expect(loader.getExtensions().extensions).toEqual([]);
     expect(() => loader.extendResources({ skillPaths: [] })).toThrow();
-    writeFileSync(join(f.bundleRoot, frozen.bundleHash, 'skills', 'invoice', 'v1', 'SKILL.md'), skill.text + ' altered');
-    expect(create({ fixedSystemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT, frozen, bundleDirectory: join(f.bundleRoot, frozen.bundleHash) }))
+    writeFileSync(join(f.bundleRoot, frozen.bundleId, 'skills', 'invoice', 'v1', 'SKILL.md'), skill.text + ' altered');
+    expect(create({ contents: f.contents, fixedSystemPrompt: INVOICE_TOOLS_SYSTEM_PROMPT, frozen, bundleDirectory: join(f.bundleRoot, frozen.bundleId) }))
       .toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
   });
 
@@ -683,7 +686,7 @@ describe('P11 controlled native resources', () => {
     const payloads: Array<{ messages: Array<{ role: string; content: string }> }> = [], sessions: AgentSession[] = [];
     const server = await createHttpProvider(async request => { payloads.push(await request.json()); return reply(); }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot, resourceDefaults: () => ok({ revision, selection }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: session => { sessions.push(session); } }) }));
     deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'P11 cache' }));
@@ -707,7 +710,7 @@ describe('P11 controlled native resources', () => {
       expect(system.split(`Business invoice constraints ${index === 1 ? 'v1' : 'v2'}.`)).toHaveLength(2);
       expect(system).not.toContain('Invoice SOP');
       const resources = need(await app.queryRunResources({ sessionId: session.sessionId, runId: accepted.runId }));
-      expect(resources.evidence!.requests[0]!.systemPromptHash).toBe(hash(system));
+      expect(resources.evidence!.requests[0]!.systemPrompt).toBe(system);
       expect(resources.evidence!.requests[0]!.contentChecks).toContainEqual(expect.objectContaining({ scope: 'business-prompt', sdkInclusion: 'confirmed', wireInclusion: 'confirmed' }));
       expect(resources.evidence!.requests[0]!.contentChecks.filter(check => check.scope === 'skill-index')).toHaveLength(index === 1 ? 1 : 0);
       expect(system.includes('Invoice fields v1')).toBe(index === 1);

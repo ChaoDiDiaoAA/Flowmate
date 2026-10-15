@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "prompt",
   "id": "research",
   "version": "v1",
@@ -19,8 +19,7 @@
   "files": [
     {
       "path": "prompt.md",
-      "bytes": 1348,
-      "sha256": "f83afe79172db968ce6b79b16996d24068bc3bb193e676aed460a62e2b0bb056"
+      "bytes": 1348
     }
   ]
 }

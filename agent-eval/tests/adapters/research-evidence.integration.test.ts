@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { HostClient } from '../../../apps/desktop/main/host-client.ts';
 import { mkdtempSync } from '../../../tests/support/resources.ts';
-import { REPO_ROOT, hash } from '../../src/dataset-loader/local.ts';
+import { REPO_ROOT } from '../../src/dataset-loader/local.ts';
 import { collectResearchEvidence } from '../../src/adapters/research-evidence.ts';
 import { ResearchEvidenceRequestSchema, ResearchSourcesRequestSchema } from '../../../packages/contracts/src/research.ts';
 
@@ -30,7 +30,7 @@ function transport(overrides: { loop?: boolean; mismatch?: boolean; changedSourc
     const task = { researchId: 1, sessionId: 2, title: 'Fixture', sourcePolicy: { web: false, domains: [], artifactIds: [3], documentIds: [] },
         status: 'planning', currentPlanId: null, planConfirmed: false, currentRunId: null, currentReportId: null, createdAt: at, updatedAt: at };
     const source = { sourceSnapshotId: 7, researchId: 1, runId: 4, toolCallId: 5, createdAt: at, kind: 'local', address: 'material:3', title: 'Fixture',
-        artifactId: 3, documentId: null, fetchedAt: at, publishedAt: null, contentHash: hash(text), relativePath: 'artifacts/research/1/' + hash(text) + '.txt',
+        artifactId: 3, documentId: null, fetchedAt: at, publishedAt: null,  relativePath: 'artifacts/research/1/source-5.txt',
         bytes: Buffer.byteLength(text), characters: text.length, truncated: false };
     return { text, commands, host: { async request(command: Parameters<HostClient['request']>[0]) {
         commands.push(command);
@@ -39,14 +39,14 @@ function transport(overrides: { loop?: boolean; mismatch?: boolean; changedSourc
         if (command.type === 'list_research_reports') return { ok: true, data: { items: [], nextBeforeId: null } };
         if (command.type === 'query_research_evidence') {
             const offset = ResearchEvidenceRequestSchema.parse(command.input).offset, end = offset === 0 ? 3999 : text.length;
-            return { ok: true, data: { source: { ...source, contentHash: overrides.changedSource && offset ? 'a'.repeat(64) : source.contentHash },
+            return { ok: true, data: { source: { ...source,bytes:source.bytes+(overrides.changedSource&&offset>0?1:0) },
                 excerpt: { start: offset, end, quote: text.slice(offset, end) }, nextOffset: end === text.length ? null : end } };
         }
         throw new Error('Unexpected write/model command: ' + command.type);
     } } };
 }
 
-test('source continuation preserves UTF-16 boundaries and verifies complete text, hash and original Run identity', async () => {
+test('source continuation preserves UTF-16 boundaries and verifies complete text and original Run identity', async () => {
     const f = transport(), evidence = await collectResearchEvidence(f.host, { sessionId: 2, pageSize: 1 });
     expect(evidence).toMatchObject({ present: true, actual: { sourceTexts: [{ sourceSnapshotId: 7, runId: 4, toolCallId: 5,
         text: f.text, acquisition: 'controller-query', modelUse: 'requires-original-tool-and-context-evidence' }], reportCount: 0 } });

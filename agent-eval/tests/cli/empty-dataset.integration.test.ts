@@ -6,7 +6,7 @@ import { mkdtempSync } from '../../../tests/support/resources.ts';
 import { discoverDatasets, loadDataset } from '../../src/dataset-loader/local.ts';
 import { findDataset } from '../../src/execution/runner.ts';
 import { main } from '../../src/cli.ts';
-import { reportFixture } from '../support/fixtures.ts';
+import { comparisonFacts, reportFixture } from '../support/fixtures.ts';
 import { exportReport, exportEvents } from '../../src/langfuse/export.ts';
 
 function emptyRepo() {
@@ -55,7 +55,7 @@ test('missing datasets reject runs and dataset operations before model or execut
     } finally { network.mockRestore(); }
 });
 
-test('saved reports remain queryable, comparable, reviewable and exportable without Dataset', async () => {
+test('saved reports remain queryable, reviewable and exportable without Dataset, and comparison requires saved conditions', async () => {
     const repo = emptyRepo(), dir = join(repo, 'agent-eval/runs/unit');
     mkdirSync(dir, { recursive: true });
     const report = reportFixture(), file = join(dir, 'summary.json');
@@ -64,6 +64,8 @@ test('saved reports remain queryable, comparable, reviewable and exportable with
     try {
         await main(['status', '--execution-id', 'unit'], repo);
         expect(JSON.parse(String(output.mock.calls.at(-1)![0])).executionId).toBe('unit');
+        await expect(main(['compare', '--left', 'unit', '--right', 'unit'], repo)).rejects.toThrow('original execution conditions');
+        writeFileSync(join(dir, 'snapshot.json'), JSON.stringify(comparisonFacts()));
         await main(['compare', '--left', 'unit', '--right', 'unit'], repo);
         await main(['review', 'add', '--execution-id', 'unit', '--case', 'sample', '--reviewer', 'test-reviewer', '--verdict', 'good', '--note', 'synthetic feedback'], repo);
         await main(['review', 'status', '--execution-id', 'unit'], repo);

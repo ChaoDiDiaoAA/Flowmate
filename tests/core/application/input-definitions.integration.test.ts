@@ -19,12 +19,12 @@ it('freezes roles and native template expansion, and writes overrides with compa
   const role = first.data[0]!;
   const expanded = service.freeze('/review "two words" tail'); expect(expanded.ok && expanded.data.command?.expandedText).toBe('Review two words with two words tail.');
   expect(service.freeze('/unknown').ok).toBe(false);
-  expect(service.saveSubagentDefinition({ id: role.id, expectedHash: '0'.repeat(64), content: role.content }).ok).toBe(false);
-  expect(service.saveSubagentDefinition({ id: role.id, expectedHash: role.hash, content: role.content.replace('Analyze without tools.', 'Analyze independently.') }).ok).toBe(true);
+  expect(service.saveSubagentDefinition({ id: role.id, expectedContent: 'Stale content', content: role.content }).ok).toBe(false);
+  expect(service.saveSubagentDefinition({ id: role.id, expectedContent: role.content, content: role.content.replace('Analyze without tools.', 'Analyze independently.') }).ok).toBe(true);
   const changed = service.getSubagentDefinition({ id: role.id }); expect(changed.ok && changed.data.source).toBe('user');
   expect(role.systemPrompt).toBe('Analyze without tools.');
   const delegated = service.freeze('/subagent analyst find contradictions'); expect(delegated.ok && delegated.data.command?.requiredRoles).toEqual(['analyst']);
-  expect(service.saveSubagentDefinition({ id: 'writer', expectedHash: null,
+  expect(service.saveSubagentDefinition({ id: 'writer', expectedContent: null,
     content: '---\nname: writer\ndescription: Write\ntools: [write]\n---\nWrite.' }).ok).toBe(false);
 });
 
@@ -36,9 +36,9 @@ it('rejects a 65th effective role before saving and recovers interrupted owned s
   const service = createInputDefinitions({ resourceRoot: join(root, 'resources'), runtimeRoot: join(root, 'runtime'),
     tools: [], parseFrontmatter, loadPromptTemplates, expandPromptTemplate });
   const before = service.listSubagentDefinitions(); if (!before.ok) throw Error(before.error.code);
-  expect(service.saveSubagentDefinition({ id: 'extra', expectedHash: null,
+  expect(service.saveSubagentDefinition({ id: 'extra', expectedContent: null,
     content: '---\nname: extra\ndescription: Extra analysis\ntools: []\n---\nAnalyze.' }).ok).toBe(false);
-  expect(service.saveSubagentDefinition({ id: before.data[0]!.id, expectedHash: before.data[0]!.hash,
+  expect(service.saveSubagentDefinition({ id: before.data[0]!.id, expectedContent: before.data[0]!.content,
     content: before.data[0]!.content.replace('without tools', 'independently') }).ok).toBe(true);
   writeFileSync(join(root, 'runtime/subagents/.b438343e-0a15-4c9b-a59c-4066d14c1eef.tmp'), 'interrupted old staging');
   writeFileSync(join(root, 'runtime/.subagent-b438343e-0a15-4c9b-a59c-4066d14c1eef.tmp'), 'interrupted staging');

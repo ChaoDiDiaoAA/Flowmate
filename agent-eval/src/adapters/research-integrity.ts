@@ -1,19 +1,16 @@
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
-import { createHash } from 'node:crypto';
 import { ClaimSchema, ResearchPlanSchema, ResearchReportSchema, SourceSnapshotSchema,
     ResearchLocatorSchema, EvidenceRefSchema, type ResearchSourcePolicy } from '../../../packages/contracts/src/research.ts';
 import { ToolCallSnapshotSchema } from '../../../packages/contracts/src/tool-evidence.ts';
 import { collectedResearchSchema } from './research-evidence.ts';
-import { hash } from '../dataset-loader/local.ts';
 import type { CaseExecutionResult, EvidenceFact } from '../types.ts';
 
 type Issue = { kind: string; id: number | null; code: string; severity: 'invalid' | 'unknown'; evidenceIndex?: number };
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const runsSchema = z.array(z.object({ runId: id, sessionId: id, kind: z.enum(['agent', 'subagent']) }).passthrough());
 const toolsSchema = z.object({ calls: z.array(z.object({ tool: ToolCallSnapshotSchema }).passthrough()) }).passthrough();
-const registrationSchema = z.array(z.object({ artifactId: id, sample: z.string().min(1), file: z.string().min(1),
-    sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict());
+const registrationSchema = z.array(z.object({ artifactId: id, sample: z.string().min(1), file: z.string().min(1) }).strict());
 const sourceReadSchema = z.object({ source: SourceSnapshotSchema, excerpt: ResearchLocatorSchema,
     evidenceRef: EvidenceRefSchema.nullable().optional(),
     usage: z.object({ requestId: z.string().max(256).nullable(), credits: z.number().finite().nonnegative().nullable() }).strict() }).strict();
@@ -93,16 +90,15 @@ export function inspectResearchEvidence(evidence: EvidenceFact, proof: { runs: E
             const body = bodies.get(snapshot.sourceSnapshotId);
             if (snapshot.researchId !== task.researchId || !allowed(snapshot, task.sourcePolicy)) add('source', snapshot.sourceSnapshotId, 'source-scope');
             if (snapshot.address !== (snapshot.kind === 'local' ? 'artifact:' + snapshot.artifactId : 'document:' + snapshot.documentId) ||
-                snapshot.relativePath !== `artifacts/research/${task.researchId}/${snapshot.contentHash}.txt`) add('source', snapshot.sourceSnapshotId, 'source-address');
+                snapshot.relativePath !== `artifacts/research/${task.researchId}/source-${snapshot.toolCallId}.txt`) add('source', snapshot.sourceSnapshotId, 'source-address');
             if (!body) add('source', snapshot.sourceSnapshotId, 'source-text-unavailable', 'unknown');
-            else if (body.runId !== snapshot.runId || body.toolCallId !== snapshot.toolCallId || hash(body.text) !== snapshot.contentHash ||
+            else if (body.runId !== snapshot.runId || body.toolCallId !== snapshot.toolCallId ||
                 body.text.length !== snapshot.characters || Buffer.byteLength(body.text) !== snapshot.bytes) add('source', snapshot.sourceSnapshotId, 'source-body');
             if (snapshot.kind === 'local' && registration.success) {
                 const matches = registration.data.filter(m => m.artifactId === snapshot.artifactId);
                 const material = matches.length === 1 ? proof.input.materials.filter(m => m.sample === matches[0]!.sample && m.file === matches[0]!.file) : [];
                 if (!matches.length) add('source', snapshot.sourceSnapshotId, 'source-material', proof.registration.present && proof.registration.source.trim() ? 'invalid' : 'unknown');
-                else if (material.length !== 1 || createHash('sha256').update(material[0]!.text, 'utf8').digest('hex') !== matches[0]!.sha256 ||
-                    snapshot.contentHash !== hash(material[0]!.text) || snapshot.bytes !== Buffer.byteLength(material[0]!.text) ||
+                else if (material.length !== 1 || snapshot.bytes !== Buffer.byteLength(material[0]!.text) ||
                     snapshot.characters !== material[0]!.text.length || snapshot.truncated ||
                     body && material[0]!.text !== body.text) add('source', snapshot.sourceSnapshotId, 'source-material');
                 else if (body) sourceBindings.push({ sourceSnapshotId: snapshot.sourceSnapshotId, sample: material[0]!.sample, file: material[0]!.file });

@@ -14,7 +14,7 @@ type Run={status:string;stoppedAt:string|null;cleanup:Record<string,unknown>};
 /** Observe the original race. Only independent engineering fixtures hold a transaction boundary. */
 export async function cancelOriginalSave(client:HostClient,owner:{runId:number;sessionId:number},signal:AbortSignal,readRun:(runId:number)=>Promise<Run>){
     const actual:Record<string,unknown>={profile:{id:'invoice-save-cancel-race',version:1},exposure:{verified:false},cancelRequests:0,resends:0,linearization:'commit-unknown',candidateCount:null,stopConfirmed:false};
-    const evidence:EvidenceFact={present:true,actual,source:'Original in-flight save, one public cancellation, hash-bound commit and every descendant stop'};
+    const evidence:EvidenceFact={present:true,actual,source:'Original in-flight save, one public cancellation, original commit and every descendant stop'};
     async function query<T>(command:Parameters<HostClient['request']>[0],schema:z.ZodType<T>):Promise<T>{
         const result=z.object({ok:z.boolean(),data:z.unknown().optional(),error:z.unknown().optional()}).strict().parse(await client.request(command));
         if(!result.ok)throw new Error(command.type+': original query unavailable');return schema.parse(result.data);

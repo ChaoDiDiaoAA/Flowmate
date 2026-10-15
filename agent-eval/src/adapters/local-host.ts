@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 import { REPO_ROOT } from '../dataset-loader/local.ts';
@@ -20,8 +19,7 @@ export function prepareLocalHost(repo: string, directory: string, invoices: Sele
     const invoiceSourceRoot = join(runtimeRoot, 'invoice-input');
     writeInvoiceInputs(invoiceSourceRoot, invoices);
     const files: string[] = [];
-    const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
-    function copyTree(source: string, target: string, allowed: (file: string) => boolean) {
+        function copyTree(source: string, target: string, allowed: (file: string) => boolean) {
         const boundary = realpathSync(source);
         function copy(file: string, destination: string) {
             const stat = lstatSync(file), rel = relative(boundary, realpathSync(file));
@@ -51,7 +49,7 @@ export function prepareLocalHost(repo: string, directory: string, invoices: Sele
     for (const resource of resources) for (const file of resource.files) {
         const destination = join(runtimeRoot, 'resources', resource.ref.kind === 'skill' ? 'skills' : 'prompts', resource.ref.id, file.path);
         const rel = relative(join(runtimeRoot, 'resources'), destination);
-        if (isAbsolute(rel) || rel.startsWith('..') || digest(file.bytes) !== file.sha256) throw Error('Selected resource escaped or changed');
+        if (isAbsolute(rel) || rel.startsWith('..')) throw Error('Selected resource escaped');
         mkdirSync(dirname(destination), { recursive: true }); writeFileSync(destination, file.bytes, { flag: 'wx' });
         files.push(relative(runtimeRoot, destination).replaceAll('\\', '/'));
     }

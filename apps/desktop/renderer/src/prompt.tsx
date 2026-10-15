@@ -15,7 +15,7 @@ export function ResourceFile({ identity, ref: resource, path, run, enabled = tru
     await file.read(`file:${offset}`, () => run
       ? window.flowmate.readRunResourceFile({ ...run, ref: resource, path, offset })
       : window.flowmate.readResourceFile({ ref: resource, path, offset }), value => resourceRefKey(value.ref) === resourceRefKey(resource)
-        && value.path === path && value.offset === offset && (offset === 0 || value.sha256 === file.state.data?.sha256),
+        && value.path === path && value.offset === offset && (offset === 0 || value.totalBytes === file.state.data?.totalBytes),
       offset === 0 ? undefined : (previous, next) => ({ ...next, text: (previous?.text ?? '') + next.text }));
   }
   useEffect(() => { if (enabled) void load(); }, [identity.hostEpoch, identity.selectionToken, resourceRefKey(resource), path, enabled]);
@@ -23,7 +23,7 @@ export function ResourceFile({ identity, ref: resource, path, run, enabled = tru
     {!enabled && <p>Enable this Skill to read its files.</p>}
     {file.state.error && <p role="alert">{file.state.error}</p>}
     {file.state.pending && <p>Loading resource…</p>}
-    {enabled && file.state.data && <><p>{file.state.data.totalBytes} bytes · SHA-256 {file.state.data.sha256}</p>
+    {enabled && file.state.data && <><p>{file.state.data.totalBytes} bytes</p>
       <pre data-testid="resource-file" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{file.state.data.text}</pre>
       {file.state.data.nextOffset !== null && <button className="secondary-button" disabled={file.state.pending}
         onClick={() => void load(file.state.data!.nextOffset!)}>Read more</button>}</>}
@@ -114,7 +114,7 @@ export function ResourcePage({ kind, hostEpoch, ready, revision, onSaved, embedd
     {kind === 'skill' && <details className="skill-recovery"><summary>Resource recovery</summary>
       <button className="text-button" disabled={!ready || catalog.state.pending || saving.state.pending || refreshRequired}
         onClick={() => void save(EMPTY_RESOURCE_SELECTION)}>Clear all resource selections</button></details>}
-    {selected && <section className="panel" aria-label="Resource details"><h3>{label(selected.ref)}</h3><p>Content SHA-256 {selected.ref.contentHash}</p>
+    {selected && <section className="panel" aria-label="Resource details"><h3>{label(selected.ref)}</h3>
       {kind === 'skill' && <><p>{selected.name} · {introduction(selected)}</p>{selected.diagnostics.map((diagnostic, index) => <p key={index} role="alert">{diagnostic.code} · {diagnostic.message}</p>)}</>}
       <p>Keywords: {selected.keywords.join(', ') || 'None'}</p><h4>Dependencies</h4>
       {selected.dependencyChecks.length ? <ul>{selected.dependencyChecks.map((check, index) => <li key={index}>{check.dependency.kind} · {'name' in check.dependency ? check.dependency.name : check.dependency.id}
@@ -136,7 +136,7 @@ export function RunResources({ identity, ready, refreshToken }: { identity: Cont
   return <section aria-label="Run resources"><h3>Run resources</h3><button className="text-button" disabled={!ready || identity.runId === null || facts.state.pending} onClick={() => void refresh()}>Refresh Run resources</button>
     {facts.state.error && <p role="alert">{facts.state.error}</p>}{facts.state.pending && <p>Loading resources…</p>}
     {data && <>{data.gap && <p>Evidence unavailable · {data.gap}</p>}
-      <p>Prompt: {data.frozen?.prompt ? label(data.frozen.prompt) : 'None recorded'} · Bundle: {data.frozen?.bundleHash ?? 'None recorded'}</p>
+      <p>Prompt: {data.frozen?.prompt ? label(data.frozen.prompt) : 'None recorded'} · Bundle: {data.frozen?.bundleId ?? 'None recorded'}</p>
       <p>Selected Skills: {data.frozen?.selectedSkills.map(label).join(', ') || 'None recorded'}</p>
       <p>Discovered Skills: {data.frozen?.discoveredSkills.map(label).join(', ') || 'None recorded'}</p>
       {data.frozen?.excludedSkills.map(item => <p key={resourceRefKey(item.ref)}>Excluded {label(item.ref)} · {item.code}</p>)}

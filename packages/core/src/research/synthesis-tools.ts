@@ -18,6 +18,8 @@ export function readResearchEvidence(options: Dependencies, raw: z.input<typeof 
   const authorized = value.kind === 'local' ? policy.artifactIds.includes(value.artifactId!)
     : policy.documentIds.includes(value.documentId!);
   if (!authorized) return fail(appError('research_source_denied', 'tool', 'This evidence is outside the selected source policy.'));
+  if (value.verificationGap === 'legacy-original-unavailable') return fail(appError('research_evidence_incomplete', 'tool',
+    'The historical source is retained, but its original bytes cannot be verified. Acquire a new source before using it as evidence.'));
   const original = options.calls.getById(value.toolCallId); if (!original.ok) return original;
   if (original.data.runId !== value.runId || original.data.status !== 'succeeded' || !original.data.cleanup.stopped
     || original.data.toolName !== 'read_research_local')

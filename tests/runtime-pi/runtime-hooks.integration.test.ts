@@ -36,8 +36,8 @@ for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-id-mutate', 'sdk-na
     const opened = await createApplication({ paths, logger: { write() {}, close: async () => undefined },
       toolDefinitions: definitions => definitions.map(tool => tool.name === 'calculate_invoice_amounts'
         ? { ...tool, execute: (...call: Parameters<typeof tool.execute>) => { business += 1; return tool.execute(...call); } } : tool),
-      agentFactory: definitions => {
-      const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => {
+      const adapter = new PiAgentAdapter({ resourceContents, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-key', sessionSetup(session) {
           const originalBefore = session.agent.beforeToolCall, originalAfter = session.agent.afterToolCall;
           session.agent.beforeToolCall = async (...call) => {

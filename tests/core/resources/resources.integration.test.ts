@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'bun:test';
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadSkillsFromDir } from '@earendil-works/pi-coding-agent';
@@ -13,33 +12,35 @@ import { canonicalResourceManifest, EMPTY_RESOURCE_SELECTION, ResourceManifestSc
 import type { ResourceDependency, ResourceSelection, ToolDefinition, AgentRunEvent, RunScope } from '../../../packages/contracts/src/index.ts';
 import { mkdtempSync, createHttpProvider, deferCleanup } from '../../support/resources.ts';
 
-const digest = (text: string | Buffer) => createHash('sha256').update(text).digest('hex');
 const tools = ['read', 'read_invoice_evidence', 'check_invoice_sources', 'normalize_invoice_values', 'validate_invoice_candidate'];
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-resources-'));
   const resourceRoot = join(root, 'author'), bundleRoot = join(root, 'bundles');
   mkdirSync(resourceRoot);
+  const storagePaths = resolveProductPaths(join(root, 'storage')); if (!storagePaths.ok) throw new Error(storagePaths.error.code);
+  const storage = core.openDatabase(storagePaths.data); if (!storage.ok) throw new Error(storage.error.code);
+  deferCleanup(() => storage.data.close()); const contents = storage.data.contents;
   function pack(kind: 'prompt' | 'skill', id = 'invoice', version = 'v1', body?: string, requires: ResourceDependency[] = []) {
     const dir = join(resourceRoot, kind === 'prompt' ? 'prompts' : 'skills', id);
     mkdirSync(join(dir, 'references'), { recursive: true });
     const bodyFile = kind === 'prompt' ? 'prompt.md' : 'SKILL.md';
     const bodyText = body ?? (kind === 'prompt' ? '核对发票字段，不补造缺失值。' : `---\nname: ${id}\ndescription: 发票字段整理\ndisable-model-invocation: false\n---\n请读取 references/field-rules.md。`);
     const texts = { [bodyFile]: bodyText, 'references/field-rules.md': '发票😀字段：缺失不等于零。' };
-    const manifest = ResourceManifestSchema.parse({ schemaVersion: 1, kind, id, version, bodyFile,
+    const manifest = ResourceManifestSchema.parse({ schemaVersion: 2, kind, id, version, bodyFile,
       keywords: ['发票'], requires, files: Object.entries(texts).map(([path, text]) => ({ path,
-        bytes: Buffer.byteLength(text), sha256: digest(text) })) });
+        bytes: Buffer.byteLength(text) })) });
     for (const [path, text] of Object.entries(texts)) writeFileSync(join(dir, path), text);
     writeFileSync(join(dir, 'resource.json'), JSON.stringify(manifest));
-    const ref = ResourceRefSchema.parse({ kind, id, version, contentHash: digest(canonicalResourceManifest(manifest)) });
+    const ref = ResourceRefSchema.parse({ kind, id, version });
     return { dir, ref, manifest, bodyText, texts };
   }
   const inspect = Reflect.get(pi, 'inspectNativeResources');
   const create = Reflect.get(core, 'createResourceService');
   const service = () => {
     expect(typeof inspect).toBe('function'); expect(typeof create).toBe('function');
-    return create({ resourceRoot, bundleRoot, registeredToolNames: tools, inspectNativeResources: inspect });
+    return create({ resourceRoot, bundleRoot, contents, registeredToolNames: tools, inspectNativeResources: inspect });
   };
-  return { root, resourceRoot, bundleRoot, pack, service, inspect };
+  return { root, resourceRoot, bundleRoot, pack, service, inspect, contents };
 }
 
 describe('P11 real resource files and native discovery', () => {
@@ -49,7 +50,7 @@ describe('P11 real resource files and native discovery', () => {
     const frozen = f.service().freeze({ settingsRevision: 1, selection: { prompt: null, enabledSkills: [ready.ref, missing.ref] },
       activeToolNames: ['read'], requiredSkill: null });
     expect(frozen.ok).toBe(true); if (!frozen.ok || !frozen.data) throw new Error('missing frozen resources');
-    const loader = pi.createRunResourceLoader({ fixedSystemPrompt: 'review', frozen: frozen.data,
+    const loader = pi.createRunResourceLoader({ contents: f.contents, fixedSystemPrompt: 'review', frozen: frozen.data,
       bundleDirectory: frozen.data.bundleDirectory, activeToolNames: ['read'] });
     expect(loader.ok).toBe(true); if (!loader.ok) throw new Error(loader.error.code);
     const text = loader.data.getAppendSystemPrompt().join('\n');
@@ -57,15 +58,15 @@ describe('P11 real resource files and native discovery', () => {
     expect(text).toContain('missing:'); expect(text).toContain('Partial (0/1 capabilities)'); expect(text).toContain('write');
     expect(loader.data.getSkills().skills.map(skill => skill.name)).toEqual(['ready']);
     expect(loader.data.bodyFor(missing.ref)).toBeNull();
-    const child = pi.createRunResourceLoader({ fixedSystemPrompt: 'child', frozen: frozen.data,
+    const child = pi.createRunResourceLoader({ contents: f.contents, fixedSystemPrompt: 'child', frozen: frozen.data,
       bundleDirectory: frozen.data.bundleDirectory, activeToolNames: [], visibleSkillRefs: [] });
     expect(child.ok).toBe(true); if (!child.ok) throw new Error(child.error.code);
     expect(child.data.getSkills().skills).toEqual([]);
     expect(child.data.getAppendSystemPrompt().join('\n')).toContain('Partial (0/1 capabilities)');
     if (!frozen.data.skillIndex) throw Error('Missing fixed readiness index');
-    const changed = { ...frozen.data, skillIndex: { ...frozen.data.skillIndex, hash: '0'.repeat(64) } };
+    const changed = { ...frozen.data, skillIndex: { entries: frozen.data.skillIndex.entries.map(entry => ({ ...entry, description: 'Changed index' })) } };
     expect(f.service().verifyFrozen(changed).ok).toBe(false);
-    expect(pi.createRunResourceLoader({ fixedSystemPrompt: 'review', frozen: changed,
+    expect(pi.createRunResourceLoader({ contents: f.contents, fixedSystemPrompt: 'review', frozen: changed,
       bundleDirectory: frozen.data.bundleDirectory, activeToolNames: ['read'] }).ok).toBe(false);
   });
   it('rejects a combined native Skill index and readiness section larger than 16 KiB', () => {
@@ -74,7 +75,7 @@ describe('P11 real resource files and native discovery', () => {
     const frozen = f.service().freeze({ settingsRevision: 1, selection: { prompt: null, enabledSkills: refs },
       activeToolNames: ['read'], requiredSkill: null });
     if (!frozen.ok || !frozen.data) throw Error('Expected valid packages before runtime index validation');
-    expect(pi.createRunResourceLoader({ fixedSystemPrompt: 'review', frozen: frozen.data,
+    expect(pi.createRunResourceLoader({ contents: f.contents, fixedSystemPrompt: 'review', frozen: frozen.data,
       bundleDirectory: frozen.data.bundleDirectory, activeToolNames: ['read'] })).toMatchObject({ ok: false,
       error: { code: 'resource_bundle_unavailable' } });
   });
@@ -114,7 +115,7 @@ describe('P11 real resource files and native discovery', () => {
     let selection: ResourceSelection = EMPTY_RESOURCE_SELECTION;
     const created = await createApplication({ paths: paths.data, invoiceSourceRoot: sourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection }),
-      agentFactory: tools => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
+      agentFactory: (tools, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-sken-key' }) });
     if (!created.ok) throw new Error(created.error.code); const app = created.data; deferCleanup(() => app.close());
     const catalog = await app.listResources(); if (!catalog.ok) throw new Error(catalog.error.code);
@@ -163,7 +164,7 @@ describe('P11 real resource files and native discovery', () => {
     expect(view.data.evidence?.requests[0]?.contentChecks.filter(check => check.scope === 'skill-readiness'))
       .toHaveLength(ids.length);
     expect(view.data.evidence?.requests[0]?.contentChecks.filter(check => check.scope === 'skill-readiness')
-      .every(check => check.sdkInclusion === 'confirmed' && check.wireInclusion === 'confirmed' && check.expectedTextHash !== null)).toBe(true);
+      .every(check => check.sdkInclusion === 'confirmed' && check.wireInclusion === 'confirmed' && check.expectedText !== null)).toBe(true);
     for (const id of requested) for (const path of ['SKILL.md', 'references/guide.md']) {
         const text = readFileSync(join(import.meta.dir, '../../../resources/skills', id, path), 'utf8');
         expect(system).not.toContain(text);
@@ -191,13 +192,16 @@ describe('P11 real resource files and native discovery', () => {
       'invoice-line-item-extraction', 'invoice-missing-info-review', 'invoice-party-role-review', 'invoice-review-handoff', 'invoice-source-audit']);
     for (const skill of skills) expect(skill).toMatchObject({ available: true, enabled: false, diagnostics: [],
       bodyFile: 'SKILL.md', disableModelInvocation: skill.ref.id === 'invoice-candidate-save' });
-    const service = core.createResourceService({ resourceRoot: join(import.meta.dir, '../../../resources'),
+    await created.data.close();
+    const storage = core.openDatabase(paths.data); if (!storage.ok) throw new Error(storage.error.code);
+    deferCleanup(() => storage.data.close());
+    const service = core.createResourceService({ contents: storage.data.contents, resourceRoot: join(import.meta.dir, '../../../resources'),
       bundleRoot: join(root, 'library-bundles'), registeredToolNames: definitions.map(tool => tool.name), inspectNativeResources: pi.inspectNativeResources });
     const selection = { prompt: null, enabledSkills: skills.map(item => item.ref) };
     const frozen = service.freeze({ selection, settingsRevision: 1, activeToolNames: definitions.map(tool => tool.name), requiredSkill: null });
     expect(frozen.ok && frozen.data?.discoveredSkills).toEqual(selection.enabledSkills);
     if (!frozen.ok || !frozen.data) throw new Error('shipped library unavailable');
-    const all = pi.createRunResourceLoader({ fixedSystemPrompt: 'Invoice review', frozen: frozen.data,
+    const all = pi.createRunResourceLoader({ contents: storage.data.contents, fixedSystemPrompt: 'Invoice review', frozen: frozen.data,
       bundleDirectory: frozen.data.bundleDirectory, activeToolNames: definitions.map(tool => tool.name) });
     if (!all.ok) throw new Error(all.error.code);
     for (const [id, count] of [['invoice-party-role-review', 5], ['invoice-date-currency-review', 5],
@@ -217,7 +221,7 @@ describe('P11 real resource files and native discovery', () => {
     expect(visible.map(ref => ref.id)).toContain('invoice-source-audit');
     expect(visible.map(ref => ref.id)).not.toContain('invoice-candidate-save');
     expect(core.visibleFrozenSkills(frozen.data, ['fill_invoice_form'])).toEqual([]);
-    const loaderInput = { fixedSystemPrompt: 'Read-only Skill context', frozen: frozen.data, bundleDirectory: frozen.data.bundleDirectory,
+    const loaderInput = { contents: storage.data.contents, fixedSystemPrompt: 'Read-only Skill context', frozen: frozen.data, bundleDirectory: frozen.data.bundleDirectory,
       activeToolNames: ['list_skill_resources', 'read_skill_resource'], visibleSkillRefs: visible };
     const loader = pi.createRunResourceLoader(loaderInput);
     expect(loader.ok && loader.data.getSkills().skills.map(skill => skill.name)).toEqual(visible.map(ref => ref.id));
@@ -234,10 +238,9 @@ describe('P11 real resource files and native discovery', () => {
     const controls = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x00, 0x00]);
     const whitespace = Buffer.from('中文\ttext\r\n');
     skill.manifest = ResourceManifestSchema.parse({ ...skill.manifest, files: [...skill.manifest.files,
-      { path: 'references/binary.bin', bytes: binary.length, sha256: digest(binary) },
-      { path: 'references/controls.bin', bytes: controls.length, sha256: digest(controls) },
-      { path: 'references/text.txt', bytes: whitespace.length, sha256: digest(whitespace) }] });
-    skill.ref = ResourceRefSchema.parse({ ...skill.ref, contentHash: digest(canonicalResourceManifest(skill.manifest)) });
+      { path: 'references/binary.bin', bytes: binary.length },
+      { path: 'references/controls.bin', bytes: controls.length },
+      { path: 'references/text.txt', bytes: whitespace.length }] });
     writeFileSync(join(skill.dir, 'references/binary.bin'), binary);
     writeFileSync(join(skill.dir, 'references/controls.bin'), controls);
     writeFileSync(join(skill.dir, 'references/text.txt'), whitespace);
@@ -253,7 +256,7 @@ describe('P11 real resource files and native discovery', () => {
     const created = await createApplication({ paths: paths.data, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
       toolDefinitions: tools => { definitions = tools; return tools; },
-      agentFactory: tools => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
+      agentFactory: (tools, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'owned-skill-key' }) });
     if (!created.ok) throw new Error(created.error.code); const app = created.data;
     deferCleanup(async () => { release(); await app.close(); });
@@ -279,7 +282,7 @@ describe('P11 real resource files and native discovery', () => {
       const call = { nativeToolCallId: 'owned-skill-read', signal: new AbortController().signal };
       writeFileSync(join(skill.dir, 'SKILL.md'), 'New unverified author text');
       expect(await list.execute({ skill: 'invoice' }, call, context)).toEqual({ ref: skill.ref,
-        bundleHash: FrozenResourcesSchema.parse(run.data.config.resources).bundleHash,
+        bundleId: FrozenResourcesSchema.parse(run.data.config.resources).bundleId,
         files: [...skill.manifest.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0) });
       expect(await read.execute({ skill: 'invoice', path: 'SKILL.md' }, call, context)).toMatchObject({ ref: skill.ref, text: skill.bodyText,
         offset: 0, nextOffset: null, totalBytes: Buffer.byteLength(skill.bodyText) });
@@ -389,7 +392,7 @@ describe('P11 real resource files and native discovery', () => {
       error: { code: 'resource_version_changed' } });
     expect(hub.freeze({ selection, settingsRevision: 2, activeToolNames: tools, requiredSkill: null })).toMatchObject({ ok: true,
       data: { prompt: prompt.ref, discoveredSkills: [], excludedSkills: [{ ref: skill.ref, code: 'resource_version_changed' }] } });
-    writeFileSync(join(f.bundleRoot, frozen.data.bundleHash, 'skills', 'invoice', 'v1', 'SKILL.md'), 'corrupt frozen copy');
+    writeFileSync(join(f.bundleRoot, frozen.data.bundleId, 'skills', 'invoice', 'v1', 'SKILL.md'), 'corrupt frozen copy');
     expect(hub.verifyFrozen(frozen.data)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
   });
 
@@ -422,18 +425,21 @@ describe('P11 real resource files and native discovery', () => {
       data: { discoveredSkills: [skill.ref] } });
   });
 
-  it('reuses one content bundle across revisions without rewriting admission metadata or corrupt published content', () => {
+  it('reuses an unchanged bundle without rewriting earlier metadata and rejects changed original bytes', () => {
     const f = fixture(), skill = f.pack('skill'), hub = f.service(), selection = { prompt: null, enabledSkills: [skill.ref] };
     const first = hub.freeze({ selection, settingsRevision: 1, activeToolNames: tools, requiredSkill: null });
     expect(first.ok && first.data).toBeTruthy(); if (!first.ok || !first.data) throw new Error('missing first bundle');
-    const path = join(f.bundleRoot, first.data.bundleHash, 'bundle.json'), bytes = readFileSync(path, 'utf8');
+    const path = join(f.bundleRoot, first.data.bundleId, 'bundle.json'), bytes = readFileSync(path, 'utf8');
     expect(bytes).not.toContain('settingsRevision'); expect(bytes).not.toContain('selectedSkills');
-    expect(hub.freeze({ selection, settingsRevision: 2, activeToolNames: tools, requiredSkill: null })).toMatchObject({ ok: true,
-      data: { bundleHash: first.data.bundleHash, settingsRevision: 2 } });
+    const second = hub.freeze({ selection, settingsRevision: 2, activeToolNames: tools, requiredSkill: null });
+    expect(second.ok && second.data).toBeTruthy(); if (!second.ok || !second.data) throw new Error('missing second bundle');
+    expect(second.data.bundleId).toBe(first.data.bundleId);
+    expect(second.data.settingsRevision).toBe(2);
     expect(readFileSync(path, 'utf8')).toBe(bytes);
     writeFileSync(path, '{}');
-    expect(hub.freeze({ selection, settingsRevision: 3, activeToolNames: tools, requiredSkill: null })).toMatchObject({ ok: false,
-      error: { code: 'resource_bundle_unavailable' } });
+    expect(hub.verifyFrozen(first.data)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
+    expect(hub.verifyFrozen(second.data).ok).toBe(false);
+    expect(hub.freeze({ selection, settingsRevision: 3, activeToolNames: tools, requiredSkill: null })).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
     expect(readFileSync(path, 'utf8')).toBe('{}');
   });
 
@@ -461,10 +467,10 @@ describe('P11 real resource files and native discovery', () => {
     const f = fixture(), skill = f.pack('skill'), hub = f.service(), selection = { prompt: null, enabledSkills: [skill.ref] };
     const frozen = hub.freeze({ selection, settingsRevision: 0, activeToolNames: tools, requiredSkill: skill.ref });
     if (!frozen.ok || !frozen.data) throw new Error('missing fixed bundle');
-    const bundleDirectory = join(f.bundleRoot, frozen.data.bundleHash);
+    const bundleDirectory = join(f.bundleRoot, frozen.data.bundleId);
     writeFileSync(join(bundleDirectory, 'skills/invoice/v1/resource.json'), '{}');
     expect(hub.verifyFrozen(frozen.data)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
-    expect(pi.createRunResourceLoader({ fixedSystemPrompt: 'fixed', frozen: frozen.data, bundleDirectory })).toMatchObject({ ok: false,
+    expect(pi.createRunResourceLoader({ contents: f.contents, fixedSystemPrompt: 'fixed', frozen: frozen.data, bundleDirectory })).toMatchObject({ ok: false,
       error: { code: 'resource_bundle_unavailable' } });
     const unregistered = f.pack('skill', 'unregistered', 'v1', undefined, [{ kind: 'tool', name: 'never_registered' }]);
     expect(hub.freeze({ selection: { prompt: null, enabledSkills: [unregistered.ref] }, settingsRevision: 0,
@@ -485,7 +491,7 @@ describe('P11 real resource files and native discovery', () => {
     deferCleanup(() => provider.stop());
     const created = await createApplication({ paths: paths.data, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision, selection }),
-      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools: definitions,
+      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-p11-key' }) });
     if (!created.ok) throw new Error(created.error.code);
     const app = created.data; deferCleanup(() => app.close());
@@ -505,12 +511,12 @@ describe('P11 real resource files and native discovery', () => {
       expect(fixed.data.settingsRevision).toBe(3); expect(fixed.data.prompt).toEqual(prompt.ref);
       const input = await app.querySessionInput({ sessionId: session.data.sessionId, inputId: accepted.data.inputId });
       expect(input).toMatchObject({ ok: true, data: { input: { content: { version: 2, text: request.text, promptText: request.text,
-        resourceBinding: { bundleHash: fixed.data.bundleHash, requiredSkill: null } } } } });
+        resourceBinding: { bundleId: fixed.data.bundleId, requiredSkill: null } } } } });
       const snapshots = await app.listContextSnapshots({ sessionId: session.data.sessionId, runId: accepted.data.runId });
       if (!snapshots.ok || !snapshots.data.items[0]) throw new Error('new Input has no Context');
       expect(await app.queryContextSnapshot({ sessionId: session.data.sessionId, runId: accepted.data.runId, snapshotId: snapshots.data.items[0].id }))
         .toMatchObject({ ok: true, data: { snapshot: { json: { resourcePolicy: 'p11-resources-v1',
-          resourceBinding: { bundleHash: fixed.data.bundleHash, requiredSkill: null } } } } });
+          resourceBinding: { bundleId: fixed.data.bundleId, requiredSkill: null } } } } });
       const next = f.pack('prompt', 'invoice', 'v2'); selection = { prompt: next.ref, enabledSkills: [] }; revision = 4;
       expect(await app.submitInput(request)).toEqual(accepted);
       expect(await app.submitInput({ ...request, text: 'changed original intent' })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
@@ -524,7 +530,7 @@ describe('P11 real resource files and native discovery', () => {
       expect(await read({ ...owner, ref: prompt.ref, path: 'prompt.md' })).toMatchObject({ ok: true,
         data: { text: prompt.bodyText } });
       expect((await query({ ...owner, sessionId: owner.sessionId + 1 })).ok).toBe(false);
-      writeFileSync(join(paths.data.runtimeDir, 'resource-bundles', fixed.data.bundleHash, 'bundle.json'), '{}');
+      writeFileSync(join(paths.data.runtimeDir, 'resource-bundles', fixed.data.bundleId, 'bundle.json'), '{}');
       expect(await query(owner)).toMatchObject({ ok: true, data: { gap: 'bundle-unavailable', frozen: fixed.data } });
       expect(await read({ ...owner, ref: prompt.ref, path: 'prompt.md' })).toMatchObject({ ok: false,
         error: { code: 'resource_bundle_unavailable' } });

@@ -1,9 +1,9 @@
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import type { HostClient } from '../../../apps/desktop/main/host-client.ts';
 import { ResearchSessionResultSchema, ResearchPlanResultSchema, ResearchSourcesResultSchema, ResearchClaimsResultSchema,
     ResearchReportsResultSchema, ResearchEvidenceResultSchema, ResearchTaskSchema, ResearchPlanSchema, SourceSnapshotSchema,
     ClaimSchema, ResearchReportSchema } from '../../../packages/contracts/src/research.ts';
-import { hash } from '../dataset-loader/local.ts';
 import type { EvidenceFact } from '../types.ts';
 
 type HostReader = Pick<HostClient, 'request'>;
@@ -82,7 +82,7 @@ export async function collectResearchEvidence(host: HostReader, input: { session
             let offset = 0, text = '';
             for (;;) {
                 const page = await read(host, { type: 'query_research_evidence', input: { researchId, sourceSnapshotId: snapshot.sourceSnapshotId, offset, limit: 4000 } }, ResearchEvidenceResultSchema);
-                if (hash(page.source) !== hash(snapshot)) throw new Error('Research source changed during continuation');
+                if (!isDeepStrictEqual(page.source,snapshot)) throw new Error('Research source changed during continuation');
                 if (page.excerpt.start !== offset || page.excerpt.end > snapshot.characters ||
                     /[\uDC00-\uDFFF]/.test(page.excerpt.quote[0]!) || /[\uD800-\uDBFF]/.test(page.excerpt.quote.at(-1)!))
                     throw new Error('Research source continuation has a gap or splits UTF-16');
@@ -91,8 +91,8 @@ export async function collectResearchEvidence(host: HostReader, input: { session
                 if (page.nextOffset !== page.excerpt.end || page.nextOffset <= offset) throw new Error('Research source continuation made no progress');
                 offset = page.nextOffset;
             }
-            if (text.length !== snapshot.characters || Buffer.byteLength(text) !== snapshot.bytes || hash(text) !== snapshot.contentHash)
-                throw new Error('Research source text differs from saved hash or size');
+            if (text.length !== snapshot.characters || Buffer.byteLength(text) !== snapshot.bytes)
+                throw new Error('Research source text differs from saved size');
             actual.sourceTexts.push({ sourceSnapshotId: snapshot.sourceSnapshotId, runId: snapshot.runId, toolCallId: snapshot.toolCallId, text,
                 acquisition: 'controller-query', modelUse: 'requires-original-tool-and-context-evidence' });
         }

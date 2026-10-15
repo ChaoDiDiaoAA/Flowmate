@@ -39,7 +39,7 @@ test('four command groups, keyboard and IME, role overrides, themes and real con
     const seed = await page.evaluate(async baseUrl => {
       const need = (r: any) => { if (!r.ok) throw Error(r.error.code); return r.data; };
       const state = need(await window.flowmate.getState());
-      const settings = need(await window.flowmate.saveSettings({ ...state.settings, models: [{ id: 'input-ui', credentialRef: 'input_ui_synthetic',
+      const settings = need(await window.flowmate.saveSettings({ ...state.settings, models: [{ id: 'input-ui', credentialRef: '00000000000000000000000000000026',
         name: 'Input UI', kind: 'custom', providerId: null, baseUrl, model: 'input-ui', api: 'openai-completions',
         contextWindow: 64000, maxTokens: 16000, reasoning: false }], defaultModelId: 'input-ui' }, { modelId: 'input-ui', apiKey: 'synthetic-ui-only' }));
       const extensions = need(await window.flowmate.listExtensions());

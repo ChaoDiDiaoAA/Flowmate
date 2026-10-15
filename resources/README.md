@@ -1,22 +1,26 @@
 # Flowmate 作者资源
 
-Skill 属于 P11。具体文档位于 `resources/skills/<skill-id>/`，每个 ID 一个当前作者包，目录中直接放 `resource.json`、`SKILL.md` 和按需参考文件，不含 `v1/` 一级。版本身份仍由 manifest 的 `version` 与规范化内容哈希记录。Prompt 作者包同样使用 `resources/prompts/<id>/`，直接放 `resource.json`、`prompt.md`；manifest 的 version 与旧选择内容哈希保持不变，固定 Run bundle 的内部版本目录不变。
+Skill属于P11。作者包位于resources/skills/<skill-id>/，每个ID一个当前包，直接包含resource.json、SKILL.md及必要参考文件，无v1作者层；Prompt同为resources/prompts/<id>/。当前目标ResourceRef只有kind／id／version，manifest schemaVersion=2；运行副本的内部版本目录保持可读。
 
 Skill Hub 位于 `packages/core/src/skill-hub/`。加载、依赖检查、显式路由、启停、固定副本和渐进读取复用同一服务。`list_skill_resources`、`read_skill_resource` 的自定义 ToolDefinition 位于 `packages/employee-invoice/src/tools/`；Agent 工具只访问原 Run 固定的、当前范围可用的 Skill。
 
 ## 编写与启用
 
+以下是本轮目标契约，代码／资源迁移已实现，回归验证结果见P11实施计划§6.1，完整门禁尚未通过；历史SHA与旧成绩保留原义。
+
 1. 创建直接 ID 目录；`SKILL.md` 的原生 frontmatter `name` 必须与目录及 manifest ID 相同，description 说明适用条件。保存类 SOP 设置 `disable-model-invocation: true`。
-2. `resource.json` 使用现有 ResourceManifestSchema：列举真实文件、工具/Skill/Extension 必要依赖。按最终 UTF-8 字节计算每个文件的 bytes 与 SHA-256；manifest 自身不列入 files。
+2. resource.json使用v2 ResourceManifestSchema，声明真实path／bytes和必要Tool／Skill／Extension依赖；按最终UTF-8字节核bytes，不计算或保存内容摘要，manifest自身不列入files。
 3. 正文写步骤和完成条件；分支规则放 references，正文写明何时读取。读取脚本文件只取得文本，不自动执行。业务证据来自当前发票工具，Skill 文档不作为字段来源。
 4. 在 Skills 或 Settings → Skills 点击 Refresh resources，查看名称、描述、依赖和诊断，显式启用。新增资源默认关闭；原已保存选择继续沿用原身份。
 5. Ready 表示已启用且所有必要条件通过；Partial 表示已启用但缺项（可为 0/n）；Disabled 表示未启用。列表显示不赋予执行权限，Run 仍按真实工具/材料/扩展范围重新检查。
 
 ## 更新、回退与历史
 
-修改作者正文、参考文件或依赖后，更新 manifest 版本和文件 hash，再刷新并显式选择新 ref。一个 ID 不同时保留多个作者版本；回退需从版本控制恢复对应文件和 manifest 后刷新、选择。内容改变而复用旧选择会给出变化或缺失诊断。
+旧资源会话不可续跑，原native历史及业务事实保留可查，不能从当前作者文件补造原内容或重放。packages与skillIndex完全相同才复用已发布UUID，复用前核bundle.json、manifest和全部文件权威字节；相同组合保留空闲SDK复用语义，组合改变仍沿原关闭／重建路径。
 
-活动 Run 与历史查询继续读取 `runtime/resource-bundles/<bundleHash>/skills/<id>/<version>/` 的不可变副本。该内部版本路径用于保留旧 Run 证据，作者目录去掉 `v1/` 不迁移或重写历史 Bundle。重启重新核作者选择，旧读取不自动重放。
+修改正文、参考文件或依赖后更新明确manifest版本，刷新并显式选择新ref。同版本作者内容与已保存权威字节直接比较，替换旧内容会诊断resource_version_changed；回退从Git恢复对应文件和声明后重新选择。
+
+活动Run及历史查询读取runtime/resource-bundles/<bundleId>/中的原运行副本，bundleId为UUID，bundle manifest为v2。DB020将文件内容按owner_kind／owner_id／relative_path保存到唯一managed_file_contents表并迁移可取得旧内容，旧路径和历史关联保留；缺原正文的旧仅摘要证据显示gap，不自动重放。
 
 ## 当前技能库
 

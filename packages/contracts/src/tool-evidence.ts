@@ -8,7 +8,6 @@ import type { ToolCallSnapshot } from './activity.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const offset = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 const utc = z.string().datetime({ offset: true });
 const jsonValue = z.custom<{} | null>(value => {
     try { return isJsonData(value) && JSON.stringify(value) !== undefined; }
@@ -21,7 +20,7 @@ const storedResult = z.discriminatedUnion('status', [
         data: jsonValue.optional(), formApplication: InvoiceFormApplicationReceiptSchema.optional() }).strict()
 ]);
 export const ToolCallSnapshotSchema: z.ZodType<ToolCallSnapshot, z.ZodTypeDef, unknown> = z.object({
-    toolCallId: id, runId: id, sessionId: id, nativeToolCallId: z.string().min(1).max(256), context: ContextReferenceSchema.nullable(),
+    toolCallId: id, evidenceRevision: offset.optional(), runId: id, sessionId: id, nativeToolCallId: z.string().min(1).max(256), context: ContextReferenceSchema.nullable(),
     toolName: z.string().min(1).max(MAX_TOOL_NAME_CHARS), toolVersion: z.string().min(1).max(MAX_TOOL_VERSION_CHARS).nullable(),
     effect: ToolEffectSchema.nullable(), status: z.enum(['requested', 'running', 'succeeded', 'failed', 'cancelled']),
     args: z.object({ version: z.literal(1), raw: jsonValue, final: jsonValue }).strict(), result: storedResult.nullable(),
@@ -36,11 +35,11 @@ export const ToolCallSnapshotSchema: z.ZodType<ToolCallSnapshot, z.ZodTypeDef, u
 });
 
 /** Trusted Host controller query; raw evidence is not a model tool or Renderer DTO. */
-export const ToolEvidenceRequestSchema = z.object({ runId: id, sessionId: id, toolCallId: id, expectedHash: sha256.optional(),
+export const ToolEvidenceRequestSchema = z.object({ runId: id, sessionId: id, toolCallId: id, expectedRevision: offset.optional(),
     offset: offset.default(0), limit: z.number().int().min(4).max(32768).default(8192) }).strict()
-    .refine(value => value.offset === 0 || value.expectedHash !== undefined, 'Continuation requires its original hash.');
+    .refine(value => value.offset === 0 || value.expectedRevision !== undefined, 'Continuation requires its original revision.');
 export type ToolEvidenceRequest = z.input<typeof ToolEvidenceRequestSchema>;
-export const ToolEvidencePageSchema = z.object({ version: z.literal(1), runId: id, sessionId: id, toolCallId: id, sha256,
+export const ToolEvidencePageSchema = z.object({ version: z.literal(2), runId: id, sessionId: id, toolCallId: id, evidenceRevision: offset,
     bytes: id, offset, chunk: z.string().min(1).refine(value => {
         const encoded = new TextEncoder().encode(value);
         return encoded.byteLength <= 32768 && new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(encoded) === value;

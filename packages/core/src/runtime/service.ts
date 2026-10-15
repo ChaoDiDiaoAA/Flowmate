@@ -11,7 +11,7 @@ import { CompactionObservationSchema, SessionCompactionSnapshotSchema, Compactio
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import { FrozenResourcesSchema, AssemblySelectionSnapshotSchema, FrozenExtensionsSchema, ExtensionAssemblyEvidenceSchema, matchesExtensionAssembly, EMPTY_RESOURCE_SELECTION, resourceRefKey } from '@flowmate/contracts';
 import type { FrozenResources, ResourceBinding, ResourceSelectionResult, AssemblySelectionSnapshot, FrozenExtensions } from '@flowmate/contracts';
-import { invoiceToolNamesForRun, subagentCompletionHash } from '../storage/repositories.ts';
+import { invoiceToolNamesForRun, serializeSubagentCompletion } from '../storage/repositories.ts';
 import type { ExtensionService } from '../extensions/service.ts';
 import { resolveRequiredSkill, type createResourceService } from '../skill-hub/index.ts';
 import { SKILL_RESOURCE_TOOL_NAMES } from '@flowmate/contracts';
@@ -700,7 +700,7 @@ export class RuntimeService {
       const verified = this.dependencies.resources?.verifyFrozen(fixed);
       if (!verified || !verified.ok) return verified ?? fail(appError('resource_bundle_unavailable', 'storage', 'Frozen resource verification is unavailable.', true));
     }
-    const resourceBinding: ResourceBinding | undefined = fixed ? { bundleHash: fixed.bundleHash, requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
+    const resourceBinding: ResourceBinding | undefined = fixed ? { bundleId: fixed.bundleId, requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
     const at = this.dependencies.now();
     const admitted = ledger.admit(request, () => {
       const frozen = runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
@@ -769,7 +769,7 @@ export class RuntimeService {
     if (frozenResources && !frozenResources.success || Boolean(frozenResources) !== Boolean(content.resourceBinding)) return corrupt();
     if (frozenResources?.success) {
       const binding = content.resourceBinding!;
-      if (binding.bundleHash !== frozenResources.data.bundleHash || binding.requiredSkill && !frozenResources.data.discoveredSkills.some(ref =>
+      if (binding.bundleId !== frozenResources.data.bundleId || binding.requiredSkill && !frozenResources.data.discoveredSkills.some(ref =>
         resourceRefKey(ref) === resourceRefKey(binding.requiredSkill!))) return corrupt();
       const verified = this.dependencies.resources?.verifyFrozen(frozenResources.data);
       if (!verified || !verified.ok) return verified ?? fail(appError('resource_bundle_unavailable', 'storage', 'Frozen resource verification is unavailable.', true));
@@ -902,7 +902,7 @@ export class RuntimeService {
       if (inputSubmission.mode !== 'prompt' || !normalized.ok || JSON.stringify(normalized.data) !== JSON.stringify(inputSubmission)) {
         return fail(appError('input_invalid', 'input', 'Input and Run request do not match.'));
       }
-      const previous = this.dependencies.sessionInputs.lookup(inputSubmission, control.desktopRequestHash);
+      const previous = this.dependencies.sessionInputs.lookup(inputSubmission, control.desktopRequestIdentity);
       if (!previous.ok) return previous;
       if (previous.data) return previous.data.runId === null
         ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
@@ -1052,7 +1052,7 @@ export class RuntimeService {
     if (inputDefinitions?.command?.requiredRoles.some(id => !activeToolNames.includes('Agent')
       || !inputDefinitions.roles.find(role => role.id === id)?.tools.every(name => activeToolNames.includes(name))))
       return fail(appError('subagent_tool_denied', 'tool', 'The requested role requires tools unavailable in this Run.'));
-    const resourceBinding: ResourceBinding | undefined = resources ? { bundleHash: resources.bundleHash,
+    const resourceBinding: ResourceBinding | undefined = resources ? { bundleId: resources.bundleId,
       requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
     const freezeConfig = (config: ReturnType<typeof initialAgentSnapshot>) => ({ ...config,
       ...(resources ? { resources } : {}), ...(extensions ? { extensions } : {}), ...(inputDefinitions ? { inputDefinitions } : {}),
@@ -1120,13 +1120,13 @@ export class RuntimeService {
         workspaceContext: admission?.workspaceContext ?? null, workspaceInput: admission?.workspaceInput ?? null,
         allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : researchContext && scope?.version === 2 ? [...scope.allowedDocumentIds] : [],
         allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : researchContext && scope?.version === 2 ? [...scope.allowedArtifactIds] : [],
-        ...(control.desktopRequestHash === undefined ? {} : { desktopRequestHash: control.desktopRequestHash }),
+        ...(control.desktopRequestIdentity === undefined ? {} : { desktopRequestIdentity: control.desktopRequestIdentity }),
         promptText: formatExecutionPrompt({ text: inputDefinitions?.command?.expandedText ?? request.text, business: admission !== null,
           ...(admission ? { workspaceInput: admission.workspaceInput, workspaceContext: admission.workspaceContext,
             goalMode: request.goalMode ?? 'answer' } : {}),
           ...(workingDirectory ? { workingDirectory } : {}) }) };
       return this.buildInput(runId, request.sessionId, content, createdAt);
-    }, createdAt, control.desktopRequestHash);
+    }, createdAt, control.desktopRequestIdentity);
     const accepted = inputSubmission ? createInput(inputSubmission)
       : this.dependencies.sessionInputs.allocateSequence(request.sessionId, sequence => {
         const normalized = normalizeSessionInputRequest({ ...rawRequest, mode: 'prompt', clientSequence: sequence });
@@ -1474,14 +1474,14 @@ export class RuntimeService {
 
   public async finishSubagent(childRunId: number, outcome: AgentNativeOutcome): Promise<Result<void>> {
     const owner = this.childSlots.get(childRunId), child = owner?.context;
-    let completionHash: string;
-    try { completionHash = subagentCompletionHash(outcome); }
+    let completionFacts: string;
+    try { completionFacts = serializeSubagentCompletion(outcome); }
     catch { return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion facts cannot be verified.')); }
     if (!owner) {
       const saved = this.dependencies.runs.get(childRunId);
       if (!saved.ok) return saved;
       if (saved.data.kind !== 'subagent' || saved.data.stoppedAt === null || saved.data.status === 'created' || saved.data.status === 'running'
-        || saved.data.output?.nativeOutcomeHash !== completionHash)
+        || saved.data.output?.nativeOutcomeFacts !== completionFacts)
         return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion differs from its saved original facts.'));
       return saved.data.error ? fail(saved.data.error) : ok(undefined);
     }
@@ -2006,7 +2006,7 @@ export class RuntimeService {
       ...outputRecord(outcome),
       version: 2,
       agent: { ...productAgent, ...(context.admission ? { candidateIds } : {}) },
-      ...(ownedChild ? { nativeOutcomeHash: subagentCompletionHash(outcome) } : {}),
+      ...(ownedChild ? { nativeOutcomeFacts: serializeSubagentCompletion(outcome) } : {}),
     } : null;
     const usage = outcome?.usage ?? initialUsage(this.dependencies.now());
     const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };

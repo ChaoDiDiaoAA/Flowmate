@@ -1,6 +1,5 @@
 import { judgeResponse, namedJudgment } from '../../support/judge-response.ts';
 import { expect, test } from 'bun:test';
-import { hash } from '../../../src/dataset-loader/local.ts';
 import { judgeConfig, publicJudgeConfig } from '../../../src/scoring/judges/client.ts';
 import { runJudge, runCompactJudge } from '../../../src/scoring/judges/harness.ts';
 import { compactScores, parseCompactJudgment } from '../../../src/scoring/judges/compact.ts';
@@ -19,7 +18,7 @@ test('one compact Judge request preserves distinct criterion counts and exact in
     const system = 'synthetic compact rubric', data = JSON.stringify({ plan, evidence: { note: 'untrusted synthetic observation' } });
     const call = await runJudge(config, system, data, async () => { requests++; return response('{"v":1,"r":[[2,3,0],[1,4,1]],"f":[[1,2,1]]}'); }, undefined, plan);
     expect(requests).toBe(1);
-    expect(call).toMatchObject({ attempts: 1, error: null, judgment: null, request: { system, data, hash: hash([system, data]), redacted: false },
+    expect(call).toMatchObject({ attempts: 1, error: null, judgment: null, request: { system, data,  redacted: false },
         compact: { plan, judgment: { v: 1, r: [[2, 3, 0], [1, 4, 1]], f: [[1, 2, 1]] } } });
 });
 
@@ -95,7 +94,7 @@ test('configured secrets in Judge input are rejected before dispatch and retaine
     expect(requests).toBe(0);
     expect(call).toMatchObject({ attempts: 0, request: { redacted: true }, compact: { judgment: null } });
     expect(JSON.stringify(call)).not.toContain(config.apiKey);
-    expect(call.request.hash).toBe(hash([call.request.system, call.request.data]));
+    expect(call.request.data).not.toContain(config.apiKey);
 });
 
 test('invalid or derived semantic criteria are rejected before any Judge request', () => {
@@ -109,5 +108,5 @@ test('invalid or derived semantic criteria are rejected before any Judge request
 test('compact Rubric identity is declared independently of unchanged Provider parameters', () => {
     const first = publicJudgeConfig(config, { id: 'semantic-batch', version: 1, prompt: 'declared v1 rubric' });
     const second = publicJudgeConfig(config, { id: 'semantic-batch', version: 2, prompt: 'changed v2 rubric' });
-    expect(first.configHash).not.toBe(second.configHash);
+    expect(first.rubric).not.toEqual(second.rubric);
 });

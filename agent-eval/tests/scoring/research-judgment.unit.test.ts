@@ -14,17 +14,16 @@ import {aggregate} from '../../src/scoring/aggregate.ts';
 import {mkdtempSync} from '../../../tests/support/resources.ts';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {hash} from '../../src/dataset-loader/local.ts';
 
 function fixture(){
  const texts=['Alpha owns Beta.','Beta follows Gamma.'],gold=texts.map((text,i)=>({id:'hop-'+i,text,required:true,acceptable:[text],conditions:[],entities:['Beta'],
-  evidence:[{sample:'synthetic',sha256:'a'.repeat(64),start:0,end:text.length,quote:text,relation:'support' as const}]}));
+  evidence:[{sample:'synthetic',start:0,end:text.length,quote:text,relation:'support' as const}]}));
  const frame:ResearchFrame={contract:'flowmate-research-frame/v1',complete:true,reportId:1,
   blocks:texts.map((text,i)=>({kind:'claim',key:'claim:'+(i+1),claimId:i+1,text})),
   links:texts.map((text,i)=>({key:'link:'+i,claimId:i+1,evidenceIndex:0,relation:'supports',valid:true,display:text,
    ref:{researchId:1,planId:1,revision:1,runId:1,toolCallId:i+1,sourceSnapshotId:i+1,locator:{start:0,end:text.length,quote:text}}})),
   integrity:{valid:true,issues:[],links:[],sourceBindings:[]},gold:{status:'verified',claims:gold,chains:[{id:'chain',claims:['hop-0','hop-1'],links:[{from:'hop-0',to:'hop-1',entity:'Beta'}]}],forbidden:[]},
-  sources:[],proofHash:'b'.repeat(64),rule:'Independent synthetic source and Report frame.'};
+  sources:[],rule:'Independent synthetic source and Report frame.'};
  const proof:PackedJudgment={rows:[],failures:[],atoms:texts.map((text,i)=>({block:i,start:0,length:text.length,correct:1,needsCitation:true,covered:1,gold:i+1,matchUncertain:false})),
   links:texts.map((_,i)=>({atom:i,state:1})),chains:[1]};return{frame,proof};
 }
@@ -160,7 +159,7 @@ test('saved local no-Report scores reject forged counts and keep semantic-plan c
  ]){const changed=structuredClone(report);mutate(changed);
   expect(()=>{saveReport(join(mkdtempSync(join(tmpdir(),'forged-local-plan-')),'report.json'),changed);}).toThrow();}
  const alternate=structuredClone(report);alternate.trials[0]!.scores.find(s=>s.metricId==='DR02')!.method='llm-judge';
- expect(()=>comparison(report,alternate)).not.toThrow();
+ expect(()=>comparison(report,alternate)).toThrow('original execution conditions');
 });
 
 test('saved no-Report proof remains readable when collected sources lose private digests on disk',async()=>{
@@ -172,7 +171,7 @@ test('saved no-Report proof remains readable when collected sources lose private
    planConfirmed:false,currentRunId:4,currentReportId:null,createdAt:at,updatedAt:at},
   plans:[],discoveredPlanIds:[],claims:[],reports:[],reportCount:0,
   sources:[{sourceSnapshotId:7,researchId:1,runId:4,toolCallId:21,createdAt:at,kind:'local',address:'artifact:3',title:'Synthetic',
-   artifactId:3,documentId:null,fetchedAt:at,publishedAt:null,contentHash:hash(text),relativePath:'artifacts/research/1/'+hash(text)+'.txt',
+   artifactId:3,documentId:null,fetchedAt:at,publishedAt:null,relativePath:'artifacts/research/1/source-21.txt',
    bytes:Buffer.byteLength(text),characters:text.length,truncated:false}],
   sourceTexts:[{sourceSnapshotId:7,runId:4,toolCallId:21,text,acquisition:'controller-query',modelUse:'requires-original-tool-and-context-evidence'}]}};
  for(const [key,actual]of Object.entries({runs:[],'tool-evidence':{calls:[]},'material-registration':[]}))

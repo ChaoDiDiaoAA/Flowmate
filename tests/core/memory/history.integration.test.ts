@@ -64,9 +64,9 @@ function agentInput(f: ReturnType<typeof fixture>, runId?: number, sequence = 1)
   const db = f.store.db;
   runId ??= Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
     VALUES('agent',?,'{}','running','fixture','{}','{}','{}','{}',?)`).run(f.session.sessionId, at).lastInsertRowid);
-  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
+  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,content_json,status,processing_status,created_at,updated_at)
     VALUES(?,?,'prompt','answer',?,?,'{"version":2,"text":"a","promptText":"a","workspaceContext":null,"workspaceInput":null,"allowedDocumentIds":[],"allowedArtifactIds":[]}','queued','pending',?,?)`)
-    .run(f.session.sessionId, sequence, 'a'.repeat(64), runId, at, at).lastInsertRowid);
+    .run(f.session.sessionId, sequence, '{}', runId, at, at).lastInsertRowid);
   return { runId, inputId };
 }
 function persistenceFacts(f: ReturnType<typeof fixture>) {
@@ -195,9 +195,9 @@ it('P9 T02 rolls back history input and P6 when CAS or an input write fails', ()
   const db = f.store.db;
   const runId = Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
     VALUES('agent',?,'{}','running','fixture','{}','{}','{}','{}',?)`).run(f.session.sessionId, at).lastInsertRowid);
-  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
+  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,content_json,status,processing_status,created_at,updated_at)
     VALUES(?,1,'prompt','answer',?,?,'{"version":2,"text":"a","promptText":"a","workspaceContext":null,"workspaceInput":null,"allowedDocumentIds":[],"allowedArtifactIds":[]}','queued','pending',?,?)`)
-    .run(f.session.sessionId, 'a'.repeat(64), runId, at, at).lastInsertRowid);
+    .run(f.session.sessionId, '{}', runId, at, at).lastInsertRowid);
   const published: unknown[] = [];
   f.store.runtimeEventStore.onCommitted(refs => { expect(db.inTransaction).toBe(false); published.push(refs); });
   const before = db.query('SELECT * FROM session_inputs').all();
@@ -249,9 +249,9 @@ it.each(['completed', 'pending'] as const)('P9 T02 revises %s input recovery blo
   const f = fixture(), db = f.store.db;
   const runId = Number(db.query(`INSERT INTO runs(kind,session_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
     VALUES('agent',?,'{}','running','fixture','{}','{}','{"stopped":true}','{}',?)`).run(f.session.sessionId, at).lastInsertRowid);
-  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
+  const inputId = Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,content_json,status,processing_status,created_at,updated_at)
     VALUES(?,1,'prompt','answer',?,?,'{"version":2,"text":"a","promptText":"a","workspaceContext":null,"workspaceInput":null,"allowedDocumentIds":[],"allowedArtifactIds":[]}','queued','pending',?,?)`)
-    .run(f.session.sessionId, 'a'.repeat(64), runId, at, at).lastInsertRowid);
+    .run(f.session.sessionId, '{}', runId, at, at).lastInsertRowid);
   const result = { type: 'message', id: 'result', parentId: 'a', timestamp: at,
     message: { ...nativeAssistantFacts, role: 'assistant', content: [{ type: 'text', text: 'Saved.' }], stopReason: 'stop', timestamp: 2 } };
   expect(need(f.commit({ appendEntries: [entry('a'), result], leafId: 'result', contexts: [
@@ -369,7 +369,7 @@ it('P9 T02 migrates 015 atomically without rewriting original facts', () => {
     const opened = need(core.openDatabase(p));
     expect(opened.db.query('SELECT commit_revision FROM session_native_history').get()).toEqual({ commit_revision: 0 });
     expect(['session_native_entries', 'session_inputs', 'context_snapshots', 'runs'].map((table, index) =>
-      opened.db.query(`SELECT ${table === 'runs' ? Object.keys((before.original[index] as Record<string, unknown>[])[0]!).join(',') : '*'} FROM ${table}`).all())).toEqual(before.original);
+      opened.db.query(`SELECT ${table === 'runs' ? Object.keys((before.original[index] as Record<string, unknown>[])[0]!).join(',') : table === 'session_inputs' ? Object.keys((before.original[index] as Record<string, unknown>[])[0]!).filter(key => key !== 'request_hash').join(',') : '*'} FROM ${table}`).all())).toEqual(before.original.map((rows, index) => index === 1 ? (rows as Record<string, unknown>[]).map(({ request_hash: _retired, ...row }) => row) : rows));
     expect(opened.db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs').get())
       .toEqual({ parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null });
     expect(opened.db.query('SELECT header_json,leaf_id,entry_count,unusable FROM session_native_history').all()).toEqual(before.oldHeader);
@@ -692,8 +692,8 @@ it.each([false, true])('P9 T05 confirms committed positions after lost changed a
 it.each(['source-progress', 'result-association'] as const)('P9 T05 confirms exactly the frozen origin associations after a lost receipt: %s', async fault => {
   const f = historyFixture([]), runId = historyRun(f);
   const addInput = (sequence: number) => Number(f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,
-    request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
-    VALUES(?,?,'prompt','answer',?, ?,?,'queued','pending',?,?)`).run(f.session.sessionId, sequence, 'a'.repeat(64), runId,
+    request_identity_json,run_id,content_json,status,processing_status,created_at,updated_at)
+    VALUES(?,?,'prompt','answer',?, ?,?,'queued','pending',?,?)`).run(f.session.sessionId, sequence, '{}', runId,
       JSON.stringify({ version: 2, text: 'source', promptText: 'source', workspaceContext: null, workspaceInput: null,
         allowedDocumentIds: [], allowedArtifactIds: [] }), at, at).lastInsertRowid);
   const inputId = addInput(1), empty = need(f.store.memory.load(f.session.sessionId))!;

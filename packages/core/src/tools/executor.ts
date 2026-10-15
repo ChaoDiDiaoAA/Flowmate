@@ -36,12 +36,7 @@ function isToolExperience(call: ToolCallSnapshot, observation: ToolRuntimeObserv
 
 export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Pick<Recorder,'observationCutoff'|'recentStarted'|'recentObservations'>; definitions: readonly Pick<ToolDefinition<any, any>,'name'|'version'|'effect'>[];
   policy?: RuntimeStrategyPolicy }): Result<RuntimeStrategySnapshot> {
-  if (input.policy?.frozenStrategy && !RuntimeStrategySnapshotSchema.safeParse(input.policy.frozenStrategy).success) {
-    return fail(appError('input_invalid', 'runtime', 'The trusted Runtime strategy snapshot is invalid.'));
-  }
-  const suppliedStrategies=input.policy?.frozenStrategies??(input.policy?.frozenStrategy?[input.policy.frozenStrategy]:undefined);
-  if(suppliedStrategies?.some(strategy=>!RuntimeStrategySnapshotSchema.safeParse(strategy).success))return fail(appError('input_invalid','runtime','The trusted Runtime strategy snapshot is invalid.'));
-  const cutoff = suppliedStrategies ? ok(suppliedStrategies[0]?.calibration.sourceCutoffToolCallId??0) : input.recorder.observationCutoff();
+  const cutoff = input.recorder.observationCutoff();
   const groups: RuntimeStrategySnapshot['calibration']['groups'] = [];
   const experience: RuntimeStrategySnapshot['experience'] = { version: 1, modelKey: input.modelKey,
     promptVersion: input.promptVersion, taskType: input.taskType, items: [] };
@@ -56,23 +51,6 @@ export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Pick<Re
     groups.push(group);
     const statistical = name !== 'Agent' && ['PURE', 'READ'].includes(definition.effect)
       && !NATIVE_TOOL_NAMES.includes(name as (typeof NATIVE_TOOL_NAMES)[number]);
-    const supplied=suppliedStrategies?.find(strategy=>strategy.calibration.groups.some(candidate=>candidate.groupKey===groupKey));
-    if (suppliedStrategies) {
-      const frozen = supplied?.calibration.groups.find(candidate => candidate.groupKey === groupKey);
-      if(!supplied&&suppliedStrategies.some(strategy=>strategy.calibration.groups.some(candidate=>candidate.toolName===name)))
-        return fail(appError('input_invalid','runtime','Frozen Runtime tool, SDK, environment, model or task is incompatible.'));
-      const compatible = supplied?.version === 'runtime-v1' && supplied.sampleSource === input.sampleSource
-        && supplied.experience.modelKey === input.modelKey && supplied.experience.promptVersion === input.promptVersion
-        && supplied.experience.taskType === input.taskType;
-      if (frozen && compatible) Object.assign(group, frozen, { selectedTimeoutMs: Math.min(input.configuredToolTimeoutMs, frozen.selectedTimeoutMs) });
-      else group.fallbackReason = 'insufficient_samples';
-      if (!statistical || input.policy?.statistics === false) Object.assign(group, { selectedTimeoutMs: input.configuredToolTimeoutMs,
-        timeoutSource: 'configured', fallbackReason: !statistical ? 'ineligible_tool' : 'disabled' });
-      if (frozen && compatible && input.policy?.experience !== false) {
-        experience.items.push(...supplied!.experience.items.filter(item => item.toolName === name));
-      }
-      continue;
-    }
     const recent = cutoff.ok ? input.recorder.recentStarted({ groupKey, cutoff: cutoff.data }) : cutoff;
     if (!recent.ok) { group.fallbackReason = 'read_failed'; continue; }
     const attempts = recent.data;

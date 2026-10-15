@@ -14,7 +14,7 @@ test('feedback is bound to the original scoring versions; changed or foreign rep
     report.export = { backend: 'langfuse', status: 'complete' };
     const file = join(directory, 'summary.json'); writeFileSync(file, JSON.stringify(report));
     const record = addFeedback(repo, { executionId: 'unit', caseId: 'sample', trialId: 'trial-1', reviewer: 'fixture', verdict: 'good', note: 'synthetic feedback', id: 'fixed', at: report.startedAt });
-    expect(record.scoringHash).toBeUndefined();expect(record.conditions).toBeDefined();
+    expect(record.conditions).toBeDefined();
     expect(feedbackStatus(repo, 'unit').stale).toBe(0);
     report.trials[0]!.scores[0]!.required=false; writeFileSync(file, JSON.stringify(report));
     expect(feedbackStatus(repo, 'unit').stale).toBe(1);
@@ -43,7 +43,7 @@ test('platform import binds current exported Trace, author and completed item; p
         expect(requested).toEqual(['first', 'next', 'first', 'next']);
         const records = feedbackStatus(repo, 'unit').records;
         expect(records).toHaveLength(1);
-        expect(records[0]!.caseHash).toBeUndefined();
+        expect(records[0]!).not.toHaveProperty('caseConditions');
         expect(records[0]!.reviewer).toBe('langfuse:human-author');
     }
     finally {

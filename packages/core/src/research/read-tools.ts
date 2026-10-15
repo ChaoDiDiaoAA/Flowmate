@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { createHash } from 'node:crypto';
 import { appError, ToolExecutionFailure, SourceSnapshotSchema, ResearchLocatorSchema, EvidenceRefSchema } from '@flowmate/contracts';
 import type { ToolDefinition, ToolCallContext, ProductToolContext, Result } from '@flowmate/contracts';
 import type { ResearchRepository } from './repository.ts';
@@ -26,7 +25,7 @@ export function createResearchReadTools(options: { research: ResearchRepository;
   function publish(text: string, source: { kind: 'local' | 'document'; address: string; title: string; artifactId: number | null; documentId: number | null },
     call: ToolCallContext, context: ProductToolContext, usage: z.infer<typeof usageSchema>) {
     const { binding, toolCallId } = identity(call, context), at = options.now();
-    const published = options.files.publishResearchSource({ researchId: binding.researchId, text });
+    const published = options.files.publishResearchSource({ researchId: binding.researchId, toolCallId, text });
     if (!published.ok) throw new ToolExecutionFailure(published.error);
     const saved = options.research.saveSource({ researchId: binding.researchId, runId: context.runId, toolCallId, at,
       source: { ...source, ...published.data, fetchedAt: at, publishedAt: null, truncated: false } });
@@ -56,9 +55,9 @@ export function createResearchReadTools(options: { research: ResearchRepository;
           if (!artifact.ok) throw new ToolExecutionFailure(artifact.error);
           if (!/\.(?:txt|md)$/.test(artifact.data.relativePath) || !['text/plain', 'text/markdown'].includes(artifact.data.mimeType)) return denied();
           const bytes = options.files.read(artifact.data);
-          if (!bytes.ok) throw new ToolExecutionFailure(bytes.error);
-          if (artifact.data.metadata.sourceKey !== 'research-local-v1'
-            || createHash('sha256').update(bytes.data).digest('hex') !== artifact.data.metadata.sourceVersion)
+          if (!bytes.ok) throw new ToolExecutionFailure(bytes.error.code === 'artifact_unavailable'
+            ? appError('research_source_unavailable', 'tool', 'Selected text is missing or has changed since import.') : bytes.error);
+          if (artifact.data.metadata.sourceKey !== 'research-local-v1')
             throw new ToolExecutionFailure(appError('research_source_unavailable', 'tool', 'Selected text has changed since import.'));
           try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.data); }
           catch { throw new ToolExecutionFailure(appError('research_source_unavailable', 'tool', 'Selected text is not valid UTF-8.')); }

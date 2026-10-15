@@ -3,10 +3,9 @@ import { join, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 import { z } from 'zod';
 import { registerSecrets, scanEvidence } from './execution/evidence-safety.ts';
-import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { canonicalExtensionManifest, ExtensionManifestSchema } from '../../packages/contracts/src/extensions.ts';
-import { canonicalResourceManifest, ResourceManifestSchema } from '../../packages/contracts/src/resources.ts';
+import { ExtensionManifestSchema } from '../../packages/contracts/src/extensions.ts';
+import { ResourceManifestSchema } from '../../packages/contracts/src/resources.ts';
 import type { ModelCatalogProvider } from '../../packages/contracts/src/settings.ts';
 
 const repository=fileURLToPath(new URL('../../',import.meta.url));
@@ -15,7 +14,7 @@ export function extensionIdentity(ref:{id:string;version:string},repo=repository
     if(!name)throw Error('Unknown trusted extension: '+ref.id);
     const manifest=ExtensionManifestSchema.parse(JSON.parse(readFileSync(join(repo,'resources/extensions',name),'utf8')));
     if(manifest.version!==ref.version)throw Error('Extension version differs: '+ref.id);
-    return{...ref,manifestHash:createHash('sha256').update(canonicalExtensionManifest(manifest)).digest('hex')};
+    return ref;
 }
 export function evaluationEnv(repo: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
     const file = join(repo,'agent-eval/configs/.env');

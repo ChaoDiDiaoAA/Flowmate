@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import {
   appError,
   fail,
@@ -60,6 +60,7 @@ type NewDocumentRegistration = {
 };
 
 export interface DocumentRepository {
+  findVersions?(input: { sourceKey: string; sourceRecordId: string }): Result<DocumentSnapshot[]>;
   findBySource(input: { sourceKey: string; sourceRecordId: string; version: string }): Result<DocumentSnapshot | null>;
   get(documentId: number): Result<DocumentSnapshot>;
   getArtifact(artifactId: number): Result<StoredArtifact>;
@@ -99,16 +100,7 @@ function decodeParsed(value: unknown): StoredParsedDocument {
     completeness: completeness as StoredParsedDocument['completeness'] };
 }
 
-function documentVersion(datasetRevision: string, files: readonly Uint8Array[]): string {
-  const digest = createHash('sha256');
-  for (const bytes of files) {
-    const length = Buffer.alloc(8);
-    length.writeBigUInt64BE(BigInt(bytes.byteLength));
-    digest.update(length);
-    digest.update(bytes);
-  }
-  return `${datasetRevision}:parsed-v3:${digest.digest('hex')}`;
-}
+function newDocumentVersion(): string { return randomUUID(); }
 
 function preparedOriginal(bytes: Uint8Array, name: string): boolean {
   if (bytes.byteLength < 1 || bytes.byteLength > MAX_WORKSPACE_ORIGINAL_BYTES) return false;
@@ -150,7 +142,6 @@ export class DocumentService {
     if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
     const input = checked.data, originalBytes = Buffer.from(input.original.base64, 'base64');
     if (!preparedOriginal(originalBytes, input.original.name) || originalBytes.toString('base64') !== input.original.base64
-      || createHash('sha256').update(originalBytes).digest('hex') !== input.original.sha256
       || input.original.name === 'source.md' && new TextDecoder('utf-8', { fatal: true }).decode(originalBytes) !== input.sourceText)
       return fail(appError('source_invalid', 'input', 'Prepared original differs from its frozen bytes or text.'));
     const sourceKey = 'prepared-invoice', sourceRecordId = input.sample;
@@ -158,8 +149,14 @@ export class DocumentService {
       completeness: { status: 'complete', checks: ['frozen-prepared-source', 'sequential-pages-and-blocks'], warnings: [] } };
     const parsedBytes = Buffer.from(JSON.stringify(parsed)), contentBytes = Buffer.from(JSON.stringify(input.sourceText));
     const pagesBytes = Buffer.from(JSON.stringify(input.pages)), sourceBytes = Buffer.from(JSON.stringify({
-      contract: input.contract, sample: input.sample, original: { name: input.original.name, sha256: input.original.sha256 } }));
-    const version = documentVersion('prepared-v1', [originalBytes, contentBytes, pagesBytes, sourceBytes]);
+      contract: input.contract, sample: input.sample, original: { name: input.original.name } }));
+    const versions = this.options.repository.findVersions?.({ sourceKey, sourceRecordId });
+    if (versions && !versions.ok) return versions;
+    for (const prior of versions?.ok ? versions.data : []) {
+      const same = this.sameVersion(prior, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, input.original.name);
+      if (same.ok || same.error.code !== 'document_version_conflict') return same;
+    }
+    const version = newDocumentVersion();
     const existing = this.options.repository.findBySource({ sourceKey, sourceRecordId, version });
     if (!existing.ok) return existing;
     if (existing.data) return this.sameVersion(existing.data, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, input.original.name);
@@ -175,7 +172,7 @@ export class DocumentService {
       ] } });
     if (!published.ok) return published;
     if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消；已发布文件保留为待核对孤儿。'));
-    return this.options.repository.register({ documentId: published.data.documentId, sourceKey, sourceRecordId, version,
+    return this.options.repository.register({ documentId: published.data.documentId, sourceKey, sourceRecordId, version: published.data.original.metadata.sourceVersion,
       originalArtifact: published.data.original, parsedArtifact: published.data.parsed, status: 'available',
       metadata: { version: 2, pageCount: input.pages.length, warnings: [], allowedUsesClaim: ['frozen-prepared-material'],
         licenseVerification: 'caller-supplied', unavailableReason: null }, createdAt: now, updatedAt: now });
@@ -197,7 +194,7 @@ export class DocumentService {
     const { originalFileName, originalMimeType, originalBytes, contentBytes, pagesBytes, metadataBytes } = source.data;
     const parsed = parseVoxel51Sample(source.data);
     if (!parsed.ok) return parsed;
-    const version = documentVersion(parsed.data.datasetRevision, [originalBytes, contentBytes, pagesBytes, metadataBytes]);
+    const version = newDocumentVersion();
     if (version.length > MAX_INVOICE_VERSION_CHARS) return fail(appError('source_invalid', 'input', '来源版本超过支持范围。'));
     const existing = this.options.repository.findBySource({ sourceKey: parsed.data.sourceKey,
       sourceRecordId: parsed.data.sourceRecordId, version });
@@ -210,6 +207,7 @@ export class DocumentService {
       datasetRevision: parsed.data.datasetRevision,
       allowedUsesClaim: parsed.data.allowedUsesClaim,
       licenseVerification: parsed.data.licenseVerification,
+      metadataBytes: Buffer.from(metadataBytes).toString('base64'),
       original: { fileName: originalFileName, bytes: originalBytes.byteLength },
       files: [
         { name: 'content.json', bytes: contentBytes.byteLength },
@@ -218,6 +216,12 @@ export class DocumentService {
     };
     const parsedBytes = Buffer.from(JSON.stringify(parsed.data.parsed), 'utf8');
     const sourceBytes = Buffer.from(JSON.stringify(sourceRecord), 'utf8');
+    const versions = this.options.repository.findVersions?.({ sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId });
+    if (versions && !versions.ok) return versions;
+    for (const prior of versions?.ok ? versions.data : []) {
+      const same = this.sameVersion(prior, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, originalFileName);
+      if (same.ok || same.error.code !== 'document_version_conflict') return same;
+    }
     if (existing.data) {
       return this.sameVersion(existing.data, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, originalFileName);
     }
@@ -239,7 +243,7 @@ export class DocumentService {
     if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消；已发布文件保留为待核对孤儿。'));
     const result = this.options.repository.register({
       documentId: published.data.documentId,
-      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, version,
+      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, version: published.data.original.metadata.sourceVersion,
       originalArtifact: published.data.original, parsedArtifact: published.data.parsed,
       status: 'available', metadata: {
         version: 2, sampleId: parsed.data.sampleId, pageCount: parsed.data.parsed.pages.length,
@@ -437,8 +441,6 @@ export class DocumentService {
           original: { ...(parseJson(source.data) as { original: object }).original, base64: Buffer.from(originalBytes.data).toString('base64') },
           sourceText: parseJson(content.data), pages: parseJson(pages.data) });
         if (!input.success || input.data.sample !== artifact.metadata.sourceRecordId || input.data.original.name !== originalName
-          || createHash('sha256').update(originalBytes.data).digest('hex') !== input.data.original.sha256
-          || documentVersion('prepared-v1', [originalBytes.data, content.data, pages.data, source.data]) !== document.documentRef.version
           || JSON.stringify(decoded.pages) !== JSON.stringify(input.data.pages) || decoded.pages.length !== document.pageCount)
           return invalid('prepared_document_mismatch');
         return ok(decoded);
@@ -471,6 +473,8 @@ export class DocumentService {
 
   private sameVersion(document: DocumentSnapshot, original: Uint8Array, content: Uint8Array, pages: Uint8Array,
     parsed: Uint8Array, source: Uint8Array, originalName: 'original.jpg' | 'original.png' | 'original.pdf' | 'source.md'): Result<DocumentSnapshot> {
+    if (document.status === 'unavailable' && document.unavailableReason === 'Legacy file content has no preserved original bytes. Re-import this document to use it again.')
+      return fail(appError('document_version_conflict', 'input', 'Legacy source bytes cannot prove equivalence; import a new version.'));
     const originalArtifact = this.options.repository.getArtifact(document.originalArtifactId);
     const parsedArtifact = this.options.repository.getArtifact(document.parsedArtifactId);
     if (!originalArtifact.ok) return originalArtifact;

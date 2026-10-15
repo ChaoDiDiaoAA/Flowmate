@@ -2,7 +2,6 @@ import { expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
 
 it('captures selected local material via SDK, Executor and Recorder, preserving actual source execution', async () => {
@@ -17,7 +16,6 @@ it('captures selected local material via SDK, Executor and Recorder, preserving 
   expect(sources).toHaveLength(1);
   const source = sources[0]!;
   expect(source.runId).toBe(investigation.accepted.runId); expect(source.kind).toBe('local');
-  expect(source.contentHash).toBe(createHash('sha256').update(body).digest('hex'));
   expect(readFileSync(join(f.paths.root, source.relativePath), 'utf8')).toBe(body);
   expect(source.characters).toBe(body.length); expect(source.truncated).toBe(false);
   const receipt=JSON.parse(String(f.requests[3]!.messages.filter(m=>m.role==='tool').at(-1)!.content));

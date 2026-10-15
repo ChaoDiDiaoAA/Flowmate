@@ -33,7 +33,7 @@ describe('P7 Workspace migration', () => {
     const opened = openTestDatabase(fixturePaths());
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
     expect(opened.data.workspace.read('2026-10-03T00:00:00.000Z')).toMatchObject({ ok: true, data: { revision: 0, selection: null } });
     expect(opened.data.workspace.read('2026-10-03T00:00:01.000Z')).toMatchObject({ ok: true, data: { revision: 0 } });
     expect(opened.data.db.query('SELECT COUNT(*) AS count FROM workspace').get()).toEqual({ count: 1 });
@@ -68,7 +68,7 @@ describe('P7 Workspace migration', () => {
       expect(() => opened.data.db.query('UPDATE workspace SET selection_json=?').run(invalid)).toThrow();
     opened.data.db.query('UPDATE workspace SET selection_json=?').run(JSON.stringify({ formatVersion: 1,
       kind: 'source', target: 'document', targetId: 1, targetVersion: 'v1', artifactId: 2, page: 1 }));
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
   });
 
   it('rolls back a failed copy of incompatible historical bytes', () => {
@@ -98,7 +98,7 @@ describe('P7 Workspace migration', () => {
   it.each(['gap', 'higher'] as const)('rejects the unsupported %s version sequence', kind => {
     const paths = fixturePaths(), db = schema13(paths);
     if (kind === 'gap') db.exec('DELETE FROM schema_migrations WHERE version=7');
-    else db.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(14,'fixture'),(15,'fixture'),(16,'fixture'),(17,'fixture'),(18,'fixture'),(19,'fixture'),(20,'fixture')");
+    else db.exec("INSERT INTO schema_migrations(version,applied_at) VALUES(14,'fixture'),(15,'fixture'),(16,'fixture'),(17,'fixture'),(18,'fixture'),(19,'fixture'),(20,'fixture'),(21,'fixture')");
     const before = db.query('SELECT * FROM schema_migrations ORDER BY version').all(); db.close();
     expect(openTestDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_schema_unsupported' } });
     const after = new Database(paths.databaseFile); deferCleanup(() => after.close());

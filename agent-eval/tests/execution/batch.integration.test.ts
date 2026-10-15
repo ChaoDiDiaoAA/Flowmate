@@ -57,7 +57,7 @@ test('stop uncertainty and cancellation block the second dataset', async () => {
 
 test('all datasets are checked before the first execution; ordinary failed results still permit the second group', async () => {
     expect(runner.runBatch).toBeFunction();let calls=0;
-    const data=datasets();data[1]!.cases[0]!.input.materials[0]!.sha256='0'.repeat(64);
+    const data=datasets();data[1]!.cases[0]!.input.materials[0]!.file='missing.md' as any;
     await expect(runner.runBatch(fixtureRepo,{datasets:data,selection:'smoke',backend:'local',judge:'required'},{env,kernel,
         run:async()=>{calls++;throw Error('must not run');}})).rejects.toThrow();expect(calls).toBe(0);
     const results=await runner.runBatch(fixtureRepo,{datasets:datasets(),selection:'smoke',backend:'local',judge:'required'}, {env,kernel,

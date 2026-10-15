@@ -16,4 +16,4 @@ export const candidateSchema = candidateSummarySchema.extend({ ...StoredCandidat
     checks: z.array(CheckResultSchema), issues: z.array(InvoiceIssueSchema), sources: z.array(SourceRefSchema) }).strict();
 export const invoiceExportSchema = z.object({ artifactId: id, candidateId: id, format: z.enum(['json', 'csv', 'markdown']),
     relativePath: z.string().regex(/^outputs\/invoice-[1-9]\d*-result-[1-9]\d*\.(json|csv|md)$/),
-    bytes: id.max(64 * 1024 * 1024), sha256: z.string().regex(/^[a-f0-9]{64}$/), createdAt: time }).strict();
+    bytes: id.max(64 * 1024 * 1024), createdAt: time }).strict();

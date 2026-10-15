@@ -1,10 +1,8 @@
-import { createHash } from 'node:crypto';
 import { closeSync, fstatSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { AppErrorSchema, appError, fail, ok, CONTEXT_ERROR_FACTS, RESOURCE_LIMITS } from '@flowmate/contracts';
 import type { ResourceErrorCode, ResourceFilePage, ResourceFileRequest, ResourceRef, Result } from '@flowmate/contracts';
 
-export const sha256 = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 export const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 export const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 // Frozen bundles retain their original versioned layout independently of author packages.
@@ -81,6 +79,6 @@ export function page(input: ResourceFileRequest, ref: ResourceRef, content: Buff
     reject('resource_file_unavailable', 'Text offset must be an existing UTF-8 character boundary.');
   let end = Math.min(content.length, offset + limit);
   while (end < content.length && (content[end]! & 0xc0) === 0x80) end--;
-  return { ref, path: input.path, sha256: sha256(content), offset, text: end === content.length && offset === 0 ? text : decoder.decode(content.subarray(offset, end)),
+  return { ref, path: input.path, offset, text: end === content.length && offset === 0 ? text : decoder.decode(content.subarray(offset, end)),
     nextOffset: end === content.length ? null : end, totalBytes: content.length };
 }

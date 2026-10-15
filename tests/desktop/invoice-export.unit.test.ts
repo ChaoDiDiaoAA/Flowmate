@@ -8,7 +8,7 @@ import { publishInvoiceExportCopy } from '../../apps/desktop/main/invoice-export
 it('publishes complete bytes, reuses the same file and never overwrites a different Native destination', () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-export-copy-'));
   const destination = join(root, 'invoice.json'); const bytes = Buffer.from('{"total":"9007199254740993.000001"}');
-  expect(publishInvoiceExportCopy(destination, bytes)).toMatchObject({ ok: true, data: { destinationPath: destination, bytes: bytes.length } });
+  expect(publishInvoiceExportCopy(destination, bytes)).toEqual({ ok: true, data: { destinationPath: destination, bytes: bytes.length } });
   expect(readFileSync(destination)).toEqual(bytes);
   expect(publishInvoiceExportCopy(destination, bytes)).toMatchObject({ ok: true });
   expect(publishInvoiceExportCopy(destination, Buffer.from('different'))).toMatchObject({ ok: false, error: { code: 'state_conflict' } });

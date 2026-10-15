@@ -33,6 +33,7 @@ function legacyStore(input: ReturnType<typeof paths>) {
     for (const statement of sql.split(';').map(item => item.trim()).filter(Boolean)) db.exec(statement);
     if (name === '004_parsed_documents') db.exec('COMMIT');
   }
+  db.exec('CREATE TEMP TABLE managed_file_contents(owner_kind TEXT,owner_id TEXT,relative_path TEXT,content BLOB,PRIMARY KEY(owner_kind,owner_id,relative_path))');
   let closed = false;
   return { db, candidates: createCandidateRepository(db), documents: createDocumentRepository(db), jobs: createJobRepository(db),
     runs: createRunRepository(db), sessions: createSessionRepository(db), sessionInputs: createSessionInputLedger(db), toolCalls: createToolCallRepository(db),
@@ -53,6 +54,8 @@ export function makeSelectedCandidate(schema9 = false, withSource = false) {
   mkdirSync(join(root,'artifacts','1'), { recursive: true });
   writeFileSync(join(root,'artifacts','1','original.png'), originalBytes);
   writeFileSync(join(root,'artifacts','2','parsed.json'), parsedBytes);
+  store.documents.contents!.remember({ ownerKind: 'artifact', ownerId: '1', relativePath: 'original.png' }, originalBytes);
+  store.documents.contents!.remember({ ownerKind: 'artifact', ownerId: '2', relativePath: 'parsed.json' }, parsedBytes);
   required(store.documents.register({ documentId: 1, sourceKey: 'synthetic', sourceRecordId: 'form-invoice', version: 'v1',
     originalArtifact: { artifactId: 1, kind: 'original', relativePath: 'artifacts/1/original.png', bytes: originalBytes.byteLength,
       mimeType: 'image/png', metadata, createdAt: stamp },

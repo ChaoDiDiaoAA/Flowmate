@@ -2,7 +2,6 @@ import { expect, test } from 'bun:test';
 import { evaluateAll } from '../../src/scoring/evaluate.ts';
 import { aggregate, dimensions } from '../../src/scoring/aggregate.ts';
 import { observed, task } from '../support/fixtures.ts';
-import { hash } from '../../src/dataset-loader/local.ts';
 import type { EvaluationContext } from '../../src/scoring/types.ts';
 import { evaluateSemantic } from '../../src/scoring/evaluators/semantic.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
@@ -33,7 +32,7 @@ function tool(toolCallId: number, toolName = 'read_invoice_document', runId = 1)
 }
 function collect(c: EvaluationContext, calls: ReturnType<typeof tool>[], complete = true) {
     c.result.evidence['tool-evidence'] = { present: complete, source: 'Original tool collection', actual: {
-        calls: calls.map(tool => ({ tool, sha256: hash(tool), bytes: Buffer.byteLength(JSON.stringify(tool)) }))
+        calls: calls.map(tool => ({ tool,  bytes: Buffer.byteLength(JSON.stringify(tool)) }))
     } };
 }
 test('zero-tool Skill absence requires a resource journal for every original Run',async()=>{
@@ -205,15 +204,15 @@ test('a recorded collection failure grades missing evidence as ERROR while prese
 });
 
 function skillResources(sdkInclusion: 'confirmed' | 'not-included' | 'unknown', wireInclusion: 'confirmed' | 'not-included' | 'unknown') {
-    const at = '2026-10-13T00:00:00.000Z', digest = 'a'.repeat(64);
-    const skill = { kind: 'skill', id: 'authorized-skill', version: '1', contentHash: digest };
+    const at = '2026-10-13T00:00:00.000Z';
+    const skill = { kind: 'skill', id: 'authorized-skill', version: '1' };
     return RunResourceViewSchema.parse({ sessionId: 1, runId: 1, frozen: null, gap: null, evidence: { version: 1,
         reads: [], expansions: [{ inputId: 1, nativeEntryId: 'entry-1', skill,
-            bundleHash: digest, expandedTextHash: digest, at }],
-        requests: [{ purpose: 'answer', callSequence: 1, compactionOperationId: null, bundleHash: digest,
-            referencedBundleHashes: [], systemPromptHash: digest, inputIds: [1], toolCallIds: [], at,
+            bundleId: '00000000-0000-4000-8000-000000000001', expandedText: 'Synthetic skill body', at }],
+        requests: [{ purpose: 'answer', callSequence: 1, compactionOperationId: null, bundleId: '00000000-0000-4000-8000-000000000001',
+            referencedBundleIds: [], systemPrompt: 'Synthetic system prompt', inputIds: [1], toolCallIds: [], at,
             contentChecks: [{ ref: skill, nativeEntryId: 'entry-1', path: 'SKILL.md',
-                scope: 'expanded-body', expectedTextHash: digest, sdkInclusion, wireInclusion,
+                scope: 'expanded-body', expectedText: 'Synthetic skill body', sdkInclusion, wireInclusion,
                 reason: sdkInclusion === 'unknown' || wireInclusion === 'unknown' ? 'payload_codec_unavailable' : null }] }] } });
 }
 
@@ -251,7 +250,7 @@ test.each(['expansion', 'read'] as const)('a forbidden Skill %s receipt still fa
     c.result.evidence.resources = { present: true, source: 'Original resource receipt', actual: [RunResourceViewSchema.parse({ ...resource,
         evidence: { ...evidence, expansions: source === 'expansion' ? evidence.expansions : [], reads: source === 'read' ? [{
             toolCallId: 1, nativeToolCallId: 'call-1', requestSequence: 1, ref: evidence.expansions[0]!.skill,
-            bundleHash: 'a'.repeat(64), path: 'SKILL.md', fileHash: 'a'.repeat(64), deliveredHash: 'a'.repeat(64),
+            bundleId: '00000000-0000-4000-8000-000000000001', path: 'SKILL.md', deliveredContent: 'Synthetic skill body',
             operation: 'read', fullBody: true, nativeEntryId: 'entry-1', at: '2026-10-13T00:00:00.000Z' }] : [] } })] };
     expect(await score(c, 'fact-check/forbidden-skills')).toMatchObject({ status: 'FAIL', value: 0 });
 });
@@ -260,7 +259,7 @@ test('derived Skill provenance remains unknown and cannot hide a separate known 
     const c = context(); Object.assign(c.task.expected, { requiredSkills: ['authorized-skill'] });
     const resource = skillResources('unknown', 'unknown');
     const derived = RunResourceViewSchema.parse({ ...resource, evidence: { ...resource.evidence!, requests: resource.evidence!.requests.map(request => ({
-        ...request, contentChecks: request.contentChecks.map(check => ({ ...check, scope: 'derived-source', expectedTextHash: null, reason: 'derived-source-only' })) })) } });
+        ...request, contentChecks: request.contentChecks.map(check => ({ ...check, scope: 'derived-source', expectedText: null, reason: 'derived-source-only' })) })) } });
     c.result.evidence.resources = { present: true, source: 'Original derived resource provenance', actual: [derived] };
     expect(await score(c, 'fact-check/required-skills')).toMatchObject({ status: 'UNJUDGEABLE', value: null });
     Object.assign(c.task.expected, { requiredSkills: ['authorized-skill', 'missing-skill'] });

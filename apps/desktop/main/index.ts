@@ -2,7 +2,7 @@ import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesIn
 import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, researchOperations } from '../../../packages/contracts/src/research-commands.ts';
 import { ResourceRefSchema } from '@flowmate/contracts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -497,8 +497,8 @@ function registerIpc(): void {
     if (!exported.data.ok) return exported.data;
     if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed.'));
     const report = exported.data.data;
-    if (createHash('sha256').update(report.markdown).digest('hex') !== report.sha256)
-      return fail(appError('research_evidence_mismatch', 'storage', 'Report export content changed.'));
+    if (Buffer.byteLength(report.markdown, 'utf8') !== report.bytes)
+      return fail(appError('research_evidence_mismatch', 'storage', 'Report export size changed.'));
     const selected = await dialog.showSaveDialog(owner!, { title: 'Save research report', defaultPath: report.filename,
       filters: [{ name: 'Markdown', extensions: ['md'] }] });
     if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed before saving.'));
@@ -1319,8 +1319,7 @@ function credentialStore(reference: string): CredentialStore {
   if (!/^[a-zA-Z0-9_-]{16,80}$/.test(reference)) throw new Error('invalid_credential_reference');
   let store = credentialStores.get(reference);
   if (!store) {
-    const hash = createHash('sha256').update(reference).digest('hex');
-    const file = join(userDataRoot, 'security', 'credentials', `${hash}.json`);
+    const file = join(userDataRoot, 'security', 'credentials', `${reference}.json`);
     store = createCredentialStore(file, systemSecureStorage);
     credentialStores.set(reference, store);
   }
@@ -1444,7 +1443,7 @@ async function startInvoiceFormRun(event: Electron.IpcMainInvokeEvent, raw: unkn
     if (!original.ok || !original.data.input?.runId) return fail(appError('operation_result_unknown', 'runtime', 'Fill admission is unknown. Query its original input.'));
     const saved = original.data.input;
     if (saved.content.version === 2 && saved.content.requestIdentityVersion === 1
-      && saved.content.desktopRequestHash !== createHash('sha256').update(serializeDesktopInvoiceFormRequest(input.data)).digest('hex'))
+      && saved.content.desktopRequestIdentity !== serializeDesktopInvoiceFormRequest(input.data))
       return fail(appError('state_conflict', 'input', 'This input sequence belongs to another Fill request.'));
     if (saved.sessionId !== input.data.workspace.sessionId || saved.clientSequence !== input.data.clientSequence || saved.mode !== 'prompt'
       || saved.goalMode !== 'fill-form' || saved.content.version !== 2 || saved.content.workspaceContext === null
@@ -1557,7 +1556,19 @@ async function saveInvoiceExport(event: Electron.IpcMainInvokeEvent, raw: unknow
     if (!currentOwner()) return fail(appError('state_conflict', 'input', 'The managed export is registered; the window changed before the external copy.'));
     const paths = resolveProductPaths(userDataRoot);
     if (!paths.ok) return paths;
-    const source = readManagedInvoiceExport(paths.data, reference);
+    const chunks: Buffer[] = [];
+    let offset = 0;
+    do {
+      const page = await productHostRequest<import('@flowmate/contracts').InvoiceExportPage>({ type: 'read_invoice_export',
+        input: { ...parsed.data, offset, limit: 32_768 } }, 'Original export bytes are unavailable.');
+      if (!page.ok) return page;
+      if (!currentOwner() || page.data.artifactId !== reference.artifactId || page.data.candidateId !== reference.candidateId
+        || page.data.relativePath !== reference.relativePath || page.data.format !== reference.format || page.data.bytes !== reference.bytes
+        || page.data.offset !== offset) return fail(appError('state_conflict', 'input', 'Export bytes do not match the original operation.'));
+      chunks.push(Buffer.from(page.data.chunkBase64, 'base64'));
+      offset = page.data.nextOffset ?? reference.bytes;
+    } while (offset < reference.bytes);
+    const source = readManagedInvoiceExport(paths.data, reference, Buffer.concat(chunks));
     if (!source.ok) return source;
     const published = publishInvoiceExportCopy(selected.filePath, source.data);
     return published.ok ? ok({ outcome: 'saved', reference, destinationPath: published.data.destinationPath })

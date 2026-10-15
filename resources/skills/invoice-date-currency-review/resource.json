@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-date-currency-review",
   "version": "v1",
@@ -37,13 +37,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1481,
-      "sha256": "39add448e79e7fadeb91c33663d125379ee12c70cd3b806af75216af8f3c9070"
+      "bytes": 1481
     },
     {
       "path": "references/guide.md",
-      "bytes": 1060,
-      "sha256": "fc56b80e376382c51b33ac79b0e2ddd5f9cfe70280861b232a7b41d0e286064f"
+      "bytes": 1060
     }
   ]
 }

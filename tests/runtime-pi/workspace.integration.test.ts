@@ -79,7 +79,7 @@ async function fixture(onRequest: (ordinal: number, app: Application) => Promise
         candidateSequence: request.candidateSequence, formInstanceId: request.target.formInstanceId,
         observedAt: new Date().toISOString(), outcome: 'applied', appliedRevision: request.target.expectedRevision + 1,
         appliedAt: new Date().toISOString() };
-    }, agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+    }, agentFactory: (tools, resourceContents) => new PiAgentAdapter({ resourceContents, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-p7-key', sessionSetup(session) {
         if (failDelivery) session.agent.afterToolCall = async () => { throw new Error('Controlled candidate delivery failure.'); };
         if (afterCandidateCommit) {

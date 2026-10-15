@@ -90,7 +90,7 @@ export const SessionInputContentV2Schema = z.object({ research: ResearchContextS
   allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id), promptText: z.string().min(1),
   inputCommand: FrozenInputCommandSchema.optional(),
   resourceBinding: ResourceBindingSchema.optional(),
-  desktopRequestHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  desktopRequestIdentity: z.string().min(1).max(262144).optional(),
   requestIdentityVersion: z.literal(1).optional(), originalBudgetOverrides: RuntimeRequestOverridesSchema.optional(),
 }).strict().refine(value => (value.requestIdentityVersion !== undefined) === (value.originalBudgetOverrides !== undefined),
 'Request identity version and original overrides must be present together.');

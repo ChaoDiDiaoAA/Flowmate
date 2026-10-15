@@ -104,7 +104,7 @@ export function SessionCompaction(props: Props) {
         {' · '}window {capacity?.contextWindow ?? 'unknown'} · threshold {capacity?.thresholdTokens ?? 'unknown'}</dd></div>
       <div><dt>Capacity allows continuation</dt><dd>{capacity?.fitsEstimate === null ? 'Unknown' : capacity?.fitsEstimate ? 'Yes, estimated' : 'No'}</dd></div>
       <div><dt>Automatic default policy</dt><dd>{saved.policy.version} · {saved.policy.autoEnabled ? 'Enabled for qualified Runs' : 'Disabled'}</dd></div>
-      <div><dt>Selected Run frozen policy</dt><dd>{typeof frozenPolicy?.version === 'string' && typeof frozenPolicy?.autoEnabled === 'boolean'
+      <div><dt>Policy used by selected Run</dt><dd>{typeof frozenPolicy?.version === 'string' && typeof frozenPolicy?.autoEnabled === 'boolean'
         ? `${frozenPolicy.version} · ${frozenPolicy.autoEnabled ? 'Enabled for this Run' : 'Disabled for this Run'}` : 'Unknown or not recorded'}</dd></div>
       <div><dt>Manual admission</dt><dd>{saved.manualAllowed ? 'Available while idle' : saved.blockCode ?? 'Unavailable'}</dd></div>
       <div><dt>Saved history position</dt><dd>Revision {saved.commit.commitRevision} · {saved.commit.entryCount} entries</dd></div>

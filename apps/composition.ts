@@ -2,7 +2,6 @@ import { createInputDefinitions } from '../packages/core/src/prompt-templates.ts
 import { parseFrontmatter, loadPromptTemplates, expandPromptTemplate } from '@flowmate/runtime-pi';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createHash } from 'node:crypto';
 import { readResearchEvidence, exportResearchReport } from '@flowmate/core';
 import { ResearchEvidenceRequestSchema } from '@flowmate/contracts';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
@@ -28,7 +27,7 @@ export type ApplicationOptions = {
   caseEvaluationFaultProfile?: import('@flowmate/contracts').CaseEvaluationFaultProfile;
   provider?: ProviderPort;
   agent?: AgentPort;
-  agentFactory?: (tools: readonly ToolDefinition<any, any>[]) => AgentPort;
+  agentFactory?: (tools: readonly ToolDefinition<any, any>[], resourceContents: Pick<import('@flowmate/contracts').ManagedFileContents, 'read'>) => AgentPort;
   promptTrace?: PromptTraceBuffer;
   logger?: SafeLogger;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
@@ -91,7 +90,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const definitions = Object.freeze([...(options.toolDefinitions?.(assembled) ?? assembled)]);
   const unavailableTools = new Set(native.availability.filter(item => !item.available).map(item => item.name as string));
   const resources = createResourceService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
-    bundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
+    bundleRoot: join(options.paths.runtimeDir, 'resource-bundles'), contents: database.data.contents,
     registeredToolNames: definitions.filter(tool => !unavailableTools.has(tool.name)).map(tool => tool.name), inspectNativeResources,
     getRun: runId => database.data.runs.get(runId) });
   const extensions = createExtensionService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
@@ -104,8 +103,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     isSessionModelUseBlocked: (sessionId) => database.data.sessions.isModelUseBlocked(sessionId), now,
     monotonicNow: () => performance.now() });
   const provider = options.provider ?? new PiProviderAdapter();
-  agent = options.agentFactory?.(definitions) ?? options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace,
-    resourceBundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
+  agent = options.agentFactory?.(definitions, database.data.contents) ?? options.agent ?? new PiAgentAdapter({ cwd: options.paths.runtimeDir, agentDir: options.paths.runtimeDir, promptTrace,
+    resourceBundleRoot: join(options.paths.runtimeDir, 'resource-bundles'), resourceContents: database.data.contents,
     tools: definitions });
   let sessionService: SessionService;
   const memory: MemoryStore = Object.assign(database.data.memory, { list: (input: Parameters<MemoryStore['list']>[0]) => sessionService.listHistory(input) });
@@ -174,16 +173,15 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       return task.ok ? readResearchEvidence({ research: database.data.research, calls: database.data.toolCalls, files }, parsed.data, task.data.sourcePolicy) : task;
     },
     importResearchMaterial: input => {
-      const contentHash = createHash('sha256').update(input.text, 'utf8').digest('hex');
-      const found = database.data.research.findMaterial({ title: input.title, format: input.format, contentHash });
+      const found = database.data.research.findMaterials({ title: input.title, format: input.format });
       if (!found.ok) return found;
-      if (found.data) {
-        const artifact = database.data.documents.getArtifact(found.data.artifactId);
+      for (const material of found.data) {
+        if (material.verificationGap === 'legacy-original-unavailable') continue;
+        const artifact = database.data.documents.getArtifact(material.artifactId);
         if (!artifact.ok) return artifact;
         const body = files.read(artifact.data);
         if (!body.ok) return body;
-        return createHash('sha256').update(body.data).digest('hex') === contentHash ? ok(found.data)
-          : fail(appError('research_source_unavailable', 'storage', 'The saved material has changed.'));
+        if (Buffer.from(body.data).equals(Buffer.from(input.text, 'utf8'))) return ok(material);
       }
       const published = files.publishResearchMaterial({ ...input, at: now() });
       return published.ok ? database.data.research.registerMaterial(published.data) : published;

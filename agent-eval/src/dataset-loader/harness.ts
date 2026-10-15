@@ -3,7 +3,7 @@ import { isAbsolute, join, relative } from 'node:path';
 import { z } from 'zod';
 import { metricCatalog } from '../scoring/catalog.ts';
 import { compileFormalSemanticPlan } from '../scoring/formal-rules.ts';
-import { byteHash, type EmbeddedFile } from './flat.ts';
+import { type EmbeddedFile } from './flat.ts';
 import { extensionIdentity } from '../configuration.ts';
 import { userTurnSchema, constraintShape } from './authoring.ts';
 
@@ -14,14 +14,7 @@ export function materialPath(repo:string,path:string) {
     if(relative(base,realpathSync(target)).startsWith('..')||!lstatSync(target).isFile())throw Error('Material escapes data directory');
     return target;
 }
-export function assertNoHashes(value:unknown) {
-    if(Array.isArray(value)) { value.forEach(assertNoHashes);return; }
-    if(value&&typeof value==='object')for(const[key,item]of Object.entries(value)) {
-        if(/hash|sha256|fingerprint|digest/i.test(key))throw Error('Evaluation artifact contains a forbidden digest field: '+key);
-        assertNoHashes(item);
-    }
-    if(typeof value==='string'&&/\b[a-f0-9]{64}\b/i.test(value))throw Error('Evaluation artifact contains a digest value');
-}
+
 const text=z.string().trim().min(1), reference=z.object({source:z.enum(['voxel51','local-text']),sample:text,file:text,originalFile:text.optional()}).strict();
 const rawCaseSchema=z.object({contract:z.literal('flowmate-eval-case/v4'),id:z.string().regex(/^FM-\d{3}$/),version:z.number().int().positive(),
     name:text,category:z.enum(['task','tools','context','memory','compaction','skills','extensions','subagents','runtime','safety','research']),
@@ -33,7 +26,6 @@ const rawCaseSchema=z.object({contract:z.literal('flowmate-eval-case/v4'),id:z.s
 
 /** Expand compact authoring into the existing execution DTO, exclusively in memory. */
 export function expandHarness(raw:any,gold:any,review:any,registry:any,repo:string, readMaterial?: (path:string)=>Buffer) {
-    [raw,gold,review,registry].forEach(assertNoHashes);
     const task=rawCaseSchema.parse(raw);
     if(gold.contract!=='flowmate-eval-gold/v4'||review.contract!=='flowmate-eval-review/v4'||gold.caseId!==task.id||review.caseId!==task.id||
         gold.version!==task.version||review.version!==task.version||review.status!=='agent-reviewed'||review.humanReview!=='pending')throw Error('Case/Gold/Review contract or identity differs');
@@ -44,7 +36,7 @@ export function expandHarness(raw:any,gold:any,review:any,registry:any,repo:stri
         if(files[path])return files[path]!;
         const location=registry.files[path];if(typeof location!=='string')throw Error('Unregistered material: '+path);
         const bytes=readMaterial ? readMaterial(path) : readFileSync(materialPath(repo,location));
-        const file={path,encoding:'base64' as const,content:bytes.toString('base64'),bytes:bytes.length,sha256:byteHash(bytes)};
+        const file={path,encoding:'base64' as const,content:bytes.toString('base64'),bytes:bytes.length};
         files[path]=file;return file;
     };
     const publicFiles:EmbeddedFile[]=[], sources:EmbeddedFile[]=[];
@@ -64,24 +56,24 @@ export function expandHarness(raw:any,gold:any,review:any,registry:any,repo:stri
             publicFiles.push(source);
             if(task.requires.includes('invoice')&&originalFile)publicFiles.push(load(prefix+originalFile));
         }
-        return{...ref,sha256:source.sha256,originalSha256:load(prefix+(originalFile??ref.file)).sha256};
+        load(prefix+(originalFile??ref.file));return ref;
     });
     for(const path of gold.sources) sources.push(load(path));
     const controllers=Object.keys(registry.files).filter(path=>path.startsWith(`quality-controls/${task.id}/`)).map(load);
     for(const file of controllers)if(file.path.endsWith('/controller.json')) {
         const value=JSON.parse(Buffer.from(file.content,'base64').toString('utf8'));
         if(value.extensionRef)value.extensionRef=extensionIdentity(value.extensionRef,repo);
-        for(const key of ['history','steer'])if(value[key]?.relativePath)value[key].sha256=load(value[key].relativePath).sha256;
-        const bytes=Buffer.from(JSON.stringify(value));Object.assign(file,{content:bytes.toString('base64'),bytes:bytes.length,sha256:byteHash(bytes)});
+        for(const key of ['history','steer'])if(value[key]?.relativePath)load(value[key].relativePath);
+        const bytes=Buffer.from(JSON.stringify(value));Object.assign(file,{content:bytes.toString('base64'),bytes:bytes.length});
     }
     const setup=structuredClone(task.setup);
     if(setup?.controllerBinding) {
-        const binding=setup.controllerBinding as any;binding.sha256=load(binding.relativePath).sha256;
+        const binding=setup.controllerBinding as any;load(binding.relativePath);
     }
     const values=structuredClone(gold.values);
     for(const key of Object.keys(constraintShape))if(Object.hasOwn(values,key))throw Error('Gold must not overwrite Case constraint: '+key);
     for(const claim of values.research?.claims??[])for(const evidence of claim.evidence) {
-        const matches=materials.filter(m=>m.sample===evidence.sample);if(matches.length!==1)throw Error('Gold source must identify one material');evidence.sha256=matches[0]!.sha256;
+        const matches=materials.filter(m=>m.sample===evidence.sample);if(matches.length!==1)throw Error('Gold source must identify one material');
     }
     const metrics=metricCatalog.map(m=>({metricId:m.id,version:m.version,unit:m.unit,...(Object.hasOwn(task.scoring.metrics,m.id)?
         {denominator:task.scoring.metrics[m.id]}:{notApplicable:'本题未设计该能力机会；已选指标缺证据仍计未知。'})}));

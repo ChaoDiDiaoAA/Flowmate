@@ -5,11 +5,11 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { reportFixture, fixtureDirectory } from '../support/fixtures.ts';
+import { reportFixture, fixtureDirectory,comparisonFacts } from '../support/fixtures.ts';
 import { exportEvents, exportReport, validateReceipt } from '../../src/langfuse/export.ts';
 import { readReport, saveReport, exitCode, comparison } from '../../src/reports/store.ts';
 import { addFeedback, feedbackStatus } from '../../src/review/local.ts';
-import { loadDataset, caseContentHash, hash } from '../../src/dataset-loader/local.ts';
+import { loadDataset } from '../../src/dataset-loader/local.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
 import { runJudge, runCompactJudge } from '../../src/scoring/judges/harness.ts';
 import { compactScores } from '../../src/scoring/judges/compact.ts';
@@ -33,7 +33,7 @@ test('plain research witnesses, independent counts and derived F1 survive report
   trial.metricPlan=[{metricId:'task-success',version:1,unit:'Trial',denominator:1},...plan.criteria.map(({metricId,version,unit,denominator}:any)=>({metricId,version,unit,denominator})),
    {metricId:'DR03',version:1,unit:formalMetric('DR03').unit,denominator:null}];
   trial.scores.push(deriveResearchF1(trial.metricPlan,trial.scores,trial.execution)!);Object.assign(trial,aggregate(trial.scores,trial.execution!));
-  report.scoringConfiguration.judgeHash=call.configuration.configHash;saveReport(file,report);
+  saveReport(file,report);
   const stored=readReport(file);expect(stored.trials[0]!.scores.filter(s=>s.metricId.startsWith('DR')).map(s=>s.value)).toEqual([1,1,1,1,1,1]);
   const partial=structuredClone(stored),partialFrame=structuredClone(frame);partialFrame.complete=false;partialFrame.links[0].valid=false;
   const partialCall=await runCompactJudge(config,plan,{researchFrame:partialFrame},async()=>judgeResponse({choices:[{
@@ -82,7 +82,7 @@ test('review records actual version and never upgrades business grade or inherit
         const task = dataset.cases[0]!;
         const feedback = addFeedback(dir, { dataset, caseId: task.id, reviewer: 'test-reviewer', verdict: 'good', note: 'synthetic test record' });
         expect(feedback.caseVersion).toBe(task.version);
-        expect(feedback.caseHash).toBeUndefined();
+        expect(feedback).not.toHaveProperty('caseConditions');
         expect(feedbackStatus(dir, undefined, dataset).records).toHaveLength(1);
         task.input.prompt += ' Changed input under the same public version.';
         expect(feedbackStatus(dir, undefined, dataset).records).toHaveLength(0);
@@ -115,9 +115,9 @@ test('incompatible report comparisons and historical re-export are rejected', ()
 });
 test('different Judge configuration is not silently treated as comparable scoring', () => {
     const left = reportFixture(), right = reportFixture();
-    const call = { configuration: { configHash: 'model-a' } } as any;
-    left.scoringConfiguration.judgeHash = 'a';
-    right.scoringConfiguration.judgeHash = 'b';
+    left.scoringConfiguration.judge={provider:'openai-compatible',model:'model-a',baseUrl:'https://example.invalid',timeoutMs:1000};
+    right.scoringConfiguration.judge={...left.scoringConfiguration.judge,model:'model-b'};
+
     expect(() => comparison(left, right)).toThrow('configuration');
 });
 test('partial or missing export receipts do not claim completion', () => {
@@ -240,7 +240,7 @@ test('stored modern Judge identity and completion are verified while legacy meta
         const config = { timeoutMs, ...parameters };
         report.trials[0]!.judgeCalls = [await runJudge(config, 'rubric', 'data', async () => judgeResponse({
             choices: [{ message: { content: '{"score":1,"reason":"Synthetic record."}' }, finish_reason: 'stop' }] }))];
-        report.scoringConfiguration.judgeHash = report.trials[0]!.judgeCalls[0]!.configuration.configHash!;
+
         saveReport(file, report);
         expect(readReport(file).trials[0]!.judgeCalls[0]!.judgment?.score).toBe(1);
         for (const mutate of [
@@ -260,8 +260,8 @@ test('stored modern Judge identity and completion are verified while legacy meta
         const legacy = JSON.parse(JSON.stringify(report)); legacy.contract = 'flowmate-agent-run/v1'; delete legacy.aggregation;
         const call = legacy.trials[0].judgeCalls[0]; delete call.stopReason; delete call.rawStopReason; delete call.usageSource;
         delete call.responseComplete; delete call.configuration.protocolVersion; delete call.configuration.api; delete call.configuration.sdk; delete call.configuration.modelCapabilities;
-        const { configHash, ...legacyParameters } = call.configuration; call.configuration.configHash = hash(legacyParameters);
-        legacy.scoringConfiguration.judgeHash = call.configuration.configHash;
+
+        legacy.scoringConfiguration.judge=structuredClone(call.configuration);
         const legacyFile = join(dir, 'legacy-summary.json'); saveReport(legacyFile, legacy);
         expect(readReport(legacyFile).trials[0]!.judgeCalls[0]).not.toHaveProperty('responseComplete');
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -285,7 +285,7 @@ test('one compact Judge record binds distinct semantic counts to their original 
     trial.metricPlan = [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 },
         ...plan.criteria.map(({ metricId, version, unit, denominator }) => ({ metricId, version, unit, denominator }))];
     Object.assign(trial, aggregate(trial.scores, trial.execution!));
-    report.scoringConfiguration.judgeHash = call.configuration.configHash;
+
     saveReport(file, report);
     expect(readReport(file).trials[0]!.scores.slice(1)).toEqual(compactScores(call));
     expect(readReport(file).trials[0]!.status).toBe('FAIL');
@@ -307,14 +307,13 @@ test('one compact Judge record binds distinct semantic counts to their original 
         (r: typeof report) => { r.trials[0]!.judgeCalls[0]!.request!.redacted = true; },
         (r: typeof report) => {
             const c = r.trials[0]!.judgeCalls[0]!; c.configuration.rubric!.version++;
-            const { configHash: _, ...parameters } = c.configuration;
-            c.configuration.configHash = hash(parameters); r.scoringConfiguration.judgeHash = c.configuration.configHash;
+
         },
         ...['rule', 'evidence', 'trigger', 'required'].map(field => (r: typeof report) => {
             const c = r.trials[0]!.judgeCalls[0]!, criterion = c.compact!.plan.criteria[0]!;
             Object.assign(criterion, { [field]: field === 'rule' ? 'Another valid rule.' : field === 'evidence' ? ['another-original'] : field === 'trigger' ? 'completed-endpoint' : false });
             const input = JSON.parse(c.request!.data); input.plan = c.compact!.plan;
-            c.request!.data = JSON.stringify(input); c.request!.hash = hash([c.request!.system, c.request!.data]);
+            c.request!.data = JSON.stringify(input);
             r.trials[0]!.scores.splice(1, 2, ...compactScores(c));
             Object.assign(r.trials[0]!, aggregate(r.trials[0]!.scores, r.trials[0]!.execution!));
             r.aggregation = aggregateTrials(r);
@@ -360,7 +359,7 @@ test('report readback rederives same-Trial F1 and rejects copied values or a dro
         ...plan.criteria.map(({ metricId, version, unit, denominator }) => ({ metricId, version, unit, denominator })),
         { metricId: 'DR03', version: 1, unit: '派生F1', denominator: null }];
     trial.scores.push(...compactScores(call)); trial.scores.push(deriveResearchF1(trial.metricPlan, trial.scores, trial.execution)!);
-    Object.assign(trial, aggregate(trial.scores, trial.execution!)); report.scoringConfiguration.judgeHash = call.configuration.configHash!;
+    Object.assign(trial, aggregate(trial.scores, trial.execution!));
     saveReport(file, report);
     expect(readReport(file).trials[0]!.scores.find(s => s.metricId === 'DR03')?.value).toBe(0.4);
     for (const mutate of [
@@ -379,8 +378,10 @@ test('report readback rederives same-Trial F1 and rejects copied values or a dro
 test('comparison aligns actual Case and repetition and rejects different scoring conditions', () => {
     const left=reportFixture(), right=reportFixture();
     right.trials=structuredClone(left.trials).reverse();
+    for(const report of [left,right]){const directory=mkdtempSync(join(tmpdir(),'eval-comparison-facts-'));writeFileSync(join(directory,'snapshot.json'),JSON.stringify(comparisonFacts()));saveReport(join(directory,'report.json'),report);}
     expect(comparison(left,right)).toHaveLength(1);
-    right.scoringConfiguration.judgeMode='required';
+    left.scoringConfiguration.judge={provider:'openai-compatible',model:'model-a',baseUrl:'https://example.invalid',timeoutMs:1000};
+    right.scoringConfiguration.judge={...left.scoringConfiguration.judge,model:'model-b'};
     expect(()=>comparison(left,right)).toThrow('scoring configuration');
 });
 
@@ -397,17 +398,17 @@ test('historical compact scalar research reports remain readable without inventi
     const raw=JSON.stringify({v:1,r:[[1,3,0],[1,2,0]],f:[]});
     const data=JSON.stringify({plan,evidence:{original:'historical scalar grading record'}});
     const configuration={provider:'openai-compatible' as const,model:'historical-synthetic',baseUrl:config.baseUrl,timeoutMs:30000,protocolVersion:'flowmate-judge/v2',
-        rubric:{id:legacyCompactRubric.id,version:legacyCompactRubric.version,hash:hash(legacyCompactRubric.prompt)}};
-    const call:Parameters<typeof compactScores>[0]={callId:'00000000-0000-4000-8000-000000000001',configuration:{...configuration,configHash:hash(configuration)},
+        rubric:{id:legacyCompactRubric.id,version:legacyCompactRubric.version}};
+    const call:Parameters<typeof compactScores>[0]={callId:'00000000-0000-4000-8000-000000000001',configuration:{...configuration},
         startedAt:report.startedAt,endedAt:report.endedAt!,attempts:1,usage:null,responseModel:'synthetic',finishReason:'stop',responseComplete:true,
-        raw,error:null,judgment:null,request:{system:legacyCompactRubric.prompt,data,redacted:false,hash:hash([legacyCompactRubric.prompt,data])},
+        raw,error:null,judgment:null,request:{system:legacyCompactRubric.prompt,data,redacted:false},
         compact:{plan,judgment:{v:1,r:[[1,3,0],[1,2,0]],f:[]}}};
     const trial = report.trials[0]!; trial.semanticPlan = structuredClone(plan); trial.judgeCalls = [call];
     trial.metricPlan = [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 },
         ...plan.criteria.map(({ metricId, version, unit, denominator }) => ({ metricId, version, unit, denominator })),
         { metricId: 'DR03', version: 1, unit: '派生F1', denominator: null }];
     trial.scores.push(...compactScores(call)); trial.scores.push(deriveResearchF1(trial.metricPlan, trial.scores, trial.execution)!);
-    Object.assign(trial, aggregate(trial.scores, trial.execution!)); report.scoringConfiguration.judgeHash = call.configuration.configHash!;
+    Object.assign(trial, aggregate(trial.scores, trial.execution!));
     saveReport(file, report);
     expect(readReport(file).trials[0]!.scores.find(s => s.metricId === 'DR03')?.value).toBe(0.4);
     for (const mutate of [

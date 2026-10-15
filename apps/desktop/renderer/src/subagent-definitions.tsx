@@ -6,28 +6,28 @@ export function SubagentDefinitions({ hostEpoch, ready }: { hostEpoch: number; r
   const identity = { hostEpoch, sessionId: 0, runId: null, selectionToken: 0 };
   const list = useRead<SubagentDefinition[]>(identity), saving = useRead<SubagentDefinition>(identity);
   const [id, setId] = useState(''), [content, setContent] = useState('');
-  const [expectedHash, setExpectedHash] = useState<string | null>(null), [editing, setEditing] = useState(false);
+  const [expectedContent, setExpectedContent] = useState<string | null>(null), [editing, setEditing] = useState(false);
   const [recovery, setRecovery] = useState(false), [notice, setNotice] = useState('');
   async function refresh() { if (ready) await list.read('agents', () => window.flowmate.listSubagentDefinitions(), () => true); }
   useEffect(() => { void refresh(); }, [hostEpoch, ready]);
   function select(role?: SubagentDefinition) {
-    setId(role?.id ?? ''); setExpectedHash(role?.hash ?? null); setRecovery(false); setNotice(''); setEditing(!!role);
+    setId(role?.id ?? ''); setExpectedContent(role?.content ?? null); setRecovery(false); setNotice(''); setEditing(!!role);
     setContent(role?.content ?? '---\nname: new-agent\ndescription: Describe when to delegate to this agent.\ntools: []\n---\nAnalyze the assigned task independently. Return findings and uncertainties.');
   }
   async function save() {
     if (!ready || recovery || saving.state.pending) return;
-    const result = await saving.read('save:'+id, () => window.flowmate.saveSubagentDefinition({ id, expectedHash, content }),
+    const result = await saving.read('save:'+id, () => window.flowmate.saveSubagentDefinition({ id, expectedContent, content }),
       value => value.id === id && value.content === content);
-    if (result) { setExpectedHash(result.hash); setEditing(true); setNotice('Saved. Changes apply to future Runs.'); await refresh(); }
+    if (result) { setExpectedContent(result.content); setEditing(true); setNotice('Saved. Changes apply to future Runs.'); await refresh(); }
     else { setRecovery(true); setNotice('The save was not confirmed. Your draft is retained. Check the saved definition before retrying.'); }
   }
   async function recover() {
     const result = await saving.read('query:'+id, () => window.flowmate.getSubagentDefinition({ id }), value => value.id === id);
-    if (result) { setExpectedHash(result.hash); setEditing(true); setRecovery(false);
+    if (result) { setExpectedContent(result.content); setEditing(true); setRecovery(false);
       setNotice(result.content === content ? 'The original save is confirmed.' : 'Loaded the current identity. Your draft is retained; review it before saving.'); await refresh(); }
     else {
       const current = await list.read('recover-agents', () => window.flowmate.listSubagentDefinitions(), () => true);
-      if (current && !current.some(role => role.id === id)) { setExpectedHash(null); setEditing(false); setRecovery(false);
+      if (current && !current.some(role => role.id === id)) { setExpectedContent(null); setEditing(false); setRecovery(false);
         setNotice('No saved definition exists for this ID. Your draft is retained.'); }
     }
   }

@@ -3,7 +3,6 @@ import { isDeepStrictEqual } from 'node:util';
 import { ToolCallSnapshotSchema } from '../../../packages/contracts/src/tool-evidence.ts';
 import { PublicContextRequestEvidenceSchema, ContextSnapshotDetailSchema } from '../../../packages/contracts/src/context.ts';
 import { RunResourceViewSchema } from '../../../packages/contracts/src/resources.ts';
-import { hash } from '../dataset-loader/local.ts';
 import type { CaseConstraints } from '../dataset-loader/authoring.ts';
 import type { EvaluationContext, EvaluationScore } from './types.ts';
 
@@ -13,13 +12,12 @@ export function evaluateCaseConstraints({ task, result }: EvaluationContext): Ev
     const scores: EvaluationScore[] = [];
     const fact = (key: string) => result.evidence[key];
     const runs = z.array(z.object({ runId: z.number().int().positive(), sessionId: z.number().int().positive() }).passthrough()).safeParse(fact('runs')?.actual);
-    const collection = z.object({ calls: z.array(z.object({ tool: z.unknown(), sha256: z.string().optional(), bytes: z.number().optional() }).passthrough()) }).passthrough().safeParse(fact('tool-evidence')?.actual);
+    const collection = z.object({ calls: z.array(z.object({ tool: z.unknown(),  bytes: z.number().optional() }).passthrough()) }).passthrough().safeParse(fact('tool-evidence')?.actual);
     const tools = new Map<number, z.infer<typeof ToolCallSnapshotSchema>>();
     let valid = collection.success && runs.success;
     if (collection.success) for (const record of collection.data.calls) {
         const parsed = ToolCallSnapshotSchema.safeParse(record.tool);
-        if (!parsed.success || record.sha256 !== undefined && hash(record.tool) !== record.sha256 ||
-            record.bytes !== undefined && Buffer.byteLength(JSON.stringify(record.tool)) !== record.bytes ||
+        if (!parsed.success || record.bytes !== undefined && Buffer.byteLength(JSON.stringify(record.tool)) !== record.bytes ||
             !runs.success || !runs.data.some(r => r.runId === parsed.data.runId && r.sessionId === parsed.data.sessionId)) {
             valid = false; continue;
         }

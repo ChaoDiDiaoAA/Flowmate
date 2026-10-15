@@ -1,6 +1,6 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from './protocol.ts';
 import { isResearchHostCommand, parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchOperations } from '../../packages/contracts/src/research-commands.ts';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { CaseEvaluationFaultProfileSchema } from '@flowmate/contracts';
 import { createWriteStream } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
@@ -83,13 +83,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
   const settingsFile = join(paths.root, 'data', 'settings.json');
   const authFile = join(paths.runtimeDir, 'pi-desktop', 'auth.json');
 
-  let settings = await readProductSettings(settingsFile);
-  if (!settings.ok) {
-    send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> });
-    process.exitCode = 2;
-    return;
-  }
-  let currentSettings: ProductSettings = settings.data ?? defaultProductSettings();
+  let currentSettings: ProductSettings = defaultProductSettings();
   const active = new Map<string, { controller: AbortController; runId: number | null }>();
   const recentlySeen = new Set<string>();
   const seenOrder: string[] = [];
@@ -175,7 +169,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
     caseEvaluationFaultProfile,
     ...(extensionEvaluationProfile || caseEvaluationFaultProfile ? { sampleSource: 'evaluation' as const } : {}),
     provider: new PiProviderAdapter({ credentialsFor }),
-    agentFactory: (tools) => new PiAgentAdapter({ credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir,
+    agentFactory: (tools, resourceContents) => new PiAgentAdapter({ resourceContents, credentialsFor, cwd: paths.runtimeDir, agentDir: paths.runtimeDir,
       resourceBundleRoot: join(paths.runtimeDir, 'resource-bundles'), promptTrace, tools }),
     promptTrace,
     runtimeDefaults: () => ok(currentSettings.runtime ?? {}),
@@ -214,6 +208,14 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
     return;
   }
   application = created.data;
+  const settings = await readProductSettings(settingsFile);
+  if (!settings.ok) {
+    await application.close();
+    send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> });
+    process.exitCode = 2;
+    return;
+  }
+  currentSettings = settings.data;
   type RuntimeRegistration = {
     ownerToken: string; identity: string; input: import('@flowmate/contracts').RuntimeEventsSubscriptionRequest;
     closed: boolean; local?: import('@flowmate/contracts').RuntimeEventSubscription;
@@ -398,6 +400,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
     if (command.type === 'accept_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.acceptInvoiceCandidate(command.input) }); return; }
     if (command.type === 'reject_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.rejectInvoiceCandidate(command.input) }); return; }
     if (command.type === 'export_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.exportInvoiceCandidate(command.input) }); return; }
+    if (command.type === 'read_invoice_export') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.readInvoiceExport(command.input) }); return; }
     if (command.type === 'query_invoice_candidate_operation') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.queryInvoiceCandidateOperation(command.input) }); return; }
     if (command.type === 'query_session_input') {
       send({ version: 1, type: 'response', requestId: command.requestId, value: await application.querySessionInput(command.input) });
@@ -773,31 +776,30 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
       }
       if (!('modelId' in command.input)) return;
       const input = command.input;
-      let desktopRequestHash: string | undefined;
+      let desktopRequestIdentity: string | undefined;
       if (command.type === 'submit_session_input' && command.input.mode === 'prompt') {
-        desktopRequestHash = createHash('sha256').update(serializeDesktopPromptRequest(command.input, 1)).digest('hex');
+        desktopRequestIdentity = serializeDesktopPromptRequest(command.input, 1);
       }
       if (command.type === 'submit_invoice_form_input') {
-        desktopRequestHash = createHash('sha256').update(serializeDesktopInvoiceFormRequest(command.input)).digest('hex');
+        desktopRequestIdentity = serializeDesktopInvoiceFormRequest(command.input);
         const original = await application.querySessionInput({ sessionId: command.input.workspace.sessionId, clientSequence: command.input.clientSequence });
         if (!original.ok) { send({ version: 1, type: 'response', requestId: command.requestId, value: original }); return; }
         if (original.data.input) {
           const prior = original.data.input;
           const value = prior.mode === 'prompt' && prior.goalMode === 'fill-form' && prior.content.version === 2
-            && prior.content.desktopRequestHash === desktopRequestHash && prior.runId !== null
+            && prior.content.desktopRequestIdentity === desktopRequestIdentity && prior.runId !== null
             ? ok({ inputId: prior.inputId, sessionId: prior.sessionId, runId: prior.runId, requestId: command.requestId })
             : fail(appError('state_conflict', 'input', 'This client sequence belongs to another Fill request.'));
           send({ version: 1, type: 'response', requestId: command.requestId, value }); return;
         }
       }
-      if (desktopRequestHash !== undefined && command.type === 'submit_session_input') {
+      if (desktopRequestIdentity !== undefined && command.type === 'submit_session_input') {
         const original = await application.querySessionInput({ sessionId: command.input.sessionId, clientSequence: command.input.clientSequence });
         if (!original.ok) { send({ version: 1, type: 'response', requestId: command.requestId, value: original }); return; }
         if (original.data.input) {
           const prior = original.data.input;
-          if (prior.content.version === 2 && command.input.mode === 'prompt') desktopRequestHash = createHash('sha256')
-            .update(serializeDesktopPromptRequest(command.input, prior.content.requestIdentityVersion)).digest('hex');
-          const value = prior.content.version === 2 && prior.content.desktopRequestHash === desktopRequestHash
+          if (prior.content.version === 2 && command.input.mode === 'prompt') desktopRequestIdentity = serializeDesktopPromptRequest(command.input, prior.content.requestIdentityVersion);
+          const value = prior.content.version === 2 && prior.content.desktopRequestIdentity === desktopRequestIdentity
             ? prior.runId === null ? fail(appError('operation_result_unknown', 'session', 'The original Run cannot be confirmed.'))
               : ok({ inputId: prior.inputId, sessionId: prior.sessionId, runId: prior.runId, requestId: command.requestId })
             : fail(appError('state_conflict', 'input', 'This client sequence belongs to another input. Query the original input.'));
@@ -861,7 +863,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
       }
       let accepted;
       try {
-        const control = { ...(desktopRequestHash === undefined ? {} : { desktopRequestHash }), onEvent(event: AgentRunEvent) {
+        const control = { ...(desktopRequestIdentity === undefined ? {} : { desktopRequestIdentity }), onEvent(event: AgentRunEvent) {
           send({ version: 1, type: 'event', event: { type: 'agent_run_event', requestId: command.requestId, value: event } });
         } };
         if (command.type === 'submit_invoice_form_input') accepted = await application.submitInput({

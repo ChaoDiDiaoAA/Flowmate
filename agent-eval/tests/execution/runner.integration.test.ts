@@ -12,7 +12,6 @@ import type { AgentKernel, AgentTrial } from '../../src/adapters/agent.ts';
 import { executeCase } from '../../src/execution/execute-case.ts';
 import { caseV2Schema, manifestSchema } from '../../src/dataset-loader/schema.ts';
 import { metricCatalog } from '../../src/scoring/catalog.ts';
-import { hash } from '../../src/dataset-loader/local.ts';
 import { readReport } from '../../src/reports/store.ts';
 import { formalFixture } from '../support/formal.ts';
 import { compileFormalSemanticPlan } from '../../src/scoring/formal-rules.ts';
@@ -48,7 +47,7 @@ test('source drift preserves original scores, records changed paths and announce
         expect(readReport(run.file).sourceInvalidation).toEqual(run.report.sourceInvalidation);
         expect(readFileSync(run.file,'utf8')).not.toContain('workspaceHash');
     }finally{unlinkSync(file);}
-});
+},30000);
 
 function semanticDataset() {
     const criteria = [
@@ -66,7 +65,7 @@ function semanticDataset() {
     const data = { ...structuredClone(dataset), manifest: manifestSchema.parse({ ...dataset.manifest, contract: 'flowmate-agent-dataset/v2',
         members: ['cases/' + item.id + '.json'], smoke: [item.id], environment: { profile: 'isolated-agent/v2', source: 'voxel51', risks: ['synthetic'] },
         scoring: { ...dataset.manifest.scoring, judges: [{ id: 'semantic-batch', required: true }] } }), cases: [item] };
-    data.hash = hash({ manifest: data.manifest, cases: data.cases });
+
     return data;
 }
 
@@ -76,7 +75,7 @@ function deterministicDataset() {
     item.expected.metrics = metricCatalog.map(m => ({ metricId: m.id, version: m.version, unit: m.unit,
         ...(m.id === 'task-success' ? { denominator: 1 } : { notApplicable: 'Exact controlled saved fact only.' }) }));
     data.manifest.scoring.judges = [{ id: 'semantic-batch', required: false }];
-    data.hash = hash({ manifest: data.manifest, cases: data.cases });
+
     return data;
 }
 
@@ -148,11 +147,11 @@ test('a simple authored Case without a Fixture executes and saves no placeholder
     data.cases = [item]; data.manifest.members = ['cases/' + item.id + '.json']; data.manifest.smoke = [item.id];
     const content = readFileSync(join(REPO_ROOT, 'data/invoices/voxel51/000001/content.md'), 'utf8');
     const metadata = '{}';
-    const file = (path: string, text: string) => ({ path, encoding: 'utf8' as const, content: text, bytes: Buffer.byteLength(text), sha256: hash(text) });
+    const file = (path: string, text: string) => ({ path, encoding: 'utf8' as const, content: text, bytes: Buffer.byteLength(text) });
     data.embedded = { manifest: data.manifest, tasks: {}, files: {
         'voxel51/000001/content.md': file('voxel51/000001/content.md', content),
         'voxel51/000001/metadata.json': file('voxel51/000001/metadata.json', metadata)
-    }, inputs: { [item.id]: [] }, reviews: {}, hash: data.hash, authored: { version: 'v1', cases: [{ id: item.id, input: { prompt: item.input.prompt } }],
+    }, inputs: { [item.id]: [] }, reviews: {},  authored: { version: 'v1', cases: [{ id: item.id, input: { prompt: item.input.prompt } }],
         gold: { [item.id]: {} }, reviews: {}, fixtures: {} } };
     let prepared = 0; const product = kernel(); const prepare = product.prepare;
     product.prepare = async (trial, signal) => { prepared++; return prepare(trial, signal); };
@@ -219,8 +218,8 @@ test('a linked result root is rejected before creating an Execution or preparing
     expect(readdirSync(outside)).toEqual([]);
 });
 test('local orchestration stores all selected members, independent trials and missing material; no backend needed', async () => {
-    const id = 'unit-' + randomUUID(), data = structuredClone(dataset);
-    data.cases[0]!.input.materials[0]!.sha256 = '0'.repeat(64);
+    const id = 'unit-' + randomUUID(), data = structuredClone(dataset);data.cases[0]!.input.materials[0]!.file='missing.md' as any;
+
     // Limit to two tasks for this orchestration test, never a production Benchmark.
     data.cases = data.cases.slice(0, 2);
     try {

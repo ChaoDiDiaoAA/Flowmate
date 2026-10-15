@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { inside } from './local.ts';
-import { expandHarness, assertNoHashes } from './harness.ts';
-import { byteHash, type FlatDataset } from './flat.ts';
+import { expandHarness } from './harness.ts';
+import { type FlatDataset } from './flat.ts';
 import { assertSafeFixtureName, loadFixture } from '../testing/load-fixture.ts';
 import { authorDatasetSchema, type AuthorCase } from './authoring.ts';
 import { isDeepStrictEqual } from 'node:util';
@@ -64,7 +64,6 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
     const scenarioPath = inside(testingRoot, 'scenarios.ts');
     delete require.cache[require.resolve(scenarioPath)];
     const { scenariosByName } = require(scenarioPath);
-    [dataset, gold, reviews].forEach(assertNoHashes);
     if (dataset.version !== 'v1' || new Set(dataset.cases.map((c:any)=>c.id)).size !== dataset.cases.length ||
         dataset.cases.some(c => !gold[c.id] || !reviews[c.id]) ||
         JSON.stringify(Object.keys(gold).sort()) !== JSON.stringify(dataset.cases.map((c:any)=>c.id).sort()) ||
@@ -81,7 +80,6 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
         const fixture = fixtureName ? scenariosByName[fixtureName] : { requires:['agent'], materials:[],
             steps:[{id:'request',action:'user-message',instruction:'$input'}], selection:{enabledSkills:[],enabledExtensions:[]} };
         if(!fixture)throw Error('Missing fixture scenario: '+fixtureName);
-        assertNoHashes(fixture);
         validateScenarioTurns(c,fixture);
         if(gold[c.id].checks.some((check:any)=>!c.scoring.deterministic.includes(check.metric)))throw Error('Unselected deterministic check: '+c.id);
         if (dataset.regressionOrigins?.[c.id]?.some(origin => origin.metricIds.some(metric => ![...c.scoring.deterministic, ...c.scoring.judge].includes(metric))))
@@ -126,7 +124,7 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
             {contract:'flowmate-eval-review/v4',caseId:c.id,version:1,status:'agent-reviewed',...reviews[c.id]},
             {datasets:{[id]:metadata},files:Object.fromEntries([...paths].map(p=>[p,p])),resources},repo,read);
         let group=groups.get(id);
-        if(!group){group={manifest:{...metadata,members:[],smoke:[]},tasks:{},files:{},inputs:{},reviews:{},hash:'',authored:{version:'v1',cases:[],gold:{},reviews:{},fixtures:{}}};groups.set(id,group);}
+        if(!group){group={manifest:{...metadata,members:[],smoke:[]},tasks:{},files:{},inputs:{},reviews:{},authored:{version:'v1',cases:[],gold:{},reviews:{},fixtures:{}}};groups.set(id,group);}
         const task=expanded.task, member=`cases/${c.id}.json`;
         const {files:visible,...input}=task.input;
         group.tasks[member]={contract:'flowmate-agent-case/v2',id:c.id,version:1,name:c.name,category:c.category,difficulty:c.difficulty,purpose:c.purpose,source:c.source,tags:c.tags,requires:task.requires,input,
@@ -136,11 +134,11 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
         if(c.scoring.judge.length)group.manifest.scoring.judges[0]!.requiredFor!.push(c.id);
         if (supplemental) (group.regressionOrigins ??= {})[c.id] = dataset.regressionOrigins![c.id]!;
         for(const file of [...visible,...task.resourceFiles,...task.controllerFiles,...expanded.gold.sources]) {
-            if(group.files[file.path]&&group.files[file.path]!.sha256!==file.sha256)throw Error('Conflicting source: '+file.path);
+            if(group.files[file.path]&&!isDeepStrictEqual(group.files[file.path],file))throw Error('Conflicting source: '+file.path);
             group.files[file.path]=file;
         }
         const authored=group.authored!;authored.cases.push(c);authored.gold[c.id]=gold[c.id];authored.reviews[c.id]=reviews[c.id];
         if(fixtureName)authored.fixtures[fixtureName]=fixture;
     }
-    return [...groups.values()].map(group=>({...group,hash:byteHash(JSON.stringify(group.authored))}));
+    return [...groups.values()];
 }

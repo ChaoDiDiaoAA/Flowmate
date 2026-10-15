@@ -103,7 +103,7 @@ test('optimizes through a real Provider run and copies or appends only to the ch
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, defaultModelId: 'optimizer', models: [{ id: 'optimizer',
-        credentialRef: 'optimizer_fixture_key', name: 'Optimizer fixture', kind: 'custom', providerId: null, baseUrl,
+        credentialRef: '00000000000000000000000000000036', name: 'Optimizer fixture', kind: 'custom', providerId: null, baseUrl,
         model: 'optimizer', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }] },
         { modelId: 'optimizer', apiKey: 'synthetic-optimizer-key' });
     }, `http://127.0.0.1:${provider.port}/v1`)).toMatchObject({ ok: true });
@@ -156,7 +156,7 @@ test('handles early completion, failure, stop and late results without losing pr
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, defaultModelId: 'optimizer', models: [{ id: 'optimizer',
-        credentialRef: 'optimizer_fixture_key', name: 'Optimizer fixture', kind: 'custom', providerId: null, baseUrl,
+        credentialRef: '00000000000000000000000000000036', name: 'Optimizer fixture', kind: 'custom', providerId: null, baseUrl,
         model: 'optimizer', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }] },
         { modelId: 'optimizer', apiKey: 'synthetic-optimizer-key' });
     }, `http://127.0.0.1:${provider.port}/v1`)).toMatchObject({ ok: true });

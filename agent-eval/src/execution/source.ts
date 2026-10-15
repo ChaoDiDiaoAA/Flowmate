@@ -1,9 +1,8 @@
 import { existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { join, relative, isAbsolute } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { hash } from '../dataset-loader/local.ts';
-import { artifactJson, withoutHashes } from '../artifacts.ts';
-import { protectedSecrets } from './evidence-safety.ts';
+import { artifactJson } from '../artifacts.ts';
+import { protectedSecrets, scanEvidence } from './evidence-safety.ts';
 const manifests = new WeakMap<object, Map<string,string>>();
 export function codeIdentity(repoRoot: string, snapshotFile?: string) {
     const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
@@ -25,7 +24,7 @@ export function codeIdentity(repoRoot: string, snapshotFile?: string) {
         }
         catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT')
-                return { path, hash: 'deleted', contentBase64: null };
+                return { path,  contentBase64: null };
             throw error;
         }
         if (snapshotFile) {
@@ -35,10 +34,10 @@ export function codeIdentity(repoRoot: string, snapshotFile?: string) {
             }
         }
         const contentBase64 = bytes.toString('base64');
-        return { path, hash: hash(contentBase64), contentBase64 };
+        return { path,  contentBase64 };
     }).filter(file=>file.contentBase64!==null);
-    const identity = { release: process.env.FLOWMATE_EVAL_RELEASE || `git:${commit}`, dirty: !!execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8' }).trim(), commit, workspaceHash: hash(source.map(file => [file.path, file.hash])) };
-    manifests.set(identity,new Map(source.map(file=>[file.path,file.hash])));
+    const identity = { release: process.env.FLOWMATE_EVAL_RELEASE || `git:${commit}`, dirty: !!execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8' }).trim(), commit };
+    manifests.set(identity,new Map(source.map(file=>[file.path,file.contentBase64!])));
     if (snapshotFile)
         writeFileSync(snapshotFile, artifactJson({ contract: 'flowmate-source-snapshot/v1', ...identity, runtime: { node: process.version, platform: process.platform, arch: process.arch }, files: source }), { flag: 'wx' });
     return identity;
@@ -48,24 +47,21 @@ export function changedSourcePaths(before: object, after: object) {
     if(!first || !last)throw Error('Source comparison requires original in-memory conditions');
     return [...new Set([...first.keys(),...last.keys()])].filter(path=>first.get(path)!==last.get(path)).sort();
 }
-/** Save actual runtime code conditions instead of a persistent source fingerprint. */
-export function runtimeSourceConditions(repo:string) {
-    const files=['packages/core/src/tools/executor.ts','packages/core/src/tools/evaluation-fault.ts',
-        'packages/contracts/src/ports.ts','packages/contracts/src/runtime.ts','packages/contracts/src/tool-evidence.ts',
-        'packages/runtime-pi/src/session.ts','packages/runtime-pi/src/schema.ts','packages/employee-invoice/src/tools/calculate_invoice_amounts.ts',
-        'agent-eval/src/scoring/evaluators/invoice-values.ts','agent-eval/src/scoring/evaluators/reference-fields.ts',
-        'agent-eval/src/scoring/evaluators/line-items.ts','agent-eval/src/scoring/evaluators/semantic.ts','agent-eval/src/scoring/safety.ts',
-        'agent-eval/src/scoring/types.ts','agent-eval/src/scoring/evaluate.ts','agent-eval/src/scoring/registry.ts',
-        'agent-eval/src/scoring/evaluator-plan.ts','agent-eval/src/scoring/evaluators/registered.ts',
-        'agent-eval/src/scoring/evaluators/formal.ts','agent-eval/src/scoring/case-constraints.ts','agent-eval/src/scoring/research-f1.ts',
-        'agent-eval/src/scoring/diagnostics.ts','agent-eval/src/scoring/diagnostic-plans.ts','agent-eval/src/scoring/judges/evaluators.ts',
-        'agent-eval/src/scoring/judges/compact.ts','agent-eval/src/scoring/judges/harness.ts',
-        'agent-eval/src/scoring/research-frame.ts','agent-eval/src/scoring/research-judgment.ts',
-        'agent-eval/src/adapters/research-integrity.ts','agent-eval/src/artifacts.ts','packages/shared/src/decimal.ts',
-        'packages/contracts/src/research.ts','packages/core/src/research/source-text.ts',
-        'packages/core/src/research/read-tools.ts','packages/core/src/research/synthesis-tools.ts','packages/runtime-pi/src/tools.ts',
-        'resources/prompts/research/prompt.md','resources/skills/deep-research/SKILL.md'];
-    const dependencies=existsSync(join(repo,'package.json'))?JSON.parse(readFileSync(join(repo,'package.json'),'utf8')).dependencies:{};
-    return withoutHashes({dependencies:Object.fromEntries(['@earendil-works/pi-ai','@earendil-works/pi-coding-agent'].map(id=>[id,dependencies?.[id]??null])),
-        files:files.filter(path=>existsSync(join(repo,path))).map(path=>({path,text:readFileSync(join(repo,path),'utf8')}))});
+/** Reuse the complete captured source bodies only in the local execution declaration. */
+export function runtimeSourceConditions(repo:string,identity:object=codeIdentity(repo)) {
+    const original=manifests.get(identity);
+    if(!original)throw Error('Source declaration requires original in-memory conditions');
+    const files=[...original].map(([path,content])=>{
+        const bytes=Buffer.from(content,'base64'),text=bytes.toString('utf8');
+        if(!Buffer.from(text).equals(bytes))throw Error(`Execution source is not valid UTF-8: ${path}`);
+        return {path,text};
+    });
+    const conditions={contract:'flowmate-execution-source/v1' as const,runtime:{node:process.version,platform:process.platform,arch:process.arch},
+        dependencies:Object.fromEntries(['@earendil-works/pi-ai','@earendil-works/pi-coding-agent'].map(id=>{
+            const file=join(repo,'node_modules',id,'package.json');return [id,existsSync(file)?JSON.parse(readFileSync(file,'utf8')).version??null:null];
+        })),files};
+    // This public test value occurs in the scanner's own source; actual configured credentials still reject the declaration.
+    const scanned=scanEvidence(conditions,protectedSecrets().filter(secret=>secret!=='fixture-synthetic-key'));
+    if((scanned.fact.actual as {leaked:boolean}).leaked)throw Error('Configured credential in execution source; refusing snapshot');
+    return conditions;
 }

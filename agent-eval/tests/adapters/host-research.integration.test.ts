@@ -9,11 +9,11 @@ import { randomUUID } from 'node:crypto';
 import { createHttpProvider, mkdtempSync } from '../../../tests/support/resources.ts';
 import { researchPlan } from '../../../tests/support/research.ts';
 import { SourceSnapshotSchema, ResearchPlanSchema, ClaimSchema } from '../../../packages/contracts/src/research.ts';
-import { ExtensionManifestSchema, canonicalExtensionManifest } from '../../../packages/contracts/src/extensions.ts';
+import { ExtensionManifestSchema } from '../../../packages/contracts/src/extensions.ts';
 import { ToolCallSnapshotSchema } from '../../../packages/contracts/src/tool-evidence.ts';
 import { prepareHostResearchTrial } from '../../src/adapters/host-research.ts';
 import type { AgentTrial, AgentTrialSession } from '../../src/adapters/agent.ts';
-import { REPO_ROOT, hash, loadDataset } from '../../src/dataset-loader/local.ts';
+import { REPO_ROOT, loadDataset } from '../../src/dataset-loader/local.ts';
 import { runLocal } from '../../src/execution/runner.ts';
 import { executeCase } from '../../src/execution/execute-case.ts';
 import { metricCatalog } from '../../src/scoring/catalog.ts';
@@ -64,7 +64,7 @@ for (const isolation of [undefined] as const) test
     const trial: AgentTrial = { identity: { executionId: 'engineering-host', trialId: 'research-1', caseId: 'synthetic-research', caseVersion: 1 },
         directory: mkdtempSync(join(tmpdir(), 'eval-host-trial-')), input: { prompt: researchPlan.question, materials: [{ sample: 'synthetic', file: 'policy.md', text }] },
         requires: ['agent', 'research', 'subagent'], configuration: { modelCapabilities: syntheticNativeModel, model: 'eval-host-fixture', baseUrl: `http://${isolation ? '127.0.0.1' : '127.0.0.1'}:${server.port}/v1`, api: 'openai-completions',
-            extensions: { enabledExtensions: [{ id: extension.id, version: extension.version, manifestHash: hash(canonicalExtensionManifest(extension)) }] } }, steps: [
+            extensions: { enabledExtensions: [{ id: extension.id, version: extension.version }] } }, steps: [
             { id: 'plan', action: 'research-plan', instruction: researchPlan.question },
             { id: 'stale', action: 'research-confirm', instruction: 'Do not accept a changed revision.', planFromStep: 'plan', revisionOffset: 1, expected: 'research_plan_stale' },
             { id: 'confirm', action: 'research-confirm', instruction: 'FUTURE_CONFIRMATION: execute the exact plan.', planFromStep: 'plan', revisionOffset: 0, expected: 'accepted' },
@@ -97,7 +97,7 @@ for (const isolation of [undefined] as const) test
             metrics:metricCatalog.map(m=>m.id==='task-success'?{metricId:m.id,version:m.version,unit:m.unit,denominator:1}:
                 {metricId:m.id,version:m.version,unit:m.unit,notApplicable:'Independent frame engineering fixture.'}),
             research:{status:'verified',claims:[{id:'metered',text:'Usage is metered.',required:true,acceptable:['Usage is metered.'],conditions:[],entities:[],
-                evidence:[{sample:'synthetic',sha256:hash(text),start:0,end:prefix.length,quote:prefix,relation:'support'}]}],chains:[],forbidden:[]}}});
+                evidence:[{sample:'synthetic',start:0,end:prefix.length,quote:prefix,relation:'support'}]}],chains:[],forbidden:[]}}});
         const frame=buildResearchFrame({task:researchTask,result,projected:trial.input,judge:null})!;
         expect(frame).toMatchObject({contract:'flowmate-research-frame/v1',complete:true,gold:{claims:[{id:'metered'}]},links:[{valid:true}],sources:[{text,modelRead:false}]});
         const drIds=['DR01','DR02','DR04','DR05'];

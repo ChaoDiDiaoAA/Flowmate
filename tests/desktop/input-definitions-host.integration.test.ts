@@ -16,14 +16,18 @@ it('runs all four definition APIs through the actual Host without Runs, Inputs, 
     expect(commands?.ok && commands.data).toEqual(expect.arrayContaining([expect.objectContaining({group:'Skills',text:'/skill:invoice '}),
       expect.objectContaining({group:'Subagents',text:'/subagent general-analyst ',available:false}),
       expect.objectContaining({group:'Prompt Templates',name:'parallel-invoice-review'}), expect.objectContaining({group:'Extension Commands',name:'invoice-assist'})]));
-    const input={id:'custom-reviewer',expectedHash:null,content:'---\nname: custom-reviewer\ndescription: Independent review\ntools: []\n---\nReview the assigned question and return findings.'};
+    const input={id:'custom-reviewer',expectedContent:null,content:'---\nname: custom-reviewer\ndescription: Independent review\ntools: []\n---\nReview the assigned question and return findings.'};
     const saved=parseInputDefinitionHostResult('save_subagent_definition',await client.request({type:'save_subagent_definition',input}));
     expect(saved).toMatchObject({ok:true,data:{id:input.id,source:'user',tools:[]}});
     expect(await client.request({type:'get_subagent_definition',input:{id:input.id}})).toEqual(saved);
     expect(await client.request({type:'save_subagent_definition',input})).toMatchObject({ok:false});
+    const revised = { ...input, expectedContent: input.content, content: input.content + '\nCheck every supplied source.' };
+    expect(await client.request({type:'save_subagent_definition',input:revised})).toMatchObject({ok:true,data:{content:revised.content}});
+    expect(await client.request({type:'save_subagent_definition',input:{...revised,content:input.content}})).toMatchObject({ok:false});
+    expect(await client.request({type:'get_subagent_definition',input:{id:input.id}})).toMatchObject({ok:true,data:{content:revised.content}});
   } finally { expect(await client.close()).toMatchObject({ok:true,data:{closed:true,stopped:true}}); }
   const db=new Database(join(root,'data/app.sqlite'),{readonly:true});
   try { for (const table of ['runs','session_inputs','tool_calls']) expect(db.query(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({count:0});
-    expect(db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({version:19}); }
+    expect(db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({version:20}); }
   finally { db.close(); }
 });

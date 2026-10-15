@@ -16,7 +16,7 @@ const rows:Array<[string,string[],string]>=[
     ['redundant-tools',['tool-evidence','context-requests','interaction-history'], '分母为实际工具调用，分子仅为无新信息且无依据的调用；合法核验、必要重复及有诊断依据的恢复不算冗余，依据需从原前后请求核实。'],
     ['skill-selection',['resources','context-requests','tool-evidence','answer'], '按适用和不适用对照核对选择或不选择指导的决策；冻结/装配/发现/实际读取/采用分别取证，装配Skill不证明读取或使用。'],
     ['skill-guidance',['resources','tool-evidence','answer','invoice'], '逐个相关指导要求点核对实际任务和轨迹，允许合法替代方法；读过或模型声称遵循均不证明遵循，内容仍对独立Gold核验。'],
-    ['progressive-reading',['resources','tool-evidence','context-requests'], '逐个应验读取决策核对索引、正文和参考资源的原身份/hash、分页范围、续读及完整/部分状态；仅装配不算读，不要求读所有文件。'],
+    ['progressive-reading',['resources','tool-evidence','context-requests'], '逐个应验读取决策核对索引、正文和参考资源的原身份及内容、分页范围、续读及完整/部分状态；仅装配不算读，不要求读所有文件。'],
     ['context-coverage',['context-requests','material-registration','inputs'], '按原任务所需且原材料可用的事实点，核对实际发出请求包含的原Snapshot内容；材料不存在不算遗漏，当前UI选择或产品相关性声明不能代替原请求。'],
     ['context-delivery',['context-requests','tool-evidence'], '按原Snapshot—实际请求—工具调用的每条关联链核对身份、版本、请求序号及引用；当前切到B不能改变历史A，缺一环计未知。'],
     ['current-fact-use',['context-requests','interaction-history','answer','invoice'], '逐个当前事实使用点对照有效新旧事实、来源和答案；新信息注入成功不证明采用，旧事实覆盖新纠正判错。'],

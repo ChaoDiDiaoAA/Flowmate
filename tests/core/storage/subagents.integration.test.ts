@@ -71,9 +71,9 @@ function admissionFixture() {
     modelProjection: { taskGoal: 'Parent evidence', candidate: null, fragments: [], issues: [], gaps: [] },
     budgets: { projectionBytes: 65536, fragmentBytes: 4096, fragments: 32, issueCount: 20, snapshotBytes: 262144 } });
   const snapshot = store.runtimeEventStore.withTransaction(() => need(store.context.appendInTransaction({ runId, sessionId: parent.sessionId, jobId: null, json: parentJson, at })));
-  const inputId = Number(store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
+  const inputId = Number(store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,
     context_snapshot_id,content_json,status,processing_status,created_at,updated_at) VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`)
-    .run(parent.sessionId, 'a'.repeat(64), runId, snapshot.id, JSON.stringify({ version: 2, text: 'Check', workspaceContext: null,
+    .run(parent.sessionId, '{}', runId, snapshot.id, JSON.stringify({ version: 2, text: 'Check', workspaceContext: null,
       workspaceInput: null, allowedDocumentIds: [1], allowedArtifactIds: [2], promptText: 'Check' }), at, at).lastInsertRowid);
   need(saveTestHistory(store.db, store.runtimeEventStore, parent.sessionId, { storageVersion: 1,
     header: { type: 'session', version: 3, id: parent.nativeSessionId, timestamp: at, cwd: p.runtimeDir },
@@ -271,14 +271,14 @@ describe('P13 SQLite ownership and migration', () => {
       VALUES(2,'Provider','{}','{}','{}','{}','failed',?,'{}',?)`).run(at, at);
     const before = old.query('SELECT * FROM runs ORDER BY id').all();
     const columns = (old.query('PRAGMA table_info(runs)').all() as { name: string }[]).map(row => row.name);
-    const objects = old.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND name!='context_snapshot_insert_guard' ORDER BY name").all();
+    const objects = old.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND NOT(type='table' AND tbl_name IN ('tool_calls','session_inputs')) AND name!='context_snapshot_insert_guard' ORDER BY name").all();
     old.close();
     const store = need(openTestDatabase(p));
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
     expect(store.db.query(`SELECT ${columns.join(',')} FROM runs ORDER BY id`).all()).toEqual(before);
     expect(store.db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs').all()).toEqual([
       { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);
-    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND tbl_name NOT IN ('research_tasks','research_runs','research_plans','research_sources','research_claims','research_reports') AND name NOT IN ('context_snapshot_insert_guard','subagent_parallel_limit') ORDER BY name").all()).toEqual(objects);
+    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND NOT(type='table' AND tbl_name IN ('tool_calls','session_inputs')) AND tbl_name NOT IN ('managed_file_contents','research_tasks','research_runs','research_plans','research_sources','research_claims','research_reports') AND name NOT IN ('context_snapshot_insert_guard','subagent_parallel_limit','tool_evidence_revision') ORDER BY name").all()).toEqual(objects);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(store.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     expect(store.db.query('PRAGMA legacy_alter_table').get()).toEqual({ legacy_alter_table: 0 });

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-amount-reconciliation",
   "version": "v1",
@@ -36,13 +36,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1447,
-      "sha256": "220424e0ede1d85b12f08d01960fae0c0b07c9be8f23819bfaead51493c9a6a1"
+      "bytes": 1447
     },
     {
       "path": "references/guide.md",
-      "bytes": 841,
-      "sha256": "ac959b9ae4f314ac588f88e2c8bf869fc6b0340336d738b325e077d27a578e7e"
+      "bytes": 841
     }
   ]
 }

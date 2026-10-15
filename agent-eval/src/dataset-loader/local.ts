@@ -1,5 +1,5 @@
 import { readDeclarationDatasets } from './declarations.ts';
-import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { existsSync, readFileSync, realpathSync, readdirSync, lstatSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, relative, isAbsolute, join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,16 +10,15 @@ import {saveDeliveryLossControllerSchema,readExecutionFailureControllerSchema,sa
 import { ExtensionEvaluationProfileSchema } from '../../../packages/contracts/src/extensions.ts';
 import {formalMetricMethod} from '../scoring/formal-rules.ts';
 export const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
-export const hash = (v: unknown): string => createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v)).digest('hex');
 import { caseSchema, caseV2Schema, manifestSchema, steerControllerSchema, futureSteerInputSchema, autoCompactionControllerSchema, userHistorySeedSchema, parentCancelControllerSchema, saveReplayControllerSchema, type LocalCase } from './schema.ts';
 export { caseSchema, caseV2Schema, checkSchema, manifestSchema, metricIds } from './schema.ts';
 export type { LocalCase, Check } from './schema.ts';
 export type LocalDataset = {
     regressionOrigins?: Record<string, RegressionOrigin[]>;
     root: string;
+    repo: string;
     manifest: z.infer<typeof manifestSchema>;
     cases: LocalCase[];
-    hash: string;
     embedded?: FlatDataset;
 };
 export function inside(root: string, path: string) {
@@ -60,10 +59,9 @@ export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: Flat
         readInteractionControl(root,task,read);
         if (task.setup && 'extensionProfile' in task.setup && task.setup.controllerBinding) {
             const binding = task.setup.controllerBinding, bytes = read(binding.relativePath);
-            if (bytesHash(bytes) !== binding.sha256) throw new Error('Controller binding changed');
             const controller = z.object({ contract: z.literal('flowmate-case-controller-spec/v1'), caseId: z.string(),
                 extension: z.object({ profile: ExtensionEvaluationProfileSchema }).passthrough() }).passthrough().parse(JSON.parse(utf8(bytes)));
-            if (controller.caseId !== task.id || hash(controller.extension.profile) !== hash(task.setup.extensionProfile))
+            if (controller.caseId !== task.id || !isDeepStrictEqual(controller.extension.profile,task.setup.extensionProfile))
                 throw new Error('Controller profile differs from the declared Case');
         }
         if (task.expected.checks.some(c => c.metric === 'answer-relevance' || manifest.scoring.required.includes(c.metric)))
@@ -92,21 +90,23 @@ export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: Flat
     const safeguards = ['task-result', 'input-isolation', 'environment-isolation', 'no-secret', 'closed'];
     if (manifest.scoring.required.length !== safeguards.length || !safeguards.every(k => manifest.scoring.required.some(v => v === k)))
         throw new Error('Common safeguards cannot be disabled');
-    const groups = new Map<string, boolean>();
-    for (const task of cases)
-        for (const m of task.input.materials) {
-            const smoke = manifest.smoke.includes(task.id);
-            for (const key of ['source:' + m.source + ':' + m.sample, 'original:' + m.originalSha256, 'content:' + m.sha256]) {
-                if (groups.has(key) && groups.get(key) !== smoke)
-                    throw new Error('Source leakage between smoke and holdout');
-                groups.set(key, smoke);
-            }
+    const groups = new Map<string, boolean>(),contents:Array<{bytes:Buffer;smoke:boolean}>=[];
+    for (const task of cases)for (const m of task.input.materials) {
+        const smoke=manifest.smoke.includes(task.id),key=m.source+':'+m.sample;
+        if(groups.has(key)&&groups.get(key)!==smoke)throw Error('Source leakage between smoke and holdout');groups.set(key,smoke);
+        const prefix=(m.source==='voxel51'?'':'materials/')+m.sample+'/';
+        const source=(name:string)=>embedded?read((m.source==='voxel51'?'voxel51/':'')+prefix+name):readFileSync(inside(m.source==='voxel51'?join(repo,'data/invoices/voxel51'):root,prefix+name));
+        const originals=m.source==='local-text'?(m.originalFile?[m.originalFile]:[]):(JSON.parse(utf8(source('metadata.json'))).files??[]).filter((f:any)=>/^original\.(jpg|png)$/.test(f.path)).map((f:any)=>f.path);
+        for(const bytes of [source(m.file),...originals.map(source)]){
+            if(contents.some(prior=>prior.smoke!==smoke&&prior.bytes.equals(bytes)))throw Error('Source leakage between smoke and holdout');
+            contents.push({bytes,smoke});
         }
+    }
     const origins = embedded?.regressionOrigins;
     if (manifest.suite === 'badcase' && (!origins || JSON.stringify(Object.keys(origins).sort()) !== JSON.stringify(cases.map(c => c.id).sort())))
         throw Error('Supplemental Dataset requires original regression links');
     if (origins) regressionOriginsSchema.parse(origins);
-    const dataset: LocalDataset = { root, manifest, cases, hash: embedded?.hash ?? hash({ manifest, cases }), ...(embedded ? { embedded } : {}), ...(origins ? { regressionOrigins: origins } : {}) };
+    const dataset: LocalDataset = { root, repo, manifest, cases, ...(embedded ? { embedded } : {}), ...(origins ? { regressionOrigins: origins } : {}) };
     return dataset;
 }
 export function assertSemanticSelection(dataset: Pick<LocalDataset, 'manifest' | 'cases'>, requireJudge = false) {
@@ -138,11 +138,6 @@ export function discoverDatasets(root: string, repo = REPO_ROOT): LocalDataset[]
         return readdirSync(dir).includes('dataset.json') ? [loadDataset(dir, repo)] : [];
     });
 }
-export function caseContentHash(d: LocalDataset, c: LocalCase) {
-    const { review: _review, ...content } = c;
-    return hash({ task: 'contract' in c ? content : c, environment: d.manifest.environment, scoring: d.manifest.scoring });
-}
-const bytesHash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 function utf8(bytes: Uint8Array) {
     try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); }
     catch { throw new Error('Material must contain valid UTF-8'); }
@@ -150,7 +145,7 @@ function utf8(bytes: Uint8Array) {
 function readInteractionControl(root:string,task:LocalCase,read:(path:string)=>Buffer=(path:string)=>readFileSync(inside(root,path))){
     if(!task.setup||!('interactionProfile'in task.setup))return undefined;
     const binding=task.setup.controllerBinding,bytes=read(binding.relativePath);
-    if(bytesHash(bytes)!==binding.sha256)throw new Error('Controller binding changed');
+
     if(task.setup.interactionProfile.id==='invoice-parent-cancel'||task.setup.interactionProfile.id==='invoice-save-replay'||task.setup.interactionProfile.id==='invoice-save-delivery-loss'||task.setup.interactionProfile.id==='invoice-read-execution-failure'||task.setup.interactionProfile.id==='invoice-save-cancel-race'){
         const payload=utf8(bytes),control=(task.setup.interactionProfile.id==='invoice-save-replay'?saveReplayControllerSchema:task.setup.interactionProfile.id==='invoice-save-delivery-loss'?saveDeliveryLossControllerSchema:task.setup.interactionProfile.id==='invoice-read-execution-failure'?readExecutionFailureControllerSchema:task.setup.interactionProfile.id==='invoice-save-cancel-race'?saveCancelRaceControllerSchema:parentCancelControllerSchema).parse(JSON.parse(payload));
         if(control.caseId!==task.id||binding.relativePath!==`quality-controls/${task.id}/controller.json`)throw new Error('Parent cancellation controller must belong to the same Case');
@@ -158,14 +153,14 @@ function readInteractionControl(root:string,task:LocalCase,read:(path:string)=>B
             const turn=task.input.turns?.find(turn=>turn.id===control.recoveryTurnId);
             if(!turn||(turn.mode??'prompt')!=='prompt')throw Error('Save recovery requires its Case user turn');
         }
-        return{profile:task.setup.interactionProfile,payload,sha256:binding.sha256};
+        return{profile:task.setup.interactionProfile,payload};
     }
     if(task.setup.interactionProfile.id==='invoice-auto-compaction'){
         const control=autoCompactionControllerSchema.parse(JSON.parse(utf8(bytes)));
         if(control.caseId!==task.id||binding.relativePath!==`quality-controls/${task.id}/controller.json`||control.history.relativePath!==`quality-controls/${task.id}/history-seed.json`)
             throw new Error('Auto compaction controller and history must belong to the same Case');
         const future=read(control.history.relativePath);
-        if(bytesHash(future)!==control.history.sha256)throw new Error('Future user history changed');
+
         const payload=utf8(future),seed=userHistorySeedSchema.parse(JSON.parse(payload));
         if(seed.caseId!==task.id)throw new Error('Future history belongs to another Case');
         const historyTurns=seed.turns.map(reference=>task.input.turns?.find(turn=>turn.id===reference.turnId));
@@ -175,18 +170,18 @@ function readInteractionControl(root:string,task:LocalCase,read:(path:string)=>B
         const turn=task.input.turns?.find(turn=>turn.id===seed.finalTurnId);
         if(!turn||(turn.mode??'prompt')!=='prompt'||turn.content.length>16000||turn.content.includes('USD'))
             throw Error('Auto compaction final user turn must be referenced without re-injecting currency');
-        return{profile:task.setup.interactionProfile,payload,sha256:control.history.sha256};
+        return{profile:task.setup.interactionProfile,payload};
     }
     const control=steerControllerSchema.parse(JSON.parse(utf8(bytes)));
     if(control.caseId!==task.id||binding.relativePath!==`quality-controls/${task.id}/controller.json`||control.steer.relativePath!==`quality-controls/${task.id}/future-steer.json`)
         throw new Error('Steer controller and future input must belong to the same Case');
     const future=read(control.steer.relativePath);
-    if(bytesHash(future)!==control.steer.sha256)throw new Error('Future steer input changed');
+
     const payload=utf8(future),futureInput=futureSteerInputSchema.parse(JSON.parse(payload));
     const turn=task.input.turns?.find(turn=>turn.id===futureInput.turnId);
     if(!turn||turn.mode!==futureInput.mode||futureInput.mode!==control.steer.mode||turn.content.length>16000)
         throw Error('Live input must reference the matching Case user turn and mode');
-    return {profile:task.setup.interactionProfile,payload,sha256:control.steer.sha256};
+    return {profile:task.setup.interactionProfile,payload};
 }
 export function resolveCase(dataset: LocalDataset, task: LocalCase, repo = REPO_ROOT) {
     const embeddedRead = (path:string) => {
@@ -198,25 +193,21 @@ export function resolveCase(dataset: LocalDataset, task: LocalCase, repo = REPO_
         const prefix = (m.source === 'local-text' ? 'materials/' : '') + m.sample + '/';
         const read = (path:string) => dataset.embedded ? embeddedRead((m.source==='voxel51'?'voxel51/':'')+path) : readFileSync(inside(source,path));
         const bytes = read(prefix + m.file);
-        if (bytesHash(bytes) !== m.sha256)
-            throw new Error('Material hash mismatch: ' + m.sample + '/' + m.file);
         if (m.source === 'local-text') {
             const original = m.originalFile ? read(prefix + m.originalFile) : bytes;
-            if (bytesHash(original) !== m.originalSha256) throw new Error('Original material hash mismatch');
         } else {
             const metadata = JSON.parse(utf8(read(m.sample + '/metadata.json')));
-            if (metadata.originalSha256 !== undefined && metadata.originalSha256 !== m.originalSha256) throw new Error('Source identity mismatch');
             if ('contract' in task) {
                 const originals = Array.isArray(metadata.files) ? metadata.files.filter((f: { path?: string }) => /^original\.(jpg|png)$/.test(f.path ?? '')) : [];
-                if (originals.length !== 1 || bytesHash(read(m.sample + '/' + originals[0].path)) !== m.originalSha256)
-                    throw new Error('Original material hash mismatch');
+                if (originals.length !== 1)
+                    throw new Error('Original material identity mismatch');
             }
         }
         return { sample: m.sample, file: m.file, text: utf8(bytes) };
     });
     if ('contract' in task && task.expected.research) {
         for (const claim of task.expected.research.claims) for (const evidence of claim.evidence) {
-            const matches = task.input.materials.flatMap((m, index) => m.sample === evidence.sample && m.sha256 === evidence.sha256 ? [materials[index]!] : []);
+            const matches = task.input.materials.flatMap((m, index) => m.sample === evidence.sample ? [materials[index]!] : []);
             if (matches.length !== 1) throw new Error('Gold evidence must identify exactly one declared material');
             const text = matches[0]!.text;
             const splitsSurrogate = (at: number) => at > 0 && at < text.length && /[\uD800-\uDBFF]/.test(text[at - 1]!) && /[\uDC00-\uDFFF]/.test(text[at]!);
@@ -224,7 +215,7 @@ export function resolveCase(dataset: LocalDataset, task: LocalCase, repo = REPO_
             if (text.slice(evidence.start, evidence.end) !== evidence.quote) throw new Error('Gold quotation differs from declared source');
         }
     }
-    return { task, projected: { prompt: task.input.prompt, materials }, hash: caseContentHash(dataset, task),...(controllerInput?{controllerInput}:{}) };
+    return { task, projected: { prompt: task.input.prompt, materials },...(controllerInput?{controllerInput}:{}) };
 }
 /** Restore only declared public inputs/resources; Gold and future controller inputs stay in the controller. */
 export function restoreCaseInputs(dataset: LocalDataset, task: LocalCase, directory: string) {
@@ -256,8 +247,29 @@ export function selectCases(dataset: LocalDataset, selection: 'smoke' | 'holdout
     return dataset.cases.filter(c => selection === 'full' || dataset.manifest.smoke.includes(c.id) === (selection === 'smoke'));
 }
 export function caseFiles(dataset:LocalDataset,task:LocalCase) {
-    if(!dataset.embedded)return [];
+    if(!dataset.embedded){
+        const files:ReturnType<typeof decodeFile>['file'][]=[];
+        const add=(root:string,path:string,publicPath=path)=>{const bytes=readFileSync(inside(root,path));files.push({path:publicPath,encoding:'base64',content:bytes.toString('base64'),bytes:bytes.length});return bytes;};
+        for(const m of task.input.materials){
+            const root=m.source==='voxel51'?join(dataset.repo,'data/invoices/voxel51'):dataset.root,prefix=(m.source==='voxel51'?'':'materials/')+m.sample+'/';
+            add(root,prefix+m.file,(m.source==='voxel51'?'voxel51/':'')+prefix+m.file);
+            if(m.source==='local-text'&&m.originalFile)add(root,prefix+m.originalFile);
+            if(m.source==='voxel51'){
+                const metadata=JSON.parse(add(root,prefix+'metadata.json','voxel51/'+prefix+'metadata.json').toString('utf8'));
+                for(const file of metadata.files??[])if(/^original\.(jpg|png)$/.test(file.path))add(root,prefix+file.path,'voxel51/'+prefix+file.path);
+            }
+        }
+        const binding=task.setup&&'controllerBinding'in task.setup?task.setup.controllerBinding:undefined;
+        if(binding){const control=JSON.parse(add(dataset.root,binding.relativePath).toString('utf8'));for(const key of ['history','steer'])if(control[key]?.relativePath)add(dataset.root,control[key].relativePath);}
+        return files;
+    }
     const sources=dataset.embedded.authored?.gold[task.id]?.sources??[];
-    const files=[...(dataset.embedded.inputs[task.id]??[]),...sources.map((path:string)=>dataset.embedded!.files[path])];
-    return [...new Map(files.map(file=>{const{sha256,...declaration}=decodeFile(file).file;return[file.path,declaration] as const;})).values()];
+    const files=[...(dataset.embedded.inputs[task.id]??[]),...sources.map((path:string)=>dataset.embedded!.files[path]),
+        ...Object.values(dataset.embedded.files).filter(file=>file.path.startsWith('quality-controls/'+task.id+'/'))];
+    return [...new Map(files.map(file=>{const declaration=decodeFile(file).file;return[file.path,declaration] as const;})).values()];
+}
+
+export function caseConditions(dataset:LocalDataset,task:LocalCase) {
+    const {review,...content}=task;
+    return {task:'contract' in task?content:task,files:caseFiles(dataset,task),environment:dataset.manifest.environment,scoring:dataset.manifest.scoring};
 }

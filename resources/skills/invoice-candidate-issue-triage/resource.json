@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-candidate-issue-triage",
   "version": "v1",
@@ -37,13 +37,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1494,
-      "sha256": "2dd2794bbd23a07bd8d5eac60b68c59f95d70cda528675fdc3797c8aa6d3ae97"
+      "bytes": 1494
     },
     {
       "path": "references/guide.md",
-      "bytes": 1104,
-      "sha256": "d7260bfcd5cfb8879a403a906e281f6a7a5ef06f7db1db7b8dd6dec120981b7a"
+      "bytes": 1104
     }
   ]
 }

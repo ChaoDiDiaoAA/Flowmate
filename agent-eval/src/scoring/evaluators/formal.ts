@@ -8,7 +8,6 @@ import {SubagentDetailSchema,SubagentProvenanceSchema} from '../../../../package
 import {FrozenInputDefinitionsSchema} from '../../../../packages/contracts/src/input-commands.ts';
 import {RunResourceViewSchema} from '../../../../packages/contracts/src/resources.ts';
 import {PublicContextRequestEvidenceSchema,ContextSnapshotDetailSchema} from '../../../../packages/contracts/src/context.ts';
-import {hash} from '../../dataset-loader/local.ts';
 import {formalRules,formalMetricMethod} from '../formal-rules.ts';
 import {formalMetric} from '../catalog.ts';
 import type {EvaluationContext,EvaluationScore,MetricPlan} from '../types.ts';
@@ -27,9 +26,9 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
         const fact=result.evidence[key];if(!fact?.source.trim()||fact.actual===null||fact.actual===undefined)return;
         const parsed=schema.safeParse(fact.actual);return parsed.success?parsed.data:undefined;
     }
-    const rawTools=original('tool-evidence',z.object({calls:z.array(z.object({sha256:z.string().regex(/^[a-f0-9]{64}$/),bytes:id,tool:z.unknown()}).passthrough())}).passthrough());
+    const rawTools=original('tool-evidence',z.object({calls:z.array(z.object({bytes:id,tool:z.unknown()}).passthrough())}).passthrough());
     const parsedTools=rawTools?.calls.map(c=>({record:c,parsed:ToolCallSnapshotSchema.safeParse(c.tool)}));
-    const tools=parsedTools?.every(c=>c.parsed.success&&hash(c.record.tool)===c.record.sha256&&Buffer.byteLength(JSON.stringify(c.record.tool))===c.record.bytes)&&
+    const tools=parsedTools?.every(c=>c.parsed.success&&Buffer.byteLength(JSON.stringify(c.record.tool))===c.record.bytes)&&
         new Set(parsedTools.map(c=>c.parsed.success?c.parsed.data.toolCallId:null)).size===parsedTools.length
         ?parsedTools.map(c=>c.parsed.success?c.parsed.data:null).filter(c=>c!==null):undefined;
     const runs=original('runs',z.array(runSchema)),contexts=original('context-requests',contextsSchema);
@@ -103,12 +102,12 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
         }));
         if(metricId==='candidate-idempotency'){
             if(!controller?.exposure?.verified||!tools)return;
-            const replay=z.object({resends:z.literal(1),input:z.object({runId:id,sessionId:id,toolCallId:id,nativeToolCallId:z.string(),argumentsHash:z.string()}).passthrough(),
+            const replay=z.object({resends:z.literal(1),input:z.object({runId:id,sessionId:id,toolCallId:id,nativeToolCallId:z.string(),rawArguments:z.unknown(),arguments:z.unknown()}).passthrough(),
                 receipt:z.object({created:z.literal(false),receipt:z.object({candidateId:id}).passthrough()}).passthrough()}).passthrough().safeParse(controller.replay);
             if(!replay.success)return[false];
             const input=replay.data.input,call=tools.find(t=>t.toolCallId===input.toolCallId);
             return[!!call&&call.runId===input.runId&&call.sessionId===input.sessionId&&call.nativeToolCallId===input.nativeToolCallId&&call.toolName==='save_invoice_candidate'&&
-                hash({raw:call.args.raw,final:call.args.final})===input.argumentsHash&&call.result?.committedCandidateId===replay.data.receipt.receipt.candidateId&&
+                isDeepStrictEqual(call.args.raw,input.rawArguments)&&isDeepStrictEqual(call.args.final,input.arguments)&&call.result?.committedCandidateId===replay.data.receipt.receipt.candidateId&&
                 controller.before!==undefined&&controller.after!==undefined&&isDeepStrictEqual(controller.before,controller.after)];
         }
         if(metricId==='retry-compliance'){
@@ -118,7 +117,7 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
                 const wrapped=z.object({tool:ToolCallSnapshotSchema}).passthrough().safeParse(controller.original);
                 const original=direct.success?direct.data:wrapped.success?wrapped.data.tool:undefined;
                 if(!original)return;
-                if(!tools.some(t=>hash(t)===hash(original)))return[false];
+                if(!tools.some(t=>isDeepStrictEqual(t,original)))return[false];
                 const recovery=z.object({attempts:z.number().int().nonnegative(),reexecuted:z.boolean().optional(),duplicateSave:z.boolean().optional()}).passthrough().safeParse(controller.recovery);
                 if(recovery.success){
                     const policy=z.object({maxRecoveryAttempts:z.number().int().nonnegative()}).passthrough().safeParse(controller.policy);
@@ -164,7 +163,7 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
             if(!firstRequest)return null;
             return parent.kind==='agent'&&run.kind==='subagent'&&run.parentRunId===parent.runId&&run.originToolCallId===call.toolCallId&&
                 call.runId===parent.runId&&call.sessionId===parent.sessionId&&call.nativeToolCallId===child.parentNativeToolCallId&&call.toolName==='Agent'&&
-                role.hash===hash(role.content)&&isDeepStrictEqual(origin.definition,role)&&origin.role===child.role&&
+                isDeepStrictEqual(origin.definition,role)&&origin.role===child.role&&
                 parentRequest?.binding.nativeSessionId===origin.parentNativeSessionId&&parentRequest.binding.inputId===origin.parentInputId&&
                 parentRequest.binding.snapshotId===origin.parentContextSnapshotId&&call.context?.snapshotId===origin.parentContextSnapshotId&&call.context.requestSequence===origin.parentRequestSequence&&
                 firstRequest.binding.nativeSessionId===child.childNativeSessionId&&firstRequest.binding.sessionId===child.childSessionId&&firstRequest.binding.inputId===origin.childInputId&&

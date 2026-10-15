@@ -35,7 +35,7 @@ async function fixture(withSteer = false, live = false) {
   await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
   const seed = await page.evaluate(async baseUrl => {
     const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
-    const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'context-ui', credentialRef: 'context_ui_controlled_key', name: 'Context UI',
+    const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'context-ui', credentialRef: '00000000000000000000000000000002', name: 'Context UI',
       kind: 'custom', providerId: null, baseUrl, model: 'context-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }],
       defaultModelId: 'context-ui' }, { modelId: 'context-ui', apiKey: 'synthetic-context-ui-key' });
     if (!settings.ok) throw new Error(settings.error.code);

@@ -54,7 +54,7 @@ async function materialApplicationFixture(text = 'FIRST税 total 113.00 LAST税'
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
   const open = async () => {
     const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
-      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+      agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-t10-material-key' }) }));
     deferCleanup(() => app.close()); return app;
   };
@@ -242,8 +242,8 @@ async function publicContextFixture(state: 'active' | 'archived' | 'blocked' | '
       + '\n\ndata: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n',
       { headers: { 'content-type': 'text/event-stream' } }); } });
   deferCleanup(() => server.stop(true));
-  const create = async () => need(await createApplication({ paths, logger: { write() {}, async close() {} }, agentFactory: tools => {
-    const agent = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+  const create = async () => need(await createApplication({ paths, logger: { write() {}, async close() {} }, agentFactory: (tools, resourceContents) => {
+    const agent = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-public-context-key' });
     const restore = agent.restoreSession.bind(agent), leaf = agent.restoreSessionLeaf.bind(agent), watch = agent.watchSession.bind(agent),
       prepare = agent.prepare.bind(agent), enqueue = agent.enqueueInput.bind(agent);

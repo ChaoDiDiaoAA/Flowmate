@@ -1,7 +1,6 @@
 import { expect, test } from 'bun:test';
 import { diagnosticApplicable, diagnosticEvaluatorIds, diagnosticMetricCatalog, diagnosticPlanSchema, evaluateDiagnostic } from '../../src/scoring/diagnostics.ts';
 import { observed, task } from '../support/fixtures.ts';
-import { hash } from '../../src/dataset-loader/local.ts';
 import type { EvaluationContext } from '../../src/scoring/types.ts';
 import { ContextSnapshotDetailSchema, PublicContextRequestEvidenceSchema } from '../../../packages/contracts/src/context.ts';
 
@@ -25,7 +24,7 @@ function tool(id = 1, data: unknown = { pages: [] }) {
 }
 function collect(c: EvaluationContext, calls: ReturnType<typeof tool>[], complete = true) {
     c.result.evidence['tool-evidence'] = { present: complete, source: 'original tool collection', actual: {
-        calls: calls.map(tool => ({ tool, sha256: hash(tool), bytes: Buffer.byteLength(JSON.stringify(tool)) }))
+        calls: calls.map(tool => ({ tool,  bytes: Buffer.byteLength(JSON.stringify(tool)) }))
     } };
 }
 
@@ -59,7 +58,7 @@ test('required recall uses declared denominator and does not trust answer claims
     expect(evaluateDiagnostic(c, 'tool-recall')).toMatchObject({ status: 'FAIL', required: true, statistics: { numerator: 0, denominator: 1 } });
     collect(c, [tool()]);
     expect(evaluateDiagnostic(c, 'tool-recall')).toMatchObject({ status: 'PASS', value: 1 });
-    const raw = c.result.evidence['tool-evidence']!.actual as { calls: Array<{ sha256: string }> }; raw.calls[0]!.sha256 = '0'.repeat(64);
+    const raw = c.result.evidence['tool-evidence']!.actual as { calls: Array<{ bytes:number }> };raw.calls[0]!.bytes++;
     expect(evaluateDiagnostic(c, 'tool-recall')).toMatchObject({ status: 'UNJUDGEABLE', value: null });
 });
 test('known forbidden and over-budget calls survive partial acquisition', () => {

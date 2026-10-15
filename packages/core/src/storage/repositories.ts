@@ -1,10 +1,11 @@
+import { createManagedFileContents } from './managed-file-contents.ts';
+import type { ManagedFileContents } from './managed-file-contents.ts';
 import { readResearchContext, researchMaterialScope } from '../research/context.ts';
 import { createNativeOriginReader, NativeOriginFault, verifyNativeForkCopy } from '../memory/origins.ts';
 import { evidenceReadFailure, readTransaction } from './reads.ts';
 import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction, markUnusableInTransaction } from '../memory/persistence.ts';
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { join, isAbsolute } from 'node:path';
-import { createHash } from 'node:crypto';
 import { verifyFrozenResourceMetadata } from '../skill-hub/index.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
@@ -120,7 +121,7 @@ export interface InvoiceEditRepository extends CandidateRepository {
   reject(input: RejectInvoiceCandidateRequest & { at: string }): Result<InvoiceCandidateDecisionResponse>;
   readAccepted(candidateId: DbId): Result<{ candidate: CandidateSnapshot; documentRef: { id: DbId; version: string } }>;
   findExport(input: ExportInvoiceCandidateRequest): Result<InvoiceExportReference | null>;
-  registerExport(input: ExportInvoiceCandidateRequest & { relativePath: string; bytes: number; sha256: string; at: string }): Result<InvoiceExportReference>;
+  registerExport(input: ExportInvoiceCandidateRequest & { relativePath: string; bytes: number; at: string }): Result<InvoiceExportReference>;
   queryOperation(input: InvoiceCandidateOperationQuery & { at: string }): Result<InvoiceCandidateOperationResult>;
 }
 
@@ -188,13 +189,14 @@ export type SessionRow = {
 
 export type NewSession = { nativeSessionId: string; title: string; at: string; expectedRevision?: number; nativeHistory?: NativeSessionHistory };
 
-export type AgentOutputRecord = OutputRecord & { agent: AgentFacts; nativeOutcomeHash?: string };
+export type AgentOutputRecord = OutputRecord & { agent: AgentFacts; nativeOutcomeFacts?: string };
 
 export type ArtifactMetadata = {
   version: 1;
   sourceKey: string;
   sourceRecordId: string;
   sourceVersion: string;
+  verificationGap?: 'legacy-original-unavailable';
   files: Array<{ relativePath: string; bytes: number; mimeType: string }>;
 };
 
@@ -229,6 +231,8 @@ export type NewDocumentRegistration = {
 };
 
 export interface DocumentRepository {
+  contents?: ManagedFileContents;
+  findVersions?(input: { sourceKey: string; sourceRecordId: string }): Result<DocumentSnapshot[]>;
   listArtifactIds(): Result<DbId[]>;
   listDocumentIds(): Result<DbId[]>;
   findBySource(input: { sourceKey: string; sourceRecordId: string; version: string }): Result<DocumentSnapshot | null>;
@@ -493,18 +497,13 @@ function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Rec
   if (record.inputDefinitions !== undefined) {
     if (kind === 'provider') throw new Error('unexpected_input_definitions');
     const fixed = FrozenInputDefinitionsSchema.parse(record.inputDefinitions);
-    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
-    if (hash(JSON.stringify({ roles: fixed.roles, templates: fixed.templates })) !== fixed.hash
-      || new Set(fixed.roles.map(role => role.id)).size !== fixed.roles.length
-      || fixed.roles.some(role => hash(role.content) !== role.hash)
-      || fixed.command && (hash(fixed.command.expandedText) !== fixed.command.expandedHash
-        || fixed.command.requiredRoles.some(id => !fixed.roles.some(role => role.id === id))
-        || fixed.command.sourceHash !== (fixed.command.kind === 'subagent'
-          ? fixed.roles.find(role => role.id === fixed.command!.requiredRoles[0])?.hash
-          : fixed.templates.find(template => template.name === fixed.command!.name)?.hash))) throw new Error('invalid_input_definitions');
+    if (new Set(fixed.roles.map(role => role.id)).size !== fixed.roles.length
+      || fixed.command?.requiredRoles.some(id => !fixed.roles.some(role => role.id === id))
+      || fixed.command?.kind === 'template' && !fixed.templates.some(template => template.name === fixed.command!.name))
+      throw new Error('invalid_input_definitions');
     if (record.inputCommandReceipt !== undefined) {
       const receipt = InputCommandReceiptSchema.parse(record.inputCommandReceipt);
-      if (fixed.command?.kind !== 'subagent' || receipt.originalHash !== hash(fixed.command.originalText)
+      if (fixed.command?.kind !== 'subagent' || receipt.originalText !== fixed.command.originalText
         || receipt.role !== fixed.command.requiredRoles[0]) throw new Error('invalid_input_command_receipt');
     }
   } else if (record.inputCommandReceipt !== undefined) throw new Error('unexpected_input_command_receipt');
@@ -605,8 +604,8 @@ function validatedScope(value: unknown): ChatScope | RunScope | LegacyRunScope {
 
 function validatedOutput(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
   const raw = object(value, 'output');
-  if (raw.nativeOutcomeHash !== undefined && (kind !== 'subagent' || raw.version !== 2
-    || typeof raw.nativeOutcomeHash !== 'string' || !/^[a-f0-9]{64}$/.test(raw.nativeOutcomeHash))) throw new Error('invalid_subagent_completion_hash');
+  if (raw.nativeOutcomeFacts !== undefined && (kind !== 'subagent' || raw.version !== 2
+    || typeof raw.nativeOutcomeFacts !== 'string' || raw.nativeOutcomeFacts.length === 0)) throw new Error('invalid_subagent_completion_facts');
   const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'output', ['text', 'partial', 'stopReason', 'responseId', 'responseModel']);
   if (typeof record.text !== 'string' || typeof record.partial !== 'boolean' || typeof record.stopReason !== 'string'
     || (record.wireMaxTokens !== undefined && record.wireMaxTokens !== null && (!Number.isSafeInteger(record.wireMaxTokens) || Number(record.wireMaxTokens) < 1))) throw new Error('invalid_output_shape');
@@ -752,7 +751,9 @@ function readToolCleanup(value: unknown): ToolCallCleanup {
 }
 
 function artifactMetadata(value: unknown): ArtifactMetadata {
-  const row = exactRecord(value, 'artifact_metadata', ['version', 'sourceKey', 'sourceRecordId', 'sourceVersion', 'files']);
+  const hasGap = Object.hasOwn(object(value, 'artifact_metadata'), 'verificationGap');
+  const row = exactRecord(value, 'artifact_metadata', ['version', 'sourceKey', 'sourceRecordId', 'sourceVersion', 'files', ...(hasGap ? ['verificationGap'] : [])]);
+  if (hasGap && row.verificationGap !== 'legacy-original-unavailable') throw new Error('invalid_artifact_verification_gap');
   if (row.version !== 1 || typeof row.sourceKey !== 'string' || typeof row.sourceRecordId !== 'string'
     || typeof row.sourceVersion !== 'string' || !Array.isArray(row.files)) throw new Error('invalid_artifact_metadata');
   const files = row.files.map((item) => {
@@ -762,7 +763,8 @@ function artifactMetadata(value: unknown): ArtifactMetadata {
       || typeof file.mimeType !== 'string' || file.mimeType.length < 1) throw new Error('invalid_artifact_file');
     return { relativePath: file.relativePath, bytes: Number(file.bytes), mimeType: file.mimeType };
   });
-  return { version: 1, sourceKey: row.sourceKey, sourceRecordId: row.sourceRecordId, sourceVersion: row.sourceVersion, files };
+  return { version: 1, sourceKey: row.sourceKey, sourceRecordId: row.sourceRecordId, sourceVersion: row.sourceVersion, files,
+    ...(hasGap ? { verificationGap: 'legacy-original-unavailable' as const } : {}) };
 }
 
 function documentSnapshot(value: unknown): DocumentSnapshot {
@@ -887,7 +889,7 @@ function toolCallSnapshot(db: Database, value: unknown, owners?: ContextOwnerCac
     tool_version: string | null; effect: string | null; status: string; args_json: string; result_json: string | null;
     delivery_json: string; cleanup_json: string; requested_at: string; started_at: string | null;
     ended_at: string | null; stopped_at: string | null; runtime_observation_json: string | null;
-    context_snapshot_id?: number | null; request_sequence?: number | null;
+    context_snapshot_id?: number | null; request_sequence?: number | null; evidence_revision?: number;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.run_id) || row.run_id < 1
     || !Number.isSafeInteger(row.session_id) || row.session_id < 1 || typeof row.native_tool_call_id !== 'string'
@@ -926,7 +928,7 @@ function toolCallSnapshot(db: Database, value: unknown, owners?: ContextOwnerCac
     args: { final: args.final }, startedAt: row.started_at,
   }, formApplication);
   return {
-    toolCallId: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
+    toolCallId: row.id, evidenceRevision: row.evidence_revision ?? 0, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,
     context: readToolContext(db, row, owners),
     toolName: row.tool_name, toolVersion: row.tool_version, effect: row.effect as ToolCallSnapshot['effect'],
     status: row.status as ToolCallStatus, args: args as unknown as ToolCallSnapshot['args'], result,
@@ -972,7 +974,7 @@ function candidateSnapshot(db: Database, value: unknown): { snapshot: CandidateS
     origin: string; based_on_candidate_id?: number | null;
     fields_json: string; lines_json: string; issues_json: string; created_at: string; accepted_at: string | null;
     document_id: number; document_version: string;
-    context_snapshot_id?: number | null; request_sequence?: number | null;
+    context_snapshot_id?: number | null; request_sequence?: number | null; evidence_revision?: number;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.job_id) || row.job_id < 1
     || (row.origin === 'model' ? !Number.isSafeInteger(row.run_id) || Number(row.run_id) < 1
@@ -985,14 +987,14 @@ function candidateSnapshot(db: Database, value: unknown): { snapshot: CandidateS
     throw new Error('invalid_candidate_row');
   }
   const fields = exactRecord(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields',
-    row.origin === 'human_edit' ? ['version', 'values', 'editRequestHash'] : ['version', 'values']);
+    row.origin === 'human_edit' ? ['version', 'values', 'editRequestFacts'] : ['version', 'values']);
   const lines = exactRecord(readJson(row.lines_json, 'candidate_lines'), 'candidate_lines', ['version', 'items']);
   const persisted = exactRecord(readJson(row.issues_json, 'candidate_issues'), 'candidate_issues', ['version', 'notes', 'checks', 'items']);
   if (fields.version !== 1 || lines.version !== 1 || persisted.version !== 1 || !Array.isArray(persisted.notes)) {
     throw new Error('invalid_candidate_version');
   }
-  if (row.origin === 'human_edit' && (typeof fields.editRequestHash !== 'string' || !/^[0-9a-f]{64}$/.test(fields.editRequestHash))) {
-    throw new Error('invalid_edit_request_hash');
+  if (row.origin === 'human_edit' && (fields.editRequestFacts !== null && typeof fields.editRequestFacts !== 'string')) {
+    throw new Error('invalid_edit_request_facts');
   }
   const candidate = (row.origin === 'human_edit' ? StoredCandidateDraftSchema : CandidateDraftSchema)
     .parse({ fields: fields.values, lines: lines.items, notes: persisted.notes });
@@ -1027,6 +1029,12 @@ function sameContextReference(left: CandidateSnapshot['context'], right: Candida
 
 export function createDocumentRepository(db: Database): DocumentRepository {
   return {
+    contents: createManagedFileContents(db),
+    findVersions(input) {
+      try { return ok(db.query('SELECT * FROM documents WHERE source_key=? AND source_record_id=? ORDER BY id DESC')
+        .all(input.sourceKey, input.sourceRecordId).map(documentSnapshot)); }
+      catch { return fail(appError('storage_corrupt', 'storage', 'Document versions could not be read.')); }
+    },
     listArtifactIds() {
       try {
         const rows = db.query('SELECT id FROM artifacts ORDER BY id').all() as Array<{ id: number }>;
@@ -1944,7 +1952,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           && Buffer.byteLength(serialized, 'utf8') > TOOL_CONFIG.payload.maxFinalArgumentsBytes) return fail(appError('tool_result_too_large', 'input', 'ToolCall 最终参数超过记录上限.'));
         const changed = db.query(`UPDATE tool_calls SET args_json=json_set(args_json,'$.final',json(?)) WHERE id=? AND status='requested' AND json_type(args_json,'$.final')='null'`)
           .run(serialized, input.toolCallId).changes;
-        if (changed === 1) return byId(input.toolCallId);
+        if (changed >= 1) return byId(input.toolCallId);
         const current = byId(input.toolCallId);
         if (!current.ok) return current;
         return stableJson(current.data.args.final) === stableJson(input.finalArguments) ? current
@@ -1959,7 +1967,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         const started = writeTransaction(() => {
           const changed = db.query("UPDATE tool_calls SET status='running',started_at=? WHERE id=? AND status='requested' AND json_type(args_json,'$.final')!='null'")
             .run(input.startedAt, input.toolCallId).changes;
-          if (changed === 1) {
+          if (changed >= 1) {
             appendToolState(db, events, input.toolCallId, 'tool_started');
             return byId(input.toolCallId);
           }
@@ -2008,7 +2016,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=?,runtime_observation_json=?
             WHERE id=? AND status='running'`).run(input.result.status, serialized, JSON.stringify(cleanup), input.endedAt,
             input.stoppedAt, observation === null ? null : JSON.stringify(observation), input.toolCallId).changes;
-          if (changed === 1) {
+          if (changed >= 1) {
             appendToolState(db, events, input.toolCallId, input.result.status === 'succeeded' ? 'tool_succeeded'
               : input.result.status === 'failed' ? 'tool_failed' : 'tool_cancelled');
             return byId(input.toolCallId);
@@ -2050,7 +2058,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           const changed = db.query(`UPDATE tool_calls SET status=?,result_json=?,cleanup_json=?,ended_at=?,stopped_at=NULL,runtime_observation_json=?
             WHERE id=? AND status='requested'`).run(input.result.status, serialized, JSON.stringify(input.cleanup), input.endedAt,
             observation === null ? null : JSON.stringify(observation), input.toolCallId).changes;
-          if (changed === 1) {
+          if (changed >= 1) {
             appendToolState(db, events, input.toolCallId, input.result.status === 'failed' ? 'tool_failed' : 'tool_cancelled');
             return byId(input.toolCallId);
           }
@@ -2073,7 +2081,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         if (!deliveryTransition(current.data.delivery.state, parsed.state)) return fail(appError('state_conflict', 'runtime', 'ToolCall 回送事实不能回退。'));
         const changed = db.query('UPDATE tool_calls SET delivery_json=? WHERE id=?')
           .run(JSON.stringify(parsed), input.toolCallId).changes;
-        return changed === 1 ? byId(input.toolCallId) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
+        return changed >= 1 ? byId(input.toolCallId) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
       } catch { return fail(databaseError('ToolCall 回送事实保存失败。')); }
     },
 
@@ -2097,7 +2105,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         const envelope = { ...(before.data.result ?? { version: 1 }), formApplication: parsed.data };
         const changed = db.query('UPDATE tool_calls SET result_json=? WHERE id=?')
           .run(JSON.stringify(envelope), input.toolCallId).changes;
-        return changed === 1 ? byId(input.toolCallId) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
+        return changed >= 1 ? byId(input.toolCallId) : fail(appError('tool_call_not_found', 'input', 'ToolCall 不存在。'));
       });
       return recorded.ok ? recorded.data : recorded;
     },
@@ -2128,7 +2136,7 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
   };
 }
 
-export function subagentCompletionHash(outcome: import('@flowmate/contracts').AgentNativeOutcome): string {
+export function serializeSubagentCompletion(outcome: import('@flowmate/contracts').AgentNativeOutcome): string {
   const visiting = new Set<object>();
   const encode = (value: unknown): unknown => {
     if (value === null) return ['null'];
@@ -2145,7 +2153,7 @@ export function subagentCompletionHash(outcome: import('@flowmate/contracts').Ag
     visiting.delete(value);
     return encoded;
   };
-  return createHash('sha256').update(JSON.stringify(encode(outcome))).digest('hex');
+  return JSON.stringify(encode(outcome));
 }
 
 function stableJson(value: unknown): string {
@@ -2219,8 +2227,8 @@ function queryCandidateRow(db: Database, candidateId: DbId, jobId?: DbId): unkno
   return jobId === undefined ? db.query(sql).get(candidateId) : db.query(sql).get(candidateId, jobId);
 }
 
-function invoiceRequestHash(value: unknown): string {
-  return createHash('sha256').update(stableJson(value)).digest('hex');
+function invoiceRequestFacts(value: unknown): string {
+  return stableJson(value);
 }
 function executionReleased(db: Database, jobId: DbId): boolean {
   const runs = db.query('SELECT status,cleanup_json FROM runs WHERE job_id=? OR status IN (\'created\',\'running\')').all(jobId) as
@@ -2288,7 +2296,9 @@ function findInvoiceExport(db: Database, input: ExportInvoiceCandidateRequest): 
     const prior = invoiceEvent(db, 'candidate_exported', input.operationRef);
     if (!prior) return ok(null);
     const summary = object(readJson(prior.safeSummary, 'export_event'), 'export_event');
-    if (summary.requestHash !== invoiceRequestHash(input) || prior.candidateId !== input.candidateId) {
+    if (summary.requestFacts === null) return fail(appError('operation_result_unknown', 'storage',
+      'Legacy export request facts are unavailable. The original operation will not be executed again.'));
+    if (summary.requestFacts !== invoiceRequestFacts(input) || prior.candidateId !== input.candidateId) {
       return fail(appError('state_conflict', 'input', '同一操作引用已有不同导出事实。'));
     }
     const artifact = db.query("SELECT * FROM artifacts WHERE id=? AND kind='export'").get(prior.artifactId!) as {
@@ -2296,19 +2306,18 @@ function findInvoiceExport(db: Database, input: ExportInvoiceCandidateRequest): 
     } | null;
     if (!artifact) throw new Error('missing_export_artifact');
     const meta = exactRecord(readJson(artifact.metadata_json, 'export_metadata'), 'export_metadata',
-      ['version', 'candidateId', 'basedOnCandidateId', 'format', 'sha256', 'requestHash']);
+      ['version', 'candidateId', 'basedOnCandidateId', 'format', 'requestFacts']);
     const saved = candidateSnapshot(db, queryCandidateRow(db, input.candidateId));
     const job = readJob(db, saved.snapshot.jobId);
     if (meta.version !== 1 || meta.candidateId !== input.candidateId || meta.format !== input.format
-      || typeof meta.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(meta.sha256)
-      || typeof meta.requestHash !== 'string' || !/^[0-9a-f]{64}$/.test(meta.requestHash)
+      || typeof meta.requestFacts !== 'string' || meta.requestFacts.length === 0
       || meta.basedOnCandidateId !== (saved.snapshot.basedOnCandidateId ?? null)
       || saved.snapshot.status !== 'accepted' || job?.status !== 'completed' || job.acceptedCandidateId !== input.candidateId
       || prior.jobId !== saved.snapshot.jobId || prior.documentId !== saved.documentRef.id
       || !Number.isSafeInteger(artifact.bytes) || artifact.bytes <= 0
       || artifact.relative_path !== invoiceExportName(saved.snapshot, input.format)) throw new Error('invalid_export_artifact');
     return ok({ artifactId: artifact.id, candidateId: input.candidateId, format: input.format,
-      relativePath: artifact.relative_path, bytes: artifact.bytes, sha256: meta.sha256, createdAt: artifact.created_at });
+      relativePath: artifact.relative_path, bytes: artifact.bytes, createdAt: artifact.created_at });
   } catch { return fail(appError('storage_corrupt', 'storage', '导出事实无法读取。')); }
 }
 function recordInvoiceEvent(db: Database, type: BusinessEventType, operationRef: string, candidate: CandidateSnapshot,
@@ -2330,12 +2339,14 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
     const parsed = schema.safeParse(request);
     if (!parsed.success) return fail(appError('input_invalid', 'input', '候选确认参数无效。'));
     const type = accept ? 'candidate_accepted' : 'candidate_rejected';
-    const hash = invoiceRequestHash(parsed.data);
+    const requestFacts = invoiceRequestFacts(parsed.data);
     const committed = transaction(db, () => {
       const prior = invoiceEvent(db, type, input.operationRef);
       if (prior) {
         const summary = object(readJson(prior.safeSummary, 'decision'), 'decision');
-        if (summary.requestHash !== hash || prior.jobId !== input.jobId || prior.candidateId !== input.candidateId) {
+        if (summary.requestFacts === null) return fail(appError('operation_result_unknown', 'storage',
+          'Legacy decision request facts are unavailable. Read the original candidate; the operation will not be repeated.'));
+        if (summary.requestFacts !== requestFacts || prior.jobId !== input.jobId || prior.candidateId !== input.candidateId) {
           return fail(appError('state_conflict', 'input', '同一操作引用已有不同事实。'));
         }
         return ok(readDecision(input.candidateId, input.jobId, at));
@@ -2361,7 +2372,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
       else db.query('UPDATE jobs SET current_candidate_id=NULL,updated_at=? WHERE id=?').run(at, input.jobId);
       db.query('UPDATE workspace SET selection_json=NULL,revision=revision+1,updated_at=? WHERE id=1').run(at);
       recordInvoiceEvent(db, type, input.operationRef, candidate, facts.data.job.documentRef.id, at,
-        asJson({ version: 1, requestHash: hash, ...('reason' in parsed.data ? { reason: parsed.data.reason } : {}) }));
+        asJson({ version: 1, requestFacts: requestFacts, ...('reason' in parsed.data ? { reason: parsed.data.reason } : {}) }));
       return ok(readDecision(input.candidateId, input.jobId, at));
     });
     return committed.ok ? committed.data : committed;
@@ -2380,9 +2391,11 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (prior.jobId !== request.jobId || prior.candidateId === null) return fail(appError('state_conflict', 'input', '同一操作引用已有不同事实。'));
         const row = queryCandidateRow(db, prior.candidateId, request.jobId) as { fields_json: string } | null;
         if (!row) throw new Error('missing_operation_candidate');
-        const hash = kind === 'save' ? object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestHash
-          : object(readJson(prior.safeSummary, 'decision'), 'decision').requestHash;
-        if (hash !== invoiceRequestHash(request)) return fail(appError('state_conflict', 'input', '同一操作引用已有不同载荷。'));
+        const requestFacts = kind === 'save' ? object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestFacts
+          : object(readJson(prior.safeSummary, 'decision'), 'decision').requestFacts;
+        if (requestFacts === null) return fail(appError('operation_result_unknown', 'storage',
+          'Legacy request facts are unavailable. Read the original candidate; the operation will not be repeated.'));
+        if (requestFacts !== invoiceRequestFacts(request)) return fail(appError('state_conflict', 'input', '同一操作引用已有不同载荷。'));
         if (kind === 'save') return ok({ changed: true, candidate: candidateSnapshot(db, row).snapshot,
           workspace: workspaceSnapshot(db, db.query('SELECT * FROM workspace WHERE id=1').get(), at) });
         return ok(readDecision(prior.candidateId, request.jobId, at));
@@ -2392,12 +2405,14 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
       const { at, validate, ...request } = input;
       const parsed = SaveInvoiceCandidateRequestSchema.safeParse(request);
       if (!parsed.success) return fail(appError('input_invalid', 'input', '人工表单参数无效。'));
-      const hash = invoiceRequestHash(parsed.data);
+      const requestFacts = invoiceRequestFacts(parsed.data);
       const committed = transaction(db, () => {
         const prior = invoiceEvent(db, 'candidate_edited', input.operationRef);
         if (prior) {
           const row = queryCandidateRow(db, prior.candidateId!, input.jobId) as { fields_json: string } | null;
-          if (!row || object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestHash !== hash) {
+          if (row && object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestFacts === null)
+            return fail(appError('operation_result_unknown', 'storage', 'Legacy edit request facts are unavailable. The operation will not be repeated.'));
+          if (!row || object(readJson(row.fields_json, 'candidate_fields'), 'candidate_fields').editRequestFacts !== requestFacts) {
             return fail(appError('state_conflict', 'input', '同一操作引用已有不同人工版本。'));
           }
           return ok({ changed: true, candidate: candidateSnapshot(db, row).snapshot,
@@ -2420,10 +2435,10 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (!validation.ok) return validation;
         const checks = z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS).parse(validation.data.checks);
         const issues = z.array(InvoiceIssueSchema).max(MAX_INVOICE_ISSUES).parse(validation.data.issues);
-        const fieldsJson = asJson({ version: 1, values: candidate.fields, editRequestHash: hash });
+        const fieldsJson = asJson({ version: 1, values: candidate.fields, editRequestFacts: requestFacts });
         const linesJson = asJson({ version: 1, items: candidate.lines });
         const issuesJson = asJson({ version: 1, notes: candidate.notes, checks, items: issues });
-        if (Buffer.byteLength(fieldsJson + linesJson + issuesJson, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', '人工候选超过保存上限。'));
+        if (Buffer.byteLength(asJson({ version: 1, values: candidate.fields }) + linesJson + issuesJson, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', '人工候选超过保存上限。'));
         const sequence = (db.query('SELECT COALESCE(MAX(sequence),0)+1 AS next FROM invoice_candidates WHERE job_id=?').get(input.jobId) as { next: number }).next;
         if (!Number.isSafeInteger(sequence)) return fail(appError('state_conflict', 'input', '候选版本已到上限。'));
         const inserted = db.query(`INSERT INTO invoice_candidates(job_id,run_id,tool_call_id,sequence,origin,based_on_candidate_id,status,
@@ -2451,13 +2466,13 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
     },
     findExport(input) { return findInvoiceExport(db, input); },
     registerExport(input) {
-      const { at, relativePath, bytes, sha256, ...request } = input;
+      const { at, relativePath, bytes, ...request } = input;
       if (!ExportInvoiceCandidateRequestSchema.safeParse(request).success || !/^outputs\/invoice-[1-9]\d*-result-[1-9]\d*\.(json|csv|md)$/.test(relativePath)
-        || !Number.isSafeInteger(bytes) || bytes <= 0 || !/^[a-f0-9]{64}$/.test(sha256)) return fail(appError('input_invalid', 'input', '导出文件引用无效。'));
+        || !Number.isSafeInteger(bytes) || bytes <= 0) return fail(appError('input_invalid', 'input', '导出文件引用无效。'));
       const committed = transaction(db, () => {
         const prior = findInvoiceExport(db, request);
         if (!prior.ok) return prior;
-        if (prior.data) return prior.data.relativePath === relativePath && prior.data.bytes === bytes && prior.data.sha256 === sha256
+        if (prior.data) return prior.data.relativePath === relativePath && prior.data.bytes === bytes
           ? prior : fail(appError('state_conflict', 'input', '同一操作已有不同的文件登记事实。'));
         const saved = candidateSnapshot(db, queryCandidateRow(db, input.candidateId));
         const job = readJob(db, saved.snapshot.jobId);
@@ -2466,11 +2481,11 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (relativePath !== invoiceExportName(saved.snapshot, input.format)) return fail(appError('state_conflict', 'input', '导出路径不属于指定的已接受版本。'));
         const existing = db.query('SELECT * FROM artifacts WHERE relative_path=?').get(relativePath) as { id: number; kind: string; metadata_json: string; bytes: number } | null;
         const metadata = { version: 1, candidateId: input.candidateId, basedOnCandidateId: saved.snapshot.basedOnCandidateId ?? null,
-          format: input.format, sha256, requestHash: invoiceRequestHash(request) };
+          format: input.format, requestFacts: invoiceRequestFacts(request) };
         let artifactId: number;
         if (existing) {
           const facts = object(readJson(existing.metadata_json, 'export'), 'export');
-          if (existing.kind !== 'export' || existing.bytes !== bytes || facts.candidateId !== input.candidateId || facts.format !== input.format || facts.sha256 !== sha256
+          if (existing.kind !== 'export' || existing.bytes !== bytes || facts.candidateId !== input.candidateId || facts.format !== input.format
             || facts.basedOnCandidateId !== (saved.snapshot.basedOnCandidateId ?? null)) {
             return fail(appError('state_conflict', 'input', '目标文件已有不同的登记事实。'));
           }
@@ -2480,7 +2495,7 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
             .run(relativePath, bytes, input.format === 'json' ? 'application/json' : input.format === 'csv' ? 'text/csv' : 'text/markdown', asJson(metadata), at).lastInsertRowid);
         }
         recordInvoiceEvent(db, 'candidate_exported', input.operationRef, saved.snapshot, saved.documentRef.id, at,
-          asJson({ version: 1, requestHash: invoiceRequestHash(request), format: input.format }), artifactId);
+          asJson({ version: 1, requestFacts: invoiceRequestFacts(request), format: input.format }), artifactId);
         return findInvoiceExport(db, request);
       });
       if (!committed.ok) return committed;

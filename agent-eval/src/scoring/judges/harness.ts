@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto';
 import { scanEvidence, protectedSecrets } from '../../execution/evidence-safety.ts';
 import { requestJudge, prepareJudge, publicJudgeConfig, type JudgeConfig, type Fetcher } from './client.ts';
 import type { StopReason } from '@earendil-works/pi-ai';
-import { hash } from '../../dataset-loader/local.ts';
 import { compactPlanSchema, parseCompactJudgment, parseMetricJudgment, parseStrictMetricJudgment, normalizeMetricJson, metricPolicyFor, metricRubrics, compactRubric, compactRubricFor, type CompactPlan, type CompactJudgment } from './compact.ts';
 import {researchFrameSchema} from '../research-judgment.ts';
 import {evaluatorEvidence} from './evaluators.ts';
@@ -19,7 +18,7 @@ export async function runJudge(config: JudgeConfig, system: string, data: string
         responseModel: null as unknown, stopReason: null as StopReason | null, rawStopReason: null as string | null, responseComplete: false,
         usageSource: 'unknown' as 'sdk' | 'unknown', transportStatus:null as number|null,
         raw: null as string | null, error: null as string | null, judgment: null as ReturnType<typeof parseJudgment> | null,
-        request: { ...input.value, hash: hash([input.value.system, input.value.data]), redacted: (input.fact.actual as { leaked: boolean }).leaked },
+        request: { ...input.value,  redacted: (input.fact.actual as { leaked: boolean }).leaked },
         compact: plan ? { plan, judgment: null as CompactJudgment | null,
             ...(named ? {format:'metric-id/v1' as const, validationErrors:{} as Record<string,string>} : {}),
             ...(parsePolicy?{parsePolicy,normalization:'none' as 'none'|'markdown-fence'}:{}) } : undefined };
@@ -63,7 +62,6 @@ export async function runJudge(config: JudgeConfig, system: string, data: string
         scanned.value.judgment = null;
         if (scanned.value.compact) scanned.value.compact.judgment = null;
         scanned.value.request.redacted ||= record.request.system !== scanned.value.request.system || record.request.data !== scanned.value.request.data;
-        scanned.value.request.hash = hash([scanned.value.request.system, scanned.value.request.data]);
     }
     return scanned.value;
 }

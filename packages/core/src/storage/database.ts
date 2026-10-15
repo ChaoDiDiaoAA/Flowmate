@@ -1,3 +1,6 @@
+import { createManagedFileContents } from './managed-file-contents.ts';
+import { backupLegacyStore, migrateLegacyMetadata, type LegacyStoreBackup } from './migration-020.ts';
+import type { ManagedFileContents } from './managed-file-contents.ts';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Database } from 'bun:sqlite';
@@ -38,6 +41,7 @@ export type DbHandle = {
   sessions: SessionRepository;
   sessionInputs: SessionInputLedger;
   documents: DocumentRepository;
+  contents: ManagedFileContents;
   workspace: WorkspaceRepository;
   jobs: JobRepository;
   toolCalls: ToolCallRepository;
@@ -54,14 +58,14 @@ export type DbHandle = {
   close: () => void;
 };
 
-type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19;
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20;
 function migrationSql(version: SchemaVersion): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql'][version - 1];
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
 
-function runMigration(db: Database, version: SchemaVersion): void {
+function runMigration(db: Database, version: SchemaVersion, paths?: ProductPaths, backup: LegacyStoreBackup | null = null): void {
   const legacyAlter = version === 17 ? (db.query('PRAGMA legacy_alter_table').get() as { legacy_alter_table: number }).legacy_alter_table : 0;
   try {
     if (version === 17) {
@@ -79,9 +83,10 @@ function runMigration(db: Database, version: SchemaVersion): void {
         || db.query('SELECT id FROM runs WHERE parent_run_id IS NOT NULL OR origin_tool_call_id IS NOT NULL OR plugin_agent_id IS NOT NULL').get())
         throw new Error('migration_preservation_failed');
       db.exec('COMMIT');
-    } else if (version === 15 || version === 16 || version === 18 || version === 19) {
+    } else if (version === 15 || version === 16 || version === 18 || version === 19 || version === 20) {
       // Trigger bodies contain semicolons: execute each explicit whole-statement boundary.
       for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
+      if (version === 20 && paths) migrateLegacyMetadata(db, paths, backup);
       if (db.query('PRAGMA foreign_key_check').all().length) throw new Error('migration_foreign_key_violation');
       db.exec('COMMIT');
     } else if (version === 4 || version === 10 || version === 11 || version === 14) {
@@ -98,6 +103,7 @@ function runMigration(db: Database, version: SchemaVersion): void {
     } else db.exec(migrationSql(version));
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* preserve migration error; caller closes the database */ }
+    if (version === 20) backup?.restore();
     throw error;
   } finally {
     if (version === 10) db.exec('PRAGMA foreign_keys=ON');
@@ -108,16 +114,17 @@ function runMigration(db: Database, version: SchemaVersion): void {
   }
 }
 
-function migrateToLatest(db: Database): void {
+function migrateToLatest(db: Database, paths: ProductPaths): void {
   const migrationTable = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'").get() as { name: string } | null;
   if (!migrationTable) runMigration(db, 1);
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 19) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 20) {
     throw new Error('unsupported_schema_version');
   }
-  for (let version = versions.length + 1; version <= 19; version += 1) runMigration(db, version as SchemaVersion);
+  const backup = migrationTable && versions.length < 20 ? backupLegacyStore(db, paths) : null;
+  for (let version = versions.length + 1; version <= 20; version += 1) runMigration(db, version as SchemaVersion, paths, backup);
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {
@@ -135,7 +142,7 @@ export function openDatabase(paths: ProductPaths): Result<DbHandle> {
     if (!created.ok) return created;
     db = new Database(paths.databaseFile, { create: true });
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 1000; PRAGMA journal_mode = DELETE; PRAGMA locking_mode = EXCLUSIVE;');
-    migrateToLatest(db);
+    migrateToLatest(db, paths);
     const runtimeEventStore = createRuntimeEventStore(db);
     const memory = createMemoryStore(db, runtimeEventStore);
     const runtimeEvents = createEventService(runtimeEventStore);
@@ -143,6 +150,7 @@ export function openDatabase(paths: ProductPaths): Result<DbHandle> {
     const sessions = createSessionRepository(db, runtimeEventStore);
     const sessionInputs = createSessionInputLedger(db, runtimeEventStore);
     const documents = createDocumentRepository(db);
+    const contents = createManagedFileContents(db);
     const workspace = createWorkspaceRepository(db);
     const jobs = createJobRepository(db);
     const toolCalls = createToolCallRepository(db, runtimeEventStore);
@@ -155,7 +163,7 @@ export function openDatabase(paths: ProductPaths): Result<DbHandle> {
     const recoveryError = inspectRuntimeRecovery(db);
     const maxRunIdAtBoot = (db.query('SELECT COALESCE(MAX(id),0) AS id FROM runs').get() as { id: number }).id;
     if (!Number.isSafeInteger(maxRunIdAtBoot) || maxRunIdAtBoot < 0) throw new Error('unsafe_run_id');
-    return ok({ db, memory, runs, sessions, sessionInputs, documents, workspace, jobs, toolCalls, businessEvents, candidates, context, research, recoveryError,
+    return ok({ db, memory, runs, sessions, sessionInputs, documents, contents, workspace, jobs, toolCalls, businessEvents, candidates, context, research, recoveryError,
       runtimeEventStore, runtimeEvents, maxRunIdAtBoot, close: () => { runtimeEvents.close(); db?.close(); } });
   } catch (error) {
     try { db?.close(); } catch { /* preserve original error */ }

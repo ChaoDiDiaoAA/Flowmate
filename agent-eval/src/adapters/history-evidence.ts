@@ -1,7 +1,7 @@
+import { isDeepStrictEqual } from 'node:util';
 import type { HostClient } from '../../../apps/desktop/main/host-client.ts';
 import { NativeHistoryPageResultSchema, SessionHistoryEntryResultSchema,
     type HistoryCommitState, type HistoryEntrySummary, type HistoryEntryDisplayFields } from '../../../packages/contracts/src/memory.ts';
-import { hash } from '../dataset-loader/local.ts';
 import type { EvidenceFact } from '../types.ts';
 import type { SessionSnapshot } from '../../../packages/contracts/src/runtime.ts';
 
@@ -21,7 +21,7 @@ export async function collectHistoryEvidence(host: Pick<HostClient, 'request'>, 
                 expectedCommitRevision: actual.commit?.commitRevision } }));
             if (!result.ok) throw new Error('query_session_history: ' + result.error.code);
             const p = result.data;
-            if (p.session.sessionId !== input.sessionId || actual.commit && hash(p.commit) !== hash(actual.commit))
+            if (p.session.sessionId !== input.sessionId || actual.commit && !isDeepStrictEqual(p.commit,actual.commit))
                 throw new Error('Foreign or changed history commit');
             actual.commit ??= p.commit;
             for (const item of p.items) {
@@ -41,8 +41,8 @@ export async function collectHistoryEvidence(host: Pick<HostClient, 'request'>, 
                     sessionId: input.sessionId, entryId: summary.entryId, expectedCommitRevision: actual.commit!.commitRevision, partIndex, offset } }));
                 if (!result.ok) throw new Error('query_session_history_entry: ' + result.error.code);
                 const detail = result.data;
-                if (hash(detail.commit) !== hash(actual.commit) || hash(detail.summary) !== hash(summary) ||
-                    entry && hash(entry.fields) !== hash(detail.fields)) throw new Error('Native history detail identity or fields changed');
+                if (!isDeepStrictEqual(detail.commit,actual.commit) || !isDeepStrictEqual(detail.summary,summary) ||
+                    entry && !isDeepStrictEqual(entry.fields,detail.fields)) throw new Error('Native history detail identity or fields changed');
                 if (detail.partIndex < partIndex || detail.partIndex === partIndex && detail.offset !== offset ||
                     detail.partIndex > partIndex && detail.offset !== 0) throw new Error('Native history detail cursor mismatch');
                 if (!entry) { entry = { summary, fields: detail.fields, parts: [] }; actual.entries.push(entry); }
@@ -67,7 +67,7 @@ export async function collectHistoryEvidence(host: Pick<HostClient, 'request'>, 
         // Check the held revision once more; never restart pagination over a newer commit.
         const final = NativeHistoryPageResultSchema.parse(await host.request({ type: 'query_session_history', input: {
             sessionId: input.sessionId, expectedCommitRevision: actual.commit!.commitRevision, limit: 1 } }));
-        if (!final.ok || final.data.session.sessionId !== input.sessionId || hash(final.data.commit) !== hash(actual.commit))
+        if (!final.ok || final.data.session.sessionId !== input.sessionId || !isDeepStrictEqual(final.data.commit,actual.commit))
             throw new Error('Native history changed before acquisition completed');
         actual.session = final.data.session;
         return { present: true, actual, source };

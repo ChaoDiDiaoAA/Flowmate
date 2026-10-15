@@ -1,10 +1,9 @@
 // Independent synthetic facility data. Never derive expectations from business drafts.
 import type { LocalCase, LocalDataset } from '../../src/dataset-loader/local.ts';
-import { hash } from '../../src/dataset-loader/local.ts';
 export const material = 'Synthetic invoice TEST-001\nNet 10.00\nTax 1.00\nTotal 11.00';
 export const tasks: LocalCase[] = [
   { id: 'test-fields', version: 1, name: 'Synthetic field task', category: 'fields', tags: ['synthetic'], requires: ['agent'],
-    input: { prompt: 'Read the provided synthetic invoice.', materials: [{ source: 'voxel51', sample: '000001', file: 'content.md', sha256: hash(material), originalSha256: hash('synthetic-original') }] },
+    input: { prompt: 'Read the provided synthetic invoice.', materials: [{ source: 'voxel51', sample: '000001', file: 'content.md',  }] },
     expected: { success: ['Save the stated number.'], failure: ['Invent a different number.'], checks: [{ metric: 'reference-fields', required: true }], reference: { status: 'pending', fields: { invoiceNumber: 'TEST-001' }, excerpt: material, basis: 'visible-parsed-material' } }, review: { status: 'pending' } },
   { id: 'test-lines', version: 1, name: 'Synthetic row task', category: 'lines', tags: ['synthetic'], requires: ['agent'], input: { prompt: 'Compare the synthetic rows.', materials: [] },
     expected: { success: ['Retain both distinct rows.'], failure: ['Duplicate or omit a row.'], checks: [{ metric: 'line-items', required: true }], reference: { status: 'pending', fields: { invoiceNumber: 'TEST-002' }, lineItems: [{ description: 'one', amount: '2.00' }, { description: 'two', amount: '3.00' }], excerpt: 'one 2.00; two 3.00', basis: 'visible-parsed-material' } }, review: { status: 'pending' } },

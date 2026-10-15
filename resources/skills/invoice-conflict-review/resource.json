@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-conflict-review",
   "version": "v1",
@@ -32,13 +32,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1334,
-      "sha256": "9d82cfea6325fb262787a9829e617fc7b1e8b57fe6ae1ecb2c55604cb737a80a"
+      "bytes": 1334
     },
     {
       "path": "references/guide.md",
-      "bytes": 772,
-      "sha256": "7db9ab3e23bd107a0e2dfea21a4d11c21f109c47e46a9c6ebc46b856307579b8"
+      "bytes": 772
     }
   ]
 }

@@ -34,7 +34,7 @@ export type ModelProfile = {
 };
 
 export type ProductSettings = {
-  version: 2 | 3 | 4 | 5;
+  version: 2 | 3 | 4 | 5 | 6;
   revision: number;
   profile: { displayName: string; theme: 'system' | 'light' | 'dark' };
   models: readonly ModelProfile[];
@@ -99,7 +99,7 @@ export function serializeDesktopInvoiceFormRequest(input: DesktopInvoiceFormRunR
   const workspace = input.workspace;
   return JSON.stringify({ requestIdentityVersion: 1, clientSequence: input.clientSequence, modelId: input.modelId,
     ...(input.requiredSkill === undefined ? {} : { requiredSkill: { kind: input.requiredSkill.kind, id: input.requiredSkill.id,
-      version: input.requiredSkill.version, contentHash: input.requiredSkill.contentHash } }),
+      version: input.requiredSkill.version } }),
     target: { formInstanceId: input.target.formInstanceId, expectedRevision: input.target.expectedRevision },
     workspace: { revision: workspace.revision, sessionId: workspace.sessionId,
       documentRef: workspace.documentRef === null ? null : { id: workspace.documentRef.id, version: workspace.documentRef.version },
@@ -126,7 +126,7 @@ export function serializeDesktopPromptRequest(input: Extract<DesktopSessionInput
     text: input.text, modelId: input.modelId, goalMode: input.goalMode ?? 'answer',
     ...(input.research === undefined ? {} : { research: input.research }),
     ...(input.requiredSkill === undefined ? {} : { requiredSkill: { kind: input.requiredSkill.kind, id: input.requiredSkill.id,
-      version: input.requiredSkill.version, contentHash: input.requiredSkill.contentHash } }),
+      version: input.requiredSkill.version } }),
     ...(workspace === undefined ? {} : { workspace: { revision: workspace.revision,
       documentRef: workspace.documentRef === null ? null : { id: workspace.documentRef.id, version: workspace.documentRef.version },
       jobId: workspace.jobId, candidateRef: workspace.candidateRef === null ? null : { id: workspace.candidateRef.id, sequence: workspace.candidateRef.sequence },

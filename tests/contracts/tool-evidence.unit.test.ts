@@ -21,12 +21,12 @@ test('tool evidence preserves original arguments/results and rejects incomplete 
     expect(ToolCallSnapshotSchema.safeParse({ ...snapshot, args: { ...snapshot.args, raw: circular } }).success).toBe(false);
 });
 
-test('tool evidence continuation binds a hash, UTF-8 length, exact end and a bounded strict page', () => {
+test('tool evidence continuation binds a revision, UTF-8 length, exact end and a bounded strict page', () => {
     const identity = { runId: 21, sessionId: 12, toolCallId: 8 };
     expect(ToolEvidenceRequestSchema.parse(identity)).toMatchObject({ offset: 0, limit: 8192 });
     expect(ToolEvidenceRequestSchema.safeParse({ ...identity, offset: 1 }).success).toBe(false);
-    expect(ToolEvidenceRequestSchema.safeParse({ ...identity, offset: 1, expectedHash: 'a'.repeat(64) }).success).toBe(true);
-    const page = { version: 1, ...identity, sha256: 'a'.repeat(64), bytes: 17, offset: 10, chunk: '汉😀', nextOffset: null };
+    expect(ToolEvidenceRequestSchema.safeParse({ ...identity, offset: 1, expectedRevision: 2 }).success).toBe(true);
+    const page = { version: 2, ...identity, evidenceRevision: 2, bytes: 17, offset: 10, chunk: '汉😀', nextOffset: null };
     expect(ToolEvidencePageSchema.safeParse(page).success).toBe(true);
     for (const invalid of [{ ...page, bytes: 16 }, { ...page, nextOffset: 17 }, { ...page, chunk: '' },
         { ...page, chunk: 'a'.repeat(32769), bytes: 32779 }, { ...page, extra: 'hidden' },

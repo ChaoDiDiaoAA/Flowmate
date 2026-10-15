@@ -40,7 +40,7 @@ it('displays Core readiness independently of enablement and adapts both Skills e
       }, { catalog, index: held++ });
       await expect(page.getByRole('button', { name: 'Refresh resources', exact: true })).toBeEnabled();
     }
-    const row = (id: string) => page.locator('.skill-row').filter({ has: page.getByRole('button', { name: `View ${id} v1`, exact: true }) });
+    const row = (id: string, version = 'v1') => page.locator('.skill-row').filter({ has: page.getByRole('button', { name: `View ${id} ${version}`, exact: true }) });
     await display(catalogs.zero);
     await expect(row('invoice').getByText('0/5 capabilities', { exact: true })).toBeVisible();
     await expect(row('invoice').locator('.skill-capability-mark')).toHaveClass(/empty/);
@@ -64,8 +64,8 @@ it('displays Core readiness independently of enablement and adapts both Skills e
     await expect(page.getByRole('button', { name: `View ${mismatchedName} (ui-name-mismatch v1)`, exact: true })).toBeVisible();
     await expect(page.getByRole('switch', { name: 'Enable ui-name-mismatch v1', exact: true })).toBeDisabled();
     await display(catalogs.updated);
-    await expect(row('invoice').locator('.skill-row-copy p')).toHaveText('同一名称的新介绍不应套用旧译文。');
-    await expect(row('invoice').locator('.skill-row-copy p')).toHaveAttribute('title', '同一名称的新介绍不应套用旧译文。');
+    await expect(row('invoice', 'v2').locator('.skill-row-copy p')).toHaveText('同一名称的新介绍不应套用旧译文。');
+    await expect(row('invoice', 'v2').locator('.skill-row-copy p')).toHaveAttribute('title', '同一名称的新介绍不应套用旧译文。');
     await display(catalogs.invalid);
     await expect(row('invoice-source-audit').getByText('4/4 capabilities', { exact: true })).toBeVisible();
     await expect(row('invoice-source-audit').getByText('Unavailable', { exact: true })).toBeVisible();
@@ -290,7 +290,7 @@ it('uses the desktop Prompt in real SDK and HTTP requests, rejects unavailable n
     const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     const sessionId = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
-      const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p11-ui', credentialRef: 'p11_ui_controlled_key', name: 'P11 UI',
+      const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p11-ui', credentialRef: '00000000000000000000000000000031', name: 'P11 UI',
         kind: 'custom', providerId: null, baseUrl, model: 'p11-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }],
         defaultModelId: 'p11-ui' }, { modelId: 'p11-ui', apiKey: 'synthetic-p11-ui-key' });
       if (!settings.ok) throw new Error(settings.error.code);

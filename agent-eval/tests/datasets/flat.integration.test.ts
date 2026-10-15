@@ -3,7 +3,6 @@ import { readdirSync, mkdirSync, mkdtempSync, rmSync, cpSync, readFileSync, writ
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discoverDatasets, resolveCase, restoreCaseInputs, REPO_ROOT, inside, caseFiles } from '../../src/dataset-loader/local.ts';
-import {byteHash} from '../../src/dataset-loader/flat.ts';
 import {addFeedback,feedbackStatus} from '../../src/review/local.ts';
 import { fixtureSelection } from '../../src/dataset-loader/selection.ts';
 import { readInvoiceInputs } from '../../src/adapters/invoice-materials.ts';
@@ -33,7 +32,7 @@ test('declared conditions retain actual original and resource contents without d
  const temporary=mkdtempSync(join(tmpdir(),'eval-file-conditions-'));try{
   addFeedback(temporary,{dataset,caseId:task.id,reviewer:'synthetic',verdict:'good',note:'Synthetic freshness check only.'});
   const file=dataset.embedded!.inputs[task.id]!.find(f=>f.path.endsWith('original.jpg'))!,bytes=Buffer.concat([Buffer.from(file.content,'base64'),Buffer.from('changed original')]);
-  Object.assign(file,{content:bytes.toString('base64'),bytes:bytes.length,sha256:byteHash(bytes)});
+  Object.assign(file,{content:bytes.toString('base64'),bytes:bytes.length});
   expect(caseFiles(dataset,task)).not.toEqual(prior);expect(feedbackStatus(temporary,undefined,dataset).stale).toBe(1);
  }finally{rmSync(temporary,{recursive:true,force:true});}
 });
@@ -58,7 +57,7 @@ test('all initial inputs restore with necessary resources, excluding Gold, Revie
    expect(()=>restoreCaseInputs(d,c,directory)).toThrow();expect(readdirSync(inputs.localRoot)).not.toContain('quality-controls');
    expect(readdirSync(inputs.localRoot)).not.toContain('gold.ts');expect(readdirSync(inputs.localRoot)).not.toContain('review.ts');
    if(c.requires.includes('invoice')){const trial:AgentTrial={identity:{executionId:'synthetic',trialId:c.id,caseId:c.id,caseVersion:1},directory,
-    input:resolveCase(d,c).projected,requires:c.requires,configuration:{},invoiceSource:{root:inputs.invoiceRoot!,localRoot:inputs.localRoot,materials:c.input.materials}};
+    input:resolveCase(d,c).projected,requires:c.requires,configuration:{},invoiceSource:{root:inputs.invoiceRoot!,localRoot:inputs.localRoot,materials:c.input.materials,files:caseFiles(d,c)}};
     expect(readInvoiceInputs(trial).length+readPreparedInvoices(trial).invoices.length).toBeGreaterThan(0);}
    const selection=fixtureSelection(d,c,REPO_ROOT);if(selection.resources?.enabledSkills.length)expect(readSelectedResources(inputs.resourceRoot,selection.resources)).toHaveLength(selection.resources.enabledSkills.length);
   }

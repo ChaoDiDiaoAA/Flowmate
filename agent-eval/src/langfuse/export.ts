@@ -1,7 +1,6 @@
-import { hash, REPO_ROOT } from '../dataset-loader/local.ts';
+import { REPO_ROOT } from '../dataset-loader/local.ts';
 import { publicVersions, atomicJson, publicReport } from '../reports/files.ts';
 import { join, dirname } from 'node:path';
-import { withoutHashes } from '../artifacts.ts';
 import { langfuseConfig, agentModelCapabilitiesSchema } from '../configuration.ts';
 import { readReport, type LocalReport } from '../reports/store.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
@@ -48,8 +47,9 @@ export async function platformClient(repo = REPO_ROOT) {
     return new LangfuseClient({ ...config, timeout: 10 });
 }
 export function exportEvents(report: LocalReport): Event[] {
+    if(report.history)throw Error('Historical reports are read-only; original content conditions are unavailable');
     const events: Event[] = [];
-    const add = (type: string, body: Record<string, unknown>) => events.push({ type, body:publicVersions(withoutHashes(body)), id: [report.executionId,type,body.id].join(':'), timestamp: report.startedAt });
+    const add = (type: string, body: Record<string, unknown>) => events.push({ type, body:publicVersions((body)), id: [report.executionId,type,body.id].join(':'), timestamp: report.startedAt });
     for (const trial of report.trials) {
         const execution = trial.execution;
         const configuration = execution?.configuration;
@@ -58,12 +58,12 @@ export function exportEvents(report: LocalReport): Event[] {
             api: typeof configuration.api === 'string' ? configuration.api : undefined,
             baseUrl: typeof configuration.baseUrl === 'string' ? configuration.baseUrl : undefined,
             ...(capabilities.success ? { modelCapabilities: capabilities.data } : {}) }).value : undefined;
-        const metadata = { code: report.code ? { commit: report.code.commit, workspaceHash: report.code.workspaceHash, release: report.code.release, dirty: report.code.dirty } : undefined,
-            executionId: report.executionId, trialId: trial.trialId, dataset: { id: report.dataset.id, version: report.dataset.version, hash: report.dataset.hash },
-            caseId: trial.caseId, caseVersion: trial.caseVersion, caseHash: trial.caseHash, partition: trial.partition, category: trial.category,
+        const metadata = { code: report.code ? { commit: report.code.commit,  release: report.code.release, dirty: report.code.dirty } : undefined,
+            executionId: report.executionId, trialId: trial.trialId, dataset: { id: report.dataset.id, version: report.dataset.version },
+            caseId: trial.caseId, caseVersion: trial.caseVersion, partition: trial.partition, category: trial.category,
             repetition: trial.repetition, trialIndex: trial.repetition, trialsPerCase: report.repeat,
             status: trial.status, contract: report.contract, scoringVersion: report.scoringConfiguration.version,
-            judgeHash: report.scoringConfiguration.judgeHash, sourceInvalidation:report.sourceInvalidation, agent,
+             sourceInvalidation:report.sourceInvalidation, agent,
             evaluatorPlan:trial.evaluatorPlan,judgeGenerations:trial.judgeCalls.filter(c=>c.attempts>0).length,
             ...(trial.regressionOrigins ? { executionKind: report.executionKind, regressionOrigins: trial.regressionOrigins.map(({ verification: _, ...identity }) => identity) } : {}) };
         add('trace-create', { id: trial.traceId, name: 'Agent · ' + trial.caseName, timestamp: execution?.startedAt ?? report.startedAt, environment: report.environment,
@@ -96,13 +96,13 @@ export function exportEvents(report: LocalReport): Event[] {
                 modelParameters: { ...(historical.temperature!==undefined?{temperature:historical.temperature}:{}), ...(maximum!==undefined?{max_tokens:maximum}:{}) },
                 // Pi fills absent counters with zero without exposing whether a zero was reported.
                 usageDetails: sdk && call.usageSource !== 'sdk' ? undefined : usage(call.usage, sdk),
-                metadata: { callId: call.callId, method: 'llm-judge', configurationHash: call.configuration.configHash, attempts: call.attempts,
+                metadata: { callId: call.callId, method: 'llm-judge',  attempts: call.attempts,
                     responseComplete: call.responseComplete, finishReason: call.finishReason, stopReason: call.stopReason, rawStopReason: call.rawStopReason,
                     api: call.configuration.api, sdk: call.configuration.sdk, usageSource: call.usageSource, errorOccurred: call.error !== null,
                     judgmentFormat: call.compact?.format, validationErrors: call.compact?.validationErrors,
                     transportStatus:call.transportStatus,parsePolicy:call.compact?.parsePolicy,normalization:call.compact?.normalization,
                     modelCapabilities:call.configuration.modelCapabilities,
-                    rubricId: call.configuration.rubric?.id, rubricVersion: call.configuration.rubric?.version, rubricHash: call.configuration.rubric?.hash } });
+                    rubricId: call.configuration.rubric?.id, rubricVersion: call.configuration.rubric?.version } });
         }
     }
     const scanned = scanEvidence(events);

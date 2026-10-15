@@ -3,17 +3,15 @@ import { loadSkillsFromDir, formatSkillsForPrompt, createExtensionRuntime, parse
 import { appError, fail, ok, ResourceNativeMetadataSchema, FrozenResourcesSchema, ResourceBundleManifestSchema, ResourceManifestSchema,
   RESOURCE_LIMITS, canonicalResourceManifest, resourceRefKey, formatSkillReadinessSection } from '@flowmate/contracts';
 import { ListSkillResourcesInputSchema, ListSkillResourcesOutputSchema, ReadSkillResourceInputSchema, ReadSkillResourceOutputSchema } from '@flowmate/contracts';
-import type { InspectNativeResources, FrozenResources, ResourceRef, Result, SkillIndexEntry, FrozenInputDefinitions } from '@flowmate/contracts';
+import type { InspectNativeResources, FrozenResources, ResourceRef, Result, SkillIndexEntry, FrozenInputDefinitions, ManagedFileContents } from '@flowmate/contracts';
 import { resolve, join, relative, isAbsolute, sep } from 'node:path';
 import { lstatSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { resolveNativeFilePath } from '@flowmate/shared';
 
-const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const samePath = (left: string, right: string) => process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 const resourcePath = (ref: ResourceRef) => `${ref.kind === 'prompt' ? 'prompts' : 'skills'}/${ref.id}/${ref.version}`;
-export type ManagedReadFile = { ref: ResourceRef; path: string; fileHash: string; text: string | null; relativePath: string };
+export type ManagedReadFile = { ref: ResourceRef; path: string; text: string | null; relativePath: string };
 export { formatSkillReadinessSection } from '@flowmate/contracts';
 /** Match this installed SDK's observable text projection, using its public truncation helper. */
 export function verifyManagedReadOutput(file: ManagedReadFile, args: Record<string, unknown>, text: string): Result<void> {
@@ -55,45 +53,45 @@ function readFixed(root: string, path: string, limit: number): Buffer {
 
 /** No default discovery, configuration reload, extension loading, or PromptTemplate expansion. */
 export function createRunResourceLoader(input: { fixedSystemPrompt: string; frozen: FrozenResources | null;
-  bundleDirectory: string; activeToolNames?: readonly string[]; visibleSkillRefs?: readonly ResourceRef[]; roleIndex?: string;
+  bundleDirectory: string; contents?: Pick<ManagedFileContents, 'read'>; activeToolNames?: readonly string[]; visibleSkillRefs?: readonly ResourceRef[]; roleIndex?: string;
   templates?: FrozenInputDefinitions['templates']; child?: boolean; extensionResult?: LoadExtensionsResult }): Result<ResourceLoader & { bodyFor(ref: ResourceRef): string | null;
     readinessFor(ref: ResourceRef): string | null;
     filesForOperation(path: string, cwd: string, operation: string): ManagedReadFile[] }> {
   try {
     const skills: Skill[] = [], appended: string[] = [], sources: Array<{ path: string }> = [];
     const bodies = new Map<string, string>();
-    const files: Array<{ ref: ResourceRef; path: string; bytes: number; sha256: string }> = [];
+    const files: Array<{ ref: ResourceRef; path: string; bytes: number }> = [];
     const readiness = new Map<string, string>();
+    const readOriginal = (path: string, limit: number) => {
+      const content = readFixed(resolve(input.bundleDirectory), path, limit);
+      const saved = input.frozen && input.contents?.read({ ownerKind: 'resource-bundle', ownerId: input.frozen.bundleId, relativePath: path });
+      if (!saved || !content.equals(Buffer.from(saved))) throw new Error('Original bundle content is missing or changed.');
+      return content;
+    };
     if (input.roleIndex) {
       if (Buffer.byteLength(input.roleIndex) > 16384) throw new Error('Role index exceeds 16 KiB.');
       appended.push('Registered subagent roles (use Agent with subagent_type; independent calls can run concurrently, maximum four):\n'+input.roleIndex);
     }
     if (input.frozen !== null) {
       const frozen = FrozenResourcesSchema.parse(input.frozen), root = resolve(input.bundleDirectory);
-      if (frozen.skillIndex && hash(JSON.stringify(frozen.skillIndex.entries)) !== frozen.skillIndex.hash) throw new Error('Fixed Skill index changed.');
       const visible = new Set((input.visibleSkillRefs ?? frozen.discoveredSkills).map(resourceRefKey));
       if (input.visibleSkillRefs?.some(ref => !frozen.discoveredSkills.some(item => resourceRefKey(item) === resourceRefKey(ref)))
         || input.visibleSkillRefs && visible.size !== input.visibleSkillRefs.length) throw new Error('Visible Skills exceed the fixed bundle.');
       if (!samePath(root, resolve(frozen.bundleDirectory))) throw new Error('Frozen content location differs from the controlled Loader root.');
-      const manifest = ResourceBundleManifestSchema.parse(JSON.parse(decoder.decode(readFixed(root, 'bundle.json', RESOURCE_LIMITS.manifestBytes * RESOURCE_LIMITS.packages * 2 + 65536))));
+      const manifest = ResourceBundleManifestSchema.parse(JSON.parse(decoder.decode(readOriginal('bundle.json', RESOURCE_LIMITS.manifestBytes * RESOURCE_LIMITS.packages * 2 + 65536))));
       const refs = [...(frozen.prompt ? [frozen.prompt] : []), ...frozen.discoveredSkills];
-      const ordered = manifest.resources.map(item => item.ref).sort((a, b) => {
-        const left = JSON.stringify([a.kind, a.id, a.version, a.contentHash]), right = JSON.stringify([b.kind, b.id, b.version, b.contentHash]);
-        return left < right ? -1 : left > right ? 1 : 0;
-      });
-      if (manifest.bundleHash !== frozen.bundleHash || hash(JSON.stringify(ordered)) !== frozen.bundleHash
-        || frozen.manifests.some(item => hash(canonicalResourceManifest(item.manifest)) !== item.ref.contentHash)
+      if (manifest.bundleId !== frozen.bundleId || JSON.stringify(manifest.resources) !== JSON.stringify(frozen.manifests)
+        || JSON.stringify(manifest.skillIndex) !== JSON.stringify(frozen.skillIndex)
         || refs.length !== manifest.resources.length || refs.some(ref => !manifest.resources.some(item => resourceRefKey(item.ref) === resourceRefKey(ref))))
         throw new Error('Fixed bundle membership changed.');
       for (const item of manifest.resources) {
-        if (hash(canonicalResourceManifest(item.manifest)) !== item.ref.contentHash) throw new Error('Fixed manifest changed.');
-        const copied = ResourceManifestSchema.parse(JSON.parse(decoder.decode(readFixed(root, `${resourcePath(item.ref)}/resource.json`, RESOURCE_LIMITS.manifestBytes))));
-        if (hash(canonicalResourceManifest(copied)) !== item.ref.contentHash) throw new Error('Fixed copied manifest changed.');
+        const copied = ResourceManifestSchema.parse(JSON.parse(decoder.decode(readOriginal(`${resourcePath(item.ref)}/resource.json`, RESOURCE_LIMITS.manifestBytes))));
+        if (canonicalResourceManifest(copied) !== canonicalResourceManifest(item.manifest)) throw new Error('Fixed copied manifest changed.');
         const bodyPath = `${resourcePath(item.ref)}/${item.manifest.bodyFile}`;
         let body: Buffer | undefined;
         for (const file of item.manifest.files) {
-          const content = readFixed(root, `${resourcePath(item.ref)}/${file.path}`, RESOURCE_LIMITS.fileBytes);
-          if (content.length !== file.bytes || hash(content) !== file.sha256) throw new Error('Fixed file identity changed.');
+          const content = readOriginal(`${resourcePath(item.ref)}/${file.path}`, RESOURCE_LIMITS.fileBytes);
+          if (content.length !== file.bytes) throw new Error('Fixed file identity changed.');
           if (file.path === item.manifest.bodyFile) body = content;
           files.push({ ref: item.ref, ...file });
         }
@@ -106,7 +104,7 @@ export function createRunResourceLoader(input: { fixedSystemPrompt: string; froz
             || !samePath(resolve(skill.baseDir), resolve(directory))
             || !ResourceNativeMetadataSchema.safeParse({ name: skill.name, description: skill.description,
               disableModelInvocation: skill.disableModelInvocation, diagnostics: [] }).success
-            || hash(readFixed(root, bodyPath, RESOURCE_LIMITS.bodyBytes)) !== hash(body)) throw new Error('Fixed native Skill could not be verified.');
+            || !readOriginal(bodyPath, RESOURCE_LIMITS.bodyBytes).equals(body)) throw new Error('Fixed native Skill could not be verified.');
           if (visible.has(resourceRefKey(item.ref))) skills.push(skill);
         }
       }
@@ -133,11 +131,11 @@ export function createRunResourceLoader(input: { fixedSystemPrompt: string; froz
         return files.flatMap(file => {
           const filePath = `${resourcePath(file.ref)}/${file.path}`, absolute = resolve(root, filePath), rel = relative(target, absolute);
           if (!samePath(target, absolute) && (operation === 'read' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))) return [];
-          const content = readFixed(root, filePath, RESOURCE_LIMITS.fileBytes);
-          if (content.length !== file.bytes || hash(content) !== file.sha256) throw new Error('Managed file changed during native read.');
+          const content = readOriginal(filePath, RESOURCE_LIMITS.fileBytes);
+          if (content.length !== file.bytes) throw new Error('Managed file changed during native read.');
           let text: string | null = null; try { text = decoder.decode(content); } catch { /* Binary output is not full text evidence. */ }
           if (text !== null && /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) text = null;
-          return [{ ref: file.ref, path: file.path, fileHash: file.sha256, text, relativePath: rel }];
+          return [{ ref: file.ref, path: file.path, text, relativePath: rel }];
         });
       },
       getExtensions: () => input.extensionResult ?? ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
@@ -156,40 +154,43 @@ export function createRunResourceLoader(input: { fixedSystemPrompt: string; froz
 
 /** Recheck structured feedback against fixed files before recording SDK delivery evidence. */
 export function verifySkillToolOutput(frozen: FrozenResources, loader: Extract<ReturnType<typeof createRunResourceLoader>, { ok: true }>['data'],
-  operation: 'list_skill_resources' | 'read_skill_resource', raw: unknown, output: unknown): Result<Array<ManagedReadFile & { fullBody: boolean }>> {
+  contents: Pick<ManagedFileContents, 'read'>, operation: 'list_skill_resources' | 'read_skill_resource', raw: unknown, output: unknown): Result<Array<ManagedReadFile & { fullBody: boolean }>> {
   try {
     const args = operation === 'list_skill_resources' ? ListSkillResourcesInputSchema.parse(raw) : ReadSkillResourceInputSchema.parse(raw);
     const data = operation === 'list_skill_resources' ? ListSkillResourcesOutputSchema.parse(output) : ReadSkillResourceOutputSchema.parse(output);
     const item = frozen.manifests.find(item => resourceRefKey(item.ref) === resourceRefKey(data.ref));
-    if (!item || data.bundleHash !== frozen.bundleHash || data.ref.id !== args.skill || loader.bodyFor(data.ref) === null) throw new Error('Hidden or foreign Skill.');
-    const directory = join(frozen.bundleDirectory, resourcePath(data.ref));
+    if (!item || data.bundleId !== frozen.bundleId || data.ref.id !== args.skill || loader.bodyFor(data.ref) === null) throw new Error('Hidden or foreign Skill.');
     if ('files' in data) {
       const ordered = [...item.manifest.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
       if (JSON.stringify(data.files) !== JSON.stringify(ordered)) throw new Error('Listed metadata changed.');
-      return ok(loader.filesForOperation(directory, directory, 'ls').map(file => ({ ...file, fullBody: false })));
+      return ok(ordered.map(file => ({ ref: data.ref, path: file.path, text: null, relativePath: file.path, fullBody: false })));
     }
     const readArgs = ReadSkillResourceInputSchema.parse(raw);
-    const file = loader.filesForOperation(join(directory, readArgs.path), directory, 'read')[0];
-    if (!file || file.text === null || data.path !== readArgs.path || data.sha256 !== file.fileHash || data.offset !== (readArgs.offset ?? 0)) throw new Error('Read identity changed.');
-    const content = Buffer.from(file.text), start = data.offset;
+    const member = item.manifest.files.find(file => file.path === readArgs.path);
+    const original = member && contents.read({ ownerKind: 'resource-bundle', ownerId: frozen.bundleId,
+      relativePath: `${resourcePath(data.ref)}/${member.path}` });
+    if (!member || !original || original.byteLength !== member.bytes || data.path !== readArgs.path
+      || data.offset !== (readArgs.offset ?? 0)) throw new Error('Read identity changed.');
+    const content = Buffer.from(original), text = decoder.decode(content), start = data.offset;
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) throw new Error('Read content is binary.');
     if (start > content.length || start < content.length && (content[start]! & 0xc0) === 0x80) throw new Error('Invalid UTF-8 offset.');
     let end = Math.min(start + (readArgs.limit ?? RESOURCE_LIMITS.pageBytes), content.length);
     while (end < content.length && end > start && (content[end]! & 0xc0) === 0x80) end--;
     if (data.totalBytes !== content.length || data.text !== decoder.decode(content.subarray(start, end))
       || data.nextOffset !== (end < content.length ? end : null)) throw new Error('Read projection changed.');
-    return ok([{ ...file, fullBody: start === 0 && end === content.length }]);
+    return ok([{ ref: data.ref, path: member.path, text, relativePath: '', fullBody: start === 0 && end === content.length }]);
   } catch { return fail(appError('resource_evidence_conflict', 'runtime', 'Structured Skill feedback differs from its fixed file.')); }
 }
 
 /** Verify the result created by Pi; never construct or execute a Skill message here. */
 export function verifySkillExpansion(input: { text: string; skill: Skill; expectedBody: string;
-  expectedUserMessage: string }): Result<{ expandedTextHash: string }> {
+  expectedUserMessage: string }): Result<{ expandedText: string }> {
   const block = parseSkillBlock(input.text);
   if (!block || block.name !== input.skill.name || block.location !== input.skill.filePath
     || block.content !== `References are relative to ${input.skill.baseDir}.\n\n${stripFrontmatter(input.expectedBody).trim()}`
     || block.userMessage !== input.expectedUserMessage.trim())
     return fail(appError('resource_expansion_mismatch', 'runtime', 'Pi did not expand the required Skill at its fixed version.'));
-  return ok({ expandedTextHash: hash(input.text) });
+  return ok({ expandedText: input.text });
 }
 
 /** Only the explicitly verified version root is passed to Pi; no default discovery. */

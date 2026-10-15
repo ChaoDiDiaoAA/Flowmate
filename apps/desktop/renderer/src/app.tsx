@@ -99,11 +99,9 @@ async function identifyOriginalInput(original: DesktopSessionInputRequest, saved
   if (original.sessionId !== saved.sessionId || original.clientSequence !== saved.clientSequence) return 'unknown';
   if (original.mode !== saved.mode) return 'conflict';
   if (original.mode === 'prompt') {
-    if (saved.content.version !== 2 || !saved.content.desktopRequestHash) return 'unknown';
+    if (saved.content.version !== 2 || !saved.content.desktopRequestIdentity) return 'unknown';
     try {
-      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serializeDesktopPromptRequest(original, saved.content.requestIdentityVersion)));
-      const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
-      return hash === saved.content.desktopRequestHash ? 'same' : 'conflict';
+      return serializeDesktopPromptRequest(original, saved.content.requestIdentityVersion) === saved.content.desktopRequestIdentity ? 'same' : 'conflict';
     } catch { return 'unknown'; }
   }
   if (saved.content.version !== 2) return 'unknown';
@@ -2938,6 +2936,7 @@ export function App() {
                       onClick={() => void logoutModel()}>Remove API key</button>}
                   </div>
                 </section>}
+                {isDraftSaved && credentialStatus === 'missing' && <p role="status">The saved credential is unavailable. Enter your API key again before testing or sending.</p>}
                 <div className="config-actions">
                   {persistedModel && <button className="text-button danger-text" onClick={() => void removeModel()}>Remove model</button>}
                   <div className="action-spacer" />

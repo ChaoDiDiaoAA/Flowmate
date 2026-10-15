@@ -1,3 +1,4 @@
+import { defaultProductSettings } from '@flowmate/core';
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -16,6 +17,10 @@ it('research imports, task lists and restored reads cross the actual Host withou
     expect(await client.request({ type: 'query_research_for_session', input: { sessionId: session.data.sessionId } })).toEqual({ ok: true, data: null });
     const material = await client.request({ type: 'import_research_material', input: { title: 'Team policy', format: 'text', text: 'Local deployments only.' } }) as any;
     expect(material.ok).toBe(true);
+    expect(await client.request({ type: 'import_research_material', input: { title: 'Team policy', format: 'text', text: 'Local deployments only.' } })).toEqual(material);
+    const revised = await client.request({ type: 'import_research_material', input: { title: 'Team policy', format: 'text', text: 'Remote deployments allowed.' } }) as any;
+    expect(revised.ok).toBe(true); expect(revised.data.artifactId).not.toBe(material.data.artifactId);
+    expect(await client.request({ type: 'import_research_material', input: { title: 'Team policy', format: 'text', text: 'Local deployments only.' } })).toEqual(material);
     const created = await client.request({ type: 'create_research_task', input: { sessionId: session.data.sessionId, title: 'Deployment research',
       sourcePolicy: { web: false, domains: [], artifactIds: [material.data.artifactId], documentIds: [] } } }) as any;
     expect(created.ok).toBe(true);
@@ -42,8 +47,8 @@ it('recovers an interrupted research Run after an actual Host crash without repl
   let failure: unknown, stage = 'configure';
   try {
     expect(await client.request({ type: 'save_settings', settings: {
-      version: 2, revision: 0, profile: { displayName: 'Research crash fixture', theme: 'system' },
-      models: [{ id: 'research-crash', credentialRef: 'research_crash_credential', name: 'Research fixture', kind: 'custom', providerId: null,
+      ...defaultProductSettings(), version: 6, revision: 0, profile: { displayName: 'Research crash fixture', theme: 'system' },
+      models: [{ id: 'research-crash', credentialRef: '00000000000000000000000000000029', name: 'Research fixture', kind: 'custom', providerId: null,
         baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'research-crash', api: 'openai-completions', contextWindow: 64000, maxTokens: 4096, reasoning: false }],
       defaultModelId: 'research-crash', updatedAt: '2026-10-10T00:00:00.000Z' } })).toMatchObject({ ok: true });
     const session = await client.request({ type: 'create_session', input: { title: 'Interrupted research' } }) as any;
@@ -52,7 +57,7 @@ it('recovers an interrupted research Run after an actual Host crash without repl
     expect(task.ok).toBe(true);
     const accepted = await client.request({ type: 'submit_session_input', input: { sessionId: session.data.sessionId, clientSequence: 1,
       mode: 'prompt', goalMode: 'answer', text: 'Plan this research.', modelId: 'research-crash', research: { researchId: task.data.researchId, phase: 'planning', plan: null } },
-      expectedSettingsRevision: 1, expectedCredentialRef: 'research_crash_credential' }) as any;
+      expectedSettingsRevision: 1, expectedCredentialRef: '00000000000000000000000000000029' }) as any;
     expect(accepted.ok).toBe(true); await waitFor(async () => requests === 1);
     stage = 'crash';
     const child = Reflect.get(client, 'child') as ChildProcessWithoutNullStreams;

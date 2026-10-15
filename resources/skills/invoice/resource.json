@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice",
   "version": "v1",
@@ -35,13 +35,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 862,
-      "sha256": "94ef0afdae1abb701c86d49c430783a3cb2725e6400e735eb67991c6e24765d0"
+      "bytes": 862
     },
     {
       "path": "references/field-rules.md",
-      "bytes": 1407,
-      "sha256": "7085bd42480ebac60f9dffa2088459e395d0a620b74e560f1971ea7d2d2b2f5b"
+      "bytes": 1407
     }
   ]
 }

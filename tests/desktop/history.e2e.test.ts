@@ -3,7 +3,6 @@ import { expect, test } from '@playwright/test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, mkdtemp } from '../support/resources.ts';
 
@@ -32,7 +31,7 @@ async function fixture(withQueued = false) {
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     const seed = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
-      const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'history-ui', credentialRef: 'history_ui_controlled_key', name: 'History UI', kind: 'custom', providerId: null,
+      const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'history-ui', credentialRef: '00000000000000000000000000000013', name: 'History UI', kind: 'custom', providerId: null,
         baseUrl, model: 'history-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }], defaultModelId: 'history-ui' }, { modelId: 'history-ui', apiKey: 'synthetic-history-key' });
       if (!settings.ok) throw new Error(settings.error.code);
       const session = await window.flowmate.createSession({ title: 'History original' }); if (!session.ok) throw new Error(session.error.code);
@@ -379,8 +378,7 @@ async function treeFixture() {
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p9-tree-'));
   const script = `
     import { openDatabase } from './packages/core/src/storage/database.ts';
-    import { createHash } from 'node:crypto';
-    import { resolveProductPaths } from '@flowmate/shared';
+        import { resolveProductPaths } from '@flowmate/shared';
     import { SessionManager } from '@earendil-works/pi-coding-agent';
     import { nativeAssistantFacts } from './tests/support/history.ts';
     const need=r=>{if(!r.ok)throw new Error(r.error.code);return r.data;};
@@ -405,11 +403,12 @@ async function treeFixture() {
       const header=SessionManager.inMemory(paths.runtimeDir).getHeader();
       const session=need(db.sessions.create({nativeSessionId:header.id,title:'Complete tree',at,nativeHistory:{storageVersion:1,header,entries,leafId:'branch',unusable:false}}));
       if(db.db.query('PRAGMA foreign_key_check').all().length)throw new Error('FK failure');
-      console.log(JSON.stringify({sessionId:session.sessionId,count:entries.length,entriesHash:createHash('sha256').update(JSON.stringify(db.db.query('SELECT * FROM session_native_entries ORDER BY sequence').all())).digest('hex')}));
+      console.log(JSON.stringify({sessionId:session.sessionId,count:entries.length,entries:db.db.query('SELECT * FROM session_native_entries ORDER BY sequence').all()}));
     } finally {db.close();}
   `;
   const child = spawn('bun', ['--no-env-file', '--eval', script], { cwd: repository, env: environment(), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-  let stdout = '', stderr = ''; child.stdout.on('data', data => { stdout += String(data); }); child.stderr.on('data', data => { stderr += String(data); });
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  let stdout = '', stderr = ''; child.stdout.on('data', data => { stdout += data; }); child.stderr.on('data', data => { stderr += data; });
   child.stdin.end(userData);
   const exit = await new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve); });
   expect(exit, stderr).toBe(0); const seed = JSON.parse(stdout.trim());
@@ -458,7 +457,7 @@ test('P9 T08 browses every branch nine entry types and complete UTF8 text withou
   } catch (error) { failure = error as Error; throw error; }
   finally { await f.app.evaluate(() => Reflect.get(globalThis, 'historyGate')?.restore()).catch(() => {}); await closeDesktopFixture(f.app, f.userData, failure); }
   const db = new Database(join(f.userData, 'data/app.sqlite'), { readonly: true });
-  try { expect(createHash('sha256').update(JSON.stringify(db.query('SELECT * FROM session_native_entries ORDER BY sequence').all())).digest('hex')).toBe(f.seed.entriesHash);
+  try { expect(db.query('SELECT * FROM session_native_entries ORDER BY sequence').all()).toEqual(f.seed.entries);
     expect(db.query('SELECT COUNT(*) count FROM runs').get()).toEqual({ count: 0 }); expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); } finally { db.close(); }
 });
 

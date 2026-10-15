@@ -91,7 +91,7 @@ it.each(['auth', 'length', 'output-limit'] as const)('preserves a real Pi %s fai
   let terminalFacts: Readonly<Record<string, unknown>> | undefined;
   const codes = { auth: 'provider_auth_failed', length: 'provider_incomplete_response', 'output-limit': 'provider_output_limit' };
   try {
-    const result = await service.callProvider(request, { signal: controller.signal, onObservation(event) {
+    const result = await service.callProvider({ ...request, timeoutMs: 10000, stopGraceMs: 500 }, { signal: controller.signal, onObservation(event) {
       if (event.type === 'native_terminal') { terminalFacts = event.data; controller.abort(); }
     } });
     expect(result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: codes[failure] } } });
@@ -116,7 +116,7 @@ it.each(['cancel', 'timeout'] as const)('keeps a prior %s as the main cause when
   } });
   const { service, database } = fixture(provider);
   try {
-    const result = await service.callProvider({ ...request, timeoutMs: 100 }, { signal: controller.signal, onObservation(event) {
+    const result = await service.callProvider({ ...request, timeoutMs: reason === 'cancel' ? 5000 : 100, stopGraceMs: 500 }, { signal: controller.signal, onObservation(event) {
       if (reason === 'cancel' && event.type === 'request_dispatched') controller.abort();
     } });
     expect(result).toMatchObject({ ok: true, data: { error: { code: reason === 'cancel' ? 'provider_cancelled' : 'provider_timeout' } } });

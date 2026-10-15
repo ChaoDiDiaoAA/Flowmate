@@ -1,6 +1,4 @@
 import { expect, test } from 'bun:test';
-import { hash } from '../../src/dataset-loader/local.ts';
-import { createHash } from 'node:crypto';
 import { inspectResearchEvidence } from '../../src/adapters/research-integrity.ts';
 import type { EvidenceFact } from '../../src/types.ts';
 import type { ToolCallSnapshot } from '../../../packages/contracts/src/activity.ts';
@@ -12,7 +10,7 @@ function fixture() {
     const plan = { planId: 10, researchId: 1, revision: 1, runId: 4, toolCallId: 20,
         body: { ...structuredClone(researchPlan), sourcePolicy: policy }, createdAt: at };
     const source = { sourceSnapshotId: 7, researchId: 1, runId: 5, toolCallId: 21, createdAt: at, kind: 'local', address: 'artifact:3', title: 'Synthetic',
-        artifactId: 3, documentId: null, fetchedAt: at, publishedAt: null, contentHash: hash(text), relativePath: 'artifacts/research/1/' + hash(text) + '.txt',
+        artifactId: 3, documentId: null, fetchedAt: at, publishedAt: null,  relativePath: 'artifacts/research/1/source-21.txt',
         bytes: Buffer.byteLength(text), characters: text.length, truncated: false };
     const ref = { researchId: 1, planId: 10, revision: 1, runId: 5, toolCallId: 21, sourceSnapshotId: 7,
         locator: { start: 0, end: text.length, quote: text } };
@@ -41,7 +39,7 @@ function fixture() {
         tool(21, 5, 6, 'read_research_local', { artifactId: 3, documentId: null }, { source, excerpt: ref.locator, usage: { requestId: null, credits: null } }),
         tool(22, 4, 2, 'save_research_claim', claimBody, claim), tool(23, 4, 2, 'save_research_report', reportBody, report)].map(tool => ({ tool })) });
     const runs = fact([{ runId: 4, sessionId: 2, kind: 'agent' }, { runId: 5, sessionId: 6, kind: 'subagent', parentRunId: 4 }]);
-    const registration = fact([{ artifactId: 3, sample: 'synthetic', file: 'policy.md', sha256: createHash('sha256').update(text).digest('hex') }]);
+    const registration = fact([{ artifactId: 3, sample: 'synthetic', file: 'policy.md' }]);
     const input = { prompt: 'Synthetic research', materials: [{ sample: 'synthetic', file: 'policy.md', text }] };
     return { evidence, tools, runs, registration, input, plan, source, claim, report, text };
 }
@@ -75,9 +73,9 @@ test('source identity, declared bytes, quote offsets and surrogate boundaries ar
         [(f: ReturnType<typeof fixture>) => { f.claim.evidence[0]!.ref.locator.quote = '错'.repeat(f.text.length); }, 'reference-quote'],
         [(f: ReturnType<typeof fixture>) => { Object.assign(f.claim.evidence[0]!.ref.locator, { start: 4, end: 5, quote: f.text.slice(4, 5) }); }, 'reference-boundary'],
         [(f: ReturnType<typeof fixture>) => { f.source.address = 'artifact:999'; }, 'source-address'],
-        [(f: ReturnType<typeof fixture>) => { (f.registration.actual as Array<{ sha256: string }>)[0]!.sha256 = 'c'.repeat(64); }, 'source-material'],
+        [(f: ReturnType<typeof fixture>) => { (f.registration.actual as Array<{sample:string}>)[0]!.sample='other'; }, 'source-material'],
         [(f: ReturnType<typeof fixture>) => { f.input.materials[0]!.text = 'changed declared text'; }, 'source-material'],
-        [(f: ReturnType<typeof fixture>) => { f.source.contentHash = 'b'.repeat(64); }, 'source-body']
+        [(f: ReturnType<typeof fixture>) => { (f.evidence.actual as {sourceTexts:Array<{text:string}>}).sourceTexts[0]!.text=f.text.replace('甲','乙'); }, 'source-material']
     ] as const) {
         const f = fixture(); change(f);
         const output = issues(f);
@@ -152,8 +150,8 @@ test('missing identities and explicit collection gaps are unknown, but observed 
     const run = fixture(); run.runs.present = false;
     (run.runs.actual as Array<{ sessionId: number }>)[0]!.sessionId = 999;
     expect(inspect(run)).toMatchObject({ present: false, actual: { valid: false } });
-    const material = fixture(); material.registration.present = false;
-    (material.registration.actual as Array<{ sha256: string }>)[0]!.sha256 = 'd'.repeat(64);
+    const material = fixture(); material.registration.present = false;(material.registration.actual as Array<{sample:string}>)[0]!.sample='different';
+
     expect(inspect(material)).toMatchObject({ present: false, actual: { valid: false, links: [{ valid: false }] } });
 });
 
@@ -173,7 +171,7 @@ test('a report records the complete two-hop claim dependency closure from origin
 
 test('a missing controller body cannot hide source metadata or citation bounds contradicted by acquired declared evidence', () => {
     for (const change of [
-        (f: ReturnType<typeof fixture>) => { f.source.contentHash = 'e'.repeat(64); f.source.relativePath = 'artifacts/research/1/' + f.source.contentHash + '.txt'; },
+        (f: ReturnType<typeof fixture>) => { f.source.truncated=true; },
         (f: ReturnType<typeof fixture>) => { f.source.bytes++; },
         (f: ReturnType<typeof fixture>) => { f.source.characters++; }
     ]) {

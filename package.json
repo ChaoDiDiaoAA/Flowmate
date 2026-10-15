@@ -53,9 +53,5 @@
     "tsx": "4.23.15",
     "typescript": "5.8.3",
     "vite": "7.1.10"
-  },
-  "patchedDependencies": {
-    "@tintinweb/pi-subagents@0.19.0": "patches/@tintinweb%2Fpi-subagents@0.19.0.patch",
-    "@earendil-works/pi-coding-agent@0.85.1": "patches/@earendil-works%2Fpi-coding-agent@0.85.1.patch"
   }
 }

@@ -1,7 +1,6 @@
 import { saveTestHistory, nativeAssistantFacts } from '../../support/history.ts';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { makeApplication } from '../../../packages/core/src/application.ts';
 import { tmpdir } from 'node:os';
@@ -93,7 +92,7 @@ function fixture(withMaterial = false) {
 }
 
 describe('idle Fill prompt input ledger', () => {
-  it('keeps new raw budget intent distinct from resolved defaults and old identity hashes', () => {
+  it('keeps new raw budget intent distinct from resolved defaults and legacy identities', () => {
     const { ledger, createRun, creates } = fixture();
     const { timeoutMs: _timeout, stopGraceMs: _grace, ...raw } = request;
     const admit = () => {
@@ -109,41 +108,49 @@ describe('idle Fill prompt input ledger', () => {
     expect(creates()).toBe(1);
   });
 
-  it('reads an old v2 hash using its original defaulting algorithm without rewriting it', () => {
+  it('reads a saved v2 direct identity using its original defaulting rules without rewriting it', () => {
     const { store, ledger, createRun } = fixture();
     const first = need(ledger.admit(request, createRun, at)).input;
     const { timeoutMs: _timeout, stopGraceMs: _grace, ...raw } = request;
     const oldRequest = need(normalizeSessionInputRequest({ ...raw, timeoutMs: 60_000, stopGraceMs: 5000 }));
-    const hash = createHash('sha256').update(JSON.stringify(oldRequest)).digest('hex');
-    store.db.query('UPDATE session_inputs SET request_hash=? WHERE id=?').run(hash, first.inputId);
+    const identity = JSON.stringify(oldRequest);
+    store.db.query('UPDATE session_inputs SET request_identity_json=? WHERE id=?').run(identity, first.inputId);
     expect(need(ledger.lookup(raw))).toHaveProperty('inputId', first.inputId);
-    expect(store.db.query('SELECT request_hash FROM session_inputs WHERE id=?').get(first.inputId)).toEqual({ request_hash: hash });
+    expect(store.db.query('SELECT request_identity_json FROM session_inputs WHERE id=?').get(first.inputId)).toEqual({ request_identity_json: identity });
+  });
+  it('does not replay a migrated input whose original direct identity is unavailable', () => {
+    const { store, ledger, createRun, creates } = fixture();
+    const first = need(ledger.admit(request, createRun, at)).input;
+    store.db.query('UPDATE session_inputs SET request_identity_json=NULL WHERE id=?').run(first.inputId);
+    expect(ledger.lookup(request)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(ledger.admit(request, createRun, at)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(creates()).toBe(1);
   });
   it('rechecks the trusted Desktop identity in the admission transaction independently of a later config', () => {
     const { store, ledger, createRun, creates } = fixture();
-    const desktopRequestHash = 'a'.repeat(64);
+    const desktopRequestIdentity = JSON.stringify({ text: request.text, clientSequence: request.clientSequence });
     const admission = () => {
       const created = createRun();
-      return created.ok ? ok({ ...created.data, content: { ...created.data.content, desktopRequestHash } }) : created;
+      return created.ok ? ok({ ...created.data, content: { ...created.data.content, desktopRequestIdentity } }) : created;
     };
-    const first = need(ledger.admit(request, admission, at, desktopRequestHash));
+    const first = need(ledger.admit(request, admission, at, desktopRequestIdentity));
     const changedConfig = { ...request, config: { ...request.config, revision: 2 } };
     expect(ledger.lookup(changedConfig)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
-    expect(need(ledger.admit(changedConfig, admission, at, desktopRequestHash)))
+    expect(need(ledger.admit(changedConfig, admission, at, desktopRequestIdentity)))
       .toMatchObject({ created: false, input: { inputId: first.input.inputId, runId: first.input.runId } });
-    expect(ledger.admit(changedConfig, admission, at, 'b'.repeat(64)))
+    expect(ledger.admit(changedConfig, admission, at, JSON.stringify({ text: 'Changed input' })))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
-    expect(ledger.lookup(changedConfig, 'invalid')).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(ledger.lookup(changedConfig, 42 as never)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
     expect(creates()).toBe(1);
     expect(store.db.query('SELECT COUNT(*) AS count FROM session_inputs').get()).toEqual({ count: 1 });
   });
-  it('preserves old Fill hash bytes and rejects a new valid mode or goal as an input conflict', () => {
+  it('preserves saved Fill request bytes and rejects a new valid mode or goal as an input conflict', () => {
     const { store, ledger, createRun } = fixture();
     const input = need(ledger.admit(request, createRun, at)).input;
     const legacyRequest = LegacySessionInputRequestSchema.parse(request);
-    store.db.query('UPDATE session_inputs SET content_json=?,request_hash=? WHERE id=?').run(JSON.stringify({ version: 1,
+    store.db.query('UPDATE session_inputs SET content_json=?,request_identity_json=? WHERE id=?').run(JSON.stringify({ version: 1,
       text: request.text, workspaceContext: workspace, allowedDocumentIds: [1], allowedArtifactIds: [2] }),
-      createHash('sha256').update(JSON.stringify(legacyRequest)).digest('hex'), input.inputId);
+      JSON.stringify(legacyRequest), input.inputId);
     expect(need(ledger.lookup(request))).toMatchObject({ inputId: input.inputId, content: { version: 1 }, resultEntryId: null });
     expect(ledger.lookup({ sessionId: 1, clientSequence: 1, mode: 'steer', runId: input.runId!, text: request.text }))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });

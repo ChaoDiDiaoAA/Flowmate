@@ -146,7 +146,7 @@ describe('P15 research storage, isolated engineering fixtures', () => {
     const runId = run(f, 'researching', plan), toolCallId = call(f, runId, 'read_research_local');
     const source = need(f.store.research.saveSource({ researchId: f.task.researchId, runId, toolCallId,
       source: { kind: 'local', address: 'artifact:1', title: 'Local pricing', artifactId: 1, documentId: null,
-        fetchedAt: at, publishedAt: null, contentHash: 'a'.repeat(64), relativePath: `artifacts/research/${f.task.researchId}/${'a'.repeat(64)}.txt`,
+        fetchedAt: at, publishedAt: null, relativePath: `artifacts/research/${f.task.researchId}/source-${toolCallId}.txt`,
         bytes: 10, characters: 10, truncated: false }, at }));
     expect(source).toMatchObject({ runId, toolCallId, publishedAt: null });
     const ref = { researchId: f.task.researchId, planId: plan.planId, revision: plan.revision, runId, toolCallId,
@@ -200,7 +200,7 @@ describe('P15 research storage, isolated engineering fixtures', () => {
     const before = db.query('SELECT * FROM sessions').all(); db.close();
     const store = need(openDatabase(p)); deferCleanup(() => store.close());
     expect(store.db.query('SELECT * FROM sessions').all()).toEqual(before);
-    expect(store.db.query('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 19 });
+    expect(store.db.query('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 20 });
     expect(need(store.research.list({ limit: 50 })).items).toEqual([]);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });

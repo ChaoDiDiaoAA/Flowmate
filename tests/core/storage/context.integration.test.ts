@@ -1,5 +1,4 @@
 import { saveTestHistory, nativeAssistantFacts } from '../../support/history.ts';
-import { createHash } from 'node:crypto';
 import { describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { z } from 'zod';
@@ -115,10 +114,10 @@ function fixture() {
       const snapshot = need(store.context.appendInTransaction({ runId, sessionId: session.sessionId, jobId, json: json(text), at }));
       const content = { version: 2 as const, text, workspaceContext: null, workspaceInput: null,
         allowedDocumentIds: [], allowedArtifactIds: [], promptText: text };
-      const inserted = store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
+      const inserted = store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,
         context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
         VALUES(?,?,'prompt','answer',?,?,?,?,'queued','pending',?,?)`)
-        .run(session.sessionId, sequence, 'a'.repeat(64), runId, snapshot.id, JSON.stringify(content), at, at);
+        .run(session.sessionId, sequence, '{}', runId, snapshot.id, JSON.stringify(content), at, at);
       return { snapshot, inputId: Number(inserted.lastInsertRowid), content };
     });
   }
@@ -287,8 +286,8 @@ function p9TargetInput(f: ReturnType<typeof fixture>, target: ReturnType<typeof 
     .run(target.sessionId,JSON.stringify(config),at,f.runId).lastInsertRowid);
   const snapshot=need(f.store.runtimeEventStore.withTransaction(()=>f.store.context.appendInTransaction({runId,sessionId:target.sessionId,jobId:null,json:json('target'),at})));
   const content={version:2,text:'target',promptText:'target',workspaceContext:null,workspaceInput:null,allowedDocumentIds:[],allowedArtifactIds:[]};
-  const inputId=Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
-    VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`).run(target.sessionId,'c'.repeat(64),runId,snapshot.id,JSON.stringify(content),at,at).lastInsertRowid);
+  const inputId=Number(db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
+    VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`).run(target.sessionId,'{}',runId,snapshot.id,JSON.stringify(content),at,at).lastInsertRowid);
   const history=need(f.store.memory.load(target.sessionId))!.history;
   need(saveTestHistory(db,f.store.runtimeEventStore,target.sessionId,{...history,entries:[...history.entries,
     {type:'message',id:'target-user',parentId:history.leafId,timestamp:at,message:{role:'user',content:'target',timestamp:4}}],leafId:'target-user'},
@@ -454,7 +453,7 @@ function p9ReadFixture(appendAnswer=true) {
       parameters:{maxRetries:0,maxRetryDelayMs:100}}};
   const normalized=need(normalizeSessionInputRequest(request));
   db.query('UPDATE runs SET scope_json=? WHERE id=?').run(JSON.stringify({version:2,allowedTools:['read_fixture'],allowedDocumentIds:[],allowedArtifactIds:[],allowedResourcePaths:[]}),local.runId);
-  db.query('UPDATE session_inputs SET request_hash=? WHERE id=?').run(createHash('sha256').update(JSON.stringify({...normalized,timeoutMs:60000,stopGraceMs:5000})).digest('hex'),local.inputId);
+  db.query('UPDATE session_inputs SET request_identity_json=? WHERE id=?').run(JSON.stringify({...normalized,timeoutMs:60000,stopGraceMs:5000}),local.inputId);
   const toolRequest={sessionId:target.sessionId,runId:local.runId,nativeToolCallId:'local-call',toolName:'read_fixture',toolVersion:'1',effect:'READ' as const,
     rawArguments:{},context:{snapshotId:local.snapshot.id,requestSequence:1},requestedAt:at};
   const call=need(f.store.toolCalls.request(toolRequest));
@@ -696,14 +695,14 @@ describe('P8 Context storage', () => {
     f.store.db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(JSON.stringify({ version: 1, requests: [], resources: emptyResourceJournal() }), f.runId);
     const input = f.append(); f.consume(input.inputId, input.content.promptText);
     need(f.store.context.bindRequest({ binding: f.binding(input.inputId, input.snapshot.id), api: 'openai-responses', at, transport: 'observed-fetch' }));
-    const value = { purpose: 'answer' as const, callSequence: 1, compactionOperationId: null, bundleHash: null,
-      referencedBundleHashes: [], systemPromptHash: createHash('sha256').update('fixture').digest('hex'),
+    const value = { purpose: 'answer' as const, callSequence: 1, compactionOperationId: null, bundleId: null,
+      referencedBundleIds: [], systemPrompt: 'fixture',
       inputIds: [input.inputId], toolCallIds: [], contentChecks: [], at };
     expect(writer(value, owner)).toEqual(ok(undefined));
     expect(writer({ ...value, at: later }, owner)).toEqual(ok(undefined));
     expect(reader(owner)).toMatchObject({ ok: true, data: { requests: [{ ...value, at }] } });
     const before = f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId);
-    expect(writer({ ...value, systemPromptHash: 'b'.repeat(64) }, owner)).toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
+    expect(writer({ ...value, systemPrompt: 'Other prompt' }, owner)).toMatchObject({ ok: false, error: { code: 'resource_evidence_conflict' } });
     expect(writer(value, { ...owner, sessionId: owner.sessionId + 1 }).ok).toBe(false);
     expect(writer({ ...value, inputIds: [input.inputId + 1] }, owner).ok).toBe(false);
     expect(f.store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(f.runId)).toEqual(before);
@@ -719,11 +718,11 @@ describe('P8 Context storage', () => {
   it('migrates real 014 without rewriting legacy evidence and installs all guards', () => {
     const productPaths = paths(), old = schema14(productPaths);
     seedOldInputs(old);
-    const before = old.query('SELECT content_json,request_hash FROM session_inputs ORDER BY id').all();
+    const before = old.query('SELECT content_json FROM session_inputs ORDER BY id').all();
     old.close();
     const migrated = need(openTestDatabase(productPaths));
-    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
-    expect(migrated.db.query('SELECT content_json,request_hash FROM session_inputs ORDER BY id').all()).toEqual(before);
+    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(migrated.db.query('SELECT content_json FROM session_inputs ORDER BY id').all()).toEqual(before);
     expect(migrated.db.query('SELECT current_context_snapshot_id,context_observations_json FROM runs').all())
       .toEqual([{ current_context_snapshot_id: null, context_observations_json: null }]);
     expect(migrated.db.query("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'context_%'").all()).toHaveLength(13);
@@ -805,9 +804,9 @@ describe('P8 Context storage', () => {
     expect(need(f.store.runs.get(f.runId)).currentContextSnapshotId).toBe(saved.snapshot.id);
     expect(() => f.store.db.exec('UPDATE context_snapshots SET created_at=created_at')).toThrow('context_snapshot_immutable');
     expect(() => f.store.db.exec('UPDATE session_inputs SET context_snapshot_id=NULL')).toThrow('context_binding_immutable');
-    expect(() => f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
+    expect(() => f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,
       context_snapshot_id,content_json,created_at,updated_at) VALUES(?,2,'steer','answer',?,?,?,'{}',?,?)`)
-      .run(f.session.sessionId,'b'.repeat(64),f.runId,saved.snapshot.id,at,at)).toThrow();
+      .run(f.session.sessionId,'{}',f.runId,saved.snapshot.id,at,at)).toThrow();
   });
   it.each(['input','event'] as const)('rolls the complete admission back after a later %s rejection', kind => {
     const f=fixture();
@@ -932,8 +931,8 @@ describe('P8 Context storage', () => {
     const snapshot=Number(f.store.db.query('INSERT INTO context_snapshots(run_id,session_id,job_id,sequence,snapshot_json,created_at) VALUES(?,?,NULL,1,?,?)')
       .run(old,f.session.sessionId,JSON.stringify(json()),at).lastInsertRowid);
     const content={version:2,text:json().text,workspaceContext:null,workspaceInput:null,allowedDocumentIds:[],allowedArtifactIds:[],promptText:json().text};
-    const input=Number(f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
-      VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`).run(f.session.sessionId,'a'.repeat(64),old,snapshot,JSON.stringify(content),at,at).lastInsertRowid);
+    const input=Number(f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,context_snapshot_id,content_json,status,processing_status,created_at,updated_at)
+      VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`).run(f.session.sessionId,'{}',old,snapshot,JSON.stringify(content),at,at).lastInsertRowid);
     expect(f.store.sessionInputs.get(input).ok).toBe(false);
     expect(f.store.context.queryContextSnapshot({sessionId:f.session.sessionId,runId:old,snapshotId:snapshot}))
       .toMatchObject({ok:false,error:{code:'storage_corrupt'}});
@@ -953,8 +952,8 @@ describe('P8 Context storage', () => {
     if(scenario==='foreign-user') {
       const other=need(f.store.sessions.create({nativeSessionId:'foreign-source',title:'Other',at}));
       const otherRun=legacyRun(f,other.nativeSessionId,other.sessionId);
-      const otherInput=Number(f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,content_json,status,processing_status,created_at,updated_at)
-        VALUES(?,1,'prompt','answer',?,?,?,'queued','pending',?,?)`).run(other.sessionId,'b'.repeat(64),otherRun,JSON.stringify(saved.content),at,at).lastInsertRowid);
+      const otherInput=Number(f.store.db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,content_json,status,processing_status,created_at,updated_at)
+        VALUES(?,1,'prompt','answer',?,?,?,'queued','pending',?,?)`).run(other.sessionId,'{}',otherRun,JSON.stringify(saved.content),at,at).lastInsertRowid);
       const history:NativeSessionHistory={storageVersion:1,header:{type:'session',version:3,id:other.nativeSessionId,timestamp:at,cwd:f.productPaths.root},
         entries:[{type:'message',id:'foreign-user',parentId:null,timestamp:at,message:{role:'user',content:saved.content.text,timestamp:1}}],leafId:'foreign-user',unusable:false};
       need(saveTestHistory(f.store.db, f.store.runtimeEventStore, other.sessionId,history,{runId:otherRun,inputId:otherInput,entryId:'foreign-user'}));

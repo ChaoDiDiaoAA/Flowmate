@@ -48,7 +48,7 @@ it('[F12-02/03/19] shares the Host settings CAS between Extensions and Resources
     const state = await client.request({ type: 'get_state' }) as Result<{ settings: unknown }>;
     if (!state.ok) throw new Error(state.error.code);
     expect(await client.request({ type: 'save_settings', settings: { ...state.data.settings as object,
-      extensions: { enabledExtensions: [{ ...selection.enabledExtensions[0], manifestHash: 'b'.repeat(64) }] } } }))
+      extensions: { enabledExtensions: [{ ...selection.enabledExtensions[0], version: 'missing-version' }] } } }))
       .toMatchObject({ ok: false, error: { code: 'extension_config_invalid' } });
     expect(readFileSync(join(root, 'data/settings.json'), 'utf8')).toBe(before);
     const resource = await client.request({ type: 'update_resource_selection', input: { expectedRevision: 2,

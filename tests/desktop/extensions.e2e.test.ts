@@ -63,7 +63,7 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
     let page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     const saved = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p12-ui', credentialRef: 'p12_ui_synthetic', name: 'P12 UI',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p12-ui', credentialRef: '00000000000000000000000000000012', name: 'P12 UI',
         kind: 'custom', providerId: null, baseUrl, model: 'p12-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }],
         defaultModelId: 'p12-ui' }, { modelId: 'p12-ui', apiKey: 'synthetic-p12-ui-key' });
     }, `http://127.0.0.1:${provider.port}/v1`); expect(saved.ok).toBe(true);

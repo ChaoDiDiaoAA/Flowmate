@@ -2,6 +2,12 @@ import { z } from 'zod';
 import { AppErrorSchema } from './runtime.ts';
 import type { Result } from './runtime.ts';
 
+export type ManagedFileOwner = { ownerKind: string; ownerId: string; relativePath: string };
+export type ManagedFileContents = {
+  read(owner: ManagedFileOwner): Uint8Array | null;
+  remember(owner: ManagedFileOwner, content: Uint8Array): void;
+};
+
 export const RESOURCE_LIMITS = {
   packages: 64, files: 64, packageBytes: 4 * 1024 * 1024, manifestBytes: 65536,
   bodyBytes: 65536, fileBytes: 512 * 1024, indexBytes: 16384, pageBytes: 16384,
@@ -14,7 +20,8 @@ export type ResourceErrorCode = typeof RESOURCE_ERROR_CODES[number];
 
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const id = integer.positive();
-const hash = z.string().regex(/^[a-f0-9]{64}$/);
+const bundleIdentity = z.string().uuid();
+const contentText = z.string().refine(value => new TextEncoder().encode(value).length <= RESOURCE_LIMITS.fileBytes);
 const opaque = z.string().min(1).max(256);
 const time = z.string().datetime({ offset: true });
 const code = z.string().min(1).max(128);
@@ -28,22 +35,22 @@ export const ResourceIdSchema = z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/).refin
 export const ResourceFilePathSchema = z.string().min(1).max(4096).refine(value =>
   value.split('/').every(part => part.length > 0 && safeSegment(part)), 'Resource paths must be relative, unaliased file paths.');
 export const ResourceRefSchema = z.object({ kind: z.enum(['prompt', 'skill']), id: ResourceIdSchema,
-  version: ResourceIdSchema, contentHash: hash }).strict().readonly();
+  version: ResourceIdSchema }).strict().readonly();
 export type ResourceRef = z.infer<typeof ResourceRefSchema>;
 const skillRef = ResourceRefSchema.refine(value => value.kind === 'skill', 'Expected a Skill reference.');
 const promptRef = ResourceRefSchema.refine(value => value.kind === 'prompt', 'Expected a Prompt reference.');
 export function resourceRefKey(ref: ResourceRef): string {
-  return JSON.stringify([ref.kind, ref.id, ref.version, ref.contentHash]);
+  return JSON.stringify([ref.kind, ref.id, ref.version]);
 }
 export const ResourceDependencySchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('tool'), name: z.string().min(1).max(128) }).strict(),
-  z.object({ kind: z.literal('skill'), id: ResourceIdSchema, version: ResourceIdSchema, contentHash: hash }).strict(),
+  z.object({ kind: z.literal('skill'), id: ResourceIdSchema, version: ResourceIdSchema }).strict(),
   z.object({ kind: z.literal('extension'), id: ResourceIdSchema, version: ResourceIdSchema }).strict(),
 ]);
 export type ResourceDependency = z.infer<typeof ResourceDependencySchema>;
-const manifestFileShape = { path: ResourceFilePathSchema, bytes: integer.max(RESOURCE_LIMITS.fileBytes), sha256: hash };
+const manifestFileShape = { path: ResourceFilePathSchema, bytes: integer.max(RESOURCE_LIMITS.fileBytes) };
 const manifestFile = z.object(manifestFileShape).strict().readonly();
-export const ResourceManifestSchema = z.object({ schemaVersion: z.literal(1), kind: z.enum(['prompt', 'skill']),
+export const ResourceManifestSchema = z.object({ schemaVersion: z.literal(2), kind: z.enum(['prompt', 'skill']),
   id: ResourceIdSchema, version: ResourceIdSchema, bodyFile: z.enum(['prompt.md', 'SKILL.md']),
   keywords: z.array(z.string().min(1).max(RESOURCE_LIMITS.keywordChars)).max(RESOURCE_LIMITS.keywords).readonly(),
   requires: z.array(ResourceDependencySchema).max(RESOURCE_LIMITS.dependencies).readonly(),
@@ -61,7 +68,7 @@ export const ResourceManifestSchema = z.object({ schemaVersion: z.literal(1), ki
 export type ResourceManifest = z.infer<typeof ResourceManifestSchema>;
 function dependencyKey(value: ResourceDependency): string {
   return JSON.stringify(value.kind === 'tool' ? ['tool', value.name] : value.kind === 'skill'
-    ? ['skill', value.id, value.version, value.contentHash] : ['extension', value.id, value.version]);
+    ? ['skill', value.id, value.version] : ['extension', value.id, value.version]);
 }
 export function canonicalResourceManifest(value: ResourceManifest): string {
   const manifest = ResourceManifestSchema.parse(value);
@@ -78,15 +85,15 @@ export const ResourceSelectionSchema = z.object({ prompt: promptRef.nullable(),
 }).readonly();
 export type ResourceSelection = z.infer<typeof ResourceSelectionSchema>;
 export const EMPTY_RESOURCE_SELECTION: ResourceSelection = Object.freeze({ prompt: null, enabledSkills: Object.freeze([]) });
-export const ResourceBindingSchema = z.object({ bundleHash: hash, requiredSkill: skillRef.nullable() }).strict().readonly();
+export const ResourceBindingSchema = z.object({ bundleId: bundleIdentity, requiredSkill: skillRef.nullable() }).strict().readonly();
 export type ResourceBinding = z.infer<typeof ResourceBindingSchema>;
 export const SkillIndexEntrySchema = z.object({ ref: skillRef, description: z.string().max(160),
   checks: z.array(z.object({ dependency: ResourceDependencySchema, available: z.boolean(), reason: z.string().max(2048).nullable() }).strict())
     .max(RESOURCE_LIMITS.dependencies).readonly(), diagnostic: z.string().max(2048).nullable() }).strict().readonly();
 export type SkillIndexEntry = z.infer<typeof SkillIndexEntrySchema>;
-export const SkillIndexSnapshotSchema = z.object({ entries: z.array(SkillIndexEntrySchema).max(RESOURCE_LIMITS.packages).readonly(), hash }).strict().readonly();
-export const FrozenResourcesSchema = z.object({ version: z.literal(1), policyVersion: z.literal('p11-resources-v1'),
-  settingsRevision: integer, bundleHash: hash, bundleDirectory: z.string().min(1).max(8192)
+export const SkillIndexSnapshotSchema = z.object({ entries: z.array(SkillIndexEntrySchema).max(RESOURCE_LIMITS.packages).readonly() }).strict().readonly();
+export const FrozenResourcesSchema = z.object({ version: z.literal(2), policyVersion: z.literal('p11-resources-v1'),
+  settingsRevision: integer, bundleId: bundleIdentity, bundleDirectory: z.string().min(1).max(8192)
     .refine(value => !/[\x00-\x1f\x7f]/.test(value) && /^(?:[a-z]:[\\/]|\/|\\\\)/i.test(value)), prompt: promptRef.nullable(),
   manifests: z.array(z.object({ ref: ResourceRefSchema, manifest: ResourceManifestSchema }).strict().readonly()).max(RESOURCE_LIMITS.packages).readonly(),
   selectedSkills: z.array(skillRef).max(RESOURCE_LIMITS.packages).readonly(),
@@ -99,7 +106,7 @@ export const FrozenResourcesSchema = z.object({ version: z.literal(1), policyVer
   if (!unique(value.selectedSkills.map(ref => ref.id)) || !unique(partition) || selected.length !== partition.length
     || partition.some(key => !selected.includes(key))) report(context, 'Discovered and excluded Skills must exactly partition selected versions.');
   if (selected.length + Number(value.prompt !== null) > RESOURCE_LIMITS.packages) report(context, 'Too many selected resource packages.');
-  if (!value.bundleDirectory.replaceAll('\\', '/').endsWith('/' + value.bundleHash)) report(context, 'Frozen content location must identify its bundle.');
+  if (!value.bundleDirectory.replaceAll('\\', '/').endsWith('/' + value.bundleId)) report(context, 'Frozen content location must identify its bundle.');
   const included = [...(value.prompt ? [value.prompt] : []), ...value.discoveredSkills].map(resourceRefKey);
   if (value.skillIndex && (value.skillIndex.entries.length !== selected.length
     || !unique(value.skillIndex.entries.map(entry => resourceRefKey(entry.ref)))
@@ -111,18 +118,19 @@ export const FrozenResourcesSchema = z.object({ version: z.literal(1), policyVer
 }).readonly();
 export type FrozenResources = z.infer<typeof FrozenResourcesSchema>;
 export function matchesResourceBinding(frozen: FrozenResources | null, binding: ResourceBinding | undefined): boolean {
-  return frozen === null ? binding === undefined : binding !== undefined && binding.bundleHash === frozen.bundleHash
+  return frozen === null ? binding === undefined : binding !== undefined && binding.bundleId === frozen.bundleId
     && (binding.requiredSkill === null || frozen.discoveredSkills.some(ref => resourceRefKey(ref) === resourceRefKey(binding.requiredSkill!)));
 }
-export const ResourceBundleManifestSchema = z.object({ version: z.literal(1), bundleHash: hash,
+export const ResourceBundleManifestSchema = z.object({ version: z.literal(2), bundleId: bundleIdentity,
+  skillIndex: SkillIndexSnapshotSchema.optional(),
   resources: z.array(z.object({ ref: ResourceRefSchema, manifest: ResourceManifestSchema }).strict().readonly()).max(RESOURCE_LIMITS.packages).readonly(),
   files: z.array(z.object({ ref: ResourceRefSchema, ...manifestFileShape }).strict().readonly())
     .max(RESOURCE_LIMITS.packages * RESOURCE_LIMITS.files).readonly(),
 }).strict().superRefine((value, context) => {
   if (!unique(value.resources.map(item => resourceRefKey(item.ref)))
     || !unique(value.resources.map(item => JSON.stringify([item.ref.kind, item.ref.id])))) report(context, 'Bundle versions must be unique.');
-  const files = value.resources.flatMap(item => item.manifest.files.map(file => JSON.stringify([resourceRefKey(item.ref), file.path.toLowerCase(), file.bytes, file.sha256])));
-  const index = value.files.map(file => JSON.stringify([resourceRefKey(file.ref), file.path.toLowerCase(), file.bytes, file.sha256]));
+  const files = value.resources.flatMap(item => item.manifest.files.map(file => JSON.stringify([resourceRefKey(item.ref), file.path.toLowerCase(), file.bytes])));
+  const index = value.files.map(file => JSON.stringify([resourceRefKey(file.ref), file.path.toLowerCase(), file.bytes]));
   if (!unique(index) || files.length !== index.length || index.some(file => !files.includes(file))) report(context, 'Bundle file index must match its manifests.');
   if (value.resources.some(item => item.ref.kind !== item.manifest.kind || item.ref.id !== item.manifest.id
     || item.ref.version !== item.manifest.version)) report(context, 'Bundle metadata must match each resource reference.');
@@ -154,7 +162,7 @@ export type ResourceCatalog = z.infer<typeof ResourceCatalogSchema>;
 export const ResourceFileRequestSchema = z.object({ ref: ResourceRefSchema, path: ResourceFilePathSchema,
   offset: integer.optional(), limit: integer.min(4).max(RESOURCE_LIMITS.pageBytes).optional() }).strict();
 export type ResourceFileRequest = z.infer<typeof ResourceFileRequestSchema>;
-export const ResourceFilePageSchema = z.object({ ref: ResourceRefSchema, path: ResourceFilePathSchema, sha256: hash,
+export const ResourceFilePageSchema = z.object({ ref: ResourceRefSchema, path: ResourceFilePathSchema,
   offset: integer, text: z.string().refine(value => new TextEncoder().encode(value).length <= RESOURCE_LIMITS.pageBytes),
   nextOffset: integer.nullable(), totalBytes: integer.max(RESOURCE_LIMITS.fileBytes),
 }).strict().superRefine((value, context) => {
@@ -168,11 +176,11 @@ export type ListSkillResourcesInput = z.infer<typeof ListSkillResourcesInputSche
 export const ReadSkillResourceInputSchema = z.object({ skill: ResourceIdSchema, path: ResourceFilePathSchema,
   offset: integer.optional(), limit: integer.min(4).max(RESOURCE_LIMITS.pageBytes).optional() }).strict();
 export type ReadSkillResourceInput = z.infer<typeof ReadSkillResourceInputSchema>;
-export const ListSkillResourcesOutputSchema = z.object({ ref: skillRef, bundleHash: hash,
+export const ListSkillResourcesOutputSchema = z.object({ ref: skillRef, bundleId: bundleIdentity,
   files: z.array(manifestFile).min(1).max(RESOURCE_LIMITS.files).readonly() }).strict().refine(value =>
     unique(value.files.map(file => file.path.toLowerCase())), 'Listed files must be unique.').readonly();
 export type ListSkillResourcesOutput = z.infer<typeof ListSkillResourcesOutputSchema>;
-export const ReadSkillResourceOutputSchema = ResourceFilePageSchema.unwrap().innerType().extend({ ref: skillRef, bundleHash: hash })
+export const ReadSkillResourceOutputSchema = ResourceFilePageSchema.unwrap().innerType().extend({ ref: skillRef, bundleId: bundleIdentity })
   .strict().superRefine((value, context) => {
     if (value.offset > value.totalBytes || value.nextOffset !== null
       && (value.nextOffset <= value.offset || value.nextOffset >= value.totalBytes)) report(context, 'Page offsets must make bounded progress.');
@@ -187,23 +195,23 @@ export type RunResourceQuery = z.infer<typeof RunResourceQuerySchema>;
 export const RunResourceFileRequestSchema = RunResourceQuerySchema.extend(ResourceFileRequestSchema.shape).strict();
 export type RunResourceFileRequest = z.infer<typeof RunResourceFileRequestSchema>;
 export const ResourceExpansionEvidenceSchema = z.object({ inputId: id, nativeEntryId: opaque, skill: skillRef,
-  bundleHash: hash, expandedTextHash: hash, at: time }).strict().readonly();
+  bundleId: bundleIdentity, expandedText: contentText, at: time }).strict().readonly();
 export type ResourceExpansionEvidence = z.infer<typeof ResourceExpansionEvidenceSchema>;
 export const ResourceReadEvidenceSchema = z.object({ toolCallId: id, nativeToolCallId: opaque, requestSequence: id,
-  ref: ResourceRefSchema, bundleHash: hash, path: ResourceFilePathSchema, fileHash: hash, deliveredHash: hash,
+  ref: ResourceRefSchema, bundleId: bundleIdentity, path: ResourceFilePathSchema, deliveredContent: contentText,
   operation: z.enum(['read', 'grep', 'find', 'ls', 'list_skill_resources', 'read_skill_resource']), fullBody: z.boolean().nullable(), nativeEntryId: opaque.nullable(), at: time,
 }).strict().refine(value => value.fullBody !== true || value.operation === 'read' || value.operation === 'read_skill_resource', 'Only actual read can prove a full body.').readonly();
 export type ResourceReadEvidence = z.infer<typeof ResourceReadEvidenceSchema>;
 export const ResourceContentEvidenceSchema = z.object({ ref: ResourceRefSchema, nativeEntryId: opaque.nullable(),
   path: ResourceFilePathSchema.nullable(), scope: z.enum(['business-prompt', 'skill-index', 'skill-readiness', 'expanded-body', 'tool-output', 'derived-source']),
-  expectedTextHash: hash.nullable(), sdkInclusion: z.enum(['confirmed', 'not-included', 'unknown']),
+  expectedText: contentText.nullable(), sdkInclusion: z.enum(['confirmed', 'not-included', 'unknown']),
   wireInclusion: z.enum(['confirmed', 'not-included', 'unknown']), reason: z.string().min(1).max(256).nullable(),
 }).strict().superRefine((value, context) => {
-  if (value.expectedTextHash === null && (value.sdkInclusion === 'confirmed' || value.wireInclusion === 'confirmed'))
+  if (value.expectedText === null && (value.sdkInclusion === 'confirmed' || value.wireInclusion === 'confirmed'))
     report(context, 'Confirmed inclusion requires observable content, not only source provenance.');
   if ((value.sdkInclusion === 'unknown' || value.wireInclusion === 'unknown') && value.reason === null)
     report(context, 'Unknown inclusion must state its evidence boundary.');
-  if (value.scope === 'derived-source' && (value.expectedTextHash !== null || value.sdkInclusion !== 'unknown'
+  if (value.scope === 'derived-source' && (value.expectedText !== null || value.sdkInclusion !== 'unknown'
     || value.wireInclusion !== 'unknown' || value.nativeEntryId === null || value.reason !== 'derived-source-only'))
     report(context, 'Derived provenance requires its original summary identity and makes no content inclusion claim.');
   if (value.scope === 'business-prompt' && value.ref.kind !== 'prompt'
@@ -226,13 +234,13 @@ export function resourceContentKey(value: Pick<ResourceContentEvidence, 'ref' | 
   return JSON.stringify([resourceRefKey(value.ref), value.scope, value.nativeEntryId, value.path]);
 }
 export const ResourceRequestEvidenceSchema = z.object({ purpose: z.enum(['answer', 'compaction']), callSequence: id,
-  compactionOperationId: opaque.nullable(), bundleHash: hash.nullable(), referencedBundleHashes: z.array(hash).max(512).readonly(),
-  systemPromptHash: hash, inputIds: z.array(id).max(512).readonly(), toolCallIds: z.array(id).max(512).readonly(),
+  compactionOperationId: opaque.nullable(), bundleId: bundleIdentity.nullable(), referencedBundleIds: z.array(bundleIdentity).max(512).readonly(),
+  systemPrompt: contentText, inputIds: z.array(id).max(512).readonly(), toolCallIds: z.array(id).max(512).readonly(),
   contentChecks: z.array(ResourceContentEvidenceSchema).max(RESOURCE_LIMITS.contentChecks).readonly(), at: time,
 }).strict().superRefine((value, context) => {
   if ((value.purpose === 'compaction') !== (value.compactionOperationId !== null)
-    || value.purpose === 'compaction' && value.bundleHash !== null) report(context, 'Summary evidence needs its original operation and an independent system prompt.');
-  if (!unique(value.contentChecks.map(resourceContentKey)) || !unique(value.referencedBundleHashes)
+    || value.purpose === 'compaction' && value.bundleId !== null) report(context, 'Summary evidence needs its original operation and an independent system prompt.');
+  if (!unique(value.contentChecks.map(resourceContentKey)) || !unique(value.referencedBundleIds)
     || !unique(value.inputIds.map(String)) || !unique(value.toolCallIds.map(String))) report(context, 'Request evidence identities must be unique.');
 }).readonly();
 export type ResourceRequestEvidence = z.infer<typeof ResourceRequestEvidenceSchema>;

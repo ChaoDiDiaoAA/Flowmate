@@ -1,3 +1,4 @@
+import { InvoiceExportReadRequestSchema,InvoiceExportPageSchema } from '../../../packages/contracts/src/invoice.ts';
 import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -20,7 +21,6 @@ import { ResearchMaterialSchema, ResearchTaskSchema, ResearchPlanSchema, Researc
 import { ContextRequestsPageSchema, ContextSnapshotDetailSchema } from '../../../packages/contracts/src/context.ts';
 import { RuntimeEventsReadResultSchema, RuntimeToolPageSchema } from '../../../packages/contracts/src/events.ts';
 import { RunResourceViewSchema } from '../../../packages/contracts/src/resources.ts';
-import { hash } from '../dataset-loader/local.ts';
 import { historyStepSchema, invoiceStepSchema, interactionProfileSchema, futureSteerInputSchema, userHistorySeedSchema, parentCancelControllerSchema } from '../dataset-loader/schema.ts';
 import type { AgentTrial, AgentTrialSession } from './agent.ts';
 import type { CaseExecutionResult, EvidenceFact } from '../types.ts';
@@ -56,7 +56,7 @@ const runSchema = z.object({ runId: id, sessionId: id, kind: z.enum(['agent', 's
     output: z.record(z.unknown()).nullable(), error: AppErrorSchema.nullable(), cleanup: z.record(z.unknown()), tokens: TokenColumnsSchema }).passthrough();
 type Command = Parameters<HostClient['request']>[0];
 type InputCommand = Extract<Command, { type: 'submit_session_input' }>;
-type StepReceipt = { stepId: string; turnId?: string; submittedText?: string; action: string; clientSequence: number; requestHash: string; result: unknown };
+type StepReceipt = { stepId: string; turnId?: string; submittedText?: string; action: string; clientSequence: number; requestContent: string; result: unknown };
 
 async function backward<T>(page: (before?: number) => Promise<{ items: readonly T[]; next: number | null }>, identity: (item: T) => number) {
     const items: T[] = [];
@@ -82,7 +82,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     const isInvoice = trial.requires.includes('invoice');
     const extensionProfile = trial.setup && 'extensionProfile' in trial.setup ? ExtensionEvaluationProfileSchema.parse(trial.setup.extensionProfile) : undefined;
     const interactionProfile=trial.setup&&'interactionProfile'in trial.setup?interactionProfileSchema.parse(trial.setup.interactionProfile):undefined;
-    if(!!interactionProfile!==!!trial.controllerInput||interactionProfile&&(!isInvoice||hash(trial.controllerInput!.profile)!==hash(interactionProfile)||hash(trial.controllerInput!.payload)!==trial.controllerInput!.sha256))
+    if(!!interactionProfile!==!!trial.controllerInput||interactionProfile&&(!isInvoice||!isDeepStrictEqual(trial.controllerInput!.profile,interactionProfile)))
         throw new Error('Declared later user input differs from its trusted controller profile');
     const futureSteer=interactionProfile?.id==='invoice-currency-steer'?futureSteerInputSchema.parse(JSON.parse(trial.controllerInput!.payload)):undefined;
     if(futureSteer && userTurn(trial.turns,futureSteer.turnId).mode!==futureSteer.mode)throw new Error('Live user turn mode differs from its controller trigger');
@@ -147,13 +147,14 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     const extensions = ExtensionSelectionSchema.parse(config.extensions ?? EMPTY_EXTENSION_SELECTION);
     if (trial.requires.includes('subagent') && !extensions.enabledExtensions.some(ref => ref.id === 'subagents'))
         throw new Error('Required subagents extension must be selected before Trial preparation');
-    if(parentCancel&&!extensions.enabledExtensions.some(ref=>hash(ref)===hash(parentCancel.extensionRef)))throw new Error('Parent cancellation requires the declared trusted subagents extension');
+    if(parentCancel&&!extensions.enabledExtensions.some(ref=>isDeepStrictEqual(ref,parentCancel.extensionRef)))throw new Error('Parent cancellation requires the declared trusted subagents extension');
     if (extensionProfile && !extensions.enabledExtensions.some(ref => ref.id === 'invoice-assist')) throw new Error('Evaluation Hook profile requires the selected trusted invoice extension');
     signal.throwIfAborted();
     registerSecrets([options.credential]);
     const local = prepareLocalHost(options.repo, trial.directory, invoices, extensionProfile, caseFaultProfile, selectedResources);
     const { productRoot, invoiceSourceRoot, launch } = local;
-    const client = new HostClient(), modelId = 'eval-agent', credentialRef = 'eval_agent_credential';
+    const client = new HostClient(), modelId = 'eval-agent', credentialRef = randomUUID().replaceAll('-','');
+    let settingsRevision=0;
     let controls: ElectronInvoiceControls | undefined;
     const formApplications: Array<Record<string, unknown>> = [];
     client.setCredentialHandler(async () => ({ ok: true, credential: { type: 'api_key', key: options.credential } }));
@@ -165,18 +166,19 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 throw new Error(command.type + ': ' + (error instanceof Error ? error.message : String(error)), { cause: error });
             }));
         if (preparing) signal.throwIfAborted();
-        if (!result.ok) throw new Error(command.type + ': ' + result.error.code);
+        if (!result.ok) throw new Error(command.type + ': ' + result.error.code + ': ' + result.error.message);
         return schema.parse(result.data);
     }
     let sessionId: number, researchId: number | undefined;
     let autoInitial:z.infer<typeof SessionCompactionSnapshotSchema>|undefined;
     const autoSnapshots:Array<z.infer<typeof SessionCompactionSnapshotSchema>>=[];
-    const registration: Array<{ sample: string; file: string; sha256: string; artifactId: number }> = [];
-    const invoiceRegistration: Array<{ sample: string; files: Array<{ name: string; sha256: string }>; document: z.infer<typeof documentSchema> }> = [];
+    const registration: Array<{ sample: string; file: string; artifactId: number }> = [];
+    const invoiceRegistration: Array<{ sample: string; files: Array<{ name: string }>; document: z.infer<typeof documentSchema> }> = [];
     const invoiceJobs = new Map<number, { sample: string; sessionId: number; documentRef: z.infer<typeof DocumentRefSchema> }>();
     const invoiceOperations: Array<Record<string, unknown>> = [], requiredCandidateRuns = new Set<number>();
     let originalSelectionCandidateId: number | undefined;
     const humanCandidates = new Map<number, number>(), invoiceExports: Array<z.infer<typeof invoiceExportSchema>> = [];
+    const invoiceExportContents=new Map<number,Buffer>();
     const editedCandidates = new Map<string, { jobId: number; candidateId: number; sequence: number }>();
     async function invoiceWorkspace(sample: string, goal: string, mode: 'start-task' | 'selected-document' | 'new-session' = 'start-task', stepId?: string) {
         const document = invoiceRegistration.find(m => m.sample === sample)?.document;
@@ -199,12 +201,12 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const select = { type: 'update_workspace' as const, input: { expectedRevision: workspace.revision,
                 change: { kind: 'session' as const, sessionId } } };
             workspace = await query(select, WorkspaceSnapshotSchema);
-            if (hash({ ...before, sessionId, revision: workspace.revision, updatedAt: workspace.updatedAt }) !== hash(workspace))
+            if (!isDeepStrictEqual({ ...before, sessionId, revision: workspace.revision, updatedAt: workspace.updatedAt },workspace))
                 throw new Error('New Session changed the selected invoice or business state');
             invoiceOperations.push({ stepId, mode, command, select, before, result: workspace });
         }
         if (mode !== 'start-task') {
-            if (workspace.sessionId !== sessionId || hash(workspace.documentRef) !== hash(document.documentRef))
+            if (workspace.sessionId !== sessionId || !isDeepStrictEqual(workspace.documentRef,document.documentRef))
                 throw new Error('Invoice browsing lost its selected Workspace');
             const { revision, documentRef, jobId, candidateRef } = workspace;
             invoiceOperations.push({ stepId, mode: 'selected-document', result: workspace });
@@ -216,17 +218,17 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const command = { type: 'start_task' as const, input: { clientSequence: workspace.nextTaskSequence,
                 expectedRevision: workspace.revision, documentRef: document.documentRef, goal } };
             const result = await query(command, z.object({ job: jobSchema, workspace: WorkspaceSnapshotSchema }).strict());
-            if (hash(result.job.documentRef) !== hash(document.documentRef) || result.workspace.jobId !== result.job.jobId || result.workspace.sessionId !== sessionId)
+            if (!isDeepStrictEqual(result.job.documentRef,document.documentRef) || result.workspace.jobId !== result.job.jobId || result.workspace.sessionId !== sessionId)
                 throw new Error('Invoice task receipt belongs to another Workspace');
             const readback = await query({ type: 'query_task_operation', clientSequence: command.input.clientSequence },
                 z.object({ job: jobSchema, workspace: WorkspaceSnapshotSchema }).strict().nullable());
-            if (!readback || hash(readback.job) !== hash(result.job) || readback.workspace.revision !== result.workspace.revision)
+            if (!readback || !isDeepStrictEqual(readback.job,result.job) || readback.workspace.revision !== result.workspace.revision)
                 throw new Error('Invoice task original operation readback differs');
             invoiceJobs.set(result.job.jobId, { sample, sessionId, documentRef: document.documentRef });
             invoiceOperations.push({ stepId, mode: 'start-task', command, result, readback }); workspace = result.workspace;
         }
         const owner = invoiceJobs.get(workspace.jobId!);
-        if (!owner || owner.sessionId !== sessionId || owner.sample !== sample || hash(workspace.documentRef) !== hash(document.documentRef) || workspace.sessionId !== sessionId)
+        if (!owner || owner.sessionId !== sessionId || owner.sample !== sample || !isDeepStrictEqual(workspace.documentRef,document.documentRef) || workspace.sessionId !== sessionId)
             throw new Error('Invoice Workspace is not bound to its original task');
         const { revision, documentRef, jobId, candidateRef } = workspace;
         return WorkspaceExpectationSchema.parse({ revision, documentRef, jobId, candidateRef, sessionId });
@@ -243,12 +245,12 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         const workspace = await query({ type: 'read_workspace' }, WorkspaceSnapshotSchema);
         const owner = invoiceJobs.get(workspace.jobId!);
         if (!owner || !workspace.candidateRef || workspace.sessionId !== owner.sessionId || workspace.sessionId !== sessionId ||
-            hash(workspace.documentRef) !== hash(owner.documentRef)) throw new Error('Invoice operation requires its selected owned Workspace');
+            !isDeepStrictEqual(workspace.documentRef,owner.documentRef)) throw new Error('Invoice operation requires its selected owned Workspace');
         const job = await query({ type: 'query_job', jobId: workspace.jobId! }, jobSchema);
         const detail = await query({ type: 'query_job_candidate', input: { jobId: job.jobId, candidateId: workspace.candidateRef.id } },
             z.object({ documentRef: DocumentRefSchema, candidate: candidateSchema }).strict());
         const candidate = detail.candidate;
-        if (job.jobId !== workspace.jobId || hash(job.documentRef) !== hash(owner.documentRef) || hash(detail.documentRef) !== hash(owner.documentRef) ||
+        if (job.jobId !== workspace.jobId || !isDeepStrictEqual(job.documentRef,owner.documentRef) || !isDeepStrictEqual(detail.documentRef,owner.documentRef) ||
             candidate.jobId !== job.jobId || candidate.candidateId !== job.currentCandidateId || candidate.candidateId !== workspace.candidateRef.id ||
             candidate.sequence !== workspace.candidateRef.sequence) throw new Error('Invoice operation selection changed or belongs to another task');
         return { workspace, job, candidate };
@@ -257,10 +259,28 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         return invoiceExports.map(reference => {
             const paths = resolveProductPaths(join(trial.directory, 'product'));
             if (!paths.ok) throw new Error('Invoice export product paths are invalid');
-            const bytes = readManagedInvoiceExport(paths.data, reference);
+            const expected=invoiceExportContents.get(reference.artifactId);if(!expected)throw Error('Original invoice export bytes are unavailable');
+            const bytes = readManagedInvoiceExport(paths.data, reference,expected);
             if (!bytes.ok) throw new Error('Original invoice export bytes are unavailable: ' + bytes.error.code);
             return { reference, text: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes.data) };
         });
+    }
+    async function rememberInvoiceExport(input:Omit<z.infer<typeof InvoiceExportReadRequestSchema>,'offset'|'limit'>,reference:z.infer<typeof invoiceExportSchema>){
+        const chunks:Buffer[]=[];let offset=0,complete=false;
+        for(let count=0;count<10000;count++){
+            const page=await query({type:'read_invoice_export',input:{...input,offset,limit:32768}},InvoiceExportPageSchema);
+            const chunk=Buffer.from(page.chunkBase64,'base64');
+            if(page.artifactId!==reference.artifactId||page.candidateId!==reference.candidateId||page.format!==reference.format||
+                page.relativePath!==reference.relativePath||page.bytes!==reference.bytes||page.offset!==offset||chunk.length>32768)
+                throw Error('Original invoice export page identity or bytes changed');
+            chunks.push(chunk);offset+=chunk.length;
+            if(page.nextOffset===null){complete=true;break;}
+            if(page.nextOffset!==offset||!chunk.length)throw Error('Original invoice export cursor made no progress');
+        }
+        if(!complete||offset!==reference.bytes)throw Error('Original invoice export bytes are incomplete');
+        const bytes=Buffer.concat(chunks),prior=invoiceExportContents.get(reference.artifactId);
+        if(prior&&!prior.equals(bytes))throw Error('Original invoice export bytes changed');
+        invoiceExportContents.set(reference.artifactId,bytes);
     }
     async function stopHost(): Promise<EvidenceFact> {
         const result = await client.close();
@@ -283,12 +303,12 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         const started = await client.start(productRoot, '0.1.0', local.runtimeRoot, invoiceSourceRoot, launch);
         if (!started.ok) throw new Error('Host start: ' + started.error.code);
         signal.throwIfAborted();
-        await query({ type: 'save_settings', settings: { version: 5, revision: 0, profile: { displayName: 'Evaluation', theme: 'system' },
+        settingsRevision=(await query({ type: 'save_settings', settings: { version: 6, revision: 0, profile: { displayName: 'Evaluation', theme: 'system' },
             models: [{ id: modelId, credentialRef, name: 'Evaluation Agent', kind: 'custom', providerId: null,
                 baseUrl: config.baseUrl, model: config.model, api: config.api, contextWindow: config.modelCapabilities.contextWindow,
                 maxTokens: config.modelCapabilities.maxTokens, reasoning: config.modelCapabilities.reasoning }],
             defaultModelId: modelId, resources, extensions, runtime: RuntimeRequestOverridesSchema.parse({...(config.budget?{budget:config.budget}:{}),...(config.timeoutMs?{timeoutMs:config.timeoutMs}:{}),
-                ...(config.stopGraceMs?{stopGraceMs:config.stopGraceMs}:{})}), updatedAt: '2026-10-11T00:00:00.000Z' } }, z.unknown());
+                ...(config.stopGraceMs?{stopGraceMs:config.stopGraceMs}:{})}), updatedAt: '2026-10-11T00:00:00.000Z' } }, z.object({revision:z.number().int().nonnegative()}).passthrough())).revision;
         sessionId = (await query({ type: 'create_session', input: { title: isResearch ? 'Evaluation research' : 'Evaluation chat' } }, z.object({ sessionId: id }).passthrough())).sessionId;
         if(autoProfile){
             autoInitial=await query({type:'query_session_compaction',input:{sessionId}},SessionCompactionSnapshotSchema);
@@ -299,8 +319,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             signal.throwIfAborted();
             const imported = await query({ type: 'import_research_material', input: { title: m.sample + '/' + m.file,
                 format: m.file.endsWith('.md') ? 'markdown' : 'text', text: m.text } }, ResearchMaterialSchema);
-            if (imported.contentHash !== hash(m.text)) throw new Error('Product material differs from declared projection');
-            registration.push({ sample: m.sample, file: m.file, sha256: imported.contentHash, artifactId: imported.artifactId });
+            registration.push({ sample: m.sample, file: m.file, artifactId: imported.artifactId });
         }
         if (isResearch) researchId = (await query({ type: 'create_research_task', input: { sessionId, title: 'Evaluation research',
             sourcePolicy: { web: false, domains: [], artifactIds: registration.map(m => m.artifactId), documentIds: [] } } }, ResearchTaskSchema)).researchId;
@@ -308,16 +327,16 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const document = await query({ type: 'import_invoice_material', sourceDirectory: join(invoiceSourceRoot, invoice.sample).replaceAll('\\', '/') }, documentSchema);
             if (document.status !== 'available' || document.isHidden) throw new Error('Invoice registration is unavailable');
             const readback = await query({ type: 'query_document', documentId: document.documentRef.id }, documentSchema);
-            if (hash(readback) !== hash(document)) throw new Error('Invoice original registration readback differs');
-            invoiceRegistration.push({ sample: invoice.sample, files: invoice.files.map(({ name, sha256 }) => ({ name, sha256 })), document });
+            if (!isDeepStrictEqual(readback,document)) throw new Error('Invoice original registration readback differs');
+            invoiceRegistration.push({ sample: invoice.sample, files: invoice.files.map(({ name }) => ({ name })), document });
         }
         for (const invoice of prepared.invoices) {
             const document = await query({ type: 'import_prepared_invoice_material', input: invoice }, documentSchema);
             const readback = await query({ type: 'query_document', documentId: document.documentRef.id }, documentSchema);
-            if (document.status !== 'available' || document.isHidden || document.pageCount !== invoice.pages.length || hash(readback) !== hash(document))
+            if (document.status !== 'available' || document.isHidden || document.pageCount !== invoice.pages.length || !isDeepStrictEqual(readback,document))
                 throw new Error('Prepared invoice registration or original readback differs');
-            invoiceRegistration.push({ sample: invoice.sample, files: [{ name: 'source.md', sha256: hash(invoice.sourceText) },
-                ...(invoice.original.name === 'original.pdf' ? [{ name: 'original.pdf', sha256: invoice.original.sha256 }] : [])], document });
+            invoiceRegistration.push({ sample: invoice.sample, files: [{ name: 'source.md' },
+                ...(invoice.original.name === 'original.pdf' ? [{ name: 'original.pdf' }] : [])], document });
         }
     } catch (error) {
         const closed = await closeHost();
@@ -331,9 +350,9 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     const nextSequences = new Map<number, number>(), historyOperations: Array<Record<string, unknown>> = [];
     const compactions: Array<{ sessionId: number; operationId: string }> = [];
     let executed = false, stepsComplete = false;
-    let steerAttempted=false,steerDelivery:{rootAtTrigger:z.infer<typeof runSchema>;read:z.infer<typeof ToolCallSnapshotSchema>;readSha256:string;accepted:z.infer<typeof SessionInputAcceptedSchema>}|undefined;
+    let steerAttempted=false,steerDelivery:{rootAtTrigger:z.infer<typeof runSchema>;read:z.infer<typeof ToolCallSnapshotSchema>;accepted:z.infer<typeof SessionInputAcceptedSchema>}|undefined;
     let parentCancellation:{rootAtTrigger:z.infer<typeof runSchema>;childrenAtTrigger:Array<z.infer<typeof SubagentDetailSchema>>;
-        reads:Array<{sha256:string;tool:z.infer<typeof ToolCallSnapshotSchema>}>;historyAtTrigger:Array<{sessionId:number;fact:EvidenceFact}>;
+        reads:Array<{tool:z.infer<typeof ToolCallSnapshotSchema>}>;historyAtTrigger:Array<{sessionId:number;fact:EvidenceFact}>;
         accepted:{accepted:boolean;runId:number};requestOutcome:'pending'|'accepted'|'rejected'|'unknown';requestedAt:string;timedOut:boolean;observationError?:string;
         observations:Array<{at:string;root:z.infer<typeof runSchema>;children:EvidenceFact}>}|undefined;
     let parentTriggerObservation:{rootStatus:string;children:number;eligibleReads:number;historyComplete:boolean}|undefined;
@@ -373,25 +392,25 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             if(calls.some(call=>call.toolName==='save_invoice_candidate'&&call.startedAt!==null))return;
             const original=calls.find(call=>call.toolName==='read_invoice_document'&&call.status==='succeeded'&&call.stoppedAt!==null);
             if(run.status==='running'&&original){
-                const fact=await collectToolEvidence(client,[original]),checked=z.object({calls:z.array(z.object({sha256:z.string(),tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().safeParse(fact.actual);
+                const fact=await collectToolEvidence(client,[original]),checked=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().safeParse(fact.actual);
                 if(!fact.present||!checked.success)return;
                 const read=checked.data.calls[0]!,body=invoiceToolSchemas.read_invoice_document.output.safeParse(read.tool.result?.data);
                 const workspace=await query({type:'read_workspace'},WorkspaceSnapshotSchema),root=await readRun(runId);
-                if(root.status!=='running'||workspace.sessionId!==sessionId||workspace.jobId!==root.jobId||!body.success||hash(body.data.documentRef)!==hash(workspace.documentRef)||
+                if(root.status!=='running'||workspace.sessionId!==sessionId||workspace.jobId!==root.jobId||!body.success||!isDeepStrictEqual(body.data.documentRef,workspace.documentRef)||
                     read.tool.result?.status!=='succeeded'||read.tool.runtimeObservation?.afterDomain!=='valid'||!read.tool.cleanup.stopped)return;
                 const {revision,documentRef,jobId,candidateRef}=workspace;
                 const turn = userTurn(trial.turns, futureSteer.turnId);
                 const command:InputCommand={type:'submit_session_input',input:{sessionId,runId,clientSequence:nextSequences.get(sessionId)??1,mode:futureSteer.mode,text:turn.content,
                     workspace:WorkspaceExpectationSchema.parse({revision,documentRef,jobId,candidateRef,sessionId})}};
                 steerAttempted=true;
-                const submitted:StepReceipt={stepId:'live-steer',turnId:turn.id,action:futureSteer.mode,clientSequence:command.input.clientSequence,requestHash:hash(command),result:{pending:true}};
+                const submitted:StepReceipt={stepId:'live-steer',turnId:turn.id,action:futureSteer.mode,clientSequence:command.input.clientSequence,requestContent:JSON.stringify(command),result:{pending:true}};
                 receipts.push(submitted);
                 const result=z.union([z.object({ok:z.literal(true),data:desktopAcceptedSchema}).strict(),z.object({ok:z.literal(false),error:AppErrorSchema}).strict()]).parse(await client.request(command));
                 submitted.result=result;
                 if(!result.ok)return;
                 if(result.data.runId!==runId||result.data.sessionId!==sessionId)throw new Error('Live steer receipt changed the original owner');
                 nextSequences.set(sessionId,command.input.clientSequence+1);
-                steerDelivery={rootAtTrigger:root,read:read.tool,readSha256:read.sha256,accepted:result.data};return;
+                steerDelivery={rootAtTrigger:root,read:read.tool,accepted:result.data};return;
             }
             await delay(50,undefined,{signal:running});
         }
@@ -413,8 +432,8 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         const turn=userTurn(trial.turns,saveDeliveryLoss.recoveryTurnId);
         const text=turn.content+'\nVerified original save identity: '+JSON.stringify({runId:originalRunId,toolCallId:candidate.toolCallId,jobId:candidate.jobId,candidateId:candidate.candidateId});
         const command:InputCommand={type:'submit_session_input',input:{sessionId,clientSequence:nextSequences.get(sessionId)??1,mode:'prompt',goalMode:'answer',text,modelId,
-            workspace:recoveryWorkspace,budget:{maxToolCalls:1}},expectedSettingsRevision:1,expectedCredentialRef:credentialRef};
-        const submitted:StepReceipt={stepId:'original-save-recovery',turnId:turn.id,submittedText:text,action:'public-read-only-recovery',clientSequence:command.input.clientSequence,requestHash:hash(command),result:{pending:true}};
+            workspace:recoveryWorkspace,budget:{maxToolCalls:1}},expectedSettingsRevision:settingsRevision,expectedCredentialRef:credentialRef};
+        const submitted:StepReceipt={stepId:'original-save-recovery',turnId:turn.id,submittedText:text,action:'public-read-only-recovery',clientSequence:command.input.clientSequence,requestContent:JSON.stringify(command),result:{pending:true}};
         receipts.push(submitted);
         const response=z.union([z.object({ok:z.literal(true),data:desktopAcceptedSchema}).strict(),z.object({ok:z.literal(false),error:AppErrorSchema}).strict()]).parse(await client.request(command));
         submitted.result=response;
@@ -446,7 +465,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const first=calls.filter(call=>call.toolName==='save_invoice_candidate'&&call.status==='succeeded').sort((a,b)=>a.toolCallId-b.toolCallId)[0];
             if(first){
                 const fact=await collectToolEvidence(client,[first]);
-                const original=z.object({calls:z.array(z.object({sha256:z.string(),tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().parse(fact.actual).calls[0]!;
+                const original=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().parse(fact.actual).calls[0]!;
                 if(!fact.present)throw new Error('Original save evidence is incomplete');
                 const call=original.tool,receipt=invoiceToolSchemas.save_invoice_candidate.output.parse(call.result?.data);
                 if(call.result?.status!=='succeeded'||call.result.committedCandidateId!==receipt.candidateId||call.runId!==runId||call.sessionId!==sessionId)throw new Error('Original save commit is unverified');
@@ -454,13 +473,13 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 const before={candidate:await detail(),history:await invoiceCandidates(receipt.jobId)};
                 if(before.candidate.candidate.toolCallId!==call.toolCallId||before.candidate.candidate.runId!==runId)throw new Error('Original candidate identity differs');
                 const input=InvoiceSaveReplayRequestSchema.parse({runId,sessionId,toolCallId:call.toolCallId,nativeToolCallId:call.nativeToolCallId,
-                    argumentsHash:hash({raw:call.args.raw,final:call.args.final}),rawArguments:call.args.raw,arguments:call.args.final});
+                    rawArguments:call.args.raw,arguments:call.args.final});
                 actual.original=original;actual.before=before;actual.replay={resends:1,input};
                 const replay=await query({type:'replay_invoice_save',input},InvoiceSaveReplayReceiptSchema);
                 const after={candidate:await detail(),history:await invoiceCandidates(receipt.jobId)};
                 actual.after=after;actual.replay={resends:1,input,receipt:replay};
                 actual.exposure={verified:true};
-                actual.preserved=hash(before)===hash(after)&&hash(replay.receipt)===hash(receipt);
+                actual.preserved=isDeepStrictEqual(before,after)&&isDeepStrictEqual(replay.receipt,receipt);
                 return;
             }
             if(!['created','running'].includes(run.status))return;
@@ -479,17 +498,17 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const children=z.object({children:z.array(SubagentDetailSchema)}).passthrough().parse(fact.actual).children;
             parentTriggerObservation.children=children.length;
             if(fact.present&&children.length>=2&&children.every(child=>child.startedAt!==null&&child.role==='invoice-evidence-checker'&&!child.scope.allowedTools.includes('Agent'))&&children.some(child=>child.status==='running')){
-                const reads:Array<{sha256:string;tool:z.infer<typeof ToolCallSnapshotSchema>}>=[];
+                const reads:Array<{tool:z.infer<typeof ToolCallSnapshotSchema>}>=[];
                 for(const child of children){
                     const calls=await backward(async beforeId=>{const page=await query({type:'list_run_tool_calls',input:{runId:child.childRunId,sessionId:child.childSessionId,beforeId,limit:100}},RuntimeToolPageSchema);
                         if(page.items.some(call=>call.runId!==child.childRunId||call.sessionId!==child.childSessionId))throw new Error('Foreign child read trigger');
                         return{items:page.items,next:page.nextBeforeId};},call=>call.toolCallId);
                     const original=calls.find(call=>call.toolName==='read_invoice_document'&&call.status==='succeeded'&&call.stoppedAt!==null);
                     if(!original)break;
-                    const readFact=await collectToolEvidence(client,[original]),parsed=z.object({calls:z.array(z.object({sha256:z.string(),tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().safeParse(readFact.actual);
+                    const readFact=await collectToolEvidence(client,[original]),parsed=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().safeParse(readFact.actual);
                     if(!readFact.present||!parsed.success)break;
                     const read=parsed.data.calls[0]!,body=invoiceToolSchemas.read_invoice_document.output.safeParse(read.tool.result?.data);
-                    if(!body.success||!invoiceRegistration.some(item=>hash(item.document.documentRef)===hash(body.data.documentRef))||!child.scope.allowedDocumentIds.includes(body.data.documentRef.id)||
+                    if(!body.success||!invoiceRegistration.some(item=>isDeepStrictEqual(item.document.documentRef,body.data.documentRef))||!child.scope.allowedDocumentIds.includes(body.data.documentRef.id)||
                         read.tool.runtimeObservation?.afterDomain!=='valid'||!read.tool.cleanup.stopped||read.tool.delivery.state!=='request_observed')break;
                     reads.push(read);
                 }
@@ -500,7 +519,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                     const nowRoot=await readRun(runId),nowChildren=await collectSubagentEvidence(client,[{runId,sessionId}]);
                     const latest=z.object({children:z.array(SubagentDetailSchema)}).passthrough().parse(nowChildren.actual).children;
                     if(historyAtTrigger.every(history=>history.fact.present)&&nowRoot.status==='running'&&nowChildren.present&&latest.some(child=>child.status==='running')&&
-                        hash(latest.map(child=>[child.childRunId,child.childSessionId,child.originToolCallId]))===hash(children.map(child=>[child.childRunId,child.childSessionId,child.originToolCallId]))){
+                        isDeepStrictEqual(latest.map(child=>[child.childRunId,child.childSessionId,child.originToolCallId]),children.map(child=>[child.childRunId,child.childSessionId,child.originToolCallId]))){
                         parentCancellation={rootAtTrigger:nowRoot,childrenAtTrigger:latest,reads,historyAtTrigger,accepted:{accepted:false,runId},requestOutcome:'pending',requestedAt:new Date().toISOString(),timedOut:false,observations:[]};
                         try{
                             const accepted=await query({type:'cancel_run',runId},z.object({accepted:z.boolean(),runId:id}).strict());
@@ -592,7 +611,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 const { usage: observedUsage, mayContinue: currentContinuation, ...observed } = snapshot.operation;
                 const originalUsage = JSON.stringify(recordedUsage, (key, value) => key === 'updatedAt' ? undefined : value);
                 const currentUsage = JSON.stringify(observedUsage, (key, value) => key === 'updatedAt' ? undefined : value);
-                if (hash(original) !== hash(observed) || originalUsage !== currentUsage) throw new Error('Completed original compaction facts changed');
+                if (!isDeepStrictEqual(original,observed) || originalUsage !== currentUsage) throw new Error('Completed original compaction facts changed');
             } else record.after = snapshot;
             return snapshot;
         }));
@@ -732,10 +751,10 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             } catch { extensionSessions.push({ sessionId: owner, gap: 'native-extension-view-unavailable' }); }
         }
         execution.evidence.extensions = { present: subagents.present && extensionSessions.every(s => s.gap === null) &&
-            (!extensionProfile || extensionRuns.filter(r => runIds.includes(r.runId)).every(r => r.frozen?.evaluationProfile && hash(r.frozen.evaluationProfile) === hash(extensionProfile))),
+            (!extensionProfile || extensionRuns.filter(r => runIds.includes(r.runId)).every(r => r.frozen?.evaluationProfile && isDeepStrictEqual(r.frozen.evaluationProfile,extensionProfile))),
             actual: { runs: extensionRuns, sessions: extensionSessions }, source: 'Original public declared Run assembly and current owned native Session Hook diagnostics; unavailable Session views remain gaps' };
         if (extensionProfile) {
-            const originals = z.object({ calls: z.array(z.object({ sha256: z.string(), tool: ToolCallSnapshotSchema }).passthrough()) }).passthrough()
+            const originals = z.object({ calls: z.array(z.object({  tool: ToolCallSnapshotSchema }).passthrough()) }).passthrough()
                 .parse(execution.evidence['tool-evidence'].actual);
             const calls = [];
             for (const original of originals.calls) {
@@ -757,7 +776,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                             Date.parse(d.at) >= Date.parse(call.requestedAt) && Date.parse(d.at) <= Date.parse(call.endedAt!));
                         if (diagnostic) calls.push({ runId: call.runId, sessionId: call.sessionId, toolCallId: call.toolCallId,
                             nativeToolCallId: call.nativeToolCallId, instanceId: instance.instanceId, diagnosticAt: diagnostic.at,
-                            diagnosticCode: diagnostic.code, toolSnapshotSha256: original.sha256 });
+                            diagnosticCode: diagnostic.code });
                     }
                 }
             }
@@ -777,7 +796,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 inputs.filter(other=>other.runId===input.runId&&other.mode===futureSteer.mode).length===1;
             execution.evidence['case-controller']={present:verified,actual:{profile:interactionProfile,exposure:verified?{verified:true,deliveries:1,consumed:true,wireInclusion:'confirmed',
                 originalRunId:delivery!.accepted.runId,inputId:input!.inputId,nativeEntryId:input!.nativeEntryId,contextSnapshotId:input!.contextSnapshotId,requestSequence:request!.binding.requestSequence,
-                futureInputSha256:trial.controllerInput!.sha256,trigger:delivery}:null},source:'Original live root/read snapshot, one public steer receipt, consumed native Input and confirmed SDK/wire inclusion; adoption and source honesty are scored separately'};
+                trigger:delivery}:null},source:'Original live root/read snapshot, one public steer receipt, consumed native Input and confirmed SDK/wire inclusion; adoption and source honesty are scored separately'};
         }
         if(historySeed){
             const final=inputs.find(input=>input.sessionId===initialSessionId&&input.content.text===userTurn(trial.turns,historySeed.finalTurnId).content&&input.mode==='prompt'&&input.status==='consumed');
@@ -795,7 +814,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 binding.nativeEntryId===final.nativeEntryId&&binding.snapshotId===final.contextSnapshotId&&binding.originRunId===final.runId)&&request.attempts.some(attempt=>attempt.wireInclusion==='confirmed'&&attempt.responseStatus!==null));
             const verified=!!summary&&!!final&&finalIncluded&&inputs.length===18&&inputs.every(input=>input.mode==='prompt')&&delivered&&execution.evidence.history!.present&&execution.evidence['context-requests']!.present&&execution.evidence['interaction-history']!.present;
             execution.evidence['case-controller']={present:verified,actual:{profile:autoProfile,exposure:verified?{verified:true,seedTurns:16,finalInputConsumed:true,summaryWireInclusion:'confirmed',
-                finalInputId:final!.inputId,finalRunId:final!.runId,historySeedSha256:trial.controllerInput!.sha256,capacity:summary!.capacity,policy:autoInitial!.policy,
+                finalInputId:final!.inputId,finalRunId:final!.runId,capacity:summary!.capacity,policy:autoInitial!.policy,
                 originalSummary:summary,originalAutoCompactions:autoSnapshots}:null},
                 source:'Distinct consumed public user Inputs, original threshold compaction operation/capacity/saved native summary/usage and actual final SDK/wire summary inclusion; semantic retention is scored separately'};
         }
@@ -818,7 +837,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         if(deliveryLossEvidence)execution.evidence['case-controller']=structuredClone(deliveryLossEvidence);
         else if(saveDeliveryLoss){
             const fact=execution.evidence['tool-evidence'];
-            const originals=z.object({calls:z.array(z.object({sha256:z.string(),tool:ToolCallSnapshotSchema}).passthrough())}).passthrough().parse(fact!.actual).calls;
+            const originals=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough())}).passthrough().parse(fact!.actual).calls;
             const saves=originals.filter(c=>c.tool.toolName==='save_invoice_candidate');
             const original=saves.find(c=>c.tool.status==='succeeded'&&c.tool.delivery.state==='failed'&&c.tool.delivery.error?.message==='Committed candidate model delivery failed.');
             const actual:Record<string,unknown>={profile:interactionProfile,policy:{maxRecoveryAttempts:saveDeliveryLoss.fault.maxRecoveryAttempts},exposure:{verified:false},recovery:{attempts:0,reexecuted:false}};
@@ -845,12 +864,12 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const originals=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough())}).passthrough().parse(execution.evidence['tool-evidence']!.actual).calls;
             const immutable=(entry:HistoryEvidenceEntry)=>{const {isLeaf,isCurrentPath,canSelect,cannotSelectReason,...summary}=entry.summary;return{summary,fields:entry.fields,parts:entry.parts};};
             const preserved=verified&&execution.evidence['tool-evidence']!.present&&cancellation!.reads.every(read=>originals.some(call=>call.tool.toolCallId===read.tool.toolCallId&&call.tool.runId===read.tool.runId&&call.tool.sessionId===read.tool.sessionId&&
-                hash({args:call.tool.args,result:call.tool.result,effect:call.tool.effect})===hash({args:read.tool.args,result:read.tool.result,effect:read.tool.effect})))&&
+                isDeepStrictEqual({args:call.tool.args,result:call.tool.result,effect:call.tool.effect},{args:read.tool.args,result:read.tool.result,effect:read.tool.effect})))&&
                 cancellation!.historyAtTrigger.every(before=>{
                     const current=[...histories,...childHistory].find(fact=>(fact.actual as {sessionId:number}).sessionId===before.sessionId);
                     const oldEntries=(before.fact.actual as {entries:HistoryEvidenceEntry[]}).entries,newEntries=(current?.actual as {entries:HistoryEvidenceEntry[]}|undefined)?.entries;
-                    return current?.present&&oldEntries.every(entry=>newEntries?.some(now=>hash(immutable(now))===hash(immutable(entry))));
-                })&&cancellation!.childrenAtTrigger.every(before=>before.output===null||children.some(child=>child.childRunId===before.childRunId&&hash(child.output)===hash(before.output)));
+                    return current?.present&&oldEntries.every(entry=>newEntries?.some(now=>isDeepStrictEqual(immutable(now),immutable(entry))));
+                })&&cancellation!.childrenAtTrigger.every(before=>before.output===null||children.some(child=>child.childRunId===before.childRunId&&isDeepStrictEqual(child.output,before.output)));
             execution.evidence['case-controller']={present:verified,actual:{profile:interactionProfile,exposure:verified?{verified:true,cancelRequests:1,originalParentRunId:cancellation!.accepted.runId,trigger:cancellation}:null,
                 stopping:cancellation?{confirmed,timedOut:cancellation.timedOut,requestOutcome:cancellation.requestOutcome,observationError:cancellation.observationError??null,originalObservation:after}:null,
                 triggerObservation:parentTriggerObservation??null,committedFactsPreserved:verified?preserved:null},
@@ -867,7 +886,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const jobs = [];
             for (const [jobId, owner] of invoiceJobs) {
                 const job = await query({ type: 'query_job', jobId }, jobSchema);
-                if (job.jobId !== jobId || hash(job.documentRef) !== hash(owner.documentRef)) throw new Error('Foreign invoice task');
+                if (job.jobId !== jobId || !isDeepStrictEqual(job.documentRef,owner.documentRef)) throw new Error('Foreign invoice task');
                 jobs.push(job);
                 const summaries = (await invoiceCandidates(jobId)).sort((a, b) => a.sequence - b.sequence);
                 for (const summary of summaries) {
@@ -879,7 +898,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                         ? candidate.runId === null && candidate.toolCallId === null && candidate.context === null && !!basis &&
                             humanCandidates.get(candidate.candidateId) === basis.candidateId
                         : !!run && run.sessionId === owner.sessionId && run.jobId === jobId && candidate.basedOnCandidateId == null;
-                    if (hash(detail.documentRef) !== hash(owner.documentRef) || candidate.jobId !== jobId || candidate.candidateId !== summary.candidateId ||
+                    if (!isDeepStrictEqual(detail.documentRef,owner.documentRef) || candidate.jobId !== jobId || candidate.candidateId !== summary.candidateId ||
                         candidate.sequence !== summary.sequence || !owned)
                         throw new Error('Invoice candidate does not belong to its original Run, Document and task');
                     candidates.push(candidate);
@@ -926,7 +945,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 execution.evidence['invoice-exports'] = { present: false, actual: structuredClone(invoiceExports), source: 'Original public export references retained; current managed bytes failed verification' };
                 throw error;
             }
-            execution.evidence['invoice-exports'] = { present: true, actual: exports, source: 'Original public export references and managed file bytes rechecked against their size and SHA-256' };
+            execution.evidence['invoice-exports'] = { present: true, actual: exports, source: 'Original public export references and managed file bytes rechecked against original stored bytes and size' };
             execution.endpointReached = stepsComplete && execution.status === 'completed' && !!execution.answer?.trim() &&
                 [...requiredCandidateRuns].every(runId => candidates.some(c => c.runId === runId));
         } else if (isResearch) {
@@ -1002,7 +1021,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                     if (!started.ok) throw new Error('Host restart: ' + started.error.code);
                     const after = await capture();
                     record.after = Object.fromEntries(keys.map(key => [key, after.evidence[key]!.actual]));
-                    if (keys.some(key => !after.evidence[key]?.present) || hash(record.after) !== hash(record.before))
+                    if (keys.some(key => !after.evidence[key]?.present) || !isDeepStrictEqual(record.after,record.before))
                         throw new Error('Host restart changed or lost original committed evidence');
                     record.verified = true;
                     continue;
@@ -1030,11 +1049,11 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                         return response.receipt;
                     });
                     const input = InvoiceFormRunInputSchema.parse({ modelId, clientSequence: nextSequences.get(sessionId) ?? 1, workspace, target: opened.target });
-                    const command = { type: 'submit_invoice_form_input' as const, input, expectedSettingsRevision: 1, expectedCredentialRef: credentialRef };
+                    const command = { type: 'submit_invoice_form_input' as const, input, expectedSettingsRevision: settingsRevision, expectedCredentialRef: credentialRef };
                     const accepted = await query(command, desktopAcceptedSchema);
                     if (accepted.sessionId !== sessionId) throw new Error('Fill admission belongs to another Session');
                     nextSequences.set(sessionId, input.clientSequence + 1); runIds.push(accepted.runId); runSessions.set(accepted.runId, sessionId);
-                    receipts.push({ stepId: step.id, action: step.action, clientSequence: input.clientSequence, requestHash: hash(command), result: { ok: true, data: accepted } });
+                    receipts.push({ stepId: step.id, action: step.action, clientSequence: input.clientSequence, requestContent: JSON.stringify(command), result: { ok: true, data: accepted } });
                     const run = await waitRun(accepted.runId, running);
                     if (run.status !== 'completed' || run.stoppedAt === null || run.cleanup.stopped !== true) throw new Error('Fill Run completion or stopping is unconfirmed');
                     const inspected = await controls.request({ action: 'inspect' });
@@ -1051,9 +1070,9 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                         const result = await query(command, invoiceExportSchema);
                         const readback = await query({ type: 'query_invoice_candidate_operation', input: { kind: 'export', request: command.input } }, invoiceExportSchema.nullable());
                         const path = `outputs/invoice-${job.jobId}-result-${candidate.sequence}.${step.format === 'markdown' ? 'md' : step.format}`;
-                        if (result.candidateId !== candidate.candidateId || result.format !== step.format || result.relativePath !== path || hash(readback) !== hash(result))
+                        if (result.candidateId !== candidate.candidateId || result.format !== step.format || result.relativePath !== path || !isDeepStrictEqual(readback,result))
                             throw new Error('Foreign invoice export or original operation readback');
-                        invoiceExports.push(result); readInvoiceExports();
+                        invoiceExports.push(result);await rememberInvoiceExport(command.input,result);readInvoiceExports();
                         invoiceOperations.push({ stepId: step.id, command, before, result, readback });
                     } else {
                         const common = { operationRef, jobId: job.jobId, expectedCandidateId: candidate.candidateId, expectedRevision: workspace.revision };
@@ -1069,11 +1088,11 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                             const response = z.object({ changed: z.boolean(), candidate: candidateSchema, workspace: WorkspaceSnapshotSchema }).strict();
                             const result = await query(command, response);
                             const readback = await query({ type: 'query_invoice_candidate_operation', input: { kind: 'save', request: command.input } }, response.nullable());
-                            if (result.candidate.jobId !== job.jobId || result.workspace.sessionId !== sessionId || hash(result.workspace.documentRef) !== hash(job.documentRef) ||
+                            if (result.candidate.jobId !== job.jobId || result.workspace.sessionId !== sessionId || !isDeepStrictEqual(result.workspace.documentRef,job.documentRef) ||
                                 result.workspace.candidateRef?.id !== result.candidate.candidateId || result.workspace.candidateRef.sequence !== result.candidate.sequence ||
                                 (result.changed ? result.candidate.origin !== 'human_edit' || result.candidate.runId !== null || result.candidate.basedOnCandidateId !== candidate.candidateId ||
-                                    !readback || hash(readback.candidate) !== hash(result.candidate) || readback.workspace.revision !== result.workspace.revision
-                                    : hash(result.candidate) !== hash(candidate) || readback !== null || result.workspace.revision !== workspace.revision))
+                                    !readback || !isDeepStrictEqual(readback.candidate,result.candidate) || readback.workspace.revision !== result.workspace.revision
+                                    : !isDeepStrictEqual(result.candidate,candidate) || readback !== null || result.workspace.revision !== workspace.revision))
                                 throw new Error('Invoice edit lacks its original candidate lineage or save receipt');
                             if (result.changed) humanCandidates.set(result.candidate.candidateId, candidate.candidateId);
                             editedCandidates.set(step.id, { jobId: job.jobId, candidateId: result.candidate.candidateId, sequence: result.candidate.sequence });
@@ -1087,12 +1106,12 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                             const readback = await query({ type: 'query_invoice_candidate_operation', input: command.type === 'accept_invoice_candidate'
                                 ? { kind: 'accept', request: command.input } : { kind: 'reject', request: command.input } }, response.nullable());
                             if (result.candidate.candidateId !== candidate.candidateId || result.candidate.jobId !== job.jobId || result.job.jobId !== job.jobId ||
-                                hash(result.job.documentRef) !== hash(job.documentRef) || result.workspace.sessionId !== sessionId ||
+                                !isDeepStrictEqual(result.job.documentRef,job.documentRef) || result.workspace.sessionId !== sessionId ||
                                 (kind === 'accept' ? result.workspace.candidateRef?.id !== candidate.candidateId || result.job.currentCandidateId !== candidate.candidateId
-                                    : result.workspace.candidateRef !== null || result.job.currentCandidateId !== null) || hash(result.workspace.documentRef) !== hash(job.documentRef) ||
+                                    : result.workspace.candidateRef !== null || result.job.currentCandidateId !== null) || !isDeepStrictEqual(result.workspace.documentRef,job.documentRef) ||
                                 result.candidate.status !== (kind === 'accept' ? 'accepted' : 'rejected') ||
                                 kind === 'accept' && (result.job.acceptedCandidateId !== candidate.candidateId || result.job.status !== 'completed') ||
-                                !readback || hash(readback.candidate) !== hash(result.candidate) || readback.workspace.revision !== result.workspace.revision)
+                                !readback || !isDeepStrictEqual(readback.candidate,result.candidate) || readback.workspace.revision !== result.workspace.revision)
                                 throw new Error('Invoice decision belongs to another candidate, Workspace or original operation');
                             invoiceOperations.push({ stepId: step.id, command, before, result, readback });
                         }
@@ -1108,7 +1127,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                         ? c.candidateId === edited.candidateId && c.sequence === edited.sequence : c.runId === run?.runId).sort((a, b) => a.sequence - b.sequence);
                     const candidate = candidates[step.ordinal - 1];
                     if (!candidate || !invoiceJobs.has(jobId) || workspace.jobId !== jobId || workspace.sessionId !== sessionId ||
-                        hash(workspace.documentRef) !== hash(job.documentRef) || workspace.candidateRef?.id !== job.currentCandidateId && job.currentCandidateId !== null)
+                        !isDeepStrictEqual(workspace.documentRef,job.documentRef) || workspace.candidateRef?.id !== job.currentCandidateId && job.currentCandidateId !== null)
                         throw new Error('Invoice selection lacks the original candidate in the current task');
                     const command = { type: 'select_candidate' as const, input: { jobId, candidateId: candidate.candidateId,
                         expectedCandidateId: job.currentCandidateId, expectedRevision: workspace.revision } };
@@ -1151,7 +1170,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                     if (before.sessionId !== sessionId || !before.manualAllowed) throw new Error('Manual compaction is not admitted: ' + before.blockCode);
                     const owner = { sessionId, operationId: randomUUID() };
                     const command = { type: 'compact_session' as const, input: { ...owner, expected: before.commit, modelId },
-                        expectedSettingsRevision: 1, expectedCredentialRef: credentialRef };
+                        expectedSettingsRevision: settingsRevision, expectedCredentialRef: credentialRef };
                     const record: Record<string, unknown> = { stepId: step.id, action: step.action, operationId: owner.operationId, command, before };
                     historyOperations.push(record); compactions.push(owner);
                     record.result = await query(command, CompactionAcceptedSchema);
@@ -1179,7 +1198,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 let workspace = step.action === 'invoice-message' ? await invoiceWorkspace(step.sample, step.instruction, step.workspaceMode, step.id) : null;
                 if (isInvoice && step.action === 'user-message') {
                     const current = await query({ type: 'read_workspace' }, WorkspaceSnapshotSchema);
-                    if (current.sessionId !== sessionId || !invoiceRegistration.some(item => hash(item.document.documentRef) === hash(current.documentRef)) ||
+                    if (current.sessionId !== sessionId || !invoiceRegistration.some(item => isDeepStrictEqual(item.document.documentRef,current.documentRef)) ||
                         current.jobId !== null && !invoiceJobs.has(current.jobId)) throw new Error('Invoice follow-up has no authorized current Workspace');
                     const { revision, documentRef, jobId, candidateRef } = current;
                     workspace = WorkspaceExpectationSchema.parse({ revision, documentRef, jobId, candidateRef, sessionId });
@@ -1196,21 +1215,21 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                     ...(workspace && trial.privateEffects ? { workingDirectory: trial.privateEffects.workingDirectory } : {}),
                     ...(isResearch ? { research: { researchId: researchId!, phase: plan ? 'researching' as const : 'planning' as const, plan: plan ? { planId: plan.planId,
                         revision: plan.revision + (step.action === 'research-confirm' ? step.revisionOffset : 0) } : null } } : {}) },
-                    expectedSettingsRevision: 1, expectedCredentialRef: credentialRef });
-                const submitted:StepReceipt={ stepId: step.id, ...(!replay && laterTurn ? {turnId:laterTurn.id} : {}), action: step.action, clientSequence: command.input.clientSequence, requestHash: hash(command), result:{pending:true} };
+                    expectedSettingsRevision: settingsRevision, expectedCredentialRef: credentialRef });
+                const submitted:StepReceipt={ stepId: step.id, ...(!replay && laterTurn ? {turnId:laterTurn.id} : {}), action: step.action, clientSequence: command.input.clientSequence, requestContent: JSON.stringify(command), result:{pending:true} };
                 receipts.push(submitted);
                 const result = z.union([z.object({ ok: z.literal(true), data: desktopAcceptedSchema }).strict(),
                     z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).parse(await client.request(command));
                 submitted.result=result;
                 const expected = step.action === 'research-confirm' ? step.expected : 'accepted';
                 if (!result.ok) {
-                    if (result.error.code !== expected) throw new Error('Research step ' + step.id + ': ' + result.error.code);
+                    if (result.error.code !== expected) throw new Error('Research step ' + step.id + ': ' + result.error.code + ': ' + result.error.message);
                     continue;
                 }
                 if (expected !== 'accepted') throw new Error('Research step accepted a request expected to be rejected');
                 if (result.data.sessionId !== command.input.sessionId) throw new Error('Accepted input belongs to another Session');
                 const accepted = { inputId: result.data.inputId, sessionId: result.data.sessionId, runId: result.data.runId };
-                if (replay && hash(accepted) !== hash(replay.accepted)) throw new Error('Replay created a different input or Run');
+                if (replay && !isDeepStrictEqual(accepted,replay.accepted)) throw new Error('Replay created a different input or Run');
                 if (!replay) { nextSequences.set(sessionId, command.input.clientSequence + 1); inputRefs.set(step.id, { command, accepted }); }
                 if (!runIds.includes(result.data.runId)) { runIds.push(result.data.runId); runSessions.set(result.data.runId, result.data.sessionId); }
                 if (!replay && step.action === 'invoice-message' && step.goalMode === 'save-candidate') {
@@ -1226,7 +1245,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                     return capture();
                 if(autoProfile){
                     const snapshot=await query({type:'query_session_compaction',input:{sessionId,runId:run.runId}},SessionCompactionSnapshotSchema);
-                    if(snapshot.sessionId!==sessionId||hash(snapshot.policy)!==hash(autoInitial!.policy)||snapshot.capacity.contextWindow!==config.modelCapabilities.contextWindow||snapshot.capacity.thresholdTokens!==config.modelCapabilities.contextWindow-autoProfile.reserveTokens)
+                    if(snapshot.sessionId!==sessionId||!isDeepStrictEqual(snapshot.policy,autoInitial!.policy)||snapshot.capacity.contextWindow!==config.modelCapabilities.contextWindow||snapshot.capacity.thresholdTokens!==config.modelCapabilities.contextWindow-autoProfile.reserveTokens)
                         throw new Error('Actual native compaction capacity differs from the declared controller');
                     const operation=snapshot.operation,saved=snapshot.lastSaved;
                     if(operation?.runId===run.runId&&operation.reason==='threshold'&&operation.phase==='ended'&&operation.nativeOutcome==='succeeded'&&operation.generated&&operation.stopped&&operation.saved&&

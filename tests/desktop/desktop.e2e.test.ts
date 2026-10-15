@@ -2,7 +2,6 @@ import { _electron as electron, type Page } from 'playwright';
 import { expect, test as it } from '@playwright/test';
 import { INVOICE_REVIEW_TOOL_NAMES as INVOICE_TOOL_NAMES, NATIVE_TOOL_NAMES } from '@flowmate/contracts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
@@ -31,7 +30,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p6-observation', credentialRef: 'p6_observation_key',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p6-observation', credentialRef: '00000000000000000000000000000003',
         name: 'Controlled P6', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'p6-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p6-observation' },
       { modelId: 'p6-observation', apiKey: 'synthetic-p6-controlled-key' });
@@ -704,7 +703,7 @@ for (const action of ['last-window', 'quit', 'main-exit'] as const) {
         const state = await window.flowmate.getState();
         if (!state.ok) return state;
         return window.flowmate.saveSettings({ ...state.data.settings,
-          models: [{ id: 'shutdown-model', credentialRef: 'desktop_shutdown_credential', name: 'Shutdown model', kind: 'custom', providerId: null,
+          models: [{ id: 'shutdown-model', credentialRef: '00000000000000000000000000000004', name: 'Shutdown model', kind: 'custom', providerId: null,
             baseUrl: `http://127.0.0.1:${port}/v1`, model: 'shutdown-model', api: 'openai-completions',
             contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'shutdown-model',
         }, { modelId: 'shutdown-model', apiKey: 'synthetic-desktop-shutdown-key' });
@@ -785,7 +784,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p5-model', credentialRef: 'p5_desktop_credential',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p5-model', credentialRef: '00000000000000000000000000000005',
         name: 'P5 model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'p5-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p5-model' },
       { modelId: 'p5-model', apiKey: 'synthetic-p5-key' });
@@ -1061,7 +1060,7 @@ it('desktop discloses the active Run and frozen invoice after the viewed invoice
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'active-context-model', credentialRef: 'active_context_credential',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'active-context-model', credentialRef: '00000000000000000000000000000006',
         name: 'Active context model', kind: 'custom', providerId: null, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'active-context-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'active-context-model' },
       { modelId: 'active-context-model', apiKey: 'synthetic-active-context-key' });
@@ -1135,7 +1134,7 @@ it(`desktop preserves a newer draft during Send preparation and ${outcome} admis
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'preparation-model', credentialRef: 'preparation_draft_credential',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'preparation-model', credentialRef: '00000000000000000000000000000007',
         name: 'Preparation model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'preparation-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'preparation-model' },
       { modelId: 'preparation-model', apiKey: 'synthetic-preparation-key' });
@@ -1223,7 +1222,7 @@ it(`desktop shows the actual frozen ${limit} allowance after budget exhaustion`,
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'frozen-budget-model', credentialRef: 'frozen_budget_credential',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'frozen-budget-model', credentialRef: '00000000000000000000000000000008',
         name: 'Frozen budget model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'frozen-budget-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'frozen-budget-model' },
       { modelId: 'frozen-budget-model', apiKey: 'synthetic-frozen-budget-key' });
@@ -1266,7 +1265,7 @@ it(`desktop shows the actual frozen ${limit} allowance after budget exhaustion`,
 });
 }
 
-for (const recovery of ['prompt-collision', 'active-collision', 'missing-prompt-hash'] as const) {
+for (const recovery of ['prompt-collision', 'active-collision', 'missing-prompt-identity'] as const) {
 it(`desktop unknown input recovery preserves its draft for ${recovery}`, async () => {
   it.setTimeout(60_000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-desktop-p5-collision-'));
@@ -1289,7 +1288,7 @@ it(`desktop unknown input recovery preserves its draft for ${recovery}`, async (
     await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
-      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'collision-model', credentialRef: 'p5_collision_credential',
+      return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'collision-model', credentialRef: '00000000000000000000000000000009',
         name: 'Collision model', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'collision-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'collision-model' },
       { modelId: 'collision-model', apiKey: 'synthetic-collision-key' });
@@ -1311,12 +1310,12 @@ it(`desktop unknown input recovery preserves its draft for ${recovery}`, async (
         if (!(result as { ok: boolean }).ok) throw new Error('Winning input was not accepted.');
         return { ok: false, error: { code: 'input_delivery_unknown', category: 'session', message: 'Controlled competing receipt', retryable: true } };
       });
-      if (kind === 'missing-prompt-hash') {
+      if (kind === 'missing-prompt-identity') {
         const query = handlers.get('flowmate:query-session-input'); if (!query) throw new Error('Missing input query');
         ipcMain.removeHandler('flowmate:query-session-input');
         ipcMain.handle('flowmate:query-session-input', async (event, ...args) => {
-          const result = await query(event, ...args) as { ok: boolean; data?: { input?: { content: { desktopRequestHash?: string } } } };
-          if (result.ok && result.data?.input) delete result.data.input.content.desktopRequestHash;
+          const result = await query(event, ...args) as { ok: boolean; data?: { input?: { content: { desktopRequestIdentity?: string } } } };
+          if (result.ok && result.data?.input) delete result.data.input.content.desktopRequestIdentity;
           return result;
         });
       }
@@ -1326,7 +1325,7 @@ it(`desktop unknown input recovery preserves its draft for ${recovery}`, async (
     await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Check input status', exact: true }).click();
     await expect(composer).toHaveValue('My retained input draft');
-    if (recovery === 'missing-prompt-hash') {
+    if (recovery === 'missing-prompt-identity') {
       await expect(page.getByRole('button', { name: 'Check input status', exact: true })).toBeVisible();
       await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
     } else {
@@ -1940,7 +1939,7 @@ it('desktop keeps requests blocked by actual Runtime state after finish and igno
       const state = await window.flowmate.getState();
       if (!state.ok) throw new Error('desktop_state_missing');
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'runtime-check-model',
-        credentialRef: 'runtime_check_credential', name: 'Runtime check', kind: 'custom', providerId: null,
+        credentialRef: '00000000000000000000000000000010', name: 'Runtime check', kind: 'custom', providerId: null,
         baseUrl: 'http://127.0.0.1:1/v1', model: 'controlled-runtime-model', api: 'openai-completions',
         contextWindow: 16_384, maxTokens: 4_096, reasoning: false }], defaultModelId: 'runtime-check-model' },
       { modelId: 'runtime-check-model', apiKey: 'synthetic-runtime-ui-key' });
@@ -2646,14 +2645,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
   const sourceRoot = await mkdtemp(join(tmpdir(), 'flowmate-desktop-p3-source-'));
   const sourceDirectory = join(sourceRoot, '000001');
   writeInvoiceSample(sourceDirectory);
-  const digest = createHash('sha256');
-  for (const name of ['original.png', 'content.json', 'pages.json', 'metadata.json']) {
-    const bytes = readFileSync(join(sourceDirectory, name));
-    const length = Buffer.alloc(8);
-    length.writeBigUInt64BE(BigInt(bytes.length));
-    digest.update(length).update(bytes);
-  }
-  const source = { documentId: 1, version: `rev-1:parsed-v3:${digest.digest('hex')}`, artifactId: 2, page: 1, blockId: 'b1', quote: 'INV-P3-1' };
+  const source = { documentId: 1, version: 'pending-import', artifactId: 2, page: 1, blockId: 'b1', quote: 'INV-P3-1' };
   const field = () => ({ raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] });
   const candidate = {
     fields: {
@@ -2720,6 +2712,9 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
       (dialog as unknown as { __selectedDefaultPath?: string }).__selectedDefaultPath);
     expect(selectedDefaultPath).toBe(join(resolve(import.meta.dirname, '../..'), 'data', 'invoices', 'agent-input'));
     await page.getByRole('heading', { name: 'Invoice 000001' }).waitFor({ state: 'visible', timeout: 10_000 });
+    const imported = await page.evaluate(() => window.flowmate.queryDocument(1));
+    if (!imported.ok) throw new Error(imported.error.code);
+    source.version = imported.data.documentRef.version;
     await page.locator('img[alt="Original invoice document page 1"]').waitFor({ state: 'visible', timeout: 10_000 });
     await page.getByRole('button', { name: 'Parsed', exact: true }).click();
     await page.getByText('Text · Page 1').waitFor({ state: 'visible', timeout: 10_000 });

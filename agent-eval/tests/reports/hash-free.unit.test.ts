@@ -1,19 +1,19 @@
 import { expect, test } from 'bun:test';
 import { artifactJson } from '../../src/artifacts.ts';
-import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { reportFixture } from '../support/fixtures.ts';
+import { reportFixture,comparisonFacts } from '../support/fixtures.ts';
 import { readReport, saveReport, comparison } from '../../src/reports/store.ts';
 import {aggregate} from '../../src/scoring/aggregate.ts';
 import {publicVersions,executionVersions} from '../../src/reports/files.ts';
-import { syntheticNativeModel } from '../support/native-model.ts';
+import {registerSecrets} from '../../src/execution/evidence-safety.ts';
 
 test('hash-free report comparison rejects changed native model capacities in actual snapshots', () => {
     const root = mkdtempSync(join(tmpdir(), 'eval-native-compare-'));
     try {
         const directories = ['a', 'b'].map(name => { const directory = join(root, name); mkdirSync(directory); return directory; });
-        const declaration = { version: 'v1', configuration: { model: 'native-model', modelCapabilities: syntheticNativeModel } };
+        const declaration = comparisonFacts();
         for (const directory of directories) { saveReport(join(directory, 'report.json'), reportFixture()); writeFileSync(join(directory, 'snapshot.json'), artifactJson(declaration)); }
         const left = readReport(join(directories[0]!, 'report.json')), right = readReport(join(directories[1]!, 'report.json'));
         expect(comparison(left, right)).toHaveLength(1);
@@ -25,12 +25,41 @@ test('hash-free report comparison rejects changed native model capacities in act
     } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('every public serialization strips nested digests, including JSON encoded inside requests',()=>{
-    const digest='a'.repeat(64);
-    const result=artifactJson({caseId:'FM-001',version:2,hash:digest,nested:[{originalSha256:digest,text:'evidence'}],
-        request:JSON.stringify({data:{contentHash:digest,tool:'read'}})});
-    expect(result).not.toMatch(/hash|sha256|\b[a-f0-9]{64}\b/i);
-    expect(JSON.parse(result)).toEqual({caseId:'FM-001',version:2,nested:[{text:'evidence'}],request:'{"data":{"tool":"read"}}'});
+test('comparison requires saved source and Agent configuration facts on both sides',()=>{
+    const root=mkdtempSync(join(tmpdir(),'eval-missing-comparison-facts-'));
+    try{
+        const directories=['left','right'].map(name=>{const directory=join(root,name);mkdirSync(directory);return directory;});
+        const reports=directories.map(directory=>{const file=join(directory,'report.json');saveReport(file,reportFixture());return readReport(file);});
+        expect(()=>comparison(reports[0]!,reports[1]!)).toThrow('original execution conditions');
+        expect(()=>comparison(reportFixture(),reportFixture())).toThrow('original execution conditions');
+        const declaration=comparisonFacts();
+        writeFileSync(join(directories[0]!,'snapshot.json'),artifactJson(declaration));
+        expect(()=>comparison(reports[0]!,reports[1]!)).toThrow('original execution conditions');
+        writeFileSync(join(directories[1]!,'snapshot.json'),artifactJson(declaration));
+        expect(comparison(reports[0]!,reports[1]!)).toHaveLength(1);
+        for(const incomplete of [{configuration:declaration.configuration},{runtimeSource:declaration.runtimeSource},
+            {...declaration,runtimeSource:{dependencies:{},files:[]}}]){
+            writeFileSync(join(directories[1]!,'snapshot.json'),artifactJson(incomplete));
+            expect(()=>comparison(reports[0]!,reports[1]!)).toThrow('original execution conditions');
+        }
+        const changed=structuredClone(declaration);changed.runtimeSource.files[0]!.text+='\nChanged actual implementation.';
+        writeFileSync(join(directories[1]!,'snapshot.json'),artifactJson(changed));
+        expect(()=>comparison(reports[0]!,reports[1]!)).toThrow('identical snapshot declarations');
+        registerSecrets(['synthetic-comparison-private-key']);
+        const secret=structuredClone(declaration);secret.runtimeSource.files[0]!.text+='\nsynthetic-comparison-private-key';
+        for(const directory of directories)writeFileSync(join(directory,'snapshot.json'),artifactJson(secret));
+        expect(()=>comparison(reports[0]!,reports[1]!)).toThrow('credential in execution conditions');
+        unlinkSync(join(directories[0]!,'snapshot.json'));
+        writeFileSync(join(directories[1]!,'snapshot.json'),artifactJson(declaration));
+        expect(()=>comparison(reports[0]!,reports[1]!)).toThrow('original execution conditions');
+    }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('artifact serialization preserves original source text and serialized tool arguments',()=>{
+    const text='a'.repeat(64),request=JSON.stringify({data:{text,tool:'read'}});
+    const value={caseId:'FM-001',version:2,nested:[{text}],request};
+    expect(JSON.parse(artifactJson(value))).toEqual(value);
+    expect(JSON.parse(artifactJson({error:new Error('Original failure')}))).toEqual({error:'Error: Original failure'});
 });
 test('public benchmark versions preserve actual product/source version fields',()=>{
     const product={contract:'product-result/v2',version:7,documentRef:{id:4,version:'v1'}};
@@ -64,4 +93,14 @@ test('saved reports are hash-free and remain readable and exportable',()=>{
         report.trials[0]!.execution!.answer='Changed original answer with identical summary';
         expect(()=>saveReport(file,report)).toThrow('immutable');
     } finally {rmSync(directory,{recursive:true,force:true});}
+});
+
+test('legacy identity-only reports keep original scores but cannot assert equivalence or be overwritten',()=>{
+ const directory=mkdtempSync(join(tmpdir(),'eval-legacy-identity-')),file=join(directory,'summary.json');
+ try{const report:any=reportFixture();delete report.trials[0].caseConditions;report.dataset.hash='legacy-only';
+ writeFileSync(file,JSON.stringify(report));const bytes=readFileSync(file,'utf8'),stored=readReport(file);
+ expect(stored.trials[0]!.scores).toEqual(report.trials[0].scores);expect(stored.history?.verification).toBe('unverified');
+ expect(()=>comparison(stored,stored)).toThrow('verified original');expect(()=>saveReport(file,stored)).toThrow('read-only');
+ expect(readFileSync(file,'utf8')).toBe(bytes);
+ }finally{rmSync(directory,{recursive:true,force:true});}
 });

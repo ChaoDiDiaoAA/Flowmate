@@ -14,6 +14,7 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   SessionInputsRequestSchema, SetSessionStatusRequestSchema, BranchSessionRequestSchema,
   SessionMessagesRequestSchema, WorkingDirectorySchema, WorkspaceExpectationSchema, SaveInvoiceCandidateRequestSchema,
   AcceptInvoiceCandidateRequestSchema, RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema,
+  InvoiceExportReadRequestSchema, InvoiceExportPageSchema,
   InvoiceCandidateOperationQuerySchema, RuntimeRequestOverridesSchema, RUNTIME_CONFIG,
   RuntimeEventsQuerySchema, RuntimeEventsSubscriptionRequestSchema, RuntimeSubscriptionIdSchema,
   ResourceFileRequestSchema, ResourceSelectionRequestSchema, ExtensionSelectionRequestSchema, SessionExtensionQuerySchema, RunExtensionQuerySchema, ExtensionCommandRequestSchema, ExtensionDisposeRequestSchema,
@@ -94,6 +95,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('accept_invoice_candidate'), input: AcceptInvoiceCandidateRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('reject_invoice_candidate'), input: RejectInvoiceCandidateRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('export_invoice_candidate'), input: ExportInvoiceCandidateRequestSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('read_invoice_export'), input: InvoiceExportReadRequestSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_invoice_candidate_operation'), input: InvoiceCandidateOperationQuerySchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('get_state') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('credential_response'),
@@ -367,6 +369,7 @@ export function matchesHistoryResponse(command: HostCommand, value: unknown): bo
 }
 
 const runtimeResultSchemas = {
+  read_invoice_export: z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: InvoiceExportPageSchema }).strict(), z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]),
   replay_invoice_save: z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: InvoiceSaveReplayReceiptSchema }).strict(), z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]),
   query_runtime_events: RuntimeEventsReadResultSchema,
   subscribe_runtime_events: RuntimeSubscriptionResultSchema,

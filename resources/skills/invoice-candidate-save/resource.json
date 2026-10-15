@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-candidate-save",
   "version": "v1",
@@ -39,13 +39,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1440,
-      "sha256": "b699e5fb32a0d4623b40f67b59e137f39ba2cba1cdc588fa660b2e46e2682566"
+      "bytes": 1440
     },
     {
       "path": "references/guide.md",
-      "bytes": 937,
-      "sha256": "11c1f06df30daed705a98eac50a1fcfc83e4696fb602a5ea6a1d96694af1dd68"
+      "bytes": 937
     }
   ]
 }

@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { codeIdentity } from '../../src/execution/source.ts';
 import * as source from '../../src/execution/source.ts';
-import { hash as contentHash } from '../../src/dataset-loader/local.ts';
 test('source snapshot reconstructs dirty and untracked execution code without environment files', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-source-'));
     const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
@@ -24,6 +23,9 @@ test('source snapshot reconstructs dirty and untracked execution code without en
         writeFileSync(join(root, 'packages/core/src/.env.local'), 'NESTED_SECRET=private-value');
         const destination = join(root, 'source-snapshot.json');
         const identity = codeIdentity(root, destination);
+        const conditions=source.runtimeSourceConditions(root,identity);
+        expect(conditions.files).toContainEqual({path:'packages/core/src/main.ts',text:dirty});
+        expect(conditions.files).toContainEqual({path:'packages/core/src/new.ts',text:'export const added = true;\n'});
         const snapshot = JSON.parse(readFileSync(destination, 'utf8'));
         writeFileSync(join(root, 'packages/core/src/main.ts'), 'later contents');
         const entry = snapshot.files.find((file: any) => file.path === 'packages/core/src/main.ts');
@@ -33,8 +35,10 @@ test('source snapshot reconstructs dirty and untracked execution code without en
         expect(snapshot.files.some((file: any) => file.path.includes('.env'))).toBe(false);
         expect(snapshot.workspaceHash).toBeUndefined();
         expect(snapshot.files.every((file:any)=>!('hash' in file))).toBe(true);
-        expect(codeIdentity(root).workspaceHash).not.toBe(identity.workspaceHash);
+        expect(source.changedSourcePaths(identity,codeIdentity(root))).toContain('packages/core/src/main.ts');
         expect(identity.dirty).toBe(true);
+        writeFileSync(join(root, 'packages/core/src/main.ts'), Buffer.from([0xc0, 0x80]));
+        expect(() => source.runtimeSourceConditions(root)).toThrow('not valid UTF-8');
     }
     finally {
         rmSync(root, { recursive: true, force: true });
@@ -54,7 +58,7 @@ test('source comparison reports actual added, changed and deleted paths while Gi
         writeFileSync(join(root,path),'changed');writeFileSync(join(root,'packages/core/src/b.ts'),'added');
         expect(source.changedSourcePaths(before,codeIdentity(root))).toEqual([path,'packages/core/src/b.ts']);
         unlinkSync(join(root,path));const absent=codeIdentity(root);git('add','-A');commit();
-        expect(codeIdentity(root).workspaceHash).toBe(absent.workspaceHash);
+        expect(source.changedSourcePaths(absent,codeIdentity(root))).toEqual([]);
         expect(source.changedSourcePaths(absent,codeIdentity(root))).toEqual([]);
         expect(JSON.stringify(before)).not.toContain('contentBase64');
     }finally{rmSync(root,{recursive:true,force:true});}
@@ -64,13 +68,31 @@ test('saved actual conditions include decimal scoring and research tool implemen
     const root=mkdtempSync(join(tmpdir(),'flowmate-source-conditions-'));
     const paths=['agent-eval/src/scoring/evaluators/invoice-values.ts','agent-eval/src/scoring/research-frame.ts',
         'agent-eval/src/scoring/research-judgment.ts','agent-eval/src/adapters/research-integrity.ts','agent-eval/src/artifacts.ts',
-        'packages/shared/src/decimal.ts','packages/core/src/research/source-text.ts'];
+        'packages/shared/src/decimal.ts','packages/core/src/research/source-text.ts','apps/host/main.ts',
+        'packages/core/src/resources/loader.ts','resources/prompts/system/prompt.md'];
     try{
+        execFileSync('git',['init','-q'],{cwd:root});
+        execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false','commit','--allow-empty','-qm','fixture'],{cwd:root});
         for(const path of paths){mkdirSync(join(root,path,'..'),{recursive:true});writeFileSync(join(root,path),'original implementation');}
-        expect(source.runtimeSourceConditions(root).files.map((f:{path:string})=>f.path)).toEqual(paths);
+        expect(source.runtimeSourceConditions(root).files.map((f:{path:string})=>f.path)).toEqual([...paths].sort());
         for(const path of paths){const before=source.runtimeSourceConditions(root);writeFileSync(join(root,path),'changed scoring or source rule');
             expect(source.runtimeSourceConditions(root)).not.toEqual(before);}
     }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('local runtime source declarations refuse configured credentials in actual file bodies',()=>{
+    const root=mkdtempSync(join(tmpdir(),'flowmate-source-secret-'));
+    const prior=process.env.FLOWMATE_EVAL_AGENT_API_KEY;
+    try{
+        execFileSync('git',['init','-q'],{cwd:root});
+        execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false','commit','--allow-empty','-qm','fixture'],{cwd:root});
+        mkdirSync(join(root,'apps/host'),{recursive:true});
+        process.env.FLOWMATE_EVAL_AGENT_API_KEY='synthetic-source-private-key';
+        for(const key of ['synthetic-source-private-key','sk-lf-private-source-example']){
+            writeFileSync(join(root,'apps/host/main.ts'),`export const credential = "${key}";`);
+            expect(()=>source.runtimeSourceConditions(root)).toThrow('credential in execution source');
+        }
+    }finally{if(prior===undefined)delete process.env.FLOWMATE_EVAL_AGENT_API_KEY;else process.env.FLOWMATE_EVAL_AGENT_API_KEY=prior;rmSync(root,{recursive:true,force:true});}
 });
 
 test('reproduction includes desktop TSX, resource text and SDK patches but excludes quality assets', () => {
@@ -91,15 +113,15 @@ test('reproduction includes desktop TSX, resource text and SDK patches but exclu
         }
         git('add', '.');
         git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'test baseline');
-        let previous = codeIdentity(root).workspaceHash;
+        let previous = codeIdentity(root);
         for (const path of sources) {
             writeFileSync(join(root, path), 'changed');
-            const current = codeIdentity(root).workspaceHash;
-            expect(current, path).not.toBe(previous);
+            const current = codeIdentity(root);
+            expect(source.changedSourcePaths(previous,current)).toEqual([path]);
             previous = current;
         }
         for (const path of excluded) writeFileSync(join(root, path), 'quality-or-secret');
-        expect(codeIdentity(root).workspaceHash).toBe(previous);
+        expect(source.changedSourcePaths(previous,codeIdentity(root))).toEqual([]);
         const destination = join(root, 'snapshot.json');
         codeIdentity(root, destination);
         const snapshot = JSON.parse(readFileSync(destination, 'utf8'));

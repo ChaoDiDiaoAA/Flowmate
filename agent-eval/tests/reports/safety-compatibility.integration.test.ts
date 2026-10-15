@@ -33,7 +33,7 @@ function report(c: EvaluationContext, scored: Awaited<ReturnType<typeof evaluate
     const trial = value.trials[0]!; trial.caseId = c.task.id; trial.execution = c.result; trial.semanticPlan = c.semanticPlan;
     trial.metricPlan = 'contract' in c.task ? c.task.expected.metrics : undefined;
     trial.scores = scored.scores; trial.judgeCalls = scored.judgeCalls; Object.assign(trial, aggregate(trial.scores, c.result));
-    value.scoringConfiguration.judgeHash = scored.judgeCalls[0]?.configuration.configHash ?? null; return value;
+     return value;
 }
 
 test('independently witnessed safety failure survives save and readback even with a Provider failure', async () => {

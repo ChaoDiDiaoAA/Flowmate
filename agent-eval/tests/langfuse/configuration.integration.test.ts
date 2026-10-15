@@ -23,7 +23,7 @@ test('Langfuse env reaches the real SDK against a local stub and resends without
         writeFileSync(join(root,'agent-eval/configs/.env'),`# 本地模拟平台\nLANGFUSE_BASE_URL=http://127.0.0.1:${server.port}\n`);
         const report=reportFixture(),scores=JSON.stringify(report.trials),file=join(root,'agent-eval/runs',report.executionId,'report.json');
         saveReport(file,report);
-        await exportReport(report,file,undefined,root);expect(report.export.status).toBe('partial');
+        await exportReport(report,file,undefined,root);expect(report.export,JSON.stringify(report.export)).toMatchObject({status:'partial'});
         partial=false;await main(['resend','--execution-id',report.executionId],root);expect(readReport(file).export.status).toBe('complete');
         expect(JSON.stringify(report.trials)).toBe(scores);expect(requests).toHaveLength(2);
         expect(requests[0]!.auth).toBe('Basic '+Buffer.from('test-lf-public:test-lf-secret').toString('base64'));

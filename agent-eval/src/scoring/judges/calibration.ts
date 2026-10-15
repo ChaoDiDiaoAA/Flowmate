@@ -3,7 +3,7 @@ import {isDeepStrictEqual} from 'node:util';
 import {randomUUID} from 'node:crypto';
 import {readFileSync,mkdirSync,lstatSync,realpathSync,openSync,writeFileSync,fsyncSync,closeSync,renameSync,unlinkSync} from 'node:fs';
 import {join,resolve} from 'node:path';
-import {inside,hash} from '../../dataset-loader/local.ts';
+import {inside} from '../../dataset-loader/local.ts';
 import {artifactJson} from '../../artifacts.ts';
 import {publicVersions,executionVersions} from '../../reports/files.ts';
 import {safeId,judgeCallSchema,sdkJudgeConfigurationSchema,legacyJudgeConfigurationSchema} from '../../reports/store.ts';
@@ -52,21 +52,22 @@ export function loadCalibration(directory:string){
  });
  for(const field of ['id','file']as const)if(new Set(samples.map(s=>s[field])).size!==samples.length)throw Error('Duplicate calibration '+field);
  if(new Set(samples.map(s=>s.document.instanceId)).size!==samples.length)throw Error('Calibration instances may not be reused');
- const evidencePartitions=new Map<string,string>(),seenQuestions=new Set<string>();
+ const seen:Array<{evidence:unknown;partition:string;metrics:string[]}>=[];
  for(const{document}of samples){
-  const identity=hash(document.evidence),partition=evidencePartitions.get(identity);
-  if(partition&&partition!==document.partition)throw Error('Calibration evidence crosses tune/validation');evidencePartitions.set(identity,document.partition);
-  for(const criterion of document.plan.criteria){const key=identity+':'+criterion.metricId;if(seenQuestions.has(key))throw Error('Duplicate criterion reference evidence');seenQuestions.add(key);}
+  const metrics=document.plan.criteria.map(c=>c.metricId),prior=seen.filter(record=>isDeepStrictEqual(record.evidence,document.evidence));
+  if(prior.some(record=>record.partition!==document.partition))throw Error('Calibration evidence crosses tune/validation');
+  if(prior.some(record=>record.metrics.some(metric=>metrics.includes(metric))))throw Error('Duplicate criterion reference evidence');
+  seen.push({evidence:document.evidence,partition:document.partition,metrics});
  }
  const groups=new Map<string,string>();for(const {document}of samples){const prior=groups.get(document.sourceGroup);if(prior&&prior!==document.partition)throw Error('Source group crosses tune/validation');groups.set(document.sourceGroup,document.partition);}
  const metrics=new Set(samples.flatMap(s=>s.document.plan.criteria.map(c=>c.metricId)));
  for(const metricId of metrics)for(const partition of ['tune','validation'])if(!samples.some(s=>s.document.partition===partition&&s.document.references.some(r=>r.metricId===metricId)))throw Error('Every criterion needs independent tune and validation references');
- return{manifest,samples,hash:hash({manifest,samples})};
+ return{manifest,samples};
 }
 type CriterionSummary={partition:'tune'|'validation';metricId:string;samples:number;measured:number;countsCorrect:number;falseAccepts:number;falseRejects:number;severeErrorMisses:number;unjudgeable:number;errors:number;notRun:number;citationSamples:number;citationCorrect:number};
 type SampleResult={id:string;instanceId:string;partition:'tune'|'validation';reference:z.infer<typeof documentSchema>;call:JudgeCall|null};
 export type CalibrationReport={contract:'flowmate-judge-calibration-report/v1';executionId:string;kind:'engineering-fixture'|'actual-judge-calibration';acceptance:'not-assessed';
- referenceHash?:string;configuration:JudgeCall['configuration'];rubrics:ReturnType<typeof rubricsFor>;startedAt:string;endedAt:string|null;executionComplete:boolean;samples:SampleResult[];criteria:CriterionSummary[]};
+ history?:{verification:'unverified';gaps:string[]};configuration:JudgeCall['configuration'];rubrics:ReturnType<typeof rubricsFor>;startedAt:string;endedAt:string|null;executionComplete:boolean;samples:SampleResult[];criteria:CriterionSummary[]};
 
 function summaries(samples:SampleResult[]):CriterionSummary[]{
  const groups=new Map<string,CriterionSummary>();
@@ -95,7 +96,8 @@ function summaries(samples:SampleResult[]):CriterionSummary[]{
 const criterionSummarySchema=z.object({partition:z.enum(['tune','validation']),metricId:text,samples:count,measured:count,countsCorrect:count,
  falseAccepts:count,falseRejects:count,severeErrorMisses:count,unjudgeable:count,errors:count,notRun:count,citationSamples:count,citationCorrect:count}).strict();
 const calibrationReportSchema=z.object({contract:z.literal('flowmate-judge-calibration-report/v1'),executionId:text,
- kind:z.enum(['engineering-fixture','actual-judge-calibration']),acceptance:z.literal('not-assessed'),referenceHash:text.optional(),
+ kind:z.enum(['engineering-fixture','actual-judge-calibration']),acceptance:z.literal('not-assessed'),
+ history:z.object({verification:z.literal('unverified'),gaps:z.array(text).min(1)}).strict().optional(),
  configuration:z.union([sdkJudgeConfigurationSchema,legacyJudgeConfigurationSchema]),
  rubrics:z.array(z.object({id:text,version:count.positive(),prompt:z.string().min(1)}).strict()).refine(r=>new Set(r.map(x=>x.id)).size===r.length),
  startedAt:z.string().datetime(),endedAt:z.string().datetime().nullable(),executionComplete:z.boolean(),
@@ -106,8 +108,15 @@ const calibrationReportSchema=z.object({contract:z.literal('flowmate-judge-calib
 export function readCalibrationReport(path:string):CalibrationReport {
  const value=executionVersions(JSON.parse(readFileSync(path,'utf8')));
  if(!isJsonData(value))throw Error('Calibration report must contain finite JSON data');
+ let legacy=false;
+ const drop=(record:any,keys:string[])=>{if(!record||typeof record!=='object')return;for(const key of keys)if(Object.hasOwn(record,key)){delete record[key];legacy=true;}};
+ const configuration=(c:any)=>{drop(c,['configHash']);drop(c?.rubric,['hash']);};
+ drop(value,['referenceHash']);configuration(value.configuration);
+ for(const sample of value.samples??[]){configuration(sample.call?.configuration);drop(sample.call?.request,['hash']);}
+ if(legacy)value.history={verification:'unverified',gaps:['Original reference identity metadata cannot establish content equivalence.']};
  calibrationReportSchema.parse(value);const report=value as CalibrationReport;
  safeId(report.executionId);
+ if(report.history)return report;
  const templates=[legacyCompactRubric,legacyPlainRubric,legacyPackedRubric,compactRubric,...metricRubrics];
  if(report.rubrics.some(r=>!templates.some(t=>t.id===r.id&&t.version===r.version&&t.prompt===r.prompt)))throw Error('Unknown original calibration template');
  const ids=new Set<string>(),instances=new Set<string>(),calls=new Set<string>();
@@ -117,11 +126,11 @@ export function readCalibrationReport(path:string):CalibrationReport {
   ids.add(sample.id);instances.add(sample.instanceId);
   const call=sample.call;if(!call)continue;
   if(calls.has(call.callId))throw Error('Duplicate calibration call');calls.add(call.callId);
-  const {configHash,...parameters}=call.configuration,{rubric,...connection}=parameters,{configHash:_,...declared}=report.configuration;
-  if(configHash&&configHash!==hash(parameters)||!isDeepStrictEqual(connection,declared))throw Error('Calibration Judge differs from its original connection');
+  const {rubric,...connection}=call.configuration,declared=report.configuration;
+  if(!isDeepStrictEqual(connection,declared))throw Error('Calibration Judge differs from its original connection');
   const template=report.rubrics.find(r=>r.id===rubric?.id&&r.version===rubric.version&&r.prompt===call.request?.system);
   if(!template||!call.request||!call.compact||call.judgment!==null||!isDeepStrictEqual(call.compact.plan,sample.reference.plan))throw Error('Calibration call lacks its original template and plan');
-  if(call.request.hash&&call.request.hash!==hash([call.request.system,call.request.data])||call.request.redacted&&call.compact.judgment!==null)throw Error('Calibration request identity or redaction contradicts its judgment');
+  if(call.request.redacted&&call.compact.judgment!==null)throw Error('Calibration request identity or redaction contradicts its judgment');
   const input=JSON.parse(call.request.data);
   const expectedEvidence=template.id.endsWith('-v3')?evaluatorEvidence(sample.reference.plan,sample.reference.evidence):sample.reference.evidence;
   if(!isDeepStrictEqual(input.plan,sample.reference.plan)||!isDeepStrictEqual(input.evidence,expectedEvidence))throw Error('Calibration request differs from its original reference');
@@ -154,7 +163,7 @@ export async function calibrateJudge(repo:string,options:{directory:string;execu
  if((scanEvidence(kit,[configured.apiKey]).fact.actual as{leaked:boolean}).leaked)throw Error('Configured secret in calibration references');
  const executionId=safeId(options.executionId),config=await prepareJudge(configured,deps.fetcher,deps.signal);
  const directory=createRunDirectory(repo,executionId,'calibration'),file=join(directory,'summary.json');
- const report:CalibrationReport={contract:'flowmate-judge-calibration-report/v1',executionId,kind:deps.fetcher?'engineering-fixture':'actual-judge-calibration',acceptance:'not-assessed',referenceHash:kit.hash,
+ const report:CalibrationReport={contract:'flowmate-judge-calibration-report/v1',executionId,kind:deps.fetcher?'engineering-fixture':'actual-judge-calibration',acceptance:'not-assessed',
   configuration:publicJudgeConfig(config),rubrics,startedAt:new Date().toISOString(),endedAt:null,executionComplete:false,
   samples:kit.samples.map(s=>({id:s.id,instanceId:s.document.instanceId,partition:s.document.partition,reference:s.document,call:null})),criteria:[]};
  report.criteria=summaries(report.samples);save(file,report);

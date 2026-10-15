@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../../src/cli.ts';
-import { reportFixture } from '../support/fixtures.ts';
+import { reportFixture,comparisonFacts } from '../support/fixtures.ts';
 
 test('explicit comparison adds a pending regression signal only after the existing comparability checks', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'eval-diagnostic-compare-'));
@@ -12,6 +12,7 @@ test('explicit comparison adds a pending regression signal only after the existi
         if (id === 'right') { trial.status = 'FAIL'; trial.scores[0]!.status = 'FAIL'; trial.scores[0]!.value = 0; }
         const directory = join(repo, 'agent-eval/runs', id); mkdirSync(directory, { recursive: true });
         writeFileSync(join(directory, 'report.json'), JSON.stringify(report));
+        writeFileSync(join(directory,'snapshot.json'),JSON.stringify(comparisonFacts()));
     }
     const output = spyOn(console, 'log').mockImplementation(() => {});
     try {

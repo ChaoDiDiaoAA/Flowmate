@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "deep-research",
   "version": "v1",
@@ -19,8 +19,7 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 3346,
-      "sha256": "6249407320c0c39869dce1b3ec2a5daf9eff7811a03586715cf6bf330bb69ee9"
+      "bytes": 3346
     }
   ]
 }

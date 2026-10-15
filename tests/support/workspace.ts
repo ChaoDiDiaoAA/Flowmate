@@ -29,6 +29,7 @@ export function prepareTestWorkspaceVerifier(store: { documents: DocumentReposit
       { id: row.parsed_artifact_id, file: 'parsed.json', mime: 'application/json', bytes: parsed }]) {
       mkdirSync(join(root, 'artifacts', String(artifact.id)), { recursive: true });
       writeFileSync(join(root, 'artifacts', String(artifact.id), artifact.file), artifact.bytes);
+      store.documents.contents!.remember({ ownerKind: 'artifact', ownerId: String(artifact.id), relativePath: artifact.file }, artifact.bytes);
       const metadata = { version: 1, sourceKey: row.source_key, sourceRecordId: row.source_record_id, sourceVersion: row.version,
         files: [{ relativePath: artifact.file, bytes: artifact.bytes.byteLength, mimeType: artifact.mime }] };
       store.db.query('UPDATE artifacts SET relative_path=?,bytes=?,mime_type=?,metadata_json=? WHERE id=?')

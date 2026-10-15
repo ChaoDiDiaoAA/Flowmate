@@ -2,7 +2,6 @@ import {expect,test} from 'bun:test';
 import {formalRules} from '../../src/scoring/formal-rules.ts';
 import {evaluateFormalMetrics} from '../../src/scoring/evaluators/formal.ts';
 import {formalFixture} from '../support/formal.ts';
-import {hash} from '../../src/dataset-loader/local.ts';
 import type {ToolCallSnapshot} from '../../../packages/contracts/src/activity.ts';
 import type {EvaluationContext,EvaluationScore} from '../../src/scoring/types.ts';
 import {evaluateAll} from '../../src/scoring/evaluate.ts';
@@ -38,7 +37,7 @@ function originalFacts(context:EvaluationContext,tools:ToolCallSnapshot[]){
     const at='2026-10-12T00:00:00.000Z';
     context.result.evidence.runs={present:true,actual:[{runId:1,sessionId:1,kind:'agent',status:'completed',scope:{version:2,allowedTools:['read_invoice_evidence'],allowedDocumentIds:[1],allowedArtifactIds:[2],allowedResourcePaths:[]},
         stoppedAt:at,cleanup:{stopped:true},config:{runtimeBudget:{maxToolCalls:4}}}],source:'Independent original Run'};
-    context.result.evidence['tool-evidence']={present:true,actual:{calls:tools.map(tool=>({tool,sha256:hash(tool),bytes:Buffer.byteLength(JSON.stringify(tool))}))},source:'Independent original ToolCall'};
+    context.result.evidence['tool-evidence']={present:true,actual:{calls:tools.map(tool=>({tool,bytes:Buffer.byteLength(JSON.stringify(tool))}))},source:'Independent original ToolCall'};
 }
 test('zero-tool negative controls retain tool and Skill opportunities locally and preserve missing evidence',()=>{
     const context:EvaluationContext=fixture('tool-selection','skill-selection','progressive-reading');
@@ -72,7 +71,7 @@ test('zero-tool absence never passes without original root and matching resource
 });
 for(const status of ['succeeded','failed','missing'] as const)test('tool-execution original protocol '+status,()=>{
     const context=fixture('tool-execution'),tool=originalTool(status==='failed');originalFacts(context,[tool]);
-    context.result.evidence['tool-evidence']={present:status!=='missing',actual:status==='missing'?null:{calls:[{tool,sha256:hash(tool),bytes:Buffer.byteLength(JSON.stringify(tool))}]},source:'Independent synthetic original ToolCall'};
+    context.result.evidence['tool-evidence']={present:status!=='missing',actual:status==='missing'?null:{calls:[{tool,bytes:Buffer.byteLength(JSON.stringify(tool))}]},source:'Independent synthetic original ToolCall'};
     const score=evaluateFormalMetrics(context).find(s=>s.metricId==='tool-execution')!;
     expect(score.status).toBe(status==='succeeded'?'PASS':status==='failed'?'FAIL':'UNJUDGEABLE');
     expect(score.statistics).toMatchObject({unit:'实际调用',denominator:status==='missing'?null:1});

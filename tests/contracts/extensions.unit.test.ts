@@ -3,16 +3,16 @@ import type { ZodTypeAny } from 'zod';
 import * as contracts from '../../packages/contracts/src/index.ts';
 
 const schema = (name: string): ZodTypeAny | undefined => Reflect.get(contracts, name);
-const hash = 'a'.repeat(64), at = '2026-10-06T08:00:00.000Z';
+const at = '2026-10-06T08:00:00.000Z';
 const instanceId = '5c080336-167f-437b-9959-0888e7708045';
 const otherInstance = '24df64c4-8bba-4327-bd38-3546e7cae10c';
-const ref = { id: 'invoice-assist', version: 'v1', manifestHash: hash };
+const ref = { id: 'invoice-assist', version: 'v1' };
 const hooks = [
   { event: 'session_start', policy: 'critical' }, { event: 'tool_call', policy: 'critical' },
   { event: 'tool_result', policy: 'observer' }, { event: 'tool_execution_end', policy: 'observer' },
   { event: 'session_shutdown', policy: 'critical' },
 ] as const;
-const manifest = { schemaVersion: 1, kind: 'extension', id: 'invoice-assist', version: 'v1', sdkVersion: '0.85.1',
+const manifest = { schemaVersion: 2, kind: 'extension', id: 'invoice-assist', version: 'v1', sdkVersion: '0.85.1',
   entryId: 'invoice-assist-v1', tools: [{ name: 'check_invoice_sources', version: '1' }], commands: ['invoice-assist'], hooks } as const;
 const selection = { enabledExtensions: [ref] };
 const frozen = { version: 1, policyVersion: 'p12-managed-extensions-v1', settingsRevision: 2,
@@ -42,17 +42,16 @@ it('freezes only the two closed evaluation profiles on an active P13 invoice ext
 
 describe('P12 controlled extension contracts', () => {
   it('[F13-27] keeps two fixed extension ledgers and rejects crossed registration or legacy expansion', () => {
-    const subagentRef = { id: 'subagents', version: 'v1', manifestHash: 'b'.repeat(64) };
+    const subagentRef = { id: 'subagents', version: 'v1' };
     const subagentManifest = { ...manifest, id: 'subagents', entryId: 'pi-subagents-managed-v1',
       pluginVersion: '0.19.0', patchVersion: 'flowmate-p13.1',
-      patchHash: 'a02f1ec857806c46212940c39d7066992d034ff5d8954b70c8aee402f815a98a',
       tools: [{ name: 'Agent', version: '0.19.0-p13.1' }], commands: [] };
     const dual = { ...frozen, policyVersion: 'p13-managed-extensions-v1', selected: [ref, subagentRef],
       included: [{ ref, manifest }, { ref: subagentRef, manifest: subagentManifest }] };
     expect(contracts.ExtensionSelectionSchema.safeParse({ enabledExtensions: dual.selected }).success).toBe(true);
     expect(contracts.FrozenExtensionsSchema.safeParse(dual).success).toBe(true);
     expect(contracts.FrozenExtensionsSchema.safeParse({ ...dual, policyVersion: frozen.policyVersion }).success).toBe(false);
-    expect(contracts.ExtensionManifestSchema.safeParse({ ...subagentManifest, patchHash: 'a'.repeat(64) }).success).toBe(false);
+    expect(contracts.ExtensionManifestSchema.safeParse({ ...subagentManifest, patchVersion: 'unregistered' }).success).toBe(false);
     const childExtension = { ...instance, instanceId: otherInstance, ref: subagentRef, registeredTools: ['Agent'], registeredCommands: [] };
     expect(contracts.SessionExtensionViewSchema.safeParse({ sessionId: 1, nativeSessionId: 'native-1', instances: [instance, childExtension] }).success).toBe(true);
     expect(contracts.ExtensionInstanceViewSchema.safeParse({ ...childExtension, registeredTools: ['check_invoice_sources'] }).success).toBe(false);
@@ -68,7 +67,7 @@ describe('P12 controlled extension contracts', () => {
   });
   it('[F12-02/07] refuses executable paths, duplicate or unsupported declarations', () => {
     expect(schema('ExtensionRefSchema')?.safeParse(ref).success).toBe(true);
-    for (const change of [{ id: '..' }, { version: 'CON' }, { manifestHash: 'A'.repeat(64) }, { entry: 'C:/secret.js' }])
+    for (const change of [{ id: '..' }, { version: 'CON' }, { entry: 'unregistered' }, { entry: 'C:/secret.js' }])
       expect(schema('ExtensionRefSchema')?.safeParse({ ...ref, ...change }).success).toBe(false);
     expect(schema('ExtensionManifestSchema')?.safeParse(manifest).success).toBe(true);
     for (const change of [{ entryId: '../module.ts' }, { sdkVersion: '1.0.2' }, { commands: ['compact'] },
@@ -83,7 +82,7 @@ describe('P12 controlled extension contracts', () => {
   it('[F12-04/23] preserves an exact selected partition and historical proof ownership', () => {
     expect(schema('FrozenExtensionsSchema')?.safeParse(frozen).success).toBe(true);
     for (const change of [{ included: [] }, { excluded: [{ ref, code: 'tool_not_active' }] },
-      { included: [{ ref: { ...ref, manifestHash: 'b'.repeat(64) }, manifest }] },
+      { included: [{ ref: { ...ref, version: 'v2' }, manifest }] },
       { included: [{ ref, manifest: { ...manifest, id: 'other' } }] }])
       expect(schema('FrozenExtensionsSchema')?.safeParse({ ...frozen, ...change }).success).toBe(false);
     const view = { sessionId: 1, runId: 2, frozen, assembly };
@@ -91,7 +90,7 @@ describe('P12 controlled extension contracts', () => {
     expect(schema('RunExtensionViewSchema')?.safeParse({ sessionId: 1, runId: 2, frozen: null, assembly: null }).success).toBe(true);
     expect(schema('RunExtensionViewSchema')?.safeParse({ ...view, frozen: null }).success).toBe(false);
     expect(schema('RunExtensionViewSchema')?.safeParse({ ...view, assembly: { ...assembly,
-      instances: [{ ...assembly.instances[0], ref: { ...ref, manifestHash: 'b'.repeat(64) } }] } }).success).toBe(false);
+      instances: [{ ...assembly.instances[0], ref: { ...ref, version: 'v2' } }] } }).success).toBe(false);
     expect(schema('RunExtensionViewSchema')?.safeParse({ ...view, assembly: { ...assembly, instances: [] } }).success).toBe(false);
     const old = { revision: 3, selection: { prompt: null, enabledSkills: [] } };
     expect(schema('AssemblySelectionSnapshotSchema')?.parse(old).extensions).toEqual({ enabledExtensions: [] });
@@ -134,7 +133,7 @@ describe('P12 controlled extension contracts', () => {
 
   it('[F12-02] canonicalizes object keys while retaining the declared Hook order', () => {
     const canonical = Reflect.get(contracts, 'canonicalExtensionManifest');
-    const expected = '{"schemaVersion":1,"kind":"extension","id":"invoice-assist","version":"v1","sdkVersion":"0.85.1",'
+    const expected = '{"schemaVersion":2,"kind":"extension","id":"invoice-assist","version":"v1","sdkVersion":"0.85.1",'
       + '"entryId":"invoice-assist-v1","tools":[{"name":"check_invoice_sources","version":"1"}],"commands":["invoice-assist"],'
       + '"hooks":[{"event":"session_start","policy":"critical"},{"event":"tool_call","policy":"critical"},'
       + '{"event":"tool_result","policy":"observer"},{"event":"tool_execution_end","policy":"observer"},'

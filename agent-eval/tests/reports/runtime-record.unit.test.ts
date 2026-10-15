@@ -11,7 +11,6 @@ import { legacyPlainRubric } from '../../src/scoring/judges/packed.ts';
 import { runJudge } from '../../src/scoring/judges/harness.ts';
 import { compactScores, type CompactPlan } from '../../src/scoring/judges/compact.ts';
 import { judgeConfig } from '../../src/scoring/judges/client.ts';
-import { hash } from '../../src/dataset-loader/local.ts';
 
 test('new reports aggregate and save actual Trials without an approval record', () => {
     const report = reportFixture(); report.contract = 'flowmate-agent-run/v2';
@@ -29,13 +28,13 @@ test('the previous plain JSON Prompt remains readable with its original scores',
         FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1',FLOWMATE_JUDGE_API_KEY:'synthetic-legacy-json-key'})!;
     const call=await runJudge(config,legacyPlainRubric.prompt,JSON.stringify({plan,evidence:{answer:{present:true,actual:'Synthetic answer',source:'synthetic'}}}),async()=>
         judgeResponse({choices:[{message:{content:'{"v":1,"r":[[1,1,0]],"f":[]}'},finish_reason:'stop'}]}),undefined,plan);
-    call.request!.system=legacyPlainRubric.prompt;call.request!.hash=hash([call.request!.system,call.request!.data]);
-    call.configuration.rubric={id:legacyPlainRubric.id,version:legacyPlainRubric.version,hash:hash(legacyPlainRubric.prompt)};
-    const {configHash:_,...parameters}=call.configuration;call.configuration.configHash=hash(parameters);
+    call.request!.system=legacyPlainRubric.prompt;
+    call.configuration.rubric={id:legacyPlainRubric.id,version:legacyPlainRubric.version};
+
     const report=reportFixture();report.contract='flowmate-agent-run/v2';report.trials[0]!.metricPlan=[{metricId:'task-success',version:1,unit:'Trial',denominator:1},
         {metricId:'tool-selection',version:1,unit:'决策点',denominator:1}];
     report.trials[0]!.semanticPlan=plan;report.trials[0]!.judgeCalls=[call];report.trials[0]!.scores.push(...compactScores(call));
-    report.aggregation=aggregateTrials(report);report.scoringConfiguration.judgeHash=call.configuration.configHash;
+    report.aggregation=aggregateTrials(report);
     const file=join(mkdtempSync(join(tmpdir(),'eval-previous-json-')),'report.json');writeFileSync(file,JSON.stringify(report));
     expect(readReport(file).trials[0]!.scores.find(s=>s.metricId==='tool-selection')!.value).toBe(1);
 });
@@ -43,7 +42,7 @@ test('the previous plain JSON Prompt remains readable with its original scores',
 test('historical report metadata is read-only compatible without becoming a new requirement', () => {
     const report = reportFixture(); report.contract = 'flowmate-agent-run/v2';
     report.trials[0]!.metricPlan = [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 }];
-    const legacy = { ...report, frozenConditions: { configurationHash: 'historical-only', strategyGroup: 'A' } };
+    const legacy = { ...report, frozenConditions: {  strategyGroup: 'A' } };
     legacy.aggregation = aggregateTrials(legacy);
     const file = join(mkdtempSync(join(tmpdir(), 'eval-historical-record-')), 'report.json');
     const bytes = JSON.stringify(legacy); writeFileSync(file, bytes);

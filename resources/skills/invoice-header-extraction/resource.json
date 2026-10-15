@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-header-extraction",
   "version": "v1",
@@ -36,13 +36,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1404,
-      "sha256": "b5911cba209f5e258493836345433e5c4a0d226de4598753285e51661da9c7e6"
+      "bytes": 1404
     },
     {
       "path": "references/guide.md",
-      "bytes": 988,
-      "sha256": "b68f2fa578be3d11e49e44836b265bf77316da934ac26915028cb53317b8aa1a"
+      "bytes": 988
     }
   ]
 }

@@ -2,7 +2,6 @@ import { expect, test } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
 import { cleanupResources, createHttpProvider, mkdtempSync } from '../support/resources.ts';
 import { prepareHostTrial } from '../../agent-eval/src/adapters/host-research.ts';
 import { REPO_ROOT } from '../../agent-eval/src/dataset-loader/local.ts';
@@ -19,7 +18,6 @@ for (const isolation of [undefined] as const) test('evaluation Fill uses actual 
     test.setTimeout(90000);
     const root = mkdtempSync(join(tmpdir(), 'eval-electron-fill-')), sample = 'synthetic-fill', text = 'Invoice INV-CONTROL-1';
     mkdirSync(join(root, 'materials', sample), { recursive: true }); writeFileSync(join(root, 'materials', sample, 'source.md'), text);
-    const sha256 = createHash('sha256').update(text).digest('hex');
     let source: { documentRef: { id: number; version: string }; parsedArtifactId: number };
     const requests: unknown[] = [];
     const server = await createHttpProvider(async request => {
@@ -39,7 +37,7 @@ for (const isolation of [undefined] as const) test('evaluation Fill uses actual 
     const prompt = 'Read this synthetic invoice and save its candidate.';
     const item: AgentTrial = { identity: { executionId: 'fill-engineering', trialId: 'actual-controls', caseId: 'synthetic-fill', caseVersion: 1 },
         directory: join(root, 'trial'), requires: ['agent', 'invoice', 'workspace'], input: { prompt, materials: [{ sample, file: 'source.md', text }] },
-        invoiceSource: { root, materials: [{ source: 'local-text', sample, file: 'source.md', sha256, originalSha256: sha256 }] },
+        invoiceSource: { root, materials: [{ source: 'local-text', sample, file: 'source.md' }] },
         configuration: { model: 'fill-engineering', baseUrl: `http://${isolation ? '127.0.0.1' : '127.0.0.1'}:${server.port}/v1`, api: 'openai-completions', modelCapabilities: syntheticNativeModel },
         steps: controllerStepsSchema.parse([{ id: 'save', action: 'invoice-message', instruction: prompt, sample, goalMode: 'save-candidate' },
             { id: 'select', action: 'select-candidate', fromStep: 'save', ordinal: 1 }, { id: 'fill', action: 'fill-form' }]) };

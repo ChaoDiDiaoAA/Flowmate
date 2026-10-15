@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-source-audit",
   "version": "v1",
@@ -32,13 +32,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1340,
-      "sha256": "cac8a32005d6fcc6d19f4a748447f8c4f11606fac3cf6cb69a56cf547d03ca18"
+      "bytes": 1340
     },
     {
       "path": "references/guide.md",
-      "bytes": 829,
-      "sha256": "b560c47a7f6366dbdb6758a5c0273d4a89fffef02d39ba6410c31ab2f3fb9efa"
+      "bytes": 829
     }
   ]
 }

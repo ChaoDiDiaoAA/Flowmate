@@ -1,3 +1,4 @@
+import { defaultProductSettings } from '@flowmate/core';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -9,7 +10,7 @@ import { Database } from 'bun:sqlite';
 import { createServer } from 'node:http';
 import { openDatabase } from '@flowmate/core';
 import { resolveProductPaths } from '@flowmate/shared';
-import { RuntimeToolPageSchema, RuntimeToolViewSchema, SessionMessageViewSchema } from '@flowmate/contracts';
+import { RuntimeToolPageSchema, RuntimeToolViewSchema, SessionMessageViewSchema, serializeDesktopPromptRequest } from '@flowmate/contracts';
 import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, SessionMessagesPage, SessionMessageView, Result,
   DocumentSnapshot, WorkspaceSnapshot, TaskOperation, CandidateSelection, RunAccepted, Page, RuntimeToolView } from '@flowmate/contracts';
 import type { RuntimeEventsReadResult, RuntimeEventsWake, RuntimeSubscriptionInfo } from '@flowmate/contracts';
@@ -92,7 +93,7 @@ it('P10 HostClient checks compaction identity and strict result on a real child 
   const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
   const input = { sessionId: 7, operationId: randomUUID(), expected: { commitRevision: 1, entryCount: 2, leafId: 'leaf' }, modelId: 'configured' };
   try {
-    const command = { type: 'compact_session' as const, input, expectedSettingsRevision: 1, expectedCredentialRef: 'fixture_key_p10_16' };
+    const command = { type: 'compact_session' as const, input, expectedSettingsRevision: 1, expectedCredentialRef: '00000000000000000000000000000014' };
     expect(await client.request(command)).toEqual({ ok: true, data: { sessionId: 7, operationId: input.operationId } });
     expect(await client.request({ type: 'cancel_session_compaction', input: { sessionId: 7, operationId: input.operationId } }))
       .toEqual({ ok: true, data: { sessionId: 7, operationId: input.operationId, accepted: true } });
@@ -152,8 +153,8 @@ it('returns the original P5 Desktop prompt after credentials or settings change 
   client.subscribe(event => { if (event.type === 'agent_run_event' && event.value.type === 'run_finished') finished.push(event.value.runId); });
   try {
     expect(await client.start(root, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true });
-    const settings = { version: 2 as const, revision: 0, profile: { displayName: 'P5', theme: 'system' as const },
-      models: [{ id: 'p5-dedup-model', credentialRef: 'p5_dedup_credential', name: 'P5 model', kind: 'custom' as const,
+    const settings = { ...defaultProductSettings(), version: 6 as const, revision: 0, profile: { displayName: 'P5', theme: 'system' as const },
+      models: [{ id: 'p5-dedup-model', credentialRef: '00000000000000000000000000000015', name: 'P5 model', kind: 'custom' as const,
         providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'p5-dedup-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'p5-dedup-model', updatedAt: '2026-10-01T00:00:00.000Z' };
     expect(await client.request({ type: 'save_settings', settings })).toMatchObject({ ok: true, data: { revision: 1 } });
@@ -189,7 +190,7 @@ it('returns the original P5 Desktop prompt after credentials or settings change 
     expect(await client.request({ type: 'submit_session_input', input: { ...input, stopGraceMs: 5000 },
       expectedSettingsRevision: 1, expectedCredentialRef: settings.models[0]!.credentialRef }))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
-    expect(await client.request({ type: 'save_settings', settings: { ...settings, version: 3, runtime: {
+    expect(await client.request({ type: 'save_settings', settings: { ...settings, version: 6, runtime: {
       budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 }, timeoutMs: 1_800_000 }, revision: 1, models: [], defaultModelId: null } }))
       .toMatchObject({ ok: true, data: { revision: 2 } });
     expect(await submit()).toMatchObject({ ok: true, data: { inputId: original.data.inputId, runId: original.data.runId } });
@@ -203,7 +204,7 @@ it('returns the original P5 Desktop prompt after credentials or settings change 
     expect(page.data.items).toHaveLength(2);
     expect(page.data.items.find(item => item.inputId === original.data.inputId))
       .toMatchObject({ inputId: original.data.inputId, status: 'consumed', processingStatus: 'completed',
-        content: { version: 2, requestIdentityVersion: 1, originalBudgetOverrides: {}, desktopRequestHash: expect.stringMatching(/^[a-f0-9]{64}$/) } });
+        content: { version: 2, requestIdentityVersion: 1, originalBudgetOverrides: {}, desktopRequestIdentity: serializeDesktopPromptRequest(input, 1) } });
   } finally { await client.close(); server.stop(true); }
 }, 15_000);
 
@@ -212,8 +213,8 @@ it.each(['prompt', 'connection'] as const)('rejects a Settings change during the
   let requests = 0;
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() { requests++; return new Response('Unexpected request', { status: 500 }); } });
   const client = new HostClient();
-  const settings = { version: 3 as const, revision: 0, profile: { displayName: 'Revision race', theme: 'system' as const }, runtime: {},
-    models: [{ id: 'revision-model', credentialRef: 'revision_model_credential', name: 'Revision model', kind: 'custom' as const,
+  const settings = { ...defaultProductSettings(), version: 6 as const, revision: 0, profile: { displayName: 'Revision race', theme: 'system' as const }, runtime: {},
+    models: [{ id: 'revision-model', credentialRef: '00000000000000000000000000000016', name: 'Revision model', kind: 'custom' as const,
       providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'revision-model', api: 'openai-completions',
       contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'revision-model', updatedAt: '2026-10-01T00:00:00.000Z' };
   let changed = false;
@@ -437,8 +438,8 @@ it('preserves unconfirmed cleanup after a Host crash and recovers its interrupte
       for (const held of heldEnd.splice(0)) Reflect.apply(oldEmit, oldChild.stdout, [held.event, ...held.values]);
     };
     expect(await client.request({ type: 'save_settings', settings: {
-      version: 2, revision: 0, profile: { displayName: 'Crash test', theme: 'system' },
-      models: [{ id: 'crash-model', credentialRef: 'credential_reference_crash', name: 'Crash model', kind: 'custom', providerId: null,
+      ...defaultProductSettings(), version: 6, revision: 0, profile: { displayName: 'Crash test', theme: 'system' },
+      models: [{ id: 'crash-model', credentialRef: '00000000000000000000000000000017', name: 'Crash model', kind: 'custom', providerId: null,
         baseUrl: `http://127.0.0.1:${address.port}/v1`, model: 'crash-model', api: 'openai-completions',
         contextWindow: 64_000, maxTokens: 16_384, reasoning: false }], defaultModelId: 'crash-model', updatedAt: '2026-09-30T00:00:00.000Z',
     } })).toMatchObject({ ok: true });
@@ -628,8 +629,8 @@ it('uses Pi native API-key login and returns the credential to the protected Mai
     const started = await client.start(userDataRoot, '0.1.0', repoRoot);
     expect(started.ok).toBe(true);
     if (!started.ok) return;
-    const settings = { version: 2 as const, revision: 0, profile: { displayName: 'Login test', theme: 'system' as const },
-      models: [{ id: 'pi-deepseek', credentialRef: 'login_credential_reference_1', name: 'DeepSeek',
+    const settings = { ...defaultProductSettings(), version: 6 as const, revision: 0, profile: { displayName: 'Login test', theme: 'system' as const },
+      models: [{ id: 'pi-deepseek', credentialRef: '00000000000000000000000000000018', name: 'DeepSeek',
         kind: 'catalog' as const, providerId: 'deepseek', baseUrl: '', model: 'deepseek-v4-flash',
         api: '', contextWindow: null, maxTokens: null, reasoning: false }],
       defaultModelId: 'pi-deepseek', updatedAt: '2026-09-29T00:00:00.000Z' };
@@ -658,10 +659,10 @@ it('rejects Pi requests without a local API key even when environment or OAuth c
     const started = await client.start(userDataRoot, '0.1.0', repoRoot);
     expect(started.ok).toBe(true);
     if (!started.ok) return;
-    const profile = { id: 'pi-deepseek', credentialRef: 'local_key_credential_ref_1234', name: 'DeepSeek',
+    const profile = { id: 'pi-deepseek', credentialRef: '00000000000000000000000000000019', name: 'DeepSeek',
       kind: 'catalog' as const, providerId: 'deepseek', baseUrl: '', model: 'deepseek-v4-flash',
       api: '', contextWindow: null, maxTokens: null, reasoning: false };
-    const settings = { version: 2 as const, revision: 0,
+    const settings = { ...defaultProductSettings(), version: 6 as const, revision: 0,
       profile: { displayName: 'Local key test', theme: 'system' as const }, models: [profile],
       defaultModelId: profile.id, updatedAt: '2026-09-30T00:00:00.000Z' };
     const saved = await client.request({ type: 'save_settings', settings }) as { ok: boolean; data?: { revision: number } };
@@ -732,11 +733,11 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     expect(started.ok).toBe(true);
     if (!started.ok) return;
 
-    const profile = { id: 'fixture-model', credentialRef: 'credential_reference_1234', name: 'Fixture', kind: 'custom' as const,
+    const profile = { id: 'fixture-model', credentialRef: '00000000000000000000000000000020', name: 'Fixture', kind: 'custom' as const,
       providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'host-agent-fixture', api: 'openai-completions',
       contextWindow: 64_000, maxTokens: 16_384, reasoning: false };
     const initialSettings = {
-      version: 2 as const,
+      ...defaultProductSettings(), version: 6 as const,
       revision: 0,
       profile: { displayName: 'Host Agent Test', theme: 'system' as const },
       models: [profile],
@@ -776,7 +777,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const stale = await client.request({
       type: 'start_run', requestId: 'stale-agent-run',
       input: { sessionId: created.data.sessionId, text: 'stale config must not dispatch', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      expectedSettingsRevision: saved.data?.revision ?? 1, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: saved.data?.revision ?? 1, expectedCredentialRef: '00000000000000000000000000000020',
     }) as { ok: boolean; error?: { code: string } };
     expect(stale).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(requestBodies).toHaveLength(0);
@@ -784,7 +785,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const firstPending = client.request({
       type: 'start_run', requestId: 'first-agent-run',
       input: { sessionId: created.data.sessionId, text: '發票摘要：號碼 INV-2048，價稅合計 1060 元，日期缺失。', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: '00000000000000000000000000000020',
     }, 30_000) as Promise<{ ok: boolean; data?: { runId: number; sessionId: number } }>;
     const first = await firstPending;
     expect(first).toMatchObject({ ok: true, data: { runId: 1, sessionId: created.data.sessionId } });
@@ -792,7 +793,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const duplicateStart = await client.request({
       type: 'start_run', requestId: 'first-agent-run',
       input: { sessionId: created.data.sessionId, text: 'must not replay a completed Run', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: '00000000000000000000000000000020',
     }) as { ok: boolean; error?: { code: string } };
     expect(duplicateStart).toMatchObject({ ok: false, error: { code: 'request_duplicate' } });
     expect(requestBodies).toHaveLength(1);
@@ -800,7 +801,7 @@ it('wires the real Host Agent path, rejects stale model state after credential l
     const second = await client.request({
       type: 'start_run', requestId: 'follow-up-agent-run',
       input: { sessionId: created.data.sessionId, text: '剛才那張發票的價稅合計是多少？', modelId: 'fixture-model', workspace, goalMode: 'answer' },
-      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: 'credential_reference_1234',
+      expectedSettingsRevision: updated.data?.revision ?? 2, expectedCredentialRef: '00000000000000000000000000000020',
     }) as { ok: boolean; data?: { runId: number; sessionId: number } };
     expect(second).toMatchObject({ ok: true, data: { runId: 2, sessionId: created.data.sessionId } });
     await waitFor(() => finished.some((event) => event.runId === 2));
@@ -909,11 +910,11 @@ it('queries real Pi messages through Host across tool delivery, model changes, S
     const sessionId = created.data.sessionId;
     expect(await client.request({ type: 'list_session_messages', input: { sessionId, limit: 20 } }))
       .toMatchObject({ ok: true, data: { items: [], leafId: null, entryCount: 0 } });
-    const profile = { id: 'p4-model-a', credentialRef: 'p4_host_credential_ref_a', name: 'P4 A', kind: 'custom' as const,
+    const profile = { id: 'p4-model-a', credentialRef: '00000000000000000000000000000021', name: 'P4 A', kind: 'custom' as const,
       providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'host-p4-model-a', api: 'openai-completions',
       contextWindow: 64_000, maxTokens: 16_384, reasoning: false };
-    const alternate = { ...profile, id: 'p4-model-b', credentialRef: 'p4_host_credential_ref_b', name: 'P4 B', model: 'host-p4-model-b' };
-    expect(await client.request({ type: 'save_settings', settings: { version: 2, revision: 0,
+    const alternate = { ...profile, id: 'p4-model-b', credentialRef: '00000000000000000000000000000022', name: 'P4 B', model: 'host-p4-model-b' };
+    expect(await client.request({ type: 'save_settings', settings: { ...defaultProductSettings(), version: 6, revision: 0,
       profile: { displayName: 'P4 messages', theme: 'system' }, models: [profile, alternate], defaultModelId: profile.id,
       updatedAt: '2026-09-30T00:00:00.000Z' } })).toMatchObject({ ok: true, data: { revision: 1 } });
     expect(await client.request({ type: 'update_workspace', requestId: 'p4-bind-primary',
@@ -1179,10 +1180,10 @@ it('retains the actual Host late applied receipt after cancellation without chan
   let db: Database | null = null;
   try {
     expect(await client.start(userDataRoot, '0.1.0', repoRoot, sourceRoot)).toMatchObject({ ok: true, data: { ready: true } });
-    const model = { id: 'host-late-model', credentialRef: 'host_late_form_credential', name: 'Host late form', kind: 'custom' as const,
+    const model = { id: 'host-late-model', credentialRef: '00000000000000000000000000000023', name: 'Host late form', kind: 'custom' as const,
       providerId: null, baseUrl: `http://127.0.0.1:${server.port}/v1`, model: 'host-late-model', api: 'openai-completions',
       contextWindow: 64_000, maxTokens: 16_384, reasoning: false };
-    expect(await client.request({ type: 'save_settings', settings: { version: 2, revision: 0, profile: { displayName: 'Host late form', theme: 'system' },
+    expect(await client.request({ type: 'save_settings', settings: { ...defaultProductSettings(), version: 6, revision: 0, profile: { displayName: 'Host late form', theme: 'system' },
       models: [model], defaultModelId: model.id, updatedAt: '2026-10-01T00:00:00.000Z' } })).toMatchObject({ ok: true, data: { revision: 1 } });
     const document = need(await client.request({ type: 'import_invoice_material', sourceDirectory: source }) as Result<DocumentSnapshot>);
     documentId = document.documentRef.id;

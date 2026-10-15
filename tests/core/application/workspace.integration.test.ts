@@ -30,7 +30,9 @@ function registerOtherMaterial(f: ReturnType<typeof makeSelectedCandidate>, same
     const name = artifact.kind === 'original' ? 'original.png' : 'parsed.json';
     const relativePath = `artifacts/${artifactId}/${name}`;
     mkdirSync(join(f.root, 'artifacts', String(artifactId)), { recursive: true });
-    writeFileSync(join(f.root, relativePath), readFileSync(join(f.root, artifact.relativePath)));
+    const bytes = readFileSync(join(f.root, artifact.relativePath));
+    writeFileSync(join(f.root, relativePath), bytes);
+    f.documents.contents!.remember({ ownerKind: 'artifact', ownerId: String(artifactId), relativePath: name }, bytes);
     return { ...artifact, artifactId, relativePath, createdAt: f.stamp,
       metadata: { ...artifact.metadata, sourceRecordId, sourceVersion: version } };
   };

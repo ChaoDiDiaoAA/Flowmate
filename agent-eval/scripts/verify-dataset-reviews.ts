@@ -28,7 +28,7 @@ for(const dataset of data){
   assert.deepEqual(task.expected.metrics.map(m=>m.metricId).sort(),metricCatalog.map(m=>m.id).sort());
   const gold=goldByCaseId[task.id].basis;
   claims+=task.expected.research?.claims.length??0;chains+=task.expected.research?.chains.length??0;
-  for(const material of task.input.materials){materialBindings++;const partitions=sourceGroups.get(material.originalSha256)??new Set();partitions.add(dataset.manifest.smoke.includes(task.id)?'smoke':'holdout');sourceGroups.set(material.originalSha256,partitions);}
+  for(const material of task.input.materials){materialBindings++;const partitions=sourceGroups.get(material.source+'/'+material.sample)??new Set();partitions.add(dataset.manifest.smoke.includes(task.id)?'smoke':'holdout');sourceGroups.set(material.source+'/'+material.sample,partitions);}
   for(const key of ['sourceChecks','localSourceChecks','lineSourceChecks','nonItemSourceChecks','parsedPageChecks'])for(const span of gold[key]??[]){
    if(typeof span.startUtf16!=='number'||typeof span.raw!=='string')continue;
    const sample=span.sample??gold.sample??gold.referenceSource,file=span.file??(/^\d{6}$/.test(sample)?'content.md':'source.md');

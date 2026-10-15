@@ -1,5 +1,4 @@
 import { judgeResponse, namedJudgment } from '../../support/judge-response.ts';
-import { withoutHashes } from '../../../src/artifacts.ts';
 import {publicVersions} from '../../../src/reports/files.ts';
 import {test,expect} from 'bun:test';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,existsSync} from 'node:fs';
@@ -54,14 +53,14 @@ test('calibration preserves tune and validation references, every original attem
   expect(result.report.samples).toHaveLength(2);expect(result.report.samples.map(s=>s.call!.attempts)).toEqual([1,1]);
   expect(result.report.criteria).toContainEqual(expect.objectContaining({partition:'tune',metricId:'tool-arguments',samples:1,falseAccepts:1,severeErrorMisses:1}));
   expect(result.report.criteria).toContainEqual(expect.objectContaining({partition:'validation',metricId:'tool-arguments',samples:1,falseRejects:1}));
-  expect(JSON.parse(readFileSync(result.file,'utf8'))).toEqual(publicVersions(withoutHashes(result.report)));expect(JSON.stringify(result.report)).not.toContain(env.FLOWMATE_JUDGE_API_KEY);
+  expect(JSON.parse(readFileSync(result.file,'utf8'))).toEqual(publicVersions((result.report)));expect(JSON.stringify(result.report)).not.toContain(env.FLOWMATE_JUDGE_API_KEY);
   await expect(calibrateJudge(f.root,{directory:f.directory,executionId:'controlled-calibration'},{env,fetcher:async()=>{throw Error('must not request');}})).rejects.toThrow();
  }finally{f.close();}
 });
 test('reference schema, partition and instance identity are checked before any Judge request',async()=>{
  for(const mutation of ['unknown-hash','cross-partition','same-evidence','duplicate','traversal','retired-budget','unknown-field']as const){
   const f=fixture();try{
-   if(mutation==='unknown-hash')Object.assign(f.manifest.samples[0]!,{sha256:'0'.repeat(64)});
+   if(mutation==='unknown-hash')Object.assign(f.manifest.samples[0]!,{unknownField:true});
    if(mutation==='duplicate')f.manifest.samples[1]!.id=f.manifest.samples[0]!.id;
    if(mutation==='traversal')f.manifest.samples[0]!.file='../elsewhere.json';
    if(mutation==='retired-budget')Object.assign(f.manifest,{maxOutputTokens:511});
@@ -122,7 +121,7 @@ test('cancellation during one original attempt preserves the failed call and all
   const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'cancel-during-call'},{env,signal:controller.signal,fetcher:async()=>{calls++;controller.abort();return reply(1);}});
   expect(calls).toBe(1);expect(result.report.executionComplete).toBe(false);expect(result.report.samples[0]!.call!.attempts).toBe(1);expect(typeof result.report.samples[0]!.call!.error).toBe('string');
   expect(result.report.samples[1]!.call).toBeNull();expect(result.report.criteria.find(c=>c.partition==='validation')!.notRun).toBe(1);
-  expect(JSON.parse(readFileSync(result.file,'utf8'))).toEqual(publicVersions(withoutHashes(result.report)));
+  expect(JSON.parse(readFileSync(result.file,'utf8'))).toEqual(publicVersions((result.report)));
  }finally{f.close();}
 });
 test('Anthropic calibration reuses native SDK capabilities for its single-attempt samples',async()=>{
@@ -200,9 +199,11 @@ test('calibration status reads and validates original current or old named calls
    sample.call=await runJudge(judgeConfig(env,f.root)!,metricBusinessRubric.prompt,JSON.stringify({plan:sample.reference.plan,evidence:sample.reference.evidence}),async()=>judgeResponse({choices:[{message:{content:raw},finish_reason:'stop'}]}),undefined,sample.reference.plan);
    delete sample.call.transportStatus;
   }
-  writeFileSync(result.file,JSON.stringify(publicVersions(withoutHashes(legacy))));
+  writeFileSync(result.file,JSON.stringify(publicVersions((legacy))));
   expect(read(result.file).criteria).toEqual(result.report.criteria);
   expect(read(result.file).samples[0]!.call!.compact).not.toHaveProperty('parsePolicy');
   expect(read(result.file).samples[0]!.call).not.toHaveProperty('transportStatus');
+  const historical:any=structuredClone(result.report);historical.referenceHash='legacy-only';writeFileSync(result.file,JSON.stringify(historical));
+  expect(read(result.file).history?.verification).toBe('unverified');expect(read(result.file).criteria).toEqual(result.report.criteria);
  }finally{f.close();}
 });

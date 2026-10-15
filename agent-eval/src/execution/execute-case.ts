@@ -4,7 +4,6 @@ import { isDeepStrictEqual } from 'node:util';
 import type { AgentKernel, AgentTrial, AgentTrialSession } from '../adapters/agent.ts';
 import type { CaseExecutionResult } from '../types.ts';
 import { scanEvidence } from './evidence-safety.ts';
-import { hash } from '../dataset-loader/local.ts';
 import { z } from 'zod';
 import { artifactJson } from '../artifacts.ts';
 const inputSchema = z.object({ prompt: z.string(), materials: z.array(z.object({ sample: z.string(), file: z.string(), text: z.string() }).strict()) }).strict();

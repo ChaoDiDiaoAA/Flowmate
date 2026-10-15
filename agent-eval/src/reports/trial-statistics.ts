@@ -92,8 +92,8 @@ export function deriveTrialStatistics(report: LocalReport): TrialStatistics {
         ids.add(trial.trialId);
     }
     const groups=report.contract==='flowmate-agent-run/v2'?aggregateTrials(report).cases:
-        [...new Set(report.trials.map(trial=>JSON.stringify([trial.caseId,trial.caseVersion,trial.caseHash])))].map(key=>{
-            const trials=report.trials.filter(trial=>JSON.stringify([trial.caseId,trial.caseVersion,trial.caseHash])===key);
+        [...new Set(report.trials.map(trial=>JSON.stringify([trial.caseId,trial.caseVersion,trial.caseConditions])))].map(key=>{
+            const trials=report.trials.filter(trial=>JSON.stringify([trial.caseId,trial.caseVersion,trial.caseConditions])===key);
             return {caseId:trials[0]!.caseId,caseVersion:trials[0]!.caseVersion,trials:trials.map(t=>({trialId:t.trialId})),metrics:[] as MetricTotal[]};
         });
     const infer=!!report.endedAt && report.scoring==='complete' && !report.sourceInvalidation;

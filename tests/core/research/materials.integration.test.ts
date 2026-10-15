@@ -83,7 +83,8 @@ it('rejects a same-length tampered material and an unselected material without p
   } }));
   writeFileSync(join(f.paths.artifactsDir, String(selected), 'source.txt'), 'Tampered');
   expect(await f.app.importResearchMaterial({ title: 'Selected.txt', format: 'text', text: 'Original' })).toMatchObject({ ok: false });
-  await f.run({ ...f.request(1), sessionId: session.sessionId, research: { researchId: task.researchId, phase: 'planning', plan: null } });
+  const run = await f.run({ ...f.request(1), sessionId: session.sessionId, research: { researchId: task.researchId, phase: 'planning', plan: null } });
+  expect(run.terminal.result).toMatchObject({ ok: true, data: { status: 'completed' } });
   expect(need(await f.app.listResearchSources({ researchId: task.researchId })).items).toEqual([]);
   const feedback = JSON.stringify(f.requests.at(-1)!.messages);
   expect(feedback).toContain('research_source_unavailable'); expect(feedback).toContain('research_source_denied');

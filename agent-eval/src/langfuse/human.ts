@@ -1,7 +1,6 @@
 import { platformClient } from './export.ts';
 import { readReport, reportPath } from '../reports/store.ts';
 import { addFeedback, feedbackStatus } from '../review/local.ts';
-import { hash } from '../dataset-loader/local.ts';
 import type { LangfuseClient } from '@langfuse/client';
 const NAME = 'Flowmate local run feedback';
 export async function platformReview(repo: string, action: string, executionId?: string, providedClient?: LangfuseClient) {
@@ -32,7 +31,7 @@ export async function platformReview(repo: string, action: string, executionId?:
             const feedback = feedbackStatus(repo, executionId);
             if (feedback.stale) throw new Error('Feedback version mismatch');
             for (const record of feedback.records) {
-                const trial = report.trials.find(t => t.caseId === record.caseId && t.trialId === record.trialId && t.caseVersion===record.caseVersion && (!record.caseHash||t.caseHash === record.caseHash));
+                const trial = report.trials.find(t => t.caseId === record.caseId && t.trialId === record.trialId && t.caseVersion===record.caseVersion);
                 if (!trial)
                     throw new Error('Feedback version mismatch');
                 client.score.create({ id: ['human', report.executionId, record.id].join(':'), traceId: trial.traceId, name: '人工反馈 · 运行结果', dataType: 'CATEGORICAL', value: record.verdict, comment: record.note,

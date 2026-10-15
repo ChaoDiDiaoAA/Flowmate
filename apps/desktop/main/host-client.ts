@@ -330,7 +330,7 @@ function matchesRuntimeResponse(command: HostCommand, value: unknown): boolean {
       && (result.error?.sessionId === undefined || result.error.sessionId === command.input.sessionId);
     const data = result.data as import('zod').z.infer<typeof import('@flowmate/contracts').InvoiceSaveReplayReceiptSchema>;
     return data.runId === command.input.runId && data.sessionId === command.input.sessionId && data.toolCallId === command.input.toolCallId
-      && data.nativeToolCallId === command.input.nativeToolCallId && data.argumentsHash === command.input.argumentsHash;
+      && data.nativeToolCallId === command.input.nativeToolCallId;
   }
   if (!result.ok && command.type === 'query_run_tool_evidence') return (result.runId === undefined || result.runId === command.input.runId)
     && (result.error?.runId === undefined || result.error.runId === command.input.runId)
@@ -367,11 +367,16 @@ function matchesRuntimeResponse(command: HostCommand, value: unknown): boolean {
     const tool = result.data as import('@flowmate/contracts').RuntimeToolView;
     return tool.runId === command.input.runId && tool.sessionId === command.input.sessionId && tool.toolCallId === command.input.toolCallId;
   }
+  if (command.type === 'read_invoice_export') {
+    const page = result.data as import('@flowmate/contracts').InvoiceExportPage;
+    return page.candidateId === command.input.candidateId && page.format === command.input.format
+      && page.offset === command.input.offset && Buffer.from(page.chunkBase64, 'base64').length <= command.input.limit;
+  }
   if (command.type === 'query_run_tool_evidence') {
     const page = result.data as import('@flowmate/contracts').ToolEvidencePage;
     return page.runId === command.input.runId && page.sessionId === command.input.sessionId && page.toolCallId === command.input.toolCallId
       && page.offset === command.input.offset && Buffer.byteLength(page.chunk) <= command.input.limit
-      && (command.input.expectedHash === undefined || page.sha256 === command.input.expectedHash);
+      && (command.input.expectedRevision === undefined || page.evidenceRevision === command.input.expectedRevision);
   }
   return true;
 }

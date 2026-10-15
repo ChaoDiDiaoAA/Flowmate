@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { hash, REPO_ROOT } from '../../dataset-loader/local.ts';
+import { REPO_ROOT } from '../../dataset-loader/local.ts';
 import { evaluationEnv, agentApiSchema, agentModelCapabilitiesSchema, resolveModelCapabilities } from '../../configuration.ts';
 import { registerSecrets } from '../../execution/evidence-safety.ts';
 import type { PreparedModelRuntime } from '../../../../packages/runtime-pi/src/model-runtime.ts';
@@ -36,8 +36,8 @@ export function publicJudgeConfig(config: JudgeConfig, rubric?: { id: string; ve
     const { apiKey, ...parameters } = config;
     const sdk = prepared.get(config)?.model.snapshot.sdk ?? {
         codingAgent: packageJson.dependencies['@earendil-works/pi-coding-agent'], ai: packageJson.dependencies['@earendil-works/pi-ai'] };
-    const safe = { ...parameters, sdk, protocolVersion: 'flowmate-judge/v2', ...(rubric ? { rubric: { id: rubric.id, version: rubric.version, hash: hash(rubric.prompt) } } : {}) };
-    return { ...safe, configHash: hash(safe) };
+    const safe = { ...parameters, sdk, protocolVersion: 'flowmate-judge/v2', ...(rubric ? { rubric: { id: rubric.id, version: rubric.version } } : {}) };
+    return safe;
 }
 async function withJudgeTimeout<T>(config: JudgeConfig, signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
     if (signal?.aborted) throw Error('Judge cancelled');

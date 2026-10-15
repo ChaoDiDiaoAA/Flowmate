@@ -1,8 +1,8 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { appError, RESOURCE_LIMITS, canonicalResourceManifest, ResourceIdSchema, ResourceManifestSchema, ResourceRefSchema, resourceRefKey } from '@flowmate/contracts';
-import type { InspectNativeResources, ResourceCatalog, ResourceManifest, ResourceRef, ResourceSelection, ResourceErrorCode } from '@flowmate/contracts';
-import { sha256, decoder, compare, checked, reject, errorFacts, directory, safePath, bytes } from './resources.ts';
+import type { InspectNativeResources, ResourceCatalog, ResourceManifest, ResourceRef, ResourceSelection, ResourceErrorCode, ManagedFileContents } from '@flowmate/contracts';
+import { decoder, compare, checked, reject, errorFacts, directory, safePath, bytes } from './resources.ts';
 
 export type Package = { ref: ResourceRef; manifest: ResourceManifest; directory: string; contents: Map<string, Buffer>;
   item: ResourceCatalog['items'][number] };
@@ -13,8 +13,6 @@ export type CatalogInput = { revision: number; selection: ResourceSelection; ava
 export function find<T extends Pick<Package, 'ref'> & { item?: Package['item'] }>(packages: readonly T[], ref: ResourceRef): T {
   const pack = packages.find(pack => resourceRefKey(pack.ref) === resourceRefKey(ref));
   if (!pack) {
-    if (packages.some(pack => pack.ref.kind === ref.kind && pack.ref.id === ref.id && pack.ref.version === ref.version))
-      reject('resource_version_changed', 'The selected resource version now has different content.');
     reject('resource_required_unavailable', 'The selected resource version is unavailable.');
   }
   if (pack.item && !pack.item.available) {
@@ -24,7 +22,7 @@ export function find<T extends Pick<Package, 'ref'> & { item?: Package['item'] }
   return pack;
 }
 
-export function createResourceLoader(options: { resourceRoot: string; inspectNativeResources: InspectNativeResources }) {
+export function createResourceLoader(options: { resourceRoot: string; contents: ManagedFileContents; inspectNativeResources: InspectNativeResources }) {
   const authorRoot = resolve(options.resourceRoot);
   function load(kind: 'prompt' | 'skill', id: string): Package {
     const relativeRoot = `${kind === 'prompt' ? 'prompts' : 'skills'}/${id}`;
@@ -33,15 +31,20 @@ export function createResourceLoader(options: { resourceRoot: string; inspectNat
       `${relativeRoot}/resource.json`), RESOURCE_LIMITS.manifestBytes))));
     if (manifest.kind !== kind || manifest.id !== id)
       reject('resource_name_conflict', 'Resource manifest and registered package directory disagree.');
-    const ref = ResourceRefSchema.parse({ kind, id, version: manifest.version, contentHash: sha256(canonicalResourceManifest(manifest)) });
+    const ref = ResourceRefSchema.parse({ kind, id, version: manifest.version });
     const contents = new Map<string, Buffer>();
+    const owner = { ownerKind: 'resource-author', ownerId: resourceRefKey(ref) };
+    try { options.contents.remember({ ...owner, relativePath: 'resource.json' }, Buffer.from(canonicalResourceManifest(manifest))); }
+    catch { reject('resource_version_changed', 'The registered author manifest changed without a new version.'); }
     let name = id, description = '', disableModelInvocation = false;
     const diagnostics: Array<{ code: string; message: string }> = [];
     const verified = checked(() => {
       for (const file of manifest.files) {
         const content = bytes(safePath(root, file.path), RESOURCE_LIMITS.fileBytes);
-        if (file.bytes !== content.length || file.sha256 !== sha256(content))
+        if (file.bytes !== content.length)
           reject('resource_version_changed', 'Resource file content differs from its fixed manifest.');
+        try { options.contents.remember({ ...owner, relativePath: file.path }, content); }
+        catch { reject('resource_version_changed', 'The registered author content changed without a new version.'); }
         contents.set(file.path, content);
       }
       const body = decoder.decode(contents.get(manifest.bodyFile)!);
@@ -53,7 +56,7 @@ export function createResourceLoader(options: { resourceRoot: string; inspectNat
         diagnostics.push(...metadata.data.diagnostics);
         if (name !== id) reject('resource_name_conflict', 'Pi Skill name and product resource ID disagree.');
         // Pi reads SKILL.md itself; a concurrent author edit must not change the verified metadata.
-        if (sha256(bytes(safePath(root, manifest.bodyFile), RESOURCE_LIMITS.bodyBytes)) !== manifest.files.find(file => file.path === manifest.bodyFile)!.sha256)
+        if (!bytes(safePath(root, manifest.bodyFile), RESOURCE_LIMITS.bodyBytes).equals(contents.get(manifest.bodyFile)!))
           reject('resource_version_changed', 'Skill body changed during native discovery.');
       }
     });

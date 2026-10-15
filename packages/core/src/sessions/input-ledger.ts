@@ -1,6 +1,5 @@
 import { markUnusableInTransaction } from '../memory/persistence.ts';
 import { evidenceReadFailure, readTransaction } from '../storage/reads.ts';
-import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Database } from 'bun:sqlite';
 import type { RuntimeEventStore } from '../events/store.ts';
@@ -12,7 +11,7 @@ import type { AppError, DbId, NormalizedSessionInputRequest, Result, SessionInpu
   SessionInputRequest, SessionInputSnapshot, SessionInputsRequest, SessionInputsPage, SessionInputContentV2, HistoryCommitInput } from '@flowmate/contracts';
 
 type InputRow = { id: number; session_id: number; client_sequence: number; mode: string; goal_mode: string;
-  request_hash: string; run_id: number | null; context_snapshot_id?: number | null; content_json: string; status: string; processing_status: string;
+  request_identity_json: string | null; run_id: number | null; context_snapshot_id?: number | null; content_json: string; status: string; processing_status: string;
   native_entry_id: string | null; result_entry_id: string | null; dispatched_at: string | null;
   error_json: string | null; created_at: string; updated_at: string };
 type NativeEntry = { id: string; parentId: string | null; type: string;
@@ -56,7 +55,7 @@ export function verifyNativeCommitContexts(db: Database, sessionId: DbId, contex
       if (context.inputId === inputId) {
         const required = input.content.version === 2 ? input.content.resourceBinding?.requiredSkill : null;
         if (required ? !context.resourceExpansion || !isDeepStrictEqual(context.resourceExpansion.skill, required)
-          || context.resourceExpansion.bundleHash !== (input.content.version === 2 ? input.content.resourceBinding?.bundleHash : undefined)
+          || context.resourceExpansion.bundleId !== (input.content.version === 2 ? input.content.resourceBinding?.bundleId : undefined)
           : context.resourceExpansion !== undefined) throw new Error('input_commit_expansion_invalid');
       }
       if (input.contextSnapshotId !== null) {
@@ -86,21 +85,21 @@ function appendInputState(db: Database, inputId: DbId, events: RuntimeEventStore
     dedupeKey: `input:${inputId}:${payload.status}:${payload.processingStatus}:${payload.nativeEntryId ?? 'none'}:${payload.resultEntryId ?? 'none'}`,
     payload });
 }
-/** Schema 009 hash bytes remain an existing idempotency fact. */
-function requestHash(request: NormalizedSessionInputRequest, legacy: boolean, identityVersion?: 1): string {
+/** Preserve the original request identity version and budget defaults for retries. */
+function requestIdentity(request: NormalizedSessionInputRequest, legacy: boolean, identityVersion?: 1): string {
   const identity = identityVersion === 1 ? { requestIdentityVersion: 1, request }
     : legacy ? LegacySessionInputRequestSchema.parse(request)
       : request.mode === 'prompt' ? { ...request, timeoutMs: request.timeoutMs ?? 60_000, stopGraceMs: request.stopGraceMs ?? 5000 } : request;
-  return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+  return JSON.stringify(identity);
 }
 export type SessionInputLedger = ReturnType<typeof createSessionInputLedger>;
 export function createSessionInputLedger(db: Database, events?: RuntimeEventStore) {
   const byId = (inputId: DbId) => db.query('SELECT * FROM session_inputs WHERE id=?').get(inputId) as InputRow | null;
   const writeTransaction = <T>(fn: () => T): T => events ? events.withTransaction(fn) : db.transaction(fn).immediate();
-  function lookup(raw: SessionInputRequest, desktopRequestHash?: string): Result<SessionInputSnapshot | null> {
+  function lookup(raw: SessionInputRequest, desktopRequestIdentity?: string): Result<SessionInputSnapshot | null> {
     const normalized = normalizeSessionInputRequest(raw);
     if (!normalized.ok) return normalized;
-    if (desktopRequestHash !== undefined && (normalized.data.mode !== 'prompt' || !/^[a-f0-9]{64}$/.test(desktopRequestHash)))
+    if (desktopRequestIdentity !== undefined && (normalized.data.mode !== 'prompt' || typeof desktopRequestIdentity !== 'string' || Buffer.byteLength(desktopRequestIdentity) > 262144))
       return fail(appError('input_invalid', 'input', 'Desktop request identity is invalid.'));
     try {
       return readTransaction(db, () => {
@@ -108,15 +107,15 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
       const row = db.query('SELECT * FROM session_inputs WHERE session_id=? AND client_sequence=?')
         .get(request.sessionId, request.clientSequence) as InputRow | null;
       if (!row) return ok(null);
-      if (desktopRequestHash !== undefined) {
+      if (desktopRequestIdentity !== undefined) {
         const input = snapshot(db, row);
-        return input.content.version === 2 && input.content.desktopRequestHash === desktopRequestHash ? ok(input)
+        return input.content.version === 2 && input.content.desktopRequestIdentity === desktopRequestIdentity ? ok(input)
           : fail(appError('state_conflict', 'input', 'This client sequence belongs to another input.'));
       }
       const content = JSON.parse(row.content_json) as { version: number; requestIdentityVersion?: 1 };
       if (content.version === 1 && !LegacySessionInputRequestSchema.safeParse(request).success)
         return fail(appError('state_conflict', 'input', 'This client sequence belongs to another input.'));
-      if (row.request_hash !== requestHash(request, content.version === 1, content.requestIdentityVersion))
+      if (row.request_identity_json !== requestIdentity(request, content.version === 1, content.requestIdentityVersion))
         return fail(appError('state_conflict', 'input', 'This client sequence belongs to another input.'));
       return ok(snapshot(db, row));
       });
@@ -137,10 +136,10 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
           || content.text !== saved.json.text || !isDeepStrictEqual(content.allowedDocumentIds, saved.json.allowedDocumentIds)
           || !isDeepStrictEqual(content.allowedArtifactIds, saved.json.allowedArtifactIds)
           || !isDeepStrictEqual(content.resourceBinding, saved.json.resourceBinding)) throw new Error('child_input_snapshot_invalid');
-        const hash = createHash('sha256').update(JSON.stringify({ originToolCallId: input.originToolCallId, childRunId: input.childRunId, content })).digest('hex');
-        const inserted = db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
+        const identity = JSON.stringify({ originToolCallId: input.originToolCallId, childRunId: input.childRunId, content });
+        const inserted = db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,
           context_snapshot_id,content_json,status,processing_status,created_at,updated_at) VALUES(?,1,'prompt','answer',?,?,?,?,'queued','pending',?,?)`)
-          .run(input.childSessionId, hash, input.childRunId, input.contextSnapshotId, JSON.stringify(content), input.at, input.at);
+          .run(input.childSessionId, identity, input.childRunId, input.contextSnapshotId, JSON.stringify(content), input.at, input.at);
         const inputId = Number(inserted.lastInsertRowid); appendInputState(db, inputId, events); return ok({ inputId });
       } catch { return fail(appError('subagent_persist_failed', 'storage', 'Child input could not be saved.', true)); }
     },
@@ -201,13 +200,13 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
       try { return readTransaction(db, () => ok(snapshots(db, db.query('SELECT * FROM session_inputs WHERE run_id=? ORDER BY id').all(runId) as InputRow[]))); }
       catch (error) { return readFailure(error); }
     },
-    admit(raw: SessionInputRequest, admitInput: () => Result<SessionInputAdmission>, at: string, desktopRequestHash?: string): Result<{ input: SessionInputSnapshot; created: boolean }> {
+    admit(raw: SessionInputRequest, admitInput: () => Result<SessionInputAdmission>, at: string, desktopRequestIdentity?: string): Result<{ input: SessionInputSnapshot; created: boolean }> {
       const normalized = normalizeSessionInputRequest(raw);
       if (!normalized.ok) return normalized;
       let rejected: Result<never> | null = null;
       try {
         return writeTransaction(() => {
-          const existing = lookup(normalized.data, desktopRequestHash);
+          const existing = lookup(normalized.data, desktopRequestIdentity);
           if (!existing.ok) { rejected = existing; throw new Error('input_admission_rejected'); }
           if (existing.data) return ok({ input: existing.data, created: false });
           const accepted = admitInput();
@@ -237,15 +236,15 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
               ...(request.stopGraceMs === undefined ? {} : { stopGraceMs: request.stopGraceMs }) };
             if (JSON.stringify(content.originalBudgetOverrides) !== JSON.stringify(overrides)) throw new Error('input_budget_identity_invalid');
           }
-          if (content.desktopRequestHash !== desktopRequestHash) throw new Error('input_desktop_identity_invalid');
+          if (content.desktopRequestIdentity !== desktopRequestIdentity) throw new Error('input_desktop_identity_invalid');
           if (content.text !== request.text || content.workspaceContext !== null && content.workspaceContext.sessionId !== request.sessionId)
             throw new Error('input_session_identity_invalid');
           const goalMode = request.mode === 'prompt' ? request.goalMode : JSON.parse(run.config_json).goalMode ?? 'answer';
           if (request.mode !== 'prompt' && goalMode === 'fill-form') throw new Error('input_fill_append_invalid');
-          const inserted = db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_hash,run_id,
+          const inserted = db.query(`INSERT INTO session_inputs(session_id,client_sequence,mode,goal_mode,request_identity_json,run_id,
             context_snapshot_id,content_json,status,processing_status,native_entry_id,result_entry_id,dispatched_at,error_json,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?,'queued','pending',NULL,NULL,NULL,NULL,?,?)`)
-            .run(request.sessionId, request.clientSequence, request.mode, goalMode, requestHash(request, false, content.requestIdentityVersion),
+            .run(request.sessionId, request.clientSequence, request.mode, goalMode, requestIdentity(request, false, content.requestIdentityVersion),
               admission.runId, contextSnapshotId, JSON.stringify(content), at, at);
           appendInputState(db, Number(inserted.lastInsertRowid), events);
           return ok({ input: snapshot(db, byId(Number(inserted.lastInsertRowid))!), created: true });

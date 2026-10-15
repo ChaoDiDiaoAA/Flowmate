@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-evidence-discovery",
   "version": "v1",
@@ -44,13 +44,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1478,
-      "sha256": "785aea9cc81fbba22f6096f4c7153ba6afa0c2259248d19fc1f8b13b6aa5f48c"
+      "bytes": 1478
     },
     {
       "path": "references/guide.md",
-      "bytes": 810,
-      "sha256": "692a92a642935dbf5dec2ef67d8264d581907fbe2bee42005f8455957411a54d"
+      "bytes": 810
     }
   ]
 }

@@ -1,97 +1,99 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { appError, fail, RESOURCE_LIMITS, canonicalResourceManifest, FrozenResourcesSchema, ResourceBundleManifestSchema, ResourceFileRequestSchema, ResourceManifestSchema, resourceRefKey } from '@flowmate/contracts';
-import type { FrozenResources, ResourceBundleManifest, ResourceFileRequest, ResourceFilePage, ResourceRef, Result } from '@flowmate/contracts';
+import type { FrozenResources, ManagedFileContents, ResourceBundleManifest, ResourceFileRequest, ResourceFilePage, Result } from '@flowmate/contracts';
 import type { Package } from './loader.ts';
-import { sha256, decoder, compare, checked, reject, errorFacts, directory, safePath, bytes, writeSynced, versionPath, page } from './resources.ts';
+import { decoder, checked, reject, errorFacts, directory, safePath, bytes, writeSynced, versionPath, page } from './resources.ts';
 
-const refOrder = (ref: ResourceRef) => JSON.stringify([ref.kind, ref.id, ref.version, ref.contentHash]);
-export const bundleHash = (refs: readonly ResourceRef[]) => sha256(JSON.stringify([...refs].sort((a, b) => compare(refOrder(a), refOrder(b)))));
-/** Durable Run metadata proves file membership even when the preserved content directory is missing. */
 export function verifyFrozenResourceMetadata(value: FrozenResources): Result<void> {
-  return checked(() => {
-    const frozen = FrozenResourcesSchema.parse(value);
-    if (frozen.skillIndex && sha256(JSON.stringify(frozen.skillIndex.entries)) !== frozen.skillIndex.hash)
-      reject('resource_evidence_conflict', 'Frozen Skill index identity changed.');
-    if (bundleHash(frozen.manifests.map(item => item.ref)) !== frozen.bundleHash
-      || frozen.manifests.some(item => sha256(canonicalResourceManifest(item.manifest)) !== item.ref.contentHash))
-      reject('resource_evidence_conflict', 'Frozen resource metadata does not match its original content identity.');
-  });
+  return checked(() => { FrozenResourcesSchema.parse(value); });
 }
 
-export function createResourceBundles(path: string) {
+export function createResourceBundles(path: string, contents: ManagedFileContents) {
   const bundleRoot = resolve(path);
-  function readBundle(hash: string): ResourceBundleManifest {
-    // Reuse directory checks only within this synchronous verification; every file is still rehashed.
+  let previous: { bundleId: string; packages: Package[]; skillIndex: FrozenResources['skillIndex'] } | null = null;
+  function original(bundleId: string, relativePath: string, content: Buffer) {
+    const saved = contents.read({ ownerKind: 'resource-bundle', ownerId: bundleId, relativePath });
+    if (saved === null || !content.equals(Buffer.from(saved)))
+      reject('resource_bundle_unavailable', 'Published resource content differs from its registered original.');
+    return content;
+  }
+  function readBundle(bundleId: string, verifyFiles: boolean): ResourceBundleManifest {
     const directories = new Set<string>();
-    const raw = bytes(safePath(bundleRoot, `${hash}/bundle.json`, directories), RESOURCE_LIMITS.manifestBytes * RESOURCE_LIMITS.packages * 2 + 65536);
+    const raw = original(bundleId, 'bundle.json', bytes(safePath(bundleRoot, `${bundleId}/bundle.json`, directories), RESOURCE_LIMITS.manifestBytes * RESOURCE_LIMITS.packages * 2 + 65536));
     const manifest = ResourceBundleManifestSchema.parse(JSON.parse(decoder.decode(raw)));
-    if (manifest.bundleHash !== hash || bundleHash(manifest.resources.map(item => item.ref)) !== hash
-      || manifest.resources.some(item => sha256(canonicalResourceManifest(item.manifest)) !== item.ref.contentHash))
-      reject('resource_bundle_unavailable', 'Published bundle identity differs from its content manifests.');
+    if (manifest.bundleId !== bundleId) reject('resource_bundle_unavailable', 'Published bundle identity differs from its registered location.');
     for (const item of manifest.resources) {
-      const copied = ResourceManifestSchema.parse(JSON.parse(decoder.decode(bytes(safePath(join(bundleRoot, hash), `${versionPath(item.ref)}/resource.json`, directories), RESOURCE_LIMITS.manifestBytes))));
-      if (sha256(canonicalResourceManifest(copied)) !== item.ref.contentHash)
-        reject('resource_bundle_unavailable', 'Published resource manifest no longer matches its original identity.');
+      const relativePath = `${versionPath(item.ref)}/resource.json`;
+      const raw = original(bundleId, relativePath, bytes(safePath(join(bundleRoot, bundleId), relativePath, directories), RESOURCE_LIMITS.manifestBytes));
+      const copied = ResourceManifestSchema.parse(JSON.parse(decoder.decode(raw)));
+      if (canonicalResourceManifest(copied) !== canonicalResourceManifest(item.manifest))
+        reject('resource_bundle_unavailable', 'Published resource metadata differs from the bundle.');
     }
-    for (const file of manifest.files) {
-      const content = bytes(safePath(join(bundleRoot, hash), `${versionPath(file.ref)}/${file.path}`, directories), RESOURCE_LIMITS.fileBytes);
-      if (content.length !== file.bytes || sha256(content) !== file.sha256)
-        reject('resource_bundle_unavailable', 'Published resource content no longer matches its original identity.');
+    if (verifyFiles) for (const file of manifest.files) {
+      const relativePath = `${versionPath(file.ref)}/${file.path}`;
+      const content = original(bundleId, relativePath, bytes(safePath(join(bundleRoot, bundleId), relativePath, directories), RESOURCE_LIMITS.fileBytes));
+      if (content.length !== file.bytes) reject('resource_bundle_unavailable', 'Published resource size differs from its manifest.');
     }
     return manifest;
   }
-  function publish(packages: Package[]): string {
-    const hash = bundleHash(packages.map(pack => pack.ref)), target = join(bundleRoot, hash);
+  function publish(packages: Package[], skillIndex: FrozenResources['skillIndex']): string {
+    if (previous && isDeepStrictEqual(previous.packages, packages) && isDeepStrictEqual(previous.skillIndex, skillIndex)) {
+      readBundle(previous.bundleId, true);
+      return previous.bundleId;
+    }
+    const bundleId = randomUUID(), target = join(bundleRoot, bundleId);
     mkdirSync(bundleRoot, { recursive: true }); directory(bundleRoot);
-    if (existsSync(target)) { readBundle(hash); return hash; }
     const temporary = join(bundleRoot, `.tmp-${randomUUID()}`);
     mkdirSync(temporary);
     try {
-      const manifest = ResourceBundleManifestSchema.parse({ version: 1, bundleHash: hash,
+      const manifest = ResourceBundleManifestSchema.parse({ version: 2, bundleId, skillIndex,
         resources: packages.map(pack => ({ ref: pack.ref, manifest: pack.manifest })),
         files: packages.flatMap(pack => pack.manifest.files.map(file => ({ ref: pack.ref, ...file }))) });
+      const write = (relativePath: string, content: string | Uint8Array) => {
+        mkdirSync(dirname(join(temporary, relativePath)), { recursive: true });
+        writeSynced(join(temporary, relativePath), content);
+        contents.remember({ ownerKind: 'resource-bundle', ownerId: bundleId, relativePath }, typeof content === 'string' ? Buffer.from(content) : content);
+      };
       for (const pack of packages) {
-        const root = join(temporary, versionPath(pack.ref)); mkdirSync(root, { recursive: true });
-        writeSynced(join(root, 'resource.json'), canonicalResourceManifest(pack.manifest));
-        for (const [path, content] of pack.contents) {
-          mkdirSync(dirname(join(root, path)), { recursive: true }); writeSynced(join(root, path), content);
-        }
+        write(`${versionPath(pack.ref)}/resource.json`, canonicalResourceManifest(pack.manifest));
+        for (const [path, content] of pack.contents) write(`${versionPath(pack.ref)}/${path}`, content);
       }
-      writeSynced(join(temporary, 'bundle.json'), JSON.stringify(manifest));
-      // All bytes are complete before the content address becomes visible. Existing bundles are never rewritten.
-      if (existsSync(target)) readBundle(hash);
-      else try { renameSync(temporary, target); } catch (error) { if (!existsSync(target)) throw error; readBundle(hash); }
-      readBundle(hash); return hash;
+      write('bundle.json', JSON.stringify(manifest));
+      if (existsSync(target)) reject('resource_bundle_unavailable', 'The publication ID is already in use.');
+      renameSync(temporary, target);
+      readBundle(bundleId, true);
+      previous = { bundleId, packages, skillIndex };
+      return bundleId;
     } finally {
       if (existsSync(temporary)) { directory(temporary); rmSync(temporary, { recursive: true, force: true }); }
     }
   }
-  function frozenBundle(input: FrozenResources) {
-    const frozen = FrozenResourcesSchema.parse(input), manifest = readBundle(frozen.bundleHash);
-    if (!verifyFrozenResourceMetadata(frozen).ok) reject('resource_bundle_unavailable', 'Frozen metadata is invalid.');
+  function frozenBundle(input: FrozenResources, verifyFiles: boolean) {
+    const frozen = FrozenResourcesSchema.parse(input), manifest = readBundle(frozen.bundleId, verifyFiles);
     const expected = [...(frozen.prompt ? [frozen.prompt] : []), ...frozen.discoveredSkills];
-    if (manifest.resources.length !== expected.length || expected.some(ref => !manifest.resources.some(item => resourceRefKey(item.ref) === resourceRefKey(ref))))
-      reject('resource_bundle_unavailable', 'Run resources and original bundle membership disagree.');
+    if (manifest.resources.length !== expected.length || expected.some(ref => !manifest.resources.some(item => resourceRefKey(item.ref) === resourceRefKey(ref)))
+      || JSON.stringify(manifest.resources) !== JSON.stringify(frozen.manifests)
+      || JSON.stringify(manifest.skillIndex) !== JSON.stringify(frozen.skillIndex))
+      reject('resource_bundle_unavailable', 'Run resources and original bundle metadata disagree.');
     return manifest;
   }
-
   return { publish,
     verifyFrozen(input: FrozenResources): Result<void> {
-      const verified = checked(() => { frozenBundle(input); }, 'resource_bundle_unavailable');
+      const verified = checked(() => { frozenBundle(input, true); }, 'resource_bundle_unavailable');
       return verified.ok ? verified : fail(appError('resource_bundle_unavailable', ...errorFacts('resource_bundle_unavailable')));
     },
     readFrozenFile(input: FrozenResources, raw: ResourceFileRequest): Result<ResourceFilePage> {
-      const verified = checked(() => frozenBundle(input), 'resource_bundle_unavailable');
-      if (!verified.ok) return verified;
       return checked(() => {
-      const request = ResourceFileRequestSchema.parse(raw), manifest = verified.data;
-      const file = manifest.files.find(file => resourceRefKey(file.ref) === resourceRefKey(request.ref) && file.path === request.path);
-      if (!file) reject('resource_file_unavailable', 'The requested content does not belong to this original Run bundle.');
-      const content = bytes(safePath(join(bundleRoot, input.bundleHash), `${versionPath(file.ref)}/${file.path}`), RESOURCE_LIMITS.fileBytes);
-      if (content.length !== file.bytes || sha256(content) !== file.sha256) reject('resource_bundle_unavailable', 'Fixed content changed while being read.');
-      return page(request, file.ref, content);
-    }, 'resource_file_unavailable'); },
+        const request = ResourceFileRequestSchema.parse(raw), manifest = frozenBundle(input, false);
+        const file = manifest.files.find(file => resourceRefKey(file.ref) === resourceRefKey(request.ref) && file.path === request.path);
+        if (!file) reject('resource_file_unavailable', 'The requested content does not belong to this original Run bundle.');
+        const relativePath = `${versionPath(file.ref)}/${file.path}`;
+        const content = original(input.bundleId, relativePath, bytes(safePath(join(bundleRoot, input.bundleId), relativePath), RESOURCE_LIMITS.fileBytes));
+        return page(request, file.ref, content);
+      }, 'resource_file_unavailable');
+    },
   };
 }

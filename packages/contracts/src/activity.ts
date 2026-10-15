@@ -147,6 +147,7 @@ export type StoredToolResult = {
 } & ToolResult<unknown>;
 
 export type ToolCallSnapshot = {
+  evidenceRevision?: number;
   toolCallId: DbId;
   context: ContextReference | null;
   runId: DbId;

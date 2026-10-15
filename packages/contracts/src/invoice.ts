@@ -54,7 +54,7 @@ export type ParsedBlock = z.infer<typeof ParsedBlockSchema>;
 
 export const PreparedInvoiceMaterialSchema = z.object({
   contract: z.literal('flowmate-prepared-invoice/v1'), sample: z.string().regex(/^[a-z0-9][a-z0-9-]{0,127}$/),
-  original: z.object({ name: z.enum(['source.md', 'original.pdf']), sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  original: z.object({ name: z.enum(['source.md', 'original.pdf']),
     base64: z.string().min(4).max(13_981_016).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/) }).strict(),
   sourceText: z.string().min(1).max(2_097_152),
   pages: z.array(z.object({ page: pageSchema, blocks: z.array(ParsedBlockSchema).min(1).max(MAX_INVOICE_BLOCKS_PER_PAGE) }).strict()).min(1).max(MAX_INVOICE_PAGES)
@@ -197,7 +197,24 @@ export type SaveInvoiceCandidateResponse = { changed: boolean; candidate: import
 export type InvoiceCandidateDecisionResponse = { candidate: import('./activity.ts').CandidateSnapshot;
   job: import('./workspace.ts').JobSnapshot; workspace: import('./workspace.ts').WorkspaceSnapshot };
 export type InvoiceExportReference = { artifactId: number; candidateId: number; format: ExportInvoiceCandidateRequest['format'];
-  relativePath: string; bytes: number; sha256: string; createdAt: string };
+  relativePath: string; bytes: number; createdAt: string };
+export const InvoiceExportReadRequestSchema = ExportInvoiceCandidateRequestSchema.extend({
+  offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), limit: z.number().int().min(1).max(32_768),
+});
+export type InvoiceExportReadRequest = z.infer<typeof InvoiceExportReadRequestSchema>;
+export const InvoiceExportPageSchema = z.object({ artifactId: idSchema, candidateId: idSchema,
+  format: ExportInvoiceCandidateRequestSchema.shape.format, relativePath: z.string().min(1).max(1024),
+  bytes: z.number().int().positive().max(10 * 1024 * 1024), offset: z.number().int().nonnegative(),
+  chunkBase64: z.string().min(1).max(43_692).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?$/),
+  nextOffset: z.number().int().positive().nullable(),
+}).strict().refine(page => {
+  const padding = page.chunkBase64.endsWith('==') ? 2 : page.chunkBase64.endsWith('=') ? 1 : 0;
+  const length = page.chunkBase64.length * 3 / 4 - padding;
+  const end = page.offset + length;
+  return length > 0 && length <= 32_768 && end <= page.bytes
+    && page.nextOffset === (end === page.bytes ? null : end);
+});
+export type InvoiceExportPage = z.infer<typeof InvoiceExportPageSchema>;
 export const InvoiceCandidateOperationQuerySchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('save'), request: SaveInvoiceCandidateRequestSchema }).strict(),
   z.object({ kind: z.literal('accept'), request: AcceptInvoiceCandidateRequestSchema }).strict(),
@@ -528,13 +545,13 @@ export const invoiceToolSchemas = {
 export type InvoiceToolName = typeof INVOICE_TOOL_NAMES[number];
 export const InvoiceSaveReplayRequestSchema = z.object({
   runId: idSchema, sessionId: idSchema, toolCallId: idSchema,
-  nativeToolCallId: z.string().min(1).max(256), argumentsHash: z.string().regex(/^[a-f0-9]{64}$/),
+  nativeToolCallId: z.string().min(1).max(256),
   rawArguments: invoiceToolSchemas.save_invoice_candidate.input,
   arguments: invoiceToolSchemas.save_invoice_candidate.input,
 }).strict();
 export type InvoiceSaveReplayRequest = z.infer<typeof InvoiceSaveReplayRequestSchema>;
 export const InvoiceSaveReplayReceiptSchema = InvoiceSaveReplayRequestSchema.pick({
-  runId: true, sessionId: true, toolCallId: true, nativeToolCallId: true, argumentsHash: true,
+  runId: true, sessionId: true, toolCallId: true, nativeToolCallId: true,
 }).extend({ receipt: CandidateReceiptSchema, created: z.literal(false) }).strict();
 export type InvoiceToolInput<Name extends InvoiceToolName> = z.infer<typeof invoiceToolSchemas[Name]['input']>;
 export type InvoiceToolOutput<Name extends InvoiceToolName> = z.infer<typeof invoiceToolSchemas[Name]['output']>;

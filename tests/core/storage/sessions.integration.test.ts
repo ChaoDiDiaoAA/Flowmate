@@ -192,12 +192,12 @@ describe('P5 migration compatibility', () => {
 
   it('preserves v1 input bytes and identifies unfinished legacy Delete without hiding normal Sessions', () => withDatabase(paths => {
     const legacy = seedLegacy(paths);
-    const before = legacy.query('SELECT * FROM session_inputs').get(); legacy.close();
+    const { request_hash: _retired, ...before } = legacy.query('SELECT * FROM session_inputs').get() as Record<string, unknown>; legacy.close();
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true); if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
-    expect(opened.data.db.query('SELECT * FROM session_inputs').get()).toEqual({ ...before as object, result_entry_id: null, context_snapshot_id: null });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(opened.data.db.query('SELECT * FROM session_inputs').get()).toEqual({ ...before, result_entry_id: null, context_snapshot_id: null, request_identity_json: null });
     const rows = opened.data.db.query('SELECT id,metadata_json,hidden_at,updated_at FROM sessions ORDER BY id').all() as Array<{ id: number; metadata_json: string; hidden_at: string | null; updated_at: string }>;
     expect(JSON.parse(rows[0]!.metadata_json)).toEqual({ version: 1, model_use_blocked: null, tool_profile: 'invoice', delete_pending: true });
     expect(rows[0]!.hidden_at).toBeNull(); expect(rows[0]!.updated_at).toBe(stamp);
@@ -228,8 +228,8 @@ describe('P5 migration compatibility', () => {
     expect(() => db.query('UPDATE session_inputs SET content_json=? WHERE id=1').run(v2)).toThrow();
     db.query("INSERT INTO session_native_entries(session_id,sequence,entry_id,entry_json,run_id) VALUES(1,1,'a1','{}',NULL),(1,2,'u2','{}',NULL)").run();
     db.query("UPDATE session_inputs SET mode='steer',goal_mode='answer',content_json=?,result_entry_id='a1' WHERE id=1").run(v2);
-    db.query("INSERT INTO session_inputs(id,session_id,client_sequence,mode,goal_mode,request_hash,content_json,status,processing_status,native_entry_id,result_entry_id,created_at,updated_at) VALUES(2,1,8,'followUp','answer',?,?,'consumed','completed','u2','a1',?,?)")
-      .run('b'.repeat(64), v2, stamp, stamp);
+    db.query("INSERT INTO session_inputs(id,session_id,client_sequence,mode,goal_mode,request_identity_json,content_json,status,processing_status,native_entry_id,result_entry_id,created_at,updated_at) VALUES(2,1,8,'followUp','answer',?,?,'consumed','completed','u2','a1',?,?)")
+      .run('{}', v2, stamp, stamp);
     expect(db.query("SELECT COUNT(*) AS count FROM session_inputs WHERE result_entry_id='a1'").get()).toEqual({ count: 2 });
     expect(() => db.query("UPDATE session_inputs SET mode='followUp',goal_mode='fill-form' WHERE id=1").run()).toThrow();
     expect(() => db.query('UPDATE session_inputs SET session_id=2 WHERE id=2').run()).toThrow();
@@ -366,11 +366,11 @@ describe('P2 Session and Agent Run storage', () => {
     expect(reopened.data.db.query("SELECT COUNT(*) AS count FROM runs WHERE status IN ('created','running')").get()).toEqual({ count: 0 });
   }));
 
-  it('migrates a real new database through version 13 before exposing repositories', () => withDatabase((paths) => {
+  it('migrates a real new database through the current schema before exposing repositories', () => withDatabase((paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual(Array.from({ length: 19 }, (_, index) => ({ version: index + 1 })));
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual(Array.from({ length: 20 }, (_, index) => ({ version: index + 1 })));
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     opened.data.close();
   }));
@@ -388,7 +388,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
     try {
-    expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 });
+    expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
       expect(migrated.data.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: entry, run_id: null });
       expect(migrated.data.db.query('SELECT header_json,storage_version,leaf_id,entry_count FROM session_native_history').get())
         .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });

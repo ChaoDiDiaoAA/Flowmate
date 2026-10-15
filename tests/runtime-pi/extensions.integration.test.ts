@@ -209,8 +209,8 @@ async function businessFixture(options: { sessionSetup?: (session: AgentSession)
   let adapter!: PiAgentAdapter;
   const app = need(await createApplication({ paths, resourceRoot, invoiceSourceRoot: sourceRoot,
     resourceDefaults: () => ok(settings),
-    agentFactory: tools => {
-      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, sessionSetup: options.sessionSetup,
+    agentFactory: (tools, resourceContents) => {
+      adapter = new PiAgentAdapter({ resourceContents, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, sessionSetup: options.sessionSetup,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p12-loopback-only' });
       if (options.prepare || options.beforePrepare) { const original = adapter.prepare.bind(adapter); adapter.prepare = async (...args) => { await options.beforePrepare?.(); const prepared = await original(...args); if (prepared.ok) options.prepare?.(prepared.data); return prepared; }; }
       return adapter;
@@ -538,7 +538,7 @@ it('[F12-18/20] rebuilds on fixed resource or selection changes and rejects old 
   expect(f.payloads).toHaveLength(5);
 });
 
-it.each(['hash', 'missing'] as const)('[F12-19] rechecks %s metadata before a new Run and never silently falls back', async fault => {
+it.each(['invalid-entry', 'missing'] as const)('[F12-19] rechecks %s metadata before a new Run and never silently falls back', async fault => {
   const f = await businessFixture(); await f.run();
   const metadata = join(f.resourceRoot, 'extensions/invoice-v1.json');
   const original = readFileSync(metadata);

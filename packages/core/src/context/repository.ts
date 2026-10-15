@@ -4,7 +4,7 @@ import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.t
 import { SQLiteError, type Database } from 'bun:sqlite';
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
-import { createHash } from 'node:crypto';
+import { createManagedFileContents } from '../storage/managed-file-contents.ts';
 import { join, relative, isAbsolute, sep } from 'node:path';
 import { resolveNativeFilePath, nativeFileResultIncludes } from '@flowmate/shared';
 import { verifyFrozenResourceMetadata } from '../skill-hub/index.ts';
@@ -61,7 +61,6 @@ function corrupt(): never { return reject('storage_corrupt', 'storage'); }
 function unknownBinding(): never { return reject('context_binding_unknown'); }
 function conflict(): never { return reject('context_binding_conflict'); }
 function resourceConflict(): never { return reject('resource_evidence_conflict'); }
-const hashText = (value: string) => createHash('sha256').update(value).digest('hex');
 function frozenResources(config: unknown): FrozenResources | null {
   const frozen = z.object({ resources: FrozenResourcesSchema.optional() }).parse(config).resources ?? null;
   if (frozen && !verifyFrozenResourceMetadata(frozen).ok) resourceConflict();
@@ -74,32 +73,35 @@ function includesResource(frozen: FrozenResources | null, ref: ResourceRef): boo
 function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: ResourceReadEvidence, reader = createNativeOriginReader(db)): void {
   const row = runRowSchema.parse(db.query('SELECT * FROM runs WHERE id=?').get(owner.runId));
   const frozen = frozenResources(json(row.config_json));
-  if (!['agent', 'subagent'].includes(row.kind) || row.session_id !== owner.sessionId || frozen?.bundleHash !== value.bundleHash || !includesResource(frozen, value.ref)) resourceConflict();
+  if (!['agent', 'subagent'].includes(row.kind) || row.session_id !== owner.sessionId || frozen?.bundleId !== value.bundleId || !includesResource(frozen, value.ref)) resourceConflict();
   const tool = z.object({ id, run_id: id, session_id: id, native_tool_call_id: z.string(), tool_name: z.string(), request_sequence: id.nullable(), args_json: z.string(),
     result_json: z.string() }).parse(db.query('SELECT * FROM tool_calls WHERE id=?').get(value.toolCallId));
   if (tool.run_id !== owner.runId || tool.session_id !== owner.sessionId || tool.native_tool_call_id !== value.nativeToolCallId
     || tool.tool_name !== value.operation || tool.request_sequence !== value.requestSequence) resourceConflict();
   const manifest = frozen.manifests.find(item => resourceRefKey(item.ref) === resourceRefKey(value.ref))?.manifest;
   const file = manifest?.files.find(item => item.path === value.path);
-  if (!file || file.sha256 !== value.fileHash) resourceConflict();
+  if (!file) resourceConflict();
+  const original = createManagedFileContents(db).read({ ownerKind: 'resource-bundle', ownerId: frozen.bundleId,
+    relativePath: `${value.ref.kind === 'prompt' ? 'prompts' : 'skills'}/${value.ref.id}/${value.ref.version}/${value.path}` });
+  if (!original || original.byteLength !== file.bytes) resourceConflict();
   const storedArgs = z.object({ version: z.literal(1), raw: z.unknown(), final: z.unknown() }).parse(json(tool.args_json));
   if (value.operation === 'list_skill_resources' || value.operation === 'read_skill_resource') {
     const result = z.object({ status: z.literal('succeeded'), data: z.unknown() }).parse(json(tool.result_json));
     const args = value.operation === 'list_skill_resources' ? ListSkillResourcesInputSchema.parse(storedArgs.final ?? storedArgs.raw)
       : ReadSkillResourceInputSchema.parse(storedArgs.final ?? storedArgs.raw);
     const data = value.operation === 'list_skill_resources' ? ListSkillResourcesOutputSchema.parse(result.data) : ReadSkillResourceOutputSchema.parse(result.data);
-    if (args.skill !== value.ref.id || resourceRefKey(data.ref) !== resourceRefKey(value.ref) || data.bundleHash !== frozen.bundleHash
-      || hashText(JSON.stringify([{ type: 'text', text: JSON.stringify(result.data) }])) !== value.deliveredHash) resourceConflict();
+    if (args.skill !== value.ref.id || resourceRefKey(data.ref) !== resourceRefKey(value.ref) || data.bundleId !== frozen.bundleId
+      || (JSON.stringify([{ type: 'text', text: JSON.stringify(result.data) }])) !== value.deliveredContent) resourceConflict();
     if ('files' in data) {
       const ordered = [...manifest!.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
       if (!same(data.files, ordered) || value.fullBody !== false) resourceConflict();
     } else {
       const readArgs = ReadSkillResourceInputSchema.parse(storedArgs.final ?? storedArgs.raw);
-      if (readArgs.path !== value.path || data.path !== value.path || data.sha256 !== file.sha256
+      if (readArgs.path !== value.path || data.path !== value.path
         || data.totalBytes !== file.bytes || data.offset !== (readArgs.offset ?? 0) || Buffer.byteLength(data.text) > (readArgs.limit ?? 16384)
         || (data.nextOffset ?? data.totalBytes) !== data.offset + Buffer.byteLength(data.text)) resourceConflict();
       const complete = data.offset === 0 && data.nextOffset === null;
-      if (value.fullBody !== complete || complete && hashText(data.text) !== file.sha256) resourceConflict();
+      if (value.fullBody !== complete || !Buffer.from(original!).subarray(data.offset, data.offset + Buffer.byteLength(data.text)).equals(Buffer.from(data.text))) resourceConflict();
     }
   } else {
     const result = z.object({ status: z.literal('succeeded'), data: NativeToolOutputSchema }).parse(json(tool.result_json));
@@ -111,15 +113,15 @@ function verifyResourceReadOwner(db: Database, owner: RunResourceQuery, value: R
     const rel = relative(target, filePath);
     if (value.operation === 'read' ? rel !== '' : rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) resourceConflict();
     const text = result.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-    if (!nativeFileResultIncludes(value.operation, rel, text) || hashText(JSON.stringify(result.data.content)) !== value.deliveredHash) resourceConflict();
-    if (value.fullBody === true && hashText(text) !== value.fileHash) resourceConflict();
+    if (!nativeFileResultIncludes(value.operation, rel, text) || (JSON.stringify(result.data.content)) !== value.deliveredContent) resourceConflict();
+    if (value.fullBody === true && !Buffer.from(text).equals(Buffer.from(original!))) resourceConflict();
   }
   if (value.nativeEntryId !== null) {
     const native = reader.entry(owner.sessionId, value.nativeEntryId);
     if (native?.type !== 'message' || native.message.role !== 'toolResult' || native.message.toolCallId !== value.nativeToolCallId
       || reader.tool(owner.sessionId, value.nativeToolCallId, true).toolCallId !== value.toolCallId
       || reader.resolve(owner.sessionId, value.nativeEntryId).originRunId !== owner.runId
-      || hashText(JSON.stringify(native.message.content)) !== value.deliveredHash) resourceConflict();
+      || (JSON.stringify(native.message.content)) !== value.deliveredContent) resourceConflict();
   }
 }
 
@@ -144,7 +146,7 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
   const binding = value.purpose === 'answer' ? owner.observations.requests.find(item => item.binding.callSequence === value.callSequence)?.binding : null;
   const operation = value.purpose === 'compaction' ? owner.observations.compactions?.find(item => item.operationId === value.compactionOperationId) : null;
   const summary = operation?.calls.find(call => call.modelCallIndex === value.callSequence);
-  if (value.purpose === 'answer' && (!binding || value.bundleHash !== (owner.frozen?.bundleHash ?? null))
+  if (value.purpose === 'answer' && (!binding || value.bundleId !== (owner.frozen?.bundleId ?? null))
     || value.purpose === 'compaction' && !summary) resourceConflict();
   const prefix = operation ? reader.path(owner.row.session_id!, operation.baseline.leafId) : [];
   const inputs = binding?.includedBindings ?? prefix.filter(entry => entry.type === 'message' && entry.message.role === 'user')
@@ -153,14 +155,14 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
     ? [reader.tool(owner.row.session_id!, entry.message.toolCallId, true)] : []);
   if (value.inputIds.some(inputId => !inputs.some(source => source.inputId === inputId))
     || value.toolCallIds.some(toolCallId => !tools.some(source => source.toolCallId === toolCallId))) resourceConflict();
-  if (value.contentChecks.length === 0 && value.referencedBundleHashes.length === 0) return;
+  if (value.contentChecks.length === 0 && value.referencedBundleIds.length === 0) return;
   const available = new Map<string, FrozenResources>();
-  if (owner.frozen && value.purpose === 'answer') available.set(owner.frozen.bundleHash, owner.frozen);
+  if (owner.frozen && value.purpose === 'answer') available.set(owner.frozen.bundleId, owner.frozen);
   for (const source of [...inputs, ...tools]) {
     if (source.originRunId === null) continue;
     const row = z.object({ config_json: z.string() }).parse(db.query('SELECT config_json FROM runs WHERE id=?').get(source.originRunId));
     const frozen = frozenResources(json(row.config_json));
-    if (frozen) available.set(frozen.bundleHash, frozen);
+    if (frozen) available.set(frozen.bundleId, frozen);
   }
   const derived = binding && 'includedNativeContexts' in binding ? z.array(NativeDerivedContextBindingSchema).parse(binding.includedNativeContexts) : [];
   const derivedIds = binding ? derived.map(source => source.nativeEntryId) : prefix.filter(entry => entry.type === 'compaction').map(entry => entry.id);
@@ -173,10 +175,10 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
       if (origin.originRunId === null) continue;
       const row = z.object({ config_json: z.string() }).parse(db.query('SELECT config_json FROM runs WHERE id=?').get(origin.originRunId));
       const frozen = frozenResources(json(row.config_json));
-      if (frozen) available.set(frozen.bundleHash, frozen);
+      if (frozen) available.set(frozen.bundleId, frozen);
     }
   }
-  if (value.referencedBundleHashes.some(hash => !available.has(hash))) resourceConflict();
+  if (value.referencedBundleIds.some(bundleId => !available.has(bundleId))) resourceConflict();
   for (const check of value.contentChecks) {
     if (check.scope === 'skill-readiness') {
       const entry = owner.frozen?.skillIndex?.entries.find(entry => same(entry.ref, check.ref));
@@ -185,7 +187,7 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
       const tools = z.object({ allowedTools: z.array(z.string()).optional() }).parse(json(scope.scope_json)).allowedTools ?? [];
       const child = owner.row.kind === 'subagent';
       const visible = child ? visibleFrozenSkills(owner.frozen!, tools) : owner.frozen!.discoveredSkills;
-      if (check.expectedTextHash !== hashText(formatSkillReadinessSection(entry!, tools, visible, child))) resourceConflict();
+      if (check.expectedText !== (formatSkillReadinessSection(entry!, tools, visible, child))) resourceConflict();
       continue;
     }
     if (![...available.values()].some(frozen => includesResource(frozen, check.ref))) resourceConflict();
@@ -197,7 +199,7 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
       if (!source || source.inputId === null || source.originRunId === null) resourceConflict();
       const origin = reader.resolve(owner.row.session_id!, source.nativeEntryId);
       const receipt = readResourceExpansion(db, { sessionId: origin.originSessionId, runId: source.originRunId }, source.inputId, source.nativeEntryId);
-      if (!receipt || !same(receipt.skill, check.ref) || receipt.expandedTextHash !== check.expectedTextHash || !value.referencedBundleHashes.includes(receipt.bundleHash)) resourceConflict();
+      if (!receipt || !same(receipt.skill, check.ref) || receipt.expandedText !== check.expectedText || !value.referencedBundleIds.includes(receipt.bundleId)) resourceConflict();
     }
     if (check.scope === 'tool-output') {
       if (check.nativeEntryId === null) resourceConflict();
@@ -206,8 +208,8 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
       const origin = reader.resolve(owner.row.session_id!, check.nativeEntryId!);
       if (origin.originRunId === null) resourceConflict();
       const receipts = verifiedReads({ sessionId: origin.originSessionId, runId: origin.originRunId });
-      if (!receipts.some(receipt => receipt.nativeEntryId === check.nativeEntryId && same(receipt.ref, check.ref) && receipt.path === check.path && value.referencedBundleHashes.includes(receipt.bundleHash))
-        || hashText(native.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')) !== check.expectedTextHash) resourceConflict();
+      if (!receipts.some(receipt => receipt.nativeEntryId === check.nativeEntryId && same(receipt.ref, check.ref) && receipt.path === check.path && value.referencedBundleIds.includes(receipt.bundleId))
+        || (native.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')) !== check.expectedText) resourceConflict();
     }
     if (check.scope === 'derived-source') {
       if (check.nativeEntryId === null || !derivedIds.includes(check.nativeEntryId)) resourceConflict();
@@ -223,9 +225,9 @@ function verifyResourceRequestOwner(db: Database, value: ResourceRequestEvidence
         if (entry.message.role === 'user' && origin.inputId !== null) {
           const receipt = readResourceExpansion(db, originalOwner, origin.inputId, entry.id);
           if (receipt && same(receipt.skill, check.ref) && (check.path === null || check.path === 'SKILL.md')
-            && value.referencedBundleHashes.includes(receipt.bundleHash)) found = true;
+            && value.referencedBundleIds.includes(receipt.bundleId)) found = true;
         } else if (entry.message.role === 'toolResult' && verifiedReads(originalOwner).some(receipt => receipt.nativeEntryId === entry.id
-          && same(receipt.ref, check.ref) && (check.path === null || check.path === receipt.path) && value.referencedBundleHashes.includes(receipt.bundleHash))) found = true;
+          && same(receipt.ref, check.ref) && (check.path === null || check.path === receipt.path) && value.referencedBundleIds.includes(receipt.bundleId))) found = true;
       }
       if (!found) resourceConflict();
     }
@@ -245,7 +247,7 @@ function verifyResourceExpansionOwner(db: Database, owner: RunResourceQuery, val
   if (!['agent', 'subagent'].includes(row.kind) || row.session_id !== owner.sessionId) resourceConflict();
   const config = json(row.config_json), frozen = frozenResources(config);
   const observations = readRunContext(row).observations;
-  if (!observations?.resources || !frozen || value.bundleHash !== frozen.bundleHash || !includesResource(frozen, value.skill)) resourceConflict();
+  if (!observations?.resources || !frozen || value.bundleId !== frozen.bundleId || !includesResource(frozen, value.skill)) resourceConflict();
   const input = z.object({ run_id: id, session_id: id, native_entry_id: z.literal(value.nativeEntryId),
     status: z.literal('consumed'), content_json: z.string() }).parse(db.query('SELECT * FROM session_inputs WHERE id=?').get(value.inputId));
   const content = SessionInputContentV2Schema.parse(json(input.content_json));
@@ -256,7 +258,7 @@ function verifyResourceExpansionOwner(db: Database, owner: RunResourceQuery, val
   const user = z.object({ type: z.literal('message'), message: z.object({ role: z.literal('user'),
     content: z.union([z.string(), z.array(z.object({ type: z.literal('text'), text: z.string() }))]) }) }).parse(json(entry.entry_json));
   const text = typeof user.message.content === 'string' ? user.message.content : user.message.content.map(item => item.text).join('');
-  if (entry.run_id !== owner.runId || hashText(text) !== value.expandedTextHash) resourceConflict();
+  if (entry.run_id !== owner.runId || (text) !== value.expandedText) resourceConflict();
   return { ...observations, resources: observations.resources };
 }
 

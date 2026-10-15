@@ -475,7 +475,8 @@ export const scenariosByName: Record<string, any> = {
               "nativeToolCallId",
               "runId",
               "sessionId",
-              "argumentsHash"
+              "rawArguments",
+              "arguments"
             ],
             "resends": 1,
             "newLogicalSaveAllowed": false,

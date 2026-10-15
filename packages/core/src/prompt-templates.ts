@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { appError, fail, ok, InputDefinitionIdSchema, GetSubagentDefinitionSchema, SaveSubagentDefinitionSchema,
   SubagentDefinitionSchema, FrozenInputDefinitionsSchema } from '@flowmate/contracts';
 import type { Result, SubagentDefinition, SaveSubagentDefinition, FrozenInputDefinitions, InputCommandItem } from '@flowmate/contracts';
-import { bytes, decoder, directory, safePath, sha256, writeSynced } from './skill-hub/resources.ts';
+import { bytes, decoder, directory, safePath, writeSynced } from './skill-hub/resources.ts';
 
 type Template = { name: string; description: string; content: string; filePath: string };
 export function createInputDefinitions(options: { resourceRoot: string; runtimeRoot: string;
@@ -25,7 +25,7 @@ export function createInputDefinitions(options: { resourceRoot: string; runtimeR
       || new Set(tools).size !== tools.length || tools.some(name => !options.tools.some(tool => tool.name === name
         && ['PURE', 'READ'].includes(tool.effect) && name !== 'Agent'))) throw new Error('Role name or read-only tool declaration is invalid.');
     return SubagentDefinitionSchema.parse({ id, description: parsed.frontmatter.description, tools, systemPrompt: parsed.body.trim(),
-      content, hash: sha256(content), source });
+      content, source });
   }
   function roles() {
     const found = new Map<string, SubagentDefinition>();
@@ -62,7 +62,7 @@ export function createInputDefinitions(options: { resourceRoot: string; runtimeR
       const role = roles().find(item => item.id === id); if (!role) throw new Error('Subagent role does not exist.'); return role; }),
     saveSubagentDefinition: (raw: SaveSubagentDefinition) => checked(() => {
       const input = SaveSubagentDefinitionSchema.parse(raw), effective = roles(), current = effective.find(item => item.id === input.id);
-      if ((current?.hash ?? null) !== input.expectedHash) throw new Error('Role changed. Query the current definition before saving.');
+      if ((current?.content ?? null) !== input.expectedContent) throw new Error('Role changed. Query the current definition before saving.');
       if (!current && effective.length >= 64) throw new Error('Effective role directory exceeds 64 definitions.');
       const role = parseRole(input.id, input.content, 'user');
       mkdirSync(userRoot, { recursive: true }); directory(userRoot);
@@ -86,20 +86,19 @@ export function createInputDefinitions(options: { resourceRoot: string; runtimeR
           const delegated = /^([a-z][a-z0-9-]{0,63})\s+([\s\S]+)$/.exec(args);
           const role = definitions.find(item => item.id === delegated?.[1]); if (!role || !delegated?.[2]?.trim()) throw new Error('Choose a registered role and provide a task.');
           const expandedText = `Delegate the following task by calling the Agent tool with subagent_type=${role.id}, run_in_background=false. Return its actual findings. Task: ${delegated[2]}`;
-          command = { kind: 'subagent', name, originalText: text, sourceHash: role.hash, expandedText, expandedHash: sha256(expandedText), requiredRoles: [role.id] };
+          command = { kind: 'subagent', name, originalText: text, expandedText, requiredRoles: [role.id] };
         } else {
           const template = loaded.find(item => item.name === name); if (!template) throw new Error('Unknown input command.');
           const expandedText = options.expandPromptTemplate(text, loaded);
           const requiredRoles = [...template.content.matchAll(/subagent_type=([a-z][a-z0-9-]*)/g)].map(match => match[1]!);
           if (requiredRoles.some(id => !definitions.some(role => role.id === id))) throw new Error('Template requires an unknown role.');
-          command = { kind: 'template', name, originalText: text, sourceHash: sha256(decoder.decode(bytes(safePath(templateRoot, `${name}.md`), 65536))),
-            expandedText, expandedHash: sha256(expandedText), requiredRoles };
+          command = { kind: 'template', name, originalText: text, expandedText, requiredRoles };
         }
       }
       const frozenTemplates = loaded.map(item => ({ name: item.name, description: item.description, content: item.content,
-        filePath: item.filePath, hash: sha256(decoder.decode(bytes(safePath(templateRoot, `${item.name}.md`), 65536))) }));
+        filePath: item.filePath }));
       return FrozenInputDefinitionsSchema.parse({ roles: definitions, templates: frozenTemplates,
-        hash: sha256(JSON.stringify({ roles: definitions, templates: frozenTemplates })), command });
+        command });
     }),
   };
 }

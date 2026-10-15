@@ -1,8 +1,6 @@
 import type { LocalDataset, LocalCase } from './local.ts';
-import { hash } from './local.ts';
 import { decodeFile } from './flat.ts';
 import { extensionIdentity } from '../configuration.ts';
-import { canonicalResourceManifest } from '../../../packages/contracts/src/resources.ts';
 
 export function fixtureSelection(dataset:LocalDataset, task:LocalCase, repo:string) {
     const authored=dataset.embedded?.authored;if(!authored)return {};
@@ -17,8 +15,8 @@ export function fixtureSelection(dataset:LocalDataset, task:LocalCase, repo:stri
             if(!source)throw Error('Missing selected Skill file: '+entry.path);
             const {file}=decodeFile(source);
             if(file.bytes!==entry.bytes)throw Error('Selected Skill file size differs: '+entry.path);
-            return {...entry,sha256:file.sha256};
+            return entry;
         });
-        return {kind:manifest.kind,id:manifest.id,version:manifest.version,contentHash:hash(canonicalResourceManifest(manifest))};
+        return {kind:manifest.kind,id:manifest.id,version:manifest.version};
     })},extensions:{enabledExtensions:selection.enabledExtensions.map((id:string)=>extensionIdentity({id,version:'v1'},repo))}};
 }

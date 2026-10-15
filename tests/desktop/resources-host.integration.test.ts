@@ -34,9 +34,9 @@ it('serialize-settings-mutations-once uses one Host queue and generic settings c
     const saved = await client.request({ type: 'update_resource_selection', input: { expectedRevision: 1, selection } }) as Result<unknown>;
     expect(saved.ok).toBe(true); if (saved.ok) expect(ResourceSelectionResultSchema.parse(saved.data)).toEqual({ revision: 2, selection });
     const before = readFileSync(join(root, 'data/settings.json'), 'utf8');
-    const invalid = { ...selection, prompt: { ...prompt.ref, contentHash: 'b'.repeat(64) } };
+    const invalid = { ...selection, prompt: { ...prompt.ref, version: 'missing-version' } };
     expect(await client.request({ type: 'save_settings', settings: { ...state.data.settings, revision: 2, resources: invalid } }))
-      .toMatchObject({ ok: false, error: { code: 'resource_version_changed' } });
+      .toMatchObject({ ok: false, error: { code: 'resource_required_unavailable' } });
     expect(await client.request({ type: 'update_resource_selection', input: { expectedRevision: 1, selection: invalid } }))
       .toMatchObject({ ok: false, error: { code: 'config_revision_conflict' } });
     expect(readFileSync(join(root, 'data/settings.json'), 'utf8')).toBe(before);
@@ -44,12 +44,12 @@ it('serialize-settings-mutations-once uses one Host queue and generic settings c
   } finally { expect(await client.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } }); }
 });
 
-it('preserves an unchanged stale selection during unrelated settings saves and never autosaves legacy upgrades', async () => {
+it('preserves an unchanged stale selection during unrelated settings saves after migrating legacy settings', async () => {
   expect(parseHostCommand({ version: 1, requestId: 'catalog', type: 'list_resources' })).not.toBeNull();
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p11-host-')), file = join(root, 'data/settings.json');
   mkdirSync(join(root, 'data'));
   const base = defaultProductSettings();
-  const resources = { prompt: { kind: 'prompt', id: 'invoice', version: 'v1', contentHash: 'b'.repeat(64) }, enabledSkills: [] };
+  const resources = { prompt: { kind: 'prompt', id: 'invoice', version: 'missing-version' }, enabledSkills: [] };
   const { extensions: _extensions, ...legacyBase } = base;
   writeFileSync(file, JSON.stringify({ ...legacyBase, version: 4, resources }));
   const client = new HostClient();
@@ -58,13 +58,13 @@ it('preserves an unchanged stale selection during unrelated settings saves and n
     expect(await client.request({ type: 'save_settings', settings: { ...base, resources, profile: { displayName: 'Still editable', theme: 'dark' } } }))
       .toMatchObject({ ok: true, data: { revision: 1, resources } });
     expect(await client.request({ type: 'list_resources' })).toMatchObject({ ok: true, data: { selection: resources,
-      diagnostics: [{ code: 'resource_version_changed' }] } });
+      diagnostics: [{ code: 'resource_required_unavailable' }] } });
   } finally { expect(await client.close()).toMatchObject({ ok: true, data: { closed: true } }); }
   const legacy = { ...legacyBase, version: 1, revision: 9 };
   delete (legacy as Record<string, unknown>).resources; delete (legacy as Record<string, unknown>).runtime;
   const original = JSON.stringify(legacy); writeFileSync(file, original);
   const restarted = new HostClient();
-  expect(await restarted.start(root, '0.1.0', repo)).toMatchObject({ ok: true, data: { settings: { version: 5, revision: 9 } } });
-  try { expect(readFileSync(file, 'utf8')).toBe(original); }
+  expect(await restarted.start(root, '0.1.0', repo)).toMatchObject({ ok: true, data: { settings: { version: 6, revision: 9 } } });
+  try { expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ version: 6, revision: 9 }); }
   finally { expect(await restarted.close()).toMatchObject({ ok: true, data: { closed: true } }); }
 });

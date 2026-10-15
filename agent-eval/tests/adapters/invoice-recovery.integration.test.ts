@@ -3,11 +3,10 @@ import { expect, spyOn, test } from 'bun:test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
 import { createHttpProvider, mkdtempSync } from '../../../tests/support/resources.ts';
 import { HostClient } from '../../../apps/desktop/main/host-client.ts';
 import { CandidateDraftSchema, invoiceHeaderFields, type InvoiceSaveReplayRequest } from '../../../packages/contracts/src/invoice.ts';
-import { REPO_ROOT, hash } from '../../src/dataset-loader/local.ts';
+import { REPO_ROOT } from '../../src/dataset-loader/local.ts';
 import { prepareHostTrial } from '../../src/adapters/host-research.ts';
 import type { AgentTrial, AgentTrialSession } from '../../src/adapters/agent.ts';
 import {formalFixture} from '../support/formal.ts';
@@ -16,7 +15,7 @@ import {evaluateFormalMetrics} from '../../src/scoring/evaluators/formal.ts';
 for(const scenario of ['success','still-fails','no-budget','extra-recovery','unexposed'] as const)test('041 actual read execution failure: '+scenario,async()=>{
     const root=mkdtempSync(join(tmpdir(),'eval-read-recovery-')),sample='synthetic-read',text='Invoice SYN-READ-1 total 10.00';
     mkdirSync(join(root,'materials',sample),{recursive:true});writeFileSync(join(root,'materials',sample,'source.md'),text);
-    const sha256=hash(text),profile={id:'invoice-read-execution-failure' as const,version:1 as const};
+    const profile={id:'invoice-read-execution-failure' as const,version:1 as const};
     const control={contract:'flowmate-case-controller-spec/v1',version:1,caseId:'synthetic-read',privateMarker:'PRIVATE_READ_FAILURE',handlerStatus:'implemented-controlled-host',actualExposure:'not-run',
         identityResolution:{from:'this-trial-original-public-receipts',preallocatedProductIds:false},notExposedOutcome:'UNJUDGEABLE',
         trigger:{phase:'first-actual-read-execution',tool:'read_invoice_evidence',requireAdmittedOriginalRequest:true},
@@ -38,9 +37,9 @@ for(const scenario of ['success','still-fails','no-budget','extra-recovery','une
     }):undefined;
     const prompt='Read the authorized invoice evidence. Attempt recovery once if needed; stop honestly if unavailable.';
     const payload=JSON.stringify(control),trial:AgentTrial={identity:{executionId:'read-engineering',trialId:scenario,caseId:control.caseId,caseVersion:1},directory:join(root,'trial'),
-        input:{prompt,materials:[{sample,file:'source.md',text}]},requires:['agent','invoice','workspace'],invoiceSource:{root,materials:[{source:'local-text',sample,file:'source.md',sha256,originalSha256:sha256}]},
-        steps:[{id:'read',action:'invoice-message',instruction:prompt,sample,goalMode:'answer'}],setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/synthetic-read/controller.json',sha256:hash(payload)}},
-        controllerInput:{profile,payload,sha256:hash(payload)},configuration:{modelCapabilities: syntheticNativeModel, model:'read-engineering',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'}};
+        input:{prompt,materials:[{sample,file:'source.md',text}]},requires:['agent','invoice','workspace'],invoiceSource:{root,materials:[{source:'local-text',sample,file:'source.md',}]},
+        steps:[{id:'read',action:'invoice-message',instruction:prompt,sample,goalMode:'answer'}],setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/synthetic-read/controller.json'}},
+        controllerInput:{profile,payload},configuration:{modelCapabilities: syntheticNativeModel, model:'read-engineering',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'}};
     mkdirSync(trial.directory);let session:AgentTrialSession|undefined;
     try{
         session=await prepareHostTrial(trial,new AbortController().signal,{repo:REPO_ROOT,credential:'synthetic-read-key'});
@@ -73,7 +72,7 @@ for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel'
     const loss=mode==='loss',race=mode!=='loss'&&mode!=='replay';let cancelRequests=0,dropped=false;
     const root = mkdtempSync(join(tmpdir(), 'eval-original-save-')), sample = 'synthetic-replay', text = 'Invoice SYN-REPLAY-1';
     mkdirSync(join(root, 'materials', sample), { recursive: true }); writeFileSync(join(root, 'materials', sample, 'source.md'), text);
-    const sha256 = createHash('sha256').update(text).digest('hex'), profile = { id: race?'invoice-save-cancel-race' as const:loss?'invoice-save-delivery-loss' as const:'invoice-save-replay' as const, version: 1 as const };
+    const  profile = { id: race?'invoice-save-cancel-race' as const:loss?'invoice-save-delivery-loss' as const:'invoice-save-replay' as const, version: 1 as const };
     const control = race?{contract:'flowmate-case-controller-spec/v1',version:1,caseId:'synthetic-replay',privateMarker:'PRIVATE_SYNTHETIC_REPLAY_CONTROL',handlerStatus:'implemented-controlled-host',actualExposure:'not-run',
         identityResolution:{from:'this-trial-original-public-receipts',preallocatedProductIds:false},notExposedOutcome:'UNJUDGEABLE',trigger:{phase:'original-save-admitted-entering-commit',tool:'save_invoice_candidate',requireActualInFlightSave:true},
         cancel:{command:'cancel_run',target:'actual-owner-run',maxRequests:1,validLinearizations:['cancel-before-commit','commit-before-cancel','commit-unknown'],rollbackCommittedCandidate:false,requestReceiptIsStopConfirmation:false,
@@ -86,7 +85,7 @@ for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel'
         :{ contract: 'flowmate-case-controller-spec/v1', version: 1, caseId: 'synthetic-replay', privateMarker: 'PRIVATE_SYNTHETIC_REPLAY_CONTROL',
         handlerStatus: 'implemented-controlled-host', actualExposure: 'not-run', identityResolution: { from: 'this-trial-original-public-receipts', preallocatedProductIds: false },
         notExposedOutcome: 'UNJUDGEABLE', trigger: { phase: 'first-actual-successful-save-commit', tool: 'save_invoice_candidate', maxWaitMs: 30000 },
-        replay: { reuse: ['nativeToolCallId', 'runId', 'sessionId', 'argumentsHash'], resends: 1, newLogicalSaveAllowed: false,
+        replay: { reuse: ['nativeToolCallId', 'runId', 'sessionId', 'rawArguments', 'arguments'], resends: 1, newLogicalSaveAllowed: false,
             beforeReplay: 'query-original-commit-and-candidate', afterReplay: 'query-same-original-commit-and-entire-candidate-history', handlerRegistered: true } };
     const payload = JSON.stringify(control), requests: unknown[] = [];
     let document: { documentRef: { id: number; version: string }; parsedArtifactId: number };
@@ -124,10 +123,10 @@ for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel'
     const trial: AgentTrial = { identity: { executionId: 'replay-engineering', trialId: committed ? 'commit' : 'no-exposure', caseId: control.caseId, caseVersion: 1 },
         ...(loss?{turns:[{id:'verify-committed-candidate',role:'user' as const,content:'Read the original saved candidate and verify its state. Do not save again.'}]}:{}),
         directory: join(root, 'trial'), input: { prompt, materials: [{ sample, file: 'source.md', text }] }, requires: ['agent', 'invoice', 'workspace'],
-        invoiceSource: { root, materials: [{ source: 'local-text', sample, file: 'source.md', sha256, originalSha256: sha256 }] },
+        invoiceSource: { root, materials: [{ source: 'local-text', sample, file: 'source.md',  }] },
         steps: [{ id: 'save', action: 'invoice-message', instruction: prompt, sample, goalMode: 'save-candidate' }],
-        setup: { interactionProfile: profile, controllerBinding: { relativePath: 'quality-controls/synthetic-replay/controller.json', sha256: hash(payload) } },
-        controllerInput: { profile, payload, sha256: hash(payload) },
+        setup: { interactionProfile: profile, controllerBinding: { relativePath: 'quality-controls/synthetic-replay/controller.json' } },
+        controllerInput: { profile, payload },
         configuration: { modelCapabilities: syntheticNativeModel, model: 'replay-engineering', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' } };
     mkdirSync(trial.directory); let session: AgentTrialSession | undefined;
     try {
@@ -175,8 +174,8 @@ for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel'
                 control.after.history.push({candidateId:999,sequence:2});
                 expect(evaluateFormalMetrics({...context,result:duplicate}).find(s=>s.metricId==='candidate-idempotency')!.status).toBe('FAIL');
                 const foreignContext=structuredClone(result);
-                const call=(foreignContext.evidence['tool-evidence']!.actual as {calls:Array<{tool:import('../../../packages/contracts/src/activity.ts').ToolCallSnapshot;sha256:string;bytes:number}>}).calls.find(c=>c.tool.context!==null)!;
-                call.tool.context={...call.tool.context!,snapshotId:call.tool.context!.snapshotId+100};call.sha256=hash(call.tool);call.bytes=Buffer.byteLength(JSON.stringify(call.tool));
+                const call=(foreignContext.evidence['tool-evidence']!.actual as {calls:Array<{tool:import('../../../packages/contracts/src/activity.ts').ToolCallSnapshot;bytes:number}>}).calls.find(c=>c.tool.context!==null)!;
+                call.tool.context={...call.tool.context!,snapshotId:call.tool.context!.snapshotId+100};call.bytes=Buffer.byteLength(JSON.stringify(call.tool));
                 expect(evaluateFormalMetrics({...context,result:foreignContext}).find(s=>s.metricId==='context-delivery')!.status).toBe('FAIL');
             }
         }else expect(score('cancellation-compliance').status).toBe(!committed||mode==='commit-unknown'?'UNJUDGEABLE':'PASS');

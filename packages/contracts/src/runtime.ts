@@ -471,8 +471,8 @@ export type AgentRunEvent = {
 );
 
 export type AgentControl = { onEvent?: (event: AgentRunEvent) => void;
-  /** Trusted Host digest of the canonical Desktop prompt, never a Renderer input field. */
-  desktopRequestHash?: string };
+  /** Original normalized Desktop request facts captured by the trusted Host. */
+  desktopRequestIdentity?: string };
 
 export type SessionRunsRequest = { sessionId: DbId; beforeRunId?: DbId; limit?: number };
 export type NormalizedSessionRunsRequest = { sessionId: DbId; beforeRunId?: DbId; limit: number };
@@ -579,6 +579,7 @@ export interface Application extends ResearchQueryApi {
   acceptInvoiceCandidate(request: import('./invoice.ts').AcceptInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
   rejectInvoiceCandidate(request: import('./invoice.ts').RejectInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceCandidateDecisionResponse>>;
   exportInvoiceCandidate(request: import('./invoice.ts').ExportInvoiceCandidateRequest): Promise<Result<import('./invoice.ts').InvoiceExportReference>>;
+  readInvoiceExport(request: import('./invoice.ts').InvoiceExportReadRequest): Promise<Result<import('./invoice.ts').InvoiceExportPage>>;
   queryInvoiceCandidateOperation(request: import('./invoice.ts').InvoiceCandidateOperationQuery): Promise<Result<import('./invoice.ts').InvoiceCandidateOperationResult>>;
   readWorkspace(): Promise<Result<import('./workspace.ts').WorkspaceSnapshot>>;
   updateWorkspace(input: { expectedRevision: number; change: import('./workspace.ts').WorkspaceChange }): Promise<Result<import('./workspace.ts').WorkspaceSnapshot>>;

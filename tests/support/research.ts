@@ -54,7 +54,7 @@ export async function researchFixture(respond: (request: Request, index: number)
   } });
   deferCleanup(() => server.stop(true));
   const app = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, logger: { write: () => undefined, close: async () => undefined },
-    agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
+    agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }) }));
   deferCleanup(() => app.close());
   const session = researchNeed(await app.createSession({ title: 'Research fixture' }));

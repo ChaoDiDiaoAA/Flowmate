@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "skill",
   "id": "invoice-review-handoff",
   "version": "v1",
@@ -37,13 +37,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 1507,
-      "sha256": "6646faf960a45cbeef672904d4041be3af491bc8e6d99546763ae7682b501bb5"
+      "bytes": 1507
     },
     {
       "path": "references/guide.md",
-      "bytes": 1095,
-      "sha256": "694e29931789b9c2e125a602bd57fe410fe6f0dd6b6c19ebf5e9df6fb122390a"
+      "bytes": 1095
     }
   ]
 }
