@@ -1,4 +1,5 @@
 import { readDeclarationDatasets } from './declarations.ts';
+import { materialPath } from './harness.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { existsSync, readFileSync, realpathSync, readdirSync, lstatSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, relative, isAbsolute, join, basename, dirname } from 'node:path';
@@ -35,6 +36,11 @@ export function inside(root: string, path: string) {
     if (!rel || rel.startsWith('..') || isAbsolute(rel) || !lstatSync(target).isFile())
         throw new Error('Material must be a file inside source');
     return target;
+}
+export function readLocalMaterial(repo: string, root: string, path: string): Buffer {
+    const file = root === join(repo, 'data/invoices/voxel51')
+        ? materialPath(repo, 'data/invoices/voxel51/' + path) : inside(root, path);
+    return readFileSync(file);
 }
 export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: FlatDataset): LocalDataset {
     if (!existsSync(directory))
@@ -95,7 +101,7 @@ export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: Flat
         const smoke=manifest.smoke.includes(task.id),key=m.source+':'+m.sample;
         if(groups.has(key)&&groups.get(key)!==smoke)throw Error('Source leakage between smoke and holdout');groups.set(key,smoke);
         const prefix=(m.source==='voxel51'?'':'materials/')+m.sample+'/';
-        const source=(name:string)=>embedded?read((m.source==='voxel51'?'voxel51/':'')+prefix+name):readFileSync(inside(m.source==='voxel51'?join(repo,'data/invoices/voxel51'):root,prefix+name));
+        const source=(name:string)=>embedded?read((m.source==='voxel51'?'voxel51/':'')+prefix+name):readLocalMaterial(repo,m.source==='voxel51'?join(repo,'data/invoices/voxel51'):root,prefix+name);
         const originals=m.source==='local-text'?(m.originalFile?[m.originalFile]:[]):(JSON.parse(utf8(source('metadata.json'))).files??[]).filter((f:any)=>/^original\.(jpg|png)$/.test(f.path)).map((f:any)=>f.path);
         for(const bytes of [source(m.file),...originals.map(source)]){
             if(contents.some(prior=>prior.smoke!==smoke&&prior.bytes.equals(bytes)))throw Error('Source leakage between smoke and holdout');
@@ -191,7 +197,7 @@ export function resolveCase(dataset: LocalDataset, task: LocalCase, repo = REPO_
     const materials = task.input.materials.map(m => {
         const source = m.source === 'local-text' ? dataset.root : dataset.embedded ? '' : realpathSync(join(repo, 'data/invoices/voxel51'));
         const prefix = (m.source === 'local-text' ? 'materials/' : '') + m.sample + '/';
-        const read = (path:string) => dataset.embedded ? embeddedRead((m.source==='voxel51'?'voxel51/':'')+path) : readFileSync(inside(source,path));
+        const read = (path:string) => dataset.embedded ? embeddedRead((m.source==='voxel51'?'voxel51/':'')+path) : readLocalMaterial(repo,source,path);
         const bytes = read(prefix + m.file);
         if (m.source === 'local-text') {
             const original = m.originalFile ? read(prefix + m.originalFile) : bytes;
@@ -246,21 +252,40 @@ export function selectCases(dataset: LocalDataset, selection: 'smoke' | 'holdout
     }
     return dataset.cases.filter(c => selection === 'full' || dataset.manifest.smoke.includes(c.id) === (selection === 'smoke'));
 }
+export function visitLocalCaseFiles(repo: string, datasetRoot: string, task: LocalCase,
+    read: (root: string, path: string, publicPath: string) => Buffer | null,
+    invalid: (path: string, error: unknown) => void = (_path, error) => { throw error; }) {
+    for (const m of task.input.materials) {
+        const root = m.source === 'voxel51' ? join(repo, 'data/invoices/voxel51') : datasetRoot;
+        const prefix = (m.source === 'voxel51' ? '' : 'materials/') + m.sample + '/';
+        const add = (path: string) => read(root, prefix + path, (m.source === 'voxel51' ? 'voxel51/' : '') + prefix + path);
+        add(m.file);
+        if (m.source === 'local-text' && m.originalFile) add(m.originalFile);
+        if (m.source === 'voxel51') {
+            const path = 'voxel51/' + prefix + 'metadata.json', bytes = add('metadata.json');
+            if (bytes) try {
+                const metadata = JSON.parse(bytes.toString('utf8'));
+                for (const file of metadata.files ?? []) if (/^original\.(jpg|png)$/.test(file.path)) add(file.path);
+            } catch (error) { invalid(path, error); }
+        }
+    }
+    const binding = task.setup && 'controllerBinding' in task.setup ? task.setup.controllerBinding : undefined;
+    if (binding) {
+        const bytes = read(datasetRoot, binding.relativePath, binding.relativePath);
+        if (bytes) try {
+            const control = JSON.parse(bytes.toString('utf8'));
+            for (const key of ['history', 'steer']) if (control[key]?.relativePath)
+                read(datasetRoot, control[key].relativePath, control[key].relativePath);
+        } catch (error) { invalid(binding.relativePath, error); }
+    }
+}
 export function caseFiles(dataset:LocalDataset,task:LocalCase) {
     if(!dataset.embedded){
         const files:ReturnType<typeof decodeFile>['file'][]=[];
-        const add=(root:string,path:string,publicPath=path)=>{const bytes=readFileSync(inside(root,path));files.push({path:publicPath,encoding:'base64',content:bytes.toString('base64'),bytes:bytes.length});return bytes;};
-        for(const m of task.input.materials){
-            const root=m.source==='voxel51'?join(dataset.repo,'data/invoices/voxel51'):dataset.root,prefix=(m.source==='voxel51'?'':'materials/')+m.sample+'/';
-            add(root,prefix+m.file,(m.source==='voxel51'?'voxel51/':'')+prefix+m.file);
-            if(m.source==='local-text'&&m.originalFile)add(root,prefix+m.originalFile);
-            if(m.source==='voxel51'){
-                const metadata=JSON.parse(add(root,prefix+'metadata.json','voxel51/'+prefix+'metadata.json').toString('utf8'));
-                for(const file of metadata.files??[])if(/^original\.(jpg|png)$/.test(file.path))add(root,prefix+file.path,'voxel51/'+prefix+file.path);
-            }
-        }
-        const binding=task.setup&&'controllerBinding'in task.setup?task.setup.controllerBinding:undefined;
-        if(binding){const control=JSON.parse(add(dataset.root,binding.relativePath).toString('utf8'));for(const key of ['history','steer'])if(control[key]?.relativePath)add(dataset.root,control[key].relativePath);}
+        visitLocalCaseFiles(dataset.repo, dataset.root, task, (root, path, publicPath) => {
+            const bytes = readLocalMaterial(dataset.repo, root, path);
+            files.push({path:publicPath,encoding:'base64',content:bytes.toString('base64'),bytes:bytes.length}); return bytes;
+        });
         return files;
     }
     const sources=dataset.embedded.authored?.gold[task.id]?.sources??[];

@@ -7,6 +7,17 @@ import { parseExtensionCommand, parseExtensionHostResult, matchesExtensionRespon
 import { parseSubagentCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure, isSubagentHostCommand } from '../../../packages/contracts/src/subagents.ts';
 import type { Result } from '@flowmate/contracts';
 import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest } from '@flowmate/contracts';
+import { parseEvaluationCommand, parseEvaluationResponse, matchesEvaluationResponse, EvaluationEventSchema,
+  type EvaluationOutput, type EvaluationInput, type EvaluationResponseType } from '../../../packages/contracts/src/evaluation.ts';
+
+async function invokeEvaluation<K extends EvaluationResponseType>(type: K, input: EvaluationInput<K>): Promise<Result<EvaluationOutput<K>>> {
+  const command = parseEvaluationCommand({ type, input });
+  if (!command) return fail(appError('input_invalid', 'input', '评测请求无效。'));
+  try {
+    const result = parseEvaluationResponse(type, await ipcRenderer.invoke(`flowmate:${type.replaceAll('_', '-')}`, command.input));
+    return result && matchesEvaluationResponse(command, result) ? result : fail(appError('evaluation_protocol_invalid', 'runtime', '评测回复不属于原请求。', true));
+  } catch { return fail(appError('evaluation_response_unknown', 'runtime', '评测回复未知，请查询原请求。', true)); }
+}
 
 async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<T>> {
   const extension = isExtensionHostCommand(type);
@@ -27,6 +38,18 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
 }
 
 const bridge: DesktopBridge = {
+  queryEvaluationCatalog: input => invokeEvaluation('query_evaluation_catalog', input),
+  addEvaluationFeedback: input => invokeEvaluation('add_evaluation_feedback', input),
+  queryEvaluationFeedback: input => invokeEvaluation('query_evaluation_feedback', input),
+  exportEvaluation: input => invokeEvaluation('export_evaluation', input),
+  listEvaluationExecutions: (input = {}) => invokeEvaluation('list_evaluation_executions', input),
+  queryEvaluationResult: input => invokeEvaluation('query_evaluation_result', input),
+  compareEvaluation: input => invokeEvaluation('compare_evaluation', input),
+  previewEvaluation: input => invokeEvaluation('preview_evaluation', input),
+  startEvaluation: input => invokeEvaluation('start_evaluation', input),
+  queryEvaluationControl: (input = {}) => invokeEvaluation('query_evaluation_control', input),
+  cancelEvaluation: input => invokeEvaluation('cancel_evaluation', input),
+  saveEvaluationSettings: input => invokeEvaluation('save_evaluation_settings', input),
   importResearchMaterial: input => invokeAssembly('import_research_material', input),
   listResearchMaterials: input => invokeAssembly('list_research_materials', input ?? {}),
   createResearchTask: input => invokeAssembly('create_research_task', input),
@@ -153,7 +176,15 @@ const bridge: DesktopBridge = {
   readDocumentOriginal: (documentId, page) => ipcRenderer.invoke('flowmate:read-document-original', documentId, page),
   revokeDocumentUse: (documentId) => ipcRenderer.invoke('flowmate:revoke-document-use', documentId),
   subscribe(listener: (event: DesktopEvent) => void) {
-    const handler = (_event: Electron.IpcRendererEvent, value: DesktopEvent) => listener(value);
+    const handler = (_event: Electron.IpcRendererEvent, value: DesktopEvent) => {
+      if (!value || typeof value !== 'object') return;
+      if (value.type === 'evaluation_event') {
+        const parsed = EvaluationEventSchema.safeParse(value.value);
+        if (!parsed.success || Object.keys(value).some(key => key !== 'type' && key !== 'value')) return;
+        listener({ type: 'evaluation_event', value: parsed.data }); return;
+      }
+      listener(value);
+    };
     ipcRenderer.on('flowmate:event', handler);
     void ipcRenderer.invoke('flowmate:subscribe');
     return () => {

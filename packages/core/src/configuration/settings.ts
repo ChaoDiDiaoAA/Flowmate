@@ -3,7 +3,7 @@ import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { appError, fail, ok, RuntimeRequestOverridesSchema, ResourceSelectionSchema, EMPTY_RESOURCE_SELECTION,
-  ExtensionSelectionSchema, EMPTY_EXTENSION_SELECTION } from '@flowmate/contracts';
+  ExtensionSelectionSchema, EMPTY_EXTENSION_SELECTION, EvaluationSettingsSchema } from '@flowmate/contracts';
 import type { ProductSettings, Result } from '@flowmate/contracts';
 
 const modelSchema = z.object({
@@ -31,7 +31,7 @@ const modelSchema = z.object({
 }, 'baseUrl must be a credential-free HTTP URL');
 
 const settingsSchema = z.object({
-  version: z.literal(6),
+  version: z.literal(7),
   revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   profile: z.object({
     displayName: z.string().trim().min(1).max(80),
@@ -42,17 +42,20 @@ const settingsSchema = z.object({
   runtime: RuntimeRequestOverridesSchema,
   resources: ResourceSelectionSchema,
   extensions: ExtensionSelectionSchema,
+  evaluation: EvaluationSettingsSchema,
   updatedAt: z.string().datetime({ offset: true }),
 }).strict().refine((settings) => {
   const ids = new Set(settings.models.map((model) => model.id));
-  const credentialRefs = new Set(settings.models.map((model) => model.credentialRef));
-  return ids.size === settings.models.length && credentialRefs.size === settings.models.length
+  const refs = [...settings.models.map((model) => model.credentialRef),
+    ...[settings.evaluation.agent, settings.evaluation.judge].flatMap(role => role ? [role.credentialRef] : [])];
+  return ids.size === settings.models.length && new Set(refs).size === refs.length
     && (settings.defaultModelId === null || ids.has(settings.defaultModelId));
 }, 'model IDs must be unique and the default must exist');
 
 export function defaultProductSettings(now = new Date().toISOString()): ProductSettings {
-  return { version: 6, revision: 0, profile: { displayName: 'Local user', theme: 'system' }, models: [], defaultModelId: null,
-    runtime: {}, resources: EMPTY_RESOURCE_SELECTION, extensions: EMPTY_EXTENSION_SELECTION, updatedAt: now };
+  return { version: 7, revision: 0, profile: { displayName: 'Local user', theme: 'system' }, models: [], defaultModelId: null,
+    runtime: {}, resources: EMPTY_RESOURCE_SELECTION, extensions: EMPTY_EXTENSION_SELECTION,
+    evaluation: { agent: null, judge: null }, updatedAt: now };
 }
 
 export function validateProductSettings(value: unknown): Result<ProductSettings> {
@@ -80,7 +83,10 @@ export function validateProductSettings(value: unknown): Result<ProductSettings>
       enabledSkills: Array.isArray(legacy.resources.enabledSkills) ? legacy.resources.enabledSkills.map(stripRef) : legacy.resources.enabledSkills },
     extensions: legacy.extensions && { ...legacy.extensions,
       enabledExtensions: Array.isArray(legacy.extensions.enabledExtensions) ? legacy.extensions.enabledExtensions.map(stripRef) : legacy.extensions.enabledExtensions } } : withExtensions;
-  const parsed = settingsSchema.safeParse(current);
+  const withEvaluation = current !== null && typeof current === 'object' && !Array.isArray(current)
+    && (current as { version?: unknown }).version === 6
+    ? { ...current, version: 7, evaluation: 'evaluation' in current ? current.evaluation : { agent: null, judge: null } } : current;
+  const parsed = settingsSchema.safeParse(withEvaluation);
   return parsed.success
     ? ok(parsed.data)
     : fail(appError('config_settings_invalid', 'input', 'Model/Profile 配置无效。'));
@@ -111,10 +117,11 @@ export async function readProductSettings(file: string): Promise<Result<ProductS
   catch { return fail(appError('config_settings_invalid', 'storage', 'Model/Profile 配置不是有效 JSON。')); }
   const validated = validateProductSettings(parsed);
   if (!validated.ok) return fail(appError('config_settings_invalid', 'storage', 'Model/Profile 配置无效。'));
-  if ((parsed as { version?: unknown })?.version !== 6) {
+  const previousVersion = (parsed as { version?: unknown })?.version;
+  if (previousVersion !== 7) {
     const temporary = `${file}.${randomUUID()}.tmp`;
     try {
-      const backup = await open(`${file}.pre-v6.${randomUUID()}.json`, 'wx', 0o600);
+      const backup = await open(`${file}.pre-v${previousVersion === 6 ? 7 : 6}.${randomUUID()}.json`, 'wx', 0o600);
       try { await backup.writeFile(raw); await backup.sync(); } finally { await backup.close(); }
       const pending = await open(temporary, 'wx', 0o600);
       try { await pending.writeFile(`${JSON.stringify(validated.data, null, 2)}\n`); await pending.sync(); } finally { await pending.close(); }

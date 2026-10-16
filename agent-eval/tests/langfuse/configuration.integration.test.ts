@@ -9,8 +9,13 @@ import { reportFixture } from '../support/fixtures.ts';
 
 test('Langfuse env reaches the real SDK against a local stub and resends without changing scores', async () => {
     const root=mkdtempSync(join(tmpdir(),'eval-lf-config-')), requests:Array<{url:string;auth:string|null;ids:string[]}>=[];
-    let partial=true;
+    let partial=true; const projectAuth: Array<string | null> = [];
     const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
+        if (new URL(request.url).pathname.endsWith('/projects')) {
+            projectAuth.push(request.headers.get('authorization'));
+            return Response.json({ data: [{ id: 'synthetic-project', name: 'Synthetic',
+                organization: { id: 'synthetic-org', name: 'Synthetic' }, metadata: {} }] });
+        }
         const body=await request.json() as {batch:Array<{id:string}>};
         requests.push({url:request.url,auth:request.headers.get('authorization'),ids:body.batch.map(event=>event.id)});
         return Response.json({successes:body.batch.filter((_,i)=>!partial||i===0).map(event=>({id:event.id,status:201})),
@@ -27,8 +32,10 @@ test('Langfuse env reaches the real SDK against a local stub and resends without
         partial=false;await main(['resend','--execution-id',report.executionId],root);expect(readReport(file).export.status).toBe('complete');
         expect(JSON.stringify(report.trials)).toBe(scores);expect(requests).toHaveLength(2);
         expect(requests[0]!.auth).toBe('Basic '+Buffer.from('test-lf-public:test-lf-secret').toString('base64'));
+        expect(projectAuth).toEqual([requests[0]!.auth, requests[0]!.auth]);
         expect(requests[1]!.ids).toEqual(requests[0]!.ids.slice(1));
         expect(report.export.url).toBe(`http://127.0.0.1:${server.port}`);
+        expect(report.export.target).toEqual({ baseUrl: `http://127.0.0.1:${server.port}`, projectId: 'synthetic-project' });
         expect(JSON.stringify(report)).not.toContain('test-lf-secret');
     } finally {
         if(oldPublic===undefined)delete process.env.LANGFUSE_PUBLIC_KEY;else process.env.LANGFUSE_PUBLIC_KEY=oldPublic;

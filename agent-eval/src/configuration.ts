@@ -45,8 +45,13 @@ export type AgentModelCapabilities = z.infer<typeof agentModelCapabilitiesSchema
 export function agentConfig(repo: string, env: NodeJS.ProcessEnv = process.env, overrides: { model?: unknown; api?: unknown; baseUrl?: unknown } = {}) {
     env = evaluationEnv(repo, env);
     const apiKey = credential(env, 'FLOWMATE_EVAL_AGENT_API_KEY');
-    const parsed = agentConnectionSchema.safeParse({ model: overrides.model ?? env.FLOWMATE_EVAL_AGENT_MODEL,
-        baseUrl: overrides.baseUrl ?? env.FLOWMATE_EVAL_AGENT_BASE_URL, api: overrides.api ?? env.FLOWMATE_EVAL_AGENT_API ?? 'openai-completions' });
+    return agentConnection({ model: overrides.model ?? env.FLOWMATE_EVAL_AGENT_MODEL,
+        baseUrl: overrides.baseUrl ?? env.FLOWMATE_EVAL_AGENT_BASE_URL, api: overrides.api ?? env.FLOWMATE_EVAL_AGENT_API ?? 'openai-completions' }, apiKey);
+}
+export function agentConnection(configuration: unknown, apiKey: string) {
+    if (typeof apiKey !== 'string' || !apiKey.trim()) throw Error('Explicit Agent credential is required; no environment fallback');
+    apiKey = apiKey.trim(); registerSecrets([apiKey]);
+    const parsed = agentConnectionSchema.safeParse(configuration);
     if (!parsed.success) {
         const field = parsed.error.issues[0]?.path[0];
         throw Error('Invalid FLOWMATE_EVAL_AGENT_' + (field === 'baseUrl' ? 'BASE_URL' : String(field ?? 'MODEL').toUpperCase()) + '; actual model, API and credential-free base URL are required');
@@ -77,6 +82,11 @@ export async function prepareAgentConfig(repo: string, env: NodeJS.ProcessEnv = 
     overrides: Parameters<typeof agentConfig>[2] = {}, catalog?: readonly ModelCatalogProvider[],
     deps: { fetcher?: (url: string, init: RequestInit) => Promise<Response>; signal?: AbortSignal } = {}) {
     const selected = agentConfig(repo, env, overrides);
+    return prepareAgentConnection(selected.configuration, selected.apiKey, catalog, deps);
+}
+export async function prepareAgentConnection(connection: z.infer<typeof agentConnectionSchema>, apiKey: string,
+    catalog?: readonly ModelCatalogProvider[], deps: Parameters<typeof readDeepSeekModelCapabilities>[2] = {}) {
+    const selected = agentConnection(connection, apiKey);
     const modelCapabilities = await resolveModelCapabilities(selected.configuration, selected.apiKey, catalog, deps);
     return { ...selected, configuration: { ...selected.configuration, modelCapabilities } };
 }
@@ -93,19 +103,26 @@ export async function resolveModelCapabilities(connection: { model: string; api:
     }
     return resolveAgentModel(connection, models);
 }
-const envName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/);
-const langfuseSchema = z.object({ baseUrl: z.string().url(), publicKeyEnv: envName.default('LANGFUSE_PUBLIC_KEY'),
-    secretKeyEnv: envName.default('LANGFUSE_SECRET_KEY') }).strict().superRefine((value, context) => {
-    const url = new URL(value.baseUrl);
+export const langfuseUrlSchema = z.string().url().superRefine((value, context) => {
+    const url = new URL(value);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
         context.addIssue({ code: 'custom', message: 'Langfuse 地址不能含凭据、查询参数或片段' });
-});
+}).transform(value => new URL(value).href.replace(/\/+$/, ''));
+export const langfuseConnectionSchema = z.object({ baseUrl: langfuseUrlSchema,
+    publicKey: z.string().trim().min(1).max(4096), secretKey: z.string().trim().min(1).max(4096) }).strict();
+export type LangfuseConnection = z.infer<typeof langfuseConnectionSchema>;
+export function langfuseConnection(value: unknown): LangfuseConnection {
+    const parsed = langfuseConnectionSchema.safeParse(value);
+    if (!parsed.success) throw Error('Invalid Langfuse connection');
+    registerSecrets([parsed.data.publicKey, parsed.data.secretKey]);
+    if ((scanEvidence(parsed.data.baseUrl).fact.actual as { leaked: boolean }).leaked) throw Error('Langfuse URL contains a configured secret');
+    return parsed.data;
+}
 export function langfuseConfig(repo: string, env: NodeJS.ProcessEnv = process.env) {
     env=evaluationEnv(repo,env);
-    const parsed=langfuseSchema.safeParse({baseUrl:env.LANGFUSE_BASE_URL});
+    const parsed=langfuseUrlSchema.safeParse(env.LANGFUSE_BASE_URL);
     if(!parsed.success)throw Error('Invalid LANGFUSE_BASE_URL');
-    const config=parsed.data;
-    return { baseUrl: config.baseUrl, publicKey: credential(env, config.publicKeyEnv), secretKey: credential(env, config.secretKeyEnv) };
+    return langfuseConnection({ baseUrl: parsed.data, publicKey: credential(env, 'LANGFUSE_PUBLIC_KEY'), secretKey: credential(env, 'LANGFUSE_SECRET_KEY') });
 }
 
 export async function readDeepSeekModelCapabilities(selection: {model:string;baseUrl:string}, apiKey:string,

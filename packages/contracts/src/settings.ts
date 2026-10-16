@@ -34,7 +34,7 @@ export type ModelProfile = {
 };
 
 export type ProductSettings = {
-  version: 2 | 3 | 4 | 5 | 6;
+  version: 2 | 3 | 4 | 5 | 6 | 7;
   revision: number;
   profile: { displayName: string; theme: 'system' | 'light' | 'dark' };
   models: readonly ModelProfile[];
@@ -42,6 +42,7 @@ export type ProductSettings = {
   runtime?: import('./runtime.ts').RuntimeRequestOverrides;
   resources?: import('./resources.ts').ResourceSelection;
   extensions?: import('./extensions.ts').ExtensionSelection;
+  evaluation?: import('./evaluation.ts').EvaluationSettings;
   updatedAt: string;
 };
 
@@ -50,6 +51,8 @@ export type DesktopState = {
   ready: boolean;
   host: 'starting' | 'ready' | 'closing' | 'error';
   modelCredentials: Readonly<Record<string, 'missing' | 'configured' | 'unavailable'>>;
+  evaluationCredentials?: import('./evaluation.ts').EvaluationConfigurationSnapshot['credentials'];
+  evaluationControl?: import('./evaluation.ts').EvaluationControlState | null;
   settings: ProductSettings;
   appVersion: string;
   userDataPath: string;
@@ -63,6 +66,7 @@ export type ProviderTestRequest = {
 };
 
 export type DesktopEvent =
+  | { type: 'evaluation_event'; value: import('./evaluation.ts').EvaluationEvent }
   | { type: 'model_auth_notice'; requestId: string; notice: ModelAuthNotice }
   | { type: 'model_auth_prompt'; requestId: string; promptId: string; prompt: ModelAuthPrompt }
   | { type: 'provider_observation'; requestId: string; runId: number; sequence: number; observation: string; at: string; data: Readonly<Record<string, unknown>> }
@@ -153,7 +157,7 @@ export type DesktopInvoiceExportResult = { outcome: 'cancelled' } | {
   outcome: 'saved'; reference: import('./invoice.ts').InvoiceExportReference; destinationPath: string;
 };
 
-export type DesktopBridge = import('./research.ts').ResearchQueryApi & Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
+export type DesktopBridge = import('./evaluation.ts').EvaluationDesktopApi & import('./research.ts').ResearchQueryApi & Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
   | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   saveResearchExport(input: import('zod').z.infer<typeof import('./research.ts').ResearchReportRequestSchema>): Promise<import('./runtime.ts').Result<{ cancelled: boolean; destinationPath?: string }>>;

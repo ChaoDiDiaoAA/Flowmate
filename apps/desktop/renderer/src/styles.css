@@ -127,6 +127,20 @@ h1 { margin-bottom: 0; color: var(--foreground); font-family: var(--font-display
 .notice.info { border-color: color-mix(in srgb, var(--accent) 25%, var(--border)); border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
 
 .model-layout { display: grid; grid-template-columns: minmax(245px, .78fr) minmax(0, 1.72fr); gap: 14px; align-items: start; }
+.evaluation-models { margin-top: 14px; }
+.evaluation-models .panel-head p { margin: 6px 0 0; color: var(--foreground-muted); font-size: 11px; line-height: 1.5; }
+.evaluation-model-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 16px; }
+.evaluation-model-card { display: flex; flex-direction: column; min-width: 0; }
+.evaluation-model-card + .evaluation-model-card { border-left: 1px solid var(--border); padding-left: 16px; }
+.evaluation-model-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.evaluation-model-heading h3 { margin: 0; }
+.evaluation-model-card .form-grid { padding: 8px 0; }
+.evaluation-model-description, .evaluation-model-credential { margin: 8px 0; color: var(--foreground-muted); font-size: 11px; line-height: 1.5; }
+.evaluation-model-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; margin-top: auto; padding-top: 10px; }
+@container workspace (max-width: 679px) {
+  .evaluation-model-grid { grid-template-columns: 1fr; }
+  .evaluation-model-card + .evaluation-model-card { border-left: 0; padding-left: 0; border-top: 1px solid var(--border); padding-top: 16px; }
+}
 .panel, .run-panel { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: none; }
 .page-content > .panel + .panel { margin-top: 14px; }
 .button-row { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 16px; }
@@ -921,3 +935,24 @@ h1 { font-family: var(--font-display-stack); font-size: clamp(30px, 2.5vw, 38px)
   .chat-directory-row { flex-wrap: wrap; }
   .chat-directory-actions, .chat-directory-rename { width: 100%; padding-left: 0; }
 }
+.evaluation-layout { display: grid; grid-template-columns: minmax(190px, 240px) minmax(0, 1fr); gap: 20px; align-items: start; }
+.evaluation-main { display: grid; gap: 20px; min-width: 0; }
+.evaluation-page .panel { padding: 18px; }
+.evaluation-page .panel-head { padding: 0; margin-bottom: 14px; }
+.evaluation-history > div:not(.panel-head) { display: grid; gap: 4px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.evaluation-history small, .evaluation-page td small { display: block; overflow-wrap: anywhere; }
+.evaluation-page fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.evaluation-page pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 420px; overflow: auto; }
+.evaluation-text { padding: 12px; background: var(--surface-muted); border-radius: 8px; }
+.evaluation-page details { margin: 12px 0; }
+.evaluation-page summary { cursor: pointer; padding: 8px 0; }
+.evaluation-paging, .evaluation-facts, .evaluation-global { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.evaluation-paging { margin-top: 12px; font-size: 12px; color: var(--foreground-muted); }
+.evaluation-global { position: sticky; top: 64px; z-index: 1; margin: 0 28px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); font-size: 12px; }
+.evaluation-feedback { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 12px; }
+.evaluation-feedback li { margin-bottom: 12px; }
+.evaluation-table-wrap { overflow-x: auto; }
+.evaluation-page table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.evaluation-page th, .evaluation-page td { padding: 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+.evaluation-originals { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@container workspace (max-width: 679px) { .evaluation-layout, .evaluation-originals { grid-template-columns: minmax(0, 1fr); } }

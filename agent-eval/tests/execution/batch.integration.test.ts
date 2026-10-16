@@ -8,6 +8,28 @@ import type { EvaluationProgress } from '../../src/execution/runner.ts';
 const env = { FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
     FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'fake-batch-judge-key' };
 const kernel: AgentKernel = { readiness: () => ({ready:true,reason:'synthetic'}), prepare: async () => { throw Error('must not generate'); } };
+
+test('an explicitly unavailable Judge cannot be replaced by environment credentials in a batch', async () => {
+    let calls=0;
+    await expect(runner.runBatch(fixtureRepo,{datasets:[dataset],selection:'smoke',backend:'local',judge:'required'},
+        {env,kernel,preparedJudge:null,run:async()=>{calls++;return{report:reportFixture(),file:'synthetic-report.json',stopped:false};}}))
+        .rejects.toThrow('Required Judge is unavailable');
+    expect(calls).toBe(0);
+});
+
+test('a batch consumes the explicit prepared Agent without consulting missing environment credentials', async () => {
+    const pure=structuredClone(dataset);pure.manifest.scoring.judges=[];
+    const preparedAgent={apiKey:'synthetic-explicit-agent',configuration:{model:'synthetic-agent',api:'openai-completions' as const,
+        baseUrl:'https://synthetic.invalid/v1',modelCapabilities:{contextWindow:64000,maxTokens:16000,reasoning:false,
+            source:'pi-sdk-model-catalog' as const,providers:['synthetic']}}};
+    let calls=0;
+    const results=await runner.runBatch(fixtureRepo,{datasets:[pure],selection:'smoke',backend:'local',judge:'required'},
+        {env:{},preparedAgent,preparedJudge:null,run:async(_,__,deps)=>{
+            calls++;expect(deps!.preparedAgent).toBe(preparedAgent);expect(deps!.preparedJudge).toBeNull();
+            return{report:reportFixture(),file:'synthetic-report.json',stopped:false};
+        }});
+    expect(calls).toBe(1);expect(results).toHaveLength(1);
+});
 test('a deterministic-only batch does not parse unused Judge credentials in required mode',async()=>{
     const pure=structuredClone(dataset);pure.manifest.scoring.judges=[];
     let executions=0;

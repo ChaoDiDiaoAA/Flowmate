@@ -47,7 +47,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
       return runs.ok && runs.data.items[0] ? { runId: runs.data.items[0].runId, sessionId } : null;
     });
     expect(identity).not.toBeNull(); if (!identity) return;
-    expect(await page.locator('.rail .nav-item').count()).toBe(11);
+    expect(await page.locator('.rail .nav-item').count()).toBe(12);
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
     await expect(page.getByTestId('activity-page')).toBeVisible();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
@@ -594,11 +594,11 @@ async function captureDesktopViews(page: Page) {
   if (!root) return;
   mkdirSync(root, { recursive: true });
   const nav = page.getByRole('navigation', { name: 'Workspace navigation' });
-  expect(await page.locator('.rail .nav-item').count()).toBe(11);
-  for (const name of ['Invoices', 'Workspace', 'Processing History', 'Chats', 'Activity', 'Models', 'Prompts', 'Skills', 'Extensions', 'Settings']) {
+  expect(await page.locator('.rail .nav-item').count()).toBe(12);
+  for (const name of ['Invoices', 'Workspace', 'Processing History', 'Chats', 'Activity', 'Models', 'Evaluation', 'Prompts', 'Skills', 'Extensions', 'Settings']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(1);
   }
-  for (const name of ['Connections', 'Approved Results', 'Evaluation']) {
+  for (const name of ['Connections', 'Approved Results']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(0);
   }
   for (const theme of ['light', 'dark'] as const) {
@@ -1003,7 +1003,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     })).toMatchObject({ ok: true });
     expect(await page.evaluate(request => window.flowmate.submitInput(request), originalPrompt)).toMatchObject(originalReceipt);
     expect(requests).toHaveLength(callsAfterStop);
-    expect(await page.locator('.rail .nav-item').count()).toBe(11);
+    expect(await page.locator('.rail .nav-item').count()).toBe(12);
     const closingApp = electronApp;
     electronApp = null;
     await closeDesktopFixture(closingApp, userData);
@@ -1462,18 +1462,19 @@ it('desktop sends directly, keeps drafts editable and restores native history af
       return window.flowmate.callProvider({ goal: 'Check', text: 'OK', modelId: state.data.settings.defaultModelId });
     }))).toMatchObject({ ok: false, error: { code: 'model_credential_missing' } });
     await page.getByRole('button', { name: 'Custom model' }).click();
-    await page.getByLabel('Display name').first().fill('Controlled model');
-    await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
-    await page.getByLabel('Model ID').fill('desktop-controlled-model');
-    await page.getByLabel('Pi API type').fill('openai-completions');
-    await page.getByLabel('Context window').fill('64000');
-    await page.getByLabel('Maximum output tokens').fill('16384');
-    await page.getByLabel(/API Key/).fill('synthetic-desktop-key');
+    const modelDetails = page.locator('.config-panel');
+    await modelDetails.getByLabel('Display name').fill('Controlled model');
+    await modelDetails.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
+    await modelDetails.getByLabel('Model ID').fill('desktop-controlled-model');
+    await modelDetails.getByLabel('Pi API type').fill('openai-completions');
+    await modelDetails.getByLabel('Context window').fill('64000');
+    await modelDetails.getByLabel('Maximum output tokens').fill('16384');
+    await modelDetails.getByLabel(/API Key/).fill('synthetic-desktop-key');
     expect(await composer.isDisabled()).toBe(false);
     await page.getByRole('button', { name: 'Save changes' }).click();
     await page.getByText(/Configuration saved/).waitFor({ state: 'visible', timeout: 10_000 });
     expect(requestBodies).toHaveLength(0);
-    await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/other`);
+    await modelDetails.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/other`);
     await page.getByRole('button', { name: 'Save changes' }).click();
     await page.getByText('write only', { exact: true }).waitFor({ state: 'visible' });
     expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
@@ -1482,8 +1483,8 @@ it('desktop sends directly, keeps drafts editable and restores native history af
       if (!result.ok) throw new Error('older_settings_missing');
       return result.data;
     });
-    await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
-    await page.getByLabel(/API Key/).fill('synthetic-desktop-key');
+    await modelDetails.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
+    await modelDetails.getByLabel(/API Key/).fill('synthetic-desktop-key');
     await page.getByRole('button', { name: 'Save changes' }).click();
     await page.getByText(/Configuration saved/).waitFor({ state: 'visible', timeout: 10_000 });
     expect(requestBodies).toHaveLength(0);
@@ -1497,7 +1498,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
       BrowserWindow.getAllWindows()[0]!.webContents.send('flowmate:event', { type: 'host_state', state });
     }, olderSettings);
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-    await expect(page.getByLabel(/Base URL/)).toHaveValue(`http://127.0.0.1:${server.port}/v1`);
+    await expect(modelDetails.getByLabel(/Base URL/)).toHaveValue(`http://127.0.0.1:${server.port}/v1`);
     await expect(page.getByRole('button', { name: 'Test connection' })).toBeEnabled();
 
     await composer.fill('Invoice total is 1060 CNY.');
@@ -2723,13 +2724,14 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
 
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
     await page.getByRole('button', { name: 'Custom model' }).click();
-    await page.getByLabel('Display name').first().fill('P3 controlled invoice model');
-    await page.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
-    await page.getByLabel('Model ID').fill('desktop-p3-model');
-    await page.getByLabel('Pi API type').fill('openai-completions');
-    await page.getByLabel('Context window').fill('64000');
-    await page.getByLabel('Maximum output tokens').fill('16384');
-    await page.getByLabel(/API Key/).fill('synthetic-desktop-p3-key');
+    const modelDetails = page.locator('.config-panel');
+    await modelDetails.getByLabel('Display name').fill('P3 controlled invoice model');
+    await modelDetails.getByLabel(/Base URL/).fill(`http://127.0.0.1:${server.port}/v1`);
+    await modelDetails.getByLabel('Model ID').fill('desktop-p3-model');
+    await modelDetails.getByLabel('Pi API type').fill('openai-completions');
+    await modelDetails.getByLabel('Context window').fill('64000');
+    await modelDetails.getByLabel('Maximum output tokens').fill('16384');
+    await modelDetails.getByLabel(/API Key/).fill('synthetic-desktop-p3-key');
     await page.getByRole('button', { name: 'Save changes' }).click();
     await page.waitForFunction(() => document.querySelector('[role="status"]')?.textContent?.includes('Configuration saved'), null, { timeout: 10_000 });
     expect(requests).toHaveLength(0);

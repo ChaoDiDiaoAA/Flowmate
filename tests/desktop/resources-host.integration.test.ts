@@ -64,7 +64,7 @@ it('preserves an unchanged stale selection during unrelated settings saves after
   delete (legacy as Record<string, unknown>).resources; delete (legacy as Record<string, unknown>).runtime;
   const original = JSON.stringify(legacy); writeFileSync(file, original);
   const restarted = new HostClient();
-  expect(await restarted.start(root, '0.1.0', repo)).toMatchObject({ ok: true, data: { settings: { version: 6, revision: 9 } } });
-  try { expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ version: 6, revision: 9 }); }
+  expect(await restarted.start(root, '0.1.0', repo)).toMatchObject({ ok: true, data: { settings: { version: 7, revision: 9 } } });
+  try { expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ version: 7, revision: 9 }); }
   finally { expect(await restarted.close()).toMatchObject({ ok: true, data: { closed: true } }); }
 });

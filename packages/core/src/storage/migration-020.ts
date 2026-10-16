@@ -219,7 +219,7 @@ export function migrateLegacyMetadata(db: Database, paths: ProductPaths, backup:
   for (const sessionId of blockedSessions) db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(sessionId);
   if (backup && existsSync(join(paths.root, 'data', 'settings.json'))) {
     const settings = JSON.parse(decoder.decode(bytes(safePath(paths.root, 'data/settings.json'), 1024 * 1024)));
-    if (settings.version !== 6) {
+    if (settings.version !== 6 && settings.version !== 7) {
       const upgraded = validateProductSettings(settings);
       if (!upgraded.ok) throw new Error('legacy_settings_invalid');
       backup.rewrite('data/settings.json', `${JSON.stringify(upgraded.data, null, 2)}\n`);

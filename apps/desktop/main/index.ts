@@ -89,6 +89,10 @@ import { createCredentialStore } from '../../../packages/shared/src/secure-crede
 import type { CredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import { systemSecureStorage } from './secure-storage.ts';
 import { HostClient } from './host-client.ts';
+import { validateBusinessSettings, saveEvaluationSettings, evaluationCredentialStatus, evaluationConfigurationSnapshot, prepareEvaluationCredentials } from './evaluation-settings.ts';
+import { EvaluationClient } from './evaluation-client.ts';
+import { evaluationResponses, parseEvaluationCommand, parseEvaluationResponse, type EvaluationResponseType } from '@flowmate/contracts';
+import { registerSecrets, scanEvidence } from '../../../agent-eval/src/execution/evidence-safety.ts';
 import type { HostCredentialRequest } from '../../host/protocol.ts';
 import { DesktopSessionInputRequestSchema, InvoiceFormRunInputSchema } from '../../host/protocol.ts';
 import { contextHostFailure, matchesContextResponse, parseContextHostResult } from '../../host/protocol.ts';
@@ -210,6 +214,7 @@ let userDataRoot = '';
 let appVersion = '0.1.0';
 let stateBroadcastSequence = 0;
 const host = new HostClient();
+let evaluation: EvaluationClient | null = null;
 const subscriptions = new Map<number, () => void>();
 type RuntimeOwner = { token: string; contents: Electron.WebContents; frame: Electron.WebFrameMain;
   url: string; generation: number; epoch: number };
@@ -287,6 +292,14 @@ async function bootstrap(): Promise<void> {
   userDataRoot = testRoot && isAbsolutePath(testRoot) ? testRoot : join(appDataPath, 'Flowmate');
   mkdirSync(userDataRoot, { recursive: true });
   app.setPath('userData', userDataRoot);
+  // The existing local test kernel owns this fixed synthetic data root; production keeps the workspace root.
+  evaluation = new EvaluationClient(appRoot, testRoot && isAbsolutePath(testRoot) ? join(userDataRoot, 'evaluation-fixture') : appRoot);
+  evaluation.subscribe(value => {
+    for (const [webContentsId] of subscriptions) {
+      const contents = BrowserWindow.getAllWindows().find(window => window.webContents.id === webContentsId)?.webContents;
+      if (contents && !contents.isDestroyed()) contents.send('flowmate:event', { type: 'evaluation_event', value } satisfies DesktopEvent);
+    }
+  });
   await app.whenReady();
   appVersion = readProductVersion(appRoot);
   const testInvoiceSourceRoot = !app.isPackaged && process.env.FLOWMATE_TEST_MODE === '1'
@@ -353,10 +366,12 @@ async function closeDesktop(): Promise<void> {
   desktopClosing = true;
   await startup;
   releaseAllRuntimeOwners();
-  const closed = await host.close();
+  const [closed, evaluationClosed] = await Promise.all([host.close(), evaluation?.close() ?? Promise.resolve(ok({ closed: true, stopped: true, errors: [] }))]);
+  const allClosed = closed.ok && closed.data.closed && evaluationClosed.ok && evaluationClosed.data.closed;
+  const allStopped = closed.ok && closed.data.stopped && evaluationClosed.ok && evaluationClosed.data.stopped;
   await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_closed', requestId: devShutdownRequestId,
-    closed: closed.ok && closed.data.closed, stopped: closed.ok && closed.data.stopped });
-  if (closed.ok && closed.data.closed && closed.data.stopped) {
+    closed: allClosed, stopped: allStopped });
+  if (allClosed && allStopped) {
     allowWindowClose = true;
     allowQuit = true;
     for (const unsubscribe of subscriptions.values()) unsubscribe();
@@ -364,7 +379,8 @@ async function closeDesktop(): Promise<void> {
     app.quit();
   } else {
     hostError = true;
-    hostErrorCode = closed.ok ? 'host_close_unconfirmed' : closed.error.code;
+    hostErrorCode = !closed.ok ? closed.error.code : !closed.data.closed || !closed.data.stopped ? 'host_close_unconfirmed'
+      : evaluationClosed.ok ? 'evaluation_stop_unconfirmed' : evaluationClosed.error.code;
     await broadcastState();
   }
 }
@@ -479,7 +495,8 @@ function registerIpc(): void {
           ? (() => { const parsed = ContextErrorSchema.safeParse(error); return parsed.success ? fail(parsed.data) : contextHostFailure(); })()
           : fail(error);
       if (!isTrustedSender(event)) return failure(appError('ipc_forbidden', 'input', '请求来源不受信任。'));
-      if (desktopClosing) return failure(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
+      if (desktopClosing && !['flowmate:query-evaluation-control', 'flowmate:cancel-evaluation', 'flowmate:list-evaluation-executions', 'flowmate:query-evaluation-result', 'flowmate:compare-evaluation', 'flowmate:query-evaluation-catalog', 'flowmate:query-evaluation-feedback'].includes(channel))
+        return failure(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
       try { return await handler(event, ...args); }
       catch { return failure(appError('desktop_operation_failed', 'runtime', '桌面操作失败。', true)); }
     });
@@ -508,6 +525,45 @@ function registerIpc(): void {
   });
   handle(channels.getState, async () => readDesktopState());
   handle(channels.saveSettings, async (_event, settingsRaw, credentialUpdateRaw) => saveSettings(settingsRaw, credentialUpdateRaw));
+  for (const type of Object.keys(evaluationResponses) as EvaluationResponseType[]) {
+    handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, input) => {
+      const command = parseEvaluationCommand({ type, input });
+      if (!command || !evaluation) return fail(appError('input_invalid', 'input', '评测操作或控制器不可用。'));
+      let result: unknown;
+      switch (command.type) {
+        case 'query_evaluation_catalog': result = await evaluation.catalog(command.input); break;
+        case 'add_evaluation_feedback': result = await evaluation.addFeedback(command.input); break;
+        case 'query_evaluation_feedback': result = await evaluation.feedback(command.input); break;
+        case 'export_evaluation': result = await evaluation.export(command.input); break;
+        case 'preview_evaluation': {
+          const current = await readSavedSettings(); if (!current.ok) return current;
+          result = await evaluation.preview(command.input, await evaluationConfigurationSnapshot(current.data, credentialStore)); break;
+        }
+        case 'start_evaluation':
+          result = await evaluation.start(command.input, async preview => {
+            const current = await readSavedSettings(); if (!current.ok) return current;
+            return prepareEvaluationCredentials(preview, current.data, credentialStore);
+          }); break;
+        case 'query_evaluation_control': result = await evaluation.control(command.input); break;
+        case 'cancel_evaluation': result = await evaluation.cancel(command.input); break;
+        case 'list_evaluation_executions': result = await evaluation.listExecutions(command.input); break;
+        case 'query_evaluation_result': result = await evaluation.result(command.input); break;
+        case 'compare_evaluation': result = await evaluation.compare(command.input); break;
+        case 'save_evaluation_settings': {
+          if (command.input.apiKey) registerSecrets([command.input.apiKey]);
+          const saved = await saveEvaluationSettings(command.input, { getSettings: readSavedSettings,
+            saveSettings: settings => requestHost({ type: 'save_settings', settings }) as Promise<Result<ProductSettings>>, credentialStore });
+          if (!saved.ok) { result = saved; break; }
+          result = ok({ role: command.input.role, revision: saved.data.revision,
+            evaluation: saved.data.evaluation ?? { agent: null, judge: null }, credentials: await evaluationCredentialStatus(saved.data, credentialStore) });
+          await broadcastState(); break;
+        }
+        default: return fail(appError('input_invalid', 'input', '未开放该评测操作。'));
+      }
+      return parseEvaluationResponse(type, scanEvidence(result).value)
+        ?? fail(appError('evaluation_protocol_invalid', 'runtime', '评测结果结构无效。', true));
+    });
+  }
   handle(channels.listModelCatalog, async (_event, providerId, refresh) => {
     if (providerId !== undefined && (typeof providerId !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(providerId)))
       return fail(appError('input_invalid', 'input', 'Provider ID is invalid.'));
@@ -885,7 +941,15 @@ async function readDesktopState(): Promise<Result<DesktopState>> {
     ...base.data,
     ...(hostError ? { ready: false, host: 'error' as const } : {}),
     modelCredentials,
+    evaluationCredentials: await evaluationCredentialStatus(base.data.settings, credentialStore),
+    evaluationControl: evaluation?.state ?? null,
   } };
+}
+
+async function readSavedSettings(): Promise<Result<ProductSettings>> {
+  const state = await requestHost({ type: 'get_state' }) as Result<Omit<DesktopState, 'modelCredentials'>>;
+  if (!state.ok) return state;
+  return state.data.settings ? ok(state.data.settings) : fail(appError(hostErrorCode, 'runtime', 'Bun Host 设置尚未就绪。', true));
 }
 
 async function modelCredentialStatus(model: ProductSettings['models'][number]): Promise<'missing' | 'configured' | 'unavailable'> {
@@ -904,11 +968,11 @@ async function modelCredentialStatus(model: ProductSettings['models'][number]): 
 }
 
 async function saveSettings(settingsRaw: unknown, credentialUpdateRaw: unknown): Promise<Result<ProductSettings>> {
-  const parsed = validateProductSettings(settingsRaw);
-  if (!parsed.ok) return parsed;
   const previousResult = await requestHost({ type: 'get_state' }) as Result<Omit<DesktopState, 'modelCredentials'>>;
   if (!previousResult.ok || !previousResult.data.settings) return fail(appError(hostErrorCode, 'runtime', 'Bun Host 尚未就绪。', true));
   const previous = previousResult.data.settings as ProductSettings;
+  const parsed = validateBusinessSettings(settingsRaw, previous);
+  if (!parsed.ok) return parsed;
   let next = parsed.data;
   let newCredentialRef: string | null = null;
   let update: { modelId: string; apiKey: string } | null = null;

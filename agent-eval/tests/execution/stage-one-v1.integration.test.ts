@@ -8,6 +8,7 @@ import { readReport } from '../../src/reports/store.ts';
 import { exportReport } from '../../src/langfuse/export.ts';
 import { addFeedback } from '../../src/review/local.ts';
 import { registerSecrets } from '../../src/execution/evidence-safety.ts';
+import { syntheticLangfuseExport } from '../support/langfuse.ts';
 
 test('v1 output uses references, cleans a stopped scene and saves optional receipts only on actual actions',async()=>{
  let working='',platformCalls=0;registerSecrets(['stage-one-fake-secret']);
@@ -28,7 +29,7 @@ test('v1 output uses references, cleans a stopped scene and saves optional recei
  expect(disk.trials[0].evidence.trial).toBe(`evidence/${t.trialId}/trial.json`);
  expect(readReport(run.file).trials[0]!.execution!.observations).toHaveLength(1);
  const before=readFileSync(run.file,'utf8');
- await exportReport(readReport(run.file),run.file,async()=>{throw Error('synthetic offline');});
+ await exportReport(readReport(run.file),run.file,async()=>{throw Error('synthetic offline');},fixtureRepo,syntheticLangfuseExport);
  expect(readReport(run.file).export.status).toBe('error');expect(readFileSync(run.file,'utf8')).toBe(before);
  addFeedback(fixtureRepo,{executionId:run.report.executionId,caseId:t.caseId,trialId:t.trialId,reviewer:'synthetic reviewer',verdict:'bad',note:'Synthetic feedback only.'});
  expect(existsSync(join(root,'review.json'))).toBe(true);

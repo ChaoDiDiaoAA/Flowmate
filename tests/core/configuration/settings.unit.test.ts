@@ -30,7 +30,7 @@ describe('desktop settings', () => {
     delete (legacy as Record<string, unknown>).extensions;
     await writeFile(file, JSON.stringify(legacy));
     const loaded = await readProductSettings(file);
-    expect(loaded).toMatchObject({ ok: true, data: { version: 6, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
+    expect(loaded).toMatchObject({ ok: true, data: { version: 7, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
     if (!loaded.ok) return;
     const runtime = { budget: { maxModelCalls: 64, maxToolCalls: 100, toolTimeoutMs: 1_800_000 },
       timeoutMs: 1_800_000, stopGraceMs: 10_000 };
@@ -58,7 +58,7 @@ describe('desktop settings', () => {
     expect(current.ok && current.data.revision).toBe(1);
   });
 
-  it('settings-v1-v2-v3-to-v6 backs up the original bytes and preserves revisions', async () => {
+  it('settings-v1-v2-v3-to-v7 backs up the original bytes and preserves revisions', async () => {
     const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-'));
     const file = join(root, 'settings.json');
     const { runtime: _runtime, ...base } = defaultProductSettings('2026-09-23T00:00:00.000Z');
@@ -68,15 +68,15 @@ describe('desktop settings', () => {
       const original = JSON.stringify({ ...base, version, revision: 7, ...(version === 3 ? { runtime: {} } : {}) });
       await writeFile(file, original);
       const loaded = await readProductSettings(file);
-      expect(loaded).toMatchObject({ ok: true, data: { version: 6, revision: 7, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
-      expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({ version: 6, revision: 7 });
+      expect(loaded).toMatchObject({ ok: true, data: { version: 7, revision: 7, runtime: {}, resources: { prompt: null, enabledSkills: [] } } });
+      expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({ version: 7, revision: 7 });
       const backups = (await fs.readdir(root)).filter(name => name.startsWith('settings.json.pre-v6.'));
       expect(await Promise.all(backups.map(name => readFile(join(root, name), 'utf8')))).toContain(original);
     }
     const current = defaultProductSettings();
     const ref = { kind: 'skill', id: 'invoice', version: 'v1' };
     expect(validateProductSettings({ ...current, resources: { prompt: null, enabledSkills: [ref] } }).ok).toBe(true);
-    for (const change of [{ version: 7 }, { resources: undefined }, { resources: { prompt: null, enabledSkills: [ref, ref] } },
+    for (const change of [{ version: 8 }, { resources: undefined }, { resources: { prompt: null, enabledSkills: [ref, ref] } },
       { resources: { prompt: null, enabledSkills: [], inferredRead: true } }])
       expect(validateProductSettings({ ...current, ...change }).ok).toBe(false);
   });
@@ -134,7 +134,7 @@ describe('desktop settings', () => {
       { id: 'other', credentialRef: 'other-credential-ref', name: 'Other', baseUrl: 'https://other.example/v1',
         model: 'other-model', api: 'openai-completions' }], defaultModelId: 'old-deepseek' }), 'utf8');
     const loaded = await readProductSettings(file);
-    expect(loaded).toMatchObject({ ok: true, data: { version: 6, defaultModelId: null,
+    expect(loaded).toMatchObject({ ok: true, data: { version: 7, defaultModelId: null,
       models: [{ id: 'other', kind: 'legacy' }] } });
   });
 

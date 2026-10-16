@@ -17,6 +17,7 @@ import { aggregate, aggregateTrials } from '../../src/scoring/aggregate.ts';
 import { deriveResearchF1 } from '../../src/scoring/research-f1.ts';
 import {formalMetric} from '../../src/scoring/catalog.ts';
 import {loadCalibration} from '../../src/scoring/judges/calibration.ts';
+import { syntheticLangfuseExport } from '../support/langfuse.ts';
 
 test('plain research witnesses, independent counts and derived F1 survive report readback and reject changed originals',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'eval-packed-report-')),file=join(dir,'summary.json');
@@ -58,11 +59,11 @@ test('export failure and repeated resend preserve business scores and reuse IDs'
         saveReport(file,report);
         const before = JSON.stringify(report.trials);
         const ids = exportEvents(report).map(e => e.id);
-        await exportReport(report, file, async () => { throw new Error('offline'); });
+        await exportReport(report, file, async () => { throw new Error('offline'); }, undefined, syntheticLangfuseExport);
         expect(report.export.status).toBe('error');
         expect(exitCode(report)).toBe(0);
         const batches: unknown[] = [];
-        await exportReport(report, file, async (batch) => { batches.push(batch); });
+        await exportReport(report, file, async (batch) => { batches.push(batch); }, undefined, syntheticLangfuseExport);
         expect(exportEvents(report).map(e => e.id)).toEqual(ids);
         expect(JSON.stringify(report.trials)).toBe(before);
         expect(readReport(file).export.status).toBe('complete');

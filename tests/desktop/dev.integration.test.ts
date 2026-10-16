@@ -9,14 +9,14 @@ import { mkdtemp } from '../support/resources.ts';
 for (const failure of ['unconfirmed-close', 'startup-failure'] as const) it(`dev rejects ${failure} and releases its launcher resources`, async () => {
   const repo = resolve(import.meta.dir, '../..');
   const root = await mkdtemp(join(tmpdir(), 'flowmate-dev-protocol-'));
-  for (const path of ['apps', 'packages', 'scripts', 'package.json', 'electron.vite.config.ts'])
+  for (const path of ['apps', 'packages', 'scripts', 'agent-eval/src', 'package.json', 'electron.vite.config.ts'])
     cpSync(join(repo, path), join(root, path), { recursive: true });
   symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'), 'junction');
   const mainFile = join(root, 'apps/desktop/main/index.ts');
   const source = readFileSync(mainFile, 'utf8');
   if (failure === 'unconfirmed-close') {
     // The real Main and Host still close. Reject their reply, then inject an unrelated success.
-    const notice = 'closed: closed.ok && closed.data.closed, stopped: closed.ok && closed.data.stopped });';
+    const notice = 'closed: allClosed, stopped: allStopped });';
     expect(source).toContain(notice);
     writeFileSync(mainFile, source.replace(notice, "closed: false, stopped: false });\n  await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_closed', requestId: 'another-request', closed: true, stopped: true });"));
     // Settle the rejected reply after the real Desktop exit to cover the

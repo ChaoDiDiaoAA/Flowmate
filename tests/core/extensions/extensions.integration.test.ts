@@ -85,12 +85,12 @@ describe('P12 trusted extension selection', () => {
       if (version < 3) delete old.runtime;
       const original = JSON.stringify(old); writeFileSync(file, original);
       const loaded = await readProductSettings(file);
-      expect(loaded).toMatchObject({ ok: true, data: { version: 6, revision: 7, extensions: { enabledExtensions: [] } } });
-      expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ version: 6, revision: 7 });
+      expect(loaded).toMatchObject({ ok: true, data: { version: 7, revision: 7, extensions: { enabledExtensions: [] } } });
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ version: 7, revision: 7 });
       expect(readdirSync(f.root).filter(name => name.startsWith('settings.json.pre-v6.')).some(name => readFileSync(join(f.root, name), 'utf8') === original)).toBe(true);
       if (!loaded.ok) continue;
       const next = { ...loaded.data, extensions: selection };
-      expect(await saveProductSettings(file, next, at)).toMatchObject({ ok: true, data: { version: 6, revision: 8, extensions: selection } });
+      expect(await saveProductSettings(file, next, at)).toMatchObject({ ok: true, data: { version: 7, revision: 8, extensions: selection } });
       expect(await saveProductSettings(file, next, at)).toMatchObject({ ok: false, error: { code: 'config_revision_conflict' } });
       const saved = readFileSync(file, 'utf8'), rename = spyOn(fsPromises, 'rename').mockRejectedValueOnce(new Error('controlled rename failure'));
       try {

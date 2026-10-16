@@ -1,9 +1,10 @@
 import { REPO_ROOT } from '../dataset-loader/local.ts';
-import { publicVersions, atomicJson, publicReport } from '../reports/files.ts';
+import { acquireEvaluationWrite, publicVersions, atomicJson, publicReport } from '../reports/files.ts';
 import { join, dirname } from 'node:path';
-import { langfuseConfig, agentModelCapabilitiesSchema } from '../configuration.ts';
-import { readReport, type LocalReport } from '../reports/store.ts';
+import { langfuseConfig, langfuseConnection, agentModelCapabilitiesSchema, type LangfuseConnection } from '../configuration.ts';
+import { readReport, readExportState, type LocalReport } from '../reports/store.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
+import { z } from 'zod';
 export type Event = {
     id: string;
     type: string;
@@ -41,8 +42,8 @@ function scoreSummary(score: LocalReport['trials'][number]['scores'][number]) {
         statistics: score.statistics ? { unit: score.statistics.unit, numerator: score.statistics.numerator, denominator: score.statistics.denominator,
             missing: score.statistics.missing } : undefined, evidenceCount: score.evidence.length };
 }
-export async function platformClient(repo = REPO_ROOT) {
-    const config = langfuseConfig(repo);
+export async function platformClient(repo = REPO_ROOT, connection?: LangfuseConnection) {
+    const config = connection === undefined ? langfuseConfig(repo) : langfuseConnection(connection);
     const { LangfuseClient } = await import('@langfuse/client');
     return new LangfuseClient({ ...config, timeout: 10 });
 }
@@ -112,50 +113,75 @@ export function exportEvents(report: LocalReport): Event[] {
         throw new Error('Secret detected in export payload; refusing export');
     return events;
 }
-export async function exportReport(report: LocalReport, path: string, transport?: (events: Event[]) => Promise<void | Receipt>, repo = REPO_ROOT) {
+type ExportOptions = { connection?: LangfuseConnection; queryProjects?: () => Promise<unknown> };
+const projectsSchema = z.object({ data: z.array(z.object({ id: z.string().min(1).max(200) }).passthrough()),
+    meta: z.object({ totalItems: z.literal(1).optional(), totalPages: z.literal(1).optional() }).passthrough().optional() }).passthrough();
+export async function exportReport(report: LocalReport, path: string, transport?: (events: Event[]) => Promise<void | Receipt>, repo = REPO_ROOT,
+    options: ExportOptions = {}) {
+    const release = acquireEvaluationWrite(join(dirname(path), 'export.json'));
+    try { return await exportOwnedReport(report, path, transport, repo, options); }
+    finally { release(); }
+}
+async function exportOwnedReport(report: LocalReport, path: string, transport: ((events: Event[]) => Promise<void | Receipt>) | undefined, repo: string,
+    options: ExportOptions) {
     if (!['flowmate-agent-run/v1', 'flowmate-agent-run/v2'].includes(report.contract))
         throw new Error('Historical exports are disabled');
     if (report.endedAt === null || report.scoring !== 'complete')
         throw new Error('Export requires an ended report with completed scoring; running progress cannot be resent');
-    if(JSON.stringify(publicReport(readReport(path)))!==JSON.stringify(publicReport(report)))throw Error('Export requires the original saved report facts');
+    const saved = readReport(path);
+    if(JSON.stringify(publicReport(saved))!==JSON.stringify(publicReport(report)))throw Error('Export requires the original saved report facts');
+    report.export = readExportState(path, saved.export);
     const previous = structuredClone(report.export), accepted = new Set(previous.progress?.acceptedEventIds ?? []), rejected = new Set(previous.progress?.rejectedEventIds ?? []);
-    let events: Event[] = [], platformUrl = process.env.LANGFUSE_BASE_URL;
-    const record = (error?: string) => {
-        report.export = { backend: 'langfuse', status: error ? (accepted.size ? 'partial' : 'error') : 'complete',
-            progress: { total: events.length, acceptedEventIds: events.filter(e => accepted.has(e.id)).map(e => e.id), rejectedEventIds: events.filter(e => rejected.has(e.id)).map(e => e.id) },
-            error, url: platformUrl };
-        if (error && previous.status === 'complete') report.export = previous;
-        atomicJson(join(dirname(path),'export.json'),publicVersions(report.export));
-    };
+    if (!previous.target && (previous.progress || previous.backend === 'langfuse' && ['complete', 'partial', 'error'].includes(previous.status)))
+        throw Error('Historical export target is unavailable; original receipts are read-only');
+    const events = exportEvents(report), current = new Set(events.map(e => e.id));
+    if ([...accepted, ...rejected].some(id => !current.has(id)) || previous.progress && previous.progress.total !== events.length ||
+        previous.target && !previous.progress || previous.status === 'complete' && accepted.size !== events.length)
+        throw Error('Export progress differs from original event identities');
+    const connection = options.connection === undefined ? langfuseConfig(repo) : langfuseConnection(options.connection);
+    let client: Awaited<ReturnType<typeof platformClient>> | undefined;
     try {
-        if (!transport) platformUrl = langfuseConfig(repo).baseUrl;
-        events = exportEvents(report);
-        const current = new Set(events.map(e => e.id));
-        if ([...accepted, ...rejected].some(id => !current.has(id)) || previous.progress && previous.progress.total !== events.length)
-            throw new Error('Export progress differs from original event identities');
-        const send = transport ?? (async (batch: Event[]) => {
-            const client = await platformClient(repo);
-            platformUrl = langfuseConfig(repo).baseUrl;
-            try {
-                return await client.api.ingestion.batch({ batch: batch as Parameters<typeof client.api.ingestion.batch>[0]['batch'] });
+        if (!transport || !options.queryProjects) client = await platformClient(repo, connection);
+        let projects: unknown;
+        try { projects = await (options.queryProjects ? options.queryProjects() : client!.api.projects.get({ maxRetries: 0 })); }
+        catch { throw Error('Langfuse project query failed; no events sent'); }
+        const parsed = projectsSchema.safeParse(projects);
+        if (!parsed.success || parsed.data.data.length !== 1) throw Error('Langfuse target requires a unique project');
+        const target = { baseUrl: connection.baseUrl, projectId: parsed.data.data[0]!.id };
+        if ((scanEvidence(target).fact.actual as { leaked: boolean }).leaked) throw Error('Langfuse target contains a configured secret');
+        if (previous.target && (previous.target.baseUrl !== target.baseUrl || previous.target.projectId !== target.projectId))
+            throw Error('Langfuse target differs from the original export');
+        if (previous.status === 'complete') return report.export;
+        const progress = () => ({ total: events.length, acceptedEventIds: events.filter(e => accepted.has(e.id)).map(e => e.id),
+            rejectedEventIds: events.filter(e => rejected.has(e.id)).map(e => e.id) });
+        const record = (status: LocalReport['export']['status'], error?: string) => {
+            const next: LocalReport['export'] = { backend: 'langfuse', status, target, progress: progress(), error, url: target.baseUrl };
+            atomicJson(join(dirname(path), 'export.json'), publicVersions(next));
+            report.export = next;
+        };
+        if (!previous.target) record('pending');
+        const send = transport ?? ((batch: Event[]) => client!.api.ingestion.batch({
+            batch: batch as Parameters<NonNullable<typeof client>['api']['ingestion']['batch']>[0]['batch'],
+        }, { maxRetries: 0 }));
+        try {
+            for (let i = 0; i < events.length; i += 50) {
+                const batch = events.slice(i, i + 50).filter(e => !accepted.has(e.id)); if (!batch.length) continue;
+                const receipt = await send(batch), confirmed = receipt ? receiptIds(batch, receipt) : new Set(batch.map(e => e.id));
+                for (const id of confirmed) { accepted.add(id); rejected.delete(id); }
+                if (receipt) {
+                    for (const error of receipt.errors as Array<{ id: string }>) if (!accepted.has(error.id)) rejected.add(error.id);
+                    validateReceipt(batch, receipt);
+                }
+                // Persist each confirmed batch before another send; missing receipts remain unconfirmed.
+                record(accepted.size === events.length ? 'complete' : 'partial');
             }
-            finally {
-                await client.shutdown();
-            }
-        });
-        for (let i = 0; i < events.length; i += 50) {
-            const batch = events.slice(i, i + 50).filter(e=>!accepted.has(e.id));if(!batch.length)continue;const receipt = await send(batch);
-            const confirmed = receipt ? receiptIds(batch, receipt) : new Set(batch.map(e => e.id));
-            for (const id of confirmed) { accepted.add(id); rejected.delete(id); }
-            for (const event of batch) if (!confirmed.has(event.id) && !accepted.has(event.id)) rejected.add(event.id);
-            if (receipt) validateReceipt(batch, receipt);
-            // Save confirmed batches before the next network request; a failed resend cannot erase them.
-            record(accepted.size === events.length ? undefined : 'Export batches remain pending');
+            record('complete');
+        } catch (error) {
+            record(accepted.size ? 'partial' : 'error', scanEvidence(String(error)).value);
         }
-        record();
+        return report.export;
+    } finally {
+        try { await client?.shutdown(); }
+        catch { throw Error('Langfuse client shutdown failed; query the original saved export state'); }
     }
-    catch (error) {
-        record(scanEvidence(String(error)).value);
-    }
-    return report.export;
 }

@@ -381,12 +381,12 @@ function matchesRuntimeResponse(command: HostCommand, value: unknown): boolean {
   return true;
 }
 
-export function safeChildEnvironment(): NodeJS.ProcessEnv {
+export function safeChildEnvironment(includeAmbientCredentials = true): NodeJS.ProcessEnv {
   const allowed = ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'BUN_INSTALL'];
   const env: NodeJS.ProcessEnv = {};
   env.PI_OFFLINE = '1';
   for (const name of allowed) if (process.env[name]) env[name] = process.env[name];
-  for (const [name, value] of Object.entries(process.env)) {
+  for (const [name, value] of includeAmbientCredentials ? Object.entries(process.env) : []) {
     if (value && !/^(FLOWMATE_|LANGFUSE_|CODEX_)/.test(name)
       && (/_(?:API_KEY|AUTH_TOKEN|OAUTH_TOKEN|TOKEN|ACCESS_KEY_ID|SECRET_ACCESS_KEY|PROFILE|REGION|CREDENTIALS|CREDENTIALS_FILE|PROJECT|LOCATION)$/.test(name)
         || name.startsWith('AWS_'))) env[name] = value;

@@ -11,6 +11,7 @@ import { metricCatalog } from '../../src/scoring/catalog.ts';
 import { readReport,saveReport } from '../../src/reports/store.ts';
 import { syntheticNativeModel } from '../support/native-model.ts';
 import { registerSecrets } from '../../src/execution/evidence-safety.ts';
+import { syntheticLangfuseExport } from '../support/langfuse.ts';
 
 test('Agent native capacity metadata is exported without keys or private configuration', () => {
     const report = reportFixture();
@@ -53,18 +54,18 @@ test('partial receipts persist accepted IDs; duplicate and foreign receipt ident
     const first = events[0]!.id;
     assert.throws(() => validateReceipt(events, { successes: [...events.map(e => ({ id: e.id })), { id: first }], errors: [] }));
     assert.throws(() => validateReceipt(events, { successes: [...events.map(e => ({ id: e.id })), { id: 'foreign' }], errors: [] }));
-    await exportReport(report, file, async batch => ({ successes: [{ id: batch[0]!.id }], errors: [{ id: batch[1]!.id }] }));
+    await exportReport(report, file, async batch => ({ successes: [{ id: batch[0]!.id }], errors: [{ id: batch[1]!.id }] }), undefined, syntheticLangfuseExport);
     assert.equal(report.export.status, 'partial');
     assert.deepEqual(report.export.progress?.acceptedEventIds, [first]);
     assert.equal(readReport(file).export.status, 'partial');
-    await exportReport(report, file, async () => { throw new Error('offline'); });
+    await exportReport(report, file, async () => { throw new Error('offline'); }, undefined, syntheticLangfuseExport);
     assert.equal(report.export.status, 'partial');
     const original = JSON.stringify(report.trials);
-    await exportReport(report, file, async batch => ({ successes: batch.map(e => ({ id: e.id })), errors: [] }));
+    await exportReport(report, file, async batch => ({ successes: batch.map(e => ({ id: e.id })), errors: [] }), undefined, syntheticLangfuseExport);
     assert.equal(report.export.status, 'complete');
     assert.equal(JSON.stringify(report.trials), original);
     assert.equal(report.export.progress?.acceptedEventIds.length, events.length);
-    await exportReport(report, file, async () => { throw new Error('offline after complete'); });
+    await exportReport(report, file, async () => { throw new Error('offline after complete'); }, undefined, syntheticLangfuseExport);
     assert.equal(report.export.status, 'complete');
 });
 
@@ -73,7 +74,7 @@ test('successful early batch survives a later batch failure', async () => {
     trial.execution!.observations = Array.from({ length: 60 }, (_, i) => ({ id: String(i), kind: 'span', name: 'Run', startedAt: report.startedAt, endedAt: report.endedAt }));
     let sent = 0;
     const file=join(mkdtempSync(join(tmpdir(),'eval-batches-')),'report.json');saveReport(file,report);
-    await exportReport(report, file, async () => { if (sent++) throw new Error('offline'); });
+    await exportReport(report, file, async () => { if (sent++) throw new Error('offline'); }, undefined, syntheticLangfuseExport);
     assert.equal(report.export.status, 'partial'); assert.equal(report.export.progress?.acceptedEventIds.length, 50);
 });
 test('optional export preserves hierarchy, API score identity and null absence', () => {
@@ -97,12 +98,12 @@ test('failed export and idempotent resend do not change scores or call models', 
     const report = reportFixture(), scores = structuredClone(report.trials[0]!.scores);
     const file = join(mkdtempSync(join(tmpdir(), 'flowmate-export-')), 'summary.json');
     saveReport(file,report);
-    await exportReport(report, file, async () => { throw new Error('offline'); });
+    await exportReport(report, file, async () => { throw new Error('offline'); }, undefined, syntheticLangfuseExport);
     assert.equal(report.export.status, 'error');
     assert.deepEqual(report.trials[0]!.scores, scores);
     const sent: string[][] = [];
     for (let i = 0; i < 2; i++)
-        await exportReport(report, file, async (events) => { sent.push(events.map(e => e.id)); });
+        await exportReport(report, file, async (events) => { sent.push(events.map(e => e.id)); }, undefined, syntheticLangfuseExport);
     assert.equal(sent.length,1);
     assert.equal(readReport(file).export.status, 'complete');
 });

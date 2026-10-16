@@ -8,6 +8,7 @@ import { findDataset } from '../../src/execution/runner.ts';
 import { main } from '../../src/cli.ts';
 import { comparisonFacts, reportFixture } from '../support/fixtures.ts';
 import { exportReport, exportEvents } from '../../src/langfuse/export.ts';
+import { syntheticLangfuseExport } from '../support/langfuse.ts';
 
 function emptyRepo() {
     const repo = mkdtempSync(join(tmpdir(), 'flowmate-empty-dataset-'));
@@ -71,8 +72,8 @@ test('saved reports remain queryable, reviewable and exportable without Dataset,
         await main(['review', 'status', '--execution-id', 'unit'], repo);
         expect(JSON.parse(String(output.mock.calls.at(-1)![0])).records).toHaveLength(1);
         const ids = exportEvents(report).map(e => e.id);
-        await exportReport(report, file, async () => {});
-        await exportReport(report, file, async () => {});
+        await exportReport(report, file, async () => {}, repo, syntheticLangfuseExport);
+        await exportReport(report, file, async () => {}, repo, syntheticLangfuseExport);
         expect(report.export.status).toBe('complete');
         expect(exportEvents(report).map(e => e.id)).toEqual(ids);
         expect(discoverDatasets(join(repo, 'agent-eval/src/datasets'))).toEqual([]);

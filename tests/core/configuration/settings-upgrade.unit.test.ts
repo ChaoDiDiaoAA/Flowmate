@@ -13,7 +13,7 @@ test('settings upgrade backs up original facts and preserves the credential refe
   const root = await mkdtemp(join(tmpdir(), 'flowmate-settings-v6-')), file = join(root, 'settings.json');
   const original = JSON.stringify(legacy()); await fs.writeFile(file, original);
   const first = await readProductSettings(file); expect(first.ok).toBe(true); if (!first.ok) throw new Error(first.error.code);
-  expect(first.data).toMatchObject({ version: 6, revision: 7, defaultModelId: 'primary', models: [{ id: 'primary', model: 'original' }] });
+  expect(first.data).toMatchObject({ version: 7, revision: 7, defaultModelId: 'primary', models: [{ id: 'primary', model: 'original' }] });
   expect(first.data.models[0]!.credentialRef).toBe('old_model_credential');
   expect(await readProductSettings(file)).toEqual(first);
   const backups = (await fs.readdir(root)).filter(name => name.includes('.pre-v6.'));

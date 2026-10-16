@@ -1,8 +1,8 @@
 import { legacyCompactRubric, legacyPlainRubric, legacyPackedRubric } from '../scoring/judges/packed.ts';
-import { atomicJson, publicVersions, publicReport, readPublicReport, saveEvidence } from './files.ts';
+import { atomicJson, publicVersions, publicReport, readPublicReport, saveEvidence, executionVersions } from './files.ts';
 import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, basename } from 'node:path';
 import { z } from 'zod';
 import { isJsonData } from '../../../packages/contracts/src/tools.ts';
 import type { CaseExecutionResult, GradeStatus } from '../types.ts';
@@ -17,7 +17,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { artifactJson } from '../artifacts.ts';
 import { scanEvidence, protectedSecrets } from '../execution/evidence-safety.ts';
 import { inside } from '../dataset-loader/local.ts';
-import { agentApiSchema, agentModelCapabilitiesSchema } from '../configuration.ts';
+import { agentApiSchema, agentModelCapabilitiesSchema, langfuseUrlSchema } from '../configuration.ts';
 import {researchFrameSchema,unavailableResearchCounts} from '../scoring/research-judgment.ts';
 import {hasNoResearchReport} from '../scoring/research-frame.ts';
 import { safeId } from './paths.ts';
@@ -90,6 +90,7 @@ export type LocalReport = {
         backend: 'local' | 'langfuse';
         status: 'disabled' | 'pending' | 'complete' | 'partial' | 'error';
         progress?: { total: number; acceptedEventIds: string[]; rejectedEventIds: string[] };
+        target?: { baseUrl: string; projectId: string };
         error?: string;
         url?: string;
     };
@@ -166,7 +167,23 @@ const reportSchema = z.object({ contract: z.enum(['flowmate-agent-run/v1', 'flow
             new Set(p.acceptedEventIds).size === p.acceptedEventIds.length && new Set(p.rejectedEventIds).size === p.rejectedEventIds.length &&
             p.acceptedEventIds.length <= p.total && p.rejectedEventIds.length <= p.total && !p.rejectedEventIds.some(id => p.acceptedEventIds.includes(id)),
             'Export receipt identities must be unique and disjoint').optional(),
+        target: z.object({ baseUrl: langfuseUrlSchema, projectId: text.max(200) }).strict().optional(),
         error: z.string().optional(), url: z.string().optional() }).strict() }).strict();
+const publicMetadataSchema = reportSchema.omit({ trials: true, export: true }).extend({
+    artifactFormat: z.literal('flowmate-eval-public/v1'),
+    trials: z.array(trialSchema.omit({ execution: true, judgeCalls: true }).extend({
+        evidence: z.object({ trial: text, observation: text, events: text }).strict(),
+        dimensions: z.record(z.object({ status: z.enum([...status.options, 'NOT_APPLICABLE']), counts: z.record(integer) }).strict()).optional(),
+    })),
+});
+type InspectionKind = 'trial' | 'observation' | 'events' | 'artifact' | 'export';
+export type ReportInspection = {
+    metadata: z.infer<typeof publicMetadataSchema>; fullReport: LocalReport | null; export: LocalReport['export'] | null;
+    parts: Array<{ trialId: string | null; kind: InspectionKind; reference: string; data: unknown }>;
+    gaps: Array<{ trialId: string | null; kind: InspectionKind; reference: string; reason: 'missing' | 'invalid' }>;
+    sources: Array<{ reference: string; content: string | null }>;
+    snapshot: { data: unknown | null; issue: 'missing' | 'invalid' | null };
+};
 function validateReport(value: unknown): asserts value is LocalReport {
     if (!value || typeof value !== 'object' || !('contract' in value) ||
         !['flowmate-agent-run/v1', 'flowmate-agent-run/v2'].includes(String(value.contract)))
@@ -354,15 +371,113 @@ function removeLegacyMetadata(report:any) {
     if(legacy||(report.trials??[]).some((t:any)=>!t.caseConditions))report.history={verification:'unverified',gaps:['Original content conditions are unavailable; historical identity metadata cannot establish equivalence.']};
     return !!report.history;
 }
-export function readReport(path: string): LocalReport {
-    const bytes=readFileSync(path,'utf8'),raw=JSON.parse(bytes);
-    const report=raw.artifactFormat==='flowmate-eval-public/v1'&&raw.dataset?.version==='v1'?readPublicReport(path,raw):raw;
+function readReportSnapshot(path: string, bytes: string, readSource?: (reference: string) => string): LocalReport {
+    const raw=JSON.parse(bytes);
+    const report=raw.artifactFormat==='flowmate-eval-public/v1'&&raw.dataset?.version==='v1'?readPublicReport(path,raw,readSource):raw;
     delete report.artifactFormat;
     if(removeLegacyMetadata(report)){
         if(!isJsonData(report))throw Error('Historical report must contain finite JSON data');
         reportSchema.parse(report);
     }else validateReport(report);
     reportRevisions.set(report,{path:resolve(path),bytes});return report;
+}
+export function readReport(path: string): LocalReport { return readReportSnapshot(path, readFileSync(path, 'utf8')); }
+const missingFile = (error: unknown) => !!error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT';
+export function readExportState(path: string, fallback: LocalReport['export']): LocalReport['export'] {
+    try { return reportSchema.shape.export.parse(JSON.parse(readFileSync(inside(dirname(path), 'export.json'), 'utf8'))); }
+    catch (error) { if (missingFile(error)) return structuredClone(fallback); throw error; }
+}
+function publicMetadata(raw: unknown) {
+    const value = executionVersions(structuredClone(raw)); removeLegacyMetadata(value);
+    return publicMetadataSchema.parse(value);
+}
+export function readReportMetadata(path: string): Pick<ReportInspection, 'metadata' | 'export'> {
+    if (lstatSync(path).isSymbolicLink()) throw Error('Linked report rejected');
+    const bytes = readFileSync(inside(dirname(path), basename(path)), 'utf8'), raw = JSON.parse(bytes);
+    if (!isJsonData(raw)) throw Error('Report must contain finite JSON data');
+    if (raw.artifactFormat === 'flowmate-eval-public/v1' && raw.dataset?.version === 'v1')
+        return { metadata: publicMetadata(raw), export: readExportState(path, { backend: 'local', status: 'disabled' }) };
+    const original = readReportSnapshot(path, bytes);
+    return { metadata: publicMetadata(publicReport(original)), export: readExportState(path, original.export) };
+}
+
+export function inspectReport(path: string): ReportInspection {
+    if (lstatSync(path).isSymbolicLink()) throw Error('Linked report rejected');
+    const root = dirname(path), bytes = readFileSync(path, 'utf8'), raw = JSON.parse(bytes);
+    if (!isJsonData(raw)) throw Error('Report must contain finite JSON data');
+    const sources = new Map<string, string | null>([[basename(path), bytes]]);
+    const sourceBytes = (reference: string): string | null => {
+        try { return readFileSync(inside(root, reference), 'utf8'); }
+        catch (error) { if (missingFile(error)) return null; throw error; }
+    };
+    const source = (reference: string) => {
+        if (!sources.has(reference)) sources.set(reference, sourceBytes(reference));
+        return sources.get(reference)!;
+    };
+    const result = (value: Omit<ReportInspection, 'sources' | 'snapshot'>): ReportInspection => {
+        const content = source('snapshot.json');
+        let snapshot: ReportInspection['snapshot'] = { data: null, issue: content === null ? 'missing' : 'invalid' };
+        if (content !== null) try {
+            const data: unknown = executionVersions(JSON.parse(content));
+            if (!isJsonData(data) || !data || typeof data !== 'object' || Array.isArray(data)) throw Error('Invalid saved conditions');
+            snapshot = { data, issue: null };
+        } catch { /* A missing or invalid optional snapshot does not erase saved evidence. */ }
+        for (const [reference, content] of sources) if (sourceBytes(reference) !== content) throw Error('Saved report changed while reading; refresh the view');
+        return { ...value, snapshot, sources: [...sources].map(([reference, content]) => ({ reference, content })) };
+    };
+    const parts: ReportInspection['parts'] = [], gaps: ReportInspection['gaps'] = [];
+    const part = <T>(reference: string, trialId: string | null, kind: InspectionKind, schema: z.ZodType<T>): T | null => {
+        const content = source(reference);
+        if (content === null) { gaps.push({ reference, trialId, kind, reason: 'missing' }); return null; }
+        try {
+            const data = kind === 'events' ? content.split('\n').filter(Boolean).map(line => executionVersions(JSON.parse(line))) : executionVersions(JSON.parse(content));
+            if (!isJsonData(data)) throw Error('Invalid saved JSON data');
+            const checked = schema.parse(data); parts.push({ reference, trialId, kind, data: checked }); return checked;
+        } catch { gaps.push({ reference, trialId, kind, reason: 'invalid' }); return null; }
+    };
+    if (raw.artifactFormat !== 'flowmate-eval-public/v1' || raw.dataset?.version !== 'v1') {
+        const fullReport = readReportSnapshot(path, bytes), metadata = publicMetadata(publicReport(fullReport));
+        const exported = source('export.json') === null ? fullReport.export : part('export.json', null, 'export', reportSchema.shape.export);
+        return result({ metadata, fullReport: gaps.length ? null : fullReport, export: exported, parts, gaps });
+    }
+    const metadata = publicMetadata(raw), trialIds = new Set<string>(), traceIds = new Set<string>(), members = new Set<string>();
+    safeId(metadata.executionId);
+    const factsSchema = z.union([executionSchema.omit({ observations: true, evidence: true, artifacts: true }).extend({
+        artifacts: z.array(z.object({ id: text, kind: text, file: text }).strict()),
+    }), z.object({ version: z.literal('v1'), status: z.literal('not-started'), identity: executionSchema.shape.identity }).strict()]);
+    const observationSchema = z.object({ version: z.literal('v1'), evidence: executionSchema.shape.evidence,
+        judgeCalls: z.array(judgeCallSchema).max(1), scoringFacts: z.array(z.object({ metricId: text, actual: z.unknown().optional(), expected: z.unknown().optional() }).strict()) }).strict();
+    for (const trial of metadata.trials) {
+        const member = JSON.stringify([trial.caseId, trial.caseVersion, trial.repetition]);
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(trial.trialId) || trialIds.has(trial.trialId) || traceIds.has(trial.traceId) || members.has(member) ||
+            trial.repetition > metadata.repeat || new Set(trial.scores.map(score => score.metricId)).size !== trial.scores.length)
+            throw Error('Invalid or duplicate saved Trial identity');
+        trialIds.add(trial.trialId); traceIds.add(trial.traceId); members.add(member);
+        const prefix = `evidence/${trial.trialId}/`;
+        if (trial.evidence.trial !== prefix + 'trial.json' || trial.evidence.observation !== prefix + 'observation.json' || trial.evidence.events !== prefix + 'events.jsonl')
+            throw Error('Invalid evidence reference');
+        const facts = part(trial.evidence.trial, trial.trialId, 'trial', factsSchema);
+        if (facts && (facts.identity.executionId !== metadata.executionId || facts.identity.trialId !== trial.trialId ||
+            facts.identity.caseId !== trial.caseId || facts.identity.caseVersion !== trial.caseVersion)) throw Error('Foreign Trial evidence identity');
+        const observation = part(trial.evidence.observation, trial.trialId, 'observation', observationSchema);
+        if (observation && (new Set(observation.scoringFacts.map(fact => fact.metricId)).size !== observation.scoringFacts.length ||
+            observation.scoringFacts.some(fact => !trial.scores.some(score => score.metricId === fact.metricId)))) throw Error('Foreign scoring evidence identity');
+        part(trial.evidence.events, trial.trialId, 'events', executionSchema.shape.observations);
+        if (facts && 'artifacts' in facts) for (const artifact of facts.artifacts) {
+            if (!/^artifacts\/artifact-\d+\.json$/.test(artifact.file)) throw Error('Invalid artifact reference');
+            const data = part(prefix + artifact.file, trial.trialId, 'artifact', executionSchema.shape.artifacts.element);
+            if (data && (data.id !== artifact.id || data.kind !== artifact.kind)) throw Error('Foreign artifact identity');
+        }
+    }
+    const exported = source('export.json') === null ? { backend: 'local' as const, status: 'disabled' as const } : part('export.json', null, 'export', reportSchema.shape.export);
+    // Strict hydration consumes the same captured bytes, so a later read cannot mix evidence generations.
+    const fullReport = gaps.length ? null : readReportSnapshot(path, bytes, reference => {
+        if (!sources.has(reference)) throw Error('Uncaptured saved evidence reference');
+        const content = sources.get(reference);
+        if (content === null) throw Object.assign(Error('Missing saved evidence'), { code: 'ENOENT' });
+        return content!;
+    });
+    return result({ metadata, fullReport, export: exported, parts, gaps });
 }
 
 export function exitCode(report: LocalReport) {

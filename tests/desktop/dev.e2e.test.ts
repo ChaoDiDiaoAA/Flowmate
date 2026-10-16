@@ -14,7 +14,7 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
   it.setTimeout(90_000);
   const repo = resolve(import.meta.dirname, '../..');
   const root = await mkdtemp(join(tmpdir(), 'flowmate-dev-e2e-'));
-  for (const path of ['apps', 'packages', 'scripts', 'package.json', 'electron.vite.config.ts']) {
+  for (const path of ['apps', 'packages', 'scripts', 'agent-eval/src', 'package.json', 'electron.vite.config.ts']) {
     cpSync(join(repo, path), join(root, path), { recursive: true });
   }
   symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'), 'junction');

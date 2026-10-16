@@ -14,7 +14,7 @@ test('resizes and remembers panels without disturbing drafts, with keyboard, the
     if (process.env[key]) env[key] = process.env[key]!;
   const launch = () => electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
     args: [join(repository, 'out/main/index.js')], env, timeout: 30000 });
-  let app = await launch(), failure: Error | undefined;
+  let app: Awaited<ReturnType<typeof launch>> | null = await launch(), failure: Error | undefined;
   try {
     let page = await app.firstWindow();
     const ready = async () => { await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); };
@@ -62,10 +62,12 @@ test('resizes and remembers panels without disturbing drafts, with keyboard, the
     expect(centerWidth).toBeGreaterThanOrEqual(360); expect(centerWidth).toBeLessThanOrEqual(361);
     for (const theme of ['light', 'dark']) {
       await page.evaluate(theme => { const root = document.querySelector('.desktop-shell')!; root.classList.remove('theme-light', 'theme-dark', 'theme-system'); root.classList.add('theme-'+theme); }, theme);
-      for (const name of ['Models', 'Prompts', 'Skills', 'Settings']) {
+      for (const name of ['Models', 'Evaluation', 'Prompts', 'Skills', 'Settings']) {
         await page.getByRole('button', { name, exact: true }).click();
         expect(await page.locator('main').evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
         if (name === 'Models') expect(await page.locator('.model-layout').evaluate(element => getComputedStyle(element).gridTemplateColumns.split(' ').length)).toBe(1);
+        if (name === 'Models') expect(await page.locator('.evaluation-model-grid').evaluate(element => getComputedStyle(element).gridTemplateColumns.split(' ').length)).toBe(1);
+        if (name === 'Evaluation') expect(await page.locator('.evaluation-layout').evaluate(element => getComputedStyle(element).gridTemplateColumns.split(' ').length)).toBe(1);
         if (name === 'Prompts') expect(await page.locator('.prompt-editors').evaluate(element => getComputedStyle(element).gridTemplateColumns.split(' ').length)).toBe(1);
       }
       await page.screenshot({ path: test.info().outputPath('panel-layout-'+theme+'.png') });
@@ -81,7 +83,8 @@ test('resizes and remembers panels without disturbing drafts, with keyboard, the
       ['submit_input', 'call_provider', 'start_run', 'start_agent_run'].includes(command.type)).length)).toBe(0);
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
     await page.reload(); await ready(); await expect(sidebar()).toHaveAttribute('aria-valuenow', '280'); await expect(assistant()).toHaveAttribute('aria-valuenow', '560');
-    await closeDesktopFixture(app, userData); app = await launch(); page = await app.firstWindow(); await ready();
+    const previous = app; app = null;
+    await closeDesktopFixture(previous, userData); app = await launch(); page = await app.firstWindow(); await ready();
     await page.setViewportSize({ width: 1500, height: 950 }); await expect(sidebar()).toHaveAttribute('aria-valuenow', '280'); await expect(assistant()).toHaveAttribute('aria-valuenow', '560');
     await page.evaluate(() => localStorage.setItem('flowmate.panel-widths', JSON.stringify({ sidebar: 500, assistant: 600 })));
     await page.setViewportSize({ width: 1200, height: 950 }); await page.reload(); await ready();
@@ -117,5 +120,5 @@ test('resizes and remembers panels without disturbing drafts, with keyboard, the
       }
     }
   } catch (error) { failure = error as Error; throw error; }
-  finally { await closeDesktopFixture(app, userData, failure); }
+  finally { if (app) await closeDesktopFixture(app, userData, failure); }
 });

@@ -1,6 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type ReactNode } from 'react';
 import { usePanelLayout } from './panel-layout.tsx';
 import { ResearchPage } from './research.tsx';
+import { EvaluationModels } from './evaluation-models.tsx';
+import { EvaluationPage } from './evaluation.tsx';
+import { applyEvaluationControl, applyEvaluationEvent, createEvaluationView, evaluationBusy } from './evaluation-state.ts';
+import type { EvaluationControlState } from '../../../../packages/contracts/src/evaluation.ts';
 import type { ResearchTask, ResearchIntent, ResearchPlanBody } from '@flowmate/contracts';
 import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema,
   MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS, MAX_INVOICE_BLOCKS_PER_PAGE } from '../../../../packages/contracts/src/invoice.ts';
@@ -29,10 +33,10 @@ import { createEventView, bindEventSubscription, applyEventWake, applyEventRead,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'research' | 'activity' | 'models' | 'settings' | 'prompts' | 'skills' | 'extensions';
+type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'research' | 'activity' | 'models' | 'evaluation' | 'settings' | 'prompts' | 'skills' | 'extensions';
 const pageLabels: Record<Page, string> = {
   workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats', research: 'Deep Research',
-  activity: 'Activity', models: 'Models', settings: 'Settings', prompts: 'Prompts', skills: 'Skills', extensions: 'Extensions',
+  activity: 'Activity', models: 'Models', evaluation: 'Evaluation', settings: 'Settings', prompts: 'Prompts', skills: 'Skills', extensions: 'Extensions',
 };
 type EventObservation = { view: EventViewState; wanted: boolean; opening: boolean; through?: number;
   pendingWake: RuntimeEventsWake | null; snapshot: RunSnapshot | null; tools: readonly RuntimeToolView[];
@@ -146,6 +150,21 @@ export function App() {
   const [page, setPage] = useState<Page>('workspace');
   const [settingsTab, setSettingsTab] = useState('General');
   const [state, setState] = useState<DesktopState | null>(null);
+  const [evaluationView, setEvaluationView] = useState(createEvaluationView);
+  const evaluationViewRef = useRef(evaluationView);
+  function receiveEvaluationControl(control: EvaluationControlState, revision: number) {
+    const next = applyEvaluationControl(evaluationViewRef.current, control, revision);
+    evaluationViewRef.current = next; setEvaluationView(next);
+  }
+  async function stopEvaluation() {
+    const current = evaluationViewRef.current, batchId = current.control?.batchId;
+    if (!batchId) return;
+    try {
+      const result = await window.flowmate.cancelEvaluation({ batchId });
+      if (result.ok) receiveEvaluationControl(result.data, current.revision);
+      else setNotice({ tone: 'bad', message: result.error.message });
+    } catch { setNotice({ tone: 'bad', message: 'Stop response unavailable. Query the original evaluation batch.' }); }
+  }
   const [runtimeState, setRuntimeState] = useState<RuntimeState | null>(null);
   const [runtimeReadFailed, setRuntimeReadFailed] = useState(false);
   const [draft, setDraft] = useState<ModelProfile>(blankModel);
@@ -556,8 +575,9 @@ export function App() {
     }
     settingsRevision.current = Math.max(settingsRevision.current, next.settings.revision);
     hostReadyRef.current = next.ready;
+    if (!evaluationViewRef.current.control && next.evaluationControl) receiveEvaluationControl(next.evaluationControl, evaluationViewRef.current.revision);
     setState(current => current && next.settings.revision < current.settings.revision
-      ? { ...next, settings: current.settings, modelCredentials: current.modelCredentials } : next);
+      ? { ...next, settings: current.settings, modelCredentials: current.modelCredentials, evaluationCredentials: current.evaluationCredentials } : next);
     return true;
   }
   const formSubmittingRef = useRef(false);
@@ -1838,6 +1858,10 @@ export function App() {
     void refresh();
     const unsubscribe = window.flowmate.subscribe((event) => {
       if (!alive) return;
+      if (event.type === 'evaluation_event') {
+        const next = applyEvaluationEvent(evaluationViewRef.current, event.value);
+        evaluationViewRef.current = next; setEvaluationView(next); return;
+      }
       if (event.type === 'compaction_observation') {
         // Reuse the window's single subscription; a panel must not unsubscribe the chat's transport.
         if (event.observation.sessionId === contextTarget.current?.sessionId) setContextRefresh(value => value + 1);
@@ -2684,6 +2708,7 @@ export function App() {
           <span className="rail-caption setup-caption">SETUP</span>
           {([
             ['models', 'Models', '◇'],
+            ['evaluation', 'Evaluation', '◫'],
             ['prompts', 'Prompts', '≡'],
             ['skills', 'Skills', '✧'],
             ['extensions', 'Extensions', '⊞'],
@@ -2742,9 +2767,16 @@ export function App() {
           <div className="top-state"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />{state?.ready ? 'LOCAL' : 'OFFLINE'}</div>
         </header>
 
+        {evaluationView.control && evaluationView.control.state !== 'idle' && <section className="evaluation-global" aria-label="Global evaluation control">
+          <button className="text-button" onClick={() => navigate('evaluation')}>Evaluation: {evaluationView.control.state}</button>
+          <span>{evaluationView.control.progress?.caseId ?? evaluationView.control.batchId} · stop: {evaluationView.control.stop}</span>
+          {evaluationBusy(evaluationView.control) && <button className="secondary-button" disabled={!['preparing', 'running', 'cancelling'].includes(evaluationView.control.state)}
+            onClick={() => void stopEvaluation()}>Stop evaluation</button>}
+        </section>}
         <PromptOptimizer visible={page === 'prompts'} hostEpoch={workspaceHostEpoch.current} ready={Boolean(modelReady && runtimeReady && !busy && !saving)}
           model={persistedModel} onUse={text => { updateChatInput(chatInputRef.current ? `${chatInputRef.current}\n\n${text}` : text); setChatCollapsed(false); }} />
-        {page === 'prompts' ? null : page === 'workspace' ? (
+        {page === 'evaluation' ? <EvaluationPage desktop={state} control={evaluationView.control} revision={() => evaluationViewRef.current.revision}
+          onControl={receiveEvaluationControl} onModels={() => navigate('models')} /> : page === 'prompts' ? null : page === 'workspace' ? (
           <InvoicesPage
             workspace={workspace}
             documents={documents}
@@ -2958,6 +2990,10 @@ export function App() {
                 </section>
               </section>
             </div>}
+            {page === 'models' && state && <EvaluationModels revision={state.settings.revision} settings={state.settings.evaluation}
+              credentials={state.evaluationCredentials} ready={state.ready} onSaved={async () => {
+                const next = await window.flowmate.getState(); if (!next.ok) throw Error('Saved settings unavailable'); receiveDesktopState(next.data);
+              }} />}
             {page === 'settings' && settingsTab === 'General' && <section className="panel profile-panel settings-appearance"><div className="panel-head"><h2>Appearance</h2></div>
               <div className="profile-fields"><label className="field"><span>Display name</span><input value={profileDraft.displayName} onChange={(event) => setProfileDraft((old) => ({ ...old, displayName: event.target.value }))} maxLength={80} /></label><label className="field"><span>Theme</span><select value={profileDraft.theme} onChange={(event) => setProfileDraft((old) => ({ ...old, theme: event.target.value as typeof old.theme }))}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div>
               <div className="config-actions"><span className="action-spacer" /><button className="secondary-button" onClick={() => void saveProfile()} disabled={saving || !state?.ready}>Save appearance</button></div>

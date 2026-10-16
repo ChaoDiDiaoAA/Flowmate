@@ -18,6 +18,12 @@ const configSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatibl
 export type JudgeConfig = z.infer<typeof configSchema>;
 export type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
 const prepared = new WeakMap<JudgeConfig, { config: JudgeConfig; model: PreparedModelRuntime }>();
+export function judgeConnection(value: unknown): JudgeConfig {
+    const parsed = configSchema.safeParse(value);
+    if (!parsed.success) throw Error('Invalid FLOWMATE_JUDGE configuration; check API, URL and timeout');
+    registerSecrets([parsed.data.apiKey]);
+    return parsed.data;
+}
 export function judgeConfig(env: NodeJS.ProcessEnv, repo = REPO_ROOT, explicit?: string): JudgeConfig | null {
     if (explicit) throw Error('Judge file configuration is retired; use configs/.env');
     env = evaluationEnv(repo, env);
@@ -26,11 +32,8 @@ export function judgeConfig(env: NodeJS.ProcessEnv, repo = REPO_ROOT, explicit?:
     if (values.every(v => !v) && !legacy && !explicitApi) return null;
     if (values.some(v => !v)) throw Error('Incomplete FLOWMATE_JUDGE configuration; no Agent fallback');
     const api = explicitApi || (legacy === 'anthropic' ? 'anthropic-messages' : !legacy || legacy === 'openai-compatible' ? 'openai-completions' : legacy);
-    const parsed = configSchema.safeParse({ api, provider: api === 'anthropic-messages' ? 'anthropic' : api.startsWith('openai-') ? 'openai-compatible' : undefined,
+    return judgeConnection({ api, provider: api === 'anthropic-messages' ? 'anthropic' : api.startsWith('openai-') ? 'openai-compatible' : undefined,
         model: values[0], baseUrl: values[1], apiKey: values[2], timeoutMs: Number(env.FLOWMATE_JUDGE_TIMEOUT_MS ?? 180000) });
-    if (!parsed.success) throw Error('Invalid FLOWMATE_JUDGE configuration; check API, URL and timeout');
-    registerSecrets([parsed.data.apiKey]);
-    return parsed.data;
 }
 export function publicJudgeConfig(config: JudgeConfig, rubric?: { id: string; version: number; prompt: string }) {
     const { apiKey, ...parameters } = config;

@@ -8,7 +8,9 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { discoverDatasets, REPO_ROOT, caseConditions, caseFiles, resolveCase, restoreCaseInputs, selectCases, assertSemanticSelection, judgeSelection, type LocalDataset, type Check } from '../dataset-loader/local.ts';
 import { productAgent, createProductAgent, type AgentKernel } from '../adapters/agent.ts';
-import { agentApiSchema, prepareAgentConfig, type AgentModelCapabilities } from '../configuration.ts';
+import { prepareAgentConfig, type AgentModelCapabilities } from '../configuration.ts';
+import { runConfigSchema, parseRunConfig, evaluationRunDefaults } from './plan.ts';
+export { runConfigSchema, parseRunConfig, findDataset, createEvaluationPlan, sameEvaluationPlan } from './plan.ts';
 export {assertModelConfiguration} from '../adapters/agent.ts';
 import { executeCase, type ExecutionPhase } from './execute-case.ts';
 import { prepareSafetyProbes } from './safety-probes.ts';
@@ -28,9 +30,6 @@ import { createRunDirectory, datasetScope } from '../reports/paths.ts';
 import { deriveBadcases, saveBadcases } from '../reports/badcases.ts';
 import { recordRegressions } from '../reports/regressions.ts';
 import { deriveTrialStatistics, type TrialStatistics } from '../reports/trial-statistics.ts';
-import {ResourceSelectionSchema} from '../../../packages/contracts/src/resources.ts';
-import {ExtensionSelectionSchema} from '../../../packages/contracts/src/extensions.ts';
-import {RuntimeBudgetOverridesSchema} from '../../../packages/contracts/src/runtime.ts';
 import type { ExecutionStatus } from '../types.ts';
 type TrialProgress = { index: number; total: number; caseId: string; trialId: string; trialIndex?: number; trialsPerCase?: number };
 export type EvaluationProgress =
@@ -38,6 +37,7 @@ export type EvaluationProgress =
     | { type: 'plan'; selection: 'smoke' | 'holdout' | 'full' | 'case'; total: number; caseCount?: number; trialsPerCase?: number; datasets: Array<{ id: string; total: number; caseCount?: number }> }
     | { type: 'dataset-start'; datasetId: string; executionId: string; reportPath: string }
     | TrialProgress & { type: 'trial-phase'; phase: ExecutionPhase | 'restoring' | 'scoring' | 'saving' }
+    | TrialProgress & { type: 'trial-cleanup'; executionId: string; stopConfirmed: boolean }
     | TrialProgress & { type: 'agent-end'; status: ExecutionStatus; endpointReached?: boolean; reason?: string }
     | TrialProgress & { type: 'scoring-end'; status: LocalReport['trials'][number]['status']; reason: string }
     | TrialProgress & { type: 'trial-end'; status: LocalReport['trials'][number]['status']; reason: string; elapsedMs: number; evidenceDirectory: string }
@@ -66,38 +66,6 @@ function scoringProgressReason(trial: LocalReport['trials'][number]) {
 }
 function notifyProgress(observer: ProgressObserver | undefined, event: EvaluationProgress) {
     try { observer?.(structuredClone(event)); } catch { /* Progress must not change evaluation results or cleanup. */ }
-}
-export const runConfigSchema = z.object({
-    model: z.string().min(1).optional(), baseUrl: z.string().url().optional(), api: agentApiSchema.optional(),
-    repeat: z.number().int().min(1).max(20).optional(),
-    timeoutMs: z.number().int().min(100).max(120000).optional(), stopGraceMs: z.number().int().min(100).max(10000).optional(),
-    environment: z.string().regex(/^[a-z0-9_-]+$/).optional(),resources:ResourceSelectionSchema.optional(),extensions:ExtensionSelectionSchema.optional(),
-    budget:RuntimeBudgetOverridesSchema.optional()
-}).strict();
-export function parseRunConfig(value: unknown) {
-    const parsed = runConfigSchema.safeParse(value);
-    if (!parsed.success) {
-        const fields = [...new Set(parsed.error.issues.map(issue => issue.path.join('.') || 'options'))];
-        throw Error('Invalid evaluation run configuration; check ' + fields.join(', '));
-    }
-    return parsed.data;
-}
-export function findDataset(repo: string, options: {
-    dataset?: string;
-    version?: number;
-} = {}) {
-    const supplemental = ['flowmate-badcase-business-v1', 'flowmate-badcase-research-v1'].includes(options.dataset ?? '');
-    const directory = join(repo, 'agent-eval/src/datasets', ...(supplemental ? ['badcase'] : []));
-    const matches = discoverDatasets(directory, repo).filter(d => d.manifest.id === (options.dataset ?? 'flowmate-agent-v1'));
-    if (supplemental && !matches.length) throw Error('暂无可运行成员：' + options.dataset);
-    if (matches.length === 0)
-        throw new Error(`Dataset ${options.dataset ?? 'flowmate-agent-v1'} 不存在：尚未制作，等待评测工程验收；真实入口与必要采证接通、工程验证通过后，依据 01/02 制作。未调用模型、未创建执行记录。`);
-    if (matches.length !== 1)
-        throw new Error('Select exactly one local Dataset');
-    const dataset = matches[0]!;
-    if (options.version !== undefined && dataset.manifest.version !== options.version)
-        throw new Error('Dataset version differs; restore the requested source revision');
-    return dataset;
 }
 export async function runLocal(repo: string, options: {
     dataset: LocalDataset;
@@ -179,7 +147,7 @@ export async function runLocal(repo: string, options: {
         contract: 'flowmate-agent-run/v2', executionId, code,
         ...(dataset.manifest.suite === 'badcase' ? { executionKind: isProductAgent && !deps.fetcher ? 'model' as const : 'controlled' as const } : {}),
         dataset: { id: dataset.manifest.id, version: dataset.manifest.version,  subject: 'agent' },
-        selection: options.caseId ? 'case' : options.selection ?? 'full', environment: config.environment ?? deps.env?.FLOWMATE_EVAL_ENVIRONMENT ?? process.env.FLOWMATE_EVAL_ENVIRONMENT ?? 'development', userId: deps.env?.FLOWMATE_EVAL_USER_ID ?? process.env.FLOWMATE_EVAL_USER_ID,
+        selection: options.caseId ? 'case' : options.selection ?? 'full', environment: config.environment ?? deps.env?.FLOWMATE_EVAL_ENVIRONMENT ?? process.env.FLOWMATE_EVAL_ENVIRONMENT ?? evaluationRunDefaults.environment, userId: deps.env?.FLOWMATE_EVAL_USER_ID ?? process.env.FLOWMATE_EVAL_USER_ID,
         startedAt: new Date().toISOString(), endedAt: null, repeat, executionComplete: false, scoring: 'pending', manualReview: 'none', formalAcceptance: 'not-assessed',
         scoringConfiguration: { version: dataset.manifest.scoring.version, judgeMode: options.judge,
             judge:selectedJudge,...(batch?{rubrics}:{}) },
@@ -229,11 +197,12 @@ export async function runLocal(repo: string, options: {
             ...(inputs.resourceRoot ? { resourceRoot: inputs.resourceRoot } : {}),
             ...(item.resolved.controllerInput?{controllerInput:item.resolved.controllerInput}:{}),
             ...(item.task.requires.includes('invoice') ? { invoiceSource: { root: inputs.invoiceRoot ?? join(repo, 'data/invoices/agent-input'), localRoot: inputs.localRoot, materials: item.task.input.materials,files:caseFiles(dataset,item.task) } } : {}),
-            requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,repo),...config} }, config.timeoutMs ?? 120000, config.stopGraceMs ?? 5000, deps.signal, phase);
+            requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,repo),...config} }, config.timeoutMs ?? evaluationRunDefaults.timeoutMs, config.stopGraceMs ?? evaluationRunDefaults.stopGraceMs, deps.signal, phase);
         if (result.stopFailed) stopReason = 'Prior Trial stopping unconfirmed: ' + (result.execution.error?.message ?? 'Stop evidence missing');
         const cleanup = result.execution.evidence.cleanup;
         const stopConfirmed = !result.stopFailed && cleanup?.present && cleanup.actual !== null && typeof cleanup.actual === 'object' &&
             'stopped' in cleanup.actual && cleanup.actual.stopped === true && 'closed' in cleanup.actual && cleanup.actual.closed === true;
+        notify({ type: 'trial-cleanup', ...identityProgress, executionId, stopConfirmed: !!stopConfirmed });
         if (stopConfirmed && result.execution.error?.infrastructure && ['provider_billing_failed', 'provider_auth_failed'].includes(result.execution.error.code))
             stopReason = 'Provider 计费或认证不可用；当前运行已停止，后续依赖题目未运行';
         if(!result.stopFailed)rmSync(scene,{recursive:true,force:true});
@@ -307,13 +276,14 @@ export async function runBatch(repo: string,
     const total = plans.reduce((sum, plan) => sum + plan.total, 0);
     notify({ type: 'plan', selection: options.selection ?? 'full', total, caseCount: plans.reduce((sum,plan)=>sum+plan.caseCount,0), trialsPerCase: repeat, datasets: plans });
     const selections=options.datasets.map(data=>judgeSelection({manifest:data.manifest,cases:selectCases(data,options.selection)},options.judge==='required'));
-    let preparedJudge = options.judge === 'off' || !selections.some(s=>s.needed) ? null : judgeConfig(deps.env ?? process.env, repo);
+    let preparedJudge = options.judge === 'off' || !selections.some(s=>s.needed) ? null
+        : deps.preparedJudge !== undefined ? deps.preparedJudge : judgeConfig(deps.env ?? process.env, repo, options.judgeConfigFile);
     if (options.judge !== 'off' && selections.some(s=>s.required) && !preparedJudge) throw Error('Required Judge is unavailable');
     const preparedAgent = !deps.kernel || deps.kernel === productAgent
-        ? await prepareAgentConfig(repo, deps.env ?? process.env, options.config, undefined, deps) : undefined;
+        ? deps.preparedAgent ?? await prepareAgentConfig(repo, deps.env ?? process.env, options.config, undefined, deps) : undefined;
     const ready = (deps.kernel ?? createProductAgent(repo, preparedAgent!.apiKey)).readiness();
     if (!ready.ready) throw Error(ready.reason);
-    if (preparedJudge) preparedJudge = await prepareJudge(preparedJudge, deps.fetcher, deps.signal);
+    if (preparedJudge && deps.preparedJudge === undefined) preparedJudge = await prepareJudge(preparedJudge, deps.fetcher, deps.signal);
     const results: Awaited<ReturnType<typeof runLocal>>[] = [];
     const { datasets, ...runOptions } = options;
     let offset = 0;

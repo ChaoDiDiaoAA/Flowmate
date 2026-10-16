@@ -22,3 +22,4 @@ export * from './subagents.ts';
 export * from './input-commands.ts';
 export * from './research.ts';
 export * from './runtime-evaluation.ts';
+export * from './evaluation.ts';
