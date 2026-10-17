@@ -14,7 +14,7 @@ export { runConfigSchema, parseRunConfig, findDataset, createEvaluationPlan, sam
 export {assertModelConfiguration} from '../adapters/agent.ts';
 import { executeCase, type ExecutionPhase } from './execute-case.ts';
 import { prepareSafetyProbes } from './safety-probes.ts';
-import { codeIdentity, changedSourcePaths, runtimeSourceConditions } from './source.ts';
+import { codeIdentity, changedSourcePaths, runtimeSourceConditions, type EvaluationRuntime } from './source.ts';
 import { scanEvidence } from './evidence-safety.ts';
 import { evaluateAll } from '../scoring/evaluate.ts';
 import { aggregate } from '../scoring/aggregate.ts';
@@ -78,6 +78,7 @@ export async function runLocal(repo: string, options: {
     judgeConfigFile?: string;
     config?: z.infer<typeof runConfigSchema>;
 }, deps: {
+    runtime?: EvaluationRuntime;
     kernel?: AgentKernel;
     env?: NodeJS.ProcessEnv;
     fetcher?: Fetcher;
@@ -99,7 +100,7 @@ export async function runLocal(repo: string, options: {
     if (isProductAgent) {
         const agent = deps.preparedAgent ?? await prepareAgentConfig(repo, deps.env ?? process.env, config, undefined, deps);
         config = { ...config, ...agent.configuration };
-        kernel = createProductAgent(repo, agent.apiKey);
+        kernel = createProductAgent(repo, agent.apiKey, deps.runtime);
     }
     const ready = kernel.readiness();
     if (!ready.ready)
@@ -121,9 +122,10 @@ export async function runLocal(repo: string, options: {
     const selectedJudge = judge ? publicJudgeConfig(judge) : null;
     const executionId = safeId(options.executionId ?? ('agent-' + Date.now() + '-' + randomUUID().slice(0, 8)));
     const root = createRunDirectory(repo, executionId, datasetScope(dataset));
-    const sourceRoot=isProductAgent&&!existsSync(join(repo,'apps/host/main.ts'))?REPO_ROOT:repo;
-    const code = codeIdentity(sourceRoot);
-    const runtimeSource=runtimeSourceConditions(sourceRoot,code);
+    const sourceRoot=deps.runtime ? deps.runtime.mode === 'installed' ? deps.runtime.layout.runtimeRoot : deps.runtime.repository
+        : isProductAgent&&!existsSync(join(repo,'apps/host/main.ts'))?REPO_ROOT:repo;
+    const code = codeIdentity(sourceRoot, undefined, deps.runtime);
+    const runtimeSource=runtimeSourceConditions(sourceRoot,code,deps.runtime);
     const prepared = selected.map(task => {
         try {
             return { task, resolved: resolveCase(dataset, task, repo), error: null };
@@ -197,7 +199,8 @@ export async function runLocal(repo: string, options: {
             ...(inputs.resourceRoot ? { resourceRoot: inputs.resourceRoot } : {}),
             ...(item.resolved.controllerInput?{controllerInput:item.resolved.controllerInput}:{}),
             ...(item.task.requires.includes('invoice') ? { invoiceSource: { root: inputs.invoiceRoot ?? join(repo, 'data/invoices/agent-input'), localRoot: inputs.localRoot, materials: item.task.input.materials,files:caseFiles(dataset,item.task) } } : {}),
-            requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,repo),...config} }, config.timeoutMs ?? evaluationRunDefaults.timeoutMs, config.stopGraceMs ?? evaluationRunDefaults.stopGraceMs, deps.signal, phase);
+            requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,
+                deps.runtime?.mode === 'installed' ? deps.runtime.layout.runtimeRoot : repo),...config} }, config.timeoutMs ?? evaluationRunDefaults.timeoutMs, config.stopGraceMs ?? evaluationRunDefaults.stopGraceMs, deps.signal, phase);
         if (result.stopFailed) stopReason = 'Prior Trial stopping unconfirmed: ' + (result.execution.error?.message ?? 'Stop evidence missing');
         const cleanup = result.execution.evidence.cleanup;
         const stopConfirmed = !result.stopFailed && cleanup?.present && cleanup.actual !== null && typeof cleanup.actual === 'object' &&
@@ -227,13 +230,23 @@ export async function runLocal(repo: string, options: {
     report.endedAt = new Date().toISOString();
     report.scoring = 'complete';
     report.executionComplete = report.trials.every(t => t.execution && !['not-started', 'cancelled'].includes(t.execution.status));
-    const after = codeIdentity(sourceRoot);
-    if (changedSourcePaths(code,after).length) {
+    let sourceFailure: string | null = null;
+    try {
+        const after = codeIdentity(sourceRoot, undefined, deps.runtime);
+        const paths = changedSourcePaths(code, after);
+        if (paths.length) {
+            sourceFailure = 'Execution source changed during the experiment';
+            report.sourceInvalidation = { reason: sourceFailure, paths };
+        }
+    } catch (error) {
+        if (deps.runtime?.mode !== 'installed') throw error;
+        sourceFailure = 'Execution source could not be rechecked; result is not verified';
+    }
+    if (sourceFailure) {
         report.executionComplete = false;
-        report.sourceInvalidation={reason:'Execution source changed during the experiment',paths:changedSourcePaths(code,after)};
         for (const t of report.trials) {
             t.status = 'ERROR';
-            t.reason = 'Execution source changed during the experiment';
+            t.reason = sourceFailure;
         }
     }
     report.trialStatistics = deriveTrialStatistics(report);
@@ -281,7 +294,7 @@ export async function runBatch(repo: string,
     if (options.judge !== 'off' && selections.some(s=>s.required) && !preparedJudge) throw Error('Required Judge is unavailable');
     const preparedAgent = !deps.kernel || deps.kernel === productAgent
         ? deps.preparedAgent ?? await prepareAgentConfig(repo, deps.env ?? process.env, options.config, undefined, deps) : undefined;
-    const ready = (deps.kernel ?? createProductAgent(repo, preparedAgent!.apiKey)).readiness();
+    const ready = (deps.kernel ?? createProductAgent(repo, preparedAgent!.apiKey, deps.runtime)).readiness();
     if (!ready.ready) throw Error(ready.reason);
     if (preparedJudge && deps.preparedJudge === undefined) preparedJudge = await prepareJudge(preparedJudge, deps.fetcher, deps.signal);
     const results: Awaited<ReturnType<typeof runLocal>>[] = [];

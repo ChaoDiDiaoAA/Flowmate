@@ -1,0 +1,61 @@
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index e2b640b661a7712fa3f86ed5ecb494b98a6f9e4d..5d8a7dda08ab9433b4e9b9b0985d2e40410741a4 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -29,6 +29,8 @@ export { ArminComponent, AssistantMessageComponent, BashExecutionComponent, Bord
+ export { getLanguageFromPath, getMarkdownTheme, getSelectListTheme, getSettingsListTheme, highlightCode, initTheme, Theme, type ThemeColor, } from "./modes/interactive/theme/theme.ts";
+ export { copyToClipboard } from "./utils/clipboard.ts";
+ export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.ts";
++export { loadPromptTemplates, expandPromptTemplate } from "./core/prompt-templates.ts";
++export { getToolPath } from "./utils/tools-manager.js";
+ export { convertToPng } from "./utils/image-convert.ts";
+ export { formatDimensionNote, type ResizedImage, resizeImage } from "./utils/image-resize.ts";
+ export { detectSupportedImageMimeTypeFromFile } from "./utils/mime.ts";
+diff --git a/dist/index.js b/dist/index.js
+index 01017cdbf6a26b3d36e236c7f9e835fbf0fa5c3a..9f99843bb387b311f06929bb3e27679a91bdaabd 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -40,6 +40,8 @@ export { getLanguageFromPath, getMarkdownTheme, getSelectListTheme, getSettingsL
+ // Clipboard utilities
+ export { copyToClipboard } from "./utils/clipboard.js";
+ export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.js";
++export { loadPromptTemplates, expandPromptTemplate } from "./core/prompt-templates.js";
++export { getToolPath } from "./utils/tools-manager.js";
+ export { convertToPng } from "./utils/image-convert.js";
+ export { formatDimensionNote, resizeImage } from "./utils/image-resize.js";
+ export { detectSupportedImageMimeTypeFromFile } from "./utils/mime.js";
+diff --git a/dist/utils/tools-manager.js b/dist/utils/tools-manager.js
+index 39b1f1ae3357925c68127b580340208c5d557ed9..36035df0c7e6ae3a3e779bb1a02ecc21c95193a1 100644
+--- a/dist/utils/tools-manager.js
++++ b/dist/utils/tools-manager.js
+@@ -1,7 +1,7 @@
+ import { spawnSync } from "child_process";
+ import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
+ import { arch, platform } from "os";
+-import { join } from "path";
++import { isAbsolute, join } from "path";
+ import { Readable } from "stream";
+ import { pipeline } from "stream/promises";
+ import { APP_NAME, getBinDir } from "../config.js";
+@@ -63,7 +63,7 @@ const TOOLS = {
+ // Check if a command exists in PATH by trying to run it
+ function commandExists(cmd) {
+     try {
+-        const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
++        const result = spawnSync(cmd, ["--version"], { stdio: "pipe", timeout: 5000, windowsHide: true });
+         // Check for ENOENT error (command not found)
+         return result.error === undefined || result.error === null;
+     }
+@@ -76,6 +76,12 @@ export function getToolPath(tool) {
+     const config = TOOLS[tool];
+     if (!config)
+         return null;
++    // Flowmate launchers bind PI_PACKAGE_DIR to the fixed runtime assets before SDK import.
++    const packageDir = process.env.PI_PACKAGE_DIR;
++    if (packageDir && isAbsolute(packageDir)) {
++        const bundledPath = join(packageDir, "..", "bin", config.binaryName + (platform() === "win32" ? ".exe" : ""));
++        if (existsSync(bundledPath)) return bundledPath;
++    }
+     // Check our tools directory first
+     const localPath = join(TOOLS_DIR, config.binaryName + (platform() === "win32" ? ".exe" : ""));
+     if (existsSync(localPath)) {

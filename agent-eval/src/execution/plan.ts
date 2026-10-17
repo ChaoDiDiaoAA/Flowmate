@@ -8,7 +8,7 @@ import { agentApiSchema } from '../configuration.ts';
 import { discoverDatasets, selectCases, assertSemanticSelection, judgeSelection, resolveCase, caseFiles,
   REPO_ROOT, type LocalDataset } from '../dataset-loader/local.ts';
 import { compileEvaluatorPlan } from '../scoring/evaluator-plan.ts';
-import { changedSourcePaths, codeIdentity } from './source.ts';
+import { changedSourcePaths, codeIdentity, type EvaluationRuntime } from './source.ts';
 import { supplementalDatasetIds } from '../dataset-loader/declarations.ts';
 
 export const evaluationRunDefaults = { timeoutMs: 120_000, stopGraceMs: 5000, environment: 'development' } as const;
@@ -27,10 +27,10 @@ export function parseRunConfig(value: unknown) {
   }
   return parsed.data;
 }
-export function findDataset(repo: string, options: { dataset?: string; version?: number } = {}) {
+export function findDataset(repo: string, options: { dataset?: string; version?: number } = {}, resourceRepository = repo) {
   const supplemental = supplementalDatasetIds.includes(options.dataset ?? '');
   const directory = join(repo, 'agent-eval/src/datasets', ...(supplemental ? ['badcase'] : []));
-  const matches = discoverDatasets(directory, repo).filter(d => d.manifest.id === (options.dataset ?? 'flowmate-agent-v1'));
+  const matches = discoverDatasets(directory, repo, resourceRepository).filter(d => d.manifest.id === (options.dataset ?? 'flowmate-agent-v1'));
   if (supplemental && !matches.length) throw Error('暂无可运行成员：' + options.dataset);
   if (matches.length === 0)
     throw Error(`Dataset ${options.dataset ?? 'flowmate-agent-v1'} 不存在：尚未制作，等待评测工程验收；真实入口与必要采证接通、工程验证通过后，依据 01/02 制作。未调用模型、未创建执行记录。`);
@@ -41,11 +41,12 @@ export function findDataset(repo: string, options: { dataset?: string; version?:
   return dataset;
 }
 
-export function createEvaluationPlan(repo: string, input: unknown) {
+export function createEvaluationPlan(repo: string, input: unknown, runtime?: EvaluationRuntime) {
   const request = EvaluationPreviewRequestSchema.parse(input);
+  const resourceRepository = runtime?.mode === 'installed' ? runtime.layout.runtimeRoot : repo;
   const datasets = request.datasetId === 'all'
-    ? ['flowmate-agent-v1', 'flowmate-research-v1'].map(dataset => findDataset(repo, { dataset }))
-    : [findDataset(repo, { dataset: request.datasetId })];
+    ? ['flowmate-agent-v1', 'flowmate-research-v1'].map(dataset => findDataset(repo, { dataset }, resourceRepository))
+    : [findDataset(repo, { dataset: request.datasetId }, resourceRepository)];
   const conditions: Array<{ manifest: LocalDataset['manifest']; cases: unknown[] }> = [];
   const datasetPlans = datasets.map(dataset => {
     const selected = selectCases(dataset, request.selection === 'case' ? 'full' : request.selection, request.caseId);
@@ -75,8 +76,9 @@ export function createEvaluationPlan(repo: string, input: unknown) {
     judgeRequired: cases.some(task => task.judge.enabled && task.judge.required),
     unmeasuredRequiredCaseIds: cases.filter(task => task.judge.required && !task.judge.enabled).map(task => task.caseId),
   });
-  const sourceRoot = existsSync(join(repo, 'apps/host/main.ts')) ? repo : REPO_ROOT;
-  return { request, datasets, summary, conditions, source: codeIdentity(sourceRoot) };
+  const sourceRoot = runtime ? runtime.mode === 'development' ? runtime.repository : runtime.layout.runtimeRoot
+    : existsSync(join(repo, 'apps/host/main.ts')) ? repo : REPO_ROOT;
+  return { request, datasets, summary, conditions, source: codeIdentity(sourceRoot, undefined, runtime) };
 }
 export type EvaluationPlan = ReturnType<typeof createEvaluationPlan>;
 export function sameEvaluationPlan(before: EvaluationPlan, after: EvaluationPlan): boolean {

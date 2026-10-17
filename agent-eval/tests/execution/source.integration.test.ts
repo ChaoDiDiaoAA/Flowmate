@@ -6,6 +6,29 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { codeIdentity } from '../../src/execution/source.ts';
 import * as source from '../../src/execution/source.ts';
+import { PACKAGED_REQUIRED_FILES, resolveRuntimeLayout, type PackagedRelease } from '@flowmate/shared';
+
+test('installed source compares actual released bodies without Git and rejects missing assets', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'flowmate-installed-source-')), root = join(directory, 'flowmate-runtime');
+    const release: PackagedRelease = { version: 1, releaseId: crypto.randomUUID(), productVersion: '0.1.0',
+        platform: 'win32', arch: 'x64', bunVersion: '1.4.0', electronVersion: '44.4.5', sdkVersion: '0.85.1', pluginVersion: '0.19.0',
+        schemaVersion: 20, settingsVersion: 7, files: [...PACKAGED_REQUIRED_FILES, 'resources/prompts/test.md'] };
+    for (const file of release.files) { mkdirSync(join(root, file, '..'), { recursive: true }); writeFileSync(join(root, file), 'one'); }
+    writeFileSync(join(root, 'sdk/package.json'), JSON.stringify({ version: release.sdkVersion }));
+    writeFileSync(join(root, 'release.json'), JSON.stringify(release));
+    const layout = resolveRuntimeLayout({ isPackaged: true, appPath: join(directory, 'app.asar'), resourcesPath: directory, userDataRoot: join(tmpdir(), 'flowmate-source-user') });
+    expect(layout.ok).toBe(true); if (!layout.ok) throw Error(layout.error.code);
+    const runtime: source.EvaluationRuntime = { mode: 'installed', layout: layout.data, release };
+    const before = codeIdentity(directory, undefined, runtime);
+    expect(before).toEqual({ release: `0.1.0:${release.releaseId}`, dirty: false });
+    const conditions = source.runtimeSourceConditions(directory, before, runtime);
+    expect(conditions.dependencies).toMatchObject({ bun: '1.4.0', '@earendil-works/pi-ai': '0.85.1' });
+    expect(conditions.files.some(file => file.path === 'bin/bun.exe')).toBe(false);
+    writeFileSync(join(root, 'apps/host.js'), 'two');
+    expect(source.changedSourcePaths(before, codeIdentity(directory, undefined, runtime))).toEqual(['apps/host.js']);
+    unlinkSync(join(root, 'apps/host.js'));
+    expect(() => codeIdentity(directory, undefined, runtime)).toThrow('unavailable');
+});
 test('source snapshot reconstructs dirty and untracked execution code without environment files', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-source-'));
     const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });

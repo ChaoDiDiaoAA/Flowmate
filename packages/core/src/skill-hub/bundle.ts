@@ -81,6 +81,9 @@ export function createResourceBundles(path: string, contents: ManagedFileContent
     return manifest;
   }
   return { publish,
+    verifyPublished(bundleId: string): Result<void> {
+      return checked(() => { readBundle(bundleId, true); }, 'resource_bundle_unavailable');
+    },
     verifyFrozen(input: FrozenResources): Result<void> {
       const verified = checked(() => { frozenBundle(input, true); }, 'resource_bundle_unavailable');
       return verified.ok ? verified : fail(appError('resource_bundle_unavailable', ...errorFacts('resource_bundle_unavailable')));

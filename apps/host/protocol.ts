@@ -68,6 +68,7 @@ const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
+  z.object({ version: z.literal(1), requestId, type: z.literal('query_diagnostics') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('compact_session'), input: DesktopSessionCompactionRequestSchema,
     expectedSettingsRevision: dbId, expectedCredentialRef: credentialRef }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_compaction'), input: SessionCompactionQuerySchema }).strict(),

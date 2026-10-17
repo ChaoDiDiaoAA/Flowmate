@@ -3,6 +3,7 @@ import { validateToolArguments, type TSchema } from '@earendil-works/pi-ai';
 import {
   createReadToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
   createEditToolDefinition, createWriteToolDefinition, createBashToolDefinition, createPowerShellToolDefinition,
+  getShellConfig, getPowerShellConfig, getToolPath,
 } from '@earendil-works/pi-coding-agent';
 import {
   appError, NATIVE_TOOL_NAMES, NativeToolOutputSchema, ToolExecutionFailure,
@@ -19,9 +20,16 @@ export function createNativeTools(options: NativeToolsOptions): {
   const factories = { read: createReadToolDefinition, grep: createGrepToolDefinition, find: createFindToolDefinition,
     ls: createLsToolDefinition, edit: createEditToolDefinition, write: createWriteToolDefinition,
     bash: createBashToolDefinition, powershell: createPowerShellToolDefinition };
-  // Pi resolves actual dependencies at execution. Its PowerShell backend only supports Windows.
-  const availability = NATIVE_TOOL_NAMES.map(name => ({ name, available: name !== 'powershell' || process.platform === 'win32',
-    reason: name === 'powershell' && process.platform !== 'win32' ? 'Pi PowerShell is only available on Windows.' : null }));
+  const availability: NativeToolAvailability[] = NATIVE_TOOL_NAMES.map(name => {
+    try {
+      if (name === 'bash') getShellConfig();
+      if (name === 'powershell') getPowerShellConfig();
+      if ((name === 'grep' || name === 'find') && !getToolPath(name === 'grep' ? 'rg' : 'fd'))
+        return { name, available: false, reason: name === 'grep' ? 'Pi requires ripgrep (rg), which is unavailable.' : 'Pi requires fd, which is unavailable.' };
+      return { name, available: true, reason: null };
+    } catch { return { name, available: false, reason: name === 'powershell' && process.platform !== 'win32'
+      ? 'Pi PowerShell is only available on Windows.' : 'Pi could not resolve the required shell executable.' }; }
+  });
   const definitions = NATIVE_TOOL_NAMES.map((name, index) => {
     const schemaTool = factories[name](process.cwd());
     const definition: ToolDefinition<unknown, NativeToolOutput> = {

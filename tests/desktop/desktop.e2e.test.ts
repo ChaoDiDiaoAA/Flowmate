@@ -2711,7 +2711,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     await page.getByRole('button', { name: /Import invoice/ }).click();
     const selectedDefaultPath = await electronApp.evaluate(({ dialog }) =>
       (dialog as unknown as { __selectedDefaultPath?: string }).__selectedDefaultPath);
-    expect(selectedDefaultPath).toBe(join(resolve(import.meta.dirname, '../..'), 'data', 'invoices', 'agent-input'));
+    expect(selectedDefaultPath).toBe(sourceRoot);
     await page.getByRole('heading', { name: 'Invoice 000001' }).waitFor({ state: 'visible', timeout: 10_000 });
     const imported = await page.evaluate(() => window.flowmate.queryDocument(1));
     if (!imported.ok) throw new Error(imported.error.code);

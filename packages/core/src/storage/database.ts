@@ -100,7 +100,10 @@ function runMigration(db: Database, version: SchemaVersion, paths?: ProductPaths
       // Bun/SQLite can suppress a statement error in an ALTER + multi-statement exec.
       // Execute this small migration statement by statement so the outer catch rolls back.
       for (const statement of migrationSql(version).split(';').map((sql) => sql.trim()).filter(Boolean)) db.exec(statement);
-    } else db.exec(migrationSql(version));
+    } else {
+      // Bun can swallow a later error in multi-statement exec; these early migrations contain no trigger bodies.
+      for (const statement of migrationSql(version).split(';').map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
+    }
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* preserve migration error; caller closes the database */ }
     if (version === 20) backup?.restore();
@@ -125,6 +128,8 @@ function migrateToLatest(db: Database, paths: ProductPaths): void {
   }
   const backup = migrationTable && versions.length < 20 ? backupLegacyStore(db, paths) : null;
   for (let version = versions.length + 1; version <= 20; version += 1) runMigration(db, version as SchemaVersion, paths, backup);
+  const completed = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
+  if (completed.length !== 20 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
 }
 
 export function openDatabase(paths: ProductPaths): Result<DbHandle> {

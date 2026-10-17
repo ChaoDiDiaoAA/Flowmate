@@ -7,6 +7,7 @@ import type { PrivateEffects } from '../execution/safety-probes.ts';
 import {REPO_ROOT} from '../dataset-loader/local.ts';
 import { agentConfig, prepareAgentConfig } from '../configuration.ts';
 import { registerSecrets } from '../execution/evidence-safety.ts';
+import type { EvaluationRuntime } from '../execution/source.ts';
 export function assertModelConfiguration(config:{model?:unknown;baseUrl?:unknown;api?:unknown}) {
     if(typeof config.model!=='string'||!config.model.trim()||config.model.includes('REPLACE_WITH')||typeof config.baseUrl!=='string'||typeof config.api!=='string'||
         !['openai-completions','openai-responses','anthropic-messages','google-generative-ai'].includes(config.api))
@@ -50,7 +51,7 @@ export interface AgentKernel {
     };
     prepare(trial: AgentTrial, signal: AbortSignal): Promise<AgentTrialSession>;
 }
-export function createProductAgent(repo: string, apiKey: string): AgentKernel {
+export function createProductAgent(repo: string, apiKey: string, runtime?: EvaluationRuntime): AgentKernel {
     registerSecrets([apiKey]);
     return {
     readiness() {
@@ -61,7 +62,7 @@ export function createProductAgent(repo: string, apiKey: string): AgentKernel {
         signal.throwIfAborted();assertModelConfiguration(trial.configuration);
         if(!apiKey.trim())throw new Error('Agent credential FLOWMATE_EVAL_AGENT_API_KEY is required');
         const {prepareHostTrial}=await import('./host-research.ts');
-        return prepareHostTrial(trial,signal,{repo,credential:apiKey});
+        return prepareHostTrial(trial,signal,{repo,credential:apiKey,runtime});
     },
     };
 }

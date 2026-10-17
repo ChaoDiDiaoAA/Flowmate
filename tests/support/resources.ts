@@ -140,7 +140,8 @@ export async function installReadGate(app: ElectronApplication, userData: string
   await app.evaluate((_electron, root) => {
     const handles = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles();
     const child = handles.find(value => value && typeof value === 'object' && 'spawnargs' in value && Array.isArray(value.spawnargs)
-      && value.spawnargs.includes(root) && value.spawnargs.includes('apps/host/main.ts')) as import('node:child_process').ChildProcessWithoutNullStreams | undefined;
+      && value.spawnargs.includes(root) && value.spawnargs.some(arg => typeof arg === 'string'
+        && /(?:^|\/)apps\/(?:host\/main\.ts|start-host\.js)$/.test(arg.replaceAll('\\', '/')))) as import('node:child_process').ChildProcessWithoutNullStreams | undefined;
     if (!child?.stdin || !child.stdout) throw new Error('Actual owned Host pipe is missing.');
     const input = child.stdin, output = child.stdout, write = input.write, emit = output.emit;
     const commands: Array<{ type: string; requestId: string; input?: { runId?: number; snapshotId?: number } }> = [];

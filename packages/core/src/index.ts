@@ -5,6 +5,7 @@ export * from './configuration/service.ts';
 export * from './configuration/settings.ts';
 export * from './storage/database.ts';
 export * from './storage/managed-file-contents.ts';
+export * from './storage/maintenance.ts';
 export * from './memory/persistence.ts';
 export * from './storage/file-store.ts';
 export * from './storage/repositories.ts';

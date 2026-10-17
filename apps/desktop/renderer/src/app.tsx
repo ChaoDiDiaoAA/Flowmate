@@ -6,6 +6,7 @@ import { EvaluationPage } from './evaluation.tsx';
 import { applyEvaluationControl, applyEvaluationEvent, createEvaluationView, evaluationBusy } from './evaluation-state.ts';
 import type { EvaluationControlState } from '../../../../packages/contracts/src/evaluation.ts';
 import type { ResearchTask, ResearchIntent, ResearchPlanBody } from '@flowmate/contracts';
+import type { DiagnosticsSnapshot } from '@flowmate/contracts';
 import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema,
   MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS, MAX_INVOICE_BLOCKS_PER_PAGE } from '../../../../packages/contracts/src/invoice.ts';
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
@@ -178,6 +179,9 @@ export function App() {
   const [workingDirectory, setWorkingDirectory] = useState('');
   const [nativeTools, setNativeTools] = useState<readonly NativeToolAvailability[]>([]);
   const [nativeToolsError, setNativeToolsError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsSnapshot | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState<'refresh' | 'export' | 'recheck' | null>(null);
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [messageState, setMessageState] = useState<MessageViewState | null>(null);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
@@ -1748,6 +1752,31 @@ export function App() {
     else setNativeToolsError(errorMessage(result));
   }
 
+  async function diagnosticsAction(action: 'refresh' | 'export' | 'recheck') {
+    if (diagnosticsBusy) return;
+    setDiagnosticsBusy(action); setDiagnosticsError(null);
+    try {
+      if (action === 'export') {
+        const result = await window.flowmate.exportDiagnostics();
+        if (!result.ok) setDiagnosticsError(result.error.message);
+        else setNotice({ tone: 'good', message: result.data.outcome === 'saved' ? 'Diagnostics JSON saved.' : 'Diagnostics export cancelled.' });
+        return;
+      }
+      if (action === 'recheck') {
+        const result = await window.flowmate.restartHost();
+        if (!result.ok) {
+          setDiagnosticsError(result.error.message);
+          const snapshot = await window.flowmate.queryDiagnostics(); if (snapshot.ok) setDiagnostics(snapshot.data);
+          return;
+        }
+        receiveDesktopState(result.data); await refreshRuntimeState();
+      }
+      const result = await window.flowmate.queryDiagnostics();
+      if (result.ok) setDiagnostics(result.data); else setDiagnosticsError(result.error.message);
+    } catch { setDiagnosticsError('Diagnostics are unavailable. Refresh to check the current sources.'); }
+    finally { setDiagnosticsBusy(null); }
+  }
+
   async function chooseWorkingDirectory() {
     const result = await window.flowmate.chooseWorkingDirectory();
     if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
@@ -3002,6 +3031,23 @@ export function App() {
             {page === 'settings' && settingsTab === 'Performance' && <details className="panel diagnostics-panel"><summary>Diagnostics</summary>
               <div><p>Application: {state?.ready ? 'Ready' : 'Unavailable'}</p>
                 <p>Selected model: {persistedModel ? credentialStatus === 'configured' ? 'Ready to connect' : 'Credential needs attention' : 'No model selected'}</p>
+                <div className="config-actions">
+                  <button className="secondary-button" disabled={diagnosticsBusy !== null} onClick={() => void diagnosticsAction('refresh')}>Refresh diagnostics</button>
+                  <button className="secondary-button" disabled={diagnosticsBusy !== null} onClick={() => void diagnosticsAction('export')}>Export diagnostics JSON</button>
+                  <button className="secondary-button" disabled={diagnosticsBusy !== null || state?.ready === true} onClick={() => void diagnosticsAction('recheck')}>Recheck Host</button>
+                </div>
+                {diagnosticsBusy && <p role="status">{diagnosticsBusy === 'recheck' ? 'Checking the original controller and saved state…' : diagnosticsBusy === 'export' ? 'Preparing diagnostics export…' : 'Collecting diagnostics…'}</p>}
+                {diagnosticsError && <p role="alert">{diagnosticsError}</p>}
+                {!diagnostics && !diagnosticsBusy && <p>No diagnostics collected. Refresh to read the current process buffers.</p>}
+                {diagnostics && <div data-testid="installation-diagnostics">
+                  <p>Collected: {diagnostics.collectedAt}. Host diagnostics: {diagnostics.host.availability}.</p>
+                  <p>Main records: {diagnostics.main.entries.length}, dropped: {diagnostics.main.dropped}. Host records: {diagnostics.host.entries.length}, dropped: {diagnostics.host.dropped ?? 'unknown'}.</p>
+                  <p>Runtime: Bun {diagnostics.runtime.bunVersion ?? 'unknown'}, Pi {diagnostics.runtime.sdkVersion}, {diagnostics.runtime.platform}/{diagnostics.runtime.arch}.</p>
+                  {diagnostics.gaps.length > 0 && <p>Collection gaps: {diagnostics.gaps.join(', ')}. Missing process records are unavailable; saved business history is unchanged.</p>}
+                  {diagnostics.host.stderrTail && <p>Recent Host diagnostic codes: {diagnostics.host.stderrTail.trim().split('\n').slice(-5).join(' · ')}</p>}
+                  <p>Latest {Math.min(10, diagnostics.main.entries.length + diagnostics.host.entries.length)} records; export JSON for all collected records.</p>
+                  <ul>{[...diagnostics.main.entries, ...diagnostics.host.entries].sort((a, b) => Date.parse(a.at) - Date.parse(b.at)).slice(-10).map((entry, index) => <li key={index}>{entry.at} · {entry.component} · {entry.event}{entry.code ? ` · ${entry.code}` : ''}</li>)}</ul>
+                </div>}
                 <h3>Tools on this device</h3><button className="quiet-button" disabled={!state?.ready} onClick={() => void loadNativeTools()}>Refresh tools</button>
                 {nativeToolsError ? <p role="alert">{nativeToolsError}</p> : <ul>{nativeTools.map(tool => <li key={tool.name}><strong>{tool.name}</strong>: {tool.available ? 'Available' : tool.reason ?? 'Unavailable'}</li>)}</ul>}</div>
             </details>}

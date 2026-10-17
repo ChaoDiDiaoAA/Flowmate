@@ -1,6 +1,9 @@
 import { realpathSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
+import { dirname, join, resolve, isAbsolute } from 'node:path';
+import { resolveRuntimeLayout } from '@flowmate/shared';
+import type { EvaluationRuntime } from '../execution/source.ts';
 import { appError, EvaluationIdSchema } from '@flowmate/contracts';
 import { REPO_ROOT } from '../dataset-loader/local.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
@@ -9,7 +12,7 @@ import { EVALUATION_FRAME_LIMIT, parseEvaluationWorkerCommand, parseEvaluationWo
   type EvaluationWorkerCommand } from './protocol.ts';
 
 export async function runEvaluationWorker(repo: string, sessionId: string,
-  input: NodeJS.ReadableStream = process.stdin, output: NodeJS.WritableStream = process.stdout) {
+  input: NodeJS.ReadableStream = process.stdin, output: NodeJS.WritableStream = process.stdout, runtime?: EvaluationRuntime) {
   const pending = new Set<Promise<void>>();
   const protocolError = { version: 1, type: 'protocol-error', sessionId,
     error: appError('evaluation_protocol_invalid', 'runtime', '评测进程消息无效，未执行该操作。', true) };
@@ -21,7 +24,7 @@ export async function runEvaluationWorker(repo: string, sessionId: string,
     const safe = !line || Buffer.byteLength(line) > EVALUATION_FRAME_LIMIT ? JSON.stringify(protocolError) : line;
     try { output.write(safe + '\n'); } catch { writable = false; }
   };
-  const service = createEvaluationService(realpathSync(repo), { sessionId,
+  const service = createEvaluationService(realpathSync(repo), { sessionId, runtime,
     onEvent: event => { sequence = event.sequence; send({ version: 1, type: 'event', sessionId, event }); } });
   const reader = createInterface({ input, crlfDelay: Infinity });
   output.on('error', () => { writable = false; void service.shutdown(); });
@@ -56,10 +59,26 @@ export async function runEvaluationWorker(repo: string, sessionId: string,
   return service.shutdown();
 }
 
-if (import.meta.main) {
+export async function startEvaluationWorker(argv: string[] = process.argv.slice(2)): Promise<void> {
   try {
-    const args = parseArgs({ options: { repo: { type: 'string' }, 'session-id': { type: 'string' } }, strict: true, allowPositionals: false });
+    for (const flag of ['--repo', '--session-id', '--runtime-root'])
+      if (argv.filter(value => value.split('=')[0] === flag).length > 1) throw Error('Invalid Worker arguments');
+    const args = parseArgs({ args: argv, options: { repo: { type: 'string' }, 'session-id': { type: 'string' }, 'runtime-root': { type: 'string' } }, strict: true, allowPositionals: false });
     const sessionId = EvaluationIdSchema.parse(args.values['session-id']);
-    await runEvaluationWorker(args.values.repo ?? REPO_ROOT, sessionId);
-  } catch { process.stderr.write('[Flowmate Evaluation] Worker startup or shutdown failed.\n'); process.exitCode = 1; }
+    let runtime: EvaluationRuntime | undefined;
+    const runtimeRoot = args.values['runtime-root'];
+    if (runtimeRoot) {
+      if (!isAbsolute(runtimeRoot) || !args.values.repo || !isAbsolute(args.values.repo)) throw Error('Invalid installed Worker root');
+      const repo = realpathSync(args.values.repo);
+      const checked = resolveRuntimeLayout({ isPackaged: true, appPath: join(dirname(runtimeRoot), 'app.asar'),
+        resourcesPath: dirname(runtimeRoot), userDataRoot: dirname(repo) });
+      if (!checked.ok || !checked.data.release || resolve(runtimeRoot) !== checked.data.runtimeRoot || repo !== checked.data.evaluationRoot
+        || Bun.version !== checked.data.release.bunVersion || process.env.PI_PACKAGE_DIR !== checked.data.sdkRoot
+        || process.env.PI_CODING_AGENT_DIR !== join(repo, 'runtime')) throw Error('Invalid installed Worker runtime');
+      runtime = { mode: 'installed', layout: checked.data, release: checked.data.release };
+    }
+    await runEvaluationWorker(args.values.repo ?? REPO_ROOT, sessionId, process.stdin, process.stdout, runtime);
+  } catch { process.stderr.write('[Flowmate Evaluation] evaluation_worker_start_failed\n'); process.exitCode = 1; }
 }
+
+if (import.meta.main) await startEvaluationWorker();

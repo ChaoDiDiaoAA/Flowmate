@@ -145,7 +145,10 @@ export function readVoxel51Files(sourceDirectory: string, productRoot: string, s
     const info = lstatSync(supplied);
     if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('invalid_source_directory');
     directory = realpathSync(supplied);
-    if (within(realpathSync(productRoot), directory)) throw new Error('product_root_not_source');
+    const productDirectory = realpathSync(productRoot);
+    // Installed intake is explicit staging, separate from managed artifacts and business state.
+    if (within(productDirectory, directory) && (allowedSourceRoot === undefined
+      || !samePath(allowedSourceRoot, resolve(productDirectory, 'imports/invoices')))) throw new Error('product_root_not_source');
   } catch {
     return fail(appError('source_invalid', 'input', '来源目录无效或位于产品受管目录内。'));
   }

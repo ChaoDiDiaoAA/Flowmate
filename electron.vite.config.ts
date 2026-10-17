@@ -8,10 +8,13 @@ const workspacePackages = ['@flowmate/contracts', '@flowmate/core', '@flowmate/r
 
 export default defineConfig({
   main: {
+    envDir: false,
     plugins: [externalizeDepsPlugin({ exclude: workspacePackages })],
-    build: { rollupOptions: { input: { index: resolve(root, 'apps/desktop/main/index.ts') } } },
+    build: { rollupOptions: { input: { index: resolve(root, 'apps/desktop/main/entry.ts') },
+      output: { entryFileNames: 'index.js', chunkFileNames: 'chunks/[name].js', assetFileNames: '[name][extname]' } } },
   },
   preload: {
+    envDir: false,
     plugins: [externalizeDepsPlugin({ exclude: [...workspacePackages, 'zod'] })],
     build: {
       rollupOptions: {
@@ -21,13 +24,15 @@ export default defineConfig({
     },
   },
   renderer: {
+    envDir: false,
     root: resolve(root, 'apps/desktop/renderer'),
     plugins: [react()],
     resolve: { alias: { '@renderer': resolve(root, 'apps/desktop/renderer/src') } },
     build: {
       outDir: resolve(root, 'out/renderer'),
       emptyOutDir: true,
-      rollupOptions: { input: resolve(root, 'apps/desktop/renderer/index.html') },
+      rollupOptions: { input: resolve(root, 'apps/desktop/renderer/index.html'),
+        output: { entryFileNames: 'assets/[name].js', chunkFileNames: 'assets/[name].js', assetFileNames: 'assets/[name][extname]' } },
     },
   },
 });

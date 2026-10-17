@@ -84,7 +84,7 @@ class ControlledProvider implements ProviderPort {
   }
 }
 
-function serviceFor(provider: ProviderPort, runsOverride?: RunRepository) {
+function serviceFor(provider: ProviderPort, runsOverride?: RunRepository, monotonicNow = () => performance.now()) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-'));
   const db = openDatabase(paths(root));
   if (!db.ok) throw new Error(db.error.message);
@@ -93,7 +93,7 @@ function serviceFor(provider: ProviderPort, runsOverride?: RunRepository) {
     provider,
     log: { write: () => undefined, close: async () => undefined },
     now: () => '2026-09-21T00:00:00.000Z',
-    monotonicNow: () => performance.now(),
+    monotonicNow,
   });
   return { db: db.data, service };
 }
@@ -176,17 +176,21 @@ describe('RuntimeService lifecycle', () => {
   it('[F-timeout-prepare] applies the total deadline while Provider preparation is still pending', async () => {
     let aborted = false;
     let preparing = true;
+    let prepareStartedAt: number | null = null;
     const provider: ProviderPort = {
       async prepare(_config, _limits, signal) {
+        prepareStartedAt = performance.now();
         signal.addEventListener('abort', () => { aborted = true; }, { once: true });
         return await new Promise<never>(() => undefined);
       },
       async close() { return { stopped: !preparing, closed: !preparing, errors: preparing ? [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: 'Provider 初始化仍在收口。', retryable: true }] : [] }; },
     };
-    const { db, service } = serviceFor(provider);
+    // Pin this scenario to pending preparation; the separate total-deadline cases cover time spent in storage.
+    const { db, service } = serviceFor(provider, undefined, () => prepareStartedAt === null ? 0 : performance.now() - prepareStartedAt);
 
     const result = await service.callProvider({ ...request, timeoutMs: 20, stopGraceMs: 10 });
 
+    expect(prepareStartedAt).not.toBeNull();
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.data.status).toBe('failed');

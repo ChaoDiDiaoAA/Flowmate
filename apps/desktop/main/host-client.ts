@@ -3,6 +3,9 @@ import { spawn } from 'node:child_process';
 import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse } from '../../../packages/contracts/src/research-commands.ts';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
+import { protectedSecrets } from '../../../agent-eval/src/execution/evidence-safety.ts';
+import { HostDiagnosticCodeSchema, HostDiagnosticsResultSchema } from '@flowmate/contracts';
 import { randomUUID } from 'node:crypto';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, RuntimeEventsWakeSchema, appError, fail, ok } from '@flowmate/contracts';
@@ -40,9 +43,17 @@ export class HostClient {
   private epoch = 0;
   private invoiceFormHandler: ((request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>) | null = null;
   private connectionChangeHandler: (() => void) | null = null;
+  private stderrTail = '';
+  private stderrTruncated = false;
 
   public get state(): HostState | null { return this.currentState; }
   public get connectionEpoch(): number { return this.epoch; }
+  public get hasLiveProcess(): boolean { return this.child !== null && !this.processExited; }
+  public get diagnosticsStderr(): { tail: string; truncated: boolean } {
+    const secrets = protectedSecrets();
+    const lines = this.stderrTail.split('\n').filter(line => line && !secrets.some(secret => line.includes(secret)));
+    return { tail: lines.length ? lines.join('\n') + '\n' : '', truncated: this.stderrTruncated || lines.length !== this.stderrTail.split('\n').filter(Boolean).length };
+  }
   public setConnectionChangeHandler(handler: () => void): void { this.connectionChangeHandler = handler; }
   public captureRuntimeSubscriptionCleanup(ownerToken: string, subscriptionId: string): () => void {
     const child = this.child;
@@ -68,6 +79,7 @@ export class HostClient {
   public async start(userDataRoot: string, appVersion: string, cwd: string,
     invoiceSourceRoot = join(cwd, 'data', 'invoices', 'agent-input'),
     launch?: { executable: string; args: readonly string[] }): Promise<Result<HostState>> {
+    if (this.hasLiveProcess) return fail(appError('host_still_running', 'runtime', 'The previous Host has not exited.', true));
     this.connectionChangeHandler?.();
     if (this.child) this.failAll('host_replaced', 'Bun Host 连接已更换。');
     const executable = process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun';
@@ -81,16 +93,36 @@ export class HostClient {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
+    this.stderrTail = ''; this.stderrTruncated = false;
     this.epoch++;
     this.expectedExit = false;
     this.processExited = false;
     this.closedReport = null;
     this.exited = new Promise<number | null>((resolveExit) => { this.resolveExit = resolveExit; });
     child.stdin.on('error', () => { if (this.child === child) this.failAll('host_write_failed', 'Bun Host 输入通道已关闭。'); });
-    child.stderr.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8').trimEnd();
-      if (text) process.stderr.write(`[Flowmate Host] ${text}\n`);
-    });
+    const decoder = new StringDecoder('utf8');
+    let stderrLine = '', discardLine = false;
+    const retainStderr = (text: string) => {
+      if (this.child !== child) return;
+      for (const character of text) {
+        if (character !== '\n') {
+          if (!discardLine) {
+            stderrLine += character;
+            if (Buffer.byteLength(stderrLine) > 16384) { stderrLine = ''; discardLine = true; this.stderrTruncated = true; }
+          }
+          continue;
+        }
+        const match = /^\[Flowmate\] ([a-z][a-z0-9_]{0,127})\r?$/.exec(stderrLine);
+        if (!discardLine && match && HostDiagnosticCodeSchema.safeParse(match[1]).success
+          && !protectedSecrets().some(secret => stderrLine.includes(secret))) {
+          this.stderrTail += `[Flowmate] ${match[1]}\n`;
+          while (Buffer.byteLength(this.stderrTail) > 16384) { this.stderrTail = this.stderrTail.slice(this.stderrTail.indexOf('\n') + 1); this.stderrTruncated = true; }
+        } else this.stderrTruncated = true;
+        stderrLine = ''; discardLine = false;
+      }
+    };
+    child.stderr.on('data', (chunk: Buffer) => retainStderr(decoder.write(chunk)));
+    child.stderr.on('end', () => { retainStderr(decoder.end()); if (this.child === child && (stderrLine || discardLine)) this.stderrTruncated = true; });
     let resolveStartup!: (result: Result<HostState>) => void;
     let startupSettled = false;
     const ready = new Promise<Result<HostState>>((resolveReady) => { resolveStartup = resolveReady; });
@@ -101,6 +133,7 @@ export class HostClient {
     };
     child.on('error', () => {
       if (this.child !== child) return;
+      if (child.pid === undefined) this.processExited = true;
       this.failAll('host_spawn_failed', 'Bun Host 无法启动.');
       settleStartup(fail(appError('host_spawn_failed', 'runtime', 'Bun Host 无法启动。', true)));
     });
@@ -122,8 +155,7 @@ export class HostClient {
     const result = await ready;
     clearTimeout(timeout);
     if (!result.ok) {
-      process.stderr.write(`[Flowmate Host] Startup failed (${result.error.code}); working directory: ${cwd}\n`);
-      child.kill();
+      process.stderr.write(`[Flowmate Host] ${result.error.code}\n`);
       return result;
     }
     return result;
@@ -217,9 +249,10 @@ export class HostClient {
         return;
       }
       if (output.type === 'credential_request') {
-        void Promise.resolve().then(() => this.credentialHandler?.(output) ?? { ok: false })
+        const epoch = this.epoch;
+        void Promise.resolve().then(() => this.child === child && this.epoch === epoch ? this.credentialHandler?.(output) ?? { ok: false } : { ok: false })
           .catch(() => ({ ok: false })).then((value) => {
-            if (child.stdin.writable) child.stdin.write(`${JSON.stringify({ version: 1, type: 'credential_response',
+            if (this.child === child && this.epoch === epoch && child.stdin.writable) child.stdin.write(`${JSON.stringify({ version: 1, type: 'credential_response',
               requestId: output.requestId, value })}\n`);
           });
         return;
@@ -229,7 +262,11 @@ export class HostClient {
         if (!pending) return;
         clearTimeout(pending.timer);
         this.pending.delete(output.requestId);
-        if (isResearchHostCommand(pending.command.type)) {
+        if (pending.command.type === 'query_diagnostics') {
+          const result = HostDiagnosticsResultSchema.safeParse(output.value);
+          if (!Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key)) || !result.success) pending.reject(new Error('host_protocol_invalid'));
+          else pending.resolve(result.data);
+        } else if (isResearchHostCommand(pending.command.type)) {
           const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
           const value = validEnvelope ? parseResearchHostResult(pending.command.type, output.value) : null;
           if (value === null || !matchesResearchResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));

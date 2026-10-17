@@ -19,7 +19,7 @@ test('an invalid evaluation root exits the real Worker without waiting for its p
     const [code] = await Promise.race([exited, new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(Error('Invalid evaluation root left the Worker input open.')), 10000);
     })]);
-    expect(code).toBe(1); expect(stdout).toBe(''); expect(stderr).toContain('Worker startup or shutdown failed.');
+    expect(code).toBe(1); expect(stdout).toBe(''); expect(stderr).toBe('[Flowmate Evaluation] evaluation_worker_start_failed\n');
     expect(existsSync(missing)).toBe(false);
   } finally { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) { child.kill(); await exited; } }
 });

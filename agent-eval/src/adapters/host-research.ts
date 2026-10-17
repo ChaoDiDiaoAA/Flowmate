@@ -30,6 +30,7 @@ import { collectHistoryEvidence, type HistoryEvidenceEntry } from './history-evi
 import { collectSubagentEvidence } from './subagent-evidence.ts';
 import { collectToolEvidence } from './tool-evidence.ts';
 import { prepareLocalHost } from './local-host.ts';
+import type { EvaluationRuntime } from '../execution/source.ts';
 import { readInvoiceInputs } from './invoice-materials.ts';
 import { readPreparedInvoices } from './prepared-invoice-materials.ts';
 import { ElectronInvoiceControls } from './electron-fill.ts';
@@ -77,7 +78,7 @@ async function backward<T>(page: (before?: number) => Promise<{ items: readonly 
 }
 
 /** Public product bridge; production readiness also requires the remaining Case capabilities and scoring. */
-export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, options: { repo: string; credential: string }): Promise<AgentTrialSession> {
+export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, options: { repo: string; credential: string; runtime?: EvaluationRuntime }): Promise<AgentTrialSession> {
     const isResearch = trial.requires.includes('research');
     const isInvoice = trial.requires.includes('invoice');
     const extensionProfile = trial.setup && 'extensionProfile' in trial.setup ? ExtensionEvaluationProfileSchema.parse(trial.setup.extensionProfile) : undefined;
@@ -151,7 +152,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     if (extensionProfile && !extensions.enabledExtensions.some(ref => ref.id === 'invoice-assist')) throw new Error('Evaluation Hook profile requires the selected trusted invoice extension');
     signal.throwIfAborted();
     registerSecrets([options.credential]);
-    const local = prepareLocalHost(options.repo, trial.directory, invoices, extensionProfile, caseFaultProfile, selectedResources);
+    const local = prepareLocalHost(options.repo, trial.directory, invoices, extensionProfile, caseFaultProfile, selectedResources, options.runtime);
     const { productRoot, invoiceSourceRoot, launch } = local;
     const client = new HostClient(), modelId = 'eval-agent', credentialRef = randomUUID().replaceAll('-','');
     let settingsRevision=0;
@@ -1029,7 +1030,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 if (step.action === 'fill-form') {
                     const selected = await selectedInvoice();
                     if (selected.job.status === 'completed' || selected.candidate.status === 'accepted') throw new Error('Fill requires an editable selected candidate');
-                    controls ??= await ElectronInvoiceControls.start(options.repo, trial.directory);
+                    controls ??= await ElectronInvoiceControls.start(options.repo, trial.directory, options.runtime);
                     running.throwIfAborted();
                     const epoch = client.connectionEpoch;
                     const { revision, documentRef, jobId, candidateRef } = selected.workspace;

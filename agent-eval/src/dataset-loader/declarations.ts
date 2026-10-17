@@ -113,7 +113,7 @@ export function readDeclarationSource(root: string, repo: string) {
 }
 
 /** Trusted authored TS is loaded only by the evaluator, never mounted for the Agent. */
-export function readDeclarationDatasets(root: string, repo: string): FlatDataset[] {
+export function readDeclarationDatasets(root: string, repo: string, resourceRepository = repo): FlatDataset[] {
     const { dataset, gold, reviews, scenariosByName, fixtureRoot } = readDeclarationSource(root, repo);
     const supplemental = dataset.suite === 'badcase';
     const groups = new Map<string, FlatDataset>();
@@ -160,7 +160,7 @@ export function readDeclarationDatasets(root: string, repo: string): FlatDataset
             expected:{...c.expected,checks:gold[c.id].checks},scoring:{methods:['deterministic','llm-judge','human-review'],metrics:Object.fromEntries(Object.entries(gold[c.id].opportunities).filter(([id])=>id==='task-success'||c.scoring.judge.includes(id)||c.scoring.deterministic.includes(id))),humanReview:c.scoring.manual},risks:c.risks};
         const expanded=expandHarness(raw,{contract:'flowmate-eval-gold/v4',caseId:c.id,version:1,...gold[c.id]},
             {contract:'flowmate-eval-review/v4',caseId:c.id,version:1,status:'agent-reviewed',...reviews[c.id]},
-            {datasets:{[id]:metadata},files:Object.fromEntries([...paths].map(p=>[p,p])),resources},repo,read);
+            {datasets:{[id]:metadata},files:Object.fromEntries([...paths].map(p=>[p,p])),resources},resourceRepository,read);
         let group=groups.get(id);
         if(!group){group={manifest:{...metadata,members:[],smoke:[]},tasks:{},files:{},inputs:{},reviews:{},authored:{version:'v1',cases:[],gold:{},reviews:{},fixtures:{}}};groups.set(id,group);}
         const task=expanded.task, member=`cases/${c.id}.json`;

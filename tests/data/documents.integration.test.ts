@@ -61,6 +61,44 @@ function serviceFor(root: string, allowedSourceRoot = join(root, 'source')) {
   return { opened: opened.data, files, service, productPaths };
 }
 
+it('installed invoice intake imports the explicit staging sample into managed Documents', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-installed-intake-'));
+  const intake = join(root, 'product/imports/invoices'), source = join(intake, '000001');
+  writeSample(source);
+  const { service, opened } = serviceFor(root, intake);
+  const imported = await service.importVoxel51({ sourceDirectory: source });
+  expect(imported).toMatchObject({ ok: true, data: { status: 'available', pageCount: 1 } });
+  if (!imported.ok) throw Error('Installed invoice staging import failed');
+  expect(service.inspectForWorkspace(imported.data.documentRef)).toMatchObject({ ok: true, data: { kind: 'valid' } });
+  expect(readFileSync(join(source, 'original.png'))).toEqual(onePixelPng);
+  expect(opened.db.query('SELECT COUNT(*) AS count FROM documents').get()).toEqual({ count: 1 });
+});
+
+it('installed invoice intake never authorizes other product directories as source roots', async () => {
+  for (const directory of ['data', 'artifacts', 'outputs', 'runtime', 'imports/other']) {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-installed-intake-denied-'));
+    const allowed = join(root, 'product', directory), source = join(allowed, '000001');
+    writeSample(source);
+    const { service, opened } = serviceFor(root, allowed);
+    expect(await service.importVoxel51({ sourceDirectory: source })).toMatchObject({ ok: false, error: { code: 'source_invalid' } });
+    expect(opened.db.query('SELECT COUNT(*) AS count FROM documents').get()).toEqual({ count: 0 });
+  }
+});
+
+it('installed invoice intake rejects a staging directory or parent redirected by a junction', async () => {
+  for (const linkParent of [false, true]) {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-installed-intake-link-'));
+    const intake = join(root, 'product/imports/invoices'), outside = join(root, 'outside');
+    const { service, opened } = serviceFor(root, intake);
+    writeSample(join(outside, linkParent ? 'invoices/000001' : '000001'));
+    if (!linkParent) mkdirSync(join(root, 'product/imports'));
+    symlinkSync(outside, linkParent ? join(root, 'product/imports') : intake, 'junction');
+    expect(await service.importVoxel51({ sourceDirectory: join(intake, '000001') }))
+      .toMatchObject({ ok: false, error: { code: 'source_invalid' } });
+    expect(opened.db.query('SELECT COUNT(*) AS count FROM documents').get()).toEqual({ count: 0 });
+  }
+});
+
 it('prepared text and three-page PDF register immutable public Documents with real page and version identities', async () => {
   const root = mkdtempSync(join(tmpdir(), 'prepared-documents-')), { service } = serviceFor(root);
   const sourceText = 'Page one synthetic item A\nPage two synthetic item B\nPage three synthetic total 3.00';

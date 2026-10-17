@@ -1,0 +1,3 @@
+[install]
+# Bun 1.4.0 must resolve transitive dependencies beside the patched SDK and plugin.
+linker = "hoisted"

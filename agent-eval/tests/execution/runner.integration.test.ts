@@ -265,6 +265,47 @@ test('wrong identity and failed cleanup block grading; timeout requests actual c
     expect(cancelled).toBe(1);
 });
 
+test('preparation uses the task budget without extending the stopping grace', async () => {
+    const product = kernel(), prepare = product.prepare.bind(product);
+    product.prepare = async (trial, signal) => {
+        await new Promise(resolve => setTimeout(resolve, 60));
+        return prepare(trial, signal);
+    };
+    const trial = (): AgentTrial => ({ identity: observed().identity, directory: mkdtempSync(join(tmpdir(), 'flowmate-prepare-budget-')),
+        input: observed().input, requires: [], configuration: {} });
+    const ready = await executeCase(product, trial(), 1000, 10);
+    expect(ready.execution.status).toBe('completed'); expect(ready.stopFailed).toBe(false);
+    const normal = product.prepare.bind(product);
+    product.prepare = async (trial, signal) => ({ ...await normal(trial, signal), close: async () => {
+        await new Promise(resolve => setTimeout(resolve, 60));
+        return { present: true, actual: { closed: true, stopped: true }, source: 'late owned cleanup' };
+    } });
+    const lateClose = await executeCase(product, trial(), 1000, 10);
+    expect(lateClose.stopFailed).toBe(true); expect(lateClose.execution.error?.code).toBe('cleanup_failed');
+});
+
+test('cancellation during preparation returns before its task budget and closes a late Session without execution', async () => {
+    const product = kernel(), prepare = product.prepare.bind(product), controller = new AbortController();
+    let entered!: () => void, release!: () => void, closed!: () => void, executed = false;
+    const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    const cleanup = new Promise<void>(resolve => { closed = resolve; });
+    product.prepare = async (trial, signal) => {
+        entered(); await gate; expect(signal.aborted).toBe(true);
+        const session = await prepare(trial, signal), close = session.close.bind(session);
+        return { ...session, execute: async () => { executed = true; return session.execute(signal); },
+            close: async () => { const fact = await close(); closed(); return fact; } };
+    };
+    const running = executeCase(product, { identity: observed().identity, directory: mkdtempSync(join(tmpdir(), 'flowmate-prepare-cancel-')),
+        input: observed().input, requires: [], configuration: {} }, 2000, 100, controller.signal);
+    let timer: ReturnType<typeof setTimeout>;
+    try {
+        await started; controller.abort();
+        const result = await Promise.race([running, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error('Cancellation waited for preparation budget')), 500); })]);
+        expect(result.stopFailed).toBe(true); expect(result.execution.status).toBe('cancelled');
+    } finally { clearTimeout(timer!); release(); await running; await cleanup; }
+    expect(executed).toBe(false);
+});
+
 test('late preparation is cancelled and closed while all later planned Trials remain blocked', async () => {
     const id = 'late-prepare-' + randomUUID(), product = kernel(), prepare = product.prepare.bind(product);
     let release!: () => void, closed!: () => void, preparations = 0, executions = 0, cancellations = 0;
@@ -282,7 +323,7 @@ test('late preparation is cancelled and closed while all later planned Trials re
     };
     try {
         const { report, file } = await runLocal(REPO_ROOT, { dataset, caseId: task.id, executionId: id, repeat: 3,
-            backend: 'local', judge: 'off', config: { stopGraceMs: 100 } }, { kernel: product });
+            backend: 'local', judge: 'off', config: { timeoutMs: 100, stopGraceMs: 100 } }, { kernel: product });
         expect(report.trials.map(trial => trial.status)).toEqual(['NOT_RUN', 'NOT_RUN', 'NOT_RUN']);
         expect(report.trials[0]!.execution).toMatchObject({ started: false, error: { code: 'execution_error', message: 'Error: Lifecycle timeout' } });
         expect(report.trials[1]!.reason).toContain('Prior Trial stopping unconfirmed');

@@ -64,6 +64,41 @@ async function finishProtocolChild(child: ChildProcessWithoutNullStreams) {
   const exited = once(child, 'exit'); child.stdin.end(); await exited;
 }
 
+function holdProtocolOutput(child: ChildProcessWithoutNullStreams) {
+  const emit = child.stdout.emit, packets: Array<{ event: string | symbol; args: unknown[] }> = [];
+  let resolvePacket!: () => void;
+  const packet = new Promise<void>(resolve => { resolvePacket = resolve; });
+  child.stdout.emit = function(event: string | symbol, ...args: unknown[]) {
+    if (['data', 'end', 'close'].includes(String(event))) {
+      packets.push({ event, args }); if (event === 'data') resolvePacket(); return true;
+    }
+    return Reflect.apply(emit, this, [event, ...args]);
+  };
+  return { packet, release() {
+    child.stdout.emit = emit;
+    for (const item of packets.splice(0)) Reflect.apply(emit, child.stdout, [item.event, ...item.args]);
+  } };
+}
+
+it('P17 refuses replacing a live Host without changing its epoch, pending reads or control owner', async () => {
+  const first = await workspaceProtocolFixture(99), second = await workspaceProtocolFixture(), client = new HostClient();
+  let changes = 0; client.setConnectionChangeHandler(() => { changes++; });
+  expect(await client.start(first, '0.1.0', first)).toMatchObject({ ok: true });
+  const child = (client as unknown as { child: ChildProcessWithoutNullStreams }).child, epoch = client.connectionEpoch;
+  try {
+    const pending = client.request({ type: 'read_workspace', requestId: 'held-workspace' })
+      .then(value => ({ value }), error => ({ error: error.message }));
+    expect(await client.start(second, '0.1.0', second)).toMatchObject({ ok: false, error: { code: 'host_still_running' } });
+    expect((client as unknown as { child: ChildProcessWithoutNullStreams }).child).toBe(child);
+    expect(client.connectionEpoch).toBe(epoch); expect(changes).toBe(1);
+    expect(await client.request({ type: 'get_state' })).toEqual({ released: true });
+    expect(await pending).toEqual({ value: { ok: true, data: { ...emptyWorkspace, revision: 99 } } });
+  } finally {
+    const current = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    await finishProtocolChild(child); if (current !== child) await finishProtocolChild(current);
+  }
+});
+
 it('P7 HostClient validates Workspace envelopes and restore shape on a real child pipe', async () => {
   const root = await workspaceProtocolFixture();
   const client = new HostClient();
@@ -118,15 +153,16 @@ it('P7 old Host replies cannot resolve the same request identity on a replacemen
     // Reinstall another held request; the first response has been consumed above.
     const originalPending = client.request({ type: 'read_workspace', requestId: 'held-workspace' }).then(() => 'resolved', error => String(error));
     expect(await oldRequest).toBe('resolved');
+    const delayed = holdProtocolOutput(oldChild);
+    oldChild.stdin.write(`${JSON.stringify({ version: 1, type: 'get_state', requestId: 'release-old' })}\n`);
+    await delayed.packet; await finishProtocolChild(oldChild);
     expect(await client.start(secondRoot, '0.1.0', secondRoot)).toMatchObject({ ok: true });
     expect(await originalPending).toContain('host_replaced');
     expect(client.connectionEpoch).toBeGreaterThan(oldEpoch);
     newChild = (client as unknown as { child: ChildProcessWithoutNullStreams }).child;
     let settled = false;
     const current = client.request({ type: 'read_workspace', requestId: 'held-workspace' }).then(value => { settled = true; return value; });
-    const observed = once(oldChild.stdout, 'data');
-    oldChild.stdin.write(`${JSON.stringify({ version: 1, type: 'get_state', requestId: 'release-old' })}\n`);
-    await observed;
+    delayed.release();
     await Promise.resolve();
     expect(settled).toBe(false);
     expect(await client.request({ type: 'get_state' })).toEqual({ released: true });
@@ -337,6 +373,9 @@ it('does not report Host closure from an acknowledgement while its process is st
       stopped: true, closed: false, errors: [{ code: 'host_exit_unconfirmed' }],
     } });
     expect(child.exitCode).toBeNull();
+    const epoch = client.connectionEpoch;
+    expect(await client.start(root, '0.1.0', root)).toMatchObject({ ok: false, error: { code: 'host_still_running' } });
+    expect(client.connectionEpoch).toBe(epoch);
     const exited = once(child, 'exit');
     child.stdin.end();
     await exited;
@@ -1302,10 +1341,13 @@ describe('P9 T08 History actual HostClient pipe', () => {
     let next: ChildProcessWithoutNullStreams | null = null;
     try {
       const pending = client.request({ type: 'query_session_history', requestId: 'held-context', input: { sessionId: 12 } }).then(() => 'resolved', error => error.message);
+      const delayed = holdProtocolOutput(old);
+      old.stdin.write(JSON.stringify({ version: 1, type: 'get_state', requestId: 'release-old' }) + '\n');
+      await delayed.packet; await finishProtocolChild(old);
       expect(await client.start(second, '0.1.0', second)).toMatchObject({ ok: true }); expect(await pending).toBe('host_replaced');
       next = (client as unknown as { child: ChildProcessWithoutNullStreams }).child; let settled = false;
       const current = client.request({ type: 'query_session_history', requestId: 'held-context', input: { sessionId: 12 } }).then(result => { settled = true; return result; });
-      const packet = once(old.stdout, 'data'); old.stdin.write(JSON.stringify({ version: 1, type: 'get_state', requestId: 'release-old' }) + '\n'); await packet; await Promise.resolve();
+      delayed.release(); await Promise.resolve();
       expect(settled).toBe(false); await client.request({ type: 'get_state' });
       expect(await current).toMatchObject({ ok: true, data: { session: { sessionId: 12 }, items: [] } });
     } finally { await finishProtocolChild(old); if (next) await finishProtocolChild(next); }
@@ -1414,10 +1456,13 @@ describe('T08 Context actual HostClient pipe', () => {
       const installed=client.request({type:'list_context_requests',requestId:'held-context',input:{sessionId:1,runId:2}});
       expect(await client.request({type:'get_state'})).toMatchObject({held:true});await installed;
       const oldPending=client.request({type:'list_context_requests',requestId:'held-context',input:{sessionId:1,runId:2}}).then(()=> 'resolved',error=>error.message);
+      const delayed=holdProtocolOutput(old);
+      old.stdin.write(JSON.stringify({version:1,type:'get_state',requestId:'old-release'})+'\n');
+      await delayed.packet;await finishProtocolChild(old);
       expect(await client.start(second,'0.1.0',second)).toMatchObject({ok:true});expect(await oldPending).toBe('host_replaced');
       next=(client as unknown as {child:ChildProcessWithoutNullStreams}).child;let settled=false;
       const current=client.request({type:'list_context_requests',requestId:'held-context',input:{sessionId:1,runId:2}}).then(value=>{settled=true;return value;});
-      const packet=once(old.stdout,'data');old.stdin.write(JSON.stringify({version:1,type:'get_state',requestId:'old-release'})+'\n');await packet;await Promise.resolve();expect(settled).toBe(false);
+      delayed.release();await Promise.resolve();expect(settled).toBe(false);
       expect(await client.request({type:'get_state'})).toMatchObject({held:true});expect(await current).toEqual(contextReplies.list_context_requests);
     }finally{await finishProtocolChild(old);if(next)await finishProtocolChild(next);}
   });

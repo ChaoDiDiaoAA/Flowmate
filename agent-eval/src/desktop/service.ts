@@ -13,8 +13,10 @@ import { createEvaluationReader, exportView } from './results.ts';
 import { createEvaluationCases } from './cases.ts';
 import { exportReport } from '../langfuse/export.ts';
 import { readReport, reportPath, readExportState } from '../reports/store.ts';
+import type { EvaluationRuntime } from '../execution/source.ts';
 
 export type EvaluationServiceOptions = {
+  runtime?: EvaluationRuntime;
   sessionId?: string; onEvent?: (event: EvaluationEvent) => void;
   prepareAgent?: typeof prepareAgentConnection; prepareJudge?: typeof prepareJudge;
   runLocal?: typeof runLocal; runBatch?: typeof runBatch;
@@ -81,10 +83,10 @@ export function createEvaluationService(repo: string, options: EvaluationService
       const judge = needsJudge ? await (options.prepareJudge ?? prepareJudge)(judgeConnection({ ...context.settings.judge!, apiKey: context.credentials.judge! }),
         undefined, controller.signal) : null;
       controller.signal.throwIfAborted();
-      if (!sameEvaluationPlan(plan, createEvaluationPlan(repo, plan.request))) throw Error('预览后的评测条件已变化，请重新预览。');
+      if (!sameEvaluationPlan(plan, createEvaluationPlan(repo, plan.request, options.runtime))) throw Error('预览后的评测条件已变化，请重新预览。');
       controller.signal.throwIfAborted(); state.state = 'running'; emit();
       const shared = { backend: 'local' as const, judge: plan.request.judge, repeat: plan.request.repeat, config: plan.summary.configuration };
-      const deps = { preparedAgent: agent, preparedJudge: judge, signal: controller.signal, onProgress: progress };
+      const deps = { preparedAgent: agent, preparedJudge: judge, signal: controller.signal, onProgress: progress, runtime: options.runtime };
       const results = plan.request.selection === 'case'
         ? [await (options.runLocal ?? runLocal)(repo, { ...shared, dataset: plan.datasets[0]!, caseId: plan.request.caseId, selection: 'full' }, deps)]
         : await (options.runBatch ?? runBatch)(repo, { ...shared, datasets: plan.datasets, selection: plan.request.selection }, deps);
@@ -139,7 +141,7 @@ export function createEvaluationService(repo: string, options: EvaluationService
     },
     preview(input: unknown, settingsInput: unknown): Result<EvaluationPreview> {
       try {
-        const settings = EvaluationConfigurationSnapshotSchema.parse(settingsInput), plan = createEvaluationPlan(repo, input), issues: string[] = [];
+        const settings = EvaluationConfigurationSnapshotSchema.parse(settingsInput), plan = createEvaluationPlan(repo, input, options.runtime), issues: string[] = [];
         if (!settings.agent || settings.credentials.agent !== 'configured') issues.push('评测Agent未配置或凭据不可用。');
         if (plan.summary.judgeRequired && (!settings.judge || settings.credentials.judge !== 'configured')) issues.push('适用的必要Judge未配置或凭据不可用。');
         const value = EvaluationPreviewSchema.parse({ version: 1, previewId: randomUUID(), request: plan.request, settings, plan: plan.summary,
@@ -159,7 +161,7 @@ export function createEvaluationService(repo: string, options: EvaluationService
       if (!isDeepStrictEqual(preview.value.settings, context.settings)) return failure('evaluation_preview_changed', '模型设置或凭据状态已变化，请刷新。');
       if (!context.credentials.agent.trim() || preview.plan.summary.judgeRequired && !context.credentials.judge?.trim())
         return failure('evaluation_not_ready', '所选评测所需凭据不可用。');
-      try { if (!sameEvaluationPlan(preview.plan, createEvaluationPlan(repo, preview.plan.request))) return failure('evaluation_preview_changed', '评测条件已变化，请刷新。'); }
+      try { if (!sameEvaluationPlan(preview.plan, createEvaluationPlan(repo, preview.plan.request, options.runtime))) return failure('evaluation_preview_changed', '评测条件已变化，请刷新。'); }
       catch (error) { return failure('evaluation_preview_changed', text(error)); }
       const batchId = EvaluationIdSchema.safeParse(context.batchId); if (!batchId.success) return failure('input_invalid', '评测批次身份无效。');
       registerSecrets([context.credentials.agent, context.credentials.judge].filter((key): key is string => key !== null));

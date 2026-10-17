@@ -7,6 +7,7 @@ import { parseExtensionCommand, parseExtensionHostResult, matchesExtensionRespon
 import { parseSubagentCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure, isSubagentHostCommand } from '../../../packages/contracts/src/subagents.ts';
 import type { Result } from '@flowmate/contracts';
 import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest } from '@flowmate/contracts';
+import { DiagnosticsResultSchema, DiagnosticsExportResultSchema } from '../../../packages/contracts/src/diagnostics.ts';
 import { parseEvaluationCommand, parseEvaluationResponse, matchesEvaluationResponse, EvaluationEventSchema,
   type EvaluationOutput, type EvaluationInput, type EvaluationResponseType } from '../../../packages/contracts/src/evaluation.ts';
 
@@ -38,6 +39,19 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
 }
 
 const bridge: DesktopBridge = {
+  restartHost: (...args: unknown[]) => args.length ? Promise.resolve(fail(appError('input_invalid', 'input', 'Recheck takes no arguments.'))) : ipcRenderer.invoke('flowmate:restart-host'),
+  async queryDiagnostics(...args: unknown[]) {
+    if (args.length) return fail(appError('input_invalid', 'input', 'Diagnostics takes no arguments.'));
+    try { const result = DiagnosticsResultSchema.safeParse(await ipcRenderer.invoke('flowmate:query-diagnostics'));
+      return result.success ? result.data : fail(appError('diagnostics_unavailable', 'runtime', 'Diagnostics response is invalid.')); }
+    catch { return fail(appError('diagnostics_unavailable', 'runtime', 'Diagnostics could not be collected.')); }
+  },
+  async exportDiagnostics(...args: unknown[]) {
+    if (args.length) return fail(appError('input_invalid', 'input', 'Diagnostics export takes no arguments.'));
+    try { const result = DiagnosticsExportResultSchema.safeParse(await ipcRenderer.invoke('flowmate:export-diagnostics'));
+      return result.success ? result.data : fail(appError('diagnostics_export_failed', 'runtime', 'Diagnostics export response is invalid.')); }
+    catch { return fail(appError('diagnostics_export_failed', 'runtime', 'Diagnostics could not be exported.')); }
+  },
   queryEvaluationCatalog: input => invokeEvaluation('query_evaluation_catalog', input),
   addEvaluationFeedback: input => invokeEvaluation('add_evaluation_feedback', input),
   queryEvaluationFeedback: input => invokeEvaluation('query_evaluation_feedback', input),

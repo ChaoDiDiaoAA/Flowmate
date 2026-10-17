@@ -2,6 +2,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { resolveRuntimeLayout } from '../../../packages/shared/src/runtime-layout.ts';
+import type { EvaluationRuntime } from '../../../agent-eval/src/execution/source.ts';
 import { appError, fail, ok, evaluationRequests, matchesEvaluationResponse, parseEvaluationCommand,
   type EvaluationConfigurationSnapshot, type EvaluationControlState, type EvaluationEvent,
   type EvaluationPreview, type Result } from '@flowmate/contracts';
@@ -22,6 +25,7 @@ type PrepareExport = () => Result<LangfuseConnection> | Promise<Result<LangfuseC
 const active = (state: EvaluationControlState | null) => !!state && ['preparing', 'running', 'cancelling', 'interrupted', 'stop-unconfirmed'].includes(state.state);
 const failure = (code: string, message: string) => fail(appError(code, 'runtime', message, true));
 const CLOSE_TIMEOUT_MS = 15_000;
+export type EvaluationWorkerLaunch = { executable: string; entry: string; cwd: string; runtime: EvaluationRuntime };
 
 export function retainEvaluationControl(current: EvaluationControlState | null, sequence: number,
   incoming: EvaluationControlState, incomingSequence: number): EvaluationControlState {
@@ -46,8 +50,9 @@ export class EvaluationClient {
   private exporting = false;
   private readonly exports = new Map<string, { executionId: string; promise: Promise<Result<EvaluationWorkerData<'export_evaluation'>>> }>();
 
-  constructor(private readonly repository: string, private readonly evaluationRepository = repository) {}
+  constructor(private readonly repository: string, private readonly evaluationRepository = repository, private readonly launch?: EvaluationWorkerLaunch) {}
   public get state(): EvaluationControlState | null { return this.current ? structuredClone(this.current) : null; }
+  public get canRestartHost(): boolean { return !this.closing && !this.exporting && !this.crashBlocked && !active(this.current); }
   public subscribe(listener: (event: EvaluationEvent) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private publish(control: EvaluationControlState, replace = false) {
     const safe = scanEvidence(structuredClone(control)).value;
@@ -68,10 +73,23 @@ export class EvaluationClient {
   private ensureReady(): Promise<Result<void>> {
     if (this.child && this.startup) return this.startup;
     if (this.closing) return Promise.resolve(failure('evaluation_worker_unavailable', '评测查询通道已关闭。'));
+    const installed = this.launch?.runtime.mode === 'installed' ? this.launch.runtime : null;
+    if (installed) {
+      const layout = installed.layout;
+      const checked = resolveRuntimeLayout({ isPackaged: true, appPath: join(layout.runtimeRoot, '../app.asar'),
+        resourcesPath: join(layout.runtimeRoot, '..'), userDataRoot: join(layout.evaluationRoot, '..') });
+      if (!checked.ok || layout.evaluationRoot !== this.evaluationRepository || this.launch!.entry !== layout.workerLauncher
+        || this.launch!.executable !== layout.bunExecutable || this.launch!.cwd !== layout.runtimeRoot
+        || checked.data.release?.releaseId !== installed.release.releaseId)
+        return Promise.resolve(failure('installation_runtime_invalid', '评测安装运行资源无效。'));
+      try { mkdirSync(this.evaluationRepository, { recursive: true }); }
+      catch { return Promise.resolve(failure('evaluation_worker_unavailable', '评测数据目录不可写。')); }
+    }
     this.sessionId = randomUUID(); this.workerSequence = 0; this.publicationSequence = 0; this.closeAcknowledged = false;
-    const session = this.sessionId, child = spawn(process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun',
-      ['--no-env-file', join(this.repository, 'agent-eval/src/desktop/worker.ts'), '--repo', this.evaluationRepository, '--session-id', session],
-      { cwd: this.repository, env: safeChildEnvironment(false), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const session = this.sessionId, child = spawn(this.launch?.executable ?? (process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun'),
+      ['--no-env-file', this.launch?.entry ?? join(this.repository, 'agent-eval/src/desktop/worker.ts'), '--repo', this.evaluationRepository,
+        ...(installed ? ['--runtime-root', installed.layout.runtimeRoot] : []), '--session-id', session],
+      { cwd: this.launch?.cwd ?? this.repository, env: safeChildEnvironment(false), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     this.child = child;
     let settle!: (value: Result<void>) => void, settled = false;
     const ready = new Promise<Result<void>>(done => { settle = done; }); this.startup = ready;

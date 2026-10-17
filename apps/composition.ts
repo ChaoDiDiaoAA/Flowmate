@@ -2,21 +2,28 @@ import { createInputDefinitions } from '../packages/core/src/prompt-templates.ts
 import { parseFrontmatter, loadPromptTemplates, expandPromptTemplate } from '@flowmate/runtime-pi';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { existsSync, renameSync, rmSync } from 'node:fs';
+import { readProductSettings } from '../packages/core/src/configuration/settings.ts';
+import { writeSynced } from '../packages/core/src/skill-hub/resources.ts';
+import { prepareStoreUpgrade } from '../packages/core/src/storage/maintenance.ts';
+import type { PackagedRelease } from '@flowmate/shared';
 import { readResearchEvidence, exportResearchReport } from '@flowmate/core';
 import { ResearchEvidenceRequestSchema } from '@flowmate/contracts';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createToolRecorder, createWorkspaceService, createWorkspaceVerifier, makeApplication,
   ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool, createResearchPlanTool, createResearchReadTools, createResearchSynthesisTools } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, listSkillResources, readSkillResource, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
-import { createPromptTraceBuffer } from '@flowmate/logging';
+import { createPromptTraceBuffer, createRuntimeLogBuffer } from '@flowmate/logging';
 import { PiAgentAdapter, PiProviderAdapter, createNativeTools, inspectNativeResources, PI_SDK_VERSION } from '@flowmate/runtime-pi';
-import { acquireProductControllerLock, createLogger } from '@flowmate/shared';
+import { acquireProductControllerLock } from '@flowmate/shared';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { Application, MemoryStore, ProductPaths, PromptTraceBuffer, Result, RuntimeRequestOverrides, RuntimeStrategyPolicy } from '@flowmate/contracts';
 import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ProviderPort, ToolDefinition } from '@flowmate/contracts';
 import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
+  installedRelease?: PackagedRelease;
   resourceRoot?: string;
   resourceDefaults?: () => Result<import('@flowmate/contracts').AssemblySelectionSnapshot | import('@flowmate/contracts').ResourceSelectionResult>;
   saveExtensionSelection?: (request: import('@flowmate/contracts').ExtensionSelectionRequest) => Promise<Result<import('@flowmate/contracts').ExtensionSelectionResult>>;
@@ -41,14 +48,22 @@ export type ApplicationOptions = {
 export async function createApplication(options: ApplicationOptions): Promise<Result<Application>> {
   const lock = await acquireProductControllerLock(options.paths);
   if (!lock.ok) return lock;
+  if (options.installedRelease) {
+    const prepared = await prepareStoreUpgrade(options.paths, options.installedRelease);
+    if (!prepared.ok) { await lock.data.release(); return prepared; }
+  }
   const database = openDatabase(options.paths);
   if (!database.ok) {
     await lock.data.release();
     return database;
   }
+  const installedSettings = options.installedRelease ? await readProductSettings(join(options.paths.root, 'data/settings.json')) : null;
+  if (installedSettings && !installedSettings.ok) {
+    database.data.close(); await lock.data.release(); return installedSettings;
+  }
   let logger: SafeLogger;
   try {
-    logger = options.logger ?? createLogger(options.paths.logsDir);
+    logger = options.logger ?? createRuntimeLogBuffer();
   } catch {
     try { database.data.close(); } catch { /* preserve logger initialization failure */ }
     await lock.data.release();
@@ -140,7 +155,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     request => runtime.appendInput(request), (sessionId, intent) => runtime.verifySessionMutation(sessionId, intent));
   const workspaceService = createWorkspaceService(database.data.workspace, now, workspaceVerifier);
   const jobService = createJobService(database.data.jobs, now);
-  return ok(makeApplication(runtime, database.data.runs, async () => {
+  const application = makeApplication(runtime, database.data.runs, async () => {
     const errors = [];
     if (!loggerClosed) {
       try { await logger.close(); loggerClosed = true; } catch { errors.push(appError('logger_close_failed', 'runtime', '日志资源关闭失败。', true)); }
@@ -213,5 +228,21 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       return image.ok ? ok({ documentRef: image.data.documentRef, mimeType: image.data.mimeType,
         base64: Buffer.from(image.data.bytes).toString('base64') }) : image;
     },
-  }, database.data.maxRunIdAtBoot));
+  }, database.data.maxRunIdAtBoot);
+  if (options.installedRelease && installedSettings?.ok) {
+    const write = (name: string, value: unknown) => {
+      const target = join(options.paths.root, 'data', name), temporary = `${target}.${randomUUID()}.tmp`;
+      try { writeSynced(temporary, `${JSON.stringify(value, null, 2)}\n`); renameSync(temporary, target); }
+      finally { if (existsSync(temporary)) rmSync(temporary); }
+    };
+    try {
+      if (!existsSync(join(options.paths.root, 'data/settings.json'))) write('settings.json', installedSettings.data);
+      write('installed-release.json', { version: 1, releaseId: options.installedRelease.releaseId,
+        productVersion: options.installedRelease.productVersion, schemaVersion: 20, settingsVersion: 7 });
+    } catch {
+      await application.close();
+      return fail(appError('maintenance_release_record_failed', 'storage', 'The installed release could not be recorded; original data and backups were retained.', true));
+    }
+  }
+  return ok(application);
 }

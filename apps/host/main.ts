@@ -3,7 +3,7 @@ import { isResearchHostCommand, parseResearchCommand, parseResearchHostResult, m
 import { randomUUID } from 'node:crypto';
 import { CaseEvaluationFaultProfileSchema } from '@flowmate/contracts';
 import { createWriteStream } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
 import { RUNTIME_CONFIG, appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest,
@@ -11,9 +11,11 @@ import { RUNTIME_CONFIG, appError, fail, normalizeAgentRunRequest, normalizeProv
   } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, Result } from '@flowmate/contracts';
 import { defaultProductSettings, readProductSettings, saveProductSettings, validateProductSettings } from '@flowmate/core';
-import { createPromptTraceBuffer } from '@flowmate/logging';
+import { createPromptTraceBuffer, createRuntimeLogBuffer } from '@flowmate/logging';
+import { HostDiagnosticCodeSchema, HostDiagnosticsSchema } from '@flowmate/contracts';
+import { PI_SDK_VERSION } from '@flowmate/runtime-pi';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
-import { resolveProductPaths } from '@flowmate/shared';
+import { resolveProductPaths, resolveRuntimeLayout } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
 import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from './protocol.ts';
 import { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse } from './protocol.ts';
@@ -51,6 +53,13 @@ function startupInvoiceSourceRoot(): string | null {
   return value && isAbsolute(value) ? value : null;
 }
 
+function startupRuntimeRoot(): string | undefined | null {
+  const occurrences = process.argv.filter(value => value === '--runtime-root').length;
+  if (!occurrences) return undefined;
+  const value = process.argv[process.argv.indexOf('--runtime-root') + 1];
+  return occurrences === 1 && value && isAbsolute(value) ? value : null;
+}
+
 function startupExtensionEvaluationProfile() {
   const flag = '--eval-extension-profile', occurrences = process.argv.filter(value => value === flag).length;
   if (occurrences === 0) return undefined;
@@ -61,18 +70,19 @@ function startupExtensionEvaluationProfile() {
 const root = startupRoot();
 const invoiceSourceRoot = startupInvoiceSourceRoot() ?? join(process.cwd(), 'data', 'invoices', 'agent-input');
 const extensionEvaluationProfile = startupExtensionEvaluationProfile();
+const runtimeRoot = startupRuntimeRoot();
 const caseEvaluationFaultProfile=(()=>{const flag='--eval-case-fault-profile',count=process.argv.filter(v=>v===flag).length;
   if(!count)return undefined;if(count!==1)return null;
   try{return CaseEvaluationFaultProfileSchema.parse(JSON.parse(process.argv[process.argv.indexOf(flag)+1]??''));}catch{return null;}})();
-if (!root || process.argv.some(arg=>['--eval-runtime-fault-profile','--eval-runtime-policy'].includes(arg)) || extensionEvaluationProfile === null || caseEvaluationFaultProfile===null || [extensionEvaluationProfile,caseEvaluationFaultProfile].filter(Boolean).length>1) {
+if (!root || runtimeRoot === null || process.argv.some(arg=>['--eval-runtime-fault-profile','--eval-runtime-policy'].includes(arg)) || extensionEvaluationProfile === null || caseEvaluationFaultProfile===null || [extensionEvaluationProfile,caseEvaluationFaultProfile].filter(Boolean).length>1) {
   send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: '' } as Omit<DesktopState, 'modelCredentials'> });
   process.exitCode = 2;
 } else {
-  await runHost(root, invoiceSourceRoot, extensionEvaluationProfile,caseEvaluationFaultProfile);
+  await runHost(root, invoiceSourceRoot, extensionEvaluationProfile,caseEvaluationFaultProfile,runtimeRoot);
 }
 
 async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensionEvaluationProfile?: import('@flowmate/contracts').ExtensionEvaluationProfile,
-  caseEvaluationFaultProfile?:import('@flowmate/contracts').CaseEvaluationFaultProfile): Promise<void> {
+  caseEvaluationFaultProfile?:import('@flowmate/contracts').CaseEvaluationFaultProfile, runtimeRoot?: string): Promise<void> {
   const pathsResult = resolveProductPaths(userDataRoot);
   if (!pathsResult.ok) {
     send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: userDataRoot } as Omit<DesktopState, 'modelCredentials'> });
@@ -80,6 +90,15 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
     return;
   }
   const paths = pathsResult.data;
+  const installed = runtimeRoot ? resolveRuntimeLayout({ isPackaged: true, appPath: join(dirname(runtimeRoot), 'app.asar'),
+    resourcesPath: dirname(runtimeRoot), userDataRoot: paths.root }) : null;
+  const layout = installed?.ok ? installed.data : null;
+  if (installed && (!installed.ok || !layout?.release || resolve(runtimeRoot!) !== layout.runtimeRoot
+    || process.env.PI_PACKAGE_DIR !== layout.sdkRoot || process.env.PI_CODING_AGENT_DIR !== paths.runtimeDir)) {
+    process.stderr.write(`[Flowmate] ${installed.ok ? 'installation_runtime_invalid' : installed.error.code}\n`);
+    await send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0',
+      userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> }); process.exitCode = 2; return;
+  }
   const settingsFile = join(paths.root, 'data', 'settings.json');
   const authFile = join(paths.runtimeDir, 'pi-desktop', 'auth.json');
 
@@ -162,8 +181,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
     };
   };
   const promptTrace = createPromptTraceBuffer();
+  const hostLog = createRuntimeLogBuffer();
   const created = await createApplication({
+    logger: hostLog,
     paths,
+    ...(layout?.release ? { installedRelease: layout.release, resourceRoot: layout.resourceRoot } : {}),
     invoiceSourceRoot,
     extensionEvaluationProfile,
     caseEvaluationFaultProfile,
@@ -203,11 +225,14 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
     invoiceFormBridge,
   });
   if (!created.ok) {
+    const code = HostDiagnosticCodeSchema.safeParse(created.error.code);
+    process.stderr.write(`[Flowmate] ${code.success ? code.data : 'host_application_start_failed'}\n`);
     send({ version: 1, type: 'ready', state: { version: 1, ready: false, host: 'error', appVersion: '0.0.0', userDataPath: paths.root } as Omit<DesktopState, 'modelCredentials'> });
     process.exitCode = 2;
     return;
   }
   application = created.data;
+  hostLog.write({ at: new Date().toISOString(), level: 'info', component: 'host', event: 'application_opened' });
   const settings = await readProductSettings(settingsFile);
   if (!settings.ok) {
     await application.close();
@@ -295,7 +320,7 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
     ready: true,
     host: 'ready',
     settings: currentSettings,
-    appVersion: process.env.FLOWMATE_DESKTOP_VERSION ?? '0.1.0',
+    appVersion: layout?.release?.productVersion ?? process.env.FLOWMATE_DESKTOP_VERSION ?? '0.1.0',
     userDataPath: paths.root,
   });
   send({ version: 1, type: 'ready', state: state() });
@@ -308,6 +333,11 @@ async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensio
   };
 
   const dispatch = async (command: HostCommand): Promise<void> => {
+    if (command.type === 'query_diagnostics') {
+      const data = HostDiagnosticsSchema.parse({ version: 1, productVersion: layout?.release?.productVersion ?? process.env.FLOWMATE_DESKTOP_VERSION ?? '0.1.0',
+        ...hostLog.snapshot(), runtime: { bunVersion: Bun.version, sdkVersion: PI_SDK_VERSION, platform: process.platform, arch: process.arch } });
+      await send({ version: 1, type: 'response', requestId: command.requestId, value: ok(data) }); return;
+    }
     if (command.type === 'subscribe_runtime_events') {
       const { subscriptionId: id, ownerToken: owner, input } = command;
       const identity = JSON.stringify(input), existing = runtimeRegistrations.get(id);

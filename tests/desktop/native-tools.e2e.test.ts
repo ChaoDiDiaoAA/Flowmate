@@ -160,9 +160,12 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
     await page.waitForFunction(directory => (document.querySelector('.run-tools-panel input') as HTMLInputElement)?.value === directory, directoryB);
     await page.getByRole('textbox', { name: 'Message to model' }).fill('NATIVE_BUDGET');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
+    // Wait for the sixteen real HTTP/storage turns before checking terminal presentation.
+    await waitFor(async () => budgetRequests === 16 && page.evaluate(async () => {
+      const value = await window.flowmate.queryRuntimeState(); return value.ok && value.data.active === null && !value.data.blocked;
+    }), 25_000);
     await page.getByRole('log').getByText('The assistant reached the request limit before finishing. Check Processing History for any saved result.', { exact: true })
       .waitFor({ timeout: 10_000 });
-    await waitFor(() => page.evaluate(async () => { const value = await window.flowmate.queryRuntimeState(); return value.ok && value.data.active === null && !value.data.blocked; }));
     expect(budgetRequests).toBe(16);
     expect(await page.getByRole('button', { name: 'Send', exact: true }).isDisabled()).toBe(true);
     expect(await page.getByText('This chat cannot continue safely. Start a new chat.', { exact: true }).count()).toBe(0);
@@ -191,7 +194,11 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
       expect(db.query('SELECT count(*) AS count FROM tool_calls WHERE run_id=?').get(budgetRun.id)).toEqual({ count: 16 });
     } finally { db.close(); }
   } catch (error) {
-    failure = new Error(`Native tools checkpoint ${checkpoint}`, { cause: error });
+    const page = app && await app.firstWindow();
+    const detail = checkpoint === 'bounded model calls with visible cause and no unsafe-chat banner' && page
+      ? JSON.stringify({ budgetRequests, runtime: await page.evaluate(() => window.flowmate.queryRuntimeState()),
+        chat: await page.getByRole('log').innerText() }) : '';
+    failure = new Error(`Native tools checkpoint ${checkpoint} ${detail}`, { cause: error });
     throw failure;
   } finally {
     try { if (app) await closeDesktopFixture(app, userData, failure); }

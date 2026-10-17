@@ -1,0 +1,34 @@
+appId: com.flowmate.desktop
+productName: Flowmate
+executableName: Flowmate
+electronVersion: 44.4.5
+electronDist: node_modules/electron/dist
+asar: true
+npmRebuild: false
+buildDependenciesFromSource: false
+directories:
+  app: out/package-stage/app
+  output: out/package
+files:
+  - out/**/*
+  - package.json
+  - node_modules/zod/**/*
+  - '!**/*.map'
+extraResources:
+  - from: out/package-stage/flowmate-runtime
+    to: flowmate-runtime
+    filter:
+      - '**/*'
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: Flowmate-${version}-win-x64-setup.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  runAfterFinish: false

@@ -6,6 +6,10 @@ import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { resolveRuntimeLayout, type RuntimeLayout } from '../../../packages/shared/src/runtime-layout.ts';
+import { createRuntimeLogBuffer } from '../../../packages/logging/src/runtime-log.ts';
+import { DiagnosticsSnapshotSchema, HostDiagnosticsResultSchema, type DiagnosticsSnapshot } from '@flowmate/contracts';
 import { z } from 'zod';
 import {
   appError,
@@ -212,8 +216,13 @@ let hostErrorCode = 'host_not_ready';
 let ipcRegistered = false;
 let userDataRoot = '';
 let appVersion = '0.1.0';
+let runtimeLayout: RuntimeLayout | null = null;
+let invoiceSourceRoot = '';
+let hostLaunch: { executable: string; args: readonly string[] } | undefined;
 let stateBroadcastSequence = 0;
 const host = new HostClient();
+const mainLog = createRuntimeLogBuffer();
+mainLog.write({ at: new Date().toISOString(), level: 'info', component: 'main', event: 'desktop_started' });
 let evaluation: EvaluationClient | null = null;
 const subscriptions = new Map<number, () => void>();
 type RuntimeOwner = { token: string; contents: Electron.WebContents; frame: Electron.WebFrameMain;
@@ -233,7 +242,6 @@ const pendingInvoiceForms = new Map<string, { request: InvoiceFormBridgeRequest;
   resolve(receipt: InvoiceFormApplicationReceipt): void }>();
 const pendingFormInspections = new Map<string, { owner: DesktopFormBinding; resolve(value: DesktopInvoiceFormInspection | null): void }>();
 
-app.setName('Flowmate');
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://')) void shell.openExternal(url);
@@ -284,28 +292,40 @@ async function sendDevelopmentNotice(value: Record<string, unknown>): Promise<vo
 }
 
 async function bootstrap(): Promise<void> {
-  const appRoot = resolveWorkspaceRoot(app.getAppPath());
-  const appDataPath = app.getPath('appData');
+  const appRoot = app.isPackaged ? app.getAppPath() : resolveWorkspaceRoot(app.getAppPath());
   const testRoot = !app.isPackaged && process.env.FLOWMATE_TEST_MODE === '1'
     ? process.env.FLOWMATE_TEST_USER_DATA_ROOT
     : undefined;
-  userDataRoot = testRoot && isAbsolutePath(testRoot) ? testRoot : join(appDataPath, 'Flowmate');
-  mkdirSync(userDataRoot, { recursive: true });
-  app.setPath('userData', userDataRoot);
+  userDataRoot = app.getPath('userData');
+  await app.whenReady();
+  appVersion = readProductVersion(appRoot);
+  const layout = resolveRuntimeLayout({ isPackaged: app.isPackaged, appPath: app.getAppPath(),
+    resourcesPath: process.resourcesPath, userDataRoot });
+  if (!layout.ok) {
+    mainLog.write({ at: new Date().toISOString(), level: 'error', component: 'main', event: 'installation_unavailable', code: layout.error.code });
+    hostError = true; hostErrorCode = layout.error.code; registerIpc(); createMainWindow(); return;
+  }
+  runtimeLayout = layout.data;
+  appVersion = runtimeLayout.release?.productVersion ?? appVersion;
   // The existing local test kernel owns this fixed synthetic data root; production keeps the workspace root.
-  evaluation = new EvaluationClient(appRoot, testRoot && isAbsolutePath(testRoot) ? join(userDataRoot, 'evaluation-fixture') : appRoot);
+  evaluation = new EvaluationClient(appRoot, app.isPackaged ? runtimeLayout.evaluationRoot
+    : testRoot && isAbsolutePath(testRoot) ? join(userDataRoot, 'evaluation-fixture') : appRoot,
+    runtimeLayout.mode === 'installed' && runtimeLayout.release ? { executable: runtimeLayout.bunExecutable,
+      entry: runtimeLayout.workerLauncher, cwd: runtimeLayout.runtimeRoot,
+      runtime: { mode: 'installed', layout: runtimeLayout, release: runtimeLayout.release } } : undefined);
   evaluation.subscribe(value => {
     for (const [webContentsId] of subscriptions) {
       const contents = BrowserWindow.getAllWindows().find(window => window.webContents.id === webContentsId)?.webContents;
       if (contents && !contents.isDestroyed()) contents.send('flowmate:event', { type: 'evaluation_event', value } satisfies DesktopEvent);
     }
   });
-  await app.whenReady();
-  appVersion = readProductVersion(appRoot);
   const testInvoiceSourceRoot = !app.isPackaged && process.env.FLOWMATE_TEST_MODE === '1'
     ? process.env.FLOWMATE_TEST_INVOICE_SOURCE_ROOT : undefined;
-  const invoiceSourceRoot = testInvoiceSourceRoot && isAbsolutePath(testInvoiceSourceRoot)
-    ? testInvoiceSourceRoot : join(appRoot, 'data', 'invoices', 'agent-input');
+  invoiceSourceRoot = testInvoiceSourceRoot && isAbsolutePath(testInvoiceSourceRoot)
+    ? testInvoiceSourceRoot : runtimeLayout.invoiceSourceRoot;
+  if (app.isPackaged) mkdirSync(invoiceSourceRoot, { recursive: true });
+  hostLaunch = { executable: runtimeLayout.bunExecutable, args: ['--no-env-file', app.isPackaged ? runtimeLayout.hostLauncher : 'apps/host/main.ts',
+    '--user-data-root', userDataRoot, '--invoice-source-root', invoiceSourceRoot] };
   let retiredCredentialRef: string | null = null;
   try {
     const old = JSON.parse(readFileSync(join(userDataRoot, 'data', 'settings.json'), 'utf8')) as { version?: unknown; models?: unknown[] };
@@ -320,6 +340,7 @@ async function bootstrap(): Promise<void> {
   host.subscribe((event) => {
     if (event.type === 'runtime_events_available') { receiveRuntimeWake(event); return; }
     if (event.type === 'host_state' && event.state.host === 'error') {
+      mainLog.write({ at: new Date().toISOString(), level: 'error', component: 'main', event: 'host_unavailable', code: 'host_exited' });
       hostError = true;
       hostErrorCode = 'host_exited';
     }
@@ -341,8 +362,13 @@ async function bootstrap(): Promise<void> {
   });
   host.setCredentialHandler(handleHostCredentialRequest);
   host.setInvoiceFormHandler(handleInvoiceFormRequest);
-  host.setConnectionChangeHandler(releaseAllRuntimeOwners);
-  const started = await host.start(userDataRoot, appVersion, appRoot, invoiceSourceRoot);
+  host.setConnectionChangeHandler(() => {
+    releaseAllRuntimeOwners();
+    if (invoiceFormBinding) invoiceFormBinding.valid = false;
+    for (const pending of pendingInvoiceForms.values()) pending.resolve(unknownInvoiceForm(pending.request));
+    for (const pending of pendingFormInspections.values()) pending.resolve(null);
+  });
+  const started = await host.start(userDataRoot, appVersion, runtimeLayout.runtimeRoot, invoiceSourceRoot, hostLaunch);
   if (started.ok && started.data.ready && retiredCredentialRef) {
     const removed = await credentialStore(retiredCredentialRef).remove();
     if (!removed.ok) process.stderr.write('[Flowmate] A retired encrypted credential could not be deleted.\n');
@@ -351,9 +377,81 @@ async function bootstrap(): Promise<void> {
     hostError = true;
     hostErrorCode = started.ok ? 'host_start_failed' : started.error.code;
   }
+  mainLog.write({ at: new Date().toISOString(), level: hostError ? 'error' : 'info', component: 'main',
+    event: hostError ? 'host_start_failed' : 'host_ready', ...(hostError ? { code: hostErrorCode } : {}) });
   registerIpc();
   createMainWindow();
   await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_ready', ready: !hostError });
+}
+
+async function restartHost(): Promise<Result<DesktopState>> {
+  await startup;
+  if (desktopClosing || host.hasLiveProcess || evaluation && !evaluation.canRestartHost)
+    return fail(appError('host_still_running', 'runtime', 'The original controller or stopping state must be resolved before Recheck.', true));
+  if (!runtimeLayout || !hostLaunch) return fail(appError('installation_runtime_invalid', 'runtime', 'Runtime layout is unavailable.'));
+  mainLog.write({ at: new Date().toISOString(), level: 'info', component: 'main', event: 'host_recheck_started' });
+  const started = await host.start(userDataRoot, appVersion, runtimeLayout.runtimeRoot, invoiceSourceRoot, hostLaunch);
+  hostError = !started.ok || !started.data.ready;
+  hostErrorCode = started.ok ? hostError ? 'host_start_failed' : 'host_not_ready' : started.error.code;
+  await broadcastState();
+  return readDesktopState();
+}
+
+async function queryDiagnostics(): Promise<Result<DiagnosticsSnapshot>> {
+  const epoch = host.connectionEpoch, gaps: string[] = [];
+  let availability: DiagnosticsSnapshot['host']['availability'] = 'source-unavailable';
+  let source: import('zod').z.infer<typeof HostDiagnosticsResultSchema> | null = null;
+  if (host.hasLiveProcess && host.state?.ready) {
+    try {
+      const checked = HostDiagnosticsResultSchema.safeParse(await host.request({ type: 'query_diagnostics' }, 2000));
+      if (checked.success && checked.data.ok && epoch === host.connectionEpoch) { source = checked.data; availability = 'available'; }
+    } catch (error) { if (epoch === host.connectionEpoch && error instanceof Error && error.message === 'host_request_timeout') availability = 'timeout'; }
+  }
+  if (epoch !== host.connectionEpoch) { availability = 'source-unavailable'; source = null; gaps.push('host_connection_changed'); }
+  if (availability !== 'available') gaps.push(availability === 'timeout' ? 'host_query_timeout' : 'host_memory_unavailable');
+  const clean = (value: { entries: readonly import('@flowmate/contracts').DiagnosticLogEntry[]; dropped: number }) => {
+    const entries = value.entries.filter(entry => !(scanEvidence(entry).fact.actual as { leaked: boolean }).leaked);
+    if (entries.length !== value.entries.length) gaps.push('diagnostic_entries_omitted');
+    return { entries, dropped: value.dropped + value.entries.length - entries.length };
+  };
+  try {
+    const settings = validateProductSettings(epoch === host.connectionEpoch && host.hasLiveProcess && host.state?.ready ? host.state.settings : null);
+    let modelId = settings.ok ? settings.data.defaultModelId : null;
+    const model = settings.ok ? settings.data.models.find(item => item.id === modelId) : null;
+    let credential: DiagnosticsSnapshot['configuration']['credential'] = settings.ok
+      ? model ? await credentialStore(model.credentialRef).status() : 'missing' : 'unavailable';
+    if (!settings.ok) gaps.push('model_configuration_unavailable');
+    if (epoch !== host.connectionEpoch || !host.hasLiveProcess || !host.state?.ready) {
+      availability = 'source-unavailable'; source = null; modelId = null; credential = 'unavailable';
+      gaps.push(epoch !== host.connectionEpoch ? 'host_connection_changed' : 'host_memory_unavailable', 'model_configuration_unavailable');
+    }
+    const stderr = host.diagnosticsStderr;
+    if (stderr.truncated) gaps.push('host_stderr_omitted');
+    const hostRecords = source?.ok ? clean(source.data) : { entries: [], dropped: null };
+    const snapshot = { version: 1, collectedAt: new Date().toISOString(), productVersion: appVersion, main: clean(mainLog.snapshot()),
+      host: { availability, ...hostRecords, stderrTail: stderr.tail, stderrTruncated: stderr.truncated },
+      runtime: source?.ok ? source.data.runtime : { bunVersion: null, sdkVersion: runtimeLayout?.release?.sdkVersion ?? '0.85.1',
+        platform: process.platform, arch: process.arch }, configuration: { modelId, credential }, gaps: [...new Set(gaps)] };
+    if ((scanEvidence(snapshot).fact.actual as { leaked: boolean }).leaked) throw Error('Unsafe diagnostics');
+    return ok(DiagnosticsSnapshotSchema.parse(snapshot));
+  } catch { return fail(appError('diagnostics_unavailable', 'runtime', 'Safe diagnostics could not be collected.', true)); }
+}
+
+async function exportDiagnostics(event: Electron.IpcMainInvokeEvent): Promise<Result<{ outcome: 'cancelled' | 'saved' }>> {
+  const window = mainWindow, frame = event.senderFrame;
+  if (!window || window.isDestroyed()) return fail(appError('diagnostics_export_failed', 'runtime', 'The diagnostics window is unavailable.'));
+  const currentOwner = () => mainWindow === window && !window.isDestroyed() && event.senderFrame === frame && isTrustedSender(event);
+  const snapshot = await queryDiagnostics(); if (!snapshot.ok) return snapshot;
+  const selected = await dialog.showSaveDialog(window, { title: 'Export diagnostics JSON',
+    defaultPath: `Flowmate-diagnostics-${snapshot.data.collectedAt.replace(/[:.]/g, '-')}.json`, filters: [{ name: 'JSON', extensions: ['json'] }] });
+  if (selected.canceled) return ok({ outcome: 'cancelled' });
+  if (!currentOwner() || !selected.filePath)
+    return fail(appError('diagnostics_export_failed', 'runtime', 'The diagnostics owner changed.'));
+  const current = await queryDiagnostics();
+  if (!current.ok) return current;
+  if (!currentOwner()) return fail(appError('diagnostics_export_failed', 'runtime', 'The diagnostics owner changed.'));
+  const saved = publishExportCopy(selected.filePath, new TextEncoder().encode(JSON.stringify(current.data, null, 2) + '\n'));
+  return saved.ok ? ok({ outcome: 'saved' }) : fail(appError('diagnostics_export_failed', 'storage', 'Diagnostics could not be saved. Choose a new writable filename.', true));
 }
 
 function closeHostAndQuit(): Promise<void> {
@@ -395,7 +493,7 @@ function createMainWindow(): void {
     backgroundColor: '#e9e7df',
     title: 'Flowmate',
     webPreferences: {
-      preload: join(resolveWorkspaceRoot(app.getAppPath()), 'out', 'preload', 'index.js'),
+      preload: join(app.isPackaged ? app.getAppPath() : resolveWorkspaceRoot(app.getAppPath()), 'out', 'preload', 'index.js'),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
@@ -421,9 +519,9 @@ function createMainWindow(): void {
       subscriptions.delete(window.webContents.id);
     }
   });
-  const rendererUrl = process.env.ELECTRON_RENDERER_URL;
+  const rendererUrl = !app.isPackaged ? process.env.ELECTRON_RENDERER_URL : undefined;
   if (rendererUrl) void window.loadURL(rendererUrl);
-  else void window.loadFile(join(resolveWorkspaceRoot(app.getAppPath()), 'out', 'renderer', 'index.html'));
+  else void window.loadFile(join(app.isPackaged ? app.getAppPath() : resolveWorkspaceRoot(app.getAppPath()), 'out', 'renderer', 'index.html'));
 }
 
 function resolveWorkspaceRoot(appPath: string): string {
@@ -495,12 +593,15 @@ function registerIpc(): void {
           ? (() => { const parsed = ContextErrorSchema.safeParse(error); return parsed.success ? fail(parsed.data) : contextHostFailure(); })()
           : fail(error);
       if (!isTrustedSender(event)) return failure(appError('ipc_forbidden', 'input', '请求来源不受信任。'));
-      if (desktopClosing && !['flowmate:query-evaluation-control', 'flowmate:cancel-evaluation', 'flowmate:list-evaluation-executions', 'flowmate:query-evaluation-result', 'flowmate:compare-evaluation', 'flowmate:query-evaluation-catalog', 'flowmate:query-evaluation-feedback'].includes(channel))
+      if (desktopClosing && !['flowmate:query-diagnostics', 'flowmate:export-diagnostics', 'flowmate:query-evaluation-control', 'flowmate:cancel-evaluation', 'flowmate:list-evaluation-executions', 'flowmate:query-evaluation-result', 'flowmate:compare-evaluation', 'flowmate:query-evaluation-catalog', 'flowmate:query-evaluation-feedback'].includes(channel))
         return failure(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
       try { return await handler(event, ...args); }
       catch { return failure(appError('desktop_operation_failed', 'runtime', '桌面操作失败。', true)); }
     });
   };
+  handle('flowmate:restart-host', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Recheck takes no arguments.')) : restartHost());
+  handle('flowmate:query-diagnostics', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Diagnostics takes no arguments.')) : queryDiagnostics());
+  handle('flowmate:export-diagnostics', async (event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Diagnostics export takes no arguments.')) : exportDiagnostics(event));
 
   handle('flowmate:save-research-export', async (event, raw) => {
     const parsed = ResearchReportRequestSchema.safeParse(raw);
@@ -1163,7 +1264,7 @@ async function listActivity(raw: unknown) {
 async function chooseAndImportInvoice(): Promise<Result<import('@flowmate/contracts').DocumentSnapshot | null>> {
   if (!mainWindow || mainWindow.isDestroyed()) return fail(appError('desktop_not_ready', 'runtime', '材料选择窗口尚未就绪。', true));
   const selected = await dialog.showOpenDialog(mainWindow, { title: '选择正式发票材料',
-    defaultPath: join(resolveWorkspaceRoot(app.getAppPath()), 'data', 'invoices', 'agent-input'),
+    defaultPath: invoiceSourceRoot,
     properties: ['openDirectory', 'dontAddToRecent'] });
   if (selected.canceled) return { ok: true, data: null };
   const sourceDirectory = selected.filePaths[0];
@@ -1398,8 +1499,13 @@ async function handleHostCredentialRequest(request: HostCredentialRequest): Prom
     const result = await store.read();
     if (!result.ok) return { ok: false };
     if (!result.data) return { ok: true };
-    if (!result.data.startsWith(piCredentialPrefix)) return { ok: true, credential: { type: 'api_key', key: result.data } };
-    try { return { ok: true, credential: JSON.parse(result.data.slice(piCredentialPrefix.length)) as unknown }; }
+    if (!result.data.startsWith(piCredentialPrefix)) { registerSecrets([result.data]); return { ok: true, credential: { type: 'api_key', key: result.data } }; }
+    try {
+      const credential: unknown = JSON.parse(result.data.slice(piCredentialPrefix.length));
+      if (!validPiCredential(credential)) return { ok: false };
+      for (const name of ['key', 'access', 'refresh']) { const value = (credential as Record<string, unknown>)[name]; if (typeof value === 'string') registerSecrets([value]); }
+      return { ok: true, credential };
+    }
     catch { return { ok: false }; }
   }
   if (request.operation === 'delete') return { ok: (await store.remove()).ok };
@@ -1728,11 +1834,11 @@ function isTrustedSender(event: Electron.IpcMainInvokeEvent): boolean {
 }
 
 function isAllowedPage(value: string): boolean {
-  const rendererUrl = process.env.ELECTRON_RENDERER_URL;
+  const rendererUrl = !app.isPackaged ? process.env.ELECTRON_RENDERER_URL : undefined;
   if (rendererUrl) {
     try { return new URL(value).origin === new URL(rendererUrl).origin; } catch { return false; }
   }
-  return value.startsWith('file://') && value.endsWith('/out/renderer/index.html');
+  return value === pathToFileURL(join(app.isPackaged ? app.getAppPath() : resolveWorkspaceRoot(app.getAppPath()), 'out/renderer/index.html')).href;
 }
 
 function isAbsolutePath(value: string): boolean {

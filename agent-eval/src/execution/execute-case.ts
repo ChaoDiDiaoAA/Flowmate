@@ -38,8 +38,15 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
             throw new Error('Cancelled before preparation');
         phase('preparing');
         const preparing = kernel.prepare(trial, controller.signal);
+        let abortPreparation!: () => void;
+        const cancelledPreparation = new Promise<never>((_, reject) => {
+            abortPreparation = () => reject(new Error('Cancelled during preparation'));
+            controller.signal.addEventListener('abort', abortPreparation, { once: true });
+            if (controller.signal.aborted) abortPreparation();
+        });
         try {
-            session = await bounded(preparing, stopGraceMs);
+            // Cold Host setup uses the task budget; only stopping uses its shorter grace.
+            session = await bounded(Promise.race([preparing, cancelledPreparation]), timeoutMs);
         }
         catch (error) {
             controller.abort();
@@ -52,7 +59,7 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
                 await bounded(s.close(), stopGraceMs);
             } }).catch(() => { });
             throw error;
-        }
+        } finally { controller.signal.removeEventListener('abort', abortPreparation); }
         projected = inputSchema.parse(session.input);
         if (projected.prompt !== original.prompt || (!trial.setup && !isDeepStrictEqual(projected, original)))
             throw new Error('Unapproved initial input mutation');

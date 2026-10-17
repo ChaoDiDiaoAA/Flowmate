@@ -42,11 +42,11 @@ export function readLocalMaterial(repo: string, root: string, path: string): Buf
         ? materialPath(repo, 'data/invoices/voxel51/' + path) : inside(root, path);
     return readFileSync(file);
 }
-export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: FlatDataset): LocalDataset {
+export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: FlatDataset, resourceRepository = repo): LocalDataset {
     if (!existsSync(directory))
         throw new Error(`Dataset 目录不存在：${resolve(directory)}。尚未制作，等待评测工程验收；依据 01/02 完成制作后再校验，不自动生成数据。`);
     if (!embedded && existsSync(join(directory, 'cases.ts'))) {
-        const groups=readDeclarationDatasets(directory,repo);if(groups.length!==1)throw Error('Select a dataset with discoverDatasets');embedded=groups[0];
+        const groups=readDeclarationDatasets(directory,repo,resourceRepository);if(groups.length!==1)throw Error('Select a dataset with discoverDatasets');embedded=groups[0];
     }
     if (!embedded && !existsSync(join(directory, 'dataset.json')))
         throw new Error(`Dataset 清单不存在：${resolve(directory, 'dataset.json')}。请选择制作完成的 Dataset 目录。`);
@@ -137,11 +137,12 @@ export function judgeSelection(dataset:Pick<LocalDataset,'manifest'|'cases'>,req
     return{needed:applicable.length>0,required:applicable.some(j=>requireJudge||j.required||dataset.cases.some(task=>j.requiredFor?.includes(task.id)||
         'contract'in task&&task.expected.semantic?.criteria.some(c=>c.required)))};
 }
-export function discoverDatasets(root: string, repo = REPO_ROOT): LocalDataset[] {
-    if (existsSync(join(root,'cases.ts'))) return readDeclarationDatasets(root,repo).map(group=>loadDataset(root,repo,group));
+export function discoverDatasets(root: string, repo = REPO_ROOT, resourceRepository = repo): LocalDataset[] {
+    if (!existsSync(root)) return [];
+    if (existsSync(join(root,'cases.ts'))) return readDeclarationDatasets(root,repo,resourceRepository).map(group=>loadDataset(root,repo,group,resourceRepository));
     return readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && !e.isSymbolicLink()).flatMap(e => {
         const dir = join(root, e.name);
-        return readdirSync(dir).includes('dataset.json') ? [loadDataset(dir, repo)] : [];
+        return readdirSync(dir).includes('dataset.json') ? [loadDataset(dir, repo, undefined, resourceRepository)] : [];
     });
 }
 function utf8(bytes: Uint8Array) {

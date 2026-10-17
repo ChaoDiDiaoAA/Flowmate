@@ -56,7 +56,7 @@ export type LocalReport = {
     trialStatistics?: TrialStatistics;
     executionId: string;
     code?: {
-        commit: string;
+        commit?: string;
 
         release: string;
         dirty: boolean;

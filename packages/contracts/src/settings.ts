@@ -157,7 +157,7 @@ export type DesktopInvoiceExportResult = { outcome: 'cancelled' } | {
   outcome: 'saved'; reference: import('./invoice.ts').InvoiceExportReference; destinationPath: string;
 };
 
-export type DesktopBridge = import('./evaluation.ts').EvaluationDesktopApi & import('./research.ts').ResearchQueryApi & Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
+export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & import('./evaluation.ts').EvaluationDesktopApi & import('./research.ts').ResearchQueryApi & Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
   | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   saveResearchExport(input: import('zod').z.infer<typeof import('./research.ts').ResearchReportRequestSchema>): Promise<import('./runtime.ts').Result<{ cancelled: boolean; destinationPath?: string }>>;
@@ -166,6 +166,7 @@ export type DesktopBridge = import('./evaluation.ts').EvaluationDesktopApi & imp
   queryRunResources(input: import('./resources.ts').RunResourceQuery): Promise<import('./runtime.ts').Result<import('./resources.ts').RunResourceView>>;
   readRunResourceFile(input: import('./resources.ts').RunResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
   getState(): Promise<import('./runtime.ts').Result<DesktopState>>;
+  restartHost(): Promise<import('./runtime.ts').Result<DesktopState>>;
   listModelCatalog(providerId?: string, refresh?: boolean): Promise<import('./runtime.ts').Result<readonly ModelCatalogProvider[]>>;
   loginModel(modelId: string, authType: 'api_key' | 'oauth', requestId: string): Promise<import('./runtime.ts').Result<{ configured: true }>>;
   logoutModel(modelId: string): Promise<import('./runtime.ts').Result<void>>;

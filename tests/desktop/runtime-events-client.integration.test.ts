@@ -115,7 +115,7 @@ response(command,{ok:true,data:page});
   } finally { await fixture.close(); }
 }, 15_000);
 
-it('P6 HostClient releases a timed-out late open only on its captured original live connection after replacement', async () => {
+it('P6 HostClient releases a timed-out late open on its original live connection and never on the replacement', async () => {
   const first = await protocolFixture(`
 appendFileSync(journal,JSON.stringify(command)+'\\n');
 if(command.type==='subscribe_runtime_events') setTimeout(()=>response(command,{ok:true,data:{...context,subscriptionId:command.subscriptionId}}),250);
@@ -129,13 +129,15 @@ else if(command.type==='unsubscribe_runtime_events') response(command,{ok:true})
   try {
     await expect(request(first.client, { type: 'subscribe_runtime_events', ownerToken, subscriptionId, input: publicInput }, 100))
       .rejects.toThrow('host_request_timeout');
-    // Start creates a replacement; the cleanup callback executes before that child is installed.
-    expect(await first.client.start(secondRoot, '0.1.0', secondRoot)).toMatchObject({ ok: true });
+    expect(await first.client.start(secondRoot, '0.1.0', secondRoot)).toMatchObject({ ok: false, error: { code: 'host_still_running' } });
     cleanup();
     await new Promise(resolveDelay => setTimeout(resolveDelay, 300));
     const originalCommands = readFileSync(join(first.root, 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter(command => !command.trace);
-    expect(originalCommands.filter(command => command.type === 'unsubscribe_runtime_events')).toHaveLength(2);
+    expect(originalCommands.filter(command => command.type === 'unsubscribe_runtime_events')).toHaveLength(1);
     expect(originalCommands.filter(command => command.type === 'unsubscribe_runtime_events').every(command => command.ownerToken === ownerToken && command.subscriptionId === subscriptionId)).toBe(true);
+    await first.close();
+    expect(await first.client.start(secondRoot, '0.1.0', secondRoot)).toMatchObject({ ok: true });
+    cleanup();
     // The replacement journal exists only after a deliberate command; captured cleanup never touched it.
     expect(await request(first.client, { type: 'unsubscribe_runtime_events', ownerToken: 'new-owner', subscriptionId: 'new-id' })).toEqual({ ok: true, data: undefined });
     const replacementCommands = readFileSync(join(secondRoot, 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter(command => !command.trace);
