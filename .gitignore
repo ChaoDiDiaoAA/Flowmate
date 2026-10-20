@@ -60,6 +60,7 @@ Thumbs.db
 # Project-local code analysis databases and generated indexes
 /.codebase-memory/
 /.codegraph/
+/.zread/
 
 # Archived v0 material is retained locally only; current v1 specifications
 # and Pn plans must remain versionable.
