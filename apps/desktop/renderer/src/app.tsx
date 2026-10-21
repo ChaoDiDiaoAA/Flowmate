@@ -34,11 +34,32 @@ import { createEventView, bindEventSubscription, applyEventWake, applyEventRead,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'research' | 'activity' | 'models' | 'evaluation' | 'settings' | 'prompts' | 'skills' | 'extensions';
+type Page = 'conversation' | 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'research' | 'activity' | 'models' | 'evaluation' | 'settings' | 'prompts' | 'skills' | 'extensions';
 const pageLabels: Record<Page, string> = {
+  conversation: 'Conversation',
   workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats', research: 'Deep Research',
   activity: 'Activity', models: 'Models', evaluation: 'Evaluation', settings: 'Settings', prompts: 'Prompts', skills: 'Skills', extensions: 'Extensions',
 };
+
+function NavigationIcon({ name }: { name: Exclude<Page, 'conversation'> | 'new-chat' }) {
+  const paths = {
+    'new-chat': 'M12 5v14M5 12h14',
+    workspace: 'M6 3h12v18l-3-2-3 2-3-2-3 2V3Zm3 5h6m-6 4h6',
+    'workspace-detail': 'M3 4h18v16H3V4Zm6 0v16m0-10h12',
+    tasks: 'M4 6h16M4 12h10M4 18h10m3-5 4 4-4 4',
+    chats: 'M4 4h16v12H9l-5 4V4Zm4 5h8m-8 3h5',
+    research: 'M10.5 3a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15Zm5.5 13 5 5',
+    activity: 'M3 12h4l3-8 4 16 3-8h4',
+    models: 'm12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5',
+    evaluation: 'M4 4h16v16H4V4Zm4 12v-4m4 4V8m4 8v-6',
+    prompts: 'M5 4h14v16H5V4Zm4 5h6m-6 4h6m-6 4h3',
+    skills: 'm12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z',
+    extensions: 'M4 4h6v6H4V4Zm10 0h6v6h-6V4ZM4 14h6v6H4v-6Zm13 0v6m-3-3h6',
+    settings: 'm9 3-.5 3-2 1-3-.5L2 10l2.5 2L4 15l2.5 2 2.5-1 2 2 .5 3h4l.5-3 2-1 3 .5L22 14l-2.5-2L20 9l-2.5-2-2.5 1-2-2-.5-3H9Zm3 6a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z',
+  };
+  return <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+    strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={paths[name]} /></svg>;
+}
 type EventObservation = { view: EventViewState; wanted: boolean; opening: boolean; through?: number;
   pendingWake: RuntimeEventsWake | null; snapshot: RunSnapshot | null; tools: readonly RuntimeToolView[];
   nextToolId: number | null; toolsExpanded: boolean; toolsLoading: boolean;
@@ -148,7 +169,7 @@ function runtimeMessage(state: RuntimeState | null, readFailed: boolean, hostRea
 }
 
 export function App() {
-  const [page, setPage] = useState<Page>('workspace');
+  const [page, setPage] = useState<Page>('conversation');
   const [settingsTab, setSettingsTab] = useState('General');
   const [state, setState] = useState<DesktopState | null>(null);
   const [evaluationView, setEvaluationView] = useState(createEvaluationView);
@@ -250,8 +271,10 @@ export function App() {
   const [revokingAccess, setRevokingAccess] = useState(false);
   const [chatCollapsed, setChatCollapsed] = useState(() => window.innerWidth < 1080);
   const [researchChatCollapsed, setResearchChatCollapsed] = useState(true);
-  const assistantCollapsed = page === 'research' ? researchChatCollapsed : chatCollapsed;
-  const panels = usePanelLayout(assistantCollapsed);
+  const chatPresentation = page === 'conversation' ? 'main' : 'sidebar';
+  const sidebarCollapsed = page === 'research' ? researchChatCollapsed : chatCollapsed;
+  const assistantCollapsed = chatPresentation === 'sidebar' && sidebarCollapsed;
+  const panels = usePanelLayout(assistantCollapsed, chatPresentation);
   const [navOpen, setNavOpen] = useState(false);
   const [run, setRun] = useState<RunSnapshot | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
@@ -930,10 +953,8 @@ export function App() {
   }
 
   async function openChat(sessionId: number) {
-    if (!await confirmFormLeave()) return;
+    if (!await confirmFormLeave() || !await navigate('conversation')) return;
     selectSession(sessionId, true);
-    setNavOpen(false);
-    if (window.innerWidth < 1080) setChatCollapsed(false);
   }
 
   async function loadSessionList(append = false) {
@@ -2689,7 +2710,7 @@ export function App() {
             </> : null;
 
   return (
-    <div ref={panels.shellRef} style={panels.style} className={`desktop-shell theme-${profileDraft.theme} ${assistantCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''} ${panels.dragging ? 'panels-resizing' : ''}`}>
+    <div ref={panels.shellRef} style={panels.style} className={`desktop-shell theme-${profileDraft.theme} ${chatPresentation === 'main' ? 'conversation-is-main' : ''} ${assistantCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''} ${panels.dragging ? 'panels-resizing' : ''}`}>
       {panels.separators}
       {rejectPrompt && <div role="dialog" aria-modal="true" aria-label="Reject invoice result"
         style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,.45)', display: 'grid', placeItems: 'center' }}>
@@ -2712,39 +2733,39 @@ export function App() {
         onKeyDown={(event) => { if (event.key === 'Escape' && navOpen) { setNavOpen(false); navToggleRef.current?.focus(); } }}>
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">F</span>
-          <span className="brand-wordmark"><strong>Flowmate</strong><small>INVOICE DESK</small></span>
+          <span className="brand-wordmark"><strong>Flowmate</strong><small>LOCAL WORKSPACE</small></span>
           <button ref={navToggleRef} type="button" className="rail-toggle" aria-label={navOpen ? 'Close navigation' : 'Open navigation'}
             aria-expanded={navOpen} onClick={() => setNavOpen((open) => !open)}>{navOpen ? '×' : '☰'}</button>
         </div>
         <button className="sidebar-new-chat" type="button" aria-label="New chat" title="New chat" disabled={!state?.ready || sessionLoading || sessionMutating}
-          onClick={() => { setNavOpen(false); if (window.innerWidth < 1080) setChatCollapsed(false); void createNewSession(); }}>
-          <span aria-hidden="true">＋</span><span>New chat</span>
+          onClick={() => { void navigate('conversation').then(moved => { if (moved) void createNewSession(); }); }}>
+          <NavigationIcon name="new-chat" /><span>New chat</span>
         </button>
         <nav aria-label="Workspace navigation">
           <span className="rail-caption">WORK</span>
           {([
-            ['workspace', 'Invoices', '▧'],
-            ['workspace-detail', 'Workspace', '▦'],
-            ['tasks', 'Processing History', '☷'],
-            ['chats', 'Chats', '◌'],
-            ['research', 'Deep Research', '⌕'],
-            ['activity', 'Activity', '≋'],
-          ] as const).map(([target, label, glyph]) => <button key={target} type="button"
+            ['workspace', 'Invoices'],
+            ['workspace-detail', 'Workspace'],
+            ['tasks', 'Processing History'],
+            ['chats', 'Chats'],
+            ['research', 'Deep Research'],
+            ['activity', 'Activity'],
+          ] as const).map(([target, label]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
             aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
-            <span className="nav-glyph" aria-hidden="true">{glyph}</span><span>{label}</span>
+            <span className="nav-glyph"><NavigationIcon name={target} /></span><span>{label}</span>
           </button>)}
           <span className="rail-caption setup-caption">SETUP</span>
           {([
-            ['models', 'Models', '◇'],
-            ['evaluation', 'Evaluation', '◫'],
-            ['prompts', 'Prompts', '≡'],
-            ['skills', 'Skills', '✧'],
-            ['extensions', 'Extensions', '⊞'],
-          ] as const).map(([target, label, glyph]) => <button key={target} type="button"
+            ['models', 'Models'],
+            ['evaluation', 'Evaluation'],
+            ['prompts', 'Prompts'],
+            ['skills', 'Skills'],
+            ['extensions', 'Extensions'],
+          ] as const).map(([target, label]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
             aria-current={page === target ? 'page' : undefined} onClick={() => navigate(target)}>
-            <span className="nav-glyph" aria-hidden="true">{glyph}</span><span>{label}</span>
+            <span className="nav-glyph"><NavigationIcon name={target} /></span><span>{label}</span>
           </button>)}
         </nav>
         <section className="sidebar-recents" aria-label="Recent chats">
@@ -2775,14 +2796,20 @@ export function App() {
         <div className="rail-bottom">
           <button className={`nav-item ${page === 'settings' ? 'active' : ''}`} type="button" aria-label="Settings" title="Settings"
             aria-current={page === 'settings' ? 'page' : undefined} onClick={() => navigate('settings')}>
-            <span className="nav-glyph" aria-hidden="true">⚙</span><span>Settings</span>
+            <span className="nav-glyph"><NavigationIcon name="settings" /></span><span>Settings</span>
           </button>
           <div className="sidebar-status"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />
             <span>{state?.ready ? 'Ready' : 'Unavailable'}</span></div>
         </div>
       </aside>
 
-      <main className="workspace" data-testid="main-content">
+      {evaluationView.control && evaluationView.control.state !== 'idle' && <section className="evaluation-global" aria-label="Global evaluation control">
+        <button className="text-button" onClick={() => navigate('evaluation')}>Evaluation: {evaluationView.control.state}</button>
+        <span>{evaluationView.control.progress?.caseId ?? evaluationView.control.batchId} · stop: {evaluationView.control.stop}</span>
+        {evaluationBusy(evaluationView.control) && <button className="secondary-button" disabled={!['preparing', 'running', 'cancelling'].includes(evaluationView.control.state)}
+          onClick={() => void stopEvaluation()}>Stop evaluation</button>}
+      </section>}
+      <main className="workspace" data-testid="main-content" hidden={chatPresentation === 'main'}>
         {sourceReview && <section className="panel invoice-evidence" aria-label="Source evidence">
           <div className="panel-head"><h2>Source evidence</h2><button className="text-button" onClick={() => { sourceReviewGeneration.current++; setSourceReview(null); }}>Close evidence</button></div>
           <p>Document {sourceReview.source.documentId} · {sourceReview.source.version} · artifact {sourceReview.source.artifactId} · page {sourceReview.source.page} · {sourceReview.source.blockId ?? 'whole page'}</p>
@@ -2796,15 +2823,9 @@ export function App() {
           <div className="top-state"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />{state?.ready ? 'LOCAL' : 'OFFLINE'}</div>
         </header>
 
-        {evaluationView.control && evaluationView.control.state !== 'idle' && <section className="evaluation-global" aria-label="Global evaluation control">
-          <button className="text-button" onClick={() => navigate('evaluation')}>Evaluation: {evaluationView.control.state}</button>
-          <span>{evaluationView.control.progress?.caseId ?? evaluationView.control.batchId} · stop: {evaluationView.control.stop}</span>
-          {evaluationBusy(evaluationView.control) && <button className="secondary-button" disabled={!['preparing', 'running', 'cancelling'].includes(evaluationView.control.state)}
-            onClick={() => void stopEvaluation()}>Stop evaluation</button>}
-        </section>}
         <PromptOptimizer visible={page === 'prompts'} hostEpoch={workspaceHostEpoch.current} ready={Boolean(modelReady && runtimeReady && !busy && !saving)}
           model={persistedModel} onUse={text => { updateChatInput(chatInputRef.current ? `${chatInputRef.current}\n\n${text}` : text); setChatCollapsed(false); }} />
-        {page === 'evaluation' ? <EvaluationPage desktop={state} control={evaluationView.control} revision={() => evaluationViewRef.current.revision}
+        {page === 'conversation' ? null : page === 'evaluation' ? <EvaluationPage desktop={state} control={evaluationView.control} revision={() => evaluationViewRef.current.revision}
           onControl={receiveEvaluationControl} onModels={() => navigate('models')} /> : page === 'prompts' ? null : page === 'workspace' ? (
           <InvoicesPage
             workspace={workspace}
@@ -3076,6 +3097,9 @@ export function App() {
       </main>
       <AgentChatPanel
         key={`chat:${workspaceHostEpoch.current}`}
+        presentation={chatPresentation}
+        notice={chatPresentation === 'main' ? notice : null}
+        runtimeStatus={chatPresentation === 'main' && (!state?.ready || runtimeReadFailed || runtimeState?.blocked) ? runtimeStatus : null}
         hostEpoch={workspaceHostEpoch.current} hostReady={Boolean(state?.ready)}
         collapsed={assistantCollapsed}
         onToggle={() => { assistantWasToggled.current = true; if (page === 'research') setResearchChatCollapsed(value => !value); else setChatCollapsed(value => !value); }}
@@ -3462,6 +3486,7 @@ function turnFromRun(run: AgentRunSnapshot): ChatTurn {
 }
 
 function AgentChatPanel({
+  presentation, notice, runtimeStatus,
   hostEpoch, hostReady,
   collapsed,
   onToggle,
@@ -3510,6 +3535,9 @@ function AgentChatPanel({
   onGoalModeChange,
   sessionHint,
 }: {
+  presentation: 'main' | 'sidebar';
+  notice: Notice;
+  runtimeStatus: ReactNode;
   hostEpoch: number; hostReady: boolean;
   collapsed: boolean;
   onToggle(): void;
@@ -3587,17 +3615,24 @@ function AgentChatPanel({
   const childParent = activeAgentSessionId === selectedSessionId && activeAgentRunId !== null ? activeAgentRunId
     : [...messages].reverse().find(message => message.runId !== null && ownsRun(message.runId))?.runId
       ?? [...turns].reverse().find(turn => turn.sessionId === selectedSessionId)?.runId;
-  if (collapsed) {
-    return <aside className="agent-chat-panel collapsed" data-testid="agent-chat-panel">
+  const title = selectedSession ? chatTitle(selectedSession.title) : 'New conversation';
+  const emptyHint = contextName ? 'Ask about your selected material, or continue the conversation.'
+    : 'Start a conversation, explore a question, or work with your documents.';
+  return <section className={`agent-chat-panel ${presentation === 'main' ? 'main' : ''} ${collapsed ? 'collapsed' : ''}`}
+    data-testid="agent-chat-panel" role={presentation === 'main' ? 'main' : 'complementary'} aria-label="Assistant"
+    onKeyDown={(event) => { if (event.key === 'Escape' && presentation === 'sidebar' && !collapsed && window.innerWidth < 1080) onToggle(); }}>
+    <div className="chat-collapsed-controls" hidden={!collapsed}>
       <button className="chat-expand" type="button" onClick={onToggle} aria-label="Open Assistant" aria-expanded={false} title="Open Assistant"><span aria-hidden="true">‹</span><b>Assistant</b></button>
       {busy && <button className="chat-collapsed-stop" type="button" onClick={onCancel} disabled={cancelPending} aria-label={cancelPending ? 'Stopping…' : 'Stop'} title={cancelPending ? 'Stopping…' : 'Stop active run'}>■</button>}
-    </aside>;
-  }
-  return <aside className="agent-chat-panel" data-testid="agent-chat-panel" aria-label="Assistant" onKeyDown={(event) => { if (event.key === 'Escape' && window.innerWidth < 1080) onToggle(); }}>
+    </div>
+    <div className="chat-panel-content" hidden={collapsed}>
     <header className="chat-panel-head">
-      <div><h2>Assistant</h2><span className="chat-current-title">{selectedSession ? chatTitle(selectedSession.title) : 'New conversation'}</span></div>
-      <button className="chat-collapse" type="button" onClick={onToggle} aria-label="Close Assistant" aria-expanded={true} title="Close Assistant">›</button>
+      <div><h2>{presentation === 'main' ? title : 'Assistant'}</h2>
+        {presentation === 'sidebar' && <span className="chat-current-title">{title}</span>}</div>
+      {presentation === 'sidebar' && <button className="chat-collapse" type="button" onClick={onToggle} aria-label="Close Assistant" aria-expanded={true} title="Close Assistant">›</button>}
     </header>
+    {notice && <div className={`notice ${notice.tone}`} role="status">{notice.message}</div>}
+    {runtimeStatus}
     <div className="chat-model-row"><span className={`status-dot ${modelName ? 'is-ready' : 'is-error'}`} /><div><strong>{modelName ?? 'Set up a model in Settings'}</strong></div></div>
     {selectedSession && <div className="chat-session-state"><span className={`status-dot ${selectedSession.availability === 'ready' ? 'is-ready' : selectedSession.availability === 'busy' ? 'is-warning' : 'is-error'}`} />
       <button className="text-button" type="button" onClick={onSessionDetails}>Session details</button>
@@ -3615,7 +3650,7 @@ function AgentChatPanel({
       </div>
       {historyError && <p className="chat-error" role="alert">{historyError}</p>}
       {unconfirmedCount > 0 && <p className="chat-save-feedback" role="status">{unconfirmedCount} {unconfirmedCount === 1 ? 'message has' : 'messages have'} not been confirmed as saved. Refresh history to check.</p>}
-      {messages.length === 0 && turns.length === 0 && !historyLoading && <div className="chat-empty"><span className="chat-empty-mark">↗</span><strong>{researchContext ? 'Explore your research question' : 'How can I help?'}</strong><p>{researchContext ? 'Create or select a research task to plan an investigation, refine its scope, or discuss a saved report.' : 'Ask about this invoice, or start a general conversation.'}</p></div>}
+      {messages.length === 0 && turns.length === 0 && !historyLoading && <div className="chat-empty"><span className="chat-empty-mark" aria-hidden="true">F</span><strong>{researchContext ? 'Explore your research question' : 'How can I help?'}</strong><p>{researchContext ? 'Create or select a research task to plan an investigation, refine its scope, or discuss a saved report.' : emptyHint}</p></div>}
       {messages.map((message) => <article className="chat-turn native-message" data-testid="chat-turn"
         data-message-role={message.role} data-message-entry={message.entryId ?? undefined}
         data-message-run={message.runId ?? undefined} data-message-ordinal={message.liveOrdinal ?? undefined}
@@ -3680,5 +3715,6 @@ function AgentChatPanel({
           : <button className="primary-button" type="submit" disabled={!enabled || !input.trim()}>Send <span aria-hidden="true">↗</span></button>}
       </div>
     </form>
-  </aside>;
+    </div>
+  </section>;
 }

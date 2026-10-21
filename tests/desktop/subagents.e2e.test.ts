@@ -75,7 +75,7 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
     app.process().stderr?.on('data', value => console.error(String(value)));
     let page = await app.firstWindow(); page.on('pageerror', error => console.error(error.stack));
     page.on('console', message => { if (message.type() === 'error') console.error(message.text()); });
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
       const saved = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p13-ui', credentialRef: '00000000000000000000000000000035', name: 'P13 UI',
@@ -85,7 +85,7 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
       const catalog = await window.flowmate.listExtensions(); if (!catalog.ok) return catalog;
       return window.flowmate.updateExtensionSelection({ expectedRevision: saved.data.revision, selection: { enabledExtensions: catalog.data.items.map(item => item.ref) } });
     }, `http://127.0.0.1:${provider.port}/v1`)).toMatchObject({ ok: true });
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await expect(page.getByRole('button', { name: 'Refresh history', exact: true })).toBeEnabled();
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('Verify invoice total');
     await expect(page.getByRole('textbox', { name: 'Message to model', exact: true })).toHaveValue('Verify invoice total');
@@ -123,7 +123,7 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
       // As in the existing process-loss history fixture, wait for the actual controller lease to expire.
       await expect.poll(async () => { try { return Date.now() - (await stat(join(userData, 'data/app.sqlite.lock'))).mtimeMs > 15_000; } catch { return true; } }, { timeout: 20_000 }).toBe(true);
       app = await launch(userData, sourceRoot); page = await app.firstWindow();
-      await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+      await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
       await expect.poll(() => page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { ready: true, host: 'ready' } });
       const after = await page.evaluate(input => window.flowmate.querySubagent(input), { parentRunId: rootId, parentSessionId: seed.sessionId, childRunId: child.childRunId });
       if (!after.ok) { console.error(JSON.stringify({ after, run: await page.evaluate(id => window.flowmate.queryRun(id), child.childRunId),
@@ -189,7 +189,7 @@ test(`[F13-10/16/18/19/23/24/25] genuine child ${scenario}, saved facts and cold
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
     await expect(panel).toHaveCount(0); await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
     await closeDesktopFixture(app, userData); app = await launch(userData, sourceRoot); page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); await page.getByRole('button', { name: 'Activity', exact: true }).click();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(seed.sessionId)); await page.getByLabel('Processing request', { exact: true }).selectOption(String(rootId));
     const restoredPanel = page.getByTestId('activity-page').getByTestId('subagents-panel');
     await restoredPanel.getByRole('button', { name: 'Check invoice total', exact: false }).click();

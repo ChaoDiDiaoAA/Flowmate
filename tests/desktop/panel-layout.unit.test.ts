@@ -33,3 +33,21 @@ test('fitting shrinks Assistant first, preserves center and original preferences
   expect(preferred).toEqual({ sidebar: 500, assistant: 600 });
   expect(fitPanelWidths(preferred, 1500, false)).toEqual(preferred);
 });
+
+test('main conversation uses the center canvas without reserving an Assistant pane', () => {
+  const preferred = Object.freeze({ sidebar: 500, assistant: 600 });
+  expect(fitPanelWidths(preferred, 1500, false, 'main')).toEqual({ sidebar: 500, assistant: 0 });
+  expect(fitPanelWidths(preferred, 1500, true, 'main')).toEqual({ sidebar: 500, assistant: 0 });
+  expect(fitPanelWidths({ sidebar: 900, assistant: 900 }, 1200, false, 'main')).toEqual({ sidebar: 840, assistant: 0 });
+  expect(preferred).toEqual({ sidebar: 500, assistant: 600 });
+  expect(fitPanelWidths(preferred, 1500, false, 'sidebar')).toEqual({ sidebar: 500, assistant: 600 });
+});
+
+test('main conversation preserves responsive navigation without changing saved widths', () => {
+  const preferred = Object.freeze({ sidebar: 500, assistant: 600 });
+  for (const width of [1199, 1080, 1079, 980])
+    expect(fitPanelWidths(preferred, width, false, 'main')).toEqual({ sidebar: 64, assistant: 0 });
+  expect(fitPanelWidths(preferred, 1200, false, 'main')).toEqual({ sidebar: 500, assistant: 0 });
+  expect(preferred).toEqual({ sidebar: 500, assistant: 600 });
+  expect(fitPanelWidths(preferred, 1200, false)).toEqual({ sidebar: 500, assistant: 340 });
+});

@@ -20,7 +20,7 @@ it('P7 Workspace remains in shared navigation and preserves a null saved chat', 
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await expect(page.locator('.rail .nav-item')).toHaveCount(12, { timeout: 3000 });
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
     await expect(page.getByTestId('workspace-page')).toBeVisible();
@@ -45,7 +45,7 @@ it('P7 historical hidden invoice material cannot become the current Workspace so
   let failure: Error | undefined;
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
     expect(await page.evaluate(async () => {
       const session = await window.flowmate.createSession({ title: 'A current chat' }); if (!session.ok) throw new Error('Session failed');
@@ -108,7 +108,7 @@ it('P7 sparse parsed pages are actual identities and unavailable original mappin
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
     expect(await page.evaluate(async () => {
       const workspace = await window.flowmate.readWorkspace(); if (!workspace.ok) throw new Error('Workspace unavailable');
@@ -341,7 +341,7 @@ it('P7 real Workspace selects every saved field and line, pages sources, freezes
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     let page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await waitFor(() => page.evaluate(async () => { const value = await window.flowmate.getState(); return value.ok && value.data.ready; }));
     const prepared = await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error('Missing settings');
@@ -530,7 +530,7 @@ it('P7 real Workspace selects every saved field and line, pages sources, freezes
     try { expect(JSON.parse((db.query('SELECT selection_json FROM workspace WHERE id = 1').get() as { selection_json: string }).selection_json))
       .toMatchObject({ kind: 'field', fieldPath: 'lines.0.taxRate' }); } finally { db.close(); }
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
-    page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Select Line 1 Tax rate', exact: true })).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('workspace-summary')).toContainText('P7 saved chat');
@@ -551,7 +551,7 @@ it(`P7 public Workspace recovery distinguishes ${fault} without replay`, async (
   let heldPath: string | null = null, originalPath: string | null = null;
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
     expect(await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
@@ -583,7 +583,7 @@ it(`P7 public Workspace recovery distinguishes ${fault} without replay`, async (
       heldPath = `${originalPath}.p7-held`;
     } finally { db.close(); }
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
-    const restoredPage = await app.firstWindow(); await restoredPage.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const restoredPage = await app.firstWindow(); await restoredPage.getByRole('button', { name: 'Invoices', exact: true }).click(); await restoredPage.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await restoredPage.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
     await expect(restoredPage.getByTestId('workspace-summary')).toContainText('Page 2 · Block b53');
     const restoredComposer = restoredPage.getByRole('textbox', { name: 'Message to model' }); await restoredComposer.fill('Recovery preserves this unsent draft.');
@@ -612,7 +612,7 @@ it(`P7 public Workspace recovery distinguishes ${fault} without replay`, async (
     } finally { afterDb.close(); }
     renameSync(heldPath!, originalPath!); heldPath = null;
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
-    const repairedPage = await app.firstWindow(); await repairedPage.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const repairedPage = await app.firstWindow(); await repairedPage.getByRole('button', { name: 'Invoices', exact: true }).click(); await repairedPage.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await repairedPage.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
     if (fault !== 'target-missing') {
       await expect(repairedPage.getByTestId('workspace-summary')).toContainText('Page 2 · Block b53');

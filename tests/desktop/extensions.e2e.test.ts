@@ -60,14 +60,14 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
   });
   let app = await launch(userData, sourceRoot), failure: Error | undefined;
   try {
-    let page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    let page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     const saved = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p12-ui', credentialRef: '00000000000000000000000000000012', name: 'P12 UI',
         kind: 'custom', providerId: null, baseUrl, model: 'p12-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 16384, reasoning: false }],
         defaultModelId: 'p12-ui' }, { modelId: 'p12-ui', apiKey: 'synthetic-p12-ui-key' });
     }, `http://127.0.0.1:${provider.port}/v1`); expect(saved.ok).toBe(true);
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Extensions', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Extensions', exact: true })).toBeVisible();
     await page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true }).click(); await expect(page.getByRole('status')).toContainText('Saved');
@@ -119,7 +119,7 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
     await page.getByRole('button', { name: 'Release Session extensions', exact: true }).click();
     await expect(page.getByTestId('extension-instance')).toContainText('disposed · closed'); await expect(page.getByRole('status')).toContainText('Session resources released');
     await closeDesktopFixture(app, userData); app = await launch(userData, sourceRoot); page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
     await page.locator('details[aria-label="Session extension instance"]').evaluate(node => { (node as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Session', { exact: true }).selectOption(String(seed.sessionId));
     await expect(page.getByTestId('extension-instance')).toHaveCount(0);
@@ -134,7 +134,7 @@ it('[F12-15/19/24/25] enables the extension, executes a real invoice tool, diagn
       const selected = await window.flowmate.updateWorkspace({ expectedRevision: w.data.revision, change: { kind: 'session', sessionId: session.data.sessionId } });
       if (!selected.ok) throw new Error(selected.error.code); return session.data.sessionId;
     });
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor(); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor(); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
     await page.locator('details[aria-label="Session extension instance"]').evaluate(node => { (node as HTMLDetailsElement).open = true; });
     await page.getByLabel('Extension Session', { exact: true }).selectOption(String(nextSession));
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('New Host assembly'); await page.getByRole('button', { name: 'Send', exact: true }).click();
@@ -154,7 +154,7 @@ it('[F12-03/24] confirms a lost save receipt by rereading real settings and igno
   it.setTimeout(60_000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p12-ui-order-')); const app = await launch(userData); let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     await installReadGate(app, userData); await page.getByRole('button', { name: 'Extensions', exact: true }).click();
     await expect(page.getByRole('switch', { name: 'Enable invoice-assist v1', exact: true })).toBeVisible();
     // An older real catalog response cannot confirm a write whose receipt was lost.

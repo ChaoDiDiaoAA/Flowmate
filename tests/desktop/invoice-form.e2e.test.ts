@@ -146,7 +146,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
   let checkpoint = 'launch';
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await waitFor(() => page.evaluate(async () => { const result = await window.flowmate.getState(); return result.ok && result.data.ready; }));
     await app.evaluate(({ dialog }, path) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] }); }, source);
     const imported = await page.evaluate(() => window.flowmate.chooseAndImportInvoice());
@@ -189,7 +189,8 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
         return window.flowmate.updateWorkspace({ expectedRevision: current.data.revision, change: { kind: 'session', sessionId: null } });
       });
       expect(withoutSession).toMatchObject({ ok: true, data: { sessionId: null } });
-      await page.reload(); await page.getByRole('button', { name: 'Edit result', exact: true }).waitFor();
+      await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click();
+      await page.getByRole('button', { name: 'Edit result', exact: true }).waitFor();
       await page.getByRole('button', { name: 'Edit result', exact: true }).click();
       await expect(page.getByLabel('Invoice number', { exact: true })).toHaveValue('INV-FORM-1');
       await expect(page.getByRole('button', { name: 'Save result', exact: true })).toBeDisabled();
@@ -859,6 +860,7 @@ it(`real Fill and manual form public chain: ${outcome}`, async () => {
       expect(existsSync(join(userData, 'outputs', 'invoice-1-result-2.csv'))).toBe(false); expect(existsSync(stalePath)).toBe(false);
       expect(await page.evaluate(() => window.flowmate.queryInvoiceCandidateOperation({ kind: 'export', request: { operationRef: 'native-query-stale', candidateId: 2, format: 'csv' } }))).toEqual({ ok: true, data: null });
       await app.evaluate(() => (globalThis as typeof globalThis & { contextReadGate: { restore(): void } }).contextReadGate.restore());
+      await page.getByRole('button', { name: 'Invoices', exact: true }).click();
       const lostPath = join(userData, 'lost-response.json');
       await app.evaluate(({ dialog, ipcMain }, filePath) => {
         dialog.showSaveDialog = async () => ({ canceled: false, filePath });

@@ -14,12 +14,104 @@ async function launch() {
   const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
     args: [join(repository, 'out/main/index.js')], env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   const page = await app.firstWindow();
-  await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+  await expect(page.locator('.rail').getByRole('button', { name: 'Settings', exact: true })).toBeEnabled({ timeout: 20_000 });
   return { app, page, userData };
 }
 const stream = (text: string) => new Response('data: ' + JSON.stringify({ id: 'ui-optimizer', choices: [{ index: 0,
   delta: { role: 'assistant', content: text }, finish_reason: null }] }) + '\n\ndata: ' + JSON.stringify({ id: 'ui-optimizer',
   choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+
+test('opens a main conversation without execution and keeps one composer across business pages and recent chats', async () => {
+  test.setTimeout(60_000);
+  let requests = 0;
+  const provider = await createHttpProvider(() => { requests++; return stream('Unexpected request'); });
+  const { app, page, userData } = await launch(); let failure: Error | undefined;
+  try {
+    await page.setViewportSize({ width: 1500, height: 950 });
+    await expect(page.getByRole('main', { name: 'Assistant', exact: true })).toBeVisible();
+    await expect(page.locator('.workspace')).toBeHidden();
+    await expect(page.locator('.agent-chat-panel')).toHaveCount(1);
+    await expect(page.getByRole('separator', { name: 'Resize Assistant', exact: true })).toHaveCount(0);
+    await expect.poll(() => page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true, data: { ready: true, host: 'ready' } });
+    await page.screenshot({ path: test.info().outputPath('main-conversation-empty.png') });
+    expect(await page.evaluate(() => window.flowmate.listSessions())).toMatchObject({ ok: true, data: { items: [] } });
+    expect(await page.evaluate(() => window.flowmate.queryRuntimeState())).toMatchObject({ ok: true, data: { active: null } });
+    expect(await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) return state;
+      return window.flowmate.saveSettings({ ...state.data.settings, defaultModelId: 'home', models: [{ id: 'home',
+        credentialRef: '00000000000000000000000000000037', name: 'Home fixture', kind: 'custom', providerId: null, baseUrl,
+        model: 'home', api: 'openai-completions', contextWindow: 64000, maxTokens: 4096, reasoning: false }] },
+        { modelId: 'home', apiKey: 'synthetic-home-key' });
+    }, `http://127.0.0.1:${provider.port}/v1`)).toMatchObject({ ok: true });
+    await installReadGate(app, userData);
+    const input = page.getByRole('textbox', { name: 'Message to model', exact: true });
+    const composer = (await input.elementHandle())!;
+    await input.click(); await expect(input).toBeFocused();
+    await input.pressSequentially('Keep this unsent home draft.');
+    await expect(input).toHaveValue('Keep this unsent home draft.');
+    await page.screenshot({ path: test.info().outputPath('main-conversation-draft.png') });
+    await page.getByRole('button', { name: 'Models', exact: true }).click();
+    await expect(page.getByRole('complementary', { name: 'Assistant', exact: true })).toBeVisible();
+    await expect(page.getByRole('separator', { name: 'Resize Assistant', exact: true })).toBeVisible();
+    await expect(input).toHaveValue('Keep this unsent home draft.');
+    expect(await composer.evaluate(element => element === document.querySelector('[aria-label="Message to model"]'))).toBe(true);
+    await page.getByRole('button', { name: 'Close Assistant', exact: true }).click();
+    await expect(input).toBeHidden();
+    await expect(page.locator('[aria-label="Message to model"]')).toHaveCount(1);
+    expect(await composer.evaluate(element => element.isConnected)).toBe(true);
+    await page.getByRole('button', { name: 'Open Assistant', exact: true }).click();
+    await expect(input).toHaveValue('Keep this unsent home draft.');
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    await expect(page.getByRole('main', { name: 'Assistant', exact: true })).toBeVisible();
+    await expect.poll(() => page.evaluate(async () => {
+      const result = await window.flowmate.listSessions(); return result.ok ? result.data.items.length : -1;
+    })).toBe(1);
+    await input.click(); await expect(input).toBeFocused();
+    await input.press('ControlOrMeta+A'); await input.press('Backspace');
+    await input.pressSequentially('Keep this conversation draft.');
+    await expect(input).toHaveValue('Keep this conversation draft.');
+    const recent = page.locator('.sidebar-chat').first();
+    const sessionId = await recent.getAttribute('data-session-id');
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Invoices', exact: true })).toBeVisible();
+    await expect(input).toHaveValue('Keep this conversation draft.');
+    await page.screenshot({ path: test.info().outputPath('invoices.png') });
+    await page.locator(`.sidebar-chat[data-session-id="${sessionId}"]`).click();
+    await expect(page.getByRole('main', { name: 'Assistant', exact: true })).toBeVisible();
+    await expect(input).toHaveValue('Keep this conversation draft.');
+    expect(await composer.evaluate(element => element === document.querySelector('[aria-label="Message to model"]'))).toBe(true);
+    await expect(page.getByRole('separator', { name: 'Resize Assistant', exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Chats', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Chats', exact: true })).toBeVisible();
+    await page.locator(`.chat-directory-row[data-session-id="${sessionId}"] .chat-directory-open`).click();
+    await expect(page.getByRole('main', { name: 'Assistant', exact: true })).toBeVisible();
+    await expect(input).toHaveValue('Keep this conversation draft.');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expect(page.getByRole('tab', { name: 'General', exact: true })).toBeVisible();
+    await page.screenshot({ path: test.info().outputPath('settings.png') });
+    await page.locator(`.sidebar-chat[data-session-id="${sessionId}"]`).click();
+    await page.setViewportSize({ width: 1380, height: 720 });
+    await expect(page.locator('.rail').getByRole('button', { name: 'Settings', exact: true })).toBeInViewport();
+    await page.setViewportSize({ width: 980, height: 720 });
+    const main = page.getByRole('main', { name: 'Assistant', exact: true });
+    await expect(main).toBeVisible();
+    expect(await main.evaluate(element => getComputedStyle(element).position)).not.toBe('fixed');
+    await expect(input).toBeVisible(); await expect(input).toHaveValue('Keep this conversation draft.');
+    expect(await composer.evaluate(element => element === document.querySelector('[aria-label="Message to model"]'))).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    await expect(page.getByRole('separator', { name: 'Resize Assistant', exact: true })).toHaveCount(0);
+    const navigation = page.getByRole('button', { name: 'Open navigation', exact: true });
+    await navigation.click(); await expect(page.locator('.rail-toggle')).toHaveAttribute('aria-expanded', 'true');
+    await page.keyboard.press('Escape'); await expect(navigation).toBeFocused();
+    await expect(page.locator('.rail-toggle')).toHaveAttribute('aria-expanded', 'false');
+    await page.screenshot({ path: test.info().outputPath('main-conversation-narrow.png') });
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').commands.filter((command: { type: string }) =>
+      ['submit_input', 'call_provider', 'start_run', 'start_agent_run'].includes(command.type)).length)).toBe(0);
+    expect(requests).toBe(0);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { try { await closeDesktopFixture(app, userData, failure); } finally { await provider.stop(); } }
+});
 
 test('keeps directory and settings usable while hiding technical composer controls', async () => {
   test.setTimeout(60_000);

@@ -55,7 +55,7 @@ test('Evaluation opens the registered catalog and reviews a Case without running
     args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
   let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Evaluation', exact: true }).focus();
     await page.getByRole('button', { name: 'Evaluation', exact: true }).press('Enter');
     await expect(page.getByRole('heading', { name: 'Evaluation', exact: true })).toBeVisible();
@@ -134,7 +134,7 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
     args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
   let failure: Error | undefined, closed = false;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Models', exact: true }).click();
     const form = page.getByRole('form', { name: 'Evaluation Agent settings' });
     await form.getByLabel('Base URL', { exact: true }).fill(`http://127.0.0.1:${server.port}/v1`);
@@ -281,7 +281,7 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
     expect(observation.evidence.cleanup).toMatchObject({ present: true, actual: { closed: true, stopped: true } });
     app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
       args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 }); closed = false;
-    const reopened = await app.firstWindow(); await reopened.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const reopened = await app.firstWindow(); await reopened.getByRole('button', { name: 'Invoices', exact: true }).click(); await reopened.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await reopened.getByRole('button', { name: 'Evaluation', exact: true }).click();
     const restored = await reopened.evaluate(executionId => window.flowmate.queryEvaluationResult({ executionId, view: 'summary' }), quitExecution);
     expect(restored).toMatchObject({ ok: true, data: { summary: { executionComplete: false } } });
@@ -309,7 +309,7 @@ test('an active Worker crash preserves partial evidence and stopping uncertainty
     args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
   let failure: Error | undefined, closed = false;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await expect.poll(async () => { const state = await page.evaluate(() => window.flowmate.getState()); return state.ok && state.data.ready; }).toBe(true);
     const configured = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw Error('Synthetic desktop not ready');
@@ -353,7 +353,7 @@ test('P16 Main and Preload save dedicated credentials without model calls and re
     args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
   let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(() => typeof Reflect.get(window.flowmate, 'saveEvaluationSettings'))).toBe('function');
     const result = await page.evaluate(async ({ baseUrl, missingId }) => {
       const original = await window.flowmate.getState(); if (!original.ok) return original;
@@ -400,7 +400,7 @@ test('P16 public desktop operations inspect and review an isolated Case while mi
     args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
   let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     const result = await page.evaluate(async () => {
       const catalog = await window.flowmate.queryEvaluationCatalog({ view: 'list' });
       if (!catalog.ok || catalog.data.view !== 'list' || catalog.data.page.total !== 3) return { catalog };
@@ -437,7 +437,7 @@ test('Models configures independent Evaluation Agent and Judge credentials witho
     args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
   let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     await page.getByRole('button', { name: 'Models', exact: true }).click();
     const originalState = await page.evaluate(() => window.flowmate.getState()); expect(originalState.ok).toBe(true);
     const agent = page.getByRole('form', { name: 'Evaluation Agent settings' }), judge = page.getByRole('form', { name: 'Evaluation Judge settings' });

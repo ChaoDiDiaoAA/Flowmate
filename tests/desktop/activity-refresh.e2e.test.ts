@@ -50,7 +50,7 @@ test('P6 Refresh activity retries failed request and invoice lists without an ex
         replace(channel, () => { counts.executions++; return error; });
     });
     await page.reload();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
     await page.getByLabel('Conversation', { exact: true }).selectOption('12');
     await page.getByLabel(/^Invoice or processing record/).selectOption('invoice:4');

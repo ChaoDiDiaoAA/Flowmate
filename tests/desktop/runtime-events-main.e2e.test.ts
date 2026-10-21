@@ -148,7 +148,7 @@ async function fixture() {
     env: { ...cleanEnvironment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   try {
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     await app.evaluate(({ BrowserWindow }, { ownedRoot, installer }) => {
       const handles = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles();
       const children = handles.filter(value => value && typeof value === 'object' && 'spawnargs' in value
@@ -434,7 +434,7 @@ it('T08 real Main preserves original Context evidence and rejects trust, malform
     for(const result of await page.evaluate(async({input,detailInput})=>[await window.flowmate.listContextSnapshots(input),
       await window.flowmate.queryContextSnapshot(detailInput),await window.flowmate.listContextRequests(input)],{input,detailInput}))
       expect(result).toEqual({ok:false,error:{code:'internal_error',category:'internal',retryable:false,message:'Context query could not be completed.'}});
-    await page.goto(originalUrl);await page.getByRole('heading',{name:'Invoices',exact:true}).waitFor();
+    await page.goto(originalUrl);await page.getByRole('button',{name:'Invoices',exact:true}).click();await page.getByRole('heading',{name:'Invoices',exact:true}).waitFor();
     expect(requests).toBe(1);
     const queryTrace=await app.evaluate(()=>Reflect.get(globalThis,'t08ContextGate').snapshot().trace);
     expect(queryTrace).toHaveLength(9);

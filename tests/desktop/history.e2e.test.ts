@@ -28,7 +28,7 @@ async function fixture(withQueued = false) {
     env: { ...environment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   let page = await app.firstWindow();
   try {
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     const seed = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
       const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'history-ui', credentialRef: '00000000000000000000000000000013', name: 'History UI', kind: 'custom', providerId: null,
@@ -69,10 +69,10 @@ async function fixture(withQueued = false) {
       await expect.poll(async () => { try { return Date.now() - (await stat(join(userData, 'data/app.sqlite.lock'))).mtimeMs > 15_000; } catch { return true; } }, { timeout: 20_000 }).toBe(true);
       app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
         env: { ...environment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
-      page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+      page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     }
     await expect.poll(() => page.evaluate(() => window.flowmate.queryRuntimeState())).toMatchObject({ ok: true, data: { active: null } });
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await expect(page.locator('.chat-current-title')).toHaveText('History original');
     return { app, page, seed, userData, provider, queuedInputId, consumedPrimary, requests: () => requests };
   } catch (error) { release(); await provider.stop(); await closeDesktopFixture(app, userData, error as Error); throw error; }
@@ -117,7 +117,7 @@ test('P9 T08 browses saved history and exact Continue through the real public IP
     await closeDesktopFixture(f.app, f.userData);
     f.app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
       env: { ...environment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: f.userData }, timeout: 30_000 });
-    f.page = await f.app.firstWindow(); await f.page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    f.page = await f.app.firstWindow(); await f.page.getByRole('button', { name: 'Invoices', exact: true }).click(); await f.page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     expect(await f.page.evaluate(async id => ({ history: await window.flowmate.querySessionHistory({ sessionId: id }), workspace: await window.flowmate.readWorkspace() }), f.seed.sessionId)).toEqual(saved);
     expect(f.requests()).toBe(1);
   } catch (error) { failure = error as Error; throw error; }
@@ -269,7 +269,7 @@ test('P9 T08 preserves a durable fork across late navigation and a real Workspac
   const f = await fixture(); let failure: Error | undefined;
   try {
     const other = await f.page.evaluate(() => window.flowmate.createSession({ title: 'Concurrent selection' })); if (!other.ok) throw new Error(other.error.code);
-    await f.page.reload();
+    await f.page.reload(); await f.page.getByRole('button', { name: 'Invoices', exact: true }).click();
     await expect(f.page.locator('.chat-current-title')).toHaveText('History original');
     const composer = f.page.getByRole('textbox', { name: 'Message to model' }); await composer.fill('Unmoved source draft');
     await installHistoryGate(f.app, f.userData);
@@ -326,7 +326,7 @@ test('P9 T08 restores the saved leaf after relaunch and keeps valid unknown inpu
     const launch = async () => {
       active = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
         env: { ...environment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: f.userData }, timeout: 30_000 });
-      const page = await active.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor(); return page;
+      const page = await active.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor(); return page;
     };
     let page = await launch();
     expect(await page.evaluate(id => window.flowmate.querySessionHistory({ sessionId: id }), f.seed.sessionId)).toEqual(saved);
@@ -360,7 +360,7 @@ test('P9 T08 keeps Workspace readable and reports unprovable input evidence when
       expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]); } finally { db.close(); }
     active = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
       env: { ...environment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: f.userData }, timeout: 30_000 });
-    const page = await active.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await active.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(workspace);
     const inputs = await page.evaluate(id => window.flowmate.listSessionInputs({ sessionId: id }), f.seed.sessionId);
     console.log('T08 malformed tree input boundary', JSON.stringify(inputs)); expect(inputs.ok).toBe(false);
@@ -415,7 +415,7 @@ async function treeFixture() {
   const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
     env: { ...environment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   const page = await app.firstWindow();
-  await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
   await page.evaluate(async id => { const workspace = await window.flowmate.readWorkspace(); if (!workspace.ok) throw new Error(workspace.error.code);
     const result = await window.flowmate.updateWorkspace({ expectedRevision: workspace.data.revision, change: { kind: 'session', sessionId: id } }); if (!result.ok) throw new Error(result.error.code);
   }, seed.sessionId);
@@ -468,7 +468,7 @@ test('P9 T08 returns explicit safe fork save failure revocation and tombstone fe
     active = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
       env: { ...environment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: f.userData }, timeout: 30_000 });
     activeChild = active.process();
-    page = await active.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    page = await active.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
   };
   try {
     const history = await page.evaluate(id => window.flowmate.querySessionHistory({ sessionId: id }), f.seed.sessionId); if (!history.ok) throw new Error(history.error.code);

@@ -71,7 +71,13 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
   const connect = async () => {
     browserRef.current = await chromium.connectOverCDP(`http://127.0.0.1:${address.port}`);
     const page = browserRef.current.contexts()[0]!.pages()[0]!;
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ state: 'visible', timeout: 15_000 });
+    await expect(page.getByRole('main', { name: 'Assistant', exact: true })).toBeVisible();
+    const input = page.getByRole('textbox', { name: 'Message to model', exact: true });
+    await input.click(); await expect(input).toBeFocused();
+    await input.press('ControlOrMeta+A'); await input.press('Backspace');
+    await input.pressSequentially('Dev home keyboard draft.');
+    await expect(input).toHaveValue('Dev home keyboard draft.');
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ state: 'visible', timeout: 15_000 });
     rendererUrl = new URL(page.url()).origin;
     return page;
   };

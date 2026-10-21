@@ -57,7 +57,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
   let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
   try {
     app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'), args: [join(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
-    page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     expect(await page.evaluate(async baseUrl => { const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'research-ui', credentialRef: '00000000000000000000000000000030', name: 'Research fixture', kind: 'custom', providerId: null,
         baseUrl: `${baseUrl}/v1`, model: 'research-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 4096, reasoning: false }], defaultModelId: 'research-ui' },

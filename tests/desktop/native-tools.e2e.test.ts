@@ -75,7 +75,7 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
     const page = await app.firstWindow();
     checkpoint = 'ready invoice view and directory tools';
     const nav = page.getByRole('navigation', { name: 'Workspace navigation' });
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     await nav.getByRole('button', { name: 'Chats', exact: true }).click();
     const before = await page.evaluate(() => window.flowmate.readWorkspace());
     expect(await page.getByRole('button', { name: 'New local task', exact: true }).count()).toBe(0);
@@ -155,6 +155,7 @@ it('ordinary desktop Send executes SDK tools, freezes each Run directory, restor
     const budgetSessions = await page.evaluate(() => window.flowmate.listSessions());
     if (!budgetSessions.ok) throw new Error('Budget Session unavailable');
     const budgetSessionId = budgetSessions.data.items.find(item => item.sessionId !== sessionId)!.sessionId;
+    await nav.getByRole('button', { name: 'Chats', exact: true }).click();
     await app.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, directoryB);
     await page.getByRole('button', { name: 'Choose directory', exact: true }).click();
     await page.waitForFunction(directory => (document.querySelector('.run-tools-panel input') as HTMLInputElement)?.value === directory, directoryB);

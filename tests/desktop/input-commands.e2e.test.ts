@@ -35,7 +35,7 @@ test('four command groups, keyboard and IME, role overrides, themes and real con
   let failure: Error | undefined;
   try {
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     const seed = await page.evaluate(async baseUrl => {
       const need = (r: any) => { if (!r.ok) throw Error(r.error.code); return r.data; };
       const state = need(await window.flowmate.getState());
@@ -53,7 +53,7 @@ test('four command groups, keyboard and IME, role overrides, themes and real con
         selection: { prompt: null, enabledSkills: [resources.items.find((item: any) => item.ref.id === 'invoice' && item.ref.kind === 'skill').ref] } }));
       return session;
     }, `http://127.0.0.1:${provider.port}/v1`);
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     const input = page.getByRole('textbox', { name: 'Message to model', exact: true });
     await input.fill('/'); const menu = page.getByRole('listbox', { name: 'Input commands' });
     await expect(menu).toBeVisible();
@@ -136,7 +136,7 @@ test('four command groups, keyboard and IME, role overrides, themes and real con
     await page.evaluate(async sessionId => { const workspace = await window.flowmate.readWorkspace(); if (!workspace.ok) throw Error(workspace.error.code);
       const selected = await window.flowmate.updateWorkspace({ expectedRevision: workspace.data.revision,
         change: { kind: 'session', sessionId } }); if (!selected.ok) throw Error(selected.error.code); }, fork.data.session.sessionId);
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await expect(page.locator('.agent-chat-panel')).toContainText('Both checks returned.');
     await expect(page.locator('.agent-chat-panel .chat-subagents')).toHaveCount(0);
     await expect(page.locator('.agent-chat-panel')).not.toContainText('subagent_identity_conflict');

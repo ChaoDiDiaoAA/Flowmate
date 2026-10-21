@@ -32,7 +32,7 @@ async function fixture(withSteer = false, live = false) {
     args: [join(repository, 'out/main/index.js')], env: { ...cleanEnvironment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   const page = await app.firstWindow();
   try {
-  await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+  await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
   const seed = await page.evaluate(async baseUrl => {
     const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
     const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'context-ui', credentialRef: '00000000000000000000000000000002', name: 'Context UI',
@@ -53,7 +53,7 @@ async function fixture(withSteer = false, live = false) {
     if (!extra.ok) throw new Error(extra.error.code); release(); }
   if (!live) await expect.poll(() => page.evaluate(() => window.flowmate.queryRuntimeState())).toMatchObject({ ok: true, data: { active: null } });
   await page.reload();
-  await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
   return { app, page, userData, seed, provider, requests: () => requests, release };
   } catch (error) { const failure = error instanceof Error ? error : new Error(String(error));
     release(); await provider.stop(); await closeDesktopFixture(app, userData, failure); throw failure; }
@@ -227,7 +227,7 @@ async function denseFixture() {
   const desktopProcess = app.process();
   deferCleanup(async () => { if (desktopProcess.exitCode === null && desktopProcess.signalCode === null) {
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate')?.restore()).catch(() => {}); await closeDesktopFixture(app, userData); } });
-  const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+  const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
   return { app, page, userData, seed, provider, requests: () => requests, rows, tables };
 }
 
@@ -360,7 +360,7 @@ it('invalidates Context during real Host exit and reads the same saved facts aft
     await closed; await f.app.close(); firstClosed = true;
     relaunched = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'), args: [join(repository, 'out/main/index.js')],
       env: { ...cleanEnvironment(), FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: f.userData }, timeout: 30_000 });
-    const page = await relaunched.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    const page = await relaunched.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Session details', exact: true }).click();
     await expect(page.getByTestId('context-snapshot-detail')).toContainText('Original user context');
     await expect(page.getByTestId('context-request')).toContainText('context-ui-response');

@@ -27,7 +27,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
   try {
     app = await electron.launch({ executablePath: electronPath, args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p6-observation', credentialRef: '00000000000000000000000000000003',
@@ -99,7 +99,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
       }
     }
     await page.reload();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
     await page.getByLabel('Processing request', { exact: true }).selectOption(String(identity.runId));
@@ -209,9 +209,9 @@ it('P6 Activity preserves drafts and verified history across a gap, a lost wake 
       Reflect.set(window, 'clearInterval', (id?: number) => { if (id !== undefined) ids.delete(id); stop(id); });
     });
     await page.reload();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.locator('.sidebar-chat[data-session-id="13"]').click();
-    await expect(page.getByRole('complementary', { name: 'Assistant', exact: true }).getByText('Observation 13', { exact: true })).toBeVisible();
+    await expect(page.getByRole('main', { name: 'Assistant', exact: true }).getByText('Observation 13', { exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Refresh history', exact: true })).toBeEnabled();
     await page.getByRole('textbox', { name: 'Message to model' }).fill('Draft retained while reading activity');
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
@@ -418,7 +418,7 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
         start(timeout === 2000 ? () => {} : handler, timeout, ...args)) as typeof window.setInterval;
     });
     await page.reload();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('textbox', { name: 'Message to model' }).fill('Lifecycle observation preserves this draft');
     // Playwright normally forces document.hasFocus() to true, which masks native blur.
     const cdp = await page.context().newCDPSession(page);
@@ -698,7 +698,7 @@ for (const action of ['last-window', 'quit', 'main-exit'] as const) {
       electronApp = await electron.launch({
         args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
       const page = await electronApp.firstWindow();
-      await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ state: 'visible', timeout: 20_000 });
+      await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ state: 'visible', timeout: 20_000 });
       const saved = await page.evaluate(async (port) => {
         const state = await window.flowmate.getState();
         if (!state.ok) return state;
@@ -781,7 +781,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
   try {
     electronApp = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await electronApp.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p5-model', credentialRef: '00000000000000000000000000000005',
@@ -1057,7 +1057,7 @@ it('desktop discloses the active Run and frozen invoice after the viewed invoice
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async port => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'active-context-model', credentialRef: '00000000000000000000000000000006',
@@ -1066,6 +1066,7 @@ it('desktop discloses the active Run and frozen invoice after the viewed invoice
       { modelId: 'active-context-model', apiKey: 'synthetic-active-context-key' });
     }, server.port)).toMatchObject({ ok: true });
     await page.reload();
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click();
     for (const source of sources) {
       await app.evaluate(({ dialog }, selectedDirectory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedDirectory] }); }, source);
       await page.getByRole('button', { name: /Import invoice/ }).click();
@@ -1131,7 +1132,7 @@ it(`desktop preserves a newer draft during Send preparation and ${outcome} admis
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'preparation-model', credentialRef: '00000000000000000000000000000007',
@@ -1219,7 +1220,7 @@ it(`desktop shows the actual frozen ${limit} allowance after budget exhaustion`,
   try {
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'frozen-budget-model', credentialRef: '00000000000000000000000000000008',
@@ -1228,7 +1229,7 @@ it(`desktop shows the actual frozen ${limit} allowance after budget exhaustion`,
       { modelId: 'frozen-budget-model', apiKey: 'synthetic-frozen-budget-key' });
     }, `http://127.0.0.1:${server.port}`)).toMatchObject({ ok: true });
     await page.reload();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     await page.getByRole('button', { name: 'New chat', exact: true }).click();
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await page.getByRole('tab', { name: 'Performance', exact: true }).click();
@@ -1285,7 +1286,7 @@ it(`desktop unknown input recovery preserves its draft for ${recovery}`, async (
   try {
     electronApp = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await electronApp.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     expect(await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'collision-model', credentialRef: '00000000000000000000000000000009',
@@ -1388,7 +1389,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
   try {
     electronApp = await launch();
     let page = await electronApp.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices' }).waitFor({ state: 'visible', timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices' }).waitFor({ state: 'visible', timeout: 20_000 });
     const composer = page.getByRole('textbox', { name: 'Message to model' });
     expect(await composer.isDisabled()).toBe(false);
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Models' }).click();
@@ -1700,7 +1701,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
 
     electronApp = await launch();
     page = await electronApp.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices' }).waitFor({ state: 'visible', timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices' }).waitFor({ state: 'visible', timeout: 20_000 });
     await page.locator(`.sidebar-chat[data-session-id="${firstSessionId}"]`).click();
     const restartedComposer = page.getByRole('textbox', { name: 'Message to model' });
     await restartedComposer.fill('Do you remember the total?');
@@ -1713,6 +1714,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
       null, { timeout: 20_000 });
     expect(JSON.stringify(requestBodies.at(-1))).toContain('Invoice total is 1060 CNY.');
     expect(JSON.stringify(requestBodies.at(-1))).toContain('What was the total?');
+    await page.screenshot({ path: it.info().outputPath('main-conversation-history.png') });
 
     const requestsBeforeNewChatEntry = requestBodies.length;
     await electronApp.evaluate(({ ipcMain }) => {
@@ -2695,7 +2697,7 @@ it('desktop completes import, Start Task, Run, candidate source and Activity wit
     env.FLOWMATE_TEST_INVOICE_SOURCE_ROOT = sourceRoot;
     electronApp = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await electronApp.firstWindow();
-    await page.getByRole('heading', { name: 'Invoices' }).waitFor({ state: 'visible', timeout: 20_000 });
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices' }).waitFor({ state: 'visible', timeout: 20_000 });
 
     await electronApp.evaluate(({ dialog }, selectedDirectory) => {
       const testDialog = dialog as unknown as {

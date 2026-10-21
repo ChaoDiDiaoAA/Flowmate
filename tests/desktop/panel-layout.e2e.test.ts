@@ -17,7 +17,7 @@ test('resizes and remembers panels without disturbing drafts, with keyboard, the
   let app: Awaited<ReturnType<typeof launch>> | null = await launch(), failure: Error | undefined;
   try {
     let page = await app.firstWindow();
-    const ready = async () => { await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); };
+    const ready = async () => { await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 }); };
     await ready(); await page.setViewportSize({ width: 1500, height: 950 });
     const sidebar = () => page.getByRole('separator', { name: 'Resize navigation', exact: true });
     const assistant = () => page.getByRole('separator', { name: 'Resize Assistant', exact: true });
@@ -37,6 +37,18 @@ test('resizes and remembers panels without disturbing drafts, with keyboard, the
     expect(await original!.evaluate(element => element.isConnected)).toBe(true);
     const widths = await page.evaluate(() => ['.desktop-shell', 'main'].map(selector => document.querySelector(selector)!.getBoundingClientRect().width));
     expect(widths[1]).toBeCloseTo(widths[0]! - 320 - 480, 1);
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    const mainAssistant = page.getByRole('main', { name: 'Assistant', exact: true });
+    await expect(mainAssistant).toBeVisible(); await expect(assistant()).toHaveCount(0);
+    await expect(sidebar()).toHaveAttribute('aria-valuenow', '320');
+    expect(await mainAssistant.evaluate(element => element.getBoundingClientRect().width)).toBeCloseTo(widths[0]! - 320, 1);
+    await sidebar().focus(); await sidebar().press('ArrowRight'); await expect(sidebar()).toHaveAttribute('aria-valuenow', '330');
+    await page.getByRole('button', { name: 'Models', exact: true }).click();
+    await expect(assistant()).toHaveAttribute('aria-valuenow', '480');
+    await expect(sidebar()).toHaveAttribute('aria-valuenow', '330');
+    await sidebar().press('ArrowLeft'); await expect(sidebar()).toHaveAttribute('aria-valuenow', '320');
+    expect(await original!.evaluate(element => element.isConnected)).toBe(true);
+    await page.getByRole('button', { name: 'Invoices', exact: true }).click();
     const cancelBox = (await sidebar().boundingBox())!;
     await page.mouse.move(cancelBox.x + 4, cancelBox.y + 100); await page.mouse.down();
     await expect(page.locator('.desktop-shell')).toHaveClass(/panels-resizing/);
@@ -75,6 +87,10 @@ test('resizes and remembers panels without disturbing drafts, with keyboard, the
     // Window fitting must not overwrite the user's saved widths.
     await page.setViewportSize({ width: 1100, height: 950 }); await expect(sidebar()).toHaveCount(0); await expect(assistant()).toBeVisible();
     await assistant().focus(); await assistant().press('ArrowLeft'); await expect(assistant()).toHaveAttribute('aria-valuenow', '570');
+    expect(await page.locator('.agent-chat-panel').evaluate(element => element.getBoundingClientRect().width)).toBeCloseTo(570, 1);
+    await drag(assistant(), -20); await expect(assistant()).toHaveAttribute('aria-valuenow', '590');
+    expect(await page.locator('.agent-chat-panel').evaluate(element => element.getBoundingClientRect().width)).toBeCloseTo(590, 1);
+    await drag(assistant(), 20); await expect(assistant()).toHaveAttribute('aria-valuenow', '570');
     await page.setViewportSize({ width: 980, height: 950 }); await expect(assistant()).toHaveCount(0);
     await page.setViewportSize({ width: 1500, height: 950 }); await expect(sidebar()).toHaveAttribute('aria-valuenow', '280');
     await expect(assistant()).toHaveAttribute('aria-valuenow', '570');

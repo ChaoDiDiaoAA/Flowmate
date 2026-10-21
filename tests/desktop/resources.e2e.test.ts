@@ -22,7 +22,7 @@ it('displays Core readiness independently of enablement and adapts both Skills e
     args: [join(repository, 'out/main/index.js')], env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
     await page.getByRole('button', { name: 'Skills', exact: true }).click();
     await page.getByRole('switch', { name: 'Enable invoice v1', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
@@ -137,7 +137,7 @@ it('manages fixed Prompt and Skill versions through real IPC without model or to
     args: [join(repository, 'out/main/index.js')], env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     const original = await page.evaluate(() => window.flowmate.readWorkspace());
     await expect(page.getByRole('button', { name: 'Prompts', exact: true })).toHaveCount(1, { timeout: 3000 });
     await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'LLM', exact: true }).click(); await page.locator('summary').filter({ hasText: /^Business instructions$/ }).click();
@@ -239,7 +239,7 @@ it('atomically clears multiple unavailable selected resources through visible co
     env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   let app = await launch(), failure: Error | undefined;
   try {
-    let page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    let page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     const saved = await page.evaluate(async () => {
       const state = await window.flowmate.getState(), catalog = await window.flowmate.listResources();
       if (!state.ok || !catalog.ok) throw new Error('Fixture settings unavailable');
@@ -251,7 +251,7 @@ it('atomically clears multiple unavailable selected resources through visible co
     await app.close();
     // Seed an isolated restart whose previously saved author versions are now unavailable. Recovery uses only real controls/IPC.
     await writeFile(join(userData, 'data', 'settings.json'), JSON.stringify(saved)); app = await launch();
-    page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'LLM', exact: true }).click(); await page.locator('summary').filter({ hasText: /^Business instructions$/ }).click();
     await expect(page.getByText('Missing enabled version: invoice missing-skill', { exact: false })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Clear all resource selections', exact: true })).toHaveCount(1, { timeout: 3000 });
@@ -287,7 +287,7 @@ it('uses the desktop Prompt in real SDK and HTTP requests, rejects unavailable n
     args: [join(repository, 'out/main/index.js')], env: { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData }, timeout: 30_000 });
   let failure: Error | undefined;
   try {
-    const page = await app.firstWindow(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     const sessionId = await page.evaluate(async baseUrl => {
       const state = await window.flowmate.getState(); if (!state.ok) throw new Error(state.error.code);
       const settings = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'p11-ui', credentialRef: '00000000000000000000000000000031', name: 'P11 UI',
@@ -299,7 +299,7 @@ it('uses the desktop Prompt in real SDK and HTTP requests, rejects unavailable n
       const selected = await window.flowmate.updateWorkspace({ expectedRevision: current.data.revision, change: { kind: 'session', sessionId: session.data.sessionId } });
       if (!selected.ok) throw new Error(selected.error.code); return session.data.sessionId;
     }, `http://127.0.0.1:${provider.port}/v1`);
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'LLM', exact: true }).click(); await page.locator('summary').filter({ hasText: /^Business instructions$/ }).click(); await page.getByRole('button', { name: 'Use invoice v1', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
     await page.getByRole('button', { name: 'Skills', exact: true }).click(); await page.getByRole('switch', { name: 'Enable invoice v1', exact: true }).click();

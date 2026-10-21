@@ -16,7 +16,7 @@ async function open(root: string) {
   const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
     args: [join(repository, 'out/main/index.js')], env: environment(root), timeout: 30_000 });
   const page = await app.firstWindow();
-  await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
   await expect.poll(() => page.evaluate(async () => { const s = await window.flowmate.getState(); return s.ok && s.data.ready; })).toBe(true);
   return { app, page };
 }
@@ -79,7 +79,7 @@ for (const mode of ['manual', 'threshold', 'overflow', 'cancel', 'auto-cancel'] 
     }
     if (mode === 'auto-cancel') await enteredSummary;
     if (mode === 'overflow') lastRun = await run(page, sessionId, 5, 'Explicit overflow question');
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Session details', exact: true }).click();
     const panel = page.getByTestId('session-compaction');
     await expect(panel.getByRole('button', { name: 'Refresh compaction', exact: true })).toBeEnabled();
@@ -197,7 +197,7 @@ test('P10 readonly UI lease discards a late query after switching Session', asyn
             usage: null, originSessionId: value.a } : null } };
       });
     }, ids);
-    await page.reload(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
+    await page.reload(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Session details', exact: true }).click();
     await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p10Lease').calls)).toBeGreaterThan(0);
     await page.getByRole('button', { name: 'Close details', exact: true }).click();
