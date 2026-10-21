@@ -16,7 +16,6 @@
   <a href="#highlights">研究与工程亮点</a> ·
   <a href="#deep-research">Deep Research</a> ·
   <a href="#runtime">工具 Runtime</a> ·
-  <a href="docs/public/subagents.zh-CN.md">Subagent 专题</a> ·
   <a href="#architecture">架构与职责</a> ·
   <a href="#quick-start">快速开始</a> ·
   <a href="#development">测试与评测</a> ·
@@ -25,7 +24,9 @@
 
 Flowmate 面向需要处理本地资料、保留工作过程并复核交付结果的任务。**Deep Research** 将问题组织为研究计划、子问题、Claim 与证据链；**资料问答**支持连续对话和工具使用；**发票处理**提供候选生成、人工复核、接受与导出。三条路径可独立使用。
 
-**公开文档：** [简体中文](docs/public/README.zh-CN.md) · [English](docs/public/README.md) · [快速开始](docs/public/getting-started.zh-CN.md) · [Subagent](docs/public/subagents.zh-CN.md) · [评测指南](docs/public/EVALUATION.zh-CN.md)。
+![Flowmate 桌面工作台：会话列表、工作目录与 Assistant](docs/screenshots/Chats.png)
+
+*桌面工作台：左侧切换任务与资源，中央管理会话和工作目录，右侧使用 Assistant。*
 
 <a id="highlights"></a>
 
@@ -48,6 +49,10 @@ Flowmate 面向需要处理本地资料、保留工作过程并复核交付结�
 ## 🔬 Deep Research：从研究问题到可追溯的证据链
 
 研究任务需要回答多个相关问题，并解释结论如何得到。Flowmate 用结构化计划和 Claim 承载研究过程，让用户能检查资料、补充缺口，并查看支持最终答案的中间结论。
+
+![Deep Research 研究入口：新建任务与研究步骤](docs/screenshots/Deep%20Research.png)
+
+*Deep Research：从研究入口新建任务，按“问题与资料 → 确认计划 → 研究报告”推进。*
 
 ### 研究流程
 
@@ -140,6 +145,10 @@ Flowmate 把可操作的参数错误、失败位置、输出检查结果和缺�
 
 Skill Hub 将技能从作者资源接入到具体运行，形成统一流程：
 
+![Skill Hub 技能管理：搜索、状态筛选、能力就绪情况与启停](docs/screenshots/Skills.png)
+
+*Skill Hub：集中搜索与筛选技能，查看能力就绪情况，并显式启用或停用。*
+
 **发现资源 → 检查依赖 → 用户启用 → 形成运行副本 → 注入短索引 → 按需读取正文。**
 
 ```mermaid
@@ -163,6 +172,10 @@ Pi 提供基础 Skill 资源机制；Flowmate 负责资源发现与刷新、显�
 ### Subagent：由产品 Runtime 驱动的任务委派
 
 Flowmate 自定义子代理驱动将任务委派纳入同一套产品运行管理：
+
+![Subagent 启用入口：Extensions 中的 subagents 开关与 Manage agents 入口](docs/screenshots/Extensions.png)
+
+*Subagent 启用入口：在 Extensions 中启用 subagents，并从 Manage agents 进入角色管理。*
 
 **主 Agent 发起委派 → 核验来源与角色 → 创建独立子会话和子 Run → 执行受限工具 → 保存结果与停止事实 → 回送父 Agent 并更新桌面状态。**
 
@@ -286,6 +299,10 @@ Renderer 支持热更新；Main / Preload 改动触发停止、关闭与重建�
 
 准备同一张发票的原件与外部已生成的解析材料，开发环境正式导入来源为 `data/invoices/agent-input/`。在 **Invoices** 导入并查看 **Original / Parsed / Results**，点击 **Process this invoice**，再在 Assistant 点击 **Send**。
 
+![发票处理入口：导入发票、选择处理任务与 Assistant](docs/screenshots/Invoices.png)
+
+*发票处理入口：在 Invoices 导入并发起处理，通过右侧 Assistant 继续交互。*
+
 选择候选后，可用 **Fill with Agent** 实际填表，或用 **Edit** 人工编辑；核对并保存后，通过 **Accept result** 明确接受，再导出 JSON、CSV 或 Markdown。业务取证读取已登记解析材料，原票用于人工对照，Host 不运行发票解析器。
 
 默认桌面数据根为 `%APPDATA%\Flowmate`，数据库位于 `data\app.sqlite`。候选生成、编辑保存和接受分别记录；未保存编辑只存在于当前窗口，离开时按提示保存或放弃。撤回材料使用权限后，受影响会话不能继续请求模型。
@@ -338,6 +355,10 @@ scripts/             开发、测试与打包入口
 标准 `test` 入口依次运行类型检查、Unit、Integration、桌面构建与 Electron E2E。临时数据目录和受控 Provider 用于检查配置、消息、工具、取消、恢复与桌面接合，不请求付费模型。
 
 Agent 评测使用专用 Agent 与 Judge 配置，通过独立本地 Host 调用同一产品核心，采集真实产品状态与工具记录。本地保存 Execution、Trial、Trace、交付产物和评分，桌面 **Evaluation** 提供配置、执行与查看入口；Langfuse 用于可选的平台查看与显式导出。
+
+![Evaluation 评测配置：数据集、重复次数、Judge 模式与执行历史入口](docs/screenshots/Evaluation.png)
+
+*评测工作台：选择数据集、重复次数与 Judge 模式，预览评测配置，并查看已保存的执行。*
 
 ### 独立评测的执行与评分
 
