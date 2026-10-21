@@ -30,10 +30,14 @@ Desktop credentials are stored using system encryption. Do not paste credentials
 
 ## First conversation
 
-1. Open **Chats** and create a conversation.
+The application opens in the main conversation view. Opening it does not create a Session or request a model response.
+
+1. After configuring the model, click **New chat** in the left navigation to create a Session and open the main conversation canvas.
 2. Enter a small request such as “Summarize the following paragraph and identify what it does not establish,” followed by non-sensitive sample text.
-3. Click **Send** in Assistant. Watch the Run and response; use **Stop** if needed, then wait for actual stopping facts.
-4. Reopen the conversation to inspect saved history. Viewing history does not start another model request.
+3. Click **Send** in the main conversation. Watch the Run and response; use **Stop** if needed, then wait for actual stopping facts.
+4. Open the conversation from recent chats in the left navigation or from **Chats** to return to the main canvas and inspect saved history. Viewing history does not start another model request.
+
+On business and settings pages, the conversation appears in the right-side Assistant. Switching presentations or collapsing and reopening that pane preserves the current Session draft in the window. Open **Invoices** or **Deep Research** for their business workflows; see [UI system](UI-SYSTEM.md) for layout behavior.
 
 For local-file work, select the intended working directory or authorized material before sending and state the scope in the request. Available native tools may include file writes and shell commands. Directory selection sets a working location; it is not a filesystem sandbox.
 

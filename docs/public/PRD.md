@@ -12,13 +12,15 @@ The primary development and packaging target is Windows x64. Local-first describ
 
 | Need | User path | Reviewable result |
 |---|---|---|
-| Ask about supplied information | Chats, selected materials or working directory, Assistant Send | Conversation history, actual tool records and context basis |
+| Ask about supplied information | Main conversation via New chat or saved chat, selected materials or working directory, Send | Conversation history, actual tool records and context basis |
 | Investigate a question across local sources | Deep Research, plan, user confirmation, investigation | Saved sources, Claims, full or partial report with gaps |
 | Extract and check an invoice | Invoices, existing parsed material, processing, review | Candidate versions, field evidence, explicit acceptance and export |
 | Delegate an independent check | Enable subagents and select a registered role | Owned child Session/Run, actual output and stopping facts |
 | Measure task behavior | Evaluation or CLI, dedicated models and dataset | Isolated Trials, execution evidence, scoring and review records |
 
 Read [Workflows](workflows.md) for the steps and [Subagents](subagents.md) for delegation constraints.
+
+The default view is the main conversation. **Chats** lists and manages saved Sessions; opening an entry or a recent chat returns to the main conversation. Business and settings pages retain a right-side Assistant. See [UI system](UI-SYSTEM.md) for layout and interaction rules.
 
 ## Functional boundaries
 

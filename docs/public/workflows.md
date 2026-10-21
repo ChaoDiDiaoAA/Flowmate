@@ -4,7 +4,7 @@
 
 ## Ask about local information
 
-1. Create/select a **Chats** conversation and configure its model.
+1. Configure a model, then use **New chat** in the left navigation to open a new main conversation, or select an existing one from recent chats or **Chats**.
 2. Supply text, select authorized materials or choose the intended working directory. Say what the Agent should inspect and what constitutes an answer.
 3. Send once and watch the actual Run/tools. A selected directory determines execution location, not an OS sandbox; native command/write tools may be available.
 4. Check the answer against source text. Open Session Details/Context and tool evidence when a citation, material version or execution claim is unclear.
@@ -28,7 +28,7 @@ flowchart LR
   Report --> Review[Review and save Markdown]
 ```
 
-1. Open **Deep Research**, import/select local material or existing parsed documents, enter the question and scope, and create the research task.
+1. Open **Deep Research** from the left navigation, import/select local material or existing parsed documents, enter the question and scope, and create the research task. This business page uses the linked right-side Assistant.
 2. Send in the linked Assistant to generate a plan. Inspect its questions, evidence needs, budget and stop conditions. Revise as necessary; confirmation is a separate user action before investigation.
 3. Investigate under the confirmed plan. Actual reads preserve source bodies and Run/ToolCall identities. If subagents is enabled, independent questions may use `research-investigator`; the parent retains responsibility for synthesis and saving.
 4. Review **Evidence** and **Report**. Claims associate evidence relations and dependencies with the plan's questions. Source references must identify the actual source execution, and excerpts/locators must match saved text.
@@ -52,7 +52,7 @@ flowchart LR
   Accept --> Export[JSON / CSV / Markdown export]
 ```
 
-1. In **Invoices**, import the prepared material and inspect **Original / Parsed / Results**.
+1. Open **Invoices** from the left navigation, import the prepared material and inspect **Original / Parsed / Results**. The right-side Assistant accompanies the invoice workspace.
 2. Click **Process this invoice**, then **Send** in Assistant. Processing and candidate saving have actual Run/ToolCall records.
 3. Select the candidate. Compare header fields, line items, amounts, uncertainties and source locations with the original and parsed evidence.
 4. Use **Fill with Agent** to invoke the real form operation, or **Edit** for human changes. Fill requires the original candidate/target/revision and a matching application receipt; a tool request alone does not prove the UI was filled.
