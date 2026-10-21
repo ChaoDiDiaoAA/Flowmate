@@ -62,9 +62,12 @@ Thumbs.db
 /.codegraph/
 /.zread/
 
-# Archived v0 material is retained locally only; current v1 specifications
-# and Pn plans must remain versionable.
+# Internal material is retained locally only; public documentation lives in docs/public/.
 /docs/v0/
+/docs/eval/
+/docs/plans/
+/docs/prompt/
+/docs/spec/
 
 # SQLite sidecars
 *.sqlite-wal

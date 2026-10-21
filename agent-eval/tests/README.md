@@ -23,4 +23,4 @@
 
 ## Trial次数、Case指标及重复诊断
 
-CLI统一--trials N（默认1，范围1–20），旧--repeat启动前拒绝。Case定义不加repetition／trialId；它们位于Trial记录。内部repeat／repetition和历史报告／CSV兼容。Smoke、Full、单题及专项共同支持；Full --trials 5计划310个Trial，Smoke为70。每次Trial显示结论，最终保存后每Case打印自己的适用指标一次，必需未测项仍显示，stderr不打印整段JSON。trialStatistics独立记录pass@k／pass^k及波动，不修改39项公式；旧status可只读派生，不重评分。完整命令、字段及解释见../../docs/eval/06_Flowmate_Agent评测数据集制作实施与操作手册_v1.md §9.1–9.4。受控测试不证明真实业务稳定性。
+CLI统一--trials N（默认1，范围1–20），旧--repeat启动前拒绝。Case定义不加repetition／trialId；它们位于Trial记录。内部repeat／repetition和历史报告／CSV兼容。Smoke、Full、单题及专项共同支持；Full --trials 5计划310个Trial，Smoke为70。每次Trial显示结论，最终保存后每Case打印自己的适用指标一次，必需未测项仍显示，stderr不打印整段JSON。trialStatistics独立记录pass@k／pass^k及波动，不修改39项公式；旧status可只读派生，不重评分。完整命令、字段及解释见[重复试验说明](../../docs/public/EVALUATION.zh-CN.md#trials)。受控测试不证明真实业务稳定性。

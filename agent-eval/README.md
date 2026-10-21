@@ -44,7 +44,7 @@ bun run eval -- dataset validate --dir agent-eval/src/datasets
 bun run eval -- doctor --backend local
 ```
 
-数据校验无需凭据。doctor 检查配置、数据和本机运行环境，必要时只读模型元数据，不生成回答或评分；未就绪返回非零状态。基线三个 TS 数据文件、附加专项、场景和 Fixture 的详细制作约定见 docs/eval。本地Agent评测由CLI启动独立本机Host，不需要Docker或镜像。
+数据校验无需凭据。doctor 检查配置、数据和本机运行环境，必要时只读模型元数据，不生成回答或评分；未就绪返回非零状态。基线三个 TS 数据文件、附加专项、场景和 Fixture 的详细制作约定见[公开评测指南](../docs/public/EVALUATION.zh-CN.md)。本地Agent评测由CLI启动独立本机Host，不需要Docker或镜像。
 
 ## 执行评测
 
@@ -80,7 +80,7 @@ Smoke／Full 始终本地执行，填写 Langfuse 配置不会触发上传。两
 
 新 Execution 根据 Dataset 声明全集保存到 `agent-eval/runs/business/<execution-id>/`、`research/<execution-id>/` 或 `mixed/<execution-id>/`；Smoke／单题选集不改变归属。目录包含 snapshot.json、report.json、逐Trial evidence 和派生 badcases.json／badcases.md。artifacts/、review.json 和 export.json 只在有实际业务产物、真实反馈或导出尝试时保存；校准在 `runs/calibration/<id>/summary.json` 及同目录 Badcase 文件，Case 审核在 `runs/case-reviews/review.json`。
 
-查看、比较、补传、审核和平台入口共享按 ID 查找，兼容旧 `runs/<execution-id>/` 与 `calibration-runs/<id>/`；同 ID 多处存在明确报冲突，不选最新或静默合并。既有两个 Execution 迁移完整目录，保留原始记录、ID、参数和分数，不重跑或重评。完整目录见[实施手册 §8.2](../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md#eval05-directory-tree)，文件职责与生成条件见[§8.3](../docs/eval/05_Flowmate_Agent评测分阶段实施与操作手册_v1.md#eval05-runtime-files)。
+查看、比较、补传、审核和平台入口共享按 ID 查找，兼容旧 `runs/<execution-id>/` 与 `calibration-runs/<id>/`；同 ID 多处存在明确报冲突，不选最新或静默合并。既有两个 Execution 迁移完整目录，保留原始记录、ID、参数和分数，不重跑或重评。完整目录见[公开评测指南](../docs/public/EVALUATION.zh-CN.md#reports)，文件职责与生成条件见[公开评测指南](../docs/public/EVALUATION.zh-CN.md#reports)。
 
 `evidence/` 下每个 Trial 都有独立子目录，多个 Case 和重复尝试不会平铺或共用证据文件。取消、停止不明或运行异常时，终端显示原因及已有报告位置；仍在等待、单题已保存或已有目录均不表示整批评测通过。用 `status` 核对执行与评分状态；`pending` 表示尚未完成评分。
 
@@ -88,7 +88,7 @@ trial 保存实际 InitialInput／附件与后续输入；events.jsonl 保留运
 
 Badcase 是报告层自动派生的 `flowmate-badcase-index/v1` 复核候选，与原分数和真实反馈独立。已发生 Trial 的 FAIL／ERROR／UNJUDGEABLE 和评分异常进入候选，计划未启动的 NOT_RUN 排除；有证据的 PASS 异常、恢复后通过、人工分歧和比较退步可补充候选。索引保存失败警告不改原判定；`status` 从原报告／证据只读重建候选视图，零模型／平台调用、不回写文件，索引不自动上传 Langfuse。实际归因与修复范围记 `agent-eval/records/<batch>/issues.md`，reruns.csv／exposure.csv 仅在对应真实事件后创建。
 
-**Smoke后如何执行专项：** badcases.json／md是待核验索引，不是可运行数据集。用户或Agent核验任务、Gold、评分器和证据后编辑专项声明，离线校验→必要Judge校准→单题→完整专项→显式重复→基线Smoke；不增加命令，也不自动付费执行。专项结果按新Execution保存到runs/business或research，由报告dataset.id及regressionOrigins关联原失败；完整分阶段命令、停止条件和方法引用见[07 §5.1](../docs/eval/07_Flowmate_Langfuse接入与评测执行操作手册_v1.md#platform-badcase-suite)。
+**Smoke后如何执行专项：** badcases.json／md是待核验索引，不是可运行数据集。用户或Agent核验任务、Gold、评分器和证据后编辑专项声明，离线校验→必要Judge校准→单题→完整专项→显式重复→基线Smoke；不增加命令，也不自动付费执行。专项结果按新Execution保存到runs/business或research，由报告dataset.id及regressionOrigins关联原失败；完整分阶段命令、停止条件和方法引用见[公开评测指南](../docs/public/EVALUATION.zh-CN.md#regressions)。
 
 附加专项集由 `src/datasets/badcase/` 维护Case／Gold／Review引用及来源关联，不追加到默认Full62／Smoke14或`--dataset all`。当前业务专项 `flowmate-badcase-business-v1` 收录FM-045，研究专项 `flowmate-badcase-research-v1` 收录FM-051；FM-020／024因任务要求与通用完整字段／明细判据有范围歧义暂缓，原Case和旧分数不改。首批为工程核验，不代表独立真人认可或真实复测成功。
 
@@ -118,4 +118,4 @@ Judge通过Pi SDK provider生成评分。Judge 复用现有 Pi SDK ModelRuntime.
 
 ## Trial次数、Case指标及重复诊断
 
-CLI统一--trials N（默认1，范围1–20），旧--repeat启动前拒绝。Case定义不加repetition／trialId；它们位于Trial记录。内部repeat／repetition和历史报告／CSV兼容。Smoke、Full、单题及专项共同支持；Full --trials 5计划310个Trial，Smoke为70。每次Trial显示结论，最终保存后每Case打印自己的适用指标一次，必需未测项仍显示，stderr不打印整段JSON。trialStatistics独立记录pass@k／pass^k及波动，不修改39项公式；旧status可只读派生，不重评分。完整命令、字段及解释见../docs/eval/06_Flowmate_Agent评测数据集制作实施与操作手册_v1.md §9.1–9.4。受控测试不证明真实业务稳定性。
+CLI统一--trials N（默认1，范围1–20），旧--repeat启动前拒绝。Case定义不加repetition／trialId；它们位于Trial记录。内部repeat／repetition和历史报告／CSV兼容。Smoke、Full、单题及专项共同支持；Full --trials 5计划310个Trial，Smoke为70。每次Trial显示结论，最终保存后每Case打印自己的适用指标一次，必需未测项仍显示，stderr不打印整段JSON。trialStatistics独立记录pass@k／pass^k及波动，不修改39项公式；旧status可只读派生，不重评分。完整命令、字段及解释见[重复试验说明](../docs/public/EVALUATION.zh-CN.md#trials)。受控测试不证明真实业务稳定性。

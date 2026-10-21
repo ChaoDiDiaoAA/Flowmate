@@ -52,4 +52,4 @@ bun run test
 
 同一桌面回归还将实际保存前的配置快照延后投递，核新配置/凭据不回退；延迟已真实提交的删除模型回复，再投递受控 Host 不可用状态，核旧闭包不能重开 Host/Runtime 准入。受控可用性事件只验证接收规则，不证明真实 Host 崩溃或完整 P16 恢复。
 
-开发期间持续工程验证；完整 Agent 后才运行 `eval:smoke/full`，不包含在 `test` 中。详见 [总方案](../docs/eval/01_Flowmate_Agent评测总方案_v1.md)。
+开发期间持续工程验证；完整 Agent 后才运行 `eval:smoke/full`，不包含在 `test` 中。详见 [公开评测指南](../docs/public/EVALUATION.zh-CN.md)。
