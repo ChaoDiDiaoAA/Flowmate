@@ -4,9 +4,21 @@
 
 ## What a child task is
 
-A parent Agent can call the registered **`Agent`** tool to delegate a bounded, foreground task to a role. The product creates a separate child Session, native Pi AgentSession and Run, links them to the original parent ToolCall, and returns the actual child result to the parent. Both execute within the same Bun Host.
+A parent Agent can call an **`Agent`** tool to delegate a bounded task. Flowmate supports two paths: ordinary Chats, Invoices and Deep Research use the controlled AgentSession subagents extension; [Personal Agent](personal-agent.md) uses a separate Durable adapter for invoice evidence. Both create product child records linked to the original parent call, but their native execution, setup and recovery differ. Parent and child run in the Application-owning process, whether that owner is the local Host or an explicitly selected ServiceOwner.
 
-A role is a system prompt and an allowed tool list, not another unrestricted assistant. Current children are read-only, share root budgets, and cannot run nested or background tasks. They do not gain an OS sandbox or independent model configuration.
+A role is a system prompt and an allowed tool list, not another unrestricted assistant. Current children are read-only, share their owner's budgets, and cannot delegate again or use a user-selected background option. They do not gain an OS sandbox or independent model configuration.
+
+## Personal Agent: Durable delegation
+
+In **Personal Agent → Assistant configuration**, enable the **Agent** tool if delegation is appropriate. The parent may then call it for a bounded invoice-evidence question; a request to delegate is not proof that a child ran. The Durable path supports only the built-in `invoice-evidence-checker` role. It does not require the AgentSession extension, role management screen, slash command or Prompt templates described below. Personal Agent currently has no Durable adapter for extensions.
+
+Core verifies the original Work, Attempt, phase and ToolCall, prepares the child from the authorized phase context, and creates linked product child Session/Run records. The Durable adapter owns the child conversation and native Task, executes the permitted read-only subset of tools, and returns a report or an evidence gap to the original parent call. The **Tasks** view exposes child status, report, parent delivery and stop facts; a report or source reference does not itself establish semantic correctness or accept an invoice.
+
+The Work shares model requests, tool calls, feedback capacity and time across its attempts and children. At most **four** children may remain owned; when all slots are occupied, admission reports `subagent_capacity_exceeded`. A child with an unconfirmed stop continues to occupy capacity. Durable admission requires remaining model budget, but does not promise the AgentSession path's reserved parent-continuation request. Children cannot create nested children, use a user-selected background option or perform business writes.
+
+**Stop current attempt** requests stopping of its owned children as well. Inspect actual stopping and saved child facts; cancellation or a lost reply is not confirmation of cleanup. The Personal Agent Tasks view currently provides child history and reports, not a separate child-stop button. Backend recovery reconciles original persisted identities and eligible native Tasks; it does not authorize a replacement solely because an outcome is unknown. See [Personal Agent](personal-agent.md) for Work continuation, cancellation and system-service limits.
+
+The remaining setup, command, sequence, permission table and lifecycle sections describe the **AgentSession extension path**.
 
 ## Prepare the extension and roles
 
@@ -127,9 +139,10 @@ Delegation spends shared requests and time. Prefer a single parent pass for smal
 | [RuntimeService](../../packages/core/src/runtime/service.ts) | Child admission, product Session/Run, shared budgets, cancellation and final persistence |
 | [Pi Session adapter](../../packages/runtime-pi/src/session.ts) | Managed child construction, model/tool binding, history and cleanup |
 | [Controlled extension](../../packages/runtime-pi/src/extensions/subagents.ts) | Register actual plugin tool/command with verified ownership |
+| [Personal Agent delegation](../../packages/core/src/personal-agent/subagents.ts), [Durable child adapter](../../packages/runtime-durable/src/subagents.ts) | Admit and reconcile the fixed invoice evidence role and native Durable child execution |
 | [Contracts](../../packages/contracts/src/subagents.ts) | Arguments, identities, summaries, detail and cancellation responses |
 | [Role/input definitions](../../packages/core/src/prompt-templates.ts) | Author/user roles, template expansion and fixed Run definitions |
 
 The pinned `pi-subagents` dependency provides plugin orchestration; the Pi coding-agent patch and subagent patch expose the managed hooks used by the product. They are required dependencies, not optional documentation assets; see [Development](development.md#dependency-patches).
 
-Verification entry points: [Runtime/Pi integration](../../tests/runtime-pi/subagents.integration.test.ts), [product child lifecycle](../../tests/core/application/subagents.integration.test.ts), [parallel admission/budgets](../../tests/core/application/parallel-subagents.integration.test.ts), [storage ownership](../../tests/core/storage/subagents.integration.test.ts), [contracts](../../tests/contracts/subagents.unit.test.ts), and [Electron UI](../../tests/desktop/subagents.e2e.test.ts). These tests use controlled conditions and do not certify real-model delegation quality.
+Verification entry points: [Runtime/Pi integration](../../tests/runtime-pi/subagents.integration.test.ts), [product child lifecycle](../../tests/core/application/subagents.integration.test.ts), [parallel admission/budgets](../../tests/core/application/parallel-subagents.integration.test.ts), [Durable children](../../tests/core/application/personal-subagents.integration.test.ts), [Durable adapter](../../tests/runtime-durable/subagents.integration.test.ts), [storage ownership](../../tests/core/storage/subagents.integration.test.ts), [contracts](../../tests/contracts/subagents.unit.test.ts), and [Electron UI](../../tests/desktop/subagents.e2e.test.ts). These tests use controlled conditions and do not certify real-model delegation quality.

@@ -48,19 +48,19 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 3. 阅读操作回执，区分资料保存、执行授权受理、原尝试或新尝试、排队与受阻。原尝试正常完成后的有效补料可以自动继续符合条件的工作；用户停止或失败后的补料仅保存，须明确继续。
 4. 逐票明确最终处置为 `accepted`、`rejected` 或 `excluded`。普通 **Reject** 只拒绝候选，不结束该票处理；有候选或 Run 成功均不单独代表事项完成。
 
-查看页面/历史与桌面重连仅纯读，不发起模型或工具调用，也不触发后端恢复。后端启动恢复另行加载原持久事实和原生记录，核已保存授权及当前资格后恢复符合条件的原尝试；不因事项仍 `open` 产生新意图，不复活已停止或失败的尝试。本次工程交付覆盖应用运行期间已验证的行为；关闭桌面后执行、Windows 服务重启恢复与开机恢复仍属系统服务目标，真实 SCM 验收延期。继续和复核的细节见 [Personal Agent 流程](workflows.zh-CN.md#personal-agent)。
+查看页面/历史与桌面重连仅纯读，不发起模型或工具调用，也不触发后端恢复。后端启动恢复另行加载原持久事实和原生记录，核已保存授权及当前资格后恢复符合条件的原尝试；不因事项仍 `open` 产生新意图，不复活已停止或失败的尝试。本次工程交付覆盖应用运行期间已验证的行为；关闭桌面后执行、Windows 服务重启恢复与开机恢复仍属系统服务目标，真实 SCM 验收延期。配置、继续和复核细节见 [Personal Agent](personal-agent.zh-CN.md)。
 
 ## 按需启用能力
 
 在 **Skills** 或 **Settings → Skills** 刷新资源、查看缺失依赖并启用版本。新资源默认不启用，Partial 表示尚未完全就绪。
 
-需要独立检查时，启用 **Extensions → subagents**，查看 **Plugin details → Manage agents**，可先尝试不带工具的 `general-analyst`：
+在 AgentSession 对话中需要独立检查时，启用 **Extensions → subagents**，查看 **Plugin details → Manage agents**，可先尝试不带工具的 `general-analyst`：
 
 ```text
 /subagent general-analyst 只依据这里提供的文字，比较以下两种解释：……
 ```
 
-命令仍需模型实际发出 `Agent` 工具调用；命令或模板成功展开不证明子任务执行。准备、实际子任务卡片和故障处理见 [Subagent](subagents.zh-CN.md)。
+命令仍需模型实际发出 `Agent` 工具调用；命令或模板成功展开不证明子任务执行。Personal Agent 使用单独配置的 Durable `Agent` 工具，不使用此扩展命令。两条路径的准备、实际子记录与故障处理见 [Subagent](subagents.zh-CN.md)。
 
 ## 后续流程与常见问题
 

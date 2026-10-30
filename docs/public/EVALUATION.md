@@ -29,7 +29,9 @@ flowchart LR
     I --> J[Targeted improvement and next run]
 ```
 
-The subject uses the product core in an isolated local Host. The scoring side receives independent Gold and recorded execution; Gold never enters the subject's context. Langfuse provides observations and scores, while local evidence retains the complete comparison and Gate decision. Candidate mining, replay and publication require explicit operations.
+The subject uses the product core in an isolated local Host. The scoring side receives independent Gold and recorded execution; Gold never enters the subject's context. Langfuse provides observations and scores when the selected workflow uploads them, while local evidence retains comparison and Gate facts. Candidate mining, replay and publication require explicit operations. Some local evaluation paths do not require export; the standard Smoke/Full workflow below requires Langfuse preflight and includes upload and readback.
+
+The original Smoke/Full selections cover their specified business and research Cases; they do not alone certify [Personal Agent](personal-agent.md) Durable work or real user value. The [Personal Agent evaluation integration test](../../agent-eval/tests/adapters/personal-runtime.integration.test.ts) exercises controlled product commands; it is engineering evidence rather than a real-model quality benchmark.
 
 | Object | Meaning |
 |---|---|
@@ -89,12 +91,12 @@ A valid metric with no actual opportunities may be N/A only when the complete ev
 
 The two standard entry points run a fixed model comparison with **one repetition per Case per model**:
 
-| Entry | Selection | Subject Trials |
+| Entry | Selection | Planned subject Trials |
 |---|---|---|
 | Smoke | 7 Cases × 2 models × 1 | 14 |
 | Full | 62 Cases × 2 models × 1 | 124 |
 
-Running both produces **138 subject Trials**, with no separate canary. Judge and mining calls are not subject Trials. One repetition can describe these observations, not stability or reliable improvement.
+Running both plans **138 subject Trials**, with no separate canary. Planned counts are not proof that execution, scoring or upload completed. Judge and mining calls are not subject Trials. One repetition can describe completed observations, not stability or reliable improvement.
 
 | Role | Configuration |
 |---|---|
@@ -131,9 +133,11 @@ Each Run is saved under `agent-eval/runs/Run-<Shanghai date_time>-smoke|full-com
 
 Independent product Traces use flat `Trace-<date>-<entry>-<purpose>-01.json` files with internal UUIDs. Four feedback targets—Case quality, saved Run, Trace and candidate review—share `agent-eval/feedback.json`, created only after real feedback. Candidate and published benchmark layouts are covered in the [authoring guide](EVALUATION-BENCHMARK.md).
 
+<a id="configuration"></a>
+
 ## Configuration, UI and commands
 
-Use the private `agent-eval/configs/.env`; same-name system environment variables take precedence. The [module reference](../../agent-eval/README.md) lists the exact role and Langfuse fields. The Judge uses the existing local HTTP gateway; native mining reuses the existing Codex login. Sol and Luna use separate roles on the same local gateway; external provider credentials are not forwarded to it.
+Use the private `agent-eval/configs/.env`; same-name system environment variables take precedence. The [module reference](../../agent-eval/README.md) lists the exact role and Langfuse fields. The two benchmark commands require a valid Langfuse project and the configured local gateway models before execution. The Judge uses the existing local HTTP gateway; native mining reuses the existing Codex login. Sol and Luna use separate roles on the same local gateway; external provider credentials are not forwarded to it.
 
 Run from the repository root:
 
@@ -142,7 +146,7 @@ bun --no-env-file run eval:smoke
 bun --no-env-file run eval:full
 ```
 
-Each command performs preflight, real execution, deterministic checks and applicable combined judging, local capture, Langfuse upload/readback, diagnostics, comparison, the matching baseline/Gate and a readable README. Quality failure remains a completed measurement when execution and evidence are complete. Pipeline completion, absolute quality, relative Gate and upload verification are reported separately.
+Each command attempts preflight, real execution, deterministic checks and applicable combined judging, local capture, Langfuse upload/readback, diagnostics, comparison, the matching baseline/Gate and a readable README. A failed preflight, interrupted run, missing evidence or failed upload can prevent completion; inspect the saved status rather than assuming all stages ran. Quality failure remains a completed measurement when execution and evidence are complete. Pipeline completion, absolute quality, relative Gate and upload verification are reported separately.
 
 Use Langfuse for Scores, Traces, Sessions and the User's related execution. Use local `README.md` and `run.json` for comparison and baseline/Gate details. These local decisions are not native Langfuse Gate pages.
 

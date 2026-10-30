@@ -4,7 +4,7 @@
 
 ## 会话背后的对象
 
-Chats、Invoices、Deep Research 保留 AgentSession，Personal Agent 使用同一 Pi SDK 1.4.0 发行版的 Durable，共享产品服务、工具、Workspace 与 Context。各适配器分别负责原生历史及恢复协议。
+Chats、Invoices、Deep Research 保留 AgentSession，[Personal Agent](personal-agent.zh-CN.md) 使用同一 Pi SDK 1.4.0 发行版的 Durable，共享产品服务、工具、Workspace 与 Context。各适配器分别负责原生历史及恢复协议。
 
 | 对象 | 含义 |
 |---|---|
@@ -77,7 +77,7 @@ sequenceDiagram
 
 工具准入校验可信 Run/Session 上下文、允许工具、资料范围、取消状态与输入 Schema；执行后检查输出结构、业务副作用、保存与交付。符合条件的自定义 PURE/READ 工具可使用有界 P95 时限策略，样本不足或不适用时回退配置。配置上限与 Run 剩余时间继续生效。
 
-AgentSession 子任务有独立 Session/Run，Durable 子任务保留原生 Task 归属及产品 Run 来源。两者共享根模型调用账本、工具次数与反馈容量，为父任务保留一次继续请求。最多准入四个归属明确的子任务，禁止嵌套；Personal Agent 仅允许只读 `invoice-evidence-checker` 角色。详细规则统一见 [Subagent](subagents.zh-CN.md)。
+AgentSession 子任务有独立 Session/Run，Durable 子任务保留原生 Task 归属及产品 Run 来源。两者共享所属模型调用、工具次数与反馈预算。AgentSession 子任务准入为根任务保留一次继续请求；Durable 检查 Work 的剩余模型预算，但不承诺该预留。最多准入四个归属明确的子任务，禁止嵌套；Personal Agent 仅允许只读 `invoice-evidence-checker` 角色。两条路径的详细规则见 [Subagent](subagents.zh-CN.md)。
 
 ## 停止与恢复
 

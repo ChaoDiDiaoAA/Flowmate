@@ -48,19 +48,19 @@ For local-file work, select the intended working directory or authorized materia
 3. Read the operation receipt to distinguish saved material, authorization to execute, an existing or new attempt, queueing and a blocked condition. Valid material after a normally completed attempt can automatically continue eligible work; material saved after a user stop or failure needs an explicit continue action.
 4. Give each invoice an explicit final disposition: `accepted`, `rejected` or `excluded`. Ordinary **Reject** rejects a candidate; it does not end processing for that invoice. A candidate or a successful Run alone does not complete the work.
 
-Viewing pages/history and desktop reconnection are read-only and make no model or tool calls; they do not trigger backend recovery. Backend startup recovery separately loads the original persisted facts and native records, then checks saved authorization and current eligibility before resuming an eligible original attempt. An `open` work item alone creates no new intent, and stopped or failed attempts are not revived. This engineering delivery covers verified behavior while the application is running; execution after desktop closure, Windows service restart recovery and Windows startup recovery remain system-service goals, with real SCM acceptance deferred. See [Personal Agent workflow](workflows.md#personal-agent) for continuation and review details.
+Viewing pages/history and desktop reconnection are read-only and make no model or tool calls; they do not trigger backend recovery. Backend startup recovery separately loads the original persisted facts and native records, then checks saved authorization and current eligibility before resuming an eligible original attempt. An `open` work item alone creates no new intent, and stopped or failed attempts are not revived. This engineering delivery covers verified behavior while the application is running; execution after desktop closure, Windows service restart recovery and Windows startup recovery remain system-service goals, with real SCM acceptance deferred. See [Personal Agent](personal-agent.md) for configuration, continuation and review details.
 
 ## Add capabilities deliberately
 
 Use **Skills** or **Settings → Skills** to refresh resources, inspect missing dependencies and enable a version. New resources are disabled until selected. A Partial resource is not fully ready.
 
-For independent checks, enable **Extensions → subagents**, inspect **Plugin details → Manage agents**, and start with the tool-free `general-analyst` role:
+For independent checks in an AgentSession conversation, enable **Extensions → subagents**, inspect **Plugin details → Manage agents**, and start with the tool-free `general-analyst` role:
 
 ```text
 /subagent general-analyst Compare these two proposed explanations using only the text supplied here: …
 ```
 
-This command still requires the model to make a real `Agent` tool call. A command or template expanding successfully does not prove that a child executed. See [Subagents](subagents.md) for setup, actual child cards and failure handling.
+This command still requires the model to make a real `Agent` tool call. A command or template expanding successfully does not prove that a child executed. Personal Agent uses its own separately configured Durable `Agent` tool rather than this extension command. See [Subagents](subagents.md) for both paths, actual child records and failure handling.
 
 ## Next workflows and common issues
 

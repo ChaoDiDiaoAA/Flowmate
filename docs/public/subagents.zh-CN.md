@@ -4,9 +4,21 @@
 
 ## 子任务是什么
 
-父 Agent 通过已登记的 **`Agent`** 工具向角色委派一个有界前台任务。产品创建独立子 Session、原生 Pi AgentSession 和 Run，关联原始父 ToolCall，并将真实子任务结果返回父任务。父子在同一个 Bun Host 中运行。
+父 Agent 可通过 **`Agent`** 工具委派有界任务。Flowmate 支持两条路径：普通 Chats、Invoices 和 Deep Research 使用受控 AgentSession subagents 扩展；[Personal Agent](personal-agent.zh-CN.md) 使用独立 Durable 适配器处理发票取证。两者都创建关联原父调用的产品子记录，但原生执行、准备及恢复方式不同。无论本地 Host 还是明确选中的 ServiceOwner 持有 Application，父子都在该控制进程内执行。
 
-角色由系统提示与允许工具列表组成，不是另一个无限制助手。当前子任务只读、共享根预算，不能创建嵌套或后台任务，也没有独立操作系统沙箱或模型配置。
+角色由系统提示与允许工具列表组成，不是另一个无限制助手。当前子任务只读、共享所属事项或父任务的预算，不能再次委派或使用用户选择的后台选项，也没有独立操作系统沙箱或模型配置。
+
+## Personal Agent：Durable 委派
+
+需要委派时，在 **Personal Agent → Assistant configuration** 启用 **Agent** 工具。父任务随后可以对限定的发票取证问题调用该工具；提出委派要求不证明子任务已执行。Durable 路径仅支持内置 `invoice-evidence-checker` 角色，不需要下面描述的 AgentSession 扩展、角色管理界面、斜杠命令或 Prompt 模板。Personal Agent 目前没有扩展的 Durable 适配器。
+
+Core 校验原 Work、Attempt、阶段和 ToolCall，依据获准阶段 Context 准备子任务，并创建关联的产品子 Session／Run。Durable 适配器持有子会话和原生 Task，执行允许的只读工具子集，将报告或证据缺口返回原父调用。**Tasks** 视图展示子任务状态、报告、父任务接收与停止事实；报告或来源引用不能单独证明语义正确，也不能接受发票。
+
+整个 Work 的尝试和子任务共享模型请求、工具次数、反馈容量与时间预算。最多同时保有 **4** 个子任务；名额全被占用时，准入返回 `subagent_capacity_exceeded`。停止未确认仍占名额。Durable 准入要求尚有模型预算，但不承诺 AgentSession 路径为父任务保留的一次继续请求。子任务不能嵌套、使用用户选择的后台选项或执行业务写入。
+
+**Stop current attempt** 也会请求停止其归属子任务。应核对实际停止和已保存子事实；取消或回复丢失不等于清理完成。Personal Agent 的 Tasks 视图当前提供子历史和报告，没有单独的子任务停止按钮。后端恢复协调原持久身份和符合条件的原生 Task，不会仅因结果未知就授权替代执行。事项继续、取消和系统服务限制见 [Personal Agent](personal-agent.zh-CN.md)。
+
+以下准备、命令、时序、权限表和生命周期章节描述 **AgentSession 扩展路径**。
 
 ## 准备扩展与角色
 
@@ -129,9 +141,10 @@ sequenceDiagram
 | [RuntimeService](../../packages/core/src/runtime/service.ts) | 子准入、产品 Session/Run、共享预算、取消与终态保存 |
 | [Pi Session 适配器](../../packages/runtime-pi/src/session.ts) | 受管子构造、模型工具绑定、历史与清理 |
 | [受控扩展](../../packages/runtime-pi/src/extensions/subagents.ts) | 以经过核验的归属登记真实插件工具和命令 |
+| [Personal Agent 委派](../../packages/core/src/personal-agent/subagents.ts)、[Durable 子适配器](../../packages/runtime-durable/src/subagents.ts) | 准入并协调固定发票取证角色和 Durable 原生子执行 |
 | [契约](../../packages/contracts/src/subagents.ts) | 参数、身份、摘要、详情与取消回复 |
 | [角色与输入定义](../../packages/core/src/prompt-templates.ts) | 作者和用户角色、模板展开与 Run 固定定义 |
 
 固定版本 `pi-subagents` 提供插件编排，Pi coding-agent 补丁与 subagents 补丁暴露产品所需的受管钩子；它们是必要依赖，不是可删的文档附件，详见[开发指南](development.zh-CN.md#dependency-patches)。
 
-验证入口：[Runtime/Pi 接合](../../tests/runtime-pi/subagents.integration.test.ts)、[产品子生命周期](../../tests/core/application/subagents.integration.test.ts)、[并发准入和预算](../../tests/core/application/parallel-subagents.integration.test.ts)、[存储归属](../../tests/core/storage/subagents.integration.test.ts)、[契约](../../tests/contracts/subagents.unit.test.ts)、[Electron 界面](../../tests/desktop/subagents.e2e.test.ts)。这些测试使用受控条件，不认证真实模型的委派质量。
+验证入口：[Runtime/Pi 接合](../../tests/runtime-pi/subagents.integration.test.ts)、[产品子生命周期](../../tests/core/application/subagents.integration.test.ts)、[并发准入和预算](../../tests/core/application/parallel-subagents.integration.test.ts)、[Durable 子任务](../../tests/core/application/personal-subagents.integration.test.ts)、[Durable 适配器](../../tests/runtime-durable/subagents.integration.test.ts)、[存储归属](../../tests/core/storage/subagents.integration.test.ts)、[契约](../../tests/contracts/subagents.unit.test.ts)、[Electron 界面](../../tests/desktop/subagents.e2e.test.ts)。这些测试使用受控条件，不认证真实模型的委派质量。

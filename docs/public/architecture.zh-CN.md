@@ -4,7 +4,7 @@
 
 ## 进程与信任边界
 
-Electron 展示工作台并管理窗口和系统集成，本地模式由 Bun Host 持有产品 Application 与本地数据库访问。Chats、Invoices、Deep Research 使用 Pi AgentSession，独立 Personal Agent 使用 Pi Durable。两套适配器统一使用 SDK 1.4.0，复用 Application、业务服务、ToolExecutor、Workspace 与 Context。Renderer 通过有限的 Preload 接口访问产品能力，不直接读取 SQLite 或调用 SDK。
+Electron 展示工作台并管理窗口和系统集成，本地模式由 Bun Host 持有产品 Application 与本地数据库访问。Chats、Invoices、Deep Research 使用 Pi AgentSession，独立 [Personal Agent](personal-agent.zh-CN.md) 使用 Pi Durable。两套适配器统一使用 SDK 1.4.0，复用 Application、业务服务、ToolExecutor、Workspace 与 Context。Renderer 通过有限的 Preload 接口访问产品能力，不直接读取 SQLite 或调用 SDK。
 
 明确启用服务模式后，ServiceOwner 持有 Application，桌面通过生产 Node ServiceClient 连接；选定服务不可连接时，不启动第二个本地 Host。
 
@@ -61,7 +61,7 @@ Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取
 5. 领域服务核对业务副作用，SQLite 与受管文件保存执行事实和产物身份。
 6. UI 查询已保存结果并显示实时进度，进度本身不等于业务提交。
 
-子任务经 Core 准入，进入同一 Application 控制进程内归属相应运行时的执行。父子共享根预算，最多四个子任务，禁止嵌套；停止未知时继续占用名额。Personal Agent 仅委派给只读 `invoice-evidence-checker` 角色。权限、上下文和停止规则统一见 [Subagent](subagents.zh-CN.md)，子执行不是独立操作系统沙箱或可写代理。
+子任务经 Core 准入，进入同一 Application 控制进程内归属相应运行时的执行。父子共享所属预算，最多四个子任务，禁止嵌套；停止未知时继续占用名额。Personal Agent 通过 Durable 适配器仅委派给只读 `invoice-evidence-checker`，AgentSession 扩展是独立路径。两条路径的权限、上下文和停止规则见 [Subagent](subagents.zh-CN.md)；子执行不是独立操作系统沙箱或可写代理。
 
 ## 持久化与资源
 

@@ -4,7 +4,7 @@
 
 ## 环境与入口
 
-使用 Windows x64、Node.js 24 和 Bun 1.4.4。AgentSession 与 Durable 统一固定 Pi SDK 1.4.0，另固定 pi-subagents 0.19.0、Electron 44.4.5、React 19.3.0、TypeScript 5.8.3。在仓库根执行：
+使用 Windows x64、Node.js 24 和 Bun 1.4.4。清单固定 Pi SDK 1.4.0 和 Durable 适配器的 `pi-durable` 1.4.0，另固定 pi-subagents 0.19.0、Electron 44.4.5、React 19.3.0、TypeScript 5.8.3。在仓库根执行：
 
 ```powershell
 bun install --frozen-lockfile
@@ -17,7 +17,7 @@ Node 开发入口管理初始构建、就绪、Electron 生命周期及 Main/Pre
 
 层次边界见[架构](architecture.zh-CN.md)。`apps/composition.ts` 与 `apps/personal-agent.ts` 组装共用产品服务。`apps/desktop` 是界面与进程壳，`apps/host` 持有本地 Bun 协议，`apps/service` 是独立 ServiceOwner。`packages/runtime-pi` 为 Chats/Invoices/Deep Research 保留 AgentSession，`packages/runtime-durable` 负责 Personal Agent 原生 Task 与恢复；两者复用 Application、ToolExecutor、Workspace、Context 及协调后的 SQLite 存储。其他包区分契约、资料、发票规则、日志、共享路径与安全。`resources/` 是作者资源，`tests/` 是工程检查，`agent-eval/` 为隔离质量设施。
 
-行为修改沿输入契约、公开 Application/Host/Preload、Runtime/适配器及相关存储、领域消费者检查，模型工具调用保持经过产品执行器。父子实现入口汇总在 [Subagent](subagents.zh-CN.md#developer-map-and-verification)。
+行为修改沿输入契约、公开 Application/Host/Preload、Runtime/适配器及相关存储、领域消费者检查，模型工具调用保持经过产品执行器。Durable 事项入口见 [Personal Agent](personal-agent.zh-CN.md)，父子实现入口汇总在 [Subagent](subagents.zh-CN.md#developer-map-and-verification)。
 
 ## 工程验证
 
@@ -39,7 +39,7 @@ bun --no-env-file test --isolate ./tests/core/storage/storage.integration.test.t
 
 工程夹具使用临时根和受控 Provider，不读取正式用户数据或运行真实模型 Benchmark。覆盖和清理职责见 [tests/README.md](../../tests/README.md)、[评测设施测试](../../agent-eval/tests/README.md)。付费评测不作为附带步骤，独立配置与费用见[评测](EVALUATION.zh-CN.md)。
 
-2026-10-30 已记录的工程基线为 typecheck 通过、Unit `1041 pass / 0 fail`、Integration `2503 pass / 1 skip / 0 fail`、Electron E2E `137 passed / 1 skipped`，标准 `bun --no-env-file run test` 命令 exit 0。本次文稿收口复用该证据，只进行文档静态核对；skip 仍是未运行项。真实 SCM 安装/启动、开机、升级/回退及关闭桌面后持续运行延期验收，真实模型语义与用户收益仍未验证。
+每次工程验证报告实际命令、版本、通过／失败和跳过项；旧结果不能认证后续版本。真实 SCM 安装／启动、开机、升级／回退与关闭桌面后持续运行属于单独的延期验收；真实模型语义和用户收益也需要各自证据。
 
 <a id="dependency-patches"></a>
 

@@ -4,11 +4,12 @@
 
 ## 工作台结构
 
-React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导航与对话主区。业务和设置页面显示各自工作区及右侧 Assistant，两种布局复用同一个对话组件。实现位于 [app.tsx](../../apps/desktop/renderer/src/app.tsx)、[styles.css](../../apps/desktop/renderer/src/styles.css) 及同目录专题组件。
+React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导航与对话主区。多数业务和设置页面显示各自工作区及右侧 Assistant；Personal Agent 使用独立主工作区，没有该侧栏。对话主区与侧栏复用同一个对话组件。实现位于 [app.tsx](../../apps/desktop/renderer/src/app.tsx)、[styles.css](../../apps/desktop/renderer/src/styles.css) 及同目录专题组件。
 
 | 区域 | 用途 |
 |---|---|
 | 对话主区 | 默认视图，用于输入消息与阅读当前会话 |
+| Personal Agent | Assistant 配置、已保存发票事项、逐票 Todo 与处置、尝试、历史和时间线 |
 | Invoices / Workspace | 原件、解析、结果复核与资料、候选上下文 |
 | Processing History | 保存的处理 Run 和业务结果 |
 | Chats / 最近会话 | 列出、管理已保存 Session，或在对话主区打开会话 |
@@ -23,7 +24,7 @@ React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导
 
 ## 布局与主题
 
-对话主区使用导航以外的空间，没有独立右侧 Assistant 栏或其分隔线，也不能收起。宽屏业务页默认偏好为导航 240 px、Assistant 380 px，下限为 200/300 px，中心下限为 360 px；此时右侧 Assistant 可以收起。
+对话主区和 Personal Agent 工作区使用导航以外的空间，没有独立右侧 Assistant 栏或其分隔线；对话主区不能收起。带侧栏的宽屏业务页默认偏好为导航 240 px、Assistant 380 px，下限为 200/300 px，中心下限为 360 px；此时右侧 Assistant 可以收起。
 
 宽度小于 1200 px 时，导航变为 64 px 栏并支持展开抽屉；小于 1080 px 时，展开的右侧 Assistant 浮在业务页面上方，对话主区仍保留在页面布局内。
 
@@ -41,6 +42,7 @@ Light、dark、system 主题复用背景、表面、正文、边框、强调、�
 - 加载、错误、缺证据、历史不可用、停止未确认分别保留；回复丢失不等于成功，也不授权新执行。
 - 未保存发票编辑仅在内存，离开时显式 Save/Discard。
 - 长任务展示父 Run、真实子卡片、工具与保存身份，助手文字不充当执行回执。
+- Personal Agent 区分停止当前尝试、Continue work 与 Cancel entire work；Invoices、Tasks、History 和 Timeline 分别展示不同保存事实。详见 [Personal Agent](personal-agent.zh-CN.md)。
 
 子卡片展示真实生命周期和单子 Stop，详细规则见 [Subagent](subagents.zh-CN.md)，交付状态见[业务流程](workflows.zh-CN.md)。
 

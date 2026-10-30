@@ -4,7 +4,7 @@
 
 ## Environment and entry points
 
-Use Windows x64, Node.js 24 and Bun 1.4.4. The manifest pins Pi SDK 1.4.0 for both AgentSession and Durable, pi-subagents 0.19.0, Electron 44.4.5, React 19.3.0 and TypeScript 5.8.3. From the repository root:
+Use Windows x64, Node.js 24 and Bun 1.4.4. The manifests pin Pi SDK 1.4.0 and the Durable adapter's `pi-durable` 1.4.0, as well as pi-subagents 0.19.0, Electron 44.4.5, React 19.3.0 and TypeScript 5.8.3. From the repository root:
 
 ```powershell
 bun install --frozen-lockfile
@@ -17,7 +17,7 @@ The Node development launcher owns initial build/readiness, Electron lifetime an
 
 Read [Architecture](architecture.md) for boundaries. `apps/composition.ts` and `apps/personal-agent.ts` assemble shared product services. `apps/desktop` is the UI/process shell, `apps/host` the local Bun protocol owner and `apps/service` the independent ServiceOwner. `packages/runtime-pi` retains AgentSession for Chats/Invoices/Deep Research; `packages/runtime-durable` owns Personal Agent native Tasks and recovery. Both reuse Application, ToolExecutor, Workspace, Context and coordinated SQLite storage. Other packages separate contracts, materials, invoice rules, logging and shared paths/security. `resources/` contains author resources, `tests/` engineering checks and `agent-eval/` isolated quality infrastructure.
 
-For behavior changes, trace input through the contract, public Application/Host/Preload boundary, Runtime/adapter and relevant storage/domain consumer. Keep model-selected tools inside the product executor. Parent/child implementation entry points are collected in [Subagents](subagents.md#developer-map-and-verification).
+For behavior changes, trace input through the contract, public Application/Host/Preload boundary, Runtime/adapter and relevant storage/domain consumer. Keep model-selected tools inside the product executor. Durable Work entry points are in [Personal Agent](personal-agent.md); parent/child implementation entry points are collected in [Subagents](subagents.md#developer-map-and-verification).
 
 ## Engineering checks
 
@@ -39,7 +39,7 @@ bun --no-env-file test --isolate ./tests/core/storage/storage.integration.test.t
 
 Engineering fixtures use temporary roots and controlled providers, not formal user data or real model Benchmark runs. See [tests/README.md](../../tests/README.md) and [evaluation facility tests](../../agent-eval/tests/README.md) for coverage and cleanup. Do not run paid evaluation incidentally; [Evaluation](EVALUATION.md) explains its separate configuration and costs.
 
-The recorded 2026-10-30 engineering baseline passed typecheck, Unit `1041 pass / 0 fail`, Integration `2503 pass / 1 skip / 0 fail` and Electron E2E `137 passed / 1 skipped`; the standard `bun --no-env-file run test` command exited 0. This documentation closeout reuses that evidence and performs static document checks only. Skips remain unrun cases. Real SCM installation/startup, boot, upgrade/rollback and execution after desktop closure are deferred acceptance; real model semantics and user benefit remain unverified.
+Report the actual command, revision, pass/fail and skipped cases for each engineering run; an earlier result does not certify a later revision. Real SCM installation/startup, boot, upgrade/rollback and execution after desktop closure are separate, deferred acceptance; real model semantics and user benefit require their own evidence.
 
 <a id="dependency-patches"></a>
 

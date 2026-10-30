@@ -4,7 +4,7 @@
 
 ## Build a Windows package
 
-The installed target is **Windows x64**, built with Bun **1.4.4** and pinned dependencies. The packager checks Pi SDK 1.4.0, pi-subagents 0.19.0, Electron 44.4.5, schema 21 migrations, native tools and required assets.
+The installed target is **Windows x64**, built with Bun **1.4.4** and pinned dependencies. The packager checks Pi SDK 1.4.0, pi-subagents 0.19.0, Electron 44.4.5, schema 21 migrations, native tools and required assets. The Durable adapter's manifest separately pins `pi-durable` 1.4.0; the package's release inventory does not by itself certify real service recovery.
 
 ```powershell
 bun install --frozen-lockfile
@@ -17,7 +17,7 @@ The scripts build the desktop and stage runtime resources under `out/package-sta
 
 The runtime includes Bun, Host/evaluation/maintenance launchers, ServiceOwner/service-management entries, WinSW, both Pi runtime paths, migrations, author resources, required native files and licenses. `release.json` records explicit versions and the file inventory. Installed validation checks actual inventory/versions and does not fall back to developer source or PATH Bun. Preserve required patches/licenses; see [Development](development.md#dependency-patches).
 
-The current engineering delivery retains the existing `out/package/win-unpacked` directory package and its `resources/flowmate-runtime/release.json`; this documentation closeout does not rebuild them. Application-running execution, committed facts and eligible recovery define the current delivery boundary. Real SCM installation/startup, boot, upgrade/rollback and continued execution after closing the desktop remain deferred acceptance.
+Application-running execution, committed facts and eligible recovery define the current delivery boundary. Real SCM installation/startup, boot, upgrade/rollback and continued execution after closing the desktop remain deferred acceptance. [Personal Agent](personal-agent.md) explains the separate local Host and ServiceOwner paths.
 
 ## Data and diagnostics
 

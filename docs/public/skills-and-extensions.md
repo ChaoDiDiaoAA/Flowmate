@@ -38,17 +38,19 @@ The model receives a bounded short index and guidance, with a 16 KiB preparation
 
 The built-in invoice Skills split evidence discovery, field extraction, amount/source checks, ambiguity review, saving and handoff. The research Skill guides plan-confirm-investigate-synthesize-report behavior. A save-oriented Skill does not remove the actual tool's schema, permission or persistence checks. “Skill selected” and “Skill actually read/used” are different facts in evaluation.
 
+Personal Agent selects its model, tools, Prompt and Skills in **Assistant configuration**, independently of the ordinary Assistant's current selection. Its Durable path checks selected dependencies against the available invoice and resource tools. No Durable extension adapter is currently available, so an extension-dependent Skill cannot be enabled for a Durable phase. Accepted Work retains its selected configuration and resource versions. See [Personal Agent](personal-agent.md).
+
 For authoring, align SKILL frontmatter name with manifest/ID, provide an accurate description, declare real dependencies and list the files and UTF-8 byte sizes expected by the manifest. Use the current author guide and existing neighboring resources rather than inventing another loader format.
 
 ## Commands and templates
 
-The slash menu groups Skills, extension commands, templates and roles. `/invoice-evidence-review <arguments>` and `/parallel-invoice-review <arguments>` expand Markdown templates; `$ARGUMENTS` is replaced for that input. Template expansion is not an execution receipt. The `/subagent <role-id> <task>` extension command also ultimately needs a real `Agent` call.
+The AgentSession slash menu groups Skills, extension commands, templates and roles. `/invoice-evidence-review <arguments>` and `/parallel-invoice-review <arguments>` expand Markdown templates; `$ARGUMENTS` is replaced for that input. Template expansion is not an execution receipt. The `/subagent <role-id> <task>` extension command also ultimately needs a real `Agent` call. These are not Personal Agent's Durable trigger interface.
 
 Selected command/template identities and content are retained with the prepared input. Editing author resources later must not change what an old input means. Detailed triggers, role overrides and parent/child permissions belong in [Subagents](subagents.md), rather than duplicate rules here.
 
 ## Controlled extensions
 
-Extensions are enabled explicitly in **Extensions**. Product registration fixes supported capabilities and hooks; arbitrary external plugin loading is not implied. The adapter verifies actual registration and binds tool/command events to owned native Sessions. The subagents integration is backed by a pinned dependency plus managed hooks, not permission to bypass the product ToolExecutor.
+AgentSession extensions are enabled explicitly in **Extensions**. Product registration fixes supported capabilities and hooks; arbitrary external plugin loading is not implied. The adapter verifies actual registration and binds tool/command events to owned native Sessions. The subagents integration is backed by a pinned dependency plus managed hooks, not permission to bypass the product ToolExecutor. Personal Agent instead exposes its own limited `Agent` tool; enabling that tool does not enable the extension.
 
 If a dependency is unavailable, inspect readiness/Diagnostics, correct the dependency and refresh for a subsequent Run. Do not assume a renamed role, extra tool or newly installed package is live inside an existing execution.
 

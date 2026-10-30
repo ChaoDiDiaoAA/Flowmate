@@ -4,11 +4,12 @@
 
 ## Workbench structure
 
-The React Renderer uses shared CSS variables and ordinary form elements. It opens with navigation and a main conversation canvas. Business and settings pages show their work area with Assistant on the right. The same conversation component serves both presentations. Implementation lives in [app.tsx](../../apps/desktop/renderer/src/app.tsx), [styles.css](../../apps/desktop/renderer/src/styles.css) and topic components in that directory.
+The React Renderer uses shared CSS variables and ordinary form elements. It opens with navigation and a main conversation canvas. Most business and settings pages show their work area with Assistant on the right; Personal Agent uses a separate main workspace without that sidebar. The same conversation component serves the main and sidebar presentations. Implementation lives in [app.tsx](../../apps/desktop/renderer/src/app.tsx), [styles.css](../../apps/desktop/renderer/src/styles.css) and topic components in that directory.
 
 | Area | Purpose |
 |---|---|
 | Main conversation | Default view for composing messages and reading the selected conversation |
+| Personal Agent | Assistant configuration, saved invoice Work, per-invoice Todo and disposition, attempts, history and timeline |
 | Invoices / Workspace | Original/parsed/result review and material/candidate context |
 | Processing History | Saved processing Runs and business outcomes |
 | Chats / recent chats | List/manage saved Sessions or open one in the main conversation canvas |
@@ -23,7 +24,7 @@ The React Renderer uses shared CSS variables and ordinary form elements. It open
 
 ## Layout and themes
 
-The main conversation uses the space beside navigation, has no separate Assistant column or Assistant separator, and cannot be collapsed. On wide business pages, the layout prefers navigation 240 px and Assistant 380 px, with minima 200/300 px and a central minimum of 360 px. Assistant can be collapsed there.
+The main conversation and Personal Agent workspace use the space beside navigation without a separate Assistant column or Assistant separator. The main conversation cannot be collapsed. On wide business pages with a sidebar, the layout prefers navigation 240 px and Assistant 380 px, with minima 200/300 px and a central minimum of 360 px. Assistant can be collapsed there.
 
 Below 1200 px, navigation becomes a 64 px rail with an expandable drawer. Below 1080 px, an open sidebar Assistant overlays the business page; the main conversation remains in the page layout.
 
@@ -41,6 +42,7 @@ Light, dark and system themes use shared background, surface, text, border, acce
 - Loading, errors, missing evidence, unavailable history and unconfirmed stopping retain their meanings; a missing reply is not success or permission for a new execution.
 - Unsaved invoice edits stay in memory; Save/Discard is explicit when leaving.
 - Long work exposes parent Run, actual child cards, tools and saved identities. Assistant prose is not an execution receipt.
+- Personal Agent separates the current attempt's Stop, Continue work and Cancel entire work; the Invoices, Tasks, History and Timeline tabs expose different saved facts. See [Personal Agent](personal-agent.md).
 
 Child cards show actual lifecycle and single-child Stop; details live in [Subagents](subagents.md). Delivery states are described in [Workflows](workflows.md).
 

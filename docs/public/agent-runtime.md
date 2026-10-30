@@ -4,7 +4,7 @@
 
 ## The objects behind a conversation
 
-Chats, Invoices and Deep Research keep AgentSession. Personal Agent uses Durable from the same Pi SDK 1.4.0 release and shares product services, tools, Workspace and Context. Each adapter owns its native history and recovery protocol.
+Chats, Invoices and Deep Research keep AgentSession. [Personal Agent](personal-agent.md) uses Durable from the same Pi SDK 1.4.0 release and shares product services, tools, Workspace and Context. Each adapter owns its native history and recovery protocol.
 
 | Object | Meaning |
 |---|---|
@@ -77,7 +77,7 @@ These are product call/time/byte constraints, not invented model token capacitie
 
 Tool admission validates trusted Run/Session context, allowed tools, material scope, cancellation and input schema. Post-execution checks validate result structure, domain effects, persistence and delivery. Eligible custom PURE/READ tool timing can use a bounded P95 strategy, with configured fallback when samples are insufficient or unsuitable. The configured limits and remaining Run time still constrain execution.
 
-AgentSession children use separate Sessions/Runs; Durable children retain native Task ownership with product Run provenance. Both share the root model-call ledger, tool-call count and feedback capacity, reserving one root continuation request. At most four owned children are admitted, with no nesting; Personal Agent permits only the read-only `invoice-evidence-checker` role. All child-specific rules live in [Subagents](subagents.md).
+AgentSession children use separate Sessions/Runs; Durable children retain native Task ownership with product Run provenance. Both share their owner's model-call, tool-call and feedback budgets. AgentSession child admission reserves one root continuation request; Durable checks the remaining Work model budget without promising that reservation. At most four owned children are admitted, with no nesting; Personal Agent permits only the read-only `invoice-evidence-checker` role. Both paths' child-specific rules live in [Subagents](subagents.md).
 
 ## Stopping and recovery
 

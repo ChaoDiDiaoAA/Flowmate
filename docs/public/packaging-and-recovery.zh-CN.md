@@ -4,7 +4,7 @@
 
 ## 构建 Windows 安装包
 
-安装目标为 **Windows x64**，使用 Bun **1.4.4** 与锁定依赖。脚本检查 Pi SDK 1.4.0、pi-subagents 0.19.0、Electron 44.4.5、schema 21 迁移、原生工具及必需资源。
+安装目标为 **Windows x64**，使用 Bun **1.4.4** 与锁定依赖。脚本检查 Pi SDK 1.4.0、pi-subagents 0.19.0、Electron 44.4.5、schema 21 迁移、原生工具及必需资源。Durable 适配器清单另固定 `pi-durable` 1.4.0；安装包清单本身不证明真实服务恢复通过。
 
 ```powershell
 bun install --frozen-lockfile
@@ -17,7 +17,7 @@ bun --no-env-file run package:win
 
 运行资源包含 Bun、Host/评测/维护入口、ServiceOwner/服务管理入口、WinSW、两套 Pi 运行路径、迁移、作者资源、必需原生文件和许可。`release.json` 保存显式版本与文件清单，安装验证核对实际清单和版本，不回退开发源码或 PATH Bun。必要补丁和许可继续保留，见[开发指南](development.zh-CN.md#dependency-patches)。
 
-当前工程交付保留已有 `out/package/win-unpacked` 目录包及其 `resources/flowmate-runtime/release.json`，本次文稿收口不重新构建。当前交付边界为应用运行期间的执行、已提交事实和合法恢复；真实 SCM 安装/启动、开机、升级/回退及关闭桌面后持续运行统一延期验收。
+当前交付边界为应用运行期间的执行、已提交事实和合法恢复；真实 SCM 安装／启动、开机、升级／回退及关闭桌面后持续运行统一延期验收。[Personal Agent](personal-agent.zh-CN.md) 说明本地 Host 与 ServiceOwner 的不同路径。
 
 ## 数据与诊断
 

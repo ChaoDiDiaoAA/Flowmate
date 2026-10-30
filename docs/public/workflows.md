@@ -68,25 +68,16 @@ An optional `invoice-evidence-checker` can inspect fixed-scope source evidence b
 
 ## Personal Agent: ongoing invoice work
 
+For configuration, execution objects and recovery details, see the dedicated [Personal Agent guide](personal-agent.md).
+
 This engineering delivery covers verified capabilities while the application is running. Continued execution after desktop closure, Windows service restart recovery and Windows startup recovery remain system-service goals; real Windows SCM acceptance is deferred and those system behaviors are not yet verified.
 
 1. Open **Personal Agent** and confirm/save its model, tool and resource configuration. Then select a fixed set of existing parsed invoices, enter the goal and explicitly submit the work. Creation is available only here; **Invoices** retains single-invoice selection and editing. New invoices require new work rather than silently enlarging the saved set.
-2. Follow the persistent work overview, per-invoice records and Todo items. The Agent prepares candidates, identifies gaps and continues other eligible invoices while one waits for material or human review. A Todo explains what is missing and the next action.
-3. Submit material or clarification for the relevant invoice/Todo, then inspect the saved-material and execution decisions separately. Use the continue action when required; the service checks current authorization, versions, attempts, stopping facts and remaining budget before selecting an existing attempt, a linked new attempt, queueing or a blocked response.
-4. Follow the review action to the original invoice in **Invoices** and compare the candidate with its sources. Editing, **Fill with Agent**, explicit **Accept result** and export keep the existing single-invoice workflow; navigating there preserves the original Durable work and conversation.
-5. Explicitly give every invoice a final disposition: `accepted`, `rejected` (end processing for this invoice) or `excluded`, with the required reason. Ordinary **Reject** only rejects a candidate. The work completes only when every invoice is finally disposed and the required business writes and execution have settled; a candidate, Run or completed child alone does not complete it.
+2. Review the Work overview and per-invoice Todo. Provide requested clarification or authorized material and inspect whether it was saved, authorized for execution or blocked. After a stopped or failed attempt, use **Continue work** when eligible.
+3. Use **View original invoice / review** to compare a candidate with its sources in **Invoices**. After **Accept result**, return to the Work and **Attach confirmed acceptance**. To end an item as rejected or excluded, use its explicit disposition action and provide a reason. Rejecting a candidate alone does not end the item.
+4. Inspect attempts and saved evidence. **Stop current attempt** and **Cancel entire work** are different actions; each invoice needs a final disposition and required writes and execution must settle before the Work completes. Viewing history does not start a model call.
 
-| Trigger | What happens |
-|---|---|
-| Explicit continue | The service checks current facts and saved input authorization, then returns or continues the original eligible attempt, authorizes a linked new attempt, queues it when root capacity is occupied, or reports a specific Todo/blocker. Completed/cancelled work does not restart. |
-| Per-invoice material | Valid material after a normally completed attempt can automatically authorize a linked new attempt while the work remains open. Material after a user stop or failure is saved and needs explicit continue. Material that is only saved without execution authorization also needs explicit continue after its blocker is resolved. Saving, authorization to execute and actual execution are separate facts. |
-| Backend startup recovery | The backend loads the original persisted facts and native records, then checks saved authorization and current eligibility before resuming an eligible original attempt. An `open` work item alone creates no new intent, and stopped or failed attempts are not revived. |
-
-Viewing pages, work history or the original operation and reconnecting the desktop are read-only. They make no model or tool calls and do not trigger backend recovery.
-
-If material arrives during execution, it is consumed at a valid stage boundary; it is not a Steer request and cannot change an already-started tool's parameters. When a write receipt or stopping result is unknown, query the original operation before another action. **Stop** targets the current execution; cancelling the whole work is a separate business action, and neither a cancelled label nor a closed window proves stopping is confirmed.
-
-The Master may delegate a bounded source question to the read-only `invoice-evidence-checker` when useful. At most four child executions may be owned at once, with no nesting and a shared root budget; unconfirmed stops retain their capacity. Child completion, returned results and valid source references do not establish semantic correctness. The Master remains responsible for synthesis and candidates, and human acceptance remains explicit. See [Subagents](subagents.md).
+The parent may delegate an invoice evidence question to a bounded read-only child. See [Subagents](subagents.md) for the Durable path and [Personal Agent](personal-agent.md) for stopping, recovery and related work.
 
 ## When to stop and inspect
 

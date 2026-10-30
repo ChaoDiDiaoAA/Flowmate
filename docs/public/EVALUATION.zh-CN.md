@@ -29,7 +29,9 @@ flowchart LR
     I --> J[针对性改进与下轮验证]
 ```
 
-被测 Agent 在隔离本机 Host 中调用产品核心。评分侧接收独立 Gold 和执行事实，Gold 不进入被测 Agent 上下文。Langfuse 提供观察记录和分数，本地证据保留完整比较与 Gate。候选挖掘、重放和发布需要明确操作。
+被测 Agent 在隔离本机 Host 中调用产品核心。评分侧接收独立 Gold 和执行事实，Gold 不进入被测 Agent 上下文。所选流程上传时，Langfuse 提供观察记录和分数，本地证据保留比较与 Gate 事实。候选挖掘、重放和发布需要明确操作。部分本地评测路径无需导出；下述标准 Smoke／Full 流程要求 Langfuse 预检，并包含上传和回读。
+
+原始 Smoke／Full 选集覆盖指定业务和研究 Case，不能单独证明 [Personal Agent](personal-agent.zh-CN.md) Durable 事项的质量或真实用户收益。[Personal Agent 评测接合测试](../../agent-eval/tests/adapters/personal-runtime.integration.test.ts)使用受控产品命令，属于工程证据，不是真实模型质量基准。
 
 | 对象 | 含义 |
 |---|---|
@@ -89,12 +91,12 @@ bun --no-env-file run eval -- judge calibrate --dir <独立参考目录> --execu
 
 两个标准入口均执行固定双模型比较，**每题每模型重复一次**：
 
-| 入口 | 选集与计算 | 被测 Trial 数 |
+| 入口 | 选集与计算 | 计划被测 Trial 数 |
 |---|---|---|
 | Smoke | 7 题 × 2 模型 × 1 | 14 |
 | Full | 62 题 × 2 模型 × 1 | 124 |
 
-两个入口合计 **138 个被测 Trial**，不另加 canary。Judge 和挖掘调用不计入 Trial。一次重复只能说明本轮观察，不能证明稳定性或可靠提升。
+两个入口合计计划 **138 个被测 Trial**，不另加 canary。计划数量不证明执行、评分或上传已经完成。Judge 和挖掘调用不计入 Trial。一次重复只能说明已完成的观察，不能证明稳定性或可靠提升。
 
 | 职责 | 配置 |
 |---|---|
@@ -131,9 +133,11 @@ Baseline 绑定实际 Run、配置、选集与可比条件，统一存入 `agent
 
 独立产品 Trace 采用平铺的 `Trace-<date>-<entry>-<purpose>-01.json`，内部使用 UUID。Case 质量、保存 Run、Trace、候选审核四类反馈共用 `agent-eval/feedback.json`，只在真实反馈后创建。候选与正式基准布局见[制作指南](EVALUATION-BENCHMARK.zh-CN.md)。
 
+<a id="configuration"></a>
+
 ## 配置、UI 与命令
 
-私有配置使用 `agent-eval/configs/.env`，同名系统环境变量优先。[模块说明](../../agent-eval/README.md)列出角色和 Langfuse 字段。Judge 使用现有本地 HTTP 网关；原生挖掘复用现有 Codex 登录；Sol 和 Luna 使用同一本地网关的独立角色，不转发外部服务凭据。
+私有配置使用 `agent-eval/configs/.env`，同名系统环境变量优先。[模块说明](../../agent-eval/README.md)列出角色和 Langfuse 字段。两个基准命令执行前需要有效的 Langfuse 项目和已配置的本地网关模型。Judge 使用现有本地 HTTP 网关；原生挖掘复用现有 Codex 登录；Sol 和 Luna 使用同一本地网关的独立角色，不转发外部服务凭据。
 
 在仓库根目录执行：
 
@@ -142,7 +146,7 @@ bun --no-env-file run eval:smoke
 bun --no-env-file run eval:full
 ```
 
-每个命令完成预检、真实执行、确定性和适用语义合并评分、本地采证、Langfuse 上传回读、诊断、比较、对应 Baseline/Gate 与可读 README。执行与采证完整时，质量失败仍是完成的测量。流程完整、绝对质量、相对 Gate 和上传验证分别报告。
+每个命令尝试执行预检、真实执行、确定性和适用语义合并评分、本地采证、Langfuse 上传回读、诊断、比较、对应 Baseline/Gate 与可读 README。预检失败、执行中断、证据缺失或上传失败都可能阻止流程完成；应检查保存状态，不能假定每个阶段均已运行。执行与采证完整时，质量失败仍是完成的测量。流程完整、绝对质量、相对 Gate 和上传验证分别报告。
 
 Langfuse 用于查看 Score、Trace、Session 及 User 关联执行；本地 `README.md` 与 `run.json` 提供比较及 Baseline/Gate 细节。这些本地结论不是 Langfuse 原生 Gate 页面。
 

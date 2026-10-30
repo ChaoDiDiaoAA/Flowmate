@@ -12,7 +12,7 @@ Full retains the original **62 Cases: 50 business and 12 research**. Smoke conta
 
 `FM-001, FM-002, FM-027, FM-033, FM-046, FM-051, FM-055`.
 
-The standard Smoke/Full commands compare Sol and Luna with one repetition, producing 14/124 subject Trials. New candidates do not enter either selection automatically. Select a published benchmark version explicitly when evaluating its members.
+The standard Smoke/Full commands compare Sol and Luna with one repetition, planning 14/124 subject Trials respectively. The counts are a selection plan, not evidence that a run completed. These commands require Langfuse preflight and attempt upload/readback; see [Evaluation](EVALUATION.md) for the fixed Judge and execution status. New candidates do not enter either selection automatically. Select a published benchmark version explicitly when evaluating its members.
 
 ## Begin with a real task and independent sources
 

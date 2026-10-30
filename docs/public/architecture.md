@@ -4,7 +4,7 @@
 
 ## Process and trust boundaries
 
-Electron renders the workbench and owns windows and operating-system integration. In local mode, a Bun Host owns the product Application and local database access. Chats, Invoices and Deep Research use Pi AgentSession; the independent Personal Agent uses Pi Durable. Both adapters use SDK 1.4.0 and share Application, business services, ToolExecutor, Workspace and Context. The Renderer uses a narrow Preload API rather than reading SQLite or calling the SDK directly.
+Electron renders the workbench and owns windows and operating-system integration. In local mode, a Bun Host owns the product Application and local database access. Chats, Invoices and Deep Research use Pi AgentSession; the independent [Personal Agent](personal-agent.md) uses Pi Durable. Both adapters use SDK 1.4.0 and share Application, business services, ToolExecutor, Workspace and Context. The Renderer uses a narrow Preload API rather than reading SQLite or calling the SDK directly.
 
 When service mode is explicitly enabled, ServiceOwner owns the Application and the desktop connects through the production Node ServiceClient. An unavailable selected service does not start a second local Host.
 
@@ -61,7 +61,7 @@ Host messages carry validated request and ownership identities. Notifications wa
 5. Domain services validate business effects. SQLite and managed files preserve execution facts and artifact identities.
 6. The UI queries saved results and displays live progress without treating progress as a durable business commit.
 
-Child tasks follow Core admission into runtime-owned execution in the same Application-owning process. They share root budgets, admit at most four children, prohibit nesting and retain occupied capacity while stopping is unknown. Personal Agent delegates only to the read-only `invoice-evidence-checker` role. [Subagents](subagents.md) is the authority for permissions, context and stopping; a child is not a separate OS sandbox or an independent write-capable agent.
+Child tasks follow Core admission into runtime-owned execution in the same Application-owning process. They share their owner's budgets, admit at most four children, prohibit nesting and retain occupied capacity while stopping is unknown. Personal Agent delegates only to the read-only `invoice-evidence-checker` role through its Durable adapter; the AgentSession extension is a separate path. [Subagents](subagents.md) describes each path's permissions, context and stopping; a child is not a separate OS sandbox or an independent write-capable agent.
 
 ## Persistence and resources
 
