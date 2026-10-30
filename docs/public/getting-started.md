@@ -30,7 +30,7 @@ Desktop credentials are stored using system encryption. Do not paste credentials
 
 ## First conversation
 
-The application opens in the main conversation view. Opening it does not create a Session or request a model response.
+Without a saved page focus, the application opens in the main conversation view; a valid saved focus can restore a previous page. Opening a view does not create a Session or request a model response.
 
 1. After configuring the model, click **New chat** in the left navigation to create a Session and open the main conversation canvas.
 2. Enter a small request such as “Summarize the following paragraph and identify what it does not establish,” followed by non-sensitive sample text.
@@ -64,7 +64,7 @@ This command still requires the model to make a real `Agent` tool call. A comman
 
 ## Next workflows and common issues
 
-Use [Workflows](workflows.md) for research, single-invoice review and ongoing Personal Agent work. Research starts from selected local text/Markdown or registered parsed material. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
+Use [Workflows](workflows.md) for research, single-invoice review and ongoing Personal Agent work. For [Deep Research](workflows.md#deep-research), optionally save **Settings → General → Research preferences**, then select local text/Markdown or registered parsed material, review and confirm the plan, and inspect **Research steps**. After interruption, **Continue research** is an explicit action when available. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
 
 | Symptom | First check |
 |---|---|
@@ -72,6 +72,7 @@ Use [Workflows](workflows.md) for research, single-invoice review and ongoing Pe
 | Send is unavailable | Selected model, Host/Runtime readiness, active or unconfirmed stopping work |
 | Skill is Partial | Its listed tool, Skill and extension dependencies |
 | No child appears | Extension enabled, role available, actual `Agent` call and remaining budget |
+| Research cannot continue | Confirmed plan, unfinished step status, runtime readiness and original stopping facts |
 | Old conversation cannot continue | Saved history/material access may be unusable; read diagnostics before a new Run |
 
 The default Windows data root is `%APPDATA%\Flowmate`, with SQLite at `data\app.sqlite`. Model requests send relevant content to the chosen service and may cost money. Test connection, Optimize, Send, Fill with Agent, research planning/execution and authorized Personal Agent execution can call a model. Opening pages and saving settings do not automatically do so.

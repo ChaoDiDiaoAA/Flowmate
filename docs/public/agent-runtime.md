@@ -51,9 +51,25 @@ sequenceDiagram
 
 Live events help the UI refresh. Saved state and tool evidence answer whether an operation was accepted, executed, committed or delivered. A reconnect or history query does not replay input.
 
+<a id="context-memory-layers"></a>
+
 ## Context and resource boundaries
 
-The product saves the selected materials and workspace basis with the input/Run. The adapter connects this basis to native messages and model request evidence. Merely reading a material on the controller side is weaker evidence than showing it in the actual model request; neither proves semantic use by the model.
+Flowmate separates the current working basis from saved conversation and research facts. These are responsibilities with different lifetimes, not a new general-purpose memory service:
+
+| Layer | Contents and lifetime |
+|---|---|
+| Workspace Context | Page focus, when supplied, and selected business references and authorized materials are captured with an accepted input. Changing the page does not rewrite that input's snapshot. |
+| Conversation | User inputs, assistant messages, actual tool results and Pi history/compaction entries are persisted with the Session. |
+| Runtime Session | The active Agent, cancellation, budgets and in-process execution exist while their owner runs; recovery uses saved facts, not a saved copy of the live process. |
+| Research preferences | Text explicitly saved in **Settings → General → Research preferences** is captured with its settings revision for each research Run. A change affects a later Run, not one already running. |
+| Research checkpoint | The confirmed plan, step executions, source identities and report facts are read from the ResearchTask and actual records; the checkpoint is a projection of those facts. |
+
+For new AgentSession prompt, steer and follow-up inputs, the product saves the applicable focus and selected material basis in a Context Snapshot. Before a model request, the Pi adapter adds a request-local system section using that input's snapshot, the Run's captured preferences and, when applicable, the current saved research checkpoint. Automatically captured page state is not appended to the native user message or accumulated as conversation text. An explicit user message or expanded template remains part of the input. The saved snapshot and request binding allow the basis to be inspected in **Session details → Context**.
+
+Historical records are not rewritten to remove earlier page content. Pi continues to own AgentSession history and compaction; request-local projection does not replace saved conversation history. Fill Form retains its frozen Workspace input path, and Personal Agent retains its separate Durable phase context. Research preference text and material content are untrusted data: they do not grant permissions or expand a task's authorized source scope. A model request may send this context to the selected provider.
+
+Merely reading a material on the controller side is weaker evidence than showing it in the actual model request; neither proves semantic use by the model. The existing implementation does not infer long-term preferences from conversations or turn this layering into automatic vector memory.
 
 Resource refresh affects future selections, not historical run copies. Revoked material access or unusable native history can block continued model use while leaving saved facts inspectable. Automatic/native compaction and explicit Session compaction use the Pi history path; a displayed summary is not a replacement for missing committed history. Child Sessions cannot be manually compacted through the root Session operation.
 
@@ -91,4 +107,4 @@ Use Session Details/Context, Activity and Processing History to inspect the rele
 
 - [RuntimeService](../../packages/core/src/runtime/service.ts), [Session service](../../packages/core/src/sessions), [Context](../../packages/core/src/context)
 - [Tool executor](../../packages/core/src/tools/executor.ts), [Pi Session adapter](../../packages/runtime-pi/src/session.ts), [Durable adapter](../../packages/runtime-durable/src/index.ts), [Personal Agent services](../../packages/core/src/personal-agent)
-- [Lifecycle tests](../../tests/core/runtime), [cold-start recovery](../../tests/core/application/cold-start-recovery.integration.test.ts), [Context integration](../../tests/runtime-pi/context.integration.test.ts)
+- [Lifecycle tests](../../tests/core/runtime), [cold-start recovery](../../tests/core/application/cold-start-recovery.integration.test.ts), [Context integration](../../tests/runtime-pi/context.integration.test.ts), [request-layer tests](../../tests/core/research/layered-context.integration.test.ts)

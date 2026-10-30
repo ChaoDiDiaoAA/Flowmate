@@ -4,7 +4,7 @@
 
 ## Workbench structure
 
-The React Renderer uses shared CSS variables and ordinary form elements. It opens with navigation and a main conversation canvas. Most business and settings pages show their work area with Assistant on the right; Personal Agent uses a separate main workspace without that sidebar. The same conversation component serves the main and sidebar presentations. Implementation lives in [app.tsx](../../apps/desktop/renderer/src/app.tsx), [styles.css](../../apps/desktop/renderer/src/styles.css) and topic components in that directory.
+The React Renderer uses shared CSS variables and ordinary form elements. It opens with navigation and, when available, a valid saved page focus; otherwise it uses the main conversation canvas. Most business and settings pages show their work area with Assistant on the right; Personal Agent uses a separate main workspace without that sidebar. The same conversation component serves the main and sidebar presentations. Implementation lives in [app.tsx](../../apps/desktop/renderer/src/app.tsx), [styles.css](../../apps/desktop/renderer/src/styles.css) and topic components in that directory.
 
 | Area | Purpose |
 |---|---|
@@ -13,12 +13,12 @@ The React Renderer uses shared CSS variables and ordinary form elements. It open
 | Invoices / Workspace | Original/parsed/result review and material/candidate context |
 | Processing History | Saved processing Runs and business outcomes |
 | Chats / recent chats | List/manage saved Sessions or open one in the main conversation canvas |
-| Deep Research | Plan, Evidence, Report and associated Assistant |
+| Deep Research | Plan, Research steps, Evidence, Report and associated Assistant |
 | Activity | Runtime events and actual tool evidence |
 | Models | Provider/model setup and explicit connection checks |
 | Evaluation | Dedicated configuration, execution and saved quality results |
 | Prompts / Skills / Extensions | Resource selection, readiness and controlled capabilities |
-| Settings | User/theme, model and runtime preferences |
+| Settings | User/theme, model, runtime and explicitly saved research preferences |
 
 **New chat** creates a Session and opens the main conversation. Opening a recent chat or an entry in **Chats** also returns to that canvas. The global **Evaluation** entry remains available in both the conversation and business views.
 
@@ -38,6 +38,8 @@ Light, dark and system themes use shared background, surface, text, border, acce
 - Opening the default conversation view alone does not create a Session or start a Run. **New chat** creates the Session; sending input is a separate operation.
 - Drafts belong to their Session. Switching between the main conversation and sidebar, or collapsing and reopening Assistant, preserves the current draft in the window.
 - Input belongs to a specific Session/context. Late replies must not attach an old workspace or result to a new selection.
+- A valid saved research page and task may be restored after the Host is ready. An unavailable task is reported, and a delayed restore does not replace a newer user selection or draft; restoration does not start research.
+- **Research steps** displays saved step status, errors and source links. **Continue research** is shown for a confirmed plan with pending, failed or interrupted steps and can be enabled only when the selected research Session, model and runtime are ready, no Run is active, and the page is not loading or saving. See [Deep Research](workflows.md#deep-research).
 - Send, Stop, Fill with Agent, Save, Accept and Export are distinct operations. Visible field values do not prove a committed candidate.
 - Loading, errors, missing evidence, unavailable history and unconfirmed stopping retain their meanings; a missing reply is not success or permission for a new execution.
 - Unsaved invoice edits stay in memory; Save/Discard is explicit when leaving.
@@ -52,4 +54,4 @@ Keep native buttons, inputs, textareas, selects and semantic headings. Existing 
 
 Reuse existing field/notice patterns. Name the affected operation without exposing credentials or raw private payloads. These conventions and controlled Electron tests do not constitute an assistive-technology or WCAG conformance audit.
 
-Verification entry points: [workbench interaction E2E](../../tests/desktop/ui-workbench.e2e.test.ts), [layout tests](../../tests/desktop/panel-layout.unit.test.ts), [layout E2E](../../tests/desktop/panel-layout.e2e.test.ts), [theme E2E](../../tests/desktop/theme.e2e.test.ts), [Subagent E2E](../../tests/desktop/subagents.e2e.test.ts), [form E2E](../../tests/desktop/invoice-form.e2e.test.ts), [test guide](../../tests/README.md). Their existence does not imply every viewport, screen reader or OS configuration has been verified.
+Verification entry points: [workbench interaction E2E](../../tests/desktop/ui-workbench.e2e.test.ts), [research E2E](../../tests/desktop/research.e2e.test.ts), [workspace focus tests](../../tests/desktop/workspace-focus.unit.test.ts), [layout tests](../../tests/desktop/panel-layout.unit.test.ts), [layout E2E](../../tests/desktop/panel-layout.e2e.test.ts), [theme E2E](../../tests/desktop/theme.e2e.test.ts), [Subagent E2E](../../tests/desktop/subagents.e2e.test.ts), [form E2E](../../tests/desktop/invoice-form.e2e.test.ts), [test guide](../../tests/README.md). Their existence does not imply every viewport, screen reader or OS configuration has been verified.

@@ -25,8 +25,8 @@ bun --no-env-file run package:win
 
 | 相对位置 | 用途 |
 |---|---|
-| `data/app.sqlite` | 同一协调 owner 下的 Session、Run、输入、Context、发票事项与 Durable 原生记录 |
-| `data/settings.json`、`data/installed-release.json` | 设置与安装发行记录 |
+| `data/app.sqlite` | 同一协调 owner 下的 Session、Run、输入、Context、研究计划／步骤回执、发票事项与 Durable 原生记录 |
+| `data/settings.json`、`data/installed-release.json` | 设置（包括已保存研究偏好）与安装发行记录 |
 | `service-installation.json` | 服务安装与明确启用选择 |
 | `artifacts/`、`outputs/` | 受管资料和交付文件 |
 | `runtime/resource-bundles/`、`runtime/subagents/` | 原 Run 资源与用户角色 |
@@ -73,6 +73,8 @@ $restoredRoot = '<absolute restored user-data directory>'
 4. 核对可读性、兼容性及缺口。`runtimeValidation: pending` 表示文件和引用检查尚未验证实时执行；目标账户检查凭据访问，恢复存储获准使用后再显式启动一个安全新 Run。
 
 校验器将恢复持久文件集合、内容、引用与 Manifest 核对，并检查 Schema/设置兼容。已启用的服务选择必须具有原 SQLite，缺失时拒绝而非新建空库。校验不复制文件、重放旧调用、修复历史缺口、证明模型连接或认证业务质量。安装发行变化时，在打开、迁移状态前先备份；失败保留原数据，不宣称恢复成功。
+
+Schema 22 增加研究步骤执行关联。升级后的存储应使用兼容版本的程序；旧的无步骤计划保留原流程。研究进度来自持久计划、工具和来源事实，已保存页面焦点则属于桌面导航状态。以备份 Manifest 中的文件为准；导航不可用时重新选择研究任务，恢复本身不会继续模型执行。见 [Deep Research](workflows.zh-CN.md#deep-research)。
 
 ## 源码与验证
 

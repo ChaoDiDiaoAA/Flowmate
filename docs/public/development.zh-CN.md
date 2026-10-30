@@ -19,6 +19,10 @@ Node 开发入口管理初始构建、就绪、Electron 生命周期及 Main/Pre
 
 行为修改沿输入契约、公开 Application/Host/Preload、Runtime/适配器及相关存储、领域消费者检查，模型工具调用保持经过产品执行器。Durable 事项入口见 [Personal Agent](personal-agent.zh-CN.md)，父子实现入口汇总在 [Subagent](subagents.zh-CN.md#developer-map-and-verification)。
 
+Context／Memory 和研究可从 [Context 准备](../../packages/core/src/context/service.ts)、[AgentSession 适配器](../../packages/runtime-pi/src/session.ts)、[研究 Checkpoint 投影](../../packages/core/src/research/workflow.ts)和[本地采集](../../packages/core/src/research/read-tools.ts)入手。[请求分层](../../tests/core/research/layered-context.integration.test.ts)、[研究流程](../../tests/core/research/workflow.integration.test.ts)、[采集并发](../../tests/core/research/read-concurrency.unit.test.ts)和[桌面研究](../../tests/desktop/research.e2e.test.ts)测试是针对性验证入口，不代表它们已在某个环境中通过。
+
+调查带步骤的计划时，`read_research_local` 必须接收已确认的 `stepId` 与准确材料参数；规划阶段读取和旧的无步骤计划不传 `stepId`。同一活动步骤的重复调用会被拒绝，现有采集队列限制实际读取并支持在等待期间取消。
+
 ## 工程验证
 
 ```powershell

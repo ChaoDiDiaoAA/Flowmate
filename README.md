@@ -38,12 +38,12 @@ Flowmate 面向需要处理本地资料、保留工作过程并复核交付结�
 | 能力 | Flowmate 的自定义实现与作用 |
 |---|---|
 | **Personal Agent 持续事项助手** | 基于 Pi Durable，将固定票组组织为持久事项，逐票跟踪 Todo、补料、候选与最终处置；保留原配置、资源和执行依据，通过授权、预算与停止事实控制后续执行。 |
-| **结构化 Deep Research** | 将研究拆为维度与子问题，用原子结论及依赖组织答案；保存来源正文与证据位置，逐项呈现覆盖、冲突和缺口。 |
+| **结构化 Deep Research** | 将确认的计划拆为可追踪步骤，以真实工具回执和来源快照推进 Checkpoint；主任务与子代理共享采集名额，手动继续复用成功证据，再以 Claim 与依赖组织覆盖、冲突和报告。 |
 | **Skill Hub 技能管理** | 串联技能发现、依赖检查、显式启用、版本化运行副本和按需读取，让用户与 Agent 明确技能是否可用、缺少什么，以及本次执行使用的资源。 |
 | **Subagent 自定义子代理驱动** | 分别接入 AgentSession 子会话与 Durable 子任务，按角色收紧工具范围，统一管理父子共享预算、并行准入、独立历史、停止确认、结果保存与回送。 |
 | **预算感知的工具 Runtime** | 每次模型请求提供剩余调用数、时间、工具时限和近期诊断；执行器同时落实预算与范围限制，让模型决策与实际约束保持一致。 |
 | **可核验的工具执行** | 执行前检查参数、权限与预算，执行后核验输出、停止及写入回执；以合格历史样本形成有上限的 P95 超时策略。 |
-| **持久会话与上下文** | 将两类原生历史接入本地产品存储，保存运行上下文与事项配置，支持历史查询及符合授权的恢复，避免用当前选择解释过去的执行。 |
+| **Context / Memory 分层** | 分开管理工作区快照、会话历史、进程内运行态、显式研究偏好与任务 Checkpoint；当前页面投影仅注入本次模型请求，研究进度依据真实执行记录恢复，隔离当前焦点并复用成功证据。 |
 | **独立 Agent 评测闭环** | 从真实轨迹、候选审核和版本化数据集，连接独立评分、配置比较、Baseline / Gate 与反馈回归；保留原执行、证据及评分修订。 |
 
 <a id="personal-agent"></a>
@@ -97,7 +97,7 @@ Personal Agent 使用自身已适配的工具、Prompt 与 Skill，不自动沿�
 
 ## 🔬 Deep Research：从研究问题到可追溯的证据链
 
-研究任务需要回答多个相关问题，并解释结论如何得到。Flowmate 用结构化计划和 Claim 承载研究过程，让用户能检查资料、补充缺口，并查看支持最终答案的中间结论。
+研究任务需要回答多个相关问题，并解释结论如何得到。Flowmate 将结构化计划拆为可执行采集步骤，以真实工具记录与来源快照保存进度，再用 Claim 组织结论和证据链。用户能检查资料、补充缺口，并在中断后明确继续，复用已经确认成功的证据。
 
 ![Deep Research 创建表单：研究问题、范围约束与本地资料选择](docs/screenshots/Deep%20Research.png)
 
@@ -107,28 +107,38 @@ Personal Agent 使用自身已适配的工具、Prompt 与 Skill，不自动沿�
 
 ```mermaid
 flowchart TB
-  Question["研究问题与范围<br/>选择授权本地资料"] --> Plan["生成并保存研究计划<br/>子问题 / 证据需求 / 预算"]
-  Plan --> Confirm{"用户确认当前计划？"}
+  Question["研究问题与范围<br/>选择授权本地资料"] --> Plan["生成并保存含步骤的计划<br/>子问题 / 材料参数 / 预算"]
+  Plan --> Confirm{"用户确认当前计划版本？"}
   Confirm -->|"修改计划"| Plan
-  Confirm -->|"确认执行"| Collect["调查授权本地资料"]
-  Collect -->|"主 Agent 调查"| Sources["保留来源正文与执行身份<br/>Run / ToolCall"]
-  Collect -.->|"按需委派"| Investigator["只读调查子代理<br/>共享范围与预算"]
-  Investigator --> Sources
-  Sources --> Claims["保存原子 Claim<br/>证据关系 / 结论依赖"]
+  Confirm -->|"确认执行"| Steps["读取计划步骤与 Checkpoint"]
+  Steps -->|"剩余步骤"| Collect["按步骤采集授权本地资料<br/>同研究主 / 子共享 2 个名额"]
+  Collect --> Receipts["保存来源正文与执行回执<br/>Run / ToolCall / 停止事实"]
+  Collect -.->|"按需委派"| Investigator["只读调查子代理<br/>沿用计划范围与预算"]
+  Investigator --> Receipts
+  Receipts --> Checkpoint["更新研究 Checkpoint<br/>依据工具终态与来源<br/>成功 / 失败 / 中断"]
+  Steps -->|"复用成功证据"| Claims["综合证据并保存原子 Claim<br/>证据关系 / 结论依赖"]
+  Checkpoint --> Claims
   Claims --> Coverage{"报告完整性条件<br/>是否满足？"}
   Coverage -->|"满足"| Full["保存完整报告"]
-  Coverage -->|"可补证且预算允许"| Collect
+  Coverage -->|"原计划可补证且预算允许"| Steps
   Coverage -->|"仍有缺口"| Partial["保存部分报告<br/>明确冲突与未解决问题"]
   Full --> Deliver["查看报告与证据<br/>导出 Markdown 时复核原文"]
   Partial --> Deliver
+  Collect -.->|"中断后重新查看"| Restore["读取持久步骤与来源<br/>恢复进度展示"]
+  Restore --> Continue["用户点击 Continue research<br/>核验预算与停止状态"]
+  Continue --> Steps
 ```
 
 1. **提出问题与范围。** 选择本地文本、Markdown 或已登记解析资料，明确允许使用的材料。
-2. **生成并确认计划。** Agent 保存研究维度、子问题、证据需求、预算和停止条件；用户可修改计划，确认后才进入调查。
-3. **读取与调查。** 工具读取授权材料并保存正文快照。需要独立调查时，主 Agent 可委派 `research-investigator`，子任务只读并共享父预算。
-4. **组织结论与证据。** 将发现保存为原子 Claim，关联支持或反驳证据，以及推理依赖的其他 Claim；证据保留原执行与工具调用身份。
-5. **检查覆盖与缺口。** 根据计划逐项说明覆盖、冲突和未解决问题；证据不足时允许提交明确标记的部分报告。
+2. **生成并确认计划。** Agent 保存研究维度、子问题、证据需求、预算和停止条件，以及包含稳定步骤 ID、关联子问题与材料参数的采集步骤。用户确认具体计划版本后才进入调查；原授权范围内可修改并重新确认计划，改变授权材料选择需要新建研究任务。
+3. **按步骤读取与调查。** 复用现有读取工具与 SDK 并行执行，调用绑定步骤及材料参数；同一研究的实际采集最多并发 **2** 个，主 Agent 与只读 `research-investigator` 共享名额、资料范围和根预算，排队期间也响应取消。
+4. **保存真实进度。** 来源正文及 Run / ToolCall 身份与计划步骤关联，Checkpoint 依据实际执行记录更新；下一次模型请求提供成功来源、失败原因、剩余步骤和预算，正文按需读取。
+5. **组织结论并检查缺口。** 将发现保存为原子 Claim，关联支持或反驳证据、依赖结论及所回答的子问题；逐项检查覆盖与冲突，采集失败或预算不足时可提交明确标记的部分报告。
 6. **保存与交付。** 报告保存后可在产品中重新查看，导出 Markdown 时再次核验结论、来源身份及原文片段。
+
+步骤展示为 `pending`、`running`、`succeeded`、`failed` 或 `interrupted`。成功需要工具成功终态、停止已确认及对应来源快照共同支撑；模型声明完成或已经出现来源文件，都不能单独把步骤判为成功。
+
+重启后重新查看任务只恢复进度，不请求模型。用户点击 **Continue research** 后，在新的研究 Run 中复用已确认成功的来源，处理待执行、失败和中断步骤；每次继续使用明确的运行预算，停止未确认时仍受阻，不在后台自动重试。旧计划保持可读及原有继续能力，重新生成并确认含步骤的计划后使用新工作流。
 
 ### 证据与完整性的约束
 
@@ -307,6 +317,43 @@ Chats、Invoices、Deep Research 保持 AgentSession 流程，Personal Agent 使
 
 默认由本地 Host 承载后端，显式启用服务模式时由 ServiceOwner 承载；服务接入已有工程实现，真实 Windows 服务生命周期仍待系统验收。
 
+### Context / Memory：分层状态与研究恢复
+
+Flowmate 将当前输入依据、持久历史、进程内对象、显式偏好和任务进度分开管理。Pi 提供原生消息、历史与压缩能力，Flowmate 负责当前请求的投影、授权绑定，以及根据业务执行事实恢复研究进度。
+
+| 层次 | 职责与生命周期 |
+|---|---|
+| **Workspace Context** | 接收输入时捕获页面焦点、材料与选区，形成独立 Context Snapshot。运行中切页不改变已接收任务，页面焦点不扩大资料访问范围。 |
+| **Conversation** | 持久保存用户输入、助手回复、真实工具结果与历史摘要，沿用 Pi 的消息、会话历史及压缩能力。 |
+| **Runtime Session** | 持有活跃 Agent、取消信号、并发执行和进程内对象；退出后根据持久事实重新建立运行对象。 |
+| **Research Preferences** | 显式保存研究关注点、证据与报告偏好，默认空文本；研究 Run 捕获当次文本与版本，设置修改用于后续 Run。 |
+| **Task Checkpoint** | 从确认的计划、步骤执行、工具终态与来源快照投影进度，关联成功证据、失败或中断及报告，不另存一份会话副本。 |
+
+```mermaid
+flowchart TB
+  Input["接收用户输入<br/>核验任务与资料范围"] --> Capture["捕获当前工作区焦点<br/>及当次研究偏好版本"]
+  Preferences["Research Preferences<br/>用户显式保存"] -->|"研究 Run"| Capture
+  Capture --> Snapshot["Workspace Context<br/>独立 Context Snapshot"]
+  Input -->|"用户原文与必要业务输入"| Conversation["Conversation<br/>持久消息、工具结果与摘要"]
+  Snapshot --> Request["组装当前模型请求<br/>临时注入投影与研究进度"]
+  Conversation --> Request
+  Checkpoint["Task Checkpoint<br/>计划 / 步骤 / 来源 / 报告"] --> Request
+  Request --> Runtime["Runtime Session<br/>进程内 Agent / 取消 / 并发"]
+  Runtime -->|"真实消息与工具结果"| Conversation
+  Runtime -->|"真实研究执行回执"| Checkpoint
+  Startup["后端重启"] -.-> Restore["读取持久历史与 Checkpoint<br/>恢复进度展示"]
+  Conversation -.-> Restore
+  Checkpoint -.-> Restore
+  Restore --> Continue["用户明确 Continue research<br/>后续 Run 复用成功来源"]
+  Continue --> Capture
+```
+
+新增自动页面投影只用于当前模型请求，不拼入新的原生用户消息，也不直接进入历史压缩输入；用户显式提交的材料、确认操作、真实工具结果和 Fill Form 必需的业务输入继续保留。历史中已经保存的页面内容保持原样，不追溯重写。
+
+研究偏好通过 **Settings → General → Research preferences** 显式保存，不自动从对话提炼，也不构成资料访问权限。当前 Run 沿用已捕获版本，下次研究 Run 才接收新的偏好。
+
+图示覆盖 AgentSession 会话与 Deep Research：恢复展示和明确继续分别处理，查看页面不发起执行。Personal Agent 沿用独立的 Durable 阶段上下文，继续按事项原配置、授权与实际停止事实核验恢复条件。
+
 ### 原生能力、适配与自定义产品实现
 
 | 模块 | 底层基础能力 | Flowmate 的适配与产品实现 |
@@ -315,10 +362,10 @@ Chats、Invoices、Deep Research 保持 AgentSession 流程，Personal Agent 使
 | **Personal Agent** | Pi Durable 的持久任务图、原生记录与恢复能力。 | 建模固定票组、逐票 Todo 与最终处置，绑定原配置和资源，核验补料、继续、恢复及结项条件。 |
 | **工具** | Pi 工具协议、原生工具和 Durable 工具执行机制。 | 分别适配会话工具与持久产品工具；执行器增加参数、范围、时限、输出、调用记录和副作用核验。 |
 | **会话与历史** | AgentSession 原生历史与 Pi Durable 原生持久记录。 | 关联产品 Session / Run 及事项、尝试和阶段，接入本地查询与受控恢复；查看历史不触发重新执行。 |
-| **上下文** | 两类运行时各自的消息、上下文与原生压缩能力。 | 组织授权资料、工作目录和资源，绑定运行或事项的实际依据，接合压缩、持久历史与恢复资格检查。 |
+| **上下文** | Pi 的原生消息、历史与压缩能力，以及 Durable 的阶段上下文。 | 分层管理会话历史、当次工作区投影、显式研究偏好与任务 Checkpoint，保存请求依据；Personal Agent 保留独立的事项上下文与恢复条件。 |
 | **Skill Hub** | Pi 的 Skill 资源与加载机制。 | 管理资源发现、依赖就绪、显式启停、选定版本和运行副本，以短索引与按需读取接入具体 Run。 |
 | **Subagent 驱动** | AgentSession 的子会话执行能力与 Pi Durable 的持久子任务能力。 | 自定义驱动负责真实委派核验、角色与上下文装配、独立历史、只读工具注册、共享预算、并行准入、停止确认与结果回送。 |
-| **研究与业务交付** | 通用模型、工具与扩展能力。 | 实现研究计划、来源、Claim 和报告模型；实现发票候选、字段规则、人工复核、接受与导出流程。 |
+| **研究与业务交付** | 通用模型、工具与扩展能力。 | 将确认的计划步骤关联真实工具回执和来源，管理并行采集、进度投影与手动继续，再组织 Claim 和报告；接合发票候选、人工复核、接受与导出。 |
 
 普通聊天可使用当前平台支持的 Pi 原生文件与命令工具。工作目录用于确定执行位置，**目录选择本身不提供沙箱隔离**。Skill 与 Extension 的依赖、启用状态及工具可用性可在对应资源页面和 Diagnostics 查看。
 
@@ -363,9 +410,11 @@ Personal Agent 使用独立的 Pi Durable 入口；已有 Chats、Invoices、Dee
 
 ### 5. 体验 Deep Research
 
-1. 进入 **Deep Research**，导入或选择本地 `.txt` / `.md` 资料，也可选择已登记解析资料；填写问题和范围并创建研究。
-2. 在 Assistant 点击 **Send** 生成研究计划。查看子问题、证据需求和预算，按需修改并确认执行。
-3. 调查结束后，在 **Evidence / Report** 查看来源、结论、覆盖和缺口，使用 **Save report** 另存 Markdown。
+1. 按需在 **Settings → General → Research preferences** 填写并保存研究偏好，后续研究 Run 使用新版本。
+2. 进入 **Deep Research**，导入或选择本地 `.txt` / `.md` 资料，也可选择已登记解析资料；填写问题和范围并创建研究。
+3. 在 Assistant 点击 **Send** 生成含采集步骤的计划，查看子问题、材料、证据需求和预算，按需修改并确认该版本。
+4. 在 **Research steps** 查看逐步状态、来源身份和失败原因；在 **Evidence / Report** 查看结论、覆盖与缺口，使用 **Save report** 另存 Markdown。
+5. 中断后重新打开任务查看已保存进度，点击 **Continue research** 明确继续，复用成功来源并处理剩余步骤。旧计划需重新生成并确认含步骤的计划，才能使用新步骤工作流。
 
 要使用调查子任务，先在 Extensions 启用已登记的 **subagents** 扩展。研究无需先创建发票任务。
 
@@ -487,7 +536,7 @@ bun --no-env-file run eval:full
 | 方面 | 当前能力与边界 |
 |---|---|
 | **Personal Agent** | 基于 Pi Durable 持续整理固定票组，保留逐票 Todo、补料、候选、原配置与人工最终处置；按已保存授权恢复合格原尝试。关闭桌面后持续执行、服务重启和开机恢复的真实系统验收仍待完成。 |
-| **研究** | 支持本地资料规划、确认、调查、Claim、证据与完整或部分报告；可选只读子任务。尚未接入联网搜索和网页抓取。 |
+| **研究** | 支持本地资料规划与确认、受控并行采集、持久步骤及手动继续，复用成功证据并保存 Claim 与完整或部分报告；可选只读子任务。尚未接入联网搜索和网页抓取。 |
 | **日常任务** | Chats、Invoices、Deep Research 使用 AgentSession，支持资料问答、持久会话和当前平台可用的 Pi 原生工具；工作目录选择不构成沙箱。 |
 | **发票** | 支持已有解析材料上的候选、字段核算、人工复核、接受与导出；不在 Host 中执行原票解析。 |
 | **验证** | 已有工程测试，以及轨迹、候选、数据集、评分、实验和回归入口。机制覆盖、真实模型质量、相对 Gate 与平台回读分别判断，不由功能存在推导质量达标。 |

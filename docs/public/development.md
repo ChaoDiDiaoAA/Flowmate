@@ -19,6 +19,10 @@ Read [Architecture](architecture.md) for boundaries. `apps/composition.ts` and `
 
 For behavior changes, trace input through the contract, public Application/Host/Preload boundary, Runtime/adapter and relevant storage/domain consumer. Keep model-selected tools inside the product executor. Durable Work entry points are in [Personal Agent](personal-agent.md); parent/child implementation entry points are collected in [Subagents](subagents.md#developer-map-and-verification).
 
+For Context/Memory and research, start with [Context preparation](../../packages/core/src/context/service.ts), [AgentSession adapter](../../packages/runtime-pi/src/session.ts), [research checkpoint projection](../../packages/core/src/research/workflow.ts) and [local acquisition](../../packages/core/src/research/read-tools.ts). The [layered-context](../../tests/core/research/layered-context.integration.test.ts), [workflow](../../tests/core/research/workflow.integration.test.ts), [acquisition concurrency](../../tests/core/research/read-concurrency.unit.test.ts) and [desktop research](../../tests/desktop/research.e2e.test.ts) tests are focused verification entry points, not evidence that they passed in a particular environment.
+
+During investigation of a plan with steps, `read_research_local` must receive the confirmed `stepId` and its exact material parameters. Planning reads and legacy plans without steps omit `stepId`. Duplicate in-flight steps are rejected; the existing acquisition queue bounds actual reads and honors cancellation while waiting.
+
 ## Engineering checks
 
 ```powershell

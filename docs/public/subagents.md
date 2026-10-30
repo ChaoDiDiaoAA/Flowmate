@@ -101,6 +101,7 @@ The product prepares the child's input/Context basis and binds original resource
 | Writes | No candidate/Claim/report saves, file edits, command execution or form fills from children |
 | Materials | Parent-authorized scope; no new material grants from a child prompt |
 | Concurrent children | At most **4** held children; a fifth is rejected with `subagent_busy`, not queued |
+| Research acquisition | At most **2** active `read_research_local` acquisitions per research task, shared by the parent and children; this is separate from the child limit |
 | Model calls | Shared root ledger; child admission leaves **one** root continuation request |
 | Tools/feedback | Shared parent tool-call count and cumulative tool-feedback capacity |
 | Time | Child deadline is no later than the parent deadline and the actual delegation deadline |
@@ -125,7 +126,7 @@ After restart, inspect the saved child/parent facts. Recovery does not automatic
 
 **Ordinary analysis:** use `general-analyst` to compare explanations, constraints or risks contained in the supplied text. It cannot look up facts because its tool list is empty. Ask the parent to distinguish independent reasoning from verified evidence.
 
-**Local research:** after confirming a research plan and enabling the extension, ask the parent to assign independent subquestions to `research-investigator`. It returns findings, source identities, excerpts, conflicts and gaps. The parent verifies evidence and saves Claims/reports. Online search and webpage extraction remain unavailable.
+**Local research:** after confirming a research plan and enabling the extension, ask the parent to assign independent subquestions to `research-investigator`. For a plan with steps, the child uses the assigned step IDs and exact planned materials; parent and children share the two acquisition slots. It returns findings, source identities, excerpts, conflicts and gaps. The parent verifies evidence and saves Claims/reports. A user can explicitly continue eligible unfinished research; this does not automatically replay an interrupted child. Online search and webpage extraction remain unavailable. See [Deep Research](workflows.md#deep-research).
 
 **Invoice review:** once the invoice and parsed material are selected, `/parallel-invoice-review …` can request an evidence child and a tool-free reasoning child. Evidence readers stay within the fixed material scope. The parent reconciles returned results; only the authorized parent/user path can save, fill or accept the candidate. A template request is not proof that both children ran.
 

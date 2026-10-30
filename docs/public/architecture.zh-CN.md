@@ -17,6 +17,7 @@ flowchart TB
   Host --> App[共用 Application 与业务服务]
   App --> Context[Workspace 与 Context 服务]
   App --> Adapter[runtime-pi: Chats / Invoices / Deep Research]
+  Context -->|请求级投影| Adapter
   Adapter --> SDK[Pi AgentSession]
   App --> Durable[runtime-durable: Personal Agent]
   Durable --> Harness[Pi Durable Harness]
@@ -25,6 +26,7 @@ flowchart TB
   SDK --> Executor[产品 ToolExecutor]
   Harness --> Executor
   Executor --> Domain[研究 / 发票 / 资源 / 原生工具]
+  Domain -->|研究检查点事实| Context
   Context --> Store[(SQLite 与受管文件)]
   Domain --> Store
   App --> Children[归属明确的子执行]
@@ -56,8 +58,8 @@ Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取
 
 1. Main 校验用户操作并路由到选定的 Application 控制者。
 2. Application 核对 Session/工作区或发票事项归属，受理具体输入或命令。
-3. 选定运行时固定当次模型配置、允许资料和工具、资源版本与 Context 依据。
-4. 对应适配器准备实际原生消息与工具，模型工具调用经过产品执行器落实权限、预算和交付记录。
+3. 选定运行时固定当次模型配置、允许资料和工具、资源版本与 Context 依据；研究 Run 还捕获已保存偏好文字与 revision。
+4. 对新的分层输入，AgentSession 适配器准备原生历史和工具，在模型请求前加入该输入的请求级 Context 投影与可用的当前研究 Checkpoint。模型工具调用经过产品执行器落实权限、预算和交付记录；Durable 保留自己的阶段上下文。
 5. 领域服务核对业务副作用，SQLite 与受管文件保存执行事实和产物身份。
 6. UI 查询已保存结果并显示实时进度，进度本身不等于业务提交。
 
@@ -66,6 +68,8 @@ Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取
 ## 持久化与资源
 
 Windows 用户数据根为 `%APPDATA%\Flowmate`，`data/app.sqlite` 在同一数据库 owner 和共用写入协调下保存产品状态及 Durable 原生记录，`artifacts/`、`outputs/` 和 `runtime/` 保存受管内容与运行资源。控制者锁避免同一数据根被多个产品控制者同时持有。AgentSession 历史与 Durable 原生 Task/检查点仍各由对应适配器负责。
+
+AgentSession 输入快照、原生会话历史与研究步骤／工具／来源记录分别归属各自层次。研究偏好明确保存在产品设置中，桌面保存的页面／研究焦点属于导航状态；恢复焦点不会启动模型 Run。详见 [Context 与 Memory 分层](agent-runtime.zh-CN.md#context-memory-layers)和 [Deep Research](workflows.zh-CN.md#deep-research)。
 
 ServiceOwner/Node ServiceClient、SID/DACL 校验、CurrentUser DPAPI 凭据、原凭据迁移与维护实现继续保留。当前工程版以 Application 控制者运行期间的执行、已提交事实和合法恢复为交付边界；真实 Windows SCM 安装/启动、开机、升级/回退及关闭桌面后持续运行统一延期验收。
 

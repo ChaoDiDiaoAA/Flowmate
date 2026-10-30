@@ -36,7 +36,7 @@ Run 准备保留选定资源版本及原文件内容。刷新不会将新作者�
 
 模型先获得有界短索引和指导，索引、补充与指导准备路径总量受 16 KiB 约束，正文与附属文件按需读取。`list_skill_resources`、`read_skill_resource` 核对原 Run、选定版本与允许路径。Skill 文件是指令或资料，读取 `scripts/` 文本不等于执行脚本，也不新增工具权限。
 
-内置发票 Skill 拆分证据发现、字段提取、金额和来源核对、歧义复核、保存与交接；研究 Skill 引导规划、确认、调查、综合、报告。保存类 Skill 不免除实际工具 Schema、权限或持久化检查。“选中 Skill”与“实际读取、使用 Skill”是评测中的不同事实。
+内置发票 Skill 拆分证据发现、字段提取、金额和来源核对、歧义复核、保存与交接；研究 Skill 引导规划、确认、调查、综合、报告，包括计划步骤 ID、已保存 Checkpoint 和明确继续。它使用既有研究工具；选择 Skill 不证明计划步骤已执行。保存类 Skill 不免除实际工具 Schema、权限或持久化检查。“选中 Skill”与“实际读取、使用 Skill”是评测中的不同事实。见 [Deep Research](workflows.zh-CN.md#deep-research)。
 
 Personal Agent 在 **Assistant configuration** 中独立选择模型、工具、Prompt 和 Skill，不沿用普通 Assistant 当前选择。Durable 路径根据可用发票与资源工具检查依赖；目前没有 Durable 扩展适配器，依赖扩展的 Skill 无法用于 Durable 阶段。已受理 Work 保留其选定配置和资源版本。详见 [Personal Agent](personal-agent.zh-CN.md)。
 

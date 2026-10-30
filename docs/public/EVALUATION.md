@@ -46,6 +46,8 @@ The original Smoke/Full selections cover their specified business and research C
 
 Start from a failed Score, open its Trace, then find the Session. Read the actual model request and response, tool arguments and results, subagent work, and saved business receipts. Match the failure to a specific requirement and the evidence supporting that requirement. A controller reading a file, a model receiving its contents and a model using them correctly are separate observations.
 
+For a research task with steps, compare its confirmed plan and checkpoint with the original Run/ToolCall, saved source and any explicit continuation. A `succeeded` acquisition records a successful receipt and source; it is not independent Gold, proof of a supported Claim, or a quality score. A partial report and a completed Run also answer different questions. See [Deep Research](workflows.md#deep-research).
+
 Keep observed facts separate from explanations. A missing business receipt can establish that delivery was not recorded; it does not alone explain whether the cause was a prompt, a tool error or a model choice. Provider, infrastructure, runtime and Judge failures need their own diagnosis. Missing capture stays missing evidence.
 
 Langfuse upload is followed by readback of the relevant observations, parent/child links, content and scores. An accepted request is not proof of a complete remote trace. If a write result is unknown, inspect the original operation before resending it. Benchmark observations stay in their Run and are not duplicated as product Trace files.

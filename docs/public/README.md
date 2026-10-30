@@ -10,6 +10,8 @@ This engineering delivery covers verified capabilities while the application is 
 
 For users: [Getting started](getting-started.md) → [Workflows](workflows.md) → [Skills and extensions](skills-and-extensions.md). Read [Personal Agent](personal-agent.md) for ongoing invoice work, [Subagents](subagents.md) for delegation, and [Packaging and recovery](packaging-and-recovery.md) before moving local data.
 
+For local research, follow the [Deep Research workflow](workflows.md#deep-research). The [Context and memory layers](agent-runtime.md#context-memory-layers) explain what is captured for an input, retained as history or restored as research progress.
+
 For ongoing invoice work, open **Personal Agent** and follow [the Personal Agent guide](personal-agent.md): select a fixed set of parsed invoices, track per-invoice Todo items, supplement material and review candidates until every invoice has an explicit final disposition.
 
 For developers: [Product scope](PRD.md) → [Architecture](architecture.md) → [Agent runtime](agent-runtime.md) → [Personal Agent](personal-agent.md) → [Subagents](subagents.md) → [Development](development.md). Use [Evaluation](EVALUATION.md) to distinguish engineering checks from real model trials.
@@ -21,10 +23,10 @@ For developers: [Product scope](PRD.md) → [Architecture](architecture.md) → 
 | [Product scope](PRD.md) | Who the workbench serves, its workflows and current limits |
 | [Getting started](getting-started.md) | Development startup, model configuration, first conversation and Personal Agent entry |
 | [Architecture](architecture.md) | Electron, Bun Host, package responsibilities and data flow |
-| [Agent runtime](agent-runtime.md) | Session, Run, Context, tools, budgets, stopping and recovery |
+| [Agent runtime](agent-runtime.md) | Session, Run, Context/memory layers, tools, budgets, stopping and recovery |
 | [Personal Agent](personal-agent.md) | Durable invoice work, Todo, review, attempts and recovery boundaries |
 | [Subagents](subagents.md) | Role setup, delegation, parent/child ownership and lifecycle |
-| [Workflows](workflows.md) | Local questions, Deep Research, single-invoice review and ongoing Personal Agent work |
+| [Workflows](workflows.md) | Local questions, Deep Research steps and continuation, single-invoice review and ongoing Personal Agent work |
 | [Skills and extensions](skills-and-extensions.md) | Resource discovery, readiness, templates and controlled extensions |
 | [Evaluation](EVALUATION.md) | Purpose, traces, scoring, dual-model Smoke/Full and Baseline/Gate |
 | [Benchmark authoring](EVALUATION-BENCHMARK.md) | Real-source candidates, independent Gold, validation and versioned publication |

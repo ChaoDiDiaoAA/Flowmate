@@ -30,7 +30,7 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 
 ## 第一次对话
 
-应用启动后默认显示对话主区，仅打开此视图不会创建 Session 或请求模型回复。
+没有保存页面焦点时，应用默认显示对话主区；有效保存的焦点可恢复先前页面。仅打开视图不会创建 Session 或请求模型回复。
 
 1. 配置模型后，点击左侧导航中的 **New chat** 创建 Session 并进入对话主区。
 2. 输入一个小任务，例如“概括以下段落，并说明它不能证明什么”，附上不敏感的示例文字。
@@ -64,7 +64,7 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 
 ## 后续流程与常见问题
 
-研究、单票复核与 Personal Agent 持续事项见[业务流程](workflows.zh-CN.md)。研究读取选定本地文本、Markdown 或已登记解析资料；发票流程需要原件与外部准备的解析材料，应用不生成解析。
+研究、单票复核与 Personal Agent 持续事项见[业务流程](workflows.zh-CN.md)。使用 [Deep Research](workflows.zh-CN.md#deep-research) 时，可先保存 **Settings → General → Research preferences**，再选择本地文本、Markdown 或已登记解析资料，复核并确认计划，查看 **Research steps**。中断后可在条件允许时明确点击 **Continue research**。发票流程需要原件与外部准备的解析材料，应用不生成解析。
 
 | 现象 | 优先检查 |
 |---|---|
@@ -72,6 +72,7 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 | Send 不可用 | 模型选择、Host/Runtime 就绪、在途或停止未确认的任务 |
 | Skill 显示 Partial | 列出的工具、Skill 和扩展依赖 |
 | 没有子任务 | 扩展启用、角色可用、实际 Agent 调用及剩余预算 |
+| 研究无法继续 | 已确认计划、未完成步骤状态、运行时就绪与原停止事实 |
 | 历史会话不能继续 | 保存历史或资料权限可能不可用；新 Run 前查看诊断 |
 
 默认 Windows 数据根为 `%APPDATA%\Flowmate`，SQLite 位于 `data\app.sqlite`。模型请求会向选定服务发送相应内容，可能收费。Test connection、Optimize、Send、Fill with Agent、研究规划与执行、获准的 Personal Agent 执行可能请求模型；打开页面、保存设置不会自动请求。

@@ -4,7 +4,7 @@
 
 ## 工作台结构
 
-React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导航与对话主区。多数业务和设置页面显示各自工作区及右侧 Assistant；Personal Agent 使用独立主工作区，没有该侧栏。对话主区与侧栏复用同一个对话组件。实现位于 [app.tsx](../../apps/desktop/renderer/src/app.tsx)、[styles.css](../../apps/desktop/renderer/src/styles.css) 及同目录专题组件。
+React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导航及可用的有效保存页面焦点；没有焦点时显示对话主区。多数业务和设置页面显示各自工作区及右侧 Assistant；Personal Agent 使用独立主工作区，没有该侧栏。对话主区与侧栏复用同一个对话组件。实现位于 [app.tsx](../../apps/desktop/renderer/src/app.tsx)、[styles.css](../../apps/desktop/renderer/src/styles.css) 及同目录专题组件。
 
 | 区域 | 用途 |
 |---|---|
@@ -13,12 +13,12 @@ React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导
 | Invoices / Workspace | 原件、解析、结果复核与资料、候选上下文 |
 | Processing History | 保存的处理 Run 和业务结果 |
 | Chats / 最近会话 | 列出、管理已保存 Session，或在对话主区打开会话 |
-| Deep Research | Plan、Evidence、Report 与关联 Assistant |
+| Deep Research | Plan、Research steps、Evidence、Report 与关联 Assistant |
 | Activity | 运行事件与实际工具证据 |
 | Models | 模型、供应商配置与显式连接检查 |
 | Evaluation | 专用配置、执行与保存质量结果 |
 | Prompts / Skills / Extensions | 资源选择、就绪与受控能力 |
-| Settings | 用户、主题、模型和运行偏好 |
+| Settings | 用户、主题、模型、运行偏好及明确保存的研究偏好 |
 
 **New chat** 创建 Session 并进入对话主区；打开最近会话或 **Chats** 中的条目也会回到主区。全局 **Evaluation** 入口在对话和业务视图中均可使用。
 
@@ -38,6 +38,8 @@ Light、dark、system 主题复用背景、表面、正文、边框、强调、�
 - 仅打开默认对话视图不会创建 Session 或启动 Run。**New chat** 创建 Session，发送输入是独立操作。
 - 草稿归属具体 Session，在当前窗口内切换对话主区与侧栏、收起并重新展开 Assistant，均保留当前草稿。
 - 输入属于具体 Session/Context，迟到回复不能把旧工作区或结果附到新选择。
+- Host 就绪后可恢复有效保存的研究页面与任务。任务不可用时显示提示；迟到的恢复不会覆盖用户后来的选择或草稿，也不会启动研究。
+- **Research steps** 展示已保存步骤状态、错误和来源入口。已确认计划存在 pending、failed 或 interrupted 步骤时显示 **Continue research**；选定研究 Session、模型与运行时就绪，没有活跃 Run 且页面未在加载或保存时才能启用。详见 [Deep Research](workflows.zh-CN.md#deep-research)。
 - Send、Stop、Fill with Agent、Save、Accept、Export 含义不同，字段可见值不证明候选提交。
 - 加载、错误、缺证据、历史不可用、停止未确认分别保留；回复丢失不等于成功，也不授权新执行。
 - 未保存发票编辑仅在内存，离开时显式 Save/Discard。
@@ -52,4 +54,4 @@ Light、dark、system 主题复用背景、表面、正文、边框、强调、�
 
 复用字段和提示样式，标明相关操作但不泄露凭据或原始私有载荷。这些约定和受控 Electron 测试不代表完成辅助技术或 WCAG 合规审计。
 
-验证入口：[工作台交互 E2E](../../tests/desktop/ui-workbench.e2e.test.ts)、[布局测试](../../tests/desktop/panel-layout.unit.test.ts)、[布局 E2E](../../tests/desktop/panel-layout.e2e.test.ts)、[主题 E2E](../../tests/desktop/theme.e2e.test.ts)、[Subagent E2E](../../tests/desktop/subagents.e2e.test.ts)、[表单 E2E](../../tests/desktop/invoice-form.e2e.test.ts)、[测试说明](../../tests/README.md)。存在测试不表示所有视口、读屏器或系统配置已验证。
+验证入口：[工作台交互 E2E](../../tests/desktop/ui-workbench.e2e.test.ts)、[研究 E2E](../../tests/desktop/research.e2e.test.ts)、[工作区焦点测试](../../tests/desktop/workspace-focus.unit.test.ts)、[布局测试](../../tests/desktop/panel-layout.unit.test.ts)、[布局 E2E](../../tests/desktop/panel-layout.e2e.test.ts)、[主题 E2E](../../tests/desktop/theme.e2e.test.ts)、[Subagent E2E](../../tests/desktop/subagents.e2e.test.ts)、[表单 E2E](../../tests/desktop/invoice-form.e2e.test.ts)、[测试说明](../../tests/README.md)。存在测试不表示所有视口、读屏器或系统配置已验证。

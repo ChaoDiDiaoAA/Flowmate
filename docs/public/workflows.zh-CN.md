@@ -23,18 +23,27 @@ flowchart LR
   Input[问题与选定来源] --> Plan[生成并保存计划]
   Plan --> Confirm{用户确认计划}
   Confirm -->|修改| Plan
-  Confirm -->|确认| Read[调查授权来源]
-  Read --> Evidence[保存来源正文与身份]
-  Evidence --> Claims[含证据与依赖的 Claim]
+  Confirm -->|确认| Read[采集计划内来源]
+  Read --> Evidence[步骤状态与已保存来源]
+  Evidence -->|未完成或失败| Continue[用户明确继续]
+  Continue --> Read
+  Evidence -->|采集已收口| Claims[含证据与依赖的 Claim]
   Claims --> Report[完整或明确的部分报告]
+  Evidence -->|有缺口且无活动读取| Report
   Report --> Review[复核并另存 Markdown]
 ```
 
-1. 从左侧导航打开 **Deep Research**，导入或选定本地资料、已有解析文档，输入问题和范围并创建研究；此业务页面使用关联的右侧 Assistant。
-2. 在关联 Assistant 发送以生成计划，检查子问题、证据需求、预算和停止条件，按需修改。确认是独立用户操作，先确认再调查。
-3. 在确认计划下调查，真实读取保留来源正文及 Run/ToolCall 身份。启用 subagents 后可将独立问题交给 `research-investigator`，父任务仍负责综合与保存。
-4. 查看 **Evidence / Report**。Claim 将证据关系和依赖与计划问题关联；来源必须标明实际执行身份，原文与定位需匹配保存正文。
-5. 满足产品覆盖和支持条件才保存完整报告，否则在部分报告中保留未解决问题。**Save report** 另存 Markdown 时重新核对报告与证据引用。
+1. 可先在 **Settings → General → Research preferences** 填写证据或报告偏好，点击 **Save research preferences**。默认文字为空，最多 8,192 UTF-8 字节；每次研究 Run 捕获当时保存的文字和 revision，保存本身不请求模型。
+2. 打开 **Deep Research → New research**，输入问题与可选范围，导入或选择授权本地资料、解析文档。点击 **Create research**，再在关联 Assistant 中 **Send** 以生成计划；当前发票不会被自动加入研究。
+3. 检查已保存 Plan 的问题、证据需求、来源范围、预算和停止条件。带步骤的计划将每次采集关联到问题及一个选定材料。需要时使用 **Revise plan**，再明确点击 **Confirm plan version** 启动调查。改变授权材料选择需要新建研究任务。
+4. 对带步骤的计划，查看 **Research steps** 和已保存来源入口。同一研究任务的父任务与 `research-investigator` 子任务合计最多同时进行 **2 路** `read_research_local` 采集；这与最多保有四个子任务的限制分别计算。Agent 可以委派适合的独立问题，但父任务仍负责综合与保存。
+5. 查看 **Evidence / Report**。Claim 将确认的问题与实际来源执行、匹配原文和依赖关联。完整报告还要求计划步骤全部成功，并满足既有覆盖与支持检查。活动采集停止后，部分报告可将失败和未完成步骤保留为明确缺口。**Save report** 将已保存报告导出为 Markdown。
+
+带步骤计划的 Checkpoint 展示 `pending`、`running`、`succeeded`、`failed` 或 `interrupted`。成功要求工具回执成功、清理已确认且来源已保存；模型自述不等于回执。仍有 pending、running 或 interrupted 步骤时不能保存 Claim。失败步骤保留供排查，在其成功前不能保存完整报告。
+
+已确认计划存在待执行、失败或中断步骤时，界面显示 **Continue research**；选定研究 Session、模型与运行时就绪，没有活跃 Run 且页面未在加载或保存时才能点击。该操作明确启动新一轮调查：原来源仍可用时成功步骤复用已保存来源，其他符合条件的步骤可再次尝试。原步骤停止未确认时仍会受阻，应先查询原 Run 与 ToolCall，不能盲目启动替代执行。重新打开页面或查询历史不会请求模型或重放工具；重启后可以恢复有效保存的研究焦点，但迟到的恢复不会覆盖用户后来的选择。
+
+旧的无 `steps` 计划仍可读取并沿用原有读取／查询流程，不会自动出现步骤列表；需要步骤跟踪时，重新生成并确认新计划。焦点、历史、偏好和 Checkpoint 的生命周期见 [Agent Runtime](agent-runtime.zh-CN.md#context-memory-layers)。
 
 来源定位合法不等于语义正确，Report 自报覆盖是产品结果，不是独立质量评分。调查 Run 完成但报告未保存，不等于报告交付；独立证据与多跳质量检查见[评测](EVALUATION.zh-CN.md)。
 

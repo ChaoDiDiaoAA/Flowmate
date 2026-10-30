@@ -25,8 +25,8 @@ Default data root: `%APPDATA%\Flowmate`. Installation files and writable product
 
 | Relative location | Purpose |
 |---|---|
-| `data/app.sqlite` | Sessions, Runs, inputs, Context, invoice Work and Durable native records under one coordinated owner |
-| `data/settings.json`, `data/installed-release.json` | Settings and installed release record |
+| `data/app.sqlite` | Sessions, Runs, inputs, Context, research plans/step receipts, invoice Work and Durable native records under one coordinated owner |
+| `data/settings.json`, `data/installed-release.json` | Settings, including saved research preferences, and installed release record |
 | `service-installation.json` | Service installation and explicit activation selection |
 | `artifacts/`, `outputs/` | Managed materials and delivered files |
 | `runtime/resource-bundles/`, `runtime/subagents/` | Original Run resources and user roles |
@@ -73,6 +73,8 @@ $restoredRoot = '<absolute restored user-data directory>'
 4. Inspect readability, compatibility and gaps. `runtimeValidation: pending` means file/reference verification has not checked live execution. Check credential access under the intended account, then explicitly start a safe new Run only after accepting the restored store for use.
 
 The verifier compares the restored persistent set/content and references to the manifest and checks schema/settings compatibility. An activated service selection requires its original SQLite database; a missing database is rejected rather than replaced with an empty store. Verification does not copy files, replay old calls, repair historical gaps, prove model access or certify business quality. A changed installed release triggers a pre-upgrade backup before opening/migrating state. Failure retains original data rather than claiming successful recovery.
+
+Schema 22 adds research step execution associations. Use a compatible program with an upgraded store; an older plan without steps retains its original flow. Research progress comes from persisted plan, tool and source facts, while the saved page focus is desktop navigation state. Inspect the backup manifest for included files and select the research task again if navigation is unavailable; restoration alone does not continue its model execution. See [Deep Research](workflows.md#deep-research).
 
 ## Source and verification
 

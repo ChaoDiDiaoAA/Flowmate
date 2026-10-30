@@ -46,6 +46,8 @@ flowchart LR
 
 从失败 Score 进入 Trace，再找到 Session。读取实际模型请求响应、工具参数与结果、子 Agent 工作和已保存业务回执，将失败对应到具体要求及其证明。控制器读到文件、模型收到文件正文、模型正确采用正文，是不同观察层次。
 
+对于带步骤的研究任务，将已确认计划和 Checkpoint 与原 Run／ToolCall、已保存来源及明确继续操作对照。采集 `succeeded` 记录的是成功回执与来源，并非独立 Gold、Claim 已获支持或质量得分。部分报告与 Run 完成也回答不同问题。见 [Deep Research](workflows.zh-CN.md#deep-research)。
+
 将事实与解释分开。缺少业务回执可以证明未记录交付，单凭这一点不能确定是 Prompt、工具报错还是模型选择导致。Provider、基础设施、Runtime 和 Judge 故障需要各自诊断；未采到的证据保留缺口。
 
 Langfuse 上传后回读相关观察、父子关系、内容及分数。请求被接受不等于远端轨迹完整。写入结果未知时先查原操作，不能盲目重发。Benchmark 观察保留在 Run 中，不再复制为产品 Trace 文件。

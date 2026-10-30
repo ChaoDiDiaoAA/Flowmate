@@ -17,6 +17,7 @@ flowchart TB
   Host --> App[Shared Application and business services]
   App --> Context[Workspace and Context services]
   App --> Adapter[runtime-pi: Chats / Invoices / Deep Research]
+  Context -->|request-local projection| Adapter
   Adapter --> SDK[Pi AgentSession]
   App --> Durable[runtime-durable: Personal Agent]
   Durable --> Harness[Pi Durable Harness]
@@ -25,6 +26,7 @@ flowchart TB
   SDK --> Executor[Product ToolExecutor]
   Harness --> Executor
   Executor --> Domain[Research / Invoice / Resources / Native tools]
+  Domain -->|research checkpoint facts| Context
   Context --> Store[(SQLite and managed files)]
   Domain --> Store
   App --> Children[Owned child executions]
@@ -56,8 +58,8 @@ Host messages carry validated request and ownership identities. Notifications wa
 
 1. Main validates a user action and routes it to the selected Application owner.
 2. The Application validates Session/workspace or invoice-work ownership and accepts a specific input or command.
-3. The selected runtime fixes model configuration, allowed materials/tools, resource versions and a Context basis for that execution.
-4. Its adapter prepares actual native messages and tools. Model-selected tool calls return through the product executor, which enforces permissions, budgets and delivery records.
+3. The selected runtime fixes model configuration, allowed materials/tools, resource versions and a Context basis for that execution. A research Run also captures the saved preference text and revision.
+4. For a new layered input, the AgentSession adapter prepares native history and tools, then adds its request-local Context projection and, when available, the current research checkpoint before a model request. Model-selected tool calls return through the product executor, which enforces permissions, budgets and delivery records. Durable retains its own phase context.
 5. Domain services validate business effects. SQLite and managed files preserve execution facts and artifact identities.
 6. The UI queries saved results and displays live progress without treating progress as a durable business commit.
 
@@ -66,6 +68,8 @@ Child tasks follow Core admission into runtime-owned execution in the same Appli
 ## Persistence and resources
 
 The Windows user-data root is `%APPDATA%\Flowmate`. `data/app.sqlite` stores product state and Durable native records under one database owner and shared write coordination; `artifacts/`, `outputs/` and `runtime/` hold managed content and run resources. A controller lock prevents competing product owners of the same data root. AgentSession history and Durable native Tasks/checkpoints remain owned by their respective adapters.
+
+AgentSession input snapshots, native conversation history and research step/tool/source records have distinct ownership. Research preferences are explicitly saved in product settings; the desktop's saved page/research focus is navigation state. Restoring that focus does not start a model Run. See [Context and memory layers](agent-runtime.md#context-memory-layers) and [Deep Research](workflows.md#deep-research).
 
 ServiceOwner/Node ServiceClient, SID/DACL checks, CurrentUser DPAPI credentials, original-credential migration and maintenance remain implemented. Current engineering delivery covers execution while the Application owner is running, committed facts and eligible recovery. Real Windows SCM installation/startup, boot, upgrade/rollback and continued execution after closing the desktop remain deferred acceptance.
 

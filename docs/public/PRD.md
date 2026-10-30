@@ -13,7 +13,7 @@ The primary development and packaging target is Windows x64. Local-first describ
 | Need | User path | Reviewable result |
 |---|---|---|
 | Ask about supplied information | Main conversation via New chat or saved chat, selected materials or working directory, Send | Conversation history, actual tool records and context basis |
-| Investigate a question across local sources | Deep Research, plan, user confirmation, investigation | Saved sources, Claims, full or partial report with gaps |
+| Investigate a question across local sources | Deep Research, plan, user confirmation, step acquisition and explicit continuation | Saved step/source facts, Claims, full or partial report with gaps |
 | Extract and check an invoice | Invoices, existing parsed material, processing, review | Candidate versions, field evidence, explicit acceptance and export |
 | Continue work on an invoice group | Personal Agent, fixed parsed invoices, Todo and explicit review | Work/attempt history and a final disposition for every invoice |
 | Delegate an independent check | AgentSession subagents extension or Personal Agent's bounded Durable `Agent` tool | Owned child execution, actual output and stopping facts |
@@ -21,13 +21,15 @@ The primary development and packaging target is Windows x64. Local-first describ
 
 Read [Workflows](workflows.md) for the steps, [Personal Agent](personal-agent.md) for ongoing work and [Subagents](subagents.md) for delegation constraints.
 
-The default view is the main conversation. **Chats** lists and manages saved Sessions; opening an entry or a recent chat returns to the main conversation. Most business and settings pages retain a right-side Assistant; Personal Agent has its own main workspace. See [UI system](UI-SYSTEM.md) for layout and interaction rules.
+The default view is the main conversation; a valid saved page focus can restore navigation on a later launch. **Chats** lists and manages saved Sessions; opening an entry or a recent chat returns to the main conversation. Most business and settings pages retain a right-side Assistant; Personal Agent has its own main workspace. See [UI system](UI-SYSTEM.md) for layout and interaction rules.
 
 ## Functional boundaries
 
 The workbench provides persistent Sessions; input and Context records; bounded Runs; platform-available Pi file and command tools; opt-in Skills and controlled extensions; research planning and evidence; and invoice review and export. The product distinguishes model output, tool execution, committed writes, delivery to the model, and user acceptance.
 
-Deep Research currently reads authorized local text, Markdown and registered parsed documents. Online search and webpage extraction are unavailable. A plan is confirmed before investigation; a partial report may explicitly retain unresolved questions. Evidence location checks do not establish that an inference is semantically correct.
+Deep Research currently reads authorized local text, Markdown and registered parsed documents. Online search and webpage extraction are unavailable. A plan is confirmed before investigation; when it contains steps, progress follows actual tool receipts and saved sources, and unfinished work can be continued explicitly. A partial report may retain unresolved questions. Evidence location checks do not establish that an inference is semantically correct.
+
+AgentSession captures applicable page focus and authorized Workspace references with the input; temporary page state is projected into the model request separately from conversation history. Research preferences are saved explicitly and captured per Run. These layers do not automatically learn permanent user preferences or grant access to a different task's material. See [Agent runtime](agent-runtime.md#context-memory-layers).
 
 Invoice processing reads registered original and externally prepared parsed material. The Host does not run an invoice parser or OCR engine. A generated candidate, a successful form fill, a saved human edit and an accepted result have separate records. The user reviews the original, parsed source and field evidence before acceptance.
 

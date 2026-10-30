@@ -51,9 +51,25 @@ sequenceDiagram
 
 实时事件帮助 UI 刷新，持久状态与工具证据用于判断操作是否受理、执行、提交或交付。重连与历史查询不会重放输入。
 
+<a id="context-memory-layers"></a>
+
 ## Context 与资源边界
 
-产品将选材和工作区依据与输入、Run 关联保存，适配器将它们接入原生消息及模型请求证据。控制器读到材料，不如实际模型请求包含材料的证据充分；两者都不能证明模型语义采用。
+Flowmate 将当前工作依据与已保存会话、研究事实分开管理。这些职责具有不同生命周期，并不构成新的通用记忆服务：
+
+| 层次 | 内容与生命周期 |
+|---|---|
+| Workspace Context | 随已受理输入捕获选定业务引用、授权资料及提供时的页面焦点；切页不会改写该输入的快照。 |
+| Conversation | 用户输入、助手消息、真实工具结果及 Pi 历史／压缩记录随 Session 持久保存。 |
+| Runtime Session | 活跃 Agent、取消、预算和进程内执行在控制者运行期间存在；恢复使用已保存事实，而非保存一份活动进程副本。 |
+| Research preferences | 在 **Settings → General → Research preferences** 明确保存的文字与设置 revision 随每次研究 Run 捕获；修改用于后续 Run，不改写正在运行的 Run。 |
+| Research checkpoint | 已确认计划、步骤执行、来源身份和报告事实来自 ResearchTask 与真实记录；Checkpoint 是这些事实的投影。 |
+
+对新的 AgentSession prompt、steer 和 follow-up 输入，产品将适用焦点与选材依据保存在 Context Snapshot。每次模型请求前，Pi 适配器根据该输入快照、Run 捕获的偏好以及适用时的当前已保存研究 Checkpoint，加入仅本次请求使用的 system section。自动捕获的页面状态不会拼进原生用户消息或作为对话文字累积；用户明确输入或展开的模板仍属于输入。可在 **Session details → Context** 中检查已保存快照和请求绑定。
+
+历史记录不会为了清除旧页面内容而追溯改写。Pi 继续负责 AgentSession 历史与压缩，请求级投影不替代已保存的会话历史。Fill Form 保留其固定 Workspace 输入路径，Personal Agent 保留独立 Durable 阶段上下文。研究偏好和资料内容均为不可信数据，不能授予权限或扩大任务授权来源；模型请求可能将这些上下文发送至选定服务。
+
+控制器读到材料，不如实际模型请求包含材料的证据充分；两者都不能证明模型语义采用。现有实现不从对话自动提炼长期偏好，也不将上述分层扩展为自动向量记忆。
 
 资源刷新影响后续选择，不替换历史运行副本。资料权限撤回或原生历史不可用可能阻断继续请求模型，已保存事实仍可查看。自动原生压缩与显式 Session 压缩沿 Pi 历史路径执行，界面摘要不替代缺失的已提交历史。子 Session 不能通过根 Session 操作手动压缩。
 
@@ -91,4 +107,4 @@ Stop 关闭准入并请求取消，随后等待实际停止、历史和必要记
 
 - [RuntimeService](../../packages/core/src/runtime/service.ts)、[Session 服务](../../packages/core/src/sessions)、[Context](../../packages/core/src/context)
 - [工具执行器](../../packages/core/src/tools/executor.ts)、[Pi Session 适配器](../../packages/runtime-pi/src/session.ts)、[Durable 适配器](../../packages/runtime-durable/src/index.ts)、[Personal Agent 服务](../../packages/core/src/personal-agent)
-- [生命周期测试](../../tests/core/runtime)、[冷启动恢复](../../tests/core/application/cold-start-recovery.integration.test.ts)、[Context 接合](../../tests/runtime-pi/context.integration.test.ts)
+- [生命周期测试](../../tests/core/runtime)、[冷启动恢复](../../tests/core/application/cold-start-recovery.integration.test.ts)、[Context 接合](../../tests/runtime-pi/context.integration.test.ts)、[请求分层测试](../../tests/core/research/layered-context.integration.test.ts)
