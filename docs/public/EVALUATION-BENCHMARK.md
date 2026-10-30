@@ -4,7 +4,7 @@
 
 A benchmark turns a task with independently provable expectations into a repeatable evaluation. Start with the task and its evidence, define success and failure, validate the controlled scenario, then publish a version only after current human approval. A trace, a candidate and a published Case are different assets.
 
-The [evaluation guide](EVALUATION.md) explains execution, scoring and Gates. The [module reference](../../agent-eval/README.md) describes configuration and storage; the [Langfuse operation guide](../../agent-eval/Langfuse评测与问题定位操作指南.md) shows how to investigate actual evidence.
+The [evaluation guide](EVALUATION.md) explains execution, scoring and Gates. The [module reference](../../agent-eval/README.md) describes configuration and storage.
 
 ## Keep the original benchmark explicit
 

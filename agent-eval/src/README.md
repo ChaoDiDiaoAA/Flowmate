@@ -1,6 +1,6 @@
 # 评测源码职责
 
-[操作与配置](../README.md) · [评测指南](../../docs/public/EVALUATION.zh-CN.md) · [基准制作](../../docs/public/EVALUATION-BENCHMARK.zh-CN.md) · [Langfuse 操作指南](../Langfuse评测与问题定位操作指南.md)
+[操作与配置](../README.md) · [评测指南](../../docs/public/EVALUATION.zh-CN.md) · [基准制作](../../docs/public/EVALUATION-BENCHMARK.zh-CN.md)
 
 评测通过隔离 Host 使用产品核心执行任务。执行事实、业务交付、质量评分和相对回归是不同结果；工程测试只验证相应实现行为。
 

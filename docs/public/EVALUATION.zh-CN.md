@@ -10,7 +10,7 @@
 
 评测将真实产品执行与证据、评分、可重复的比较连接起来。它帮助定位本地资料任务、发票复核和研究中的失败，再用明确 Baseline 检查产品、Prompt、策略、Skill 或模型变更。执行完成、业务回执、质量得分和回归判断回答不同问题。
 
-Case 与 Gold 规则见[基准制作指南](EVALUATION-BENCHMARK.zh-CN.md)，配置见[模块说明](../../agent-eval/README.md)，真实截图与测量示例见 [Langfuse 操作指南](../../agent-eval/Langfuse评测与问题定位操作指南.md)。
+Case 与 Gold 规则见[基准制作指南](EVALUATION-BENCHMARK.zh-CN.md)，配置见[模块说明](../../agent-eval/README.md)。
 
 ## 架构
 
@@ -144,7 +144,7 @@ bun --no-env-file run eval:full
 
 每个命令完成预检、真实执行、确定性和适用语义合并评分、本地采证、Langfuse 上传回读、诊断、比较、对应 Baseline/Gate 与可读 README。执行与采证完整时，质量失败仍是完成的测量。流程完整、绝对质量、相对 Gate 和上传验证分别报告。
 
-Langfuse 用于查看 Score、Trace、Session 及 User 关联执行；本地 `README.md` 与 `run.json` 提供比较及 Baseline/Gate 细节。这些本地结论不是 Langfuse 原生 Gate 页面。[中文操作指南](../../agent-eval/Langfuse评测与问题定位操作指南.md)用真实 Langfuse 截图记录本次 Smoke、Full 中断与续跑，分别演示失败定位和模型比较。
+Langfuse 用于查看 Score、Trace、Session 及 User 关联执行；本地 `README.md` 与 `run.json` 提供比较及 Baseline/Gate 细节。这些本地结论不是 Langfuse 原生 Gate 页面。
 
 
 ## 执行预算与评分故障恢复

@@ -59,6 +59,12 @@ Thumbs.db
 !/agent-eval/configs/runtime/*.example.jsonc
 /data/invoices/
 
+# Local-only evaluation plans and operation guide
+/agent-eval/评测闭环完整实施计划.md
+/agent-eval/评测简化与 Smoke／Full 完整验收：继续推进计划.md
+/agent-eval/评测简化与 Smoke／Full 完整验收计划.md
+/agent-eval/Langfuse评测与问题定位操作指南.md
+
 # Local execution-plan ledger and review artifacts
 .superpowers/
 

@@ -4,7 +4,7 @@
 
 基准将有独立证据支持的任务变为可复测评测。从任务与证据出发，定义成功/失败，校验受控场景，再在当前真人批准后发布明确版本。Trace、候选与正式 Case 是不同资产。
 
-[评测指南](EVALUATION.zh-CN.md)解释执行、评分与 Gate，[模块说明](../../agent-eval/README.md)说明配置及保存位置，[Langfuse 操作指南](../../agent-eval/Langfuse评测与问题定位操作指南.md)说明如何追查实际证据。
+[评测指南](EVALUATION.zh-CN.md)解释执行、评分与 Gate，[模块说明](../../agent-eval/README.md)说明配置及保存位置。
 
 ## 原始基准与选集
 

@@ -1,8 +1,8 @@
 # Flowmate Agent 评测
 
-[评测指南](../docs/public/EVALUATION.zh-CN.md) · [基准制作](../docs/public/EVALUATION-BENCHMARK.zh-CN.md) · [Langfuse 评测与问题定位操作指南](Langfuse评测与问题定位操作指南.md) · [源码职责](src/README.md)
+[评测指南](../docs/public/EVALUATION.zh-CN.md) · [基准制作](../docs/public/EVALUATION-BENCHMARK.zh-CN.md) · [源码职责](src/README.md)
 
-通过隔离本机 Host 执行真实产品任务，将原始执行、业务交付、质量评分和回归比较保存在同一次 Run 中。实际 Smoke／Full 结果、Full 中断与续跑边界及网页操作见上方中文指南。Langfuse 用于观察实际模型、工具、子 Agent 和评分；本地保存的原始证据用于复核比较与 Gate。
+通过隔离本机 Host 执行真实产品任务，将原始执行、业务交付、质量评分和回归比较保存在同一次 Run 中。实际 Smoke／Full 结果及中断、续跑边界以对应运行记录为准。Langfuse 用于观察实际模型、工具、子 Agent 和评分；本地保存的原始证据用于复核比较与 Gate。
 
 ## 两个运行入口
 
@@ -152,7 +152,7 @@ Langfuse 中从 Score 进入 Trace，再回到 Session，核对实际模型请�
 
 产品 capture、upload、mining 三开关独立且默认关闭；已填写凭据不自动上传产品轨迹。主动运行 Smoke/Full 所需的评测上传是这两个命令的明确动作。Langfuse 展示观察与评分，本地 README/`run.json` 给出比较和 Baseline/Gate；不把本地结论描述成 Langfuse 原生页面。
 
-详细实操、截图和本次实际执行结果见[中文操作指南](Langfuse评测与问题定位操作指南.md)。未执行步骤应保留未执行状态；工程测试或受控演示不能替代真实模型质量证据。
+实际执行与证据以对应运行记录为准。未执行步骤应保留未执行状态；工程测试或受控演示不能替代真实模型质量证据。
 
 ## Metric 独立定义与校准
 

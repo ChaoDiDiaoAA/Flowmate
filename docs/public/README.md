@@ -27,7 +27,6 @@ For developers: [Product scope](PRD.md) → [Architecture](architecture.md) → 
 | [Skills and extensions](skills-and-extensions.md) | Resource discovery, readiness, templates and controlled extensions |
 | [Evaluation](EVALUATION.md) | Purpose, traces, scoring, dual-model Smoke/Full and Baseline/Gate |
 | [Benchmark authoring](EVALUATION-BENCHMARK.md) | Real-source candidates, independent Gold, validation and versioned publication |
-| [Langfuse operation guide](../../agent-eval/Langfuse评测与问题定位操作指南.md) | Failure investigation and configuration comparison with real evidence (Chinese) |
 | [UI system](UI-SYSTEM.md) | Layout, observable states, interaction and accessibility conventions |
 | [Development](development.md) | Repository structure, test commands and required dependency patches |
 | [Packaging and recovery](packaging-and-recovery.md) | Windows packages, data roots, diagnostics, backup and restore verification |

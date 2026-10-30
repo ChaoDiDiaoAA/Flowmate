@@ -27,7 +27,6 @@ Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久�
 | [Skills 与扩展](skills-and-extensions.zh-CN.md) | 资源发现、依赖就绪、模板与受控扩展 |
 | [评测指南](EVALUATION.zh-CN.md) | 目的、轨迹、评分、双模型 Smoke/Full 与 Baseline/Gate |
 | [基准制作](EVALUATION-BENCHMARK.zh-CN.md) | 真实来源候选、独立 Gold、校验与版本发布 |
-| [Langfuse 操作指南](../../agent-eval/Langfuse评测与问题定位操作指南.md) | 用真实证据定位失败与比较配置 |
 | [UI 系统](UI-SYSTEM.zh-CN.md) | 布局、可观察状态、交互与可访问性约定 |
 | [开发指南](development.zh-CN.md) | 仓库结构、测试入口与必要依赖补丁 |
 | [打包与恢复](packaging-and-recovery.zh-CN.md) | Windows 产物、数据目录、诊断、备份与恢复验证 |

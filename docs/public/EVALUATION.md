@@ -10,7 +10,7 @@
 
 Evaluation connects real product execution to evidence, scoring and a repeatable comparison. It helps locate failures in local-material tasks, invoice review and research, then check a product, prompt, strategy, Skill or model change against an explicit baseline. A completed execution, a business receipt, a quality score and a regression decision answer different questions.
 
-Read the [benchmark authoring guide](EVALUATION-BENCHMARK.md) for Case and Gold rules, the [module reference](../../agent-eval/README.md) for configuration, and the [Langfuse operation guide](../../agent-eval/Langfuse评测与问题定位操作指南.md) for real screenshots and measured examples.
+Read the [benchmark authoring guide](EVALUATION-BENCHMARK.md) for Case and Gold rules and the [module reference](../../agent-eval/README.md) for configuration.
 
 ## Architecture
 
@@ -144,7 +144,7 @@ bun --no-env-file run eval:full
 
 Each command performs preflight, real execution, deterministic checks and applicable combined judging, local capture, Langfuse upload/readback, diagnostics, comparison, the matching baseline/Gate and a readable README. Quality failure remains a completed measurement when execution and evidence are complete. Pipeline completion, absolute quality, relative Gate and upload verification are reported separately.
 
-Use Langfuse for Scores, Traces, Sessions and the User's related execution. Use local `README.md` and `run.json` for comparison and baseline/Gate details. These local decisions are not native Langfuse Gate pages. The [Chinese operation guide](../../agent-eval/Langfuse评测与问题定位操作指南.md) records the actual Smoke, interrupted Full and continuation results, with real Langfuse screenshots for failure diagnosis and model comparison.
+Use Langfuse for Scores, Traces, Sessions and the User's related execution. Use local `README.md` and `run.json` for comparison and baseline/Gate details. These local decisions are not native Langfuse Gate pages.
 
 
 ## Execution budgets and scoring recovery
