@@ -26,7 +26,7 @@ windows.each([{ name: 'missing', status: 2, release: 0 }, { name: 'below 4.6.1',
   writeFileSync(join(runtimeRoot, 'release.json'), JSON.stringify({ version: 1,
     releaseId: 'e591bd4b-a830-442f-8523-b111f9385980', productVersion: '0.1.0', platform: 'win32', arch: 'x64',
     bunVersion: '1.4.4', electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0',
-    schemaVersion: 21, settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files }));
+    schemaVersion: 22, settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files }));
   const before = readdirSync(dataRoot), native = ffi.dlopen;
   let reads = 0, closes = 0, versionReads = 0;
   const unexpectedNative: string[] = [];

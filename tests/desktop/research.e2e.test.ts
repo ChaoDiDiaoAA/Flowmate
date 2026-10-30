@@ -14,6 +14,92 @@ function environment(userData: string) {
   return env;
 }
 
+test('research restores unfinished steps after relaunch and acquires them only after Continue', async () => {
+  test.setTimeout(90000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-research-checkpoint-ui-'));
+  let requests = 0, artifactId = 0;
+  const policy = () => ({ web: false, domains: [], artifactIds: [artifactId], documentIds: [] });
+  const provider = await createHttpProvider(async () => {
+    const index = ++requests;
+    const execution = { budget: { maxModelCalls: 8, maxToolCalls: 16, toolTimeoutMs: 10000 }, timeoutMs: 60000, stopGraceMs: 5000 };
+    const tool = index === 1 ? { name: 'save_research_plan', args: { question: 'Restore the local policy research.', scope: 'Selected local policy only.',
+      dimensions: [{ id: 'policy', title: 'Policy', questions: [{ id: 'local', question: 'What does the policy require?', evidenceNeeded: ['Selected policy'] }] }],
+      sourcePolicy: policy(), stopConditions: ['Policy is cited or an explicit gap is saved.'], execution,
+      steps: [{ id: 'policy-source', questionIds: ['local'], tool: 'read_research_local', input: { artifactId, documentId: null } }] } }
+      : index === 3 || index === 6 ? { name: 'read_research_local', args: { artifactId, documentId: null, stepId: index === 3 ? 'wrong-step' : 'policy-source' } }
+      : index === 4 ? { name: 'save_research_report', args: { answer: 'The source still needs acquisition.', completeness: 'partial',
+        sections: [{ title: 'Evidence gap', text: 'The planned source has not been acquired.', claimIds: [] }], conflicts: [],
+        limitations: ['Acquisition was rejected because it used the wrong step.'], unresolvedQuestions: ['What does the policy require?'],
+        coverage: [{ questionId: 'local', claimIds: [], status: 'gap', reason: 'Acquire the confirmed source step.' }] } } : null;
+    const chunk = (delta: object, finish_reason: string | null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
+    const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `checkpoint-${index}`, type: 'function', function: { name: tool.name, arguments: JSON.stringify(tool.args) } }] }
+      : { role: 'assistant', content: 'Saved checkpoint. Continue explicitly when ready.' };
+    return new Response(chunk(delta, null) + chunk({}, tool ? 'tool_calls' : 'stop') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  });
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  try {
+    const launch = () => electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'),
+      args: [join(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
+    app = await launch(); let page = await app.firstWindow();
+    await page.getByRole('button', { name: 'Deep Research', exact: true }).waitFor({ timeout: 20000 });
+    const created = await page.evaluate(async baseUrl => {
+      const state = await window.flowmate.getState(); if (!state.ok) throw Error(state.error.code);
+      const saved = await window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'checkpoint-ui', credentialRef: '00000000000000000000000000000031',
+        name: 'Checkpoint fixture', kind: 'custom', providerId: null, baseUrl: `${baseUrl}/v1`, model: 'checkpoint-ui', api: 'openai-completions',
+        contextWindow: 64000, maxTokens: 4096, reasoning: false }], defaultModelId: 'checkpoint-ui' }, { modelId: 'checkpoint-ui', apiKey: 'synthetic-checkpoint-key' });
+      if (!saved.ok) throw Error(saved.error.code);
+      const material = await window.flowmate.importResearchMaterial({ title: 'Checkpoint policy.md', format: 'markdown', text: 'The selected policy requires local execution.' });
+      if (!material.ok) throw Error(material.error.code);
+      const session = await window.flowmate.createSession({ title: 'Checkpoint research' }); if (!session.ok) throw Error(session.error.code);
+      const task = await window.flowmate.createResearchTask({ sessionId: session.data.sessionId, title: 'Checkpoint research',
+        sourcePolicy: { web: false, domains: [], artifactIds: [material.data.artifactId], documentIds: [] } });
+      if (!task.ok) throw Error(task.error.code);
+      return { task: task.data, artifactId: material.data.artifactId };
+    }, `http://127.0.0.1:${provider.port}`);
+    artifactId = created.artifactId;
+    await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
+    await page.getByRole('complementary', { name: 'Research list', exact: true }).getByRole('button', { name: 'Checkpoint research', exact: false }).first().click();
+    const expand = page.getByRole('button', { name: 'Open Assistant', exact: true }); if (await expand.isVisible()) await expand.click();
+    await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('Plan the selected local policy research.');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await page.getByRole('button', { name: 'Confirm plan version 1', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Continue research', exact: true })).toBeEnabled();
+    await expect.poll(() => requests).toBe(5);
+    const count = requests;
+    await closeDesktopFixture(app, userData); app = null;
+    app = await launch(); page = await app.firstWindow();
+    await installReadGate(app, userData);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'query_research_task'));
+    await page.reload();
+    await expect.poll(() => app!.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
+    await page.getByRole('button', { name: 'Chats', exact: true }).click();
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
+    const independentDraft = 'Keep this new conversation independent of restored research.';
+    await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill(independentDraft);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
+    await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('flowmate.workspace-focus.v1') ?? '{}').page)).toBe('conversation');
+    await expect(page.getByRole('textbox', { name: 'Message to model', exact: true })).toHaveValue(independentDraft);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
+    await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
+    await page.getByRole('complementary', { name: 'Research list', exact: true }).getByRole('button', { name: 'Checkpoint research', exact: false }).first().click();
+    await expect(page.getByRole('heading', { name: 'Deep Research', exact: true })).toBeVisible({ timeout: 20000 });
+    const resume = page.getByRole('button', { name: 'Continue research', exact: true });
+    await expect(resume).toBeEnabled({ timeout: 20000 });
+    expect(requests).toBe(count);
+    await resume.click();
+    await expect(page.getByRole('region', { name: 'Research steps', exact: true })).toContainText('1 / 1 sources acquired');
+    await expect.poll(() => requests).toBe(7);
+    const sources = await page.evaluate(id => window.flowmate.listResearchSources({ researchId: id }), created.task.researchId);
+    expect(sources).toMatchObject({ ok: true, data: { items: [expect.objectContaining({ artifactId })] } });
+    await installReadGate(app, userData);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').fail(1, 'restore_workspace'));
+    await page.reload();
+    await expect(page.getByRole('region', { name: 'Research steps', exact: true })).toContainText('1 / 1 sources acquired', { timeout: 20000 });
+    expect(requests).toBe(7);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
+  } finally { if (app) await closeDesktopFixture(app, userData); }
+});
+
 test('research desktop creates and confirms a plan, reads local evidence, exports and reopens without replay', async () => {
   test.setTimeout(90000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p15-ui-')), text = 'Team policy: deployments must run locally.';
@@ -29,10 +115,11 @@ test('research desktop creates and confirms a plan, reads local evidence, export
       tool = { name: 'save_research_plan', arguments: { question: task.title, scope: 'Use only selected team policy.',
         dimensions: [{ id: 'deployment', title: 'Deployment constraints', questions: [{ id: 'local', question: 'Where must deployment run?', evidenceNeeded: ['Team policy'] }] }],
         sourcePolicy: task.sourcePolicy, stopConditions: ['The deployment constraint has evidence or an explicit gap.'],
+        steps: [{ id: 'team-policy', questionIds: ['local'], tool: 'read_research_local', input: { artifactId: task.sourcePolicy.artifactIds[0], documentId: null } }],
         execution: { budget: { maxModelCalls: 8, maxToolCalls: 16, toolTimeoutMs: 10000 }, timeoutMs: 60000, stopGraceMs: 5000 } } };
     } else if (index === 5) {
       const material = await page.evaluate(async () => { const r = await window.flowmate.listResearchMaterials(); if (!r.ok) throw new Error(r.error.code); return r.data.items[0]!; });
-      tool = { name: 'read_research_local', arguments: { artifactId: material.artifactId, documentId: null } };
+      tool = { name: 'read_research_local', arguments: { artifactId: material.artifactId, documentId: null, stepId: 'team-policy' } };
     } else if (index === 6) {
       const facts = await page.evaluate(async () => { const tasks = await window.flowmate.listResearchTasks(); if (!tasks.ok) throw new Error(tasks.error.code); const task = tasks.data.items[0]!;
         const plan = await window.flowmate.queryResearchPlan({ researchId: task.researchId, planId: task.currentPlanId! });
@@ -63,6 +150,10 @@ test('research desktop creates and confirms a plan, reads local evidence, export
         baseUrl: `${baseUrl}/v1`, model: 'research-ui', api: 'openai-completions', contextWindow: 64000, maxTokens: 4096, reasoning: false }], defaultModelId: 'research-ui' },
       { modelId: 'research-ui', apiKey: 'synthetic-research-model-key' }); }, `http://127.0.0.1:${provider.port}`)).toMatchObject({ ok: true });
     const before = await page.evaluate(() => window.flowmate.readWorkspace());
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('textbox', { name: 'Research preferences', exact: true }).fill('Compare evidence dates and retain conflicting statements.');
+    await page.getByRole('button', { name: 'Save research preferences', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Research preferences saved');
     await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Deep Research', exact: true })).toBeVisible();
     await expect(page.getByText('Search service settings', { exact: true })).toHaveCount(0);
@@ -203,7 +294,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
     await installReadGate(app, userData);
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').hold(1, 'list_research_reports'));
-    await page.getByRole('complementary', { name: 'Research list', exact: true }).getByRole('button', { name: task.title, exact: false }).click();
+    await page.getByRole('button', { name: 'Refresh research', exact: true }).click();
     await expect.poll(() => app!.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
     await page.getByRole('button', { name: 'Open Assistant', exact: true }).click();
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));

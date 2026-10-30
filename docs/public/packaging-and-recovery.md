@@ -4,7 +4,7 @@
 
 ## Build a Windows package
 
-The installed target is **Windows x64**, built with Bun **1.4.4** and pinned dependencies. The packager checks Pi SDK 1.4.0, pi-subagents 0.19.0, Electron 44.4.5, schema 21 migrations, native tools and required assets. The Durable adapter's manifest separately pins `pi-durable` 1.4.0; the package's release inventory does not by itself certify real service recovery.
+The installed target is **Windows x64**, built with Bun **1.4.4** and pinned dependencies. The packager checks Pi SDK 1.4.0, pi-subagents 0.19.0, Electron 44.4.5, schema 22 migrations, native tools and required assets. The Durable adapter's manifest separately pins `pi-durable` 1.4.0; the package's release inventory does not by itself certify real service recovery.
 
 ```powershell
 bun install --frozen-lockfile

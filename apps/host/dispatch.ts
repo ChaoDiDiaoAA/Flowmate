@@ -292,6 +292,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
       resourceBundleRoot: join(paths.runtimeDir, 'resource-bundles'), promptTrace, tools }),
     promptTrace,
     runtimeDefaults: () => ok(currentSettings.runtime ?? {}),
+    researchPreferences: () => ok({ text: currentSettings.researchPreferences ?? '', revision: currentSettings.revision }),
     resourceDefaults: () => ok({ revision: currentSettings.revision, selection: currentSettings.resources ?? EMPTY_RESOURCE_SELECTION,
       extensions: currentSettings.extensions ?? EMPTY_EXTENSION_SELECTION }),
     saveResourceSelection: input => enqueueSettingsWrite(async () => {

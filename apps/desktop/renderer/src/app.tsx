@@ -32,7 +32,7 @@ import { WorkspacePage, InvoiceFieldDetails } from './workspace.tsx';
 import { SessionDetails, type ContextBasis } from './session-details.tsx';
 import { hasNewContextEvents } from './context-state.ts';
 import { createWorkspaceState, beginWorkspaceRequest, acceptWorkspaceSnapshot, failWorkspaceRequest,
-  resetWorkspaceHost, sameWorkspaceBasis, sameWorkspaceSelection, selectionLabel, workspaceReady, type WorkspaceState } from './workspace-state.ts';
+  resetWorkspaceHost, sameWorkspaceBasis, sameWorkspaceSelection, selectionLabel, workspaceReady, readWorkspaceFocus, saveWorkspaceFocus, type WorkspaceState } from './workspace-state.ts';
 import { createEventView, bindEventSubscription, applyEventWake, applyEventRead, eventReadRequest,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
@@ -173,7 +173,10 @@ function runtimeMessage(state: RuntimeState | null, readFailed: boolean, hostRea
 }
 
 export function App() {
-  const [page, setPage] = useState<Page>('conversation');
+  const [initialFocus] = useState(() => readWorkspaceFocus(localStorage));
+  const [page, setPage] = useState<Page>(initialFocus?.page ?? 'conversation');
+  const pageRef = useRef(page); pageRef.current = page;
+  const [focusRestored, setFocusRestored] = useState(false);
   const [settingsTab, setSettingsTab] = useState('General');
   const [state, setState] = useState<DesktopState | null>(null);
   const [evaluationView, setEvaluationView] = useState(createEvaluationView);
@@ -199,6 +202,7 @@ export function App() {
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [profileDraft, setProfileDraft] = useState<ProfileDraft>({ displayName: 'Local user', theme: 'system' });
+  const [researchPreferencesDraft, setResearchPreferencesDraft] = useState('');
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [chatInput, setChatInput] = useState('');
@@ -1292,6 +1296,24 @@ export function App() {
     } catch {
       publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token,
         'Workspace recovery could not be confirmed. Refresh to try again.', 'error'));
+    } finally {
+      if (!focusRestored && epoch === workspaceHostEpoch.current && hostReadyRef.current) {
+        const selection = sessionLoadSequence.current;
+        if (initialFocus?.page === 'research' && initialFocus.researchId !== undefined && pageRef.current === 'research') {
+          try {
+            const research = await window.flowmate.queryResearchTask(initialFocus.researchId);
+            if (epoch !== workspaceHostEpoch.current || !hostReadyRef.current) return;
+            if (pageRef.current === 'research' && selection === sessionLoadSequence.current) {
+              if (research.ok) { setResearchTask(research.data); selectSession(research.data.sessionId, false, true); }
+              else setNotice({ tone: 'bad', message: 'Saved research is unavailable. Choose an available task to continue.' });
+            }
+          } catch {
+            if (epoch === workspaceHostEpoch.current && pageRef.current === 'research' && selection === sessionLoadSequence.current)
+              setNotice({ tone: 'bad', message: 'Saved research could not be restored. Choose an available task to continue.' });
+          }
+        }
+        if (epoch === workspaceHostEpoch.current && hostReadyRef.current) setFocusRestored(true);
+      }
     }
   }
 
@@ -2155,6 +2177,12 @@ export function App() {
   }, [state?.ready]);
 
   useEffect(() => {
+    if (!focusRestored || !state?.ready) return;
+    if (!saveWorkspaceFocus(localStorage, { page, ...(page === 'research' && researchTask ? { researchId: researchTask.researchId } : {}) }))
+      setNotice({ tone: 'bad', message: 'Navigation could not be saved for the next launch.' });
+  }, [page, researchTask?.researchId, focusRestored, state?.ready]);
+
+  useEffect(() => {
     if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current
       || page !== 'workspace' && page !== 'workspace-detail') return;
     const reload = workspaceDetailsToReload.current;
@@ -2189,6 +2217,7 @@ export function App() {
     if (revisionLoaded.current === revision) return;
     revisionLoaded.current = revision;
     setProfileDraft(state.settings.profile);
+    setResearchPreferencesDraft(state.settings.researchPreferences ?? '');
     setRuntimeDefaultsDraft(runtimeLimitsDraft(state.settings.runtime ?? {}));
     const preferred = state.settings.models.find((item) => item.id === state.settings.defaultModelId)
       ?? state.settings.models[0];
@@ -2373,6 +2402,18 @@ export function App() {
     setNotice({ tone: 'good', message: 'Run limits saved.' });
   }
 
+  async function saveResearchPreferences() {
+    if (!state) return;
+    setSaving(true);
+    try {
+      const saved = await window.flowmate.saveSettings({ ...state.settings, researchPreferences: researchPreferencesDraft });
+      if (!saved.ok) { setNotice({ tone: 'bad', message: errorMessage(saved) }); return; }
+      const refreshed = await window.flowmate.getState();
+      if (refreshed.ok) receiveDesktopState(refreshed.data);
+      setNotice({ tone: 'good', message: 'Research preferences saved. New research runs will use them.' });
+    } finally { setSaving(false); }
+  }
+
   async function testConnection() {
     if (!canTest || !selectedModelId) return;
     setBusy(true);
@@ -2430,6 +2471,7 @@ export function App() {
     if (!researchInput && (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current)) return;
     const sendEpoch = override?.hostEpoch ?? workspaceHostEpoch.current;
     const submittedDraft = researchInput?.text ?? override?.prompt ?? chatInputRef.current;
+    const focus = { page, ...(researchInput ? { researchId: researchInput.intent.researchId } : {}) };
     const prompt = submittedDraft.trim();
     let sessionId = override?.sessionId ?? selectedSessionIdRef.current;
     const directory = researchInput ? '' : workingDirectory;
@@ -2501,6 +2543,7 @@ export function App() {
       sessionId,
       clientSequence,
       mode: 'prompt',
+      focus,
       text: prompt,
       modelId: model.id,
       ...(!researchInput && !override?.detached ? { workspace: {
@@ -2579,6 +2622,7 @@ export function App() {
   }
 
   async function appendChatInput(mode: 'steer' | 'followUp') {
+    const focus = { page, ...(researchSelected && researchTask ? { researchId: researchTask.researchId } : {}) };
     if (!researchSelected && (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current)) return;
     const sessionId = selectedSessionIdRef.current;
     const runId = activeAgentRunIdRef.current;
@@ -2605,7 +2649,7 @@ export function App() {
       if (hasWorkspace && (!current || current.sessionId !== sessionId)) {
         setNotice({ tone: 'bad', message: 'Select this Run’s invoice context before adding an input. Your draft is preserved.' }); return;
       }
-      const request: DesktopSessionInputRequest = { sessionId, clientSequence, mode, runId, text: prompt,
+      const request: DesktopSessionInputRequest = { sessionId, clientSequence, mode, runId, text: prompt, focus,
           ...(hasWorkspace && current ? { workspace: { revision: current.revision, documentRef: current.documentRef,
           jobId: current.jobId, candidateRef: current.candidateRef, sessionId } } : {}),
       };
@@ -3155,6 +3199,12 @@ export function App() {
               credentials={state.evaluationCredentials} ready={state.ready} onSaved={async () => {
                 const next = await window.flowmate.getState(); if (!next.ok) throw Error('Saved settings unavailable'); receiveDesktopState(next.data);
               }} />}
+            {page === 'settings' && settingsTab === 'General' && <section className="panel" aria-label="Research preferences"><div className="panel-head"><h2>Research preferences</h2></div>
+              <label className="field"><span>Research preferences</span><textarea value={researchPreferencesDraft} maxLength={8192} rows={4}
+                placeholder="Evidence, comparison and report preferences…" onChange={event => setResearchPreferencesDraft(event.target.value)} /></label>
+              <p>Saved preferences apply to new research runs.</p><div className="config-actions"><span className="action-spacer" />
+                <button className="secondary-button" disabled={saving || !state?.ready} onClick={() => void saveResearchPreferences()}>Save research preferences</button></div>
+            </section>}
             {page === 'settings' && settingsTab === 'General' && <section className="panel profile-panel settings-appearance"><div className="panel-head"><h2>Appearance</h2></div>
               <div className="profile-fields"><label className="field"><span>Display name</span><input value={profileDraft.displayName} onChange={(event) => setProfileDraft((old) => ({ ...old, displayName: event.target.value }))} maxLength={80} /></label><label className="field"><span>Theme</span><select value={profileDraft.theme} onChange={(event) => setProfileDraft((old) => ({ ...old, theme: event.target.value as typeof old.theme }))}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div>
               <div className="config-actions"><span className="action-spacer" /><button className="secondary-button" onClick={() => void saveProfile()} disabled={saving || !state?.ready}>Save appearance</button></div>

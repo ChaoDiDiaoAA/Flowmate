@@ -79,7 +79,7 @@ async function fixture(confirmed: boolean, toolCase?: ToolCase) {
   writeFileSync(join(f.paths.root, 'data/settings.json'), JSON.stringify(defaultProductSettings()));
   const release = JSON.parse(readFileSync(join(runtimeRoot, 'release.json'), 'utf8'));
   writeFileSync(join(f.paths.root, 'data/installed-release.json'), JSON.stringify({ version: 1, releaseId: release.releaseId,
-    productVersion: release.productVersion, schemaVersion: 21, settingsVersion: 7 }));
+    productVersion: release.productVersion, schemaVersion: 22, settingsVersion: 7 }));
   const backups = join(f.paths.root, 'backups'); mkdirSync(backups);
   const lease = need(await acquireProductControllerLock(f.paths));
   let source: Awaited<ReturnType<typeof backupStore>>;

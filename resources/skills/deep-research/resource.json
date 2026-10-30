@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "kind": "skill",
   "id": "deep-research",
-  "version": "v1",
+  "version": "v2",
   "bodyFile": "SKILL.md",
   "keywords": [
     "research",
@@ -19,7 +19,7 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 3346
+      "bytes": 4028
     }
   ]
 }

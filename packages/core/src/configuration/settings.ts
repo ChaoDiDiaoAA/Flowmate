@@ -43,6 +43,7 @@ const settingsSchema = z.object({
   resources: ResourceSelectionSchema,
   extensions: ExtensionSelectionSchema,
   evaluation: EvaluationSettingsSchema,
+  researchPreferences: z.string().max(8192).refine(value => new TextEncoder().encode(value).byteLength <= 8192).default(''),
   updatedAt: z.string().datetime({ offset: true }),
 }).strict().refine((settings) => {
   const ids = new Set(settings.models.map((model) => model.id));
@@ -55,7 +56,7 @@ const settingsSchema = z.object({
 export function defaultProductSettings(now = new Date().toISOString()): ProductSettings {
   return { version: 7, revision: 0, profile: { displayName: 'Local user', theme: 'system' }, models: [], defaultModelId: null,
     runtime: {}, resources: EMPTY_RESOURCE_SELECTION, extensions: EMPTY_EXTENSION_SELECTION,
-    evaluation: { agent: null, judge: null }, updatedAt: now };
+    evaluation: { agent: null, judge: null }, researchPreferences: '', updatedAt: now };
 }
 
 export function validateProductSettings(value: unknown): Result<ProductSettings> {

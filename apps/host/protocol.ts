@@ -1,6 +1,6 @@
 export { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../packages/contracts/src/input-commands.ts';
 import { InputDefinitionCommandSchema } from '@flowmate/contracts';
-import { ResearchIntentSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema, InvoiceSaveReplayReceiptSchema } from '@flowmate/contracts';
+import { ResearchIntentSchema, WorkspaceFocusSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema, InvoiceSaveReplayReceiptSchema } from '@flowmate/contracts';
 import { researchOperations } from '../../packages/contracts/src/research-commands.ts';
 import { personalAgentHostCommandSchemas, isPersonalAgentHostCommand } from '../../packages/contracts/src/personal-agent-commands.ts';
 export { isPersonalAgentHostCommand, parsePersonalAgentCommand, parsePersonalAgentHostResult,
@@ -46,12 +46,15 @@ const requiredSkill = ResourceRefSchema.refine(ref => ref.kind === 'skill').opti
 const inputText = z.string().refine(value => value.trim().length > 0 && new TextEncoder().encode(value).byteLength <= 65_000);
 export const DesktopSessionInputRequestSchema = z.discriminatedUnion('mode', [
   z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('prompt'), text: inputText, modelId, requiredSkill,
+    focus: WorkspaceFocusSchema.optional(),
     research: ResearchIntentSchema.optional(), goalMode: z.enum(['answer', 'save-candidate']).default('answer'), workspace: WorkspaceExpectationSchema.optional(),
     workingDirectory: WorkingDirectorySchema.optional(), ...RuntimeRequestOverridesSchema.shape,
   }).strict(),
   z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('steer'), runId: dbId, text: inputText, requiredSkill,
+    focus: WorkspaceFocusSchema.optional(),
     workspace: WorkspaceExpectationSchema.optional() }).strict(),
   z.object({ sessionId: dbId, clientSequence: dbId, mode: z.literal('followUp'), runId: dbId, text: inputText, requiredSkill,
+    focus: WorkspaceFocusSchema.optional(),
     workspace: WorkspaceExpectationSchema.optional() }).strict(),
 ]).superRefine((input, ctx) => {
   if (input.workspace && input.workspace.sessionId !== input.sessionId)

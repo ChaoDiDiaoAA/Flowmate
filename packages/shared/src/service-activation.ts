@@ -93,7 +93,7 @@ export function serviceActivationBackupDirectory(installation: ServiceInstallati
 // The existing offline manifest contract is read as metadata only; maintenance verifies actual bytes and database references.
 const manifestSchema = z.object({ version: z.literal(1), backupId: z.string().uuid(), createdAt: z.string().datetime(),
   productVersion: z.string().max(128).nullable(), releaseId: z.string().uuid().nullable(),
-  schemaVersion: z.number().int().min(1).max(21).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
+  schemaVersion: z.number().int().min(1).max(22).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
   files: z.array(z.object({ path: z.string().min(1).max(1024).refine(path => !isAbsolute(path)
     && path.split('/').every(part => part && part !== '.' && part !== '..' && !/[\\:\x00-\x1f]/.test(part))),
     byteLength: z.number().int().nonnegative().safe() }).strict()).min(1), gaps: z.array(z.string().max(256)) }).strict()

@@ -33,7 +33,7 @@ describe('P7 Workspace migration', () => {
     const opened = openTestDatabase(fixturePaths());
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
     expect(opened.data.workspace.read('2026-10-03T00:00:00.000Z')).toMatchObject({ ok: true, data: { revision: 0, selection: null } });
     expect(opened.data.workspace.read('2026-10-03T00:00:01.000Z')).toMatchObject({ ok: true, data: { revision: 0 } });
     expect(opened.data.db.query('SELECT COUNT(*) AS count FROM workspace').get()).toEqual({ count: 1 });
@@ -68,7 +68,7 @@ describe('P7 Workspace migration', () => {
       expect(() => opened.data.db.query('UPDATE workspace SET selection_json=?').run(invalid)).toThrow();
     opened.data.db.query('UPDATE workspace SET selection_json=?').run(JSON.stringify({ formatVersion: 1,
       kind: 'source', target: 'document', targetId: 1, targetVersion: 'v1', artifactId: 2, page: 1 }));
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
   });
 
   it('rolls back a failed copy of incompatible historical bytes', () => {

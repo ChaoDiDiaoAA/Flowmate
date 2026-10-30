@@ -13,7 +13,7 @@ const serviceFiles = ['apps/service.js', 'apps/service-manager.js', 'service/Flo
 function release() {
   return { version: 1, releaseId: '7fcdf7d9-c2ed-4ac9-860d-98ee69ad7ceb', productVersion: '0.1.0',
     platform: 'win32', arch: 'x64', bunVersion: '1.4.4', electronVersion: '44.4.5', sdkVersion: '1.4.0',
-    pluginVersion: '0.19.0', schemaVersion: 21, settingsVersion: 7,
+    pluginVersion: '0.19.0', schemaVersion: 22, settingsVersion: 7,
     service: { wrapperVersion: '2.12.0', framework: 'net461' }, files: [...PACKAGED_REQUIRED_FILES, ...serviceFiles] };
 }
 

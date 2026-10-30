@@ -282,7 +282,7 @@ describe('P13 SQLite ownership and migration', () => {
     const originalKeys = keys(old).filter(key => !(key.table === 'runs' && key.from === 'job_id'));
     old.close();
     const store = need(openTestDatabase(p));
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
     expect(store.db.query(`SELECT ${columns.join(',')} FROM runs ORDER BY id`).all()).toEqual(before);
     expect(store.db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs').all()).toEqual([
       { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);

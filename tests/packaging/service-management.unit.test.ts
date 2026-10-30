@@ -27,7 +27,7 @@ async function fixture(published = true) {
   copyFileSync(join(repo, 'resources/service/FlowmateRuntime.xml'), join(runtimeRoot, 'resources/service/FlowmateRuntime.xml'));
   writeFileSync(join(runtimeRoot, 'release.json'), JSON.stringify({ version: 1,
     releaseId: '165f0598-c6b8-4e71-902e-dc64555e0e4e', productVersion: '0.1.0', platform: 'win32', arch: 'x64',
-    bunVersion: '1.4.4', electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 21,
+    bunVersion: '1.4.4', electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 22,
     settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files }));
   const saved = await layout.prepareServiceInstallation({ runtimeRoot, dataRoot }); if (!saved.ok) throw Error(saved.error.code);
   if (published) { const result = await layout.publishServiceConfiguration(saved.data); if (!result.ok) throw Error(result.error.code); }

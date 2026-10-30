@@ -27,7 +27,7 @@ async function target(runtimeRoot: string, dataRoot: string) {
   const checked = await resolveServiceRuntime({ runtimeRoot, dataRoot });
   if (!checked.ok) throw new ReleaseError(checked.error.code);
   const release = checked.data.runtime.release;
-  if (!release || release.schemaVersion !== 21 || release.settingsVersion !== 7 || release.sdkVersion !== '1.4.0')
+  if (!release || release.schemaVersion !== 22 || release.settingsVersion !== 7 || release.sdkVersion !== '1.4.0')
     throw new ReleaseError('service_upgrade_target_incompatible');
   return release;
 }

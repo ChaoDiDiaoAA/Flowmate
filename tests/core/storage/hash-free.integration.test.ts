@@ -37,7 +37,7 @@ it('creates the direct-content schema and preserves immutable original bytes acr
   const owner = { ownerKind: 'artifact', ownerId: '1', relativePath: 'original.txt' };
   const original = Uint8Array.from([1, 2, 3]);
   try {
-    expect(opened.data.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
+    expect(opened.data.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
     expect(opened.data.db.query("SELECT name FROM pragma_table_info('session_inputs') WHERE name='request_hash'").get()).toBeNull();
     expect(opened.data.db.query("SELECT name FROM pragma_table_info('tool_calls') WHERE name='evidence_revision'").get()).toEqual({ name: 'evidence_revision' });
     opened.data.contents.remember(owner, original);

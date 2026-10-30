@@ -48,6 +48,7 @@ export type ApplicationOptions = {
   promptTrace?: PromptTraceBuffer;
   logger?: SafeLogger;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  researchPreferences?: () => Result<{ text: string; revision: number }>;
   runtimePolicy?: RuntimeStrategyPolicy;
   sampleSource?: 'production' | 'test' | 'evaluation';
   toolDefinitions?: (definitions: readonly ToolDefinition<any, any>[]) => readonly ToolDefinition<any, any>[];
@@ -180,6 +181,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     provider,
     agent,
     runtimeDefaults: options.runtimeDefaults,
+    researchPreferences: options.researchPreferences,
     systemPromptOverride: options.systemPromptOverride,
     thinkingLevelOverride: options.thinkingLevelOverride,
     observeCompaction: value => {
@@ -462,7 +464,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     try {
       if (!existsSync(join(options.paths.root, 'data/settings.json'))) write('settings.json', installedSettings.data);
       write('installed-release.json', { version: 1, releaseId: options.installedRelease.releaseId,
-        productVersion: options.installedRelease.productVersion, schemaVersion: 21, settingsVersion: 7 });
+        productVersion: options.installedRelease.productVersion, schemaVersion: 22, settingsVersion: 7 });
     } catch {
       await application.close();
       return fail(appError('maintenance_release_record_failed', 'storage', 'The installed release could not be recorded; original data and backups were retained.', true));

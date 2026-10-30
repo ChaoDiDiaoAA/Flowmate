@@ -88,7 +88,7 @@ it('projects only the original backup manifest identity and distinguishes absent
   expect(await readServiceActivationBackup(key)).toEqual({ ok: true, data: null });
   mkdirSync(path.data, { recursive: true }); expect((await readServiceActivationBackup(key)).ok).toBe(false);
   const manifest = { version: 1, backupId: randomUUID(), createdAt: '2026-10-29T00:00:00.000Z', productVersion: '0.1.0',
-    releaseId: f.installation.releaseId, schemaVersion: 21, settingsVersion: 7,
+    releaseId: f.installation.releaseId, schemaVersion: 22, settingsVersion: 7,
     files: [{ path: 'service-installation.json', byteLength: 100 }, { path: 'data/app.sqlite', byteLength: 100 }], gaps: [] };
   writeFileSync(join(path.data, 'manifest.json'), JSON.stringify(manifest));
   const snapshot = join(path.data, 'service-installation.json'), foreignId = randomUUID();
@@ -141,7 +141,7 @@ it('prepares the real installed record and XML while the original Host remains t
     const directory = serviceActivationBackupDirectory(pending.data, operationId); if (!directory.ok) throw Error(directory.error.code);
     mkdirSync(join(dataRoot, 'backups'), { recursive: true });
     const saved = await invoke('backup', ['--destination', directory.data]);
-    expect(saved).toMatchObject({ code: 0, stderr: '', output: { result: { ok: true, data: { directory: directory.data, schemaVersion: 21 } } } });
+    expect(saved).toMatchObject({ code: 0, stderr: '', output: { result: { ok: true, data: { directory: directory.data, schemaVersion: 22 } } } });
     expect(await readServiceActivationBackup({ installation: pending.data, operationId })).toEqual({ ok: true,
       data: { id: saved.output.result.data.backupId, directory: directory.data } });
     writeFileSync(join(dataRoot, 'data/settings.json'), JSON.stringify({ ...base.data.settings, revision: base.data.settings.revision + 1,

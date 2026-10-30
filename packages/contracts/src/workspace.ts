@@ -11,6 +11,12 @@ const idSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export type WorkspaceView = 'original' | 'parsed' | 'candidate';
 export type GoalMode = 'answer' | 'save-candidate' | 'fill-form';
 
+export const WorkspaceFocusSchema = z.object({
+  page: z.enum(['conversation', 'workspace', 'workspace-detail', 'tasks', 'chats', 'research', 'personal', 'activity', 'models', 'evaluation', 'settings', 'prompts', 'skills', 'extensions']),
+  researchId: idSchema.optional(),
+}).strict();
+export type WorkspaceFocus = z.infer<typeof WorkspaceFocusSchema>;
+
 const candidateFieldPath = InvoiceCandidateFieldPathSchema;
 const selectionBase = { formatVersion: z.literal(1), targetId: idSchema };
 export const WorkspaceSelectionSchema = z.union([

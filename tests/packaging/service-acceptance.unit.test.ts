@@ -34,7 +34,7 @@ function isolatedPorts() {
   const remove = spyOn(files, 'rm').mockImplementation(async () => { throw Error('Runner must retain all temporary data.'); });
   const build = spyOn(packaging, 'buildRuntime').mockResolvedValue({ version: 1, releaseId: installation.releaseId,
     productVersion: '0.1.0', platform: 'win32', arch: 'x64', bunVersion: '1.4.4', electronVersion: '44.4.5',
-    sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 21, settingsVersion: 7, files: [],
+    sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 22, settingsVersion: 7, files: [],
     service: { wrapperVersion: '2.12.0', framework: 'net461' } });
   const prepare = spyOn(layout, 'prepareServiceInstallation').mockResolvedValue(ok(installation));
   const publish = spyOn(layout, 'publishServiceConfiguration').mockResolvedValue(ok({ installation,

@@ -142,6 +142,19 @@ export function ResearchPage(props: Props) {
             <div className="button-row"><button type="button" className="secondary-button" onClick={() => props.onAssistant(false)}>Open research Assistant</button>{props.running && <button type="button" className="secondary-button" disabled={props.stopping} onClick={props.onStop}>{props.stopping ? 'Stopping…' : 'Stop research'}</button>}</div>
           </header>
           <div className="research-tabs" role="group" aria-label="Research views">{(['Plan', 'Evidence', 'Report'] as const).map(name => <button type="button" key={name} aria-pressed={view === name} onClick={() => { setView(name); if (name === 'Report') props.onAssistant(true); }}>{name}</button>)}</div>
+          {task.workflow && <section className="research-source" aria-label="Research steps"><h3>Research steps</h3>
+            <p>{task.workflow.steps.filter(step => step.status === 'succeeded').length} / {task.workflow.steps.length} sources acquired</p>
+            <ol>{task.workflow.steps.map((step, index) => <li key={step.id}><strong>Step {index + 1} · {step.status}</strong>
+              <p>{step.questionIds.map(id => plan?.body.dimensions.flatMap(dimension => dimension.questions).find(question => question.id === id)?.question ?? id).join(' · ')}</p>
+              {step.error && <p>{step.error.message}</p>}
+              {step.sourceSnapshotId !== null && <button type="button" className="text-button" disabled={saving || !props.ready}
+                onClick={() => { setView('Evidence'); void readEvidence(step.sourceSnapshotId!); }}>View saved source for step {index + 1}</button>}
+            </li>)}</ol>
+            {task.planConfirmed && plan && task.workflow.steps.some(step => ['pending', 'failed', 'interrupted'].includes(step.status)) &&
+              <button type="button" className="secondary-button" disabled={!props.canRun || props.running || loading || saving}
+                onClick={() => props.onRun('Continue the confirmed research plan. Reuse successful sources and acquire the remaining steps.',
+                  { researchId: task.researchId, phase: 'researching', plan: { planId: plan.planId, revision: plan.revision }, continuation: true }, plan.body.execution)}>Continue research</button>}
+          </section>}
           {view === 'Plan' && (plan ? <div className="research-plan">
             <div className="research-section-heading"><h3>Plan version {plan.revision}</h3><span className="research-badge">{plan.body.dimensions.length} dimensions</span></div>
             <p className="research-prose">{plan.body.question}</p><p className="research-prose research-help">{plan.body.scope}</p>

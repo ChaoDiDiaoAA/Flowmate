@@ -86,7 +86,7 @@ it('starts the real bundled Host with fixed assets and records its installed ope
   } finally { expect(await client.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } }); }
   const db = new Database(join(data, 'data/app.sqlite'), { readonly: true });
   try {
-    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
+    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
     expect(db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 0 });
   } finally { db.close(); }
   const checked = resolveRuntimeLayout({ isPackaged: true, appPath: join(parent, 'app.asar'), resourcesPath: parent, userDataRoot: data });

@@ -721,7 +721,7 @@ describe('P8 Context storage', () => {
     const before = old.query('SELECT content_json FROM session_inputs ORDER BY id').all();
     old.close();
     const migrated = need(openTestDatabase(productPaths));
-    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
+    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
     expect(migrated.db.query('SELECT content_json FROM session_inputs ORDER BY id').all()).toEqual(before);
     expect(migrated.db.query('SELECT current_context_snapshot_id,context_observations_json FROM runs').all())
       .toEqual([{ current_context_snapshot_id: null, context_observations_json: null }]);

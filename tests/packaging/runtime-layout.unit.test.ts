@@ -9,7 +9,7 @@ const migrations = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_t
   '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql',
   '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql',
   '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql',
-  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql'];
+  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql'];
 
 function installation() {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-package-'));
@@ -24,7 +24,7 @@ function installation() {
   const release = { version: 1, releaseId: '7fcdf7d9-c2ed-4ac9-860d-98ee69ad7ceb', productVersion: '0.1.0',
     platform: 'win32', arch: 'x64',
     bunVersion: '1.4.4', electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0',
-    schemaVersion: 21, settingsVersion: 7, files } as const;
+    schemaVersion: 22, settingsVersion: 7, files } as const;
   for (const file of files) {
     const path = join(runtime, file); mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, file === 'sdk/package.json' ? JSON.stringify({ version: '1.4.0' }) : 'synthetic package asset');
@@ -72,7 +72,7 @@ describe('P17 runtime layout', () => {
     if (!result.ok) expect(result.error.code).toBe('installation_dependency_missing');
   });
 
-  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 22 }, { settingsVersion: 8 },
+  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 23 }, { settingsVersion: 8 },
     { arch: 'arm64' }, { platform: 'linux' }, { releaseId: 'not-an-id' }, { extra: 'untrusted' }])
   ('rejects an incompatible or malformed release: %j', change => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, ...change }));

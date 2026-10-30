@@ -444,6 +444,7 @@ export type NormalizedListSessionsRequest = { limit: number; before?: SessionCur
 export type SessionPage = { items: AgentSessionSnapshot[]; next: SessionCursor | null };
 
 export type AgentRunRequest = {
+  focus?: import('./workspace.ts').WorkspaceFocus;
   research?: import('./research.ts').ResearchIntent;
   requiredSkill?: import('./resources.ts').ResourceRef;
   sessionId: DbId;

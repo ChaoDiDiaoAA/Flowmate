@@ -29,7 +29,7 @@ import { researchFixture, researchPlan, researchNeed as need } from '../../suppo
 
 const release: PackagedRelease = { version: 1, releaseId: '43f163a3-b56f-4133-b04d-8bbf92eb1e52', productVersion: '0.1.0',
   platform: 'win32', arch: 'x64', bunVersion: '1.4.4',
-  electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 21, settingsVersion: 7,
+  electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 22, settingsVersion: 7,
   files: PACKAGED_REQUIRED_FILES };
 
 for (const unusable of [false, true]) it('checks an entirely missing referenced bundle without clearing unusable history, unusable=' + unusable, async () => {
@@ -265,7 +265,7 @@ it('backs up committed SQLite and all persistent references, then verifies an is
   const { root, paths, destination } = await fixture();
   const original = readFileSync(paths.databaseFile), settings = readFileSync(join(root, 'data/settings.json'));
   const backed = await backupStore(paths, destination); expect(backed.ok).toBe(true); if (!backed.ok) return;
-  expect(backed.data.manifest.schemaVersion).toBe(21); expect(backed.data.manifest.settingsVersion).toBe(7);
+  expect(backed.data.manifest.schemaVersion).toBe(22); expect(backed.data.manifest.settingsVersion).toBe(7);
   expect(backed.data.manifest.files.map(file => file.path)).toContain('security/credentials/synthetic-ref.json');
   expect(backed.data.manifest.files.map(file => file.path)).toContain('runtime/resource-bundles/historical-bundle/skills/example/v1/SKILL.md');
   expect(backed.data.manifest.files.some(file => file.path.includes('temporary-run') || file.path.endsWith('.lock'))).toBe(false);
@@ -350,7 +350,7 @@ it('backs up before Settings migration, records only a successful installed open
     expect(JSON.parse(readFileSync(join(root, 'backups', backups[0]!, 'data/settings.json'), 'utf8')).version).toBe(6);
     expect(JSON.parse(readFileSync(settingsFile, 'utf8')).version).toBe(7);
     expect(JSON.parse(readFileSync(join(root, 'data/installed-release.json'), 'utf8'))).toEqual({ version: 1,
-      releaseId: release.releaseId, productVersion: release.productVersion, schemaVersion: 21, settingsVersion: 7 });
+      releaseId: release.releaseId, productVersion: release.productVersion, schemaVersion: 22, settingsVersion: 7 });
   } finally { await opened.data.close(); }
   const again = await createApplication(options); expect(again.ok).toBe(true);
   if (again.ok) await again.data.close();
@@ -396,11 +396,11 @@ it('refuses linked references and unsafe or existing destinations without copyin
 it('backs up a different release even at the same Schema and skips only the matching successful release', async () => {
   const { root, paths } = await fixture();
   writeFileSync(join(root, 'data/installed-release.json'), JSON.stringify({ version: 1, releaseId: release.releaseId,
-    productVersion: release.productVersion, schemaVersion: 21, settingsVersion: 7 }));
+    productVersion: release.productVersion, schemaVersion: 22, settingsVersion: 7 }));
   expect(await prepareStoreUpgrade(paths, release)).toEqual({ ok: true, data: null });
   const next = { ...release, releaseId: '54ec481d-a0d9-4cf9-8143-3600e67f77b9' };
   const backed = await prepareStoreUpgrade(paths, next); expect(backed.ok).toBe(true);
-  if (backed.ok) { expect(backed.data?.manifest.releaseId).toBe(release.releaseId); expect(backed.data?.manifest.schemaVersion).toBe(21); }
+  if (backed.ok) { expect(backed.data?.manifest.releaseId).toBe(release.releaseId); expect(backed.data?.manifest.schemaVersion).toBe(22); }
   expect(readdirSync(join(root, 'backups'))).toHaveLength(1);
   expect(JSON.parse(readFileSync(join(root, 'data/installed-release.json'), 'utf8')).releaseId).toBe(release.releaseId);
 });
@@ -411,7 +411,7 @@ it('rejects future or nonconsecutive Schema and corrupt Settings before any upgr
     if (kind === 'settings') writeFileSync(join(root, 'data/settings.json'), '{"version":8}');
     else {
       const db = new Database(paths.databaseFile);
-      if (kind === 'future') db.query('INSERT INTO schema_migrations(version,applied_at) VALUES(22,?)').run('2026-10-17T00:00:00.000Z');
+      if (kind === 'future') db.query('INSERT INTO schema_migrations(version,applied_at) VALUES(23,?)').run('2026-10-17T00:00:00.000Z');
       else db.query('DELETE FROM schema_migrations WHERE version=19').run(); db.close();
     }
     const before = readFileSync(paths.databaseFile), settings = readFileSync(join(root, 'data/settings.json'));
@@ -557,7 +557,7 @@ it('runs the bundled offline CLI against the same controller lease, then saves a
   expect(blocked.code).toBe(1); expect(blocked.output.result).toMatchObject({ ok: false, error: { code: 'runtime_already_owned' } });
   expect(existsSync(destination)).toBe(false); await lease.release();
   const saved = await command(entry, args);
-  expect(saved.code).toBe(0); expect(saved.output.result).toMatchObject({ ok: true, data: { directory: destination, schemaVersion: 21, settingsVersion: 7 } });
+  expect(saved.code).toBe(0); expect(saved.output.result).toMatchObject({ ok: true, data: { directory: destination, schemaVersion: 22, settingsVersion: 7 } });
   expect(saved.output.result.data.fileCount).toBeGreaterThan(3); expect(existsSync(join(destination, 'manifest.json'))).toBe(true);
 });
 
@@ -601,7 +601,7 @@ async function serviceRestoreFixture() {
     enabled: true, activationOperationId: randomUUID(), activationSettingsRevision: 3 });
   writeFileSync(join(f.root, 'service-installation.json'), JSON.stringify(originalInstallation));
   const installed = (releaseId: string) => writeFileSync(join(f.root, 'data/installed-release.json'), JSON.stringify({ version: 1,
-    releaseId, productVersion: release.productVersion, schemaVersion: 21, settingsVersion: 7 }));
+    releaseId, productVersion: release.productVersion, schemaVersion: 22, settingsVersion: 7 }));
   installed(release.releaseId);
   const addNative = async (title: string) => {
     const database = need(openDatabase(f.paths)), storage = await createDurableSqliteStorage(database.coordinator);

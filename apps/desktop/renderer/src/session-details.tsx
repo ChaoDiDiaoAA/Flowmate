@@ -65,6 +65,12 @@ export function ContextSnapshotFacts({ detail, pendingCandidate, canQueryCandida
       <div><dt>Processing</dt><dd>{input.processingStatus}</dd></div><div><dt>Native entry</dt><dd>{input.nativeEntryId ?? 'Not observed'}</dd></div>
       <div><dt>Document</dt><dd>{saved.json.workspaceContext?.documentRef ? `${saved.json.workspaceContext.documentRef.id} / ${saved.json.workspaceContext.documentRef.version}` : 'No business material'}</dd></div>
       <div><dt>Goal</dt><dd>{saved.json.goalMode} · {projection.taskGoal ?? 'No task goal'}</dd></div></dl>
+    {saved.json.layers && <section aria-label="Context layers"><h4>Request context layers</h4>
+      <p>Workspace: {saved.json.layers.focus?.page ?? saved.json.workspaceContext?.activeView ?? 'Conversation'} · captured for this input.</p>
+      <p>Conversation history is saved separately. Runtime execution is rebuilt when needed.</p>
+      {saved.json.layers.researchPreferences && <><h4>Saved research preferences</h4><p>{saved.json.layers.researchPreferences.text || 'No preferences saved.'}</p></>}
+      {saved.json.research && <p>Research checkpoint: task {saved.json.research.binding.researchId} · plan {saved.json.research.binding.plan?.revision ?? 'planning'}.</p>}
+    </section>}
     {input.error && <p role="alert">{input.error.code} · {input.error.category} · {input.error.retryable ? 'Retryable' : 'Not retryable'}</p>}
     {saved.json.goalMode === 'fill-form' && <p>Fill reference · Saved candidate {projection.candidate?.id} / sequence {projection.candidate?.sequence}. The full form payload is not copied into this snapshot.</p>}
     {projection.candidate && <div><h4>Candidate {projection.candidate.id} · {projection.candidate.origin} · {projection.candidate.statusAtSelection}</h4>

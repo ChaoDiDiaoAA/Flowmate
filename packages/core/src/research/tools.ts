@@ -9,8 +9,8 @@ export function checkResearchControl(call: ToolCallContext): void {
 }
 
 export function createResearchPlanTool(database: Pick<DbHandle, 'read' | 'transaction'>, now: () => string): ToolDefinition<ResearchPlanBody, ResearchPlan> {
-  return { name: 'save_research_plan', version: 'p15-v1', label: 'Save research plan', effect: 'LOCAL_WRITE', executionMode: 'sequential',
-    description: 'Save a versioned research plan for user confirmation. Include dimensions, questions, evidence needs, authorized sources, explicit execution budget and stop conditions. Does not begin investigation. Finish this planning Run after receiving the saved receipt.',
+  return { name: 'save_research_plan', version: 'p15-v2', label: 'Save research plan', effect: 'LOCAL_WRITE', executionMode: 'sequential',
+    description: 'Save a versioned research plan for user confirmation. Include dimensions, questions, evidence needs, authorized sources, execution budget, stop conditions and executable steps (id, questionIds, tool:"read_research_local", input:{artifactId,documentId}). Each step selects exactly one material. Use steps:[] when no material is selected. Finish this planning Run after the saved receipt.',
     inputSchema: ResearchPlanToolInputSchema, outputSchema: ResearchPlanSchema,
     execute: async (body, call, context) => {
       body = structuredClone(body); call = { ...call }; context = structuredClone(context);

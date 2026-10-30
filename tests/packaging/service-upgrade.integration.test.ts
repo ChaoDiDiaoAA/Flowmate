@@ -222,7 +222,7 @@ it('backs up all real product/native tables and assets only after Stopped and ve
   const f = await maintenanceFixture(), paths = await savedOfflineFacts(f.installation), destination = join(f.root, 'stopped-complete-backup');
   const record = readFileSync(join(paths.root, 'service-installation.json'));
   const backed = await offlineCommand(f.root, f.installation, 'Stopped', ['backup', '--user-data-root', paths.root, '--destination', destination]);
-  expect(backed.code).toBe(0); expect(backed.output.result).toMatchObject({ ok: true, data: { schemaVersion: 21, settingsVersion: 7 } });
+  expect(backed.code).toBe(0); expect(backed.output.result).toMatchObject({ ok: true, data: { schemaVersion: 22, settingsVersion: 7 } });
   expect(backed.calls).toHaveLength(1);
   const original = databaseFacts(paths.databaseFile), copied = databaseFacts(join(destination, 'data/app.sqlite'));
   expect(copied).toEqual(original); expect(copied.fm_durable_durable_schema).toEqual([{ singleton: 1, version: 2 }]);

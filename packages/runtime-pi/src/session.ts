@@ -1729,7 +1729,7 @@ export class PiAgentAdapter implements AgentPort {
         return errorStream(model, error);
       }
       // Awareness is a request-local copy; native history and the saved system prompt remain authoritative.
-      const requestContext = await this.withRuntimeAwareness(active, context, modelCallLimit, remainingMs);
+      let requestContext = await this.withRuntimeAwareness(active, context, modelCallLimit, remainingMs);
       const contextLimit = active.p3 ? RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes : maxContextBytes;
       let contextSize: number;
       try {
@@ -1750,7 +1750,16 @@ export class PiAgentAdapter implements AgentPort {
       if (active.input.contextHooks) {
         const binding = await this.bindContext(record, active, context, model);
         if (!binding.ok) { this.failToolRun(record, active, binding.error); return errorStream(model, binding.error); }
-        requestBinding = binding.data;
+        requestBinding = binding.data.binding;
+        if (binding.data.projection !== null) {
+          requestContext = normalizeContext({ messages: [...requestContext.messages, { role: 'system', timestamp: Date.now(), content: '',
+            sections: { flowmateContextLayers: binding.data.projection } }] });
+          contextSize = encoder.encode(JSON.stringify(requestContext)).byteLength;
+          if (contextSize > contextLimit) {
+            const error = appError('agent_context_limit', 'runtime', 'Request-local context exceeds the request budget.');
+            this.failToolRun(record, active, error); return errorStream(model, error);
+          }
+        }
       }
       active.attemptsAtCallStart = active.attempts;
       active.responseStarted = false;
@@ -1774,7 +1783,7 @@ export class PiAgentAdapter implements AgentPort {
     };
   }
 
-  private async bindContext(record: SessionRecord, active: ActiveExecution, context: StreamContext, model: StreamModel): Promise<Result<RequestContextBinding>> {
+  private async bindContext(record: SessionRecord, active: ActiveExecution, context: StreamContext, model: StreamModel): Promise<Result<{ binding: RequestContextBinding; projection: string | null }>> {
     const hooks = active.input.contextHooks!;
     const includedBindings: NativeInputContextBinding[] = [];
     const includedToolResults: NativeToolResultContextBinding[] = [];
@@ -1821,14 +1830,16 @@ export class PiAgentAdapter implements AgentPort {
         nativeSessionId: active.nativeSessionId, requestSequence: active.callSequence, callSequence: active.callSequence,
         inputId: primary.inputId, snapshotId: primary.snapshotId, includedBindings, includedToolResults, includedNativeContexts });
       if (!parsed.success) return fail(appError('context_binding_unknown', 'runtime', 'Request provenance is inconsistent.'));
-      const binding = structuredClone(parsed.data);
+      const projected = hooks.projectRequest ? await hooks.projectRequest(parsed.data) : ok(null);
+      if (!projected.ok) return projected;
+      const binding = RequestContextBindingSchema.parse({ ...parsed.data, ...(projected.data === null ? {} : { requestLocalSnapshotId: parsed.data.snapshotId }) });
       for (const source of binding.includedBindings) Object.freeze(source);
       for (const source of binding.includedToolResults) { if (source.context) Object.freeze(source.context); Object.freeze(source); }
       for (const source of binding.includedNativeContexts) { Object.freeze(source.referenceEntryIds); Object.freeze(source); }
       Object.freeze(binding.includedNativeContexts); Object.freeze(binding.includedBindings); Object.freeze(binding.includedToolResults); Object.freeze(binding);
       const saved = await hooks.bind({ binding, api: model.api,
         transport: observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch) ? 'observed-fetch' : 'not-observable', at: now().at });
-      return saved.ok ? ok(binding) : saved;
+      return saved.ok ? ok({ binding, projection: projected.data }) : saved;
     } catch { return fail(appError('context_binding_unknown', 'runtime', 'Request provenance could not be confirmed.')); }
   }
 

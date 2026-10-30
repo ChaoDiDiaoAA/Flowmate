@@ -68,6 +68,7 @@ import type { ToolExecutor } from '../tools/executor.ts';
 import type { SessionInputAdmission } from '../sessions/input-ledger.ts';
 import type { WorkspaceVerifier } from '../workspace/verification.ts';
 import type { ContextService } from '../context/service.ts';
+import { formatRequestContext } from '../context/service.ts';
 import type { ContextRepository } from '../context/repository.ts';
 import { SUBAGENT_ROLE, SUBAGENT_SYSTEM_PROMPT, SUBAGENT_TOOL_NAMES, DelegateArgsSchema } from '@flowmate/contracts';
 import { visibleFrozenSkills } from '../skill-hub/capability-map.ts';
@@ -89,6 +90,7 @@ export type RuntimeDependencies = {
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  researchPreferences?: () => Result<{ text: string; revision: number }>;
   resources?: ReturnType<typeof createResourceService>;
   extensions?: ExtensionService;
   inputDefinitions?: InputDefinitions;
@@ -747,6 +749,7 @@ export class RuntimeService {
           text: request.text, expected: request.workspace, at }, this.dependencies.workspaceVerifier
             ? input => this.dependencies.workspaceVerifier!(input, store) : undefined);
         return frozen.ok ? this.buildInput(frozen.data.runId, request.sessionId, { ...frozen.data.content,
+          ...(request.focus ? { focus: request.focus } : {}),
           ...(resourceBinding ? { resourceBinding } : {}) }, at, store) : frozen;
       }, at);
       if (!admitted.ok) return admitted;
@@ -814,6 +817,9 @@ export class RuntimeService {
     if (goalMode !== 'answer' && goalMode !== 'save-candidate' && goalMode !== 'fill-form')
       return fail(appError('storage_corrupt', 'storage', 'Saved Context goal is invalid.'));
     const built = contextService.build({ runId, sessionId, jobId: run.data.jobId, text: content.text,
+      ...(goalMode === 'fill-form' ? {} : { layers: { version: 1 as const,
+        ...(content.focus ? { focus: content.focus } : {}),
+        ...(run.data.config.researchPreferences ? { researchPreferences: run.data.config.researchPreferences as { text: string; revision: number } } : {}) } }),
       ...(content.research ? { research: content.research } : {}),
       goalMode, workspaceContext: content.workspaceContext, workspaceInput: content.workspaceInput,
       ...(content.resourceBinding ? { resourceBinding: content.resourceBinding } : {}),
@@ -1196,7 +1202,10 @@ export class RuntimeService {
     });
     if (!preparedResources.ok) return preparedResources;
     const { resources, extensions, inputDefinitions, resourceBinding, skillNames, activeToolNames } = preparedResources.data;
+    const preferences = request.research ? this.dependencies.researchPreferences?.() : undefined;
+    if (preferences && !preferences.ok) return preferences;
     const freezeConfig = (config: ReturnType<typeof initialAgentSnapshot>) => ({ ...config,
+      ...(preferences?.ok ? { researchPreferences: preferences.data } : {}),
       ...(resources ? { resources } : {}), ...(extensions ? { extensions } : {}), ...(inputDefinitions ? { inputDefinitions } : {}),
       agent: { ...config.agent, ...(resources ? { resourcePolicy: 'p11-resources-v1' as const } : {}),
         ...(this.dependencies.systemPromptOverride === undefined ? {} : { systemPrompt: this.dependencies.systemPromptOverride }),
@@ -1285,6 +1294,7 @@ export class RuntimeService {
           researchContext = { binding: bound.data, plan: confirmedPlan?.body ?? null };
         }
         const content: SessionInputContentV2 = { ...(researchContext ? { research: researchContext } : {}), version: 2, text: request.text,
+          ...(request.focus ? { focus: request.focus } : {}),
           ...(inputDefinitions?.command ? { inputCommand: inputDefinitions.command } : {}),
           ...(resourceBinding ? { resourceBinding } : {}),
           requestIdentityVersion: 1, originalBudgetOverrides: originalOverrides(rawRequest),
@@ -1756,6 +1766,14 @@ export class RuntimeService {
     const { active, request, session } = context;
     const p8 = context.contextSnapshotId !== undefined;
     return p8 ? {
+      projectRequest: binding => this.readRuntimeStorage(store => {
+        const saved = store.context.queryContextSnapshot({ sessionId: request.sessionId, runId: active.runId, snapshotId: binding.snapshotId });
+        if (!saved.ok) return saved;
+        const research = saved.data.snapshot.json.research;
+        const task = research ? store.research.get(research.binding.researchId) : null;
+        if (task && !task.ok) return task;
+        return ok(formatRequestContext(saved.data.snapshot, task?.ok ? task.data.workflow : undefined));
+      }),
       ...(this.dependencies.resources ? { recordResourceRead: value => this.writeRuntimeStorage(store => store.context.recordResourceRead(value,
         { runId: active.runId, sessionId: request.sessionId })) } : {}),
       ...(this.dependencies.resources ? { recordResourceRequest: value => this.writeRuntimeStorage(store => store.context.recordResourceRequest(value,

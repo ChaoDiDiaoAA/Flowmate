@@ -23,6 +23,16 @@ export const ResearchSourcePolicySchema = z.object({
   web: z.boolean().refine(value => !value, 'Online research is unavailable in this version.'), domains: z.array(z.string()).max(0),
   artifactIds: ids, documentIds: ids,
 }).strict();
+export const ResearchStepSchema = z.object({ id: key, questionIds: z.array(key).min(1).max(256),
+  tool: z.literal('read_research_local'), input: z.object({ artifactId: id.nullable(), documentId: id.nullable() }).strict(),
+}).strict();
+const steps = z.array(ResearchStepSchema).max(128);
+export const ResearchWorkflowSchema = z.object({ planId: id, revision: id, phase: z.enum(['acquiring', 'synthesizing']),
+  steps: z.array(ResearchStepSchema.extend({ status: z.enum(['pending', 'running', 'succeeded', 'failed', 'interrupted']),
+    runId: id.nullable(), toolCallId: id.nullable(), sourceSnapshotId: id.nullable(), error: AppErrorSchema.nullable(),
+  })).max(128),
+}).strict();
+export type ResearchWorkflow = z.infer<typeof ResearchWorkflowSchema>;
 export const ResearchPlanBodySchema = z.object({
   question: boundedText(16000), scope: boundedText(16000),
   dimensions: z.array(z.object({ id: key, title: label, questions: z.array(z.object({ id: key,
@@ -31,9 +41,17 @@ export const ResearchPlanBodySchema = z.object({
   sourcePolicy: ResearchSourcePolicySchema,
   stopConditions: z.array(boundedText(1000)).min(1).max(16),
   execution: ResearchExecutionSchema,
+  steps: steps.optional(),
 }).strict().superRefine((value, ctx) => {
   if (!unique(value.dimensions.map(d => d.id)) || !unique(value.dimensions.flatMap(d => d.questions.map(q => q.id))))
     ctx.addIssue({ code: 'custom', message: 'Dimension and question identities must be unique.' });
+  const questions = value.dimensions.flatMap(d => d.questions.map(q => q.id));
+  if (value.steps && (!unique(value.steps.map(step => step.id)) || value.steps.some(step => !unique(step.questionIds)
+    || step.questionIds.some(question => !questions.includes(question))
+    || (step.input.artifactId === null) === (step.input.documentId === null)
+    || step.input.artifactId !== null && !value.sourcePolicy.artifactIds.includes(step.input.artifactId)
+    || step.input.documentId !== null && !value.sourcePolicy.documentIds.includes(step.input.documentId))))
+    ctx.addIssue({ code: 'custom', message: 'Steps require unique identities, confirmed questions and exactly one selected material.' });
 });
 export const ResearchLocatorSchema = z.object({ start: z.number().int().min(0).max(2_000_000),
   end: z.number().int().min(1).max(2_000_000), quote: boundedText(16000) }).strict()
@@ -59,9 +77,10 @@ export const ResearchPlanToolInputSchema = z.object({ question: z.string().min(1
   dimensions: z.array(z.object({ id: key, title: z.string().min(1).max(480), questions: z.array(z.object({ id: key,
     question: z.string().min(1).max(4000), evidenceNeeded: z.array(z.string().min(1).max(1000)).min(1).max(16) }).strict()).min(1).max(16) }).strict()).min(1).max(16),
   sourcePolicy: z.object({ web: z.boolean().refine(value => !value, 'Online research is unavailable in this version.'), domains: z.array(z.string()).max(0), artifactIds: z.array(id).max(128), documentIds: z.array(id).max(128) }).strict(),
-  stopConditions: z.array(z.string().min(1).max(1000)).min(1).max(16), execution: ResearchExecutionSchema }).strict();
+  stopConditions: z.array(z.string().min(1).max(1000)).min(1).max(16), execution: ResearchExecutionSchema, steps: steps.optional() }).strict();
 export const ResearchTaskSchema = z.object({ researchId: id, sessionId: id, title: label,
   sourcePolicy: ResearchSourcePolicySchema,
+  workflow: ResearchWorkflowSchema.optional(),
   status: z.enum(['planning', 'awaiting_confirmation', 'researching', 'completed', 'partial', 'failed', 'cancelled', 'interrupted']),
   currentPlanId: id.nullable(), planConfirmed: z.boolean(), currentRunId: id.nullable(), currentReportId: id.nullable(),
   createdAt: z.string().datetime(), updatedAt: z.string().datetime() }).strict();

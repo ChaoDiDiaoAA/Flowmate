@@ -1,4 +1,17 @@
 import type { WorkspaceChange, WorkspaceSelection, WorkspaceSnapshot } from '@flowmate/contracts';
+import { WorkspaceFocusSchema, type WorkspaceFocus } from '@flowmate/contracts';
+
+export function readWorkspaceFocus(storage: Pick<Storage, 'getItem'>): WorkspaceFocus | null {
+  try {
+    const raw = storage.getItem('flowmate.workspace-focus.v1');
+    const parsed = WorkspaceFocusSchema.safeParse(raw === null ? null : JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
+  } catch { return null; }
+}
+export function saveWorkspaceFocus(storage: Pick<Storage, 'setItem'>, focus: WorkspaceFocus): boolean {
+  try { storage.setItem('flowmate.workspace-focus.v1', JSON.stringify(WorkspaceFocusSchema.parse(focus))); return true; }
+  catch { return false; }
+}
 
 export type WorkspaceStatus = 'loading' | 'saving' | 'ready' | 'error' | 'conflict' | 'unknown' | 'blocked';
 export type WorkspaceState = { confirmed: WorkspaceSnapshot | null; hostEpoch: number; requestToken: number;

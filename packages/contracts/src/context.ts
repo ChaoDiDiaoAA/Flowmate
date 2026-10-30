@@ -8,7 +8,7 @@ import { CONTEXT_ERROR_FACTS } from './errors.ts';
 export { CONTEXT_ERROR_FACTS } from './errors.ts';
 import { DocumentRefSchema, InvoiceIssueSchema, ParsedBlockSchema, SourceRefSchema, StoredInvoiceFieldSchema,
   invoiceHeaderFields, invoiceLineFields, MAX_INVOICE_BLOCKS_PER_PAGE, MAX_INVOICE_LINES, MAX_INVOICE_PAGES } from './invoice.ts';
-import { WorkspaceContextSchema, WorkspaceInputSchema, WorkspaceSelectionSchema } from './workspace.ts';
+import { WorkspaceContextSchema, WorkspaceInputSchema, WorkspaceSelectionSchema, WorkspaceFocusSchema } from './workspace.ts';
 import { WorkingDirectorySchema } from './schemas.ts';
 import { RESOURCE_ERROR_CODES, ResourceBindingSchema, ResourceEvidenceJournalSchema } from './resources.ts';
 import type { ResourceReadEvidence, ResourceRequestEvidence } from './resources.ts';
@@ -122,7 +122,10 @@ export const ContextProjectionSchema = z.object({ taskGoal: z.string().nullable(
 export type ContextProjection = z.infer<typeof ContextProjectionSchema>;
 export const ContextBudgetsSchema = z.object({ projectionBytes: z.literal(65536), fragmentBytes: z.literal(4096),
   fragments: z.literal(32), issueCount: z.literal(20), snapshotBytes: z.literal(262144) }).strict();
-const publicJsonShape = { research: ResearchContextSchema.optional(), version: z.literal(1), policyVersion: z.literal('p8-context-v1'), text: userText, goalMode,
+export const ContextLayersSchema = z.object({ version: z.literal(1), focus: WorkspaceFocusSchema.optional(),
+  researchPreferences: z.object({ text: z.string().max(8192).refine(value => textBytes(value) <= 8192), revision: nonnegative }).strict().optional(),
+}).strict();
+const publicJsonShape = { layers: ContextLayersSchema.optional(), research: ResearchContextSchema.optional(), version: z.literal(1), policyVersion: z.literal('p8-context-v1'), text: userText, goalMode,
   workspaceContext: WorkspaceContextSchema.nullable(), resourcePolicy: z.enum(['none', 'p11-resources-v1']),
   resourceBinding: ResourceBindingSchema.optional(), inputCommand: FrozenInputCommandSchema.optional(),
   modelProjection: ContextProjectionSchema, budgets: ContextBudgetsSchema };
@@ -150,6 +153,7 @@ export const ContextSnapshotSchema = z.object({ ...snapshotIdentity, json: Conte
     && value.json.workspaceContext.jobId === value.jobId, 'Snapshot and frozen Workspace identity disagree.').readonly();
 export type ContextSnapshot = z.infer<typeof ContextSnapshotSchema>;
 export const ContextBuildRequestSchema = z.object({ research: ResearchContextSchema.optional(), runId: id, sessionId: id, jobId: id.nullable(), text: userText, goalMode,
+  layers: ContextLayersSchema.optional(),
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id).max(64).readonly(), allowedArtifactIds: z.array(id).max(128).readonly(),
   workingDirectory: WorkingDirectorySchema.nullable(), createdAt: time, resourceBinding: ResourceBindingSchema.optional(),
@@ -203,6 +207,7 @@ export const NativeDerivedContextBindingSchema = z.object({ nativeEntryId: opaqu
 export type NativeDerivedContextBinding = z.infer<typeof NativeDerivedContextBindingSchema>;
 const requestBindingShape = { runId: id, sessionId: id, nativeSessionId: opaqueId,
   requestSequence: id, callSequence: id, inputId: id, snapshotId: id,
+  requestLocalSnapshotId: id.optional(),
   includedBindings: z.array(NativeInputContextBindingSchema).max(512).readonly(),
   includedToolResults: z.array(NativeToolResultContextBindingSchema).max(512).readonly(),
 };
@@ -213,6 +218,8 @@ function checkRequestBinding(value: z.infer<z.ZodObject<typeof requestBindingSha
     : !value.includedNativeContexts?.some(source => source.entryType === 'compaction'))
     report(context, 'Primary binding requires the last current Run source or a committed compaction proof.');
   if (value.callSequence !== value.requestSequence) report(context, 'Call and logical request sequences disagree.');
+  if (value.requestLocalSnapshotId !== undefined && value.requestLocalSnapshotId !== value.snapshotId)
+    report(context, 'Request-local layers must use the primary snapshot.');
   if (value.includedBindings.length + value.includedToolResults.length + (value.includedNativeContexts?.length ?? 0) > 512)
     report(context, 'Combined request provenance exceeds 512 entries.');
   if (value.includedNativeContexts && !unique(value.includedNativeContexts.map(item => item.contextMessageIndex)))
@@ -331,6 +338,7 @@ export const ContextEvidenceUpdateSchema = z.discriminatedUnion('kind', [
 ]).superRefine((value, context) => { if (value.kind === 'sdk-payload') checkInclusion(value, context); }).readonly();
 export type ContextEvidenceUpdate = z.infer<typeof ContextEvidenceUpdateSchema>;
 export type ContextHooks = {
+  projectRequest?: (binding: RequestContextBinding) => Result<string | null> | Promise<Result<string | null>>;
   compaction?: (value: RunCompactionEvidence) => Result<void> | Promise<Result<void>>;
   recordResourceRead?: (value: ResourceReadEvidence) => Result<void> | Promise<Result<void>>;
   recordResourceRequest?: (value: ResourceRequestEvidence) => Result<void> | Promise<Result<void>>;

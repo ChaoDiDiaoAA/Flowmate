@@ -7,7 +7,7 @@ import { AppErrorSchema, RuntimeRequestOverridesSchema } from './runtime.ts';
 import type { DbId, ProviderConfig, Result, RuntimeBudgetOverrides } from './runtime.ts';
 import { InvoiceFormTargetSchema } from './invoice.ts';
 import type { InvoiceFormTarget } from './invoice.ts';
-import { LegacyWorkspaceContextSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema } from './workspace.ts';
+import { LegacyWorkspaceContextSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, WorkspaceFocusSchema } from './workspace.ts';
 import type { GoalMode, WorkspaceContext, WorkspaceExpectation, WorkspaceInput } from './workspace.ts';
 import { normalizeProviderConfig, WorkingDirectorySchema } from './schemas.ts';
 import { ResourceRefSchema, ResourceBindingSchema } from './resources.ts';
@@ -33,6 +33,7 @@ export const LegacySessionInputRequestSchema = z.object({
   && value.workspace.documentRef !== null && value.workspace.jobId !== null && value.workspace.candidateRef !== null,
 'Fill requires the selected candidate in the same Session.');
 const promptSchema = z.object({
+  focus: WorkspaceFocusSchema.optional(),
   research: ResearchIntentSchema.optional(),
   sessionId: id, clientSequence: id, mode: z.literal('prompt'), goalMode: z.enum(['answer', 'save-candidate']).default('answer'), text,
   requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional(),
@@ -44,6 +45,7 @@ const promptSchema = z.object({
   && (value.goalMode !== 'save-candidate' || !!value.workspace?.documentRef && !!value.workspace.jobId),
 'Prompt requires a compatible Workspace and business target.');
 const activeSchema = z.object({ sessionId: id, clientSequence: id, mode: z.enum(['steer', 'followUp']),
+  focus: WorkspaceFocusSchema.optional(),
   runId: id, text, workspace: WorkspaceExpectationSchema.optional(),
   requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional() }).strict()
   .refine(value => !value.workspace || value.workspace.sessionId === value.sessionId, 'Input belongs to a different Session.');
@@ -57,11 +59,11 @@ const fillSchema = z.object({
 'Fill requires the selected candidate in the same Session.');
 export const SessionInputRequestSchema = z.union([fillSchema, promptSchema, activeSchema]);
 type InputBase = { sessionId: DbId; clientSequence: DbId; text: string; requiredSkill?: ResourceRef };
-export type PromptInputRequest = InputBase & { mode: 'prompt'; config: ProviderConfig; workspace?: WorkspaceExpectation;
+export type PromptInputRequest = InputBase & { mode: 'prompt'; config: ProviderConfig; workspace?: WorkspaceExpectation; focus?: import('./workspace.ts').WorkspaceFocus;
   research?: ResearchIntent; goalMode?: 'answer' | 'save-candidate'; workingDirectory?: string; budget?: RuntimeBudgetOverrides; timeoutMs?: number; stopGraceMs?: number };
 export type FillInputRequest = InputBase & { mode: 'prompt'; goalMode: 'fill-form'; config: ProviderConfig;
   workspace: WorkspaceExpectation; formTarget: InvoiceFormTarget; budget?: RuntimeBudgetOverrides; timeoutMs?: number; stopGraceMs?: number };
-export type ActiveInputRequest = InputBase & { mode: 'steer' | 'followUp'; runId: DbId; workspace?: WorkspaceExpectation };
+export type ActiveInputRequest = InputBase & { mode: 'steer' | 'followUp'; runId: DbId; workspace?: WorkspaceExpectation; focus?: import('./workspace.ts').WorkspaceFocus };
 export type SessionInputRequest = PromptInputRequest | FillInputRequest | ActiveInputRequest;
 export type NormalizedSessionInputRequest = z.output<typeof SessionInputRequestSchema>;
 export type NormalizedActiveInputRequest = z.output<typeof activeSchema>;
@@ -86,6 +88,7 @@ export const LegacySessionInputContentSchema = z.object({ version: z.literal(1),
   workspaceContext: LegacyWorkspaceContextSchema, allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id) }).strict();
 export type SessionInputContentV1 = z.infer<typeof LegacySessionInputContentSchema>;
 export const SessionInputContentV2Schema = z.object({ research: ResearchContextSchema.optional(), version: z.literal(2), text: z.string(),
+  focus: WorkspaceFocusSchema.optional(),
   workspaceContext: WorkspaceContextSchema.nullable(), workspaceInput: WorkspaceInputSchema.nullable(),
   allowedDocumentIds: z.array(id), allowedArtifactIds: z.array(id), promptText: z.string().min(1),
   inputCommand: FrozenInputCommandSchema.optional(),

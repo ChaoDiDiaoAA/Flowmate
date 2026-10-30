@@ -209,7 +209,7 @@ describe('P15 research storage, isolated engineering fixtures', () => {
     expect(store.db.query(`SELECT ${columns.join(',')} FROM sessions`).all()).toEqual(before);
     expect(store.db.query('SELECT runtime_kind,durable_conversation_id FROM sessions').all())
       .toEqual([{ runtime_kind: 'agent_session', durable_conversation_id: null }]);
-    expect(store.db.query('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 21 });
+    expect(store.db.query('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 22 });
     expect(need(store.research.list({ limit: 50 })).items).toEqual([]);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });

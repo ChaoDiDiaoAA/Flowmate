@@ -4,7 +4,7 @@
 
 ## 构建 Windows 安装包
 
-安装目标为 **Windows x64**，使用 Bun **1.4.4** 与锁定依赖。脚本检查 Pi SDK 1.4.0、pi-subagents 0.19.0、Electron 44.4.5、schema 21 迁移、原生工具及必需资源。Durable 适配器清单另固定 `pi-durable` 1.4.0；安装包清单本身不证明真实服务恢复通过。
+安装目标为 **Windows x64**，使用 Bun **1.4.4** 与锁定依赖。脚本检查 Pi SDK 1.4.0、pi-subagents 0.19.0、Electron 44.4.5、schema 22 迁移、原生工具及必需资源。Durable 适配器清单另固定 `pi-durable` 1.4.0；安装包清单本身不证明真实服务恢复通过。
 
 ```powershell
 bun install --frozen-lockfile

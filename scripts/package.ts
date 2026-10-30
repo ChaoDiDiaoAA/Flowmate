@@ -162,7 +162,7 @@ export async function buildRuntime(repository: string, destination: string): Pro
   const release = PackagedReleaseSchema.parse({ version: 1, releaseId: randomUUID(), productVersion: metadata.version,
     platform: 'win32', arch: 'x64', bunVersion: Bun.version, electronVersion: versions.electron,
     sdkVersion: versions['@earendil-works/pi-coding-agent'], pluginVersion: versions['@tintinweb/pi-subagents'],
-    schemaVersion: 21, settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files: files(destination) });
+    schemaVersion: 22, settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files: files(destination) });
   writeFileSync(join(destination, 'release.json'), JSON.stringify(release, null, 2), { flag: 'wx' });
   const layout = resolveRuntimeLayout({ isPackaged: true, appPath: join(dirname(destination), 'app/app.asar'),
     resourcesPath: dirname(destination), userDataRoot: join(dirname(dirname(destination)), 'package-validation-data') });

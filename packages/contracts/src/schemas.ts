@@ -11,7 +11,7 @@ import type {
   RenameSessionRequest,
   Result,
 } from './runtime.ts';
-import { WorkspaceContextSchema } from './workspace.ts';
+import { WorkspaceContextSchema, WorkspaceFocusSchema } from './workspace.ts';
 import { RuntimeRequestOverridesSchema } from './runtime.ts';
 import { RUNTIME_CONFIG } from './runtime-config.ts';
 import { ResearchIntentSchema } from './research.ts';
@@ -96,6 +96,7 @@ export const INVOICE_FILL_FORM_SYSTEM_PROMPT = `You are Flowmate's invoice form 
 export const WorkingDirectorySchema = z.string().min(1).max(4096).refine(value => isAbsolute(value)
   && value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value), 'Invalid working directory.');
 const agentRunRequestSchema = z.object({
+  focus: WorkspaceFocusSchema.optional(),
   research: ResearchIntentSchema.optional(),
   requiredSkill: ResourceRefSchema.refine(ref => ref.kind === 'skill').optional(),
   sessionId: dbIdSchema,

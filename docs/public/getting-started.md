@@ -4,7 +4,7 @@
 
 ## Prepare the development environment
 
-Use Windows x64, Bun **1.4.4**, Node.js **24**, and Git. The current engineering baseline uses Pi SDK **1.4.0** and data schema **21**. Dependency versions are pinned in [package.json](../../package.json) and [bun.lock](../../bun.lock); preserve the required [dependency patches](development.md#dependency-patches). A model endpoint and its credentials are needed for model operations, not for reading the UI or running engineering fixtures.
+Use Windows x64, Bun **1.4.4**, Node.js **24**, and Git. The current engineering baseline uses Pi SDK **1.4.0** and data schema **22**. Dependency versions are pinned in [package.json](../../package.json) and [bun.lock](../../bun.lock); preserve the required [dependency patches](development.md#dependency-patches). A model endpoint and its credentials are needed for model operations, not for reading the UI or running engineering fixtures.
 
 From the repository root:
 

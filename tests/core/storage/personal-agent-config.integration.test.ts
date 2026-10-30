@@ -103,7 +103,7 @@ test('021 creates the real default configuration table and its queued readers wa
   const root = mkdtempSync(join(tmpdir(), 'flowmate-personal-config-'));
   const database = need(openTestDatabase({ root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
     runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') }));
-  expect(await database.read(scope => scope.db.query('SELECT MAX(version) AS version FROM schema_migrations').get())).toEqual({ version: 21 });
+  expect(await database.read(scope => scope.db.query('SELECT MAX(version) AS version FROM schema_migrations').get())).toEqual({ version: 22 });
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   const writing = database.transaction(async scope => {
     const saved = createPersonalAgentRepository(scope.db).ensureDefault(configuration, at);

@@ -1,5 +1,6 @@
 import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import { readResearchContext, researchMaterialScope } from './context.ts';
+import { readResearchWorkflow } from './workflow.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, ResearchTaskSchema, ResearchPlanSchema, ResearchPlanBodySchema, ResearchSourcePolicySchema,
@@ -31,6 +32,7 @@ export interface ResearchRepository {
   savePlan(input: Identity & { body: ResearchPlanBody }): Result<ResearchPlan>;
   getPlan(input: { researchId: number; planId: number }): Result<ResearchPlan>;
   saveSource(input: Identity & { source: z.infer<typeof ResearchSourceDataSchema> }): Result<SourceSnapshot>;
+  bindStep(input: Identity & { stepId?: string; artifactId: number | null; documentId: number | null }): Result<SourceSnapshot | null>;
   getSource(input: { researchId: number; sourceSnapshotId: number }): Result<SourceSnapshot>;
   listSources(input: ResearchPageRequest & { researchId: number }): Result<{ items: SourceSnapshot[]; nextBeforeId: number | null }>;
   saveClaim(input: Identity & { claim: ResearchClaimBody }): Result<Claim>;
@@ -112,7 +114,8 @@ export function createResearchRepository(db: Database): ResearchRepository {
         status = !report || report.planId !== b.plan?.planId ? 'failed' : report.completeness === 'full' ? 'completed' : 'partial';
       }
     }
-    return ResearchTaskSchema.parse({ researchId: row.id, sessionId: row.session_id, title: row.title, sourcePolicy: JSON.parse(row.source_policy_json),
+    const workflow = row.current_plan_id === null ? null : readResearchWorkflow(db, row.id, row.current_plan_id);
+    return ResearchTaskSchema.parse({ ...(workflow ? { workflow } : {}), researchId: row.id, sessionId: row.session_id, title: row.title, sourcePolicy: JSON.parse(row.source_policy_json),
       status, currentPlanId: row.current_plan_id, planConfirmed: confirmed(row), currentRunId: row.current_run_id, currentReportId: row.current_report_id,
       createdAt: row.created_at, updatedAt: row.updated_at });
   }
@@ -254,6 +257,28 @@ export function createResearchRepository(db: Database): ResearchRepository {
       return record('plan', input.researchId, id);
     }),
     getPlan: input => operation(false, () => record('plan', input.researchId, input.planId)),
+    bindStep: input => operation(true, () => {
+      const value = execution(input, 'read_research_local', false);
+      if (value.phase === 'planning') { requireFact(input.stepId === undefined, 'research_phase_invalid'); return null; }
+      const plan = currentPlan(value);
+      if (!plan.body.steps) { requireFact(input.stepId === undefined, 'research_step_unknown'); return null; }
+      const step = plan.body.steps.find(step => step.id === input.stepId);
+      requireFact(step && isDeepStrictEqual(step.input, { artifactId: input.artifactId, documentId: input.documentId }), 'research_step_invalid');
+      const existing = db.query('SELECT step_id,plan_id FROM research_step_executions WHERE tool_call_id=?').get(input.toolCallId) as
+        { step_id: string; plan_id: number } | null;
+      if (existing) { requireFact(existing.step_id === step.id && existing.plan_id === plan.planId); return null; }
+      const previous = readResearchWorkflow(db, input.researchId, plan.planId)!.steps.find(item => item.id === step.id)!;
+      if (previous.status === 'succeeded') return record('source', input.researchId, previous.sourceSnapshotId!);
+      requireFact(previous.status !== 'running', 'research_step_running');
+      if (previous.toolCallId !== null) {
+        const original = db.query('SELECT stopped_at FROM tool_calls WHERE id=?').get(previous.toolCallId) as { stopped_at: string | null };
+        const owner = db.query('SELECT stopped_at FROM runs WHERE id=?').get(previous.runId) as { stopped_at: string | null };
+        requireFact(original.stopped_at !== null || owner.stopped_at !== null, 'research_step_stop_unconfirmed');
+      }
+      db.query('INSERT INTO research_step_executions(research_id,plan_id,revision,step_id,run_id,tool_call_id,created_at) VALUES (?,?,?,?,?,?,?)')
+        .run(input.researchId, plan.planId, plan.revision, step.id, input.runId, input.toolCallId, input.at);
+      return null;
+    }),
     saveSource: input => operation(true, () => {
       const source = parseInput(ResearchSourceDataSchema, input.source), found = duplicate('source', input, source); if (found) return found;
       const value = execution(input, 'read_research_local', false);
@@ -268,6 +293,8 @@ export function createResearchRepository(db: Database): ResearchRepository {
     saveClaim: input => operation(true, () => {
       const claim = parseInput(ResearchClaimBodySchema, input.claim), found = duplicate('claim', input, claim); if (found) return found;
       const value = execution(input, 'save_research_claim', true), plan = currentPlan(value);
+      const workflow = readResearchWorkflow(db, input.researchId, plan.planId);
+      requireFact(!workflow?.steps.some(step => ['pending', 'running', 'interrupted'].includes(step.status)), 'research_acquisition_incomplete');
       requireFact(questionIds(plan).includes(claim.questionId));
       const dependencies = claim.dependencies.map(id => record('claim', input.researchId, id));
       requireFact(dependencies.every(dependency => dependency.planId === plan.planId));
@@ -290,6 +317,9 @@ export function createResearchRepository(db: Database): ResearchRepository {
     saveReport: input => operation(true, () => {
       const report = parseInput(ResearchReportBodySchema, input.report), found = duplicate('report', input, report); if (found) return found;
       const value = execution(input, 'save_research_report', true), plan = currentPlan(value), questions = questionIds(plan);
+      const workflow = readResearchWorkflow(db, input.researchId, plan.planId);
+      requireFact(!workflow?.steps.some(step => step.status === 'running'), 'research_acquisition_running');
+      requireFact(report.completeness !== 'full' || !workflow?.steps.some(step => step.status !== 'succeeded'), 'research_acquisition_incomplete');
       requireFact(report.coverage.length === questions.length && report.coverage.every(c => questions.includes(c.questionId)), 'research_coverage_invalid',
         'coverage must contain exactly one record for every confirmed plan questionId, with no missing or unknown questions.');
       const ids = new Set([...report.sections.flatMap(s => s.claimIds), ...report.coverage.flatMap(c => c.claimIds)]);

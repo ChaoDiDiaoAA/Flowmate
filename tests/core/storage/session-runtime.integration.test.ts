@@ -10,7 +10,7 @@ import { AgentSessionSnapshotSchema, SessionSnapshotSchema, SessionInputContentV
 import { openTestDatabase } from '../../support/database.ts';
 import { makeSelectedCandidate, makeCurrentSelectedCandidate } from '../../support/selected-candidate.ts';
 import { backupStore, inspectStore } from '../../../packages/core/src/storage/maintenance.ts';
-import { PACKAGED_MIGRATIONS, PACKAGED_REQUIRED_FILES, PackagedReleaseSchema } from '@flowmate/shared';
+import { PACKAGED_REQUIRED_FILES, PackagedReleaseSchema } from '@flowmate/shared';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels, InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
 import { createRegistry, Harness } from '@earendil-works/pi-durable';
@@ -50,7 +50,7 @@ test('021 upgrades actual schema20 Sessions as legacy and preserves their rows, 
   const before = old.query('SELECT * FROM sessions').all(); old.close();
   const current = need(openTestDatabase(input));
   try {
-    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
+    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
     expect(current.db.query('SELECT id,native_session_id,title,status,created_at,updated_at,metadata_json,hidden_at FROM sessions').all()).toEqual(before);
     expect(current.sessions.get(1)).toMatchObject({ ok: true, data: { runtimeKind: 'agent_session', nativeSessionId: 'original-pi-session', durableConversationId: null } });
     expect(current.db.query('SELECT active_session_id FROM workspace WHERE id=1').get()).toEqual({ active_session_id: 1 });
@@ -207,22 +207,24 @@ test('the actual active-root constraint separates engines while rejecting same-e
   } finally { await current.close(); }
 });
 
-test('schema21 remains inspectable and backed up without interpreting an unbound Durable Session as Pi history', async () => {
+test('schema22 remains inspectable and backed up without interpreting an unbound Durable Session as Pi history', async () => {
   const input = paths(), current = need(openTestDatabase(input));
   const session = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: 'Accepted before native binding', at }));
   await current.close();
-  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 21 } });
+  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 22 } });
   mkdirSync(join(input.root, 'backups'));
   const backup = need(await backupStore(input, join(input.root, 'backups/saved-backup')));
-  expect(backup.manifest.schemaVersion).toBe(21);
+  expect(backup.manifest.schemaVersion).toBe(22);
   expect(backup.manifest.gaps).not.toContain(`session_execution_requires_recheck:${session.sessionId}`);
 });
 
-test('the current packaged release includes migration021 and declares product schema21', () => {
-  expect(PACKAGED_MIGRATIONS).toContain('021_personal_agent.sql');
-  expect(PackagedReleaseSchema.safeParse({ version: 1, releaseId: 'a0000000-0000-4000-8000-000000000021', productVersion: '0.1.0',
+test('a schema22 release requires its research step migration asset', () => {
+  const release = { version: 1, releaseId: 'a0000000-0000-4000-8000-000000000021', productVersion: '0.1.0',
     platform: 'win32', arch: 'x64', bunVersion: '1.4.4', electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0',
-    schemaVersion: 21, settingsVersion: 7, files: [...PACKAGED_REQUIRED_FILES] }).success).toBe(true);
+    schemaVersion: 22, settingsVersion: 7, files: [...PACKAGED_REQUIRED_FILES] };
+  expect(PackagedReleaseSchema.safeParse(release).success).toBe(true);
+  expect(PackagedReleaseSchema.safeParse({ ...release,
+    files: release.files.filter(file => file !== 'apps/migrations/022_research_steps.sql') }).success).toBe(false);
 });
 
 test('maintenance preserves an actual zero-model Durable Conversation binding and rejects a future native schema', async () => {
@@ -236,7 +238,7 @@ test('maintenance preserves an actual zero-model Durable Conversation binding an
     need(await current.transaction(scope => scope.sessions.bindDurableConversation(session.sessionId, conversation.id, at)));
     expect(await current.read(scope => scope.db.query('SELECT count(*) AS count FROM fm_durable_tasks').get())).toEqual({ count: 0 });
   } finally { await harness.close(BACKGROUND_CONTEXT); await current.close(); }
-  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 21 } });
+  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 22 } });
   mkdirSync(join(input.root, 'backups'));
   expect(await backupStore(input, join(input.root, 'backups/bound-backup'))).toMatchObject({ ok: true });
   const changed = need(openTestDatabase(input));

@@ -4,7 +4,7 @@
 
 ## 准备开发环境
 
-使用 Windows x64、Bun **1.4.4**、Node.js **24** 与 Git。当前工程基线为 Pi SDK **1.4.0**、数据 schema **21**。依赖版本由 [package.json](../../package.json) 和 [bun.lock](../../bun.lock) 固定，保留[必要补丁](development.zh-CN.md#dependency-patches)。模型操作需要服务地址与凭据，浏览界面和运行工程夹具不需要真实模型。
+使用 Windows x64、Bun **1.4.4**、Node.js **24** 与 Git。当前工程基线为 Pi SDK **1.4.0**、数据 schema **22**。依赖版本由 [package.json](../../package.json) 和 [bun.lock](../../bun.lock) 固定，保留[必要补丁](development.zh-CN.md#dependency-patches)。模型操作需要服务地址与凭据，浏览界面和运行工程夹具不需要真实模型。
 
 在仓库根目录执行：
 

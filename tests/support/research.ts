@@ -18,7 +18,7 @@ type Request = { tools?: Array<{ function: { name: string } }>; messages: Array<
 type ToolReply = { tool: string; args: unknown; id: string; note?: string };
 type Reply = { text: string } | ToolReply | { tools: ToolReply[] };
 export async function researchFixture(respond: (request: Request, index: number) => Reply | Promise<Reply>,
-  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults' | 'toolDefinitions'> & { material?: string; parsedDocument?: string } = {}) {
+  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults' | 'toolDefinitions' | 'researchPreferences'> & { material?: string; parsedDocument?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-research-fixture-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), artifactsDir: join(root, 'artifacts'),
     runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') };
@@ -54,10 +54,14 @@ export async function researchFixture(respond: (request: Request, index: number)
     return new Response(text + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   } });
   deferCleanup(() => server.stop(true));
-  const app = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, logger: { write: () => undefined, close: async () => undefined },
+  const open = async () => {
+  const opened = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, researchPreferences: options.researchPreferences, logger: { write: () => undefined, close: async () => undefined },
     agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }) }));
-  deferCleanup(() => app.close());
+  deferCleanup(() => opened.close());
+  return opened;
+  };
+  let app = await open();
   const session = researchNeed(await app.createSession({ title: 'Research fixture' }));
   const material = options.material ? researchNeed(await app.importResearchMaterial({ title: 'Deployment evidence.md', format: 'markdown', text: options.material })) : null;
   const task = researchNeed(await app.createResearchTask({ sessionId: session.sessionId, title: 'Deployment comparison',
@@ -76,5 +80,6 @@ export async function researchFixture(respond: (request: Request, index: number)
     return { accepted, completion };
   }
   async function run(input: SessionInputRequest) { const started = await start(input); return { accepted: researchNeed(started.accepted), terminal: await started.completion }; }
-  return { app, task, session, config, paths, requests, request, start, run };
+  return { get app() { return app; }, task, session, config, paths, requests, request, start, run,
+    async reopen() { researchNeed(await app.close()); app = await open(); } };
 }

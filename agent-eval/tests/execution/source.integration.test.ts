@@ -12,7 +12,7 @@ test('installed source compares actual released bodies without Git and rejects m
     const directory = mkdtempSync(join(tmpdir(), 'flowmate-installed-source-')), root = join(directory, 'flowmate-runtime');
     const release: PackagedRelease = { version: 1, releaseId: crypto.randomUUID(), productVersion: '0.1.0',
         platform: 'win32', arch: 'x64', bunVersion: '1.4.0', electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0',
-        schemaVersion: 21, settingsVersion: 7, files: [...PACKAGED_REQUIRED_FILES, 'resources/prompts/test.md'] };
+        schemaVersion: 22, settingsVersion: 7, files: [...PACKAGED_REQUIRED_FILES, 'resources/prompts/test.md'] };
     for (const file of release.files) { mkdirSync(join(root, file, '..'), { recursive: true }); writeFileSync(join(root, file), 'one'); }
     writeFileSync(join(root, 'sdk/package.json'), JSON.stringify({ version: release.sdkVersion }));
     writeFileSync(join(root, 'release.json'), JSON.stringify(release));

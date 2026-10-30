@@ -43,6 +43,7 @@ export type ProductSettings = {
   resources?: import('./resources.ts').ResourceSelection;
   extensions?: import('./extensions.ts').ExtensionSelection;
   evaluation?: import('./evaluation.ts').EvaluationSettings;
+  researchPreferences?: string;
   updatedAt: string;
 };
 
@@ -129,6 +130,7 @@ export function serializeDesktopPromptRequest(input: Extract<DesktopSessionInput
   };
   return JSON.stringify({ sessionId: input.sessionId, clientSequence: input.clientSequence, mode: input.mode,
     text: input.text, modelId: input.modelId, goalMode: input.goalMode ?? 'answer',
+    ...(input.focus === undefined ? {} : { focus: input.focus }),
     ...(input.research === undefined ? {} : { research: input.research }),
     ...(input.requiredSkill === undefined ? {} : { requiredSkill: { kind: input.requiredSkill.kind, id: input.requiredSkill.id,
       version: input.requiredSkill.version } }),

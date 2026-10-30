@@ -9,7 +9,7 @@ export const PACKAGED_MIGRATIONS = ['001_provider.sql', '002_agent_sessions.sql'
   '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql',
   '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql',
   '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql',
-  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql'] as const;
+  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql'] as const;
 
 export const PACKAGED_NATIVE_TOOLS = { rg: { name: 'ripgrep', version: '15.2.0' }, fd: { name: 'fd', version: '10.4.2' } } as const;
 export const PACKAGED_BUN_VERSION = '1.4.4' as const;
@@ -35,7 +35,7 @@ export const PackagedReleaseSchema = z.object({
   version: z.literal(1), releaseId: z.string().uuid(), productVersion: z.string().regex(/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/),
   platform: z.literal('win32'), arch: z.literal('x64'),
   bunVersion: z.enum(['1.4.0', PACKAGED_BUN_VERSION]), electronVersion: z.literal('44.4.5'), sdkVersion: z.literal('1.4.0'),
-  pluginVersion: z.literal('0.19.0'), schemaVersion: z.literal(21), settingsVersion: z.literal(7),
+  pluginVersion: z.literal('0.19.0'), schemaVersion: z.literal(22), settingsVersion: z.literal(7),
   service: z.object({ wrapperVersion: z.literal('2.12.0'), framework: z.literal('net461') }).strict().optional(),
   files: z.array(z.string().refine(isRuntimeMember)).min(PACKAGED_REQUIRED_FILES.length).max(20_000),
 }).strict().superRefine((release, ctx) => {
