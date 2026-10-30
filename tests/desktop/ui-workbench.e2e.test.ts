@@ -29,6 +29,7 @@ test('opens a main conversation without execution and keeps one composer across 
   try {
     await page.setViewportSize({ width: 1500, height: 950 });
     await expect(page.getByRole('main', { name: 'Assistant', exact: true })).toBeVisible();
+    await expect(page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button').first()).toHaveAccessibleName('Personal Agent');
     await expect(page.locator('.workspace')).toBeHidden();
     await expect(page.locator('.agent-chat-panel')).toHaveCount(1);
     await expect(page.getByRole('separator', { name: 'Resize Assistant', exact: true })).toHaveCount(0);

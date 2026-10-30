@@ -2842,12 +2842,12 @@ export function App() {
         <nav aria-label="Workspace navigation">
           <span className="rail-caption">WORK</span>
           {([
+            ['personal', 'Personal Agent'],
             ['workspace', 'Invoices'],
             ['workspace-detail', 'Workspace'],
             ['tasks', 'Processing History'],
             ['chats', 'Chats'],
             ['research', 'Deep Research'],
-            ['personal', 'Personal Agent'],
             ['activity', 'Activity'],
           ] as const).map(([target, label]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}

@@ -4,6 +4,7 @@ import { isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPerson
 import { ResourceRefSchema } from '@flowmate/contracts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { mkdir, lstat, open, readFile, rename, rm } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -219,6 +220,7 @@ let allowWindowClose = false;
 let allowQuit = false;
 let desktopClosing = false;
 let closeInFlight: Promise<void> | null = null;
+let interactiveCloseRequested = false;
 let devShutdownRequestId: string | null = null;
 let hostError = false;
 let hostErrorCode = 'host_not_ready';
@@ -691,10 +693,33 @@ async function exportDiagnostics(event: Electron.IpcMainInvokeEvent): Promise<Re
   return saved.ok ? ok({ outcome: 'saved' }) : fail(appError('diagnostics_export_failed', 'storage', 'Diagnostics could not be saved. Choose a new writable filename.', true));
 }
 
-function closeHostAndQuit(): Promise<void> {
+function closeHostAndQuit(interactive = false): Promise<void> {
+  interactiveCloseRequested ||= interactive;
   if (closeInFlight) return closeInFlight;
-  closeInFlight = closeDesktop().finally(() => { closeInFlight = null; });
+  closeInFlight = closeDesktop().catch(async () => {
+    hostError = true; hostErrorCode = 'desktop_close_failed'; await broadcastState();
+  }).then(async () => {
+    if (interactiveCloseRequested && !allowQuit && !serviceActivation.busy) await confirmDesktopExit();
+  }).finally(() => { closeInFlight = null; interactiveCloseRequested = false; });
   return closeInFlight;
+}
+
+async function confirmDesktopExit(): Promise<void> {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const choice = await dialog.showMessageBox(mainWindow, { type: 'warning', title: 'Unable to finish closing',
+    message: 'Background cleanup could not be confirmed.',
+    detail: 'Exit now stops this Flowmate window and its child processes. Running tasks may be interrupted; check their saved results after restarting.',
+    buttons: ['Keep open', 'Exit now'], defaultId: 0, cancelId: 0 });
+  if (choice.response !== 1) return;
+  for (const pid of [legacyHost.processId, evaluation?.processId]) {
+    if (pid === undefined) continue;
+    const result = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 5_000 });
+    if (result.error || result.status !== 0) {
+      dialog.showErrorBox('Flowmate could not exit', 'A background process could not be stopped. Keep this window open and try closing again.');
+      return;
+    }
+  }
+  app.exit(1);
 }
 
 async function closeDesktop(): Promise<void> {
@@ -708,7 +733,8 @@ async function closeDesktop(): Promise<void> {
   const allStopped = closed.ok && closed.data.stopped && evaluationClosed.ok && evaluationClosed.data.stopped;
   await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_closed', requestId: devShutdownRequestId,
     closed: allClosed, stopped: allStopped });
-  if (allClosed && allStopped) {
+  // Preserve stop uncertainty without trapping a window whose processes have exited.
+  if (allClosed) {
     releaseAllRuntimeOwners();
     allowWindowClose = true;
     allowQuit = true;
@@ -749,7 +775,7 @@ function createMainWindow(): void {
   window.on('close', (event) => {
     if (allowWindowClose) return;
     event.preventDefault();
-    void confirmInvoiceFormClose().then(confirmed => { if (confirmed) void closeHostAndQuit(); });
+    void confirmInvoiceFormClose().then(confirmed => { if (confirmed) void closeHostAndQuit(true); });
   });
   window.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => {
     if (isMainFrame) {

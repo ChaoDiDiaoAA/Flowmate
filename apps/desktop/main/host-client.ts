@@ -55,6 +55,7 @@ export class HostClient {
   public get state(): HostState | null { return this.currentState; }
   public get connectionEpoch(): number { return this.epoch; }
   public get hasLiveProcess(): boolean { return this.child !== null && !this.processExited; }
+  public get processId(): number | undefined { return this.hasLiveProcess ? this.child?.pid : undefined; }
   public get diagnosticsStderr(): { tail: string; truncated: boolean } {
     const secrets = protectedSecrets();
     const lines = this.stderrTail.split('\n').filter(line => line && !secrets.some(secret => line.includes(secret)));

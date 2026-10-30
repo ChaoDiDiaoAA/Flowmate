@@ -57,6 +57,7 @@ export class EvaluationClient {
 
   constructor(private readonly repository: string, private readonly evaluationRepository = repository, private readonly launch?: EvaluationWorkerLaunch) {}
   public get state(): EvaluationControlState | null { return this.current ? structuredClone(this.current) : null; }
+  public get processId(): number | undefined { return this.child?.pid; }
   public get canRestartHost(): boolean { return !this.closing && !this.exporting && !this.workflowWriting && !this.crashBlocked && !active(this.current); }
   public subscribe(listener: (event: EvaluationEvent) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private publish(control: EvaluationControlState, replace = false) {
