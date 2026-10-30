@@ -144,7 +144,29 @@ bun --no-env-file run eval:full
 
 Each command performs preflight, real execution, deterministic checks and applicable combined judging, local capture, Langfuse upload/readback, diagnostics, comparison, the matching baseline/Gate and a readable README. Quality failure remains a completed measurement when execution and evidence are complete. Pipeline completion, absolute quality, relative Gate and upload verification are reported separately.
 
-Use Langfuse for Scores, Traces, Sessions and the User's related execution. Use local `README.md` and `run.json` for comparison and baseline/Gate details. These local decisions are not native Langfuse Gate pages. The [Chinese operation guide](../../agent-eval/Langfuse评测与问题定位操作指南.md) documents both navigation directions with actual screenshots when performed.
+Use Langfuse for Scores, Traces, Sessions and the User's related execution. Use local `README.md` and `run.json` for comparison and baseline/Gate details. These local decisions are not native Langfuse Gate pages. The [Chinese operation guide](../../agent-eval/Langfuse评测与问题定位操作指南.md) records the actual Smoke, interrupted Full and continuation results, with real Langfuse screenshots for failure diagnosis and model comparison.
+
+
+## Execution budgets and scoring recovery
+
+Budgets are Run conditions, not Case, Gold or grading changes. Business defaults are 600 seconds per Trial, 180 seconds per Agent Run and 16 model calls; research defaults are 900 seconds, 300 seconds and 24 calls. Preparation and stopped evidence capture each have 60 seconds; stopping grace remains five seconds. `FLOWMATE_EVAL_BUSINESS_*` and `FLOWMATE_EVAL_RESEARCH_*` configure `TRIAL_TIMEOUT_MS`, `RUN_TIMEOUT_MS` and `MAX_MODEL_CALLS`, shared by both experiment arms. An explicit legacy `timeoutMs` still bounds the complete business execution unless `trialTimeoutMs` separates it. Confirmed research Plan budgets retain precedence.
+
+The Judge reserves an explicit 32768 output tokens, bounded by model and transport limits. Preflight checks estimated input, output reserve and safety margin. An oversized batch uses the existing lossless shared-text encoding once; if it still cannot fit, `judge_context_capacity` records no submission. Evidence is not truncated and Metrics are not split into extra requests.
+
+Original execution and stopping facts are saved before judging. Execution completion, grading processed, necessary scores usable, errors/missing evidence and platform verification are separate states. Proven zero opportunities retain null ratios and original counts; errors, unknown capture and one-sided opportunities cannot count as passes. Historical statistical summaries retain validation under their original policy; new records use `statisticsPolicyVersion: 2`. Historical statistics do not establish current Gate comparability.
+
+Only `score retry` submits Judge work, never subject Agent work. `score list/show` are read-only; `score upload` sends already saved scores. Keep the same operation UUID when checking an interrupted operation:
+
+```powershell
+bun --no-env-file run eval -- score retry --run-id <RunId> --failed-only --operation-id <UUID>
+bun --no-env-file run eval -- score list --run-id <RunId>
+bun --no-env-file run eval -- score show --run-id <RunId> --revision-id <RevisionId> --execution-id <ExecutionId>
+bun --no-env-file run eval -- score upload --run-id <RunId> --revision-id <RevisionId>
+```
+
+Use `--trial <TrialId>` to limit recovery. Append-only revisions live in the same `run.json.scoringRevisions`; original execution, Scores and Judge records remain unchanged. Original is the default source. Comparison, baseline and Gate operations require an explicit `--scoring-revision <RevisionId>` and still block incompatible conditions.
+
+Revision upload adds namespaced Scores to already verified original Traces, without resending observations. Unknown writes are queried by their saved identity rather than blindly resubmitted. Recovery never starts automatic Agent reruns, calibration or Case publication.
 
 ## Limits
 

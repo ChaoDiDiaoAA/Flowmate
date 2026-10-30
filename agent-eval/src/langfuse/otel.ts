@@ -19,6 +19,7 @@ export function buildObservationTree(report: LocalReport): ObservationNode[] {
   if (report.history || !report.endedAt || report.scoring !== 'complete') throw Error('Only complete original reports may be exported');
   const nodes: ObservationNode[] = [];
   for (const trial of report.trials) {
+    if (trial.status === 'NOT_RUN' && trial.execution === null && !trial.scores.length && !trial.judgeCalls.length) continue;
     const execution = trial.execution, rootId = trial.traceId + ':root';
     const actualEnds = [execution?.endedAt, ...(execution?.observations ?? []).map(observation => observation.endedAt),
       ...trial.judgeCalls.map(call => call.endedAt)].filter((end): end is string => typeof end === 'string');
@@ -50,6 +51,7 @@ export function buildObservationTree(report: LocalReport): ObservationNode[] {
         originalUsage: call.usageSource === 'unknown' ? undefined : call.usage,
         inputOmittedReason: 'independent-quality-reference', inputOmittedSource: 'local-judge-request' } });
   }
+  if (!nodes.length) throw Error('No original Trial observations to export');
   return validateObservationTree(nodes);
 }
 

@@ -7,6 +7,7 @@ import { experimentPlanSchema,baselineReferenceSchema,gateThresholdsSchema,type 
   type GateResult, type ExperimentComparison } from '../../../packages/contracts/src/evaluation-experiments.ts';
 import { findDataset } from '../execution/plan.ts';
 import { runBatch } from '../execution/runner.ts';
+import { resolveEvaluationBudgets } from '../execution/budgets.ts';
 import { agentConfig, evaluationEnv, localAgentCredential, prepareAgentConfig, prepareAgentConnection, sameAgentConnection,
   type EvaluationAgentCredential } from '../configuration.ts';
 import { productAgent } from '../adapters/agent.ts';
@@ -17,6 +18,7 @@ import { readReport, reportPath, safeId } from '../reports/store.ts';
 import { compareExecutionSets, evidenceValidity, assessGate,baselineReference,defaultGateThresholds, type ExecutionEvidence } from './compare.ts';
 import { createArchive, archiveReference, findArchive, listArchives, readArchive, readArchivePart, readSnapshot, writeArchivePart, finishArchive } from '../reports/archive.ts';
 import { writeRunReadme } from '../reports/readme.ts';
+import { readScoringRevision, readScoringRevisionReport } from '../execution/score-retry.ts';
 export { experimentPlanSchema };
 export type { ExperimentPlan, ExperimentRecord, BaselineRecord, GateResult, ExperimentComparison };
 
@@ -50,18 +52,20 @@ function list<T>(repo:string,kind:'records'|'baselines'):T[] {
 }
 export function listExperiments(repo:string):ExperimentRecord[] { return list(repo,'records'); }
 export function listBaselines(repo:string):BaselineRecord[] { return list(repo,'baselines'); }
-function loadEvidence(repo:string,ids:string[]):ExecutionEvidence[] {
+function loadEvidence(repo:string,ids:string[],scoringRevision?:string,runId?:string):ExecutionEvidence[] {
   return ids.map(id=>{
     const path=reportPath(repo,id);
-    return {report:readReport(path),snapshot:readSnapshot(path),evidenceRef:relative(repo,path).replaceAll('\\','/')};
+    const revision = scoringRevision && runId ? readScoringRevision(repo,runId,scoringRevision) : undefined;
+    const report = revision?.executions[id] ? readScoringRevisionReport(repo,runId!,scoringRevision!,id) : readReport(path);
+    return {report,snapshot:readSnapshot(path),evidenceRef:relative(repo,path).replaceAll('\\','/') + (revision ? '&scoringRevision='+revision.id : '')};
   });
 }
-function armEvidence(repo:string,record:ExperimentRecord,armId:string) {
+function armEvidence(repo:string,record:ExperimentRecord,armId:string,scoringRevision?:string) {
   const arm=record.arms.find(arm=>arm.id===armId);
   if(record.status!=='complete'||!arm||arm.status!=='complete')throw Error('Experiment arm is incomplete, stopped or blocked');
   const declaration=[record.plan.control,...record.plan.candidates].find(arm=>arm.id===armId);
   if(!declaration)throw Error('Missing experiment arm declaration');
-  const evidence=loadEvidence(repo,arm.executionIds),expected=config(record.plan,declaration);
+  const evidence=loadEvidence(repo,arm.executionIds,scoringRevision,record.id),expected=config(record.plan,declaration);
   for(const item of evidence)for(const [key,value]of Object.entries(expected))
     if(!isDeepStrictEqual(item.snapshot.configuration?.[key],value))throw Error('Observed Agent configuration differs from declared arm: '+key);
   return evidence;
@@ -104,7 +108,7 @@ async function prepareRuntime(repo:string,ref:string,output:string,ownedBase:str
   } catch(error) {cleanup();throw error;}
 }
 function config(plan:ExperimentPlan,arm:ExperimentArm) {
-  return {environment:plan.environment,...arm.model,...(arm.systemPrompt===undefined?{}:{systemPrompt:arm.systemPrompt}),
+  return {environment:plan.environment,evaluationBudgets:plan.evaluationBudgets,...arm.model,...(arm.systemPrompt===undefined?{}:{systemPrompt:arm.systemPrompt}),
     ...(arm.strategy===undefined?{}:{strategy:arm.strategy}),...(arm.resources===undefined?{}:{resources:arm.resources})};
 }
 export async function runExperiment(repo:string,input:unknown,deps:ExperimentDependencies={}):Promise<ExperimentRecord> {
@@ -119,10 +123,12 @@ export async function runExperiment(repo:string,input:unknown,deps:ExperimentDep
   const save=()=>writeArchivePart(target,record); save();
   try {
     const env=evaluationEnv(repo,deps.env??process.env);
+    plan.evaluationBudgets ??= resolveEvaluationBudgets(env);
+    save();
     const datasets=await benchmark(repo,plan,deps);
     if(!datasets.length)throw Error('Benchmark contains no runnable dataset groups');
     const perArm=datasets.reduce((sum,data)=>sum+selectCases(data,plan.benchmark.selection).length*plan.repeats,0),armCount=1+plan.candidates.length;
-    deps.onProgress?.({type:'plan',selection:plan.benchmark.selection,caseCount:perArm/plan.repeats,trialsPerCase:plan.repeats,total:perArm*armCount,
+    deps.onProgress?.({type:'plan',selection:plan.benchmark.selection,evaluationBudgets:plan.evaluationBudgets,caseCount:perArm/plan.repeats,trialsPerCase:plan.repeats,total:perArm*armCount,
       datasets:datasets.map(data=>({id:data.manifest.id,caseCount:selectCases(data,plan.benchmark.selection).length,total:selectCases(data,plan.benchmark.selection).length*plan.repeats*armCount}))});
     const frozenDatasets=structuredClone(datasets);
     const harnessBefore=codeIdentity(repo);
@@ -179,21 +185,21 @@ export async function runExperiment(repo:string,input:unknown,deps:ExperimentDep
   save();finishArchive(archive.file, record.status === 'complete' ? 'complete' : record.status === 'stopped' ? 'stopped' : 'blocked');writeRunReadme(archive.file);return record;
   } finally {release();}
 }
-export function compareExperiment(repo:string,id:string):ExperimentComparison[] {
+export function compareExperiment(repo:string,id:string,scoringRevision?:string):ExperimentComparison[] {
   const record=read<ExperimentRecord>(repo,'records',id);
   return record.plan.candidates.map(candidate=>{
     let comparison:ExperimentComparison;
-    try {comparison=compareExecutionSets(armEvidence(repo,record,record.plan.control.id),armEvidence(repo,record,candidate.id),record.plan.axes);}
+    try {comparison=compareExecutionSets(armEvidence(repo,record,record.plan.control.id,scoringRevision),armEvidence(repo,record,candidate.id,scoringRevision),record.plan.axes);}
     catch(error){comparison=blockedComparison(record,String(error));}
-    writeArchivePart(file(repo,'comparisons',candidate.id,id),comparison);return comparison;
+    writeArchivePart(file(repo,'comparisons',candidate.id+(scoringRevision?'-'+scoringRevision:''),id),comparison);return comparison;
   });
 }
 function blockedComparison(record:ExperimentRecord,reason:string):ExperimentComparison {
   return {status:'blocked',reasons:[{code:'experiment-unavailable',message:reason,evidenceRefs:[`agent-eval/experiments/${record.id}/experiment.json`]}],
     metrics:[],assertions:[],scope:{selection:record.plan.benchmark.selection,datasets:[],cases:0,trials:0},attribution:record.attribution,evidenceKind:'unknown'};
 }
-export function createBaseline(repo:string,input:{experimentId:string;armId:string;baselineId?:string}):BaselineRecord {
-  const record=read<ExperimentRecord>(repo,'records',input.experimentId),evidence=armEvidence(repo,record,input.armId);
+export function createBaseline(repo:string,input:{experimentId:string;armId:string;baselineId?:string;scoringRevision?:string}):BaselineRecord {
+  const record=read<ExperimentRecord>(repo,'records',input.experimentId),evidence=armEvidence(repo,record,input.armId,input.scoringRevision);
   const comparison=compareExecutionSets(evidence,evidence,[]),invalid=evidenceValidity(evidence);
   if(comparison.status==='blocked'||invalid.length)throw Error('Baseline requires complete measured original evidence: '+[...comparison.reasons,...invalid].map(r=>r.message).join('; '));
   const id=safeId(input.baselineId??'baseline-'+randomUUID()),target=file(repo,'baselines',id),release=acquireEvaluationWrite(target);
@@ -201,25 +207,25 @@ export function createBaseline(repo:string,input:{experimentId:string;armId:stri
   const previous=listBaselines(repo);
   if(previous.some(value=>value.id===id))throw Error('Baseline identity already exists; existing baselines are never automatically replaced');
   const baseline:BaselineRecord={contract:'flowmate-baseline/v1',id,createdAt:new Date().toISOString(),experimentId:record.id,armId:input.armId,
-    executionIds:[...record.arms.find(arm=>arm.id===input.armId)!.executionIds],plan:record.plan,
+    executionIds:[...record.arms.find(arm=>arm.id===input.armId)!.executionIds],...(input.scoringRevision?{scoringRevision:input.scoringRevision}:{}),plan:record.plan,
     conditions:evidence.map(e=>({dataset:e.report.dataset,scoringConfiguration:e.report.scoringConfiguration,snapshot:e.snapshot})),evidenceKind:comparison.evidenceKind,
     reference:baselineReference(evidence,comparison),thresholds:defaultGateThresholds(comparison)};
   atomicJson(target,{contract:'flowmate-baselines/v1',records:[...previous,baseline]});return baseline;
   } finally {release();}
 }
-export function checkGate(repo:string,input:{baselineId:string;experimentId:string;armId:string;fullRelease?:boolean}):GateResult {
+export function checkGate(repo:string,input:{baselineId:string;experimentId:string;armId:string;fullRelease?:boolean;scoringRevision?:string}):GateResult {
   const record=read<ExperimentRecord>(repo,'records',input.experimentId);let comparison:ExperimentComparison,thresholds:GateThresholds|undefined;
   try {
     const baseline=read<BaselineRecord>(repo,'baselines',input.baselineId);
     if(!baseline.reference||!baseline.thresholds)throw Error('Baseline reference metrics and thresholds are unavailable; old records remain read-only');
     const reference=baselineReferenceSchema.parse(baseline.reference);thresholds=gateThresholdsSchema.parse(baseline.thresholds);
-    const left=loadEvidence(repo,baseline.executionIds);
+    const left=loadEvidence(repo,baseline.executionIds,baseline.scoringRevision,baseline.experimentId);
     if(!isDeepStrictEqual(baseline.plan.benchmark,record.plan.benchmark)||baseline.plan.repeats!==record.plan.repeats||baseline.plan.environment!==record.plan.environment)
       throw Error('Baseline benchmark revision, selection, repeats or environment differs');
     const conditions=left.map(e=>({dataset:e.report.dataset,scoringConfiguration:e.report.scoringConfiguration,snapshot:e.snapshot}));
     if(!isDeepStrictEqual(conditions,baseline.conditions))throw Error('Baseline original conditions changed since explicit creation');
     if(!isDeepStrictEqual(baselineReference(left),reference))throw Error('Baseline reference measurements changed since explicit creation');
-    comparison=compareExecutionSets(left,armEvidence(repo,record,input.armId),record.plan.axes);
+    comparison=compareExecutionSets(left,armEvidence(repo,record,input.armId,input.scoringRevision),record.plan.axes);
   } catch(error){comparison=blockedComparison(record,String(error));}
   const gate:GateResult={...input,...assessGate(comparison,input.fullRelease,thresholds),id:'gate-'+randomUUID()};
   writeArchivePart(file(repo,'gates',gate.id!,record.id),gate);return gate;

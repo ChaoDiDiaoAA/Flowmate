@@ -125,14 +125,23 @@ for(const situation of ['allowed','wrong-document','missing-budget','unknown-rej
     if(situation==='missing-budget')(context.result.evidence.runs!.actual as Array<{config:Record<string,unknown>}>)[0]!.config={};
     expect(evaluateFormalMetrics(context).find(s=>s.metricId==='runtime-admission')!.status).toBe(situation==='allowed'?'PASS':situation==='wrong-document'?'FAIL':'UNJUDGEABLE');
 });
-test('a confirmed absence of completion declarations keeps the rate unknown without failing a separately verified task',()=>{
+test('only original completed Judge proof can exclude zero completion opportunities from task success',()=>{
     const context:EvaluationContext=fixture('task-success','false-completion');
     context.semanticPlan={contract:'flowmate-semantic-plan/v1',criteria:[{metricId:'false-completion',version:1,unit:'完成声明',denominator:null,required:true,rule:'Inspect actual declarations.',evidence:['answer'],trigger:'started'}]};
     context.gradedScores=[{metricId:'reference-fields',name:'Independent result',version:1,method:'deterministic',required:true,value:1,status:'PASS',reason:'Independent Gold verified',evidence:['candidate-fields']},
         {metricId:'false-completion',name:'Original declarations',version:1,method:'llm-judge',required:true,value:null,status:'UNJUDGEABLE',reason:'Original query confirmed no declaration',evidence:['answer'],statistics:{unit:'完成声明',numerator:0,denominator:0,missing:0}}];
+    expect(evaluateFormalMetrics(context).find(s=>s.metricId==='task-success')!.status).toBe('UNJUDGEABLE');
+    context.gradedScores[1]!.judge={callId:'10000000-0000-4000-8000-000000000001',criterion:0};
+    context.scoringContext={execution:context.result,semanticPlan:context.semanticPlan,
+        metricPlan:[{metricId:'false-completion',version:1,unit:'完成声明',denominator:null}],judgeCalls:[{
+            callId:'10000000-0000-4000-8000-000000000001',configuration:{provider:'codex-cli',transport:'codex-cli',model:'synthetic',reasoningEffort:'max',
+                timeoutMs:180000,protocolVersion:'flowmate-judge/v2'},startedAt:'2026-10-30T00:00:00Z',endedAt:'2026-10-30T00:00:01Z',
+            attempts:1,usage:{},responseModel:'synthetic',raw:'original response',error:null,judgment:null,request:{system:'Declared rubric',data:'{}',redacted:false},
+            stopReason:'stop',rawStopReason:null,usageSource:'codex-cli',responseComplete:true,
+            compact:{plan:structuredClone(context.semanticPlan),judgment:{v:1,r:[[0,0,0]],f:[]},validationErrors:{}}}]};
     const scores=[...context.gradedScores,...evaluateFormalMetrics(context)];
     expect(scores.find(s=>s.metricId==='task-success')!.status).toBe('PASS');
-    expect(aggregate(scores,context.result).status).toBe('PASS');
+    expect(aggregate(scores,context.result,context.scoringContext).status).toBe('PASS');
     expect(scores.find(s=>s.metricId==='false-completion')!.status).toBe('UNJUDGEABLE');
 });
 test('admission accepts a correctly refused request after the actual product budget is exhausted',()=>{

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { agentModelCapabilitiesSchema } from '../configuration.ts';
+import { ResolvedEvaluationBudgetSchema } from '../../../packages/contracts/src/evaluation-budget.ts';
 import { EvaluationAgentOverridesSchema } from '../../../packages/contracts/src/runtime-evaluation.ts';
 import { registerSecrets } from '../execution/evidence-safety.ts';
 import { executionUsage } from '../reports/usage.ts';
@@ -378,6 +379,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     const observedRuns = new Map<number, z.infer<typeof runSchema>>();
     let businessEnded=false,businessSignal:AbortSignal|undefined;
     const stopGaps: unknown[] = [], captureGaps: string[] = [];
+    const budgetOrigins = new Map<number, { kind: string; stepId: string; planId?: number }>();
     let controllerFailure: CaseExecutionResult['error'];
     function rememberStop(run: z.infer<typeof runSchema>) {
         if (!['created', 'running'].includes(run.status) && (run.stoppedAt === null || run.cleanup.stopped !== true || run.cleanup.lateObservationRequired !== false))
@@ -672,6 +674,14 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             execution.status = 'error'; execution.endpointReached = false;
             execution.error = { code: 'stop_unconfirmed', message: 'Original root or descendant stopping could not be confirmed.', infrastructure: true };
         }
+        if(config.evaluationBudget) execution.evidence['evaluation-budget'] = { present: true,
+            actual: { configuredDefault: config.evaluationBudget, rootRuns: runs.map(run => {
+                const saved = z.object({ limits: z.unknown().optional(), runtimeBudget: z.unknown().optional() }).passthrough().safeParse(run.config);
+                return { runId: run.runId,
+                source: budgetOrigins.get(run.runId) ?? { kind: 'original-run-config' },
+                limits: saved.success ? saved.data.limits ?? null : null,
+                budget: saved.success ? saved.data.runtimeBudget ?? null : null }; }) },
+            source: 'Original Host Run configuration and controller-recorded confirmed Plan association; no Plan budget is overwritten' };
         return structuredClone(execution);
     }
     async function enrichCapture(runs: Array<z.infer<typeof runSchema>>, rootsComplete: boolean): Promise<void> {
@@ -1086,7 +1096,10 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         async execute(external,onQuiescent) {
             if (executed) throw new Error('Trial execute cannot replay; use snapshot for readback');
             executed = true;
-            const running = AbortSignal.any([signal, external, AbortSignal.timeout(z.number().int().positive().parse(trial.configuration.timeoutMs ?? 120000))]);
+            // The Runner owns the whole-Trial deadline; per-Run/confirmed Plan limits remain in the Host.
+            const running = ResolvedEvaluationBudgetSchema.safeParse(trial.configuration.evaluationBudget).success
+                ? AbortSignal.any([signal, external])
+                : AbortSignal.any([signal, external, AbortSignal.timeout(z.number().int().positive().parse(trial.configuration.timeoutMs ?? 120000))]);
             businessSignal=running;
             const finish=async()=>{businessEnded=true;if(onQuiescent){running.throwIfAborted();const facts=await stopSnapshot();running.throwIfAborted();onQuiescent(facts);}return capture();};
             for (const step of steps) {
@@ -1325,6 +1338,9 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 if (expected !== 'accepted') throw new Error('Research step accepted a request expected to be rejected');
                 if (result.data.sessionId !== command.input.sessionId) throw new Error('Accepted input belongs to another Session');
                 const accepted = { inputId: result.data.inputId, sessionId: result.data.sessionId, runId: result.data.runId };
+                if(!budgetOrigins.has(accepted.runId)) budgetOrigins.set(accepted.runId, {
+                    kind: plan ? 'confirmed-research-plan' : config.evaluationBudget ? 'evaluation-profile' : 'product-default',
+                    stepId: step.id, ...(plan ? { planId: plan.planId } : {}) });
                 if (replay && !isDeepStrictEqual(accepted,replay.accepted)) throw new Error('Replay created a different input or Run');
                 if (!replay) { nextSequences.set(sessionId, command.input.clientSequence + 1); inputRefs.set(step.id, { command, accepted }); }
                 if (!runIds.includes(result.data.runId)) { runIds.push(result.data.runId); runSessions.set(result.data.runId, result.data.sessionId); }

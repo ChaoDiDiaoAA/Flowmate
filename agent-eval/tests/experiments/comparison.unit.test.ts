@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { experimentPlanSchema } from '../../src/experiments/index.ts';
-import { compareExecutionSets, assessGate } from '../../src/experiments/compare.ts';
+import { compareExecutionSets, assessGate, evidenceValidity } from '../../src/experiments/compare.ts';
 import type { LocalReport } from '../../src/reports/store.ts';
 function reportFixture():LocalReport {
   return {contract:'flowmate-agent-run/v1',executionId:'test',dataset:{id:'test',version:1,subject:'agent'},selection:'smoke',
@@ -29,6 +29,13 @@ function entry(values = [1, 1, 1], metricId = 'tool-selection', direction = 'up'
       dependencies: { sdk: '1' }, files: [{ path: 'apps/host/main.ts', text: 'control source' }] }
   } };
 }
+test('an explicitly selected revision cannot make unknown Judge conditions comparable', () => {
+  const before = entry(), after = structuredClone(before);
+  Object.assign(after.report, { scoringRevision: { id: 'Scoring-known-id', conditionsComplete: false } });
+  const compared = compareExecutionSets([before], [after], []);
+  expect(compared.status).toBe('blocked');
+  expect(compared.reasons.some(reason => reason.message.includes('unknown Judge conditions'))).toBe(true);
+});
 test('experiment schema defaults to one repeat and rejects undeclared axes', () => {
   const plan = { benchmark: { id: 'baseline', revision: 1, selection: 'smoke' }, axes: ['model'],
     control: { id: 'control', model: { model: 'a', api: 'openai-responses', baseUrl: 'https://example.invalid' } },
@@ -196,5 +203,22 @@ test('required, critical and formal metrics remain strict even if labeled diagno
     score.required=required;score.category='diagnostic';score.status='UNJUDGEABLE';score.value=null;
     score.statistics={unit:'检查机会',numerator:0,denominator:null,missing:null};
     expect(assessGate(compareExecutionSets([value],[value],[])).status).toBe('blocked');
+  }
+});
+
+test('incomplete scoring reasons identify the original Case, metric and comparison stage', () => {
+  const value=entry([1]),score=value.report.trials[0]!.scores[0]!;
+  score.status='ERROR';score.value=null;
+  const reasons=evidenceValidity([value]);
+  expect(reasons.some(reason=>reason.caseId==='sample'&&reason.metricId==='tool-selection'&&reason.stage==='compare'&&
+    reason.evidenceRefs.some(ref=>ref.includes('#trial-0/scores/tool-selection')))).toBe(true);
+});
+
+test('unfinished Trial checkpoints cannot become comparable from stale complete report summaries', () => {
+  for(const scoringState of ['pending','prepared','submitted','submission-unknown'] as const){
+    const value=entry([1]);Object.assign(value.report.trials[0]!,{scoringState});
+    const comparison=compareExecutionSets([value],[value],[]);
+    expect(comparison.status).toBe('blocked');
+    expect(comparison.reasons.some(reason=>reason.caseId==='sample'&&reason.stage==='compare'&&reason.message.includes('checkpoint'))).toBe(true);
   }
 });

@@ -24,7 +24,7 @@ Use independent material to prove the expected answer, acceptable business value
 |---|---|
 | Case | Identity/version, input, category, difficulty, task purpose and expected behavior |
 | Gold | Independent facts, acceptable values, source witnesses and rubric |
-| Review | Human assessment of Case quality, ambiguity and evidence sufficiency |
+| Review | Author-side checks of Case quality, ambiguity and evidence sufficiency, with explicit authorship; Agent self-review and human approval stay distinct |
 | Scenario | Controlled product state and materials delivered under the task's authorization |
 | Source | Actual Trace and material references that explain the candidate's origin |
 
@@ -100,3 +100,5 @@ Use Metric IDs in each Case's `scoring.judge`, for example `['tool-selection', '
 A Trial merges applicable semantic criteria into zero or one logical Judge submission. Missing evidence is not automatic non-applicability, and a known failure is not erased by incomplete capture. Keep required/optional declarations and original opportunity denominators explicit. New diagnostics use their Metric ID as `evaluatorId`; historical `task-judge`/`tool-use-judge` declarations are read using their explicit `params.metricId`.
 
 Changing an Evaluator's Rubric, evidence contract or validator requires its own version change. Changes to the common protocol require the corresponding scoring/template version change. Keep the Case/Gold version rules distinct. Old results are readable; incompatible versions block comparison/Gates. Single-Metric calibration does not establish combined quality; missing, partial or stale calibration references must remain visible. See the [scoring and calibration guide](EVALUATION.md#evaluators-measure-behavior-before-judging-semantics).
+
+Execution budgets belong to Run/experiment conditions. They do not revise Cases or Gold; keep old budgets with old results. Explicit scoring recovery uses the saved Case and Gold versions, and a scoring revision does not publish a new benchmark.

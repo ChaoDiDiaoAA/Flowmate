@@ -23,6 +23,7 @@ export * from './input-commands.ts';
 export * from './research.ts';
 export * from './runtime-evaluation.ts';
 export * from './evaluation.ts';
+export * from './evaluation-budget.ts';
 export * from './evaluation-loop.ts';
 export * from './evaluation-experiments.ts';
 export * from './trace-observation.ts';

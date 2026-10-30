@@ -45,7 +45,7 @@ function actorsStopped(execution: CaseExecutionResult, trial: AgentTrial): boole
 }
 export type ExecutionPhase = 'preparing' | 'executing' | 'capturing' | 'cleanup';
 export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeoutMs: number, stopGraceMs: number, signal?: AbortSignal,
-    onPhase?: (phase: ExecutionPhase) => void) {
+    onPhase?: (phase: ExecutionPhase) => void, limits?: { prepareTimeoutMs: number; captureTimeoutMs: number }) {
     const phase = (value: ExecutionPhase) => { try { onPhase?.(value); } catch { /* Display observers cannot interrupt the lifecycle. */ } };
     const expectedIdentity=structuredClone(trial.identity),original=structuredClone(trial.input);
     let projected=structuredClone(original);
@@ -79,7 +79,7 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
         phase('preparing');const preparing=kernel.prepare(trial,controller.signal);
         let abortPreparation!:()=>void;
         const cancelledPreparation=new Promise<never>((_,reject)=>{abortPreparation=()=>reject(Error('Cancelled during preparation'));controller.signal.addEventListener('abort',abortPreparation,{once:true});if(controller.signal.aborted)abortPreparation();});
-        try{session=await bounded(Promise.race([preparing,cancelledPreparation]),timeoutMs);}
+        try{session=await bounded(Promise.race([preparing,cancelledPreparation]),limits?.prepareTimeoutMs ?? timeoutMs);}
         catch(error){controller.abort();stopFailed=true;void preparing.then(async late=>{try{await bounded(late.cancel(),stopGraceMs);}finally{await bounded(late.close(),stopGraceMs);}}).catch(()=>{});throw error;}
         finally{controller.signal.removeEventListener('abort',abortPreparation);}
         projected=inputSchema.parse(session.input);
@@ -96,8 +96,8 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
             observe(facts);
             if(!actorsStopped(execution,trial)){stopFailed=true;throw Error('Original actor stopping unconfirmed before capture');}
             proved=true;clearTimeout(timer);capturing=true;phase('capturing');
-            // The same Case limit now bounds read-only collection; no model actor is left running.
-            timer=setTimeout(()=>{captureTimedOut=true;controller.abort();},timeoutMs);
+            // Read-only capture has its own limit after every model actor is stopped.
+            timer=setTimeout(()=>{captureTimedOut=true;controller.abort();},limits?.captureTimeoutMs ?? timeoutMs);
         }),cancelled]);
         observe(completed);
     }catch(error){
@@ -130,7 +130,7 @@ export async function executeCase(kernel: AgentKernel, trial: AgentTrial, timeou
                     });
                     try{
                         if(signal?.aborted)throw Error('Evidence collection cancelled');
-                        observe(await bounded(Promise.race([session.snapshot(),cancelledCollection]),timeoutMs));
+                        observe(await bounded(Promise.race([session.snapshot(),cancelledCollection]),limits?.captureTimeoutMs ?? timeoutMs));
                         execution.status=controlledAfterStop.status;execution.error=controlledAfterStop.error;execution.endpointReached=false;
                     }
                     catch(error){captureGap(error);}

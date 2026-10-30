@@ -86,6 +86,13 @@ test('Evaluation loop persists opt-in switches and saves Trace feedback without 
     await page.getByRole('button', { name: 'Experiments', exact: true }).click();
     expect(JSON.parse(await page.getByLabel('Experiment plan JSON').inputValue()).repeats).toBe(1);
     await expect(page.getByRole('button', { name: 'Run declared experiment', exact: true })).toBeDisabled();
+    await expect(page.getByLabel('Scoring source', { exact: true })).toHaveValue('original');
+    await expect(page.getByRole('button', { name: 'Retry failed scoring', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Upload selected scoring revision', exact: true })).toBeDisabled();
+    await page.getByLabel('Scoring Run ID', { exact: true }).fill('Run-missing-offline');
+    await page.getByRole('button', { name: 'List scoring revisions', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'ENOENT' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Upload selected scoring revision', exact: true })).toBeDisabled();
     expect(existsSync(join(root, 'agent-eval/runs'))).toBe(false);
     expect(existsSync(join(root, 'agent-eval/src/datasets/gold-candidates'))).toBe(false);
   } catch (error) { failure = error as Error; }
@@ -259,7 +266,8 @@ test('Evaluation opens the registered catalog and reviews a Case without running
 });
 
 test('Evaluation runs the real isolated Agent with zero Judge and keeps global control while another page is open', async ({}, testInfo) => {
-  test.setTimeout(90_000);
+  // Three isolated starts, upload recovery and an app restart share this deadline; each operation keeps its own timeout.
+  test.setTimeout(150_000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p16-run-')), root = evaluationFixture(userData);
   // This independent deterministic fixture retains every required check and has no semantic requirement.
   writeFileSync(join(root, 'agent-eval/src/datasets/facility-test/dataset.json'), JSON.stringify({ ...manifest, scoring: { ...manifest.scoring, judges: [] } }));

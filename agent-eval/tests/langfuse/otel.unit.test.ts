@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { reportFixture } from '../support/fixtures.ts';
 import { buildObservationTree, sendObservationTree } from '../../src/langfuse/otel.ts';
+import { exportEvents } from '../../src/langfuse/export.ts';
 
 test('OTEL projection preserves actual root and child input/output without exporting independent Gold', () => {
   const report = reportFixture(), trial = report.trials[0]!;
@@ -73,4 +74,34 @@ test('a trial root ends at its own last actual Judge end and declares why protec
   expect(JSON.stringify(tree)).not.toContain('PRIVATE_GOLD');
   report.trials[0]!.execution!.endedAt = null;
   expect(buildObservationTree(report)[0]!.end).toBe('2026-09-23T00:00:04Z');
+});
+
+const interruptedReport = () => {
+  const report = reportFixture();
+  report.executionComplete = false;
+  report.trials.push({ ...structuredClone(report.trials[0]!), trialId: 'planned-trial', traceId: '11111111111141118111111111111111',
+    caseId: 'FM-999', caseName: 'Not executed', status: 'NOT_RUN', reason: 'Planned', execution: null, scores: [], judgeCalls: [] });
+  return report;
+};
+
+test('interrupted OTEL reports export actual Trials and retain unexecuted plans only locally', () => {
+  const report = interruptedReport(), before = structuredClone(report.trials);
+  expect([...new Set(buildObservationTree(report).map(node => node.traceId))]).toEqual([report.trials[0]!.traceId]);
+  expect(report.trials).toEqual(before);
+});
+
+test('legacy transport also avoids creating traces for unexecuted plans', () => {
+  const report = interruptedReport();
+  expect(exportEvents(report).filter(event => event.type === 'trace-create').map(event => event.body.id)).toEqual([report.trials[0]!.traceId]);
+});
+
+test('ungraded original execution evidence is retained instead of being hidden by its status', () => {
+  const report = reportFixture(); report.trials[0]!.status = 'NOT_RUN';
+  expect(buildObservationTree(report).some(node => node.traceId === report.trials[0]!.traceId)).toBe(true);
+  expect(exportEvents(report).some(event => event.type === 'trace-create')).toBe(true);
+});
+
+test('an ended report containing only plans has no original observations to export', () => {
+  const report = interruptedReport(); report.trials = [report.trials[1]!];
+  expect(() => buildObservationTree(report)).toThrow('No original Trial observations');
 });

@@ -2,7 +2,8 @@ import type { LocalReport, TrialReport } from './store.ts';
 import { aggregateTrials, type MetricTotal } from '../scoring/aggregate.ts';
 import { formalMetric } from '../scoring/catalog.ts';
 import type { GradeStatus } from '../types.ts';
-import { isRequiredScore } from '../scoring/types.ts';
+import { isRequiredScore, type EvaluationScore } from '../scoring/types.ts';
+import { scoreAvailability } from '../scoring/availability.ts';
 
 export type TrialProbability = { k: number; passAtK: number | null; passAllK: number | null };
 export type CaseMetricStatistics = Pick<MetricTotal, 'metricId'|'version'|'unit'|'numerator'|'denominator'|'missing'|'value'|
@@ -31,19 +32,30 @@ function probabilities(n: number, correct: number, valid: boolean): TrialProbabi
         return {k,passAtK:valid?1-none:null,passAllK:valid?all:null};
     });
 }
-function scoringFault(trial: TrialReport) {
+// Unversioned saved summaries retain the original opportunity policy only during validation.
+const legacyRequiredScore=(score:EvaluationScore)=>score.required&&score.status!=='NOT_APPLICABLE'&&
+    !(score.statistics?.numerator===0&&score.statistics.denominator===0&&score.statistics.missing===0);
+function scoringFault(trial: TrialReport, legacyOpportunityPolicy = false) {
     const criteria=trial.semanticPlan?.criteria??[];
     const inactive=new Set(criteria.filter(criterion=>criterion.trigger==='completed-endpoint' &&
         (trial.execution?.status!=='completed'||!trial.execution.endpointReached)).map(criterion=>criterion.metricId));
     const missingRequired=criteria.some(criterion=>{
         if(!criterion.required||inactive.has(criterion.metricId))return false;
         const score=trial.scores.find(score=>score.metricId===criterion.metricId),counts=score?.statistics;
-        if(counts?.numerator===0&&counts.denominator===0&&counts.missing===0)return false;
-        return !score || !['PASS','FAIL'].includes(score.status) || score.value===null || !counts ||
-            counts.numerator===null || counts.denominator===null || counts.missing!==0;
+        if(legacyOpportunityPolicy){
+            if(counts?.numerator===0&&counts.denominator===0&&counts.missing===0)return false;
+            return !score || !['PASS','FAIL'].includes(score.status) || score.value===null || !counts ||
+                counts.numerator===null || counts.denominator===null || counts.missing!==0;
+        }
+        const availability=score?scoreAvailability(score,trial):undefined;
+        if(availability&&['not-applicable','no-opportunity'].includes(availability.state))return false;
+        return !score || availability?.state!=='measured' || !counts;
     });
-    return trial.execution?.started && trial.execution.error?.infrastructure || trial.scores.some(score=>score.status==='ERROR' ||
-        isRequiredScore(score) && !inactive.has(score.metricId) && ['UNJUDGEABLE','NOT_RUN'].includes(score.status)) || missingRequired ||
+    return trial.execution?.started && trial.execution.error?.infrastructure || trial.scores.some(score=>{
+        const unavailable=legacyOpportunityPolicy?legacyRequiredScore(score)&&['UNJUDGEABLE','NOT_RUN'].includes(score.status):
+            isRequiredScore(score,trial)&&['missing-evidence','not-run'].includes(scoreAvailability(score,trial).state);
+        return score.status==='ERROR'||!inactive.has(score.metricId)&&unavailable;
+    }) || missingRequired ||
         trial.judgeCalls.some(call=>call.error || call.responseComplete===false ||
             call.stopReason && call.stopReason!=='stop' || Object.keys(call.compact?.validationErrors??{}).length>0);
 }
@@ -84,7 +96,7 @@ function metricView(metric: MetricTotal, trials: TrialReport[], planned: number,
 }
 
 /** Derived diagnostics never change original grades, opportunity totals or identities. */
-export function deriveTrialStatistics(report: LocalReport): TrialStatistics {
+export function deriveTrialStatistics(report: LocalReport, options: { legacyOpportunityPolicy?: boolean } = {}): TrialStatistics {
     if(!Number.isSafeInteger(report.repeat)||report.repeat<1||report.repeat>20)throw Error('Trials must be 1–20');
     const ids=new Set<string>();
     for(const trial of report.trials){
@@ -110,7 +122,7 @@ export function deriveTrialStatistics(report: LocalReport): TrialStatistics {
         if(!infer)reasons.push(report.sourceInvalidation?'执行条件失效':'Execution尚未最终保存');
         if(own.some(trial=>!trial.metricPlan?.length))reasons.push('缺少原始正式指标计划');
         if(own.some(trial=>!['PASS','FAIL'].includes(trial.status)))reasons.push('包含不可判定、错误或未运行Trial');
-        if(own.some(scoringFault))reasons.push('包含评分或设施故障');
+        if(own.some(trial=>scoringFault(trial,options.legacyOpportunityPolicy===true)))reasons.push('包含评分或设施故障');
         const valid=reasons.length===0;
         const plannedMetrics=new Set(own.flatMap(trial=>(trial.metricPlan??[]).filter(plan=>!plan.notApplicable).map(plan=>plan.metricId)));
         return {caseId:group.caseId,caseVersion:group.caseVersion,planned:report.repeat,started,

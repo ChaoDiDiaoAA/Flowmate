@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ResolvedEvaluationBudgetSchema, EvaluationBudgetProfilesSchema } from './evaluation-budget.ts';
 import { AppErrorSchema, RuntimeBudgetOverridesSchema, type Result } from './runtime.ts';
 import { ResourceSelectionSchema } from './resources.ts';
 import { ExtensionSelectionSchema } from './extensions.ts';
@@ -40,7 +41,9 @@ export type EvaluationSettings = z.infer<typeof EvaluationSettingsSchema>;
 
 export const EvaluationRunConfigurationSchema = z.object({
   budget: RuntimeBudgetOverridesSchema.optional(),
-  timeoutMs: z.number().int().min(100).max(120_000).optional(),
+  timeoutMs: z.number().int().min(100).max(1_800_000).optional(),
+  trialTimeoutMs: z.number().int().min(100).max(1_800_000).optional(),
+  evaluationBudgets: EvaluationBudgetProfilesSchema.optional(),
   stopGraceMs: z.number().int().min(100).max(10_000).optional(),
   environment: z.string().regex(/^[a-z0-9_-]{1,80}$/).optional(),
 }).strict();
@@ -65,6 +68,7 @@ export const EvaluationEvaluatorPlanSchema = z.object({
 }).strict();
 export const EvaluationCasePlanSchema = z.object({
   caseId: EvaluationIdSchema, caseVersion: z.number().int().positive(), name: z.string(), category: z.string(),
+  evaluationBudget: ResolvedEvaluationBudgetSchema.optional(),
   evaluators: z.array(EvaluationEvaluatorPlanSchema),
   judge: z.object({ applicable: z.boolean(), required: z.boolean(), enabled: z.boolean() }).strict(),
 }).strict();

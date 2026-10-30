@@ -114,7 +114,9 @@ test('two real CLI processes preserve partial export receipts through a conflict
     const after = JSON.parse(readFileSync(receipt, 'utf8'));
     expect(after).toMatchObject({ status: 'complete', target: before.target });
     expect(batches).toHaveLength(1); expect(scores).toHaveLength(1);
-    expect(after.progress).toEqual({ total: 2, acceptedEventIds: [rootId, ...scores.map(score => score.id)], rejectedEventIds: [] });
+    expect(after.progress).toEqual({ total: 2, acceptedEventIds: [rootId, ...scores.map(score => score.id)], rejectedEventIds: [],
+      knownScoreIds: scores.map(score => score.id), submittedScoreIds: scores.map(score => score.id),
+      scoreTimestamp: '2026-09-23T00:00:01Z' });
     expect(readFileSync(file, 'utf8')).toBe(original);
   } finally { release(); await server.stop(true); }
 }, 45_000);

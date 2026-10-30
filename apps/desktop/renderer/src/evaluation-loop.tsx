@@ -28,6 +28,7 @@ function originalRead(request: Request): Request {
     case 'experiment.run': return { action: 'experiment.show', experimentId: String(request.plan.id) };
     case 'baseline.create': return { action: 'baseline.list' };
     case 'gate.check': case 'experiment.compare': return { action: 'experiment.show', experimentId: request.experimentId };
+    case 'score.retry': case 'score.upload': return { action: 'score.list', runId: request.runId };
     default: return request;
   }
 }
@@ -64,6 +65,10 @@ export function EvaluationLoop({ blocked, traceTarget, productRoot, onOpenActivi
   const [previewedPlan, setPreviewedPlan] = useState<string | null>(null), [experiments, setExperiments] = useState<Experiment[]>([]);
   const [experiment, setExperiment] = useState<Experiment | null>(null), [experimentId, setExperimentId] = useState('');
   const [armId, setArmId] = useState('luna'), [baselineId, setBaselineId] = useState(''), [fullRelease, setFullRelease] = useState(false);
+  const [scoringRunId, setScoringRunId] = useState(''), [scoringExecutionId, setScoringExecutionId] = useState(''), [scoringTrialId, setScoringTrialId] = useState('');
+  const [scoringSource, setScoringSource] = useState<'original' | 'revision'>('original'), [scoringRevision, setScoringRevision] = useState('');
+  const selectedScoringRevision = scoringSource === 'revision' ? scoringRevision.trim() : '';
+  const scoringSourceReady = scoringSource === 'original' || !!selectedScoringRevision;
   const disabled = blocked || !!busy || !!unknown;
   const workspaceUnavailable = settings?.workspace?.available === false;
   const writeDisabled = disabled || !settings || workspaceUnavailable;
@@ -95,9 +100,11 @@ export function EvaluationLoop({ blocked, traceTarget, productRoot, onOpenActivi
     if (!readOnly && !readBack && (writeGate.current || blocked || unknown)) return null;
     if (!readOnly) { writeGate.current = true; setBusy(input.action); }
     if (mounted.current) setMessage('');
+    let dispatched = false;
     try {
       const checked = EvaluationWorkflowRequestSchema.safeParse(input);
       if (!checked.success) throw Error(checked.error.issues.map(issue => issue.message).join('; '));
+      dispatched = true;
       const reply = await window.flowmate.runEvaluationWorkflow(checked.data);
       if (!mounted.current) return null;
       if (!reply.ok) {
@@ -113,7 +120,10 @@ export function EvaluationLoop({ blocked, traceTarget, productRoot, onOpenActivi
       else if (readBack && reply.data.exitCode === 0) setUnknown(null);
       return reply.data;
     } catch (error) {
-      if (mounted.current) setMessage(error instanceof Error ? error.message : 'Response unavailable; inspect the original record.');
+      if (mounted.current) {
+        setMessage(error instanceof Error ? error.message : 'Response unavailable; inspect the original record.');
+        if (dispatched && (input.action === 'score.retry' || input.action === 'score.upload')) setUnknown(input);
+      }
       return null;
     } finally { if (!readOnly) { writeGate.current = false; if (mounted.current) setBusy(''); } }
   }
@@ -223,12 +233,14 @@ export function EvaluationLoop({ blocked, traceTarget, productRoot, onOpenActivi
     && trace.complete && !trace.gaps.length && !!trace.endedAt);
   const resultPaging = result && (result.action === 'baseline.list' || result.action === 'benchmark.list' || result.action === 'experiment.list')
     && result.data.page && result.data.viewId ? { action: result.action, page: result.data.page, viewId: result.data.viewId } : null;
+  const savedProgress = result?.action === 'benchmark.run' ? result.data.run.progress
+    : result?.action === 'experiment.show' || result?.action === 'experiment.run' ? result.data.progress : undefined;
   const resultRecord = result?.action === 'baseline.create' && 'record' in result.data.baseline ? result.data.baseline.record
     : result?.action === 'gate.check' && 'record' in result.data.gate ? result.data.gate.record : null;
   return <section className="panel evaluation-loop" aria-label="Evaluation loop">
     <div className="panel-head"><h2>Evaluation loop</h2><button className="text-button" onClick={() => void invoke({ action: 'settings.get' })}>Refresh loop configuration</button></div>
     <p>Trace → Dataset → Evaluator → Experiment → Regression → Improvement</p>
-    <p>Saved-record reads do not run models. Explicit mining and experiments make real model calls; upload sends captured materials.</p>
+    <p>Saved-record reads do not run models. Explicit mining, experiments and scoring retries can make model calls; upload sends saved materials.</p>
     {workspaceUnavailable && <p role="alert">{settings.workspace?.reason}</p>}
     <fieldset className="form-grid" disabled={writeDisabled}>
       {([['capture', 'Capture product traces'], ['upload', 'Upload captured traces'], ['mining', 'Automatically mine candidates']] as const).map(([key, label]) =>
@@ -337,15 +349,35 @@ export function EvaluationLoop({ blocked, traceTarget, productRoot, onOpenActivi
       <button className="primary-button" disabled={writeDisabled || previewedPlan !== plan} onClick={() => void startExperiment().catch(error => setMessage(error instanceof Error ? error.message : 'Invalid experiment plan.'))}>Run declared experiment</button>
       <button className="text-button" onClick={() => void invoke({ action: 'experiment.list' })}>Refresh experiments</button>
       {experiments.map(item => <p key={item.id}><button className="text-button" onClick={() => void invoke({ action: 'experiment.show', experimentId: item.id })}>{item.id}</button> · {item.status} · {item.attribution}</p>)}
+      <section aria-label="Scoring revisions"><h4>Scoring revisions</h4><p>Retry failed scoring from saved evidence. Each explicit retry can make Judge calls.</p>
+        <div className="form-grid"><label className="field"><span>Scoring Run ID</span><input value={scoringRunId} onChange={event => { setScoringRunId(event.target.value); setScoringSource('original'); setScoringRevision(''); }} /></label>
+          <label className="field"><span>Scoring Execution ID</span><input value={scoringExecutionId} onChange={event => setScoringExecutionId(event.target.value)} /></label>
+          <label className="field"><span>Scoring Trial ID (optional)</span><input value={scoringTrialId} onChange={event => setScoringTrialId(event.target.value)} /></label>
+          <button className="secondary-button" disabled={writeDisabled || !scoringRunId.trim()} onClick={() => void invoke({ action: 'score.retry', runId: scoringRunId.trim(), operationId: uuid(),
+            failedOnly: true, ...(scoringTrialId.trim() ? { trialId: scoringTrialId.trim() } : {}) })}>Retry failed scoring</button>
+          <button className="text-button" disabled={!scoringRunId.trim()} onClick={() => void invoke({ action: 'score.list', runId: scoringRunId.trim() })}>List scoring revisions</button>
+          <label className="field"><span>Scoring source</span><select aria-label="Scoring source" value={scoringSource} onChange={event => setScoringSource(event.target.value as typeof scoringSource)}>
+            <option value="original">Original scoring</option><option value="revision">Selected scoring revision</option></select></label>
+          <label className="field"><span>Scoring revision ID</span><input value={scoringRevision} disabled={scoringSource !== 'revision'} onChange={event => setScoringRevision(event.target.value)} /></label>
+          <button className="text-button" disabled={!scoringExecutionId.trim() || !scoringSourceReady || scoringSource === 'revision' && !scoringRunId.trim() || scoringSource === 'original' && !onOpenExecution}
+            onClick={() => scoringSource === 'original' ? onOpenExecution?.(scoringExecutionId.trim()) : void invoke({ action: 'score.show', runId: scoringRunId.trim(),
+              revisionId: selectedScoringRevision, executionId: scoringExecutionId.trim(), ...(scoringTrialId.trim() ? { trialId: scoringTrialId.trim() } : {}) })}>Read selected scoring source</button>
+          <button className="secondary-button" disabled={writeDisabled || !scoringRunId.trim() || !selectedScoringRevision} onClick={() => void invoke({ action: 'score.upload',
+            runId: scoringRunId.trim(), revisionId: selectedScoringRevision })}>Upload selected scoring revision</button>
+        </div><p>Views, comparison, Baseline and Gate use the scoring source selected above. Original scoring is the default.</p>
+      </section>
       <div className="form-grid"><label className="field"><span>Experiment ID</span><input value={experimentId} onChange={event => setExperimentId(event.target.value)} /></label>
         <button className="text-button" disabled={!experimentId} onClick={() => void invoke({ action: 'experiment.show', experimentId })}>Read original experiment</button>
-        <button className="secondary-button" disabled={writeDisabled || !experimentId} onClick={() => void invoke({ action: 'experiment.compare', experimentId })}>Compare declared arms</button>
+        <button className="secondary-button" disabled={writeDisabled || !experimentId || !scoringSourceReady} onClick={() => void invoke({ action: 'experiment.compare', experimentId,
+          ...(selectedScoringRevision ? { scoringRevision: selectedScoringRevision } : {}) })}>Compare declared arms</button>
         <label className="field"><span>Arm ID</span><input value={armId} onChange={event => setArmId(event.target.value)} /></label>
         <label className="field"><span>Explicit Baseline ID</span><input value={baselineId} onChange={event => setBaselineId(event.target.value)} /></label>
-        <button className="secondary-button" disabled={writeDisabled || !experimentId || !armId || !baselineId} onClick={() => void invoke({ action: 'baseline.create', experimentId, armId, baselineId })}>Create explicit Baseline</button>
+        <button className="secondary-button" disabled={writeDisabled || !experimentId || !armId || !baselineId || !scoringSourceReady} onClick={() => void invoke({ action: 'baseline.create', experimentId, armId, baselineId,
+          ...(selectedScoringRevision ? { scoringRevision: selectedScoringRevision } : {}) })}>Create explicit Baseline</button>
         <button className="text-button" onClick={() => void invoke({ action: 'baseline.list' })}>List Baselines</button>
         <label><input type="checkbox" checked={fullRelease} onChange={event => setFullRelease(event.target.checked)} /> Require Full release</label>
-        <button className="secondary-button" disabled={writeDisabled || !experimentId || !armId || !baselineId} onClick={() => void invoke({ action: 'gate.check', baselineId, experimentId, armId, fullRelease })}>Check regression Gate</button>
+        <button className="secondary-button" disabled={writeDisabled || !experimentId || !armId || !baselineId || !scoringSourceReady} onClick={() => void invoke({ action: 'gate.check', baselineId, experimentId, armId, fullRelease,
+          ...(selectedScoringRevision ? { scoringRevision: selectedScoringRevision } : {}) })}>Check regression Gate</button>
       </div>{experiment && <details open><summary>Actual experiment state and saved execution identities</summary><pre className="evaluation-text">{json(experiment)}</pre></details>}
       <p>Smoke covers its selected Cases. Missing/error/incomparable evidence is blocked; controlled demonstrations do not establish a real-model release.</p>
     </section>}
@@ -373,6 +405,12 @@ export function EvaluationLoop({ blocked, traceTarget, productRoot, onOpenActivi
         offset: Math.max(0, resultPaging.page.offset - resultPaging.page.limit), viewId: resultPaging.viewId })}>Previous saved summaries</button>
       <button className="text-button" disabled={resultPaging.page.nextOffset === null} onClick={() => resultPaging.page.nextOffset !== null && void invoke({ action: resultPaging.action,
         offset: resultPaging.page.nextOffset, viewId: resultPaging.viewId })}>Next saved summaries</button></div>}
+    {savedProgress && <section aria-label="Benchmark progress"><h3>Saved evaluation progress</h3>
+      <div className="evaluation-facts">{([
+        ['processedTrials', 'Processed Trials'], ['scoredTrials', 'Scored Trials'], ['scoringErrorTrials', 'Scoring errors'], ['unjudgeableTrials', 'Unjudgeable Trials'],
+        ['judgeTasksPrepared', 'Judge prepared'], ['judgeTasksSubmitted', 'Judge submitted'], ['judgeTasksCompleted', 'Judge complete'],
+        ['judgeTasksEnded', 'Judge ended'], ['judgeTasksUnknown', 'Judge submission unknown'], ['verifiedTrials', 'Verified Trials'],
+      ] as const).map(([key, label]) => <span key={key}>{label}: {Reflect.get(savedProgress, key) ?? 'unknown'}</span>)}</div></section>}
     {result && <details open><summary>Actual workflow result · {result.action} · exit {result.exitCode}</summary><pre className="evaluation-text">{json(result.data)}</pre></details>}
   </section>;
 }

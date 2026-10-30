@@ -5,6 +5,7 @@ import type { LocalReport, TrialReport } from '../reports/store.ts';
 import type { EvaluationScore } from '../scoring/types.ts';
 import { metricCatalog } from '../scoring/catalog.ts';
 import { safetyEffectsSchema } from '../scoring/safety.ts';
+import { scoreAvailability } from '../scoring/availability.ts';
 
 export type ExecutionEvidence = { report: LocalReport; snapshot: Record<string, any>; evidenceRef: string };
 export const criticalMetrics = ['task-success', 'false-completion', 'reference-fields', 'line-items', 'candidate-idempotency',
@@ -13,28 +14,8 @@ const measured = (status: string) => ['PASS', 'FAIL'].includes(status);
 const gatedScore = (score: EvaluationScore) => score.required || score.category !== 'diagnostic' ||
   criticalMetrics.includes(score.metricId) || metricCatalog.some(metric => metric.id === score.metricId);
 function notApplicableReason(trial: TrialReport, score: EvaluationScore): string | undefined {
-  if (score.status === 'NOT_APPLICABLE') {
-    const plan = trial.metricPlan?.find(plan => plan.metricId === score.metricId && plan.notApplicable);
-    const output = trial.evaluatorPlan?.flatMap(plan => plan.outputs).find(output => output.metricId === score.metricId && !output.applicable);
-    return plan || output ? 'Declared non-applicability: ' + (plan?.notApplicable ?? output!.reason) : undefined;
-  }
-  const counts = score.statistics, reference = score.judge;
-  if (score.status !== 'UNJUDGEABLE' || score.value !== null || score.method !== 'llm-judge' || !reference ||
-    counts?.numerator !== 0 || counts.denominator !== 0 || counts.missing !== 0) return;
-  const declarations = trial.semanticPlan?.criteria.filter(criterion => criterion.metricId === score.metricId) ?? [];
-  const calls = trial.judgeCalls.filter(call => call.callId === reference.callId);
-  if (declarations.length !== 1 || calls.length !== 1 || !Number.isSafeInteger(reference.criterion) || reference.criterion < 0) return;
-  const declared = declarations[0]!, call = calls[0]!, compact = call.compact;
-  const opportunity = trial.metricPlan?.find(plan => plan.metricId === score.metricId);
-  if (declared.denominator !== null || declared.version !== score.version || declared.unit !== counts.unit || declared.required !== score.required ||
-    opportunity && opportunity.denominator !== null || !compact || !isDeepStrictEqual(compact.plan.criteria[reference.criterion], declared)) return;
-  const completed = call.stopReason === undefined ? ['stop', 'end_turn', 'stop_sequence'].includes(call.finishReason ?? '') : call.stopReason === 'stop';
-  if (!completed || call.responseComplete !== true || call.error !== null ||
-    call.transportStatus != null && (call.transportStatus < 200 || call.transportStatus >= 300) ||
-    Object.keys(compact.validationErrors ?? {}).length || compact.judgment?.research?.unavailable === true ||
-    !isDeepStrictEqual(compact.judgment?.r[reference.criterion], [0, 0, 0]) ||
-    compact.judgment?.f.some(failure => failure[0] === reference.criterion)) return;
-  return 'Completed Judge confirms zero opportunities for the declared dynamic criterion; original UNJUDGEABLE 0/0 with missing=0 is retained';
+  const availability = scoreAvailability(score, trial);
+  return ['not-applicable', 'no-opportunity'].includes(availability.state) ? availability.reason : undefined;
 }
 function scoringIdentity(trial: TrialReport) {
   return { metricPlan: trial.metricPlan, semanticPlan: trial.semanticPlan, evaluatorPlan: trial.evaluatorPlan,
@@ -52,9 +33,13 @@ function source(snapshot: Record<string, any>, axes: ExperimentAxis[]) {
 }
 export function evidenceValidity(entries: ExecutionEvidence[]): GateReason[] {
   const reasons: GateReason[] = [];
-  const add = (message: string, evidenceRef: string) => reasons.push({ code: 'incomplete-evidence', message, evidenceRefs: [evidenceRef] });
+  const add = (message: string, evidenceRef: string, trial?: Pick<TrialReport, 'caseId' | 'trialId'>, metricId?: string) =>
+    reasons.push({ code: 'incomplete-evidence', stage: 'compare', message, ...(trial ? { caseId: trial.caseId } : {}), ...(metricId ? { metricId } : {}),
+      evidenceRefs: [evidenceRef, ...(trial ? [evidenceRef + '#' + trial.trialId + (metricId ? '/scores/' + metricId : '')] : [])] });
   if (!entries.length) add('Execution set is empty', '');
   for (const { report, snapshot, evidenceRef } of entries) {
+    if (report.scoringRevision && !report.scoringRevision.conditionsComplete)
+      add('Explicit scoring revision has mixed or unknown Judge conditions', evidenceRef);
     if (report.history || report.sourceInvalidation || !report.executionComplete || !report.endedAt || report.scoring !== 'complete' || !report.trials.length)
       add('Execution is incomplete, historical, invalidated or not fully scored', evidenceRef);
     if (!snapshot.configuration || !snapshot.runtimeSource?.files?.length || !snapshot.runtimeSource.runtime || !snapshot.scoring)
@@ -66,34 +51,34 @@ export function evidenceValidity(entries: ExecutionEvidence[]): GateReason[] {
       !isDeepStrictEqual([...new Set(report.trials.map(t=>t.caseId))].sort(),declaredCases.map(c=>c.id).sort()))
       add('Saved snapshot Case members differ from original Trial groups',evidenceRef);
     for (const trial of report.trials) {
+      if (trial.scoringState && trial.scoringState !== 'complete')
+        add('Trial scoring checkpoint is incomplete or submission is unknown', evidenceRef, trial);
       const key = JSON.stringify([trial.caseId, trial.caseVersion]), repetitions = members.get(key) ?? new Set<number>();
-      if (repetitions.has(trial.repetition) || trial.repetition < 1 || trial.repetition > report.repeat) add('Duplicate or invalid Case repetition', evidenceRef);
+      if (repetitions.has(trial.repetition) || trial.repetition < 1 || trial.repetition > report.repeat) add('Duplicate or invalid Case repetition', evidenceRef, trial);
       repetitions.add(trial.repetition); members.set(key, repetitions);
       if (!trial.caseConditions || trial.caseConditions.unavailable || !measured(trial.status) || !trial.execution?.started ||
         ['cancelled','error','not-started'].includes(trial.execution.status) || trial.execution.error?.infrastructure)
-        add('Case execution, capture or original conditions are unavailable: ' + trial.caseId, evidenceRef);
+        add('Case execution, capture or original conditions are unavailable: ' + trial.caseId, evidenceRef, trial);
       if (!trial.scores.length || new Set(trial.scores.map(s=>s.metricId)).size !== trial.scores.length)
-        add('Missing or duplicate assertions: ' + trial.caseId, evidenceRef);
+        add('Missing or duplicate assertions: ' + trial.caseId, evidenceRef, trial);
       for (const score of trial.scores) {
         if (!gatedScore(score)) continue;
         if (notApplicableReason(trial, score)) continue;
         if (score.status === 'NOT_APPLICABLE') {
-          if(!trial.metricPlan?.some(p=>p.metricId===score.metricId&&p.notApplicable) &&
-            !trial.evaluatorPlan?.some(p=>p.outputs.some(o=>o.metricId===score.metricId&&!o.applicable)))
-            add('Metric non-applicability lacks an original declaration: '+score.metricId,evidenceRef);
+          add('Metric non-applicability lacks an original declaration: '+score.metricId,evidenceRef,trial,score.metricId);
           continue;
         }
         if (!measured(score.status) || score.value === null || !Number.isFinite(score.value) || score.value < 0 || score.value > 1)
-          add('Unmeasured assertion: ' + score.metricId, evidenceRef);
+          add('Unmeasured assertion: ' + score.metricId + '; ' + scoreAvailability(score, trial).reason, evidenceRef, trial, score.metricId);
         const counts = score.statistics;
         if (counts && score.metricId !== 'DR03' && (counts.numerator === null || counts.denominator === null || counts.missing !== 0 ||
           !Number.isSafeInteger(counts.numerator) || !Number.isSafeInteger(counts.denominator) || counts.denominator <= 0 ||
           counts.numerator < 0 || counts.numerator > counts.denominator ||
           score.metricId !== 'DR03' && score.value !== null && Math.abs(score.value - counts.numerator / counts.denominator) > 1e-12))
-          add('Invalid or missing opportunity denominator: ' + score.metricId, evidenceRef);
+          add('Invalid or missing opportunity denominator: ' + score.metricId, evidenceRef, trial, score.metricId);
       }
       for (const plan of trial.metricPlan ?? []) if (!plan.notApplicable && plan.metricId !== 'task-success' && !trial.scores.some(s=>s.metricId===plan.metricId))
-        add('Planned metric has no measurement: ' + plan.metricId, evidenceRef);
+        add('Planned metric has no measurement: ' + plan.metricId, evidenceRef, trial, plan.metricId);
     }
     if ([...members.values()].some(repetitions=>repetitions.size !== report.repeat)) add('Case repetition group is incomplete', evidenceRef);
   }
@@ -115,7 +100,8 @@ export function compareExecutionSets(left: ExecutionEvidence[], right: Execution
       [{code:'forbidden-effect',message:'Original private probe proves actual leakage or forbidden side effects',caseId:trial.caseId,
         evidenceRefs:[entry.evidenceRef+'#'+trial.trialId]}]:[];
   }));
-  const add = (message:string,refs:string[]) => reasons.push({code:'conditions-differ',message,evidenceRefs:refs});
+  const add = (message:string,refs:string[],caseId?:string,metricId?:string) => reasons.push({code:'conditions-differ',stage:'compare',message,
+    ...(caseId?{caseId}:{}),...(metricId?{metricId}:{}),evidenceRefs:refs});
   if (left.length !== right.length || new Set(left.map(e=>e.report.dataset.id)).size !== left.length || new Set(right.map(e=>e.report.dataset.id)).size !== right.length)
     add('Dataset groups differ or contain duplicates', []);
   const scorePairs: Array<{before:EvaluationScore;after:EvaluationScore;refs:string[];beforeNotApplicable?:string;afterNotApplicable?:string}> = [];
@@ -135,11 +121,11 @@ export function compareExecutionSets(left: ExecutionEvidence[], right: Execution
     for (const trial of a.trials) {
       const other=indexed.get(key(trial));
       if (!other || !isDeepStrictEqual(trial.caseConditions,other.caseConditions) || !isDeepStrictEqual(scoringIdentity(trial),scoringIdentity(other)) || trial.purpose!==other.purpose)
-        { add('Case/Gold, metric versions, required assertions or members differ: '+trial.caseId,refs); continue; }
+        { add('Case/Gold, metric versions, required assertions or members differ: '+trial.caseId,refs,trial.caseId); continue; }
       for (const score of trial.scores) {
         const next=other.scores.find(s=>s.metricId===score.metricId)!;
         const beforeNotApplicable=notApplicableReason(trial,score),afterNotApplicable=notApplicableReason(other,next);
-        if (Boolean(beforeNotApplicable)!==Boolean(afterNotApplicable)) add('One-sided metric applicability: '+score.metricId,refs);
+        if (Boolean(beforeNotApplicable)!==Boolean(afterNotApplicable)) add('One-sided metric applicability: '+score.metricId,refs,trial.caseId,score.metricId);
         scorePairs.push({before:score,after:next,beforeNotApplicable,afterNotApplicable,
           refs:[...refs,before.evidenceRef+'#'+trial.trialId+'/scores/'+score.metricId,after.evidenceRef+'#'+other.trialId+'/scores/'+next.metricId]});
       }

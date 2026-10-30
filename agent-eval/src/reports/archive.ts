@@ -7,7 +7,7 @@ import { acquireEvaluationWrite, atomicJson, atomicText } from './files.ts';
 import type { LocalReport } from './store.ts';
 
 const identity = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/);
-const sections = ['executions', 'snapshots', 'exports', 'comparisons', 'gates', 'diagnostics', 'sources'] as const;
+const sections = ['executions', 'snapshots', 'exports', 'comparisons', 'gates', 'diagnostics', 'sources', 'scoringRevisions'] as const;
 type Section = typeof sections[number] | 'experiment';
 const archiveSchema = z.object({
     contract: z.literal('flowmate-evaluation-run/v1'), id: identity, selection: z.string(),
@@ -16,6 +16,7 @@ const archiveSchema = z.object({
     materials: z.record(z.object({ path: z.string(), file: z.string() }).strict()).default({}),
     sources: z.record(z.unknown()), executions: z.record(z.unknown()), snapshots: z.record(z.unknown()),
     exports: z.record(z.unknown()), comparisons: z.record(z.unknown()), gates: z.record(z.unknown()), diagnostics: z.record(z.unknown()),
+    scoringRevisions: z.record(z.unknown()).default({}),
     experiment: z.unknown().optional(), workflow: z.unknown().optional(),
 }).strict();
 export type RunArchive = z.infer<typeof archiveSchema>;
@@ -25,7 +26,7 @@ export function readableSlug(value: string) {
     return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70).replace(/-+$/g, '') || 'record';
 }
 export function archiveFile(reference: string) { return reference.split('#')[0]!; }
-export function isArchiveReference(reference: string) { return /run\.json#(?:experiment$|(?:executions|snapshots|exports|comparisons|gates|diagnostics)=)/.test(reference); }
+export function isArchiveReference(reference: string) { return /run\.json#(?:experiment$|(?:executions|snapshots|exports|comparisons|gates|diagnostics|scoringRevisions)=)/.test(reference); }
 export function archiveReference(file: string, section: Section, id?: string) {
     if (!['experiment', ...sections].includes(section)) throw Error('Unknown Run section');
     if (section !== 'experiment') identity.parse(id);
@@ -76,7 +77,7 @@ export function createArchive(repo: string, options: { selection: string; compar
     root = join(root, name); mkdirSync(root);
     const file = join(root, 'run.json'), archive: RunArchive = { contract: 'flowmate-evaluation-run/v1', id: name,
         selection: options.selection, startedAt: new Date().toISOString(), endedAt: null, status: 'running', caseSnapshots: {},
-        fixtures: {}, scoring: {}, materials: {}, sources: {}, executions: {}, snapshots: {}, exports: {}, comparisons: {}, gates: {}, diagnostics: {} };
+        fixtures: {}, scoring: {}, materials: {}, sources: {}, executions: {}, snapshots: {}, exports: {}, comparisons: {}, gates: {}, diagnostics: {}, scoringRevisions: {} };
     saveArchive(file, archive);
     atomicText(join(root, 'README.md'), '# ' + name + '\n\nStatus: running. Original progress and evidence are saved in `run.json`.\n');
     return { id: name, file };

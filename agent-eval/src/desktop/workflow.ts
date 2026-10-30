@@ -27,6 +27,8 @@ import { atomicJson, acquireEvaluationWrite } from '../reports/files.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
 import { createWorkflowRecordReader } from './workflow-records.ts';
 import { runBenchmarkWorkflow } from '../execution/benchmark.ts';
+import { runProgress } from '../reports/readme.ts';
+import { retryScoring, listScoringRevisions, readScoringRevisionReport } from '../execution/score-retry.ts';
 export { isWorkflowReadOnly } from '../../../packages/contracts/src/evaluation-workflow.ts';
 import { readObservabilitySettings } from '../observability-settings.ts';
 export { readObservabilitySettings } from '../observability-settings.ts';
@@ -395,6 +397,27 @@ export async function dispatchWorkflow(repo: string, value: unknown, deps: Workf
         }
         case 'candidate.publish': { const { action, ...input } = request; data = { publication: curation.publish(input) }; break; }
         case 'benchmark.list': data = { items: listPublishedBenchmarks(repo) }; break;
+        case 'score.retry': {
+            const { action, ...input } = request;
+            const scoring = await retryScoring(repo, input, { env: deps.env, fetcher: deps.fetcher, nativeRunner: deps.nativeRunner, signal: deps.signal });
+            data = { scoring }; exitCode = scoring.status === 'complete' ? 0 : 2; break;
+        }
+        case 'score.list': data = { items: listScoringRevisions(repo, request.runId) }; break;
+        case 'score.show': {
+            const report = readScoringRevisionReport(repo, request.runId, request.revisionId, request.executionId);
+            const trials = request.trialId ? report.trials.filter(t => t.trialId === request.trialId) : report.trials;
+            if (request.trialId && !trials.length) throw Error('Trial is not present in the selected scoring source');
+            data = { revision: { revisionId: request.revisionId, executionId: report.executionId,
+                conditionsComplete: report.scoringRevision?.conditionsComplete ?? false, statisticsPolicyVersion: report.statisticsPolicyVersion ?? 1,
+                trials: trials.map(t => ({ trialId: t.trialId, caseId: t.caseId, status: t.status, reason: t.reason, scoringState: t.scoringState })),
+                ...(request.trialId ? { scores: trials[0]!.scores.map(({ actual, expected, evidence, ...score }) => ({ ...score, evidenceCount: evidence.length })) } : {}) } };
+            break;
+        }
+        case 'score.upload': {
+            const { uploadScoringRevisionScores } = await import('../langfuse/scoring-revision.ts');
+            const upload = await uploadScoringRevisionScores(repo, request, { connection: deps.connection });
+            data = { upload }; exitCode = upload.status === 'complete' ? 0 : 2; break;
+        }
         case 'benchmark.run': {
             const run = await runBenchmarkWorkflow(repo, request.selection, { ...deps.experiments, env: deps.env, signal: deps.signal });
             data = { run }; exitCode = run.exitCode; break;
@@ -403,13 +426,15 @@ export async function dispatchWorkflow(repo: string, value: unknown, deps: Workf
         case 'experiment.run': {
             const plan = experimentPlanSchema.parse(request.plan); if (!plan.id) throw Error('Experiment run requires an explicit stable plan.id');
             const old = listExperiments(repo).find(item => item.id === plan.id);
-            if (old && !isDeepStrictEqual(old.plan, plan)) throw Error('Experiment identity differs from its original plan');
+            const previousPlan = old ? { ...old.plan } : undefined;
+            if (previousPlan && plan.evaluationBudgets === undefined) delete previousPlan.evaluationBudgets;
+            if (old && !isDeepStrictEqual(previousPlan, plan)) throw Error('Experiment identity differs from its original plan');
             const experiment = old ?? await runExperiment(repo, plan, { ...deps.experiments, env: deps.env ?? deps.experiments?.env, signal: deps.signal ?? deps.experiments?.signal });
-            data = { experiment }; exitCode = experiment.status === 'complete' ? 0 : 2; break;
+            data = { experiment, progress: runProgress(experiment.arms.flatMap(arm => arm.executionIds.map(id => readReport(reportPath(repo,id))))) }; exitCode = experiment.status === 'complete' ? 0 : 2; break;
         }
         case 'experiment.list': data = { items: listExperiments(repo) }; break;
-        case 'experiment.show': { const experiment = listExperiments(repo).find(item => item.id === request.experimentId); if (!experiment) throw Error('Unknown experiment'); data = { experiment }; break; }
-        case 'experiment.compare': { const comparisons = compareExperiment(repo, request.experimentId); data = { comparisons }; exitCode = comparisons.some(item => item.status === 'blocked') ? 2 : 0; break; }
+        case 'experiment.show': { const experiment = listExperiments(repo).find(item => item.id === request.experimentId); if (!experiment) throw Error('Unknown experiment'); data = { experiment, progress: runProgress(experiment.arms.flatMap(arm => arm.executionIds.map(id => readReport(reportPath(repo,id))))) }; break; }
+        case 'experiment.compare': { const comparisons = compareExperiment(repo, request.experimentId, request.scoringRevision); data = { comparisons }; exitCode = comparisons.some(item => item.status === 'blocked') ? 2 : 0; break; }
         case 'baseline.create': { const { action, ...input } = request; data = { baseline: createBaseline(repo, input) }; break; }
         case 'baseline.list': data = { items: listBaselines(repo) }; break;
         case 'gate.check': {

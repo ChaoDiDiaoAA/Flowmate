@@ -11,13 +11,16 @@ import { compileEvaluatorPlan } from '../scoring/evaluator-plan.ts';
 import { changedSourcePaths, codeIdentity, type EvaluationRuntime } from './source.ts';
 import { loadPublishedBenchmark } from '../curation/publication.ts';
 import { EvaluationAgentOverridesSchema } from '../../../packages/contracts/src/runtime-evaluation.ts';
+import { EvaluationBudgetProfilesSchema } from '../../../packages/contracts/src/evaluation-budget.ts';
+import { readEvaluationBudgets, resolveTrialBudget } from './budgets.ts';
 
-export const evaluationRunDefaults = { timeoutMs: 120_000, stopGraceMs: 5000, environment: 'development' } as const;
+export const evaluationRunDefaults = { stopGraceMs: 5000, environment: 'development' } as const;
 export const runConfigSchema = z.object({
   ...EvaluationAgentOverridesSchema.shape,
   model: z.string().min(1).optional(), baseUrl: z.string().url().optional(), api: agentApiSchema.optional(),
   repeat: z.number().int().min(1).max(20).optional(),
-  timeoutMs: z.number().int().min(100).max(120000).optional(), stopGraceMs: z.number().int().min(100).max(10000).optional(),
+  timeoutMs: z.number().int().min(100).max(1800000).optional(), trialTimeoutMs: z.number().int().min(100).max(1800000).optional(),
+  evaluationBudgets: EvaluationBudgetProfilesSchema.optional(), stopGraceMs: z.number().int().min(100).max(10000).optional(),
   environment: z.string().regex(/^[a-z0-9_-]+$/).optional(), resources: ResourceSelectionSchema.optional(),
   extensions: ExtensionSelectionSchema.optional(), budget: RuntimeBudgetOverridesSchema.optional(),
 }).strict();
@@ -45,6 +48,7 @@ export function findDataset(repo: string, options: { dataset?: string; version?:
 
 export function createEvaluationPlan(repo: string, input: unknown, runtime?: EvaluationRuntime) {
   const request = EvaluationPreviewRequestSchema.parse(input);
+  const budgets = request.configuration.evaluationBudgets ?? readEvaluationBudgets(repo);
   const resourceRepository = runtime?.mode === 'installed' ? runtime.layout.runtimeRoot : repo;
   const datasets = request.datasetId === 'all'
     ? ['flowmate-agent-v1', 'flowmate-research-v1'].map(dataset => findDataset(repo, { dataset }, resourceRepository))
@@ -58,6 +62,7 @@ export function createEvaluationPlan(repo: string, input: unknown, runtime?: Eva
       resolveCase(dataset, task, repo);
       const selection = judgeSelection({ manifest: dataset.manifest, cases: [task] }, request.judge === 'required');
       return { caseId: task.id, caseVersion: task.version, name: task.name, category: task.category,
+        evaluationBudget: resolveTrialBudget(task.requires, request.configuration, budgets),
         evaluators: compileEvaluatorPlan(task, [...dataset.manifest.scoring.required.map(metric => ({ metric, required: true })), ...task.expected.checks]),
         judge: { applicable: selection.needed, required: selection.required, enabled: request.judge !== 'off' && selection.needed } };
     });
@@ -72,7 +77,8 @@ export function createEvaluationPlan(repo: string, input: unknown, runtime?: Eva
   });
   const cases = datasetPlans.flatMap(dataset => dataset.cases);
   const summary = EvaluationPlanSummarySchema.parse({ selection: request.selection, repeat: request.repeat, judge: request.judge,
-    configuration: { ...evaluationRunDefaults, ...request.configuration }, datasets: datasetPlans,
+    configuration: { stopGraceMs: evaluationRunDefaults.stopGraceMs, environment: evaluationRunDefaults.environment,
+      ...request.configuration, evaluationBudgets: budgets }, datasets: datasetPlans,
     caseCount: cases.length, total: cases.length * request.repeat,
     judgeMaxGenerations: cases.filter(task => task.judge.enabled).length * request.repeat,
     judgeRequired: cases.some(task => task.judge.enabled && task.judge.required),
@@ -84,7 +90,8 @@ export function createEvaluationPlan(repo: string, input: unknown, runtime?: Eva
 }
 export type EvaluationPlan = ReturnType<typeof createEvaluationPlan>;
 export function sameEvaluationPlan(before: EvaluationPlan, after: EvaluationPlan): boolean {
-  return isDeepStrictEqual(before.request, after.request) && isDeepStrictEqual(before.conditions, after.conditions)
+  return isDeepStrictEqual(before.request, after.request) && isDeepStrictEqual(before.summary.configuration, after.summary.configuration)
+    && isDeepStrictEqual(before.conditions, after.conditions)
     && isDeepStrictEqual(before.summary, after.summary) && isDeepStrictEqual(before.source, after.source)
     && changedSourcePaths(before.source, after.source).length === 0;
 }

@@ -12,6 +12,21 @@ import type { EvaluationConnection } from '../../../packages/contracts/src/evalu
 import { findDataset } from './plan.ts';
 import { selectCases } from '../dataset-loader/local.ts';
 import { scanEvidence } from './evidence-safety.ts';
+import { setTimeout } from 'node:timers/promises';
+import { resolveEvaluationBudgets } from './budgets.ts';
+import { productAgent } from '../adapters/agent.ts';
+
+export async function preflightBenchmarkGateway(baseUrl: string, models: string[],
+    fetcher: (url: string, init: RequestInit) => Promise<Response> = fetch, signal?: AbortSignal) {
+    const bounded = AbortSignal.any([AbortSignal.timeout(10000), ...(signal ? [signal] : [])]);
+    const health = await fetcher(new URL('/health', baseUrl).href, { method: 'GET', signal: bounded });
+    if (!health.ok) throw Error('Model gateway health check failed (' + health.status + ')');
+    const response = await fetcher(baseUrl.replace(/\/$/, '') + '/models', { method: 'GET', signal: bounded });
+    if (!response.ok) throw Error('Model gateway model metadata failed (' + response.status + ')');
+    const catalog = z.object({ data: z.array(z.object({ id: z.string() }).passthrough()) }).parse(await response.json());
+    const missing = models.filter(model => !catalog.data.some(item => item.id === model));
+    if (missing.length) throw Error('Model gateway is missing required models: ' + missing.join(', '));
+}
 
 export function createBenchmarkPlan(selection: 'smoke' | 'full', candidate: EvaluationConnection & { reasoning?: string },
     control: EvaluationConnection & { reasoning?: string }) {
@@ -49,12 +64,20 @@ export async function finalizeBenchmark(repo: string, runId: string, options: { 
     for (const report of reports) {
         if (options.signal?.aborted) break;
         if (!report.endedAt || report.scoring !== 'complete') continue;
-        try { await exportReport(report, reportPath(repo, report.executionId), undefined, repo,
-            options.connection ? { connection: options.connection } : {}); }
+        try {
+            for (let attempt = 0; attempt < 4; attempt++) {
+                const exported = await exportReport(report, reportPath(repo, report.executionId), undefined, repo,
+                    options.connection ? { connection: options.connection } : {});
+                if (exported.status === 'complete' || attempt === 3 || options.signal?.aborted) break;
+                await setTimeout(1000 * (attempt + 1), undefined, { signal: options.signal });
+            }
+        }
         catch (error) {
             updateArchive(file, archive => {
                 const previous = archive.exports[report.executionId] as LocalReport['export'] | undefined;
-                archive.exports[report.executionId] = { ...previous, backend: 'langfuse', status: previous?.progress?.acceptedEventIds.length ? 'partial' : 'error',
+                // A failed project query must not turn a fresh local export into a targetless historical upload.
+                archive.exports[report.executionId] = { ...(previous ?? { backend: 'local', status: 'disabled' }),
+                    ...(previous?.target ? { backend: 'langfuse', status: previous.progress?.acceptedEventIds.length ? 'partial' : 'error' } : {}),
                     error: scanEvidence(error instanceof Error ? error.message : String(error)).value };
             });
         }
@@ -111,6 +134,9 @@ export async function runBenchmarkWorkflow(repo: string, selection: 'smoke' | 'f
     const control = agentConfig(repo, env, { model: env.FLOWMATE_EVAL_CONTROL_MODEL, api: env.FLOWMATE_EVAL_CONTROL_API,
         baseUrl: env.FLOWMATE_EVAL_CONTROL_BASE_URL, reasoning: env.FLOWMATE_EVAL_CONTROL_REASONING_EFFORT });
     const plan = createBenchmarkPlan(selection, agent.configuration, control.configuration);
+    plan.evaluationBudgets = resolveEvaluationBudgets(env);
+    if (!deps.kernel || deps.kernel === productAgent)
+        await preflightBenchmarkGateway(agent.configuration.baseUrl, [control.configuration.model, agent.configuration.model, judge.model], deps.fetcher, deps.signal);
     const datasets = deps.loadBenchmark ? await deps.loadBenchmark(repo, 'baseline', 1) :
         ['flowmate-agent-v1', 'flowmate-research-v1'].map(dataset => findDataset(repo, { dataset }));
     const count = datasets.reduce((sum, dataset) => sum + selectCases(dataset, selection).length, 0), expected = selection === 'smoke' ? 7 : 62;

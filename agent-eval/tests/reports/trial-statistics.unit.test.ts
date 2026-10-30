@@ -136,7 +136,7 @@ test('missing or partial required semantic measurements exclude a preserved FAIL
 test('required semantic eligibility respects actual zero opportunities and declared triggers',async()=>{
     for(const triggered of [true,false]){
         const r=sample(['FAIL']),trial=r.trials[0]!;
-        const denominator=triggered?0:2;
+        const denominator=triggered?null:2;
         trial.metricPlan!.push({metricId:'tool-arguments',version:1,unit:'请求',denominator});
         trial.semanticPlan={contract:'flowmate-semantic-plan/v1',criteria:[{metricId:'tool-arguments',version:1,unit:'请求',
             denominator,required:true,rule:'Check original arguments when triggered',evidence:['tool-calls'],
@@ -144,7 +144,19 @@ test('required semantic eligibility respects actual zero opportunities and decla
         if(!triggered)Object.assign(trial.execution!,{status:'failed',endpointReached:false});
         trial.scores.push({metricId:'tool-arguments',version:1,name:'参数正确率',method:'llm-judge',required:true,
             status:triggered?'UNJUDGEABLE':'NOT_RUN',value:null,reason:triggered?'Observed zero opportunities':'Trigger not reached',
-            evidence:['tool-calls'],statistics:{unit:'请求',numerator:triggered?0:null,denominator,missing:triggered?0:denominator}});
+            evidence:['tool-calls'],statistics:{unit:'请求',numerator:triggered?0:null,denominator:triggered?0:denominator,missing:triggered?0:denominator}});
+        if(triggered){
+            expect((await derive(r)).cases[0]!.valid).toBe(false);
+            trial.scores[0]!.required=false;
+            expect((await derive(r)).cases[0]!.valid).toBe(false);
+            trial.scores[0]!.required=true;
+            trial.scores[0]!.judge={callId:'10000000-0000-4000-8000-000000000001',criterion:0};
+            trial.judgeCalls=[{callId:'10000000-0000-4000-8000-000000000001',configuration:{provider:'codex-cli',transport:'codex-cli',model:'synthetic',
+                reasoningEffort:'max',timeoutMs:180000,protocolVersion:'flowmate-judge/v2'},startedAt:'2026-10-30T00:00:00Z',endedAt:'2026-10-30T00:00:01Z',
+                attempts:1,usage:{},responseModel:'synthetic',raw:'original response',error:null,judgment:null,request:{system:'Declared rubric',data:'{}',redacted:false},
+                stopReason:'stop',rawStopReason:null,usageSource:'codex-cli',responseComplete:true,
+                compact:{plan:structuredClone(trial.semanticPlan),judgment:{v:1,r:[[0,0,0]],f:[]},validationErrors:{}}}];
+        }
         const c=(await derive(r)).cases[0]!;
         expect(c.valid).toBe(true);expect(c.probabilities[0]!.passAtK).toBe(0);
         expect(c.metrics.find(m=>m.metricId==='tool-arguments')!.measured).toBe(0);

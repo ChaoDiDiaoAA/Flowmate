@@ -53,9 +53,12 @@ export type TrialReport = {
     semanticPlan?: CompactPlan;
     evaluatorPlan?: EvaluatorPlanEntry[];
     judgeCalls: JudgeCall[];
+    scoringState?: 'pending' | 'prepared' | 'submitted' | 'complete' | 'submission-unknown';
     feedback: 'none';
 };
 export type LocalReport = {
+    statisticsPolicyVersion?: 2;
+    scoringRevision?: { id: string; conditionsComplete: boolean };
     history?: {verification:'unverified';gaps:string[]};
     executionKind?: 'controlled' | 'model';
     contract: 'flowmate-agent-run/v1' | 'flowmate-agent-run/v2';
@@ -98,7 +101,7 @@ export type LocalReport = {
     export: {
         backend: 'local' | 'langfuse';
         status: 'disabled' | 'pending' | 'complete' | 'partial' | 'error';
-        progress?: { total: number; acceptedEventIds: string[]; rejectedEventIds: string[]; scoreTimestamp?: string; knownScoreIds?: string[] };
+        progress?: { total: number; acceptedEventIds: string[]; rejectedEventIds: string[]; scoreTimestamp?: string; knownScoreIds?: string[]; submittedScoreIds?: string[] };
         target?: { baseUrl: string; projectId: string };
         error?: string;
         url?: string;
@@ -130,7 +133,7 @@ const executionSchema = z.object({ identity: z.object({ executionId: text, trial
     error: z.object({ code: text, message: z.string(), infrastructure: z.boolean() }).strict().optional() }).strict();
 // Legacy v1 calls lack completion metadata; preserve their fields without inventing a modern completion proof.
 export const legacyJudgeConfigurationSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatible']), model: text,
-    baseUrl: z.string().url(), temperature: z.number().finite().min(0).max(2).optional(), maxTokens: positive.optional(), timeoutMs: positive,
+    baseUrl: z.string().url(), maxOutputTokens: positive.optional(), temperature: z.number().finite().min(0).max(2).optional(), maxTokens: positive.optional(), timeoutMs: positive,
     modelCapabilities: z.object({modelId:text,maxOutputTokens:positive,source:z.enum(['anthropic-models-api','deepseek-models-api'])}).strict().optional(),
     protocolVersion: text.optional(), rubric: z.object({ id: text, version: positive }).strict().optional()
     }).strict();
@@ -143,7 +146,12 @@ export const nativeJudgeConfigurationSchema = z.object({ transport: z.literal('c
     reasoningEffort: z.enum(['none','minimal','low','medium','high','xhigh','max']), timeoutMs: positive,
     protocolVersion: text, rubric: z.object({id:text,version:positive}).strict().optional() }).strict();
 export const judgeConfigurationSchema = z.union([sdkJudgeConfigurationSchema,nativeJudgeConfigurationSchema,legacyJudgeConfigurationSchema]);
-const judgeCallBase = z.object({ callId: text, startedAt: timestamp, endedAt: timestamp, attempts: integer.max(1),
+const judgeCallBase = z.object({ callId: text, startedAt: timestamp, endedAt: z.union([timestamp, z.literal('')]), attempts: integer.max(1),
+    lifecycle: z.enum(['prepared', 'submitted', 'ended']).optional(), submissionUnknown: z.boolean().optional(),
+    errorCode: z.string().nullable().optional(),
+    capacity: z.object({ inputChars: integer, inputBytes: integer, estimatedInputTokens: integer.nullable(),
+        contextWindow: positive.nullable(), outputBudget: positive.nullable(), actualMaxOutputTokens: positive.nullable(),
+        inputEncoding: z.enum(['raw', 'flowmate-judge-shared-text/v1']) }).strict().optional(),
     usage: z.unknown(), responseModel: z.unknown(), raw: z.string().nullable(), error: z.string().nullable(),
     transportStatus:z.number().int().min(100).max(599).nullable().optional(),
     judgment: z.object({ score: z.number().finite().min(0).max(1), reason: text }).strict().nullable(),
@@ -161,6 +169,7 @@ export const judgeCallSchema = z.union([
         cliVersion: text.nullable(), cost: z.null(), internalRetries: z.null() })
 ]);
 const trialSchema = z.object({ sessionId: text.max(199).optional(), caseId: text, caseVersion: positive, caseConditions: z.record(z.unknown()).optional(), caseName: text, category: text, purpose:z.enum(['capability','regression']).optional(),
+    scoringState: z.enum(['pending', 'prepared', 'submitted', 'complete', 'submission-unknown']).optional(),
     partition: z.enum(['smoke', 'holdout', 'full', 'badcase']), regressionOrigins: regressionOriginListSchema.optional(), repetition: positive, trialId: text, traceId: z.string().regex(/^[a-f0-9]{32}$/),
     status, reason: z.string(), counts: z.record(integer), execution: executionSchema.nullable(), scores: z.array(scoreSchema),
     metricPlan: z.array(z.object({ metricId: text, version: positive, unit: text, denominator: integer.nullable().optional(),
@@ -169,6 +178,8 @@ const trialSchema = z.object({ sessionId: text.max(199).optional(), caseId: text
         outputs:z.array(z.object({metricId:text,category:z.enum(['formal','diagnostic','guardrail']),applicable:z.boolean(),reason:text,required:z.boolean(),denominator:integer.nullable().optional()}).strict())}).strict()).optional(),
     judgeCalls: z.array(judgeCallSchema).max(1), feedback: z.literal('none') }).strict();
 const reportSchema = z.object({ contract: z.enum(['flowmate-agent-run/v1', 'flowmate-agent-run/v2']), executionId: text,
+    statisticsPolicyVersion: z.literal(2).optional(),
+    scoringRevision: z.object({ id: text, conditionsComplete: z.boolean() }).strict().optional(),
     runId: text.optional(),
     executionKind: z.enum(['controlled', 'model']).optional(),
     history:z.object({verification:z.literal('unverified'),gaps:z.array(text).min(1)}).strict().optional(),
@@ -184,10 +195,11 @@ const reportSchema = z.object({ contract: z.enum(['flowmate-agent-run/v1', 'flow
         rubrics: z.array(z.object({id:text,version:positive,prompt:text}).strict()).refine(items=>new Set(items.map(r=>r.id)).size===items.length).optional() }).strict(),
     trials: z.array(trialSchema), export: z.object({ backend: z.enum(['local', 'langfuse']), status: z.enum(['disabled', 'pending', 'complete', 'partial', 'error']),
         progress: z.object({ total: integer, acceptedEventIds: z.array(text), rejectedEventIds: z.array(text), scoreTimestamp: timestamp.optional(),
-            knownScoreIds: z.array(text).optional() }).strict().refine(p =>
+            knownScoreIds: z.array(text).optional(), submittedScoreIds: z.array(text).optional() }).strict().refine(p =>
             new Set(p.acceptedEventIds).size === p.acceptedEventIds.length && new Set(p.rejectedEventIds).size === p.rejectedEventIds.length &&
             p.acceptedEventIds.length <= p.total && p.rejectedEventIds.length <= p.total && !p.rejectedEventIds.some(id => p.acceptedEventIds.includes(id)) &&
-            (!p.knownScoreIds || new Set(p.knownScoreIds).size === p.knownScoreIds.length && p.knownScoreIds.length <= p.total),
+            (!p.knownScoreIds || new Set(p.knownScoreIds).size === p.knownScoreIds.length && p.knownScoreIds.length <= p.total) &&
+            (!p.submittedScoreIds || new Set(p.submittedScoreIds).size === p.submittedScoreIds.length && p.submittedScoreIds.length <= p.total),
             'Export receipt identities must be unique and disjoint').optional(),
         target: z.object({ baseUrl: langfuseUrlSchema, projectId: text.max(200) }).strict().optional(),
         error: z.string().optional(), url: z.string().optional() }).strict() }).strict();
@@ -206,7 +218,7 @@ export type ReportInspection = {
     sources: Array<{ reference: string; content: string | null }>;
     snapshot: { data: unknown | null; issue: 'missing' | 'invalid' | null };
 };
-function validateReport(value: unknown): asserts value is LocalReport {
+export function validateReport(value: unknown): asserts value is LocalReport {
     if (!value || typeof value !== 'object' || !('contract' in value) ||
         !['flowmate-agent-run/v1', 'flowmate-agent-run/v2'].includes(String(value.contract)))
         throw new Error('Historical report is read-only; no regrading or new export');
@@ -243,6 +255,21 @@ function validateReport(value: unknown): asserts value is LocalReport {
                 throw new Error('Declared semantic criterion differs from its metric opportunity plan');
         }
         const deterministic=trial.scores.filter(s=>s.method==='deterministic'&&trial.semanticPlan?.criteria.some(c=>c.metricId===s.metricId));
+        if (trial.scoringState && trial.scoringState !== 'complete') {
+            if (trial.scores.length || report.scoring === 'complete' && trial.execution?.started)
+                throw Error('Pending scoring cannot claim final scores or completion');
+            for (const call of trial.judgeCalls) {
+                if (!trial.execution?.endedAt || !call.lifecycle) throw Error('Judge checkpoint requires original ended execution');
+                const { rubric: _, ...actual } = call.configuration;
+                const { rubric: __, ...declared } = report.scoringConfiguration.judge ?? {};
+                if (!isDeepStrictEqual(actual, declared)) throw Error('Judge checkpoint differs from declared configuration');
+                if (call.compact?.plan.criteria.some(c => !trial.semanticPlan?.criteria.some(original => isDeepStrictEqual(c, original))))
+                    throw Error('Judge checkpoint differs from original criterion');
+                if (call.lifecycle === 'prepared' && call.attempts !== 0 || call.lifecycle === 'submitted' && call.attempts !== 1 ||
+                    call.lifecycle !== 'ended' && call.endedAt !== '') throw Error('Judge checkpoint lifecycle is inconsistent');
+            }
+            continue;
+        }
         for(const score of deterministic.filter(s=>isSafetyMetric(s.metricId))){
             const criterion=trial.semanticPlan!.criteria.find(c=>c.metricId===score.metricId)!;
             const original=trial.execution&&localSafetyFailure(criterion,trial.execution);
@@ -270,6 +297,8 @@ function validateReport(value: unknown): asserts value is LocalReport {
             }
         }
         for (const call of trial.judgeCalls) {
+            if (!call.endedAt || call.lifecycle !== undefined && call.lifecycle !== 'ended')
+                throw Error('Final Judge record must have ended before scoring can be complete');
             if (calls.has(call.callId)) throw new Error('Duplicate Judge call identity');
             calls.add(call.callId);
             if(call.transportStatus!==undefined&&(call.attempts===0&&call.transportStatus!==null||
@@ -368,11 +397,20 @@ function validateReport(value: unknown): asserts value is LocalReport {
         throw new Error('Legacy v1 report cannot claim inferred v2 aggregation');
     if (report.contract === 'flowmate-agent-run/v2' && JSON.stringify((report.aggregation)) !== JSON.stringify((aggregateTrials(value as LocalReport))))
         throw new Error('Stored aggregation differs from original Trial records');
-    if (report.trialStatistics !== undefined && !isDeepStrictEqual((report.trialStatistics), (deriveTrialStatistics(value as LocalReport))))
+    if (report.trialStatistics !== undefined && !isDeepStrictEqual((report.trialStatistics),
+        deriveTrialStatistics(value as LocalReport, { legacyOpportunityPolicy: report.statisticsPolicyVersion !== 2 })))
         throw new Error('Trial statistics differ from original Trial records');
 }
 export function saveReport(path: string, report: LocalReport) {
     if(report.history)throw Error('Historical reports are read-only; original facts cannot be verified');
+    if (report.statisticsPolicyVersion === undefined) {
+        let exists = existsSync(path);
+        if (isArchiveReference(path)) {
+            try { readArchivePart(path); exists = true; }
+            catch (error) { if (!missingFile(error)) throw error; exists = false; }
+        }
+        if (!exists) report.statisticsPolicyVersion = 2;
+    }
     if(report.scoringConfiguration.judge===undefined){const call=report.trials.flatMap(t=>t.judgeCalls)[0];if(call){const{rubric,...connection}=call.configuration;report.scoringConfiguration.judge=connection;}}
     if (report.contract === 'flowmate-agent-run/v2') report.aggregation = aggregateTrials(report);
     JSON.stringify(report, (_, value) => {

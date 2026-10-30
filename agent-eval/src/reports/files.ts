@@ -43,7 +43,7 @@ export function publicReport(report: LocalReport) {
     const {export:_,...rest}=report;
     return publicVersions(({...rest,artifactFormat:'flowmate-eval-public/v1',trials:report.trials.map(t=>{
         const {execution,judgeCalls,...summary}=t;
-        return {...summary,dimensions:dimensions(t.scores,!!t.execution?.started),scores:t.scores.map(({actual,expected,...score})=>score),evidence:{trial:`evidence/${t.trialId}/trial.json`,observation:`evidence/${t.trialId}/observation.json`,events:`evidence/${t.trialId}/events.jsonl`}};
+        return {...summary,dimensions:dimensions(t.scores,!!t.execution?.started,t),scores:t.scores.map(({actual,expected,...score})=>score),evidence:{trial:`evidence/${t.trialId}/trial.json`,observation:`evidence/${t.trialId}/observation.json`,events:`evidence/${t.trialId}/events.jsonl`}};
     })}));
 }
 export function saveEvidence(root:string, report:LocalReport) {
@@ -92,7 +92,7 @@ export function readPublicReport(path:string, raw:any, readSource?: (reference: 
         refresh(observation);
         t.execution=facts.status==='not-started'&&!facts.started?null:{...facts,observations:events,evidence:observation.evidence,
             artifacts:facts.artifacts.map((a:any)=>{if(!/^artifacts\/artifact-\d+\.json$/.test(a.file))throw Error('Invalid artifact reference');return read(expected+a.file);})};
-        if(t.dimensions&&!isDeepStrictEqual(t.dimensions,dimensions(t.scores,!!t.execution?.started)))throw Error('Dimension summary differs from original scores');
+        if(t.dimensions&&!isDeepStrictEqual(t.dimensions,dimensions(t.scores,!!t.execution?.started,t)))throw Error('Dimension summary differs from original scores');
         delete t.evidence;
         delete t.dimensions;
     }

@@ -24,7 +24,7 @@ Full 保留原始 **62 题：业务 50、研究 12**。Smoke 为 **7 题：业�
 |---|---|
 | Case | 身份/版本、输入、类别、难度、任务用途与期望行为 |
 | Gold | 独立事实、可接受值、来源见证与评分规则 |
-| Review | 真人对题目质量、歧义及证据充分性的评估 |
+| Review | 题目质量、歧义与证据充分性的作者侧检查，明确来源；Agent 自审与真人批准分别记录 |
 | Scenario | 受控产品状态及按任务授权交付的材料 |
 | Source | 解释候选来源的真实 Trace 与材料引用 |
 
@@ -100,3 +100,5 @@ Case 的 `scoring.judge` 使用 Metric ID，例如 `['tool-selection', 'tool-arg
 每个 Trial 将适用语义项合并为 0／1 次逻辑 Judge 提交。缺证据不能自动记作不适用，已知失败也不因采证不全消失。明确必要／可选条件及原始机会分母。新增语义诊断的 `evaluatorId` 使用对应 Metric ID；历史 `task-judge`／`tool-use-judge` 声明依据明确的 `params.metricId` 读取。
 
 修改 Evaluator 的 Rubric、证据契约或校验行为，需要修改该项独立版本；公共协议变化需要修改对应评分／模板版本。Case／Gold 版本规则另行保留。旧结果仍可读，评分条件不兼容时比较和 Gate 阻断。单指标校准不能代替组合效果；校准未提供、覆盖不足或版本不匹配均需显示。详见[评分与校准](EVALUATION.zh-CN.md#evaluator先核对行为再判断语义)。
+
+执行预算属于 Run／实验条件，调整预算不修改 Case 或 Gold，旧结果保留原预算。显式补评分使用原执行保存的 Case／Gold 版本；评分修订不等于发布新的 Benchmark。

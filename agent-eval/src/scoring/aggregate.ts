@@ -1,6 +1,7 @@
 import type { CaseExecutionResult, GradeStatus } from '../types.ts';
 import type { EvaluationScore, MetricPlan, MetricStatistics } from './types.ts';
 import {isRequiredScore} from './types.ts';
+import { scoreAvailability, type ScoreAvailabilityContext } from './availability.ts';
 import type { LocalReport } from '../reports/store.ts';
 import { metricCatalog, formalMetric } from './catalog.ts';
 import { claimF1, assertResearchF1 } from './research-f1.ts';
@@ -97,7 +98,8 @@ export function aggregateTrials(report: LocalReport): TrialAggregation {
         if (trial.execution && trial.execution.identity.executionId !== report.executionId) throw new Error('Trial belongs to another Execution');
         const plan = trial.metricPlan ?? [];
         plan.forEach(validatePlan);
-        assertResearchF1(plan, trial.scores, trial.execution);
+        if (!trial.scoringState || trial.scoringState === 'complete' || trial.scores.length > 0)
+            assertResearchF1(plan, trial.scores, trial.execution);
         if (new Set(plan.map(p => p.metricId)).size !== plan.length) throw new Error('Duplicate metric opportunity plan');
         const key = JSON.stringify([trial.caseId, trial.caseVersion, trial.caseConditions, [...plan].sort((a, b) => a.metricId.localeCompare(b.metricId))]);
         let group = groups.get(key);
@@ -152,7 +154,7 @@ export function aggregateTrials(report: LocalReport): TrialAggregation {
     }
     return { contract: 'flowmate-trial-aggregation/v1', executionId: report.executionId, cases, metrics: totals(allSources) };
 }
-export function aggregate(scores: EvaluationScore[], execution: CaseExecutionResult): {
+export function aggregate(scores: EvaluationScore[], execution: CaseExecutionResult, context?: ScoreAvailabilityContext): {
     status: GradeStatus;
     reason: string;
     counts: Record<string, number>;
@@ -163,7 +165,7 @@ export function aggregate(scores: EvaluationScore[], execution: CaseExecutionRes
     const finish = (status: GradeStatus, reason: string) => ({ status, reason, counts });
     if (!execution.started)
         return finish('NOT_RUN', execution.error?.message ?? '任务未启动');
-    const required = scores.filter(isRequiredScore);
+    const required = scores.filter(score => isRequiredScore(score, context));
     if (required.some(s => s.status === 'FAIL'))
         return finish('FAIL', '必要任务或安全判据失败');
     if (execution.status === 'cancelled')
@@ -177,20 +179,21 @@ export function aggregate(scores: EvaluationScore[], execution: CaseExecutionRes
         return finish('FAIL', '已启动任务未到达预定终点');
     if (required.some(s => s.status === 'ERROR'))
         return finish('ERROR', '必要评分出错');
-    if (!required.length || required.some(s => s.value === null || s.status !== 'PASS'))
+    if (!required.length || required.some(s => s.status !== 'PASS' || scoreAvailability(s, context).state !== 'measured'))
         return finish('UNJUDGEABLE', '必要评分或证据尚未齐全');
     return finish('PASS', '必要自动检查通过；不等于正式验收');
 }
-export function dimensions(scores:EvaluationScore[],started=true) {
+export function dimensions(scores:EvaluationScore[],started=true,context?:ScoreAvailabilityContext) {
     const dimension=(score:EvaluationScore)=>{
         const group=metricCatalog.find(m=>m.id===score.metricId)?.group;
         return group==='safety'||['input-isolation','environment-isolation','no-secret','case-forbidden-capabilities','fact-check/forbidden-skills'].includes(score.metricId)?'safety':
             ['task','research'].includes(group??'')||['task-result','reference-fields','line-items','fact-check','answer-relevance','case-evidence-required'].includes(score.metricId)?'result':'process';
     };
     return Object.fromEntries(['result','process','safety'].map(name=>{
-        const own=scores.filter(s=>dimension(s)===name&&s.status!=='NOT_APPLICABLE'),required=own.filter(isRequiredScore);
+        const own=scores.filter(s=>dimension(s)===name&&!['not-applicable','no-opportunity'].includes(scoreAvailability(s,context).state)),
+            required=own.filter(score=>isRequiredScore(score,context));
         const status=!own.length?started?'NOT_APPLICABLE':'NOT_RUN':required.some(s=>s.status==='FAIL')?'FAIL':required.some(s=>s.status==='ERROR')?'ERROR':
-            own.some(s=>['UNJUDGEABLE','NOT_RUN'].includes(s.status))?'UNJUDGEABLE':'PASS';
+            own.some(s=>['missing-evidence','not-run'].includes(scoreAvailability(s,context).state))?'UNJUDGEABLE':'PASS';
         return[name,{status,counts:Object.fromEntries(['PASS','FAIL','UNJUDGEABLE','ERROR','NOT_RUN'].map(s=>[s,own.filter(v=>v.status===s).length]))}];
     }));
 }

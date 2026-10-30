@@ -30,6 +30,10 @@ bun run eval:upload -- --execution-id <id>
 bun --no-env-file run eval -- run [--dataset <local-id|all>] [--benchmark-revision N] [--selection smoke|holdout|full] [--case <id>] [--trials <1..20>] [--model <name>] [--api <type>] [--base-url <url>] [--execution-id <id>] [--backend local|langfuse] [--judge auto|off|required]
 bun --no-env-file run eval -- status --execution-id <id> | --dataset <id>
 bun --no-env-file run eval -- compare --left <execution-id> --right <execution-id>
+bun --no-env-file run eval -- score retry --run-id <RunId> --failed-only [--trial <TrialId>] [--operation-id UUID]
+bun --no-env-file run eval -- score list --run-id <RunId>
+bun --no-env-file run eval -- score show --run-id <RunId> --revision-id ID --execution-id ID [--trial ID]
+bun --no-env-file run eval -- score upload --run-id <RunId> --revision-id ID
 bun --no-env-file run eval -- judge calibrate --dir <independent-reference-directory> --execution-id <id> [--metric <metricId>]
 bun --no-env-file run eval -- resend (--execution-id <id> | --report <absolute-report.json>)
 bun --no-env-file run eval -- review add (--execution-id <id> | --dataset <id>) --case <id> [--trial <TrialID>] --reviewer <name> --verdict good|bad --note <text>
@@ -71,7 +75,7 @@ export function parseOptions(args: string[], valued: string[], flags: string[] =
 }
 export function parseWorkflowCli(args: string[]): EvaluationWorkflowRequest | undefined {
     const command = args[0];
-    if (!command || !['workflow', 'trace', 'mine', 'candidate', 'benchmark', 'experiment', 'baseline', 'gate', 'observability'].includes(command)) return undefined;
+    if (!command || !['workflow', 'trace', 'mine', 'candidate', 'benchmark', 'experiment', 'baseline', 'gate', 'observability', 'score'].includes(command)) return undefined;
     const action = command === 'workflow' ? 'workflow' : command === 'mine' ? 'mine' : command === 'observability' ? 'settings.' + args[1] : command + '.' + args[1];
     const wholeFile = ['candidate.review', 'trace.feedback', 'candidate.publish', 'experiment.preview', 'experiment.run'];
     const allowed: Record<string, string[]> = {
@@ -81,13 +85,15 @@ export function parseWorkflowCli(args: string[]): EvaluationWorkflowRequest | un
         mine: ['--trace-id', '--revision', '--operation-id', '--kind'], 'candidate.list': ['--kind'], 'candidate.show': ['--candidate-id'],
         'candidate.edit': ['--candidate-id', '--revision', '--file'], 'candidate.validate': ['--candidate-id', '--revision'],
         'candidate.review': ['--file'], 'candidate.publish': ['--file'], 'benchmark.list': [],
-        'experiment.preview': ['--file'], 'experiment.run': ['--file'], 'experiment.list': [], 'experiment.show': ['--experiment-id'], 'experiment.compare': ['--experiment-id'],
+        'experiment.preview': ['--file'], 'experiment.run': ['--file'], 'experiment.list': [], 'experiment.show': ['--experiment-id'], 'experiment.compare': ['--experiment-id','--scoring-revision'],
         'benchmark.run': ['--selection'],
-        'baseline.create': ['--experiment-id', '--arm-id', '--baseline-id'], 'baseline.list': [], 'gate.check': ['--baseline-id', '--experiment-id', '--arm-id'],
+        'score.retry': ['--run-id','--trial','--operation-id'], 'score.list': ['--run-id'],
+        'score.show': ['--run-id','--revision-id','--execution-id','--trial'], 'score.upload': ['--run-id','--revision-id'],
+        'baseline.create': ['--experiment-id', '--arm-id', '--baseline-id','--scoring-revision'], 'baseline.list': [], 'gate.check': ['--baseline-id', '--experiment-id', '--arm-id','--scoring-revision'],
     };
     if (!(action in allowed)) throw Error(HELP);
     const options = parseOptions(args.slice(command === 'mine' || command === 'workflow' ? 1 : 2), allowed[action]!,
-        action === 'candidate.validate' ? ['--replay'] : action === 'gate.check' ? ['--full-release'] : []);
+        action === 'score.retry' ? ['--failed-only'] : action === 'candidate.validate' ? ['--replay'] : action === 'gate.check' ? ['--full-release'] : []);
     const string = (name: string) => typeof options[name] === 'string' ? options[name] as string : undefined;
     const file = () => { const path = string('--file'); if (!path) throw Error('Required --file'); return JSON.parse(readFileSync(resolve(path), 'utf8')); };
     if (command === 'workflow') return EvaluationWorkflowRequestSchema.parse(file());
@@ -96,6 +102,10 @@ export function parseWorkflowCli(args: string[]): EvaluationWorkflowRequest | un
     const boolean = (name: string) => string(name) === 'true' ? true : string(name) === 'false' ? false : string(name);
     let input: Record<string, unknown> = { action };
     switch (action) {
+        case 'score.retry': input = { action, runId: string('--run-id'), trialId: string('--trial'), operationId: string('--operation-id'), failedOnly: options['--failed-only'] === true }; break;
+        case 'score.list': input.runId = string('--run-id'); break;
+        case 'score.show': input = { action, runId: string('--run-id'), revisionId: string('--revision-id'), executionId: string('--execution-id'), trialId: string('--trial') }; break;
+        case 'score.upload': input = { action, runId: string('--run-id'), revisionId: string('--revision-id') }; break;
         case 'benchmark.run': input.selection = string('--selection'); break;
         case 'settings.save': input.settings = { capture: boolean('--capture'), upload: boolean('--upload'), mining: boolean('--mining') }; break;
         case 'trace.show': case 'trace.process': input.traceId = string('--trace-id'); break;
@@ -106,9 +116,9 @@ export function parseWorkflowCli(args: string[]): EvaluationWorkflowRequest | un
         case 'candidate.show': input.candidateId = string('--candidate-id'); break;
         case 'candidate.edit': input = { action, candidateId: string('--candidate-id'), expectedRevision: number('--revision'), patch: file() }; break;
         case 'candidate.validate': input = { action, candidateId: string('--candidate-id'), expectedRevision: number('--revision'), replay: options['--replay'] === true }; break;
-        case 'experiment.show': case 'experiment.compare': input.experimentId = string('--experiment-id'); break;
-        case 'baseline.create': input = { action, experimentId: string('--experiment-id'), armId: string('--arm-id'), baselineId: string('--baseline-id') }; break;
-        case 'gate.check': input = { action, baselineId: string('--baseline-id'), experimentId: string('--experiment-id'), armId: string('--arm-id'), fullRelease: options['--full-release'] === true }; break;
+        case 'experiment.show': case 'experiment.compare': input.experimentId = string('--experiment-id'); if(action==='experiment.compare')input.scoringRevision=string('--scoring-revision'); break;
+        case 'baseline.create': input = { action, experimentId: string('--experiment-id'), armId: string('--arm-id'), baselineId: string('--baseline-id'), scoringRevision: string('--scoring-revision') }; break;
+        case 'gate.check': input = { action, baselineId: string('--baseline-id'), experimentId: string('--experiment-id'), armId: string('--arm-id'), fullRelease: options['--full-release'] === true, scoringRevision: string('--scoring-revision') }; break;
     }
     return EvaluationWorkflowRequestSchema.parse(input);
 }
@@ -147,6 +157,7 @@ export function createProgressReporter(write: (line: string) => void = line => {
                 case 'plan': {
                     const name = { smoke: 'Smoke', full: 'Full', holdout: '留出集', case: '单题' }[event.selection];
                     line(`[评测]${name}：${event.caseCount ?? event.total}个Case，每Case ${event.trialsPerCase ?? 1}个Trial，共${event.total}个Trial；${event.datasets.map(d => `${datasetName(d.id)}${d.total}个Trial`).join(' → ')}`);
+                    if(event.evaluationBudgets)for(const [kind,budget]of Object.entries(event.evaluationBudgets))line('[预算]'+kind+'：Trial '+budget.trialTimeoutMs+' ms；Agent Run 默认 '+budget.runTimeoutMs+' ms；模型调用上限 '+budget.maxModelCalls+'（确认研究 Plan 优先）');
                     break;
                 }
                 case 'dataset-start':
@@ -159,7 +170,8 @@ export function createProgressReporter(write: (line: string) => void = line => {
                 case 'agent-end': {
                     if (completed.has(event.trialId + ':agent')) break;
                     completed.add(event.trialId + ':agent');
-                    stopWaiting(); const [symbol, label] = agentLabels[event.status];
+                    stopWaiting(); const [symbol, originalLabel] = agentLabels[event.status];
+                    const label = event.infrastructure ? '执行或采证设施错误' : originalLabel;
                     const missing = event.status === 'completed' && event.endpointReached === false;
                     line(`${missing ? '⚠' : symbol} ${trialLabel(event)}：${missing ? 'Agent运行已结束，业务终点未达成' : label}${event.reason ? '；' + shortReason(event.reason) : ''}`);
                     break;

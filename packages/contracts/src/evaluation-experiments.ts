@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { EvaluationConnectionSchema } from './evaluation.ts';
 import { RuntimeStrategyPolicySchema } from './ports.ts';
 import { ResourceSelectionSchema } from './resources.ts';
+import { EvaluationBudgetProfilesSchema } from './evaluation-budget.ts';
 import type { ExperimentMetricDelta,ExperimentAssertion,BaselineReference,GateThresholds } from './evaluation-baseline.ts';
 export { experimentMetricDeltaSchema,experimentAssertionSchema,baselineReferenceSchema,gateThresholdsSchema } from './evaluation-baseline.ts';
 export type { ExperimentMetricDelta,ExperimentAssertion,BaselineReference,GateThresholds } from './evaluation-baseline.ts';
@@ -19,6 +20,7 @@ export const experimentPlanSchema = z.object({ id: id.optional(), benchmark: z.o
   repeats: z.number().int().min(1).max(20).default(1), environment: id.default('development'),
   axes: z.array(experimentAxisSchema).min(1).max(4), control: experimentArmSchema,
   candidates: z.array(experimentArmSchema).min(1).max(10),
+  evaluationBudgets: EvaluationBudgetProfilesSchema.optional(),
 }).strict().superRefine((plan, ctx) => {
   if (new Set(plan.axes).size !== plan.axes.length) ctx.addIssue({ code: 'custom', message: 'Duplicate experiment axes' });
   const arms = [plan.control, ...plan.candidates];
@@ -40,6 +42,7 @@ export type ExperimentRecord = { contract: 'flowmate-experiment/v1'; id: string;
   plan: ExperimentPlan; attribution: 'single-axis' | 'combination'; status: 'running' | 'complete' | 'blocked' | 'stopped';
   arms: ExperimentArmRecord[]; reason?: string };
 export type GateReason = { code: string; message: string; evidenceRefs: string[]; metricId?: string; caseId?: string;
+  stage?: 'prepare' | 'execute' | 'capture' | 'judge' | 'compare' | 'upload';
   before?: number; after?: number; delta?: number; threshold?: number };
 export type ExperimentComparison = { status: 'comparable' | 'blocked'; reasons: GateReason[]; metrics: ExperimentMetricDelta[];
   safetyViolations?: GateReason[];
@@ -50,5 +53,5 @@ export type GateResult = { id?: string; baselineId?: string; experimentId?: stri
   status: 'pass' | 'fail' | 'blocked'; exitCode: 0 | 1 | 2; fullRelease: boolean;
   scope: ExperimentComparison['scope']; reasons: GateReason[]; deltas: ExperimentMetricDelta[] };
 export type BaselineRecord = { contract: 'flowmate-baseline/v1'; id: string; createdAt: string; experimentId: string; armId: string;
-  executionIds: string[]; plan: ExperimentPlan; conditions: unknown[]; evidenceKind: ExperimentComparison['evidenceKind'];
+  executionIds: string[]; scoringRevision?: string; plan: ExperimentPlan; conditions: unknown[]; evidenceKind: ExperimentComparison['evidenceKind'];
   reference?:BaselineReference;thresholds?:GateThresholds };

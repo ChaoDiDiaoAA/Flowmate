@@ -7,6 +7,7 @@ import { parseArgs } from 'node:util';
 import type { ElectronApplication, Locator, Page } from 'playwright';
 import { z } from 'zod';
 import { isWorkflowReadOnly, type EvaluationWorkflowRequest } from '../../packages/contracts/src/evaluation-workflow.ts';
+import { traceFile, readTrace, readTraceState, readCandidate } from '../../agent-eval/src/curation/store.ts';
 
 const uuid = z.string().uuid();
 const id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
@@ -123,18 +124,21 @@ async function prepare(page: Page, step: CaptureStep, p: Parameters): Promise<{ 
     await loop.getByLabel('Trace UUID', { exact: true }).fill(step.request.traceId); await button('Read Trace by ID').click();
     data = await displayed(page, 'trace.show', step.request.traceId);
     const selected = loop.getByRole('region', { name: 'Selected trace', exact: true });
-    let file = join(p.repository, 'agent-eval/traces', step.request.traceId, 'trace.json');
+    const file = traceFile(p.repository, step.request.traceId);
+    let original = file.includes('#') ? JSON.stringify({ ...readTrace(p.repository, step.request.traceId), ...readTraceState(p.repository, step.request.traceId) }, null, 2) + '\n'
+      : readFileSync(file, 'utf8');
     if (step.number === 12) {
       assert(data.platformSnapshot, 'No independent saved platformSnapshot exists for this original Trace');
-      file = join(p.repository, 'agent-eval/traces', step.request.traceId, 'langfuse.json');
-      const saved = JSON.parse(readFileSync(file, 'utf8')) as { trace?: { facts?: { langfuseObservations?: unknown[] } } };
-      assert(saved.trace?.facts?.langfuseObservations?.length, 'No original saved Langfuse observation rows exist; no verified readback will be claimed');
+      const saved = readTraceState(p.repository, step.request.traceId).platformSnapshot;
+      assert(saved?.trace.facts.langfuseObservations && Array.isArray(saved.trace.facts.langfuseObservations) && saved.trace.facts.langfuseObservations.length,
+        'No original saved Langfuse observation rows exist; no verified readback will be claimed');
+      original = JSON.stringify(saved, null, 2) + '\n';
       await selected.getByRole('button', { name: 'Read saved platform snapshot JSON', exact: true }).click();
     } else await selected.getByRole('button', { name: 'Read original Trace JSON', exact: true }).click();
     const reader = loop.getByRole('region', { name: 'Original record reader', exact: true });
     await reader.getByLabel('Original JSON chunk', { exact: true }).waitFor();
     if (step.view === 'trace-trajectory') {
-      const key = step.number === 12 ? '"langfuseObservations"' : '"events"', original = readFileSync(file, 'utf8'), offset = original.indexOf(key);
+      const key = step.number === 12 ? '"langfuseObservations"' : '"events"', offset = original.indexOf(key);
       assert(offset >= 0, 'Requested original trajectory field is missing');
       await reader.getByLabel('Original character offset', { exact: true }).fill(String(Math.max(0, offset - 5)));
       await reader.getByRole('button', { name: 'Read original offset', exact: true }).click();
@@ -153,8 +157,7 @@ async function prepare(page: Page, step: CaptureStep, p: Parameters): Promise<{ 
     if (step.number === 14 || step.number === 16) {
       const candidate = data.candidate as { kind: string };
       assert(['gold', 'bad', 'regression'].includes(candidate.kind));
-      const file = join(p.repository, 'agent-eval/src/datasets', candidate.kind + '-candidates', step.request.candidateId, 'candidate.json');
-      const original = readFileSync(file, 'utf8'), parsed = JSON.parse(original) as Record<string, unknown>;
+      const original = JSON.stringify(readCandidate(p.repository, step.request.candidateId), null, 2) + '\n', parsed = JSON.parse(original) as Record<string, unknown>;
       await selected.getByRole('button', { name: 'Read original candidate JSON', exact: true }).click();
       const reader = loop.getByRole('region', { name: 'Original record reader', exact: true });
       await reader.getByLabel('Original JSON chunk', { exact: true }).waitFor();

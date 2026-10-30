@@ -15,6 +15,16 @@ import { exportEvents } from '../../src/langfuse/export.ts';
 const config = () => judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'anthropic', FLOWMATE_JUDGE_API: 'anthropic-messages', FLOWMATE_JUDGE_MODEL: 'claude-haiku-4-5',
     FLOWMATE_JUDGE_BASE_URL: 'https://example.com', FLOWMATE_JUDGE_API_KEY: 'sdk-report-judge-key' }, join(tmpdir(), 'no-judge-report-config'))!;
 const sdkCall = (usage?: unknown) => runJudge(config(), 'rubric', 'data', async () => judgeResponse({ content: [{ type: 'text', text: '{"score":1,"reason":"Original SDK result"}' }], stop_reason: 'end_turn', usage }));
+test('a final scoring report rejects an unterminated or submitted-only Judge call', async () => {
+    const call = await sdkCall();
+    for (const state of ['missing-end', 'submitted-only']) {
+        const report = modernReport(), altered = structuredClone(call);
+        if (state === 'missing-end') altered.endedAt = '';
+        else altered.lifecycle = 'submitted';
+        report.trials[0]!.judgeCalls = [altered];
+        expect(() => saveReport(join(mkdtempSync(join(tmpdir(), 'judge-final-state-')), 'report.json'), report)).toThrow();
+    }
+});
 function modernReport() {
     const report = reportFixture(); report.contract = 'flowmate-agent-run/v2';
     report.trials[0]!.metricPlan = [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 }];

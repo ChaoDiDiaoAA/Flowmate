@@ -13,15 +13,11 @@ import {scoringMetric} from '../diagnostic-plans.ts';
 import {calibrationCoverage} from '../judges/calibration-coverage.ts';
 import {publicJudgeConfig} from '../judges/client.ts';
 
-export async function evaluateSemantic(context: EvaluationContext): Promise<{ scores: EvaluationScore[]; judgeCalls: JudgeCall[] }> {
+export function prepareSemanticEvaluation(context: EvaluationContext, judgeEnabled = !!context.judge && !context.signal?.aborted): {
+    scores: EvaluationScore[]; eligiblePlan?: CompactPlan; evidence?: unknown;
+} {
     const { task, result } = context, plan = context.semanticPlan ?? ('contract' in task ? task.expected.semantic : undefined);
-    if (!plan) return { scores: [], judgeCalls: [] };
-    const finish=(scores:EvaluationScore[],judgeCalls:JudgeCall[])=>{
-        const call=judgeCalls[0];
-        const calibration=calibrationCoverage(context.calibration,call?.compact?.plan??plan,
-            call?.configuration??(context.judge?publicJudgeConfig(context.judge):undefined));
-        return{scores:scores.map(s=>s.method==='llm-judge'?{...s,calibration}:s),judgeCalls};
-    };
+    if (!plan) return { scores: [] };
     const selectedEvaluators=plan.criteria.map(c=>semanticEvaluator(c.metricId)).filter(def=>def.appliesTo(context));
     const ownedCriteria=selectedEvaluators.flatMap(def=>def.prepare!(context));
     if(plan.criteria.some(c=>!ownedCriteria.some(o=>o.metricId===c.metricId)&&metricAppliesTo(task,c.metricId)))
@@ -79,18 +75,17 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
             base.actual = {row,opportunities:measured.opportunities,locallyDerived:true,...(localFrameSaved?{}:{researchFrame})};
             localFrameSaved=true;
         }
-        else if (!context.judge || context.signal?.aborted) base.reason = context.signal?.aborted ? 'Judge 调用前已取消' : 'Judge 未配置或关闭';
+        else if (!judgeEnabled) base.reason = context.signal?.aborted ? 'Judge 调用前已取消' : 'Judge 未配置或关闭';
         else if (criterion.evidence.some(key => ['gold-reference', 'gold-research','gold-materials'].includes(key) && !facts[key]!.present) ||
             !criterion.evidence.some(key => !key.startsWith('gold-')&&(facts[key]!.present || facts[key]!.actual !== null))) {
             base.status = 'UNJUDGEABLE'; base.reason = '该语义判据的必要证据缺失或独立参考未核验';
         } else eligible.push({ ...criterion, required });
         scores.push(base);
     }
-    if (!eligible.length) return finish(scores,[]);
+    if (!eligible.length) return { scores };
     const selected = [...new Set(eligible.flatMap(c => c.evidence))];
     const selectedPlan:CompactPlan={...plan,criteria:eligible};
-    try{
-    const call = await runCompactJudge(context.judge!, selectedPlan, {
+    return { scores, eligiblePlan: selectedPlan, evidence: {
         input: result.input, outcome: { status: result.status, endpointReached: result.endpointReached, answer: result.answer },
         criteria: { success: task.expected.success, failure: task.expected.failure, expectedAnswerHint:task.expected.expectedAnswerHint,
             requiredCapabilities:task.expected.requiredCapabilities, optionalCapabilities:task.expected.optionalCapabilities, forbiddenCapabilities:task.expected.forbiddenCapabilities,
@@ -98,10 +93,26 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
             requiredResearchDimensions:task.expected.requiredResearchDimensions,
             turnRule:'Judge only actual submitted/accepted/consumed turns. Planned future text is not an executed user instruction.' },
         facts: Object.fromEntries(selected.map(key => [key, facts[key]])),...(eligible.some(c=>c.metricId.startsWith('DR'))?{researchFrame}:{})
-    }, context.fetcher, context.signal);
+    } };
+}
+
+export async function evaluateSemantic(context: EvaluationContext): Promise<{ scores: EvaluationScore[]; judgeCalls: JudgeCall[] }> {
+    const plan = context.semanticPlan ?? ('contract' in context.task ? context.task.expected.semantic : undefined);
+    if (!plan) return { scores: [], judgeCalls: [] };
+    const { scores, eligiblePlan, evidence } = prepareSemanticEvaluation(context);
+    const finish=(scores:EvaluationScore[],judgeCalls:JudgeCall[])=>{
+        const call=judgeCalls[0];
+        const calibration=calibrationCoverage(context.calibration,call?.compact?.plan??plan,
+            call?.configuration??(context.judge?publicJudgeConfig(context.judge):undefined));
+        return{scores:scores.map(s=>s.method==='llm-judge'?{...s,calibration}:s),judgeCalls};
+    };
+    if (!eligiblePlan) return finish(scores,[]);
+    try{
+    const call = await runCompactJudge(context.judge!, eligiblePlan, evidence, context.fetcher, context.signal, context.nativeJudgeRunner, context.onJudgeUpdate);
     const measured = compactScores(call).map(score=>semanticEvaluator(score.metricId).parseResult(score));
     return finish(scores.map(score => measured.find(m => m.metricId === score.metricId) ?? score),[call]);
     }catch(error){
-        return finish(scores.map(score=>eligible.some(c=>c.metricId===score.metricId)?{...score,status:'ERROR' as const,reason:error instanceof Error?error.message:String(error)}:score),[]);
+        if (error instanceof Error && 'evaluationPersistenceFailed' in error) throw error;
+        return finish(scores.map(score=>eligiblePlan.criteria.some(c=>c.metricId===score.metricId)?{...score,status:'ERROR' as const,reason:error instanceof Error?error.message:String(error)}:score),[]);
     }
 }

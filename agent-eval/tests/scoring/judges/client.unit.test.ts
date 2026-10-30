@@ -67,7 +67,7 @@ test('Anthropic uses the shared catalog and reuses prepared state for distinct s
         expect(new URL(url).pathname).toBe('/v1/messages');
         expect(new Headers(init.headers).get('x-api-key')).toBe('judge-key');
         const body = JSON.parse(String(init.body));
-        expect(body.max_tokens).toBe(64000);
+        expect(body.max_tokens).toBe(32768);
         expect(body).not.toHaveProperty('temperature');
         expect(body).not.toHaveProperty('tools');
         return answer('anthropic', text, 'end_turn', { input_tokens: 10, output_tokens: 8 });

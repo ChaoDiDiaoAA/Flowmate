@@ -50,7 +50,7 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
         if(metricId==='task-success'){
             if(result.status==='cancelled')return[null];
             if(controller&&controller.exposure?.verified!==true)return;
-            const required=context.gradedScores?.filter(s=>isRequiredScore(s)&&s.metricId!=='task-success');
+            const required=context.gradedScores?.filter(s=>isRequiredScore(s,context.scoringContext)&&s.metricId!=='task-success');
             if(!required?.length)return;
             const semantic=context.semanticPlan??task.expected.semantic;
             if(task.expected.metrics.some(m=>!m.notApplicable&&['completion-verification','false-completion'].includes(m.metricId)&&
@@ -195,7 +195,7 @@ export function evaluateFormalMetrics(context:EvaluationContext):EvaluationScore
         const mismatch=measured!==undefined&&denominator!==null&&measured.length>denominator;
         const missing=denominator===null?null:measured?Math.max(0,denominator-measured.length)+measured.filter(v=>v===null).length:denominator;
         const failure=measured?.some(v=>v===false)??false;
-        const witnessedFailure=failure&&(metric.id!=='task-success'||context.gradedScores?.some(s=>isRequiredScore(s)&&s.status==='FAIL'));
+        const witnessedFailure=failure&&(metric.id!=='task-success'||context.gradedScores?.some(s=>isRequiredScore(s,context.scoringContext)&&s.status==='FAIL'));
         const knownSuccess=missing===0&&denominator!==null&&denominator>0&&!failure;
         const status:EvaluationScore['status']=!result.started?'NOT_RUN':mismatch?'ERROR':witnessedFailure?'FAIL':knownSuccess?'PASS':result.error?.infrastructure?'ERROR':failure?'FAIL':'UNJUDGEABLE';
         return[{...base,status,value:status==='PASS'||status==='FAIL'&&missing===0?numerator!/denominator!:null,reason:mismatch?'原机会数超过事前声明分母':'原单位逐项核对；已知失败保留，缺证与未暴露不记成功',

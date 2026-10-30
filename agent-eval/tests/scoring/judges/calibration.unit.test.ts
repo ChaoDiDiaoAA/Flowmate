@@ -8,7 +8,7 @@ import {calibrateJudge,loadCalibration} from '../../../src/scoring/judges/calibr
 import * as calibration from '../../../src/scoring/judges/calibration.ts';
 import {runJudge,runCompactJudge} from '../../../src/scoring/judges/harness.ts';
 import {judgeConfig,publicJudgeConfig, type NativeJudgeConfig} from '../../../src/scoring/judges/client.ts';
-import {metricBusinessRubric,rubricsFor} from '../../../src/scoring/judges/compact.ts';
+import {metricBusinessRubric,rubricsFor,type CompactPlan} from '../../../src/scoring/judges/compact.ts';
 import {decodeJudgeInput,sharedTextEncoding} from '../../../src/scoring/judges/shared-text.ts';
 import {semanticEvaluator} from '../../../src/scoring/judges/evaluators.ts';
 
@@ -114,9 +114,9 @@ test('Judge calibration records a missed leakage as a false accept instead of re
  }finally{f.close();}
 });
 
-test('oversized HTTP input stays plain and a shared-text native calibration retains exactly its independent references',async()=>{
+test('oversized HTTP and native calibration inputs share text while retaining exactly their independent references',async()=>{
  const f=fixture();try{
-  const original='Independent original source statement with preserved detail.\n'.repeat(7000);
+  const original='Independent original source statement with preserved detail.\n'.repeat(4500);
   for(const name of ['tune','validation']){
    const path=join(f.directory,name+'.json'),document=JSON.parse(readFileSync(path,'utf8'));
    document.evidence={...document.evidence,original,copies:[original,original,original]};writeFileSync(path,JSON.stringify(document));
@@ -124,7 +124,9 @@ test('oversized HTTP input stays plain and a shared-text native calibration reta
   let httpCalls=0;
   const result=await calibrateJudge(f.root,{directory:f.directory,executionId:'shared-calibration'},{env,fetcher:async(_url,init)=>{
    httpCalls++;const data=JSON.parse(String(init.body)).messages[1].content,request=JSON.parse(data);
-   expect(data.length).toBeGreaterThan(1048576);expect(request.wireEncoding).toBeUndefined();expect(request.plan.criteria).toHaveLength(1);
+   expect(data.length).toBeLessThan(1048576);expect(request.wireEncoding).toBe(sharedTextEncoding);
+   const restored=decodeJudgeInput<{plan:CompactPlan;evidence:{original:string}}>(data,true);
+   expect(restored.plan.criteria).toHaveLength(1);expect(restored.evidence.original).toBe(original);
    return judgeResponse({choices:[{message:{content:JSON.stringify({v:1,results:[{metricId:'tool-arguments',counts:null,failures:[]}]})},finish_reason:'stop'}]});
   }});
   expect(httpCalls).toBe(2);

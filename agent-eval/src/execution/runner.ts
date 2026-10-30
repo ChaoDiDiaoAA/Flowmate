@@ -8,7 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { discoverDatasets, REPO_ROOT, caseConditions, caseFiles, resolveCase, restoreCaseInputs, selectCases, assertSemanticSelection, judgeSelection, type LocalDataset, type Check } from '../dataset-loader/local.ts';
 import { productAgent, createProductAgent, type AgentKernel } from '../adapters/agent.ts';
-import { prepareAgentConfig, type AgentModelCapabilities } from '../configuration.ts';
+import { prepareAgentConfig, evaluationEnv, type AgentModelCapabilities } from '../configuration.ts';
+import { resolveEvaluationBudgets, resolveTrialBudget } from './budgets.ts';
 import { runConfigSchema, parseRunConfig, evaluationRunDefaults } from './plan.ts';
 export { runConfigSchema, parseRunConfig, findDataset, createEvaluationPlan, sameEvaluationPlan } from './plan.ts';
 export {assertModelConfiguration} from '../adapters/agent.ts';
@@ -37,11 +38,13 @@ import { reportTraces } from './trace.ts';
 type TrialProgress = { index: number; total: number; caseId: string; trialId: string; trialIndex?: number; trialsPerCase?: number };
 export type EvaluationProgress =
     | { type: 'preflight' }
-    | { type: 'plan'; selection: 'smoke' | 'holdout' | 'full' | 'case'; total: number; caseCount?: number; trialsPerCase?: number; datasets: Array<{ id: string; total: number; caseCount?: number }> }
+    | { type: 'plan'; selection: 'smoke' | 'holdout' | 'full' | 'case'; total: number; caseCount?: number; trialsPerCase?: number;
+        evaluationBudgets?: import('../../../packages/contracts/src/evaluation-budget.ts').EvaluationBudgetProfiles;
+        datasets: Array<{ id: string; total: number; caseCount?: number }> }
     | { type: 'dataset-start'; datasetId: string; executionId: string; reportPath: string }
     | TrialProgress & { type: 'trial-phase'; phase: ExecutionPhase | 'restoring' | 'scoring' | 'saving' }
     | TrialProgress & { type: 'trial-cleanup'; executionId: string; stopConfirmed: boolean }
-    | TrialProgress & { type: 'agent-end'; status: ExecutionStatus; endpointReached?: boolean; reason?: string }
+    | TrialProgress & { type: 'agent-end'; status: ExecutionStatus; endpointReached?: boolean; reason?: string; errorCode?: string; infrastructure?: boolean }
     | TrialProgress & { type: 'scoring-end'; status: LocalReport['trials'][number]['status']; reason: string }
     | TrialProgress & { type: 'trial-end'; status: LocalReport['trials'][number]['status']; reason: string; elapsedMs: number; evidenceDirectory: string }
     | {type:'source-invalidated';datasetId:string;executionId:string;reason:string;paths:string[]}
@@ -57,7 +60,7 @@ function scoringProgressReason(trial: LocalReport['trials'][number]) {
     let summary='评分设施异常';
     if(semantic.length) {
         if(!call) summary=trial.execution?.error?.infrastructure?'执行设施异常，语义评分未运行':'必要语义评分未运行';
-        else if(call.error) summary=call.transportStatus===402?'Judge 计费不可用':[401,403].includes(call.transportStatus??0)?'Judge 认证失败':
+        else if(call.error) summary=call.errorCode==='judge_context_capacity'?'Judge 输入超出容量，未提交模型':call.transportStatus===402?'Judge 计费不可用':[401,403].includes(call.transportStatus??0)?'Judge 认证失败':
             /timeout/i.test(call.error)?'Judge 调用超时':/cancel|abort/i.test(call.error)?'Judge 调用已取消':
             call.stopReason==='length'?'Judge 返回被截断':call.responseComplete?'Judge 返回格式或指标身份不合法':'Judge 调用失败或返回未完成';
         else {
@@ -101,6 +104,8 @@ export async function runLocal(repo: string, options: {
     const isProductAgent = !deps.kernel || deps.kernel === productAgent;
     let kernel = deps.kernel ?? productAgent;
     let config: z.infer<typeof runConfigSchema> & { modelCapabilities?: AgentModelCapabilities } = parseRunConfig(options.config ?? {});
+    const evaluationBudgets = config.evaluationBudgets ?? resolveEvaluationBudgets(evaluationEnv(repo, deps.env ?? process.env));
+    config.evaluationBudgets = evaluationBudgets;
     const repeat = options.repeat ?? config.repeat ?? 1;
     if (!Number.isSafeInteger(repeat) || repeat < 1 || repeat > 20)
         throw new Error('Trials must be 1–20');
@@ -113,7 +118,8 @@ export async function runLocal(repo: string, options: {
     if (!ready.ready)
         throw new Error(ready.reason);
     notify({ type: 'plan', selection: options.caseId ? 'case' : options.selection ?? 'full', total: selected.length * repeat,
-        caseCount: selected.length, trialsPerCase: repeat, datasets: [{ id: dataset.manifest.id, total: selected.length * repeat, caseCount: selected.length }] });
+        caseCount: selected.length, trialsPerCase: repeat, evaluationBudgets,
+        datasets: [{ id: dataset.manifest.id, total: selected.length * repeat, caseCount: selected.length }] });
     assertSemanticSelection({ manifest: dataset.manifest, cases: selected }, options.judge === 'required');
     if (selected.some(c => c.expected.checks.some(check => check.metric === 'answer-relevance' || dataset.manifest.scoring.required.includes(check.metric))))
         throw new Error('Case cannot override common scoring or select Judge; configure Judges once in dataset.json');
@@ -154,7 +160,7 @@ export async function runLocal(repo: string, options: {
     if((snapshot.fact.actual as {leaked:boolean}).leaked)throw Error('Secret in declared configuration; refusing execution');
     writeArchivePart(snapshotReference(file), { ...snapshot.value, runtimeSource });
     const report: LocalReport = {
-        contract: 'flowmate-agent-run/v2', executionId, runId: readArchive(runFile).id, code,
+        contract: 'flowmate-agent-run/v2', statisticsPolicyVersion: 2, executionId, runId: readArchive(runFile).id, code,
         executionKind: isProductAgent && !deps.fetcher ? 'model' : 'controlled',
         dataset: { id: dataset.manifest.id, version: dataset.manifest.version,  subject: 'agent' },
         selection: options.caseId ? 'case' : options.selection ?? 'full', environment: config.environment ?? deps.env?.FLOWMATE_EVAL_ENVIRONMENT ?? process.env.FLOWMATE_EVAL_ENVIRONMENT ?? evaluationRunDefaults.environment, userId: deps.env?.FLOWMATE_EVAL_USER_ID ?? process.env.FLOWMATE_EVAL_USER_ID,
@@ -170,7 +176,8 @@ export async function runLocal(repo: string, options: {
                 partition: dataset.manifest.suite === 'badcase' ? 'badcase' : dataset.manifest.smoke.includes(task.id) ? 'smoke' :
                     dataset.manifest.holdout && !dataset.manifest.holdout.includes(task.id) ? 'full' : 'holdout', repetition, trialId, traceId: randomUUID().replaceAll('-',''),
                 ...(dataset.regressionOrigins?.[task.id] ? { regressionOrigins: structuredClone(dataset.regressionOrigins[task.id]) } : {}),
-                sessionId: 'Eval-' + trialId, status: 'NOT_RUN', reason: 'Planned', counts: {}, execution: null, scores: [], judgeCalls: [], feedback: 'none',
+                sessionId: 'Eval-' + trialId, status: 'NOT_RUN', reason: 'Planned', counts: {}, execution: null, scores: [], judgeCalls: [],
+                scoringState: 'pending', feedback: 'none',
                 metricPlan: 'contract' in task ? structuredClone(task.expected.metrics) : [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 }],
                 evaluatorPlan:compileEvaluatorPlan(task,[...dataset.manifest.scoring.required.map(metric=>({metric,required:true})),...task.expected.checks]),
                 ...('contract' in task && task.expected.semantic ? { semanticPlan: structuredClone(task.expected.semantic) } : {}) });
@@ -190,6 +197,7 @@ export async function runLocal(repo: string, options: {
                 elapsedMs: performance.now() - started, evidenceDirectory: `run.json#/executions/${executionId}/trials/${index}` });
         };
         const item = prepared.find(p => p.task.id === trial.caseId)!;
+        const executionBudget = resolveTrialBudget(item.task.requires, config, evaluationBudgets);
         if (stopReason || deps.signal?.aborted || !item.resolved) {
             trial.reason = item.error ?? stopReason ?? 'Execution stopped before this Trial';
             finishTrial();
@@ -208,7 +216,10 @@ export async function runLocal(repo: string, options: {
             ...(item.resolved.controllerInput?{controllerInput:item.resolved.controllerInput}:{}),
             ...(item.task.requires.includes('invoice') ? { invoiceSource: { root: inputs.invoiceRoot ?? join(repo, 'data/invoices/agent-input'), localRoot: inputs.localRoot, materials: item.task.input.materials,files:caseFiles(dataset,item.task) } } : {}),
             requires: item.task.requires, setup: item.task.setup, steps: item.task.steps, configuration: {...fixtureSelection(dataset,item.task,
-                deps.runtime?.mode === 'installed' ? deps.runtime.layout.runtimeRoot : repo),...config} }, config.timeoutMs ?? evaluationRunDefaults.timeoutMs, config.stopGraceMs ?? evaluationRunDefaults.stopGraceMs, deps.signal, phase);
+                deps.runtime?.mode === 'installed' ? deps.runtime.layout.runtimeRoot : repo),...config,
+                timeoutMs: executionBudget.runTimeoutMs, stopGraceMs: executionBudget.stopGraceMs,
+                budget: { ...config.budget, maxModelCalls: executionBudget.maxModelCalls }, evaluationBudget: executionBudget } },
+            executionBudget.trialTimeoutMs, executionBudget.stopGraceMs, deps.signal, phase, executionBudget);
         if (result.stopFailed) stopReason = 'Prior Trial stopping unconfirmed: ' + (result.execution.error?.message ?? 'Stop evidence missing');
         const cleanup = result.execution.evidence.cleanup;
         const stopConfirmed = !result.stopFailed && cleanup?.present && cleanup.actual !== null && typeof cleanup.actual === 'object' &&
@@ -216,24 +227,33 @@ export async function runLocal(repo: string, options: {
         notify({ type: 'trial-cleanup', ...identityProgress, executionId, stopConfirmed: !!stopConfirmed });
         if (stopConfirmed && result.execution.error?.infrastructure && ['provider_billing_failed', 'provider_auth_failed'].includes(result.execution.error.code))
             stopReason = 'Provider 计费或认证不可用；当前运行已停止，后续依赖题目未运行';
-        if(!result.stopFailed)rmSync(scene,{recursive:true,force:true});
-        else result.execution.evidence['retained-scene']={present:true,actual:{directory:scene},source:'Controller retains scene until stopping is confirmed'};
+        if(result.stopFailed) result.execution.evidence['retained-scene']={present:true,actual:{directory:scene},source:'Controller retains scene until stopping is confirmed'};
         trial.execution = result.execution;
-        notify({ type: 'agent-end', ...identityProgress, status: result.execution.status, endpointReached: result.execution.endpointReached, reason: result.execution.error?.message });
+        // Persist the original stopped execution before any Judge request or deletion of its temporary scene.
+        saveReport(file, report);
+        notify({ type: 'agent-end', ...identityProgress, status: result.execution.status, endpointReached: result.execution.endpointReached,
+            reason: result.execution.error?.message, errorCode: result.execution.error?.code, infrastructure: result.execution.error?.infrastructure });
         const checks: Check[] = [...dataset.manifest.scoring.required.map(metric => ({ metric, required: true })), ...item.task.expected.checks,
             ...dataset.manifest.scoring.judges.flatMap(j => j.id === 'answer-relevance'
                 ? [{ metric: j.id, required: j.required || !!j.requiredFor?.includes(item.task.id) || options.judge === 'required' }] : [])];
         phase('scoring');
         const scored = await evaluateAll({ task: item.task, result: result.execution, projected: result.projected, judge, fetcher: deps.fetcher, signal: deps.signal,
-            semanticPlan: trial.semanticPlan }, checks);
+            semanticPlan: trial.semanticPlan, onJudgeUpdate(call) {
+                trial.judgeCalls = [call];
+                trial.scoringState = call.lifecycle === 'submitted' ? 'submitted' : call.lifecycle === 'prepared' ? 'prepared' : 'pending';
+                try { saveReport(file, report); }
+                catch (error) { throw Object.assign(error instanceof Error ? error : Error(String(error)), { evaluationPersistenceFailed: true }); }
+            } }, checks);
         trial.scores = scored.scores;
         trial.judgeCalls = scored.judgeCalls;
+        trial.scoringState = 'complete';
         if (stopConfirmed && trial.judgeCalls.some(call => call.error && [401,402,403].includes(call.transportStatus ?? 0)))
             stopReason = 'Judge Provider 计费或认证不可用；当前运行已停止，后续依赖题目未运行';
-        Object.assign(trial, aggregate(trial.scores, result.execution));
+        Object.assign(trial, aggregate(trial.scores, result.execution, trial));
         const reason = scoringProgressReason(trial);
         notify({ type: 'scoring-end', ...identityProgress, status: trial.status, reason });
         finishTrial();
+        if(!result.stopFailed)rmSync(scene,{recursive:true,force:true});
     }
     report.endedAt = new Date().toISOString();
     report.scoring = 'complete';

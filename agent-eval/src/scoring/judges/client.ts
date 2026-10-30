@@ -4,12 +4,14 @@ import { evaluationEnv, agentApiSchema, agentModelCapabilitiesSchema, resolveMod
 import { registerSecrets } from '../../execution/evidence-safety.ts';
 import type { PreparedModelRuntime } from '../../../../packages/runtime-pi/src/model-runtime.ts';
 import packageJson from '../../../../package.json';
-import { generateJSON, NativeJSONError, nativeTextModelConfigSchema, type NativeTextModelConfig, type ProcessRunner } from '../../text-model/codex.ts';
+import { generateJSON, NativeJSONError, nativeTextModelConfigSchema, runProcess, type NativeTextModelConfig, type ProcessRunner } from '../../text-model/codex.ts';
+import { encodeSharedTextInput, nativeJudgeMaxInputChars, sharedTextEncoding } from './shared-text.ts';
 
 const configSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatible']).optional(), api: agentApiSchema,
     model: z.string().trim().min(1), baseUrl: z.string().url(), apiKey: z.string().trim().min(1),
     timeoutMs: z.number().int().positive().max(300000), modelCapabilities: agentModelCapabilitiesSchema.optional(),
-    reasoningEffort: nativeTextModelConfigSchema.shape.reasoningEffort.optional()
+    reasoningEffort: nativeTextModelConfigSchema.shape.reasoningEffort.optional(),
+    maxOutputTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional()
 }).strict().superRefine((config, context) => {
     const url = new URL(config.baseUrl);
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
@@ -23,6 +25,10 @@ export type JudgeConfig = HttpJudgeConfig | NativeJudgeConfig;
 type NativeJudgeConfiguration = Omit<NativeTextModelConfig, 'executable'> & { transport: 'codex-cli'; protocolVersion: string;
     rubric?: { id: string; version: number }; api?: never; sdk?: never; baseUrl?: never; modelCapabilities?: never };
 export type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
+export type JudgeCapacity = { inputChars: number; inputBytes: number; estimatedInputTokens: number | null; contextWindow: number | null;
+    outputBudget: number | null; actualMaxOutputTokens: number | null; inputEncoding: 'raw' | typeof sharedTextEncoding };
+export type JudgeRequestUpdate = { lifecycle: 'prepared' | 'submitted'; data: string; capacity: JudgeCapacity; submissionUnknown: boolean };
+type JudgeRequestOptions = { onUpdate?: (update: JudgeRequestUpdate) => void; sharedText?: boolean; inputEncoding?: typeof sharedTextEncoding };
 const prepared = new WeakMap<HttpJudgeConfig, { config: HttpJudgeConfig; model: PreparedModelRuntime }>();
 export function judgeConnection(value: unknown): JudgeConfig {
     if (value && typeof value === 'object' && 'provider' in value && value.provider === 'codex-cli') return nativeTextModelConfigSchema.parse(value);
@@ -47,6 +53,7 @@ export function judgeConfig(env: NodeJS.ProcessEnv, repo = REPO_ROOT, explicit?:
     if (!values[0] || !values[1] || !apiKey) throw Error('Incomplete FLOWMATE_JUDGE configuration; no Agent fallback');
     return judgeConnection({ api, provider: api === 'anthropic-messages' ? 'anthropic' : api.startsWith('openai-') ? 'openai-compatible' : undefined,
         model: values[0], baseUrl: values[1], apiKey, timeoutMs: Number(env.FLOWMATE_JUDGE_TIMEOUT_MS ?? 180000),
+        ...(env.FLOWMATE_JUDGE_MAX_OUTPUT_TOKENS !== undefined ? { maxOutputTokens: Number(env.FLOWMATE_JUDGE_MAX_OUTPUT_TOKENS) } : {}),
         ...(localKey && env.FLOWMATE_JUDGE_REASONING_EFFORT ? { reasoningEffort: env.FLOWMATE_JUDGE_REASONING_EFFORT } : {}) });
 }
 export function publicJudgeConfig(config: JudgeConfig, rubric?: { id: string; version: number; prompt: string }) {
@@ -86,13 +93,14 @@ export async function prepareJudge(config: JudgeConfig, fetcher: Fetcher = fetch
     const selected = configSchema.parse(config);
     return withJudgeTimeout(selected, signal, async signal => {
         const modelCapabilities = await resolveModelCapabilities(selected, selected.apiKey, undefined, { fetcher, signal, timeoutMs: selected.timeoutMs });
-        const resolved = { ...selected, modelCapabilities };
+        const resolved = { ...selected, maxOutputTokens: selected.maxOutputTokens ?? 32768, modelCapabilities };
         const { InMemoryCredentialStore } = await import('@earendil-works/pi-ai');
         const { prepareModelRuntime } = await import('../../../../packages/runtime-pi/src/model-runtime.ts');
         const model = await prepareModelRuntime({ version: 1, name: 'Evaluation Judge', revision: 1,
             modelRef: { provider: 'flowmate-judge', model: selected.model }, native: { authPath: 'flowmate-judge-in-memory', modelsPath: null },
             connection: { api: selected.api, baseUrl: selected.baseUrl, contextWindow: modelCapabilities.contextWindow,
-                maxTokens: modelCapabilities.transport?.maxTokens ?? modelCapabilities.maxTokens, reasoning: modelCapabilities.reasoning }, parameters: { maxRetries: 0, maxRetryDelayMs: 0 }
+                maxTokens: Math.min(selected.maxOutputTokens ?? 32768, modelCapabilities.maxTokens, modelCapabilities.transport?.maxTokens ?? modelCapabilities.maxTokens),
+                reasoning: modelCapabilities.reasoning }, parameters: { maxRetries: 0, maxRetryDelayMs: 0 }
         }, { timeoutMs: selected.timeoutMs, stopGraceMs: 0 }, signal,
         { credentials: new InMemoryCredentialStore(), runtimeApiKey: selected.apiKey });
         if (!model.ok) throw Error(model.error.message);
@@ -103,12 +111,30 @@ export async function prepareJudge(config: JudgeConfig, fetcher: Fetcher = fetch
 }
 export async function requestJudge(config: JudgeConfig, system: string, data: string, fetcher: Fetcher = fetch, signal?: AbortSignal,
     schema: Record<string, unknown> = { type: 'object', properties: { score: { type: 'number', minimum: 0, maximum: 1 }, reason: { type: 'string' } }, required: ['score', 'reason'], additionalProperties: false },
-    nativeRunner?: ProcessRunner) {
+    nativeRunner?: ProcessRunner, options: JudgeRequestOptions = {}) {
+    const { estimateContextTokens } = await import('@earendil-works/pi-ai/utils/estimate');
+    const estimate = (data: string) => estimateContextTokens([
+        { role: 'system', content: system, timestamp: 0 }, { role: 'user', content: data, timestamp: 0 },
+    ]).tokens;
+    const capacity: JudgeCapacity = { inputChars: data.length, inputBytes: Buffer.byteLength(data, 'utf8'), estimatedInputTokens: config.provider === 'codex-cli' ? null : estimate(data),
+        contextWindow: null, outputBudget: null, actualMaxOutputTokens: null, inputEncoding: options.inputEncoding ?? 'raw' };
+    let updateFailure: { error: unknown } | undefined, submissionUnknown = false;
+    const notify = (lifecycle: JudgeRequestUpdate['lifecycle']) => {
+        try { options.onUpdate?.({ lifecycle, data, capacity: { ...capacity }, submissionUnknown }); }
+        catch (error) { updateFailure = { error }; throw error; }
+    };
     if (config.provider === 'codex-cli') {
+        notify('prepared');
+        if (data.length > nativeJudgeMaxInputChars) throw Object.assign(Error('Native Judge input exceeds ' + nativeJudgeMaxInputChars +
+            ' characters after lossless projection; necessary evidence retained, no model submission'), { code: 'judge_context_capacity' });
         try {
-            const result = await generateJSON(config, { system, data, schema, signal }, { runner: nativeRunner });
+            const result = await generateJSON(config, { system, data, schema, signal }, { runner: async (executable, args, input) => {
+                if (args[0] === 'exec') notify('submitted');
+                return (nativeRunner ?? runProcess)(executable, args, input);
+            } });
             return { ...result, stopReason: 'stop' as const, rawStopReason: 'turn.completed', responseComplete: true, transportStatus: null, error: null };
         } catch (error) {
+            if (updateFailure) throw updateFailure.error;
             if (!(error instanceof NativeJSONError)) throw error;
             return { ...error.response, stopReason: 'stop' as const, rawStopReason: 'turn.completed', responseComplete: true, transportStatus: null, error: error.message };
         }
@@ -117,21 +143,42 @@ export async function requestJudge(config: JudgeConfig, system: string, data: st
     config = await prepareJudge(config, fetcher, signal) as HttpJudgeConfig;
     const { observedFetch, normalizeUsage } = await import('../../../../packages/runtime-pi/src/model-runtime.ts');
     const { runtime, model } = prepared.get(config)!.model;
+    capacity.contextWindow = model.contextWindow;
+    capacity.outputBudget = model.maxTokens;
+    const fits = () => capacity.estimatedInputTokens! + capacity.outputBudget! + 4096 <= capacity.contextWindow!;
+    if (!fits() && options.sharedText && capacity.inputEncoding === 'raw') {
+        data = encodeSharedTextInput(data);
+        Object.assign(capacity, { inputChars: data.length, inputBytes: Buffer.byteLength(data, 'utf8'), estimatedInputTokens: estimate(data), inputEncoding: sharedTextEncoding });
+    }
+    if (!fits()) {
+        notify('prepared');
+        throw Object.assign(Error('judge_context_capacity: estimated input ' + capacity.estimatedInputTokens + ' + output ' +
+        capacity.outputBudget + ' + safety reserve 4096 exceeds context window ' + capacity.contextWindow + '; full evidence retained, no model submission'),
+        { code: 'judge_context_capacity' });
+    }
     const gatewayEffort = localAgentCredential(config) ? config.reasoningEffort : undefined;
     let transportStatus:number|null=null;
+    const dispatchFetch = observedFetch(config.api, async (url, init) => {
+        const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        const limit = payload.max_completion_tokens ?? payload.max_tokens ?? payload.max_output_tokens;
+        capacity.actualMaxOutputTokens = typeof limit === 'number' ? limit : null;
+        notify('submitted');
+        const response=await fetcher(String(url),init??{});transportStatus=response.status;return response;
+    });
     try{return await withJudgeTimeout(config, signal, async signal => {
+        submissionUnknown = dispatchFetch === undefined;
+        notify('prepared');
         const message = await runtime.completeSimple(model, { systemPrompt: system,
             messages: [{ role: 'user', content: data, timestamp: Date.now() }] }, {
-            signal, timeoutMs: config.timeoutMs, maxRetries: 0,
+            signal, timeoutMs: config.timeoutMs, maxRetries: 0, maxTokens: capacity.outputBudget!,
             ...(config.reasoningEffort && config.reasoningEffort !== 'none' ? { reasoning: config.reasoningEffort } : {}),
             ...(gatewayEffort ? { onPayload: (payload: unknown) => {
                 if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw Error('Invalid local Judge payload');
                 // The SDK's unknown-model fallback lowers max to high; this gateway validates the exact configured effort.
                 return { ...payload, reasoning_effort: gatewayEffort };
             } } : {}),
-            fetch: observedFetch(config.api, async (url, init) => {
-                const response=await fetcher(String(url),init??{});transportStatus=response.status;return response;
-            }) });
+            fetch: dispatchFetch });
+        if (updateFailure) throw updateFailure.error;
         const blocks = message.content.filter(block => block.type === 'text');
         const responseComplete = message.stopReason === 'stop' && !message.errorMessage && !message.content.some(block => block.type === 'toolCall');
         return { text: blocks.length ? blocks.map(block => block.text).join('') : null, usage: message.usage,
@@ -139,5 +186,5 @@ export async function requestJudge(config: JudgeConfig, system: string, data: st
             responseModel: message.responseModel ?? null, stopReason: message.stopReason,
             rawStopReason: message.rawStopReason ?? null, responseComplete,transportStatus,
             error: signal.aborted ? (signal.reason as Error).message : message.errorMessage ?? null };
-    });}catch(error){throw Object.assign(error instanceof Error?error:Error(String(error)),{transportStatus});}
+    });}catch(error){if (updateFailure) throw updateFailure.error;throw Object.assign(error instanceof Error?error:Error(String(error)),{transportStatus});}
 }

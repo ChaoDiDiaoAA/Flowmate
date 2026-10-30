@@ -40,9 +40,11 @@ test('benchmark refuses a substituted model, effort or non-local control endpoin
 
 test('planned Trial slots never count as started, finished, scored or stopped execution', () => {
     const report = reportFixture(), planned = structuredClone(report.trials[0]!);
+    report.trials[0]!.scores.push({ ...report.trials[0]!.scores[0]!, metricId: 'false-completion', value: null, status: 'UNJUDGEABLE',
+        statistics: { unit: 'opportunity', numerator: 0, denominator: 0, missing: 0 } });
     planned.trialId = 'not-started'; planned.execution = null; planned.scores = []; planned.status = 'NOT_RUN';
     report.trials.push(planned);
-    expect(runProgress([report])).toMatchObject({ storedTrials: 2, startedTrials: 1, endedTrials: 1, stopConfirmedTrials: 1, scoredTrials: 1,
+    expect(runProgress([report])).toMatchObject({ storedTrials: 2, startedTrials: 1, endedTrials: 1, stopConfirmedTrials: 1, scoredTrials: 0, unjudgeableTrials: 1,
         judgeTasksSubmitted: 0, judgeTasksCompleted: 0, verifiedTrials: 0 });
     report.trials[0]!.execution!.evidence.cleanup = { present: false, actual: null, source: 'missing' };
     expect(runProgress([report]).stopConfirmedTrials).toBe(0);

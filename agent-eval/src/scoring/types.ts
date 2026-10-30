@@ -5,6 +5,7 @@ import type { runJudge } from './judges/harness.ts';
 import type { CompactPlan } from './judges/compact.ts';
 import type { CalibrationReport } from './judges/calibration.ts';
 import type { EvaluationCalibrationView } from '../../../packages/contracts/src/evaluation.ts';
+import { scoreAvailability, type ScoreAvailabilityContext } from './availability.ts';
 export type EvaluatorKind = 'deterministic' | 'llm-judge';
 type CurrentJudgeCall = Omit<Awaited<ReturnType<typeof runJudge>>, 'transportStatus'> & {transportStatus?:number|null};
 type LegacyJudgeCall = Omit<CurrentJudgeCall, 'configuration' | 'stopReason' | 'rawStopReason' | 'usageSource' | 'responseComplete' | 'request' | 'compact'> & {
@@ -39,8 +40,8 @@ export type EvaluationScore = {
     actual?: unknown;
     expected?: unknown;
 };
-export const isRequiredScore=(score:EvaluationScore)=>score.required&&score.status!=='NOT_APPLICABLE'&&
-    !(score.statistics?.numerator===0&&score.statistics.denominator===0&&score.statistics.missing===0);
+export const isRequiredScore=(score:EvaluationScore,context?:ScoreAvailabilityContext)=>score.required&&
+    !['not-applicable','no-opportunity'].includes(scoreAvailability(score,context).state);
 /** Evaluator provenance is additive; original wire/count validators compare the measurement itself. */
 export function scoreMeasurement(score:EvaluationScore|undefined){
     if(!score)return score;
@@ -48,6 +49,9 @@ export function scoreMeasurement(score:EvaluationScore|undefined){
     return measurement;
 }
 export type EvaluationContext = {
+    onJudgeUpdate?: import('./judges/harness.ts').JudgeCallUpdate;
+    nativeJudgeRunner?: import('../text-model/codex.ts').ProcessRunner;
+    scoringContext?: ScoreAvailabilityContext;
     gradedScores?: readonly EvaluationScore[];
     task: LocalCase;
     result: CaseExecutionResult;

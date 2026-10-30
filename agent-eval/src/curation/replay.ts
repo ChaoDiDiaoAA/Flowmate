@@ -22,7 +22,7 @@ export function createControlledReplay(repo: string, env?: NodeJS.ProcessEnv, de
       candidateDirectory(repo, candidate.kind, candidate.id), false, target.caseVersion, target.goldFiles, target.formalCase);
     const { report, file, stopped } = await runLocal(repo, { dataset, backend: 'local', judge: 'required', repeat: 1,
       executionId: 'candidate-replay-' + randomUUID(), config: { controlledReplay: true } }, { ...dependencies, env, signal });
-    const trial = report.trials[0], execution = trial?.execution, required = trial?.scores.filter(isRequiredScore) ?? [];
+    const trial = report.trials[0], execution = trial?.execution, required = trial?.scores.filter(score => isRequiredScore(score, trial)) ?? [];
     let status: 'PASS' | 'FAIL' | 'ERROR' | 'NOT_RUN';
     if (report.trials.length !== 1 || !execution?.started) status = 'NOT_RUN';
     else if (stopped || !report.executionComplete || report.scoring !== 'complete' || report.sourceInvalidation || execution.error?.infrastructure ||
@@ -38,6 +38,6 @@ export function createControlledReplay(repo: string, env?: NodeJS.ProcessEnv, de
       evidence: { executionId: report.executionId, report: file, stopped, executionComplete: report.executionComplete, scoring: report.scoring,
         sourceInvalidation: report.sourceInvalidation ?? null, trials: report.trials.map(trial => ({ trialId: trial.trialId, status: trial.status,
           started: trial.execution?.started ?? false, executionStatus: trial.execution?.status ?? null, error: trial.execution?.error ?? null, reason: trial.reason,
-          requiredScores: trial.scores.filter(isRequiredScore).map(score => ({ metricId: score.metricId, status: score.status })) })) } };
+          requiredScores: trial.scores.filter(score => isRequiredScore(score, trial)).map(score => ({ metricId: score.metricId, status: score.status })) })) } };
   };
 }

@@ -55,6 +55,7 @@ export function exportEvents(report: LocalReport): Event[] {
     const events: Event[] = [];
     const add = (type: string, body: Record<string, unknown>) => events.push({ type, body:publicVersions((body)), id: [report.executionId,type,body.id].join(':'), timestamp: report.startedAt });
     for (const trial of report.trials) {
+        if (trial.status === 'NOT_RUN' && trial.execution === null && !trial.scores.length && !trial.judgeCalls.length) continue;
         const execution = trial.execution;
         const configuration = execution?.configuration;
         const capabilities = agentModelCapabilitiesSchema.safeParse(configuration?.modelCapabilities);
@@ -204,9 +205,10 @@ async function exportOtelReport(report: LocalReport, path: string, repo: string,
             trialId: trial.trialId, caseId: trial.caseId, caseVersion: trial.caseVersion, ...scoreSummary(score) } })));
     const identities = [...nodes.map(node => node.id), ...scores.map(score => score.id)], accepted = new Set(previous.progress?.acceptedEventIds ?? []);
     const knownScores = new Set(previous.progress?.knownScoreIds ?? [...accepted].filter(id => scores.some(score => score.id === id)));
+    const submittedScores = new Set(previous.progress?.submittedScoreIds ?? []);
     if (!previous.target && (previous.progress || previous.backend === 'langfuse' && previous.status !== 'pending')) throw Error('Historical export target is unavailable; original receipts are read-only');
     if (previous.target && (!previous.progress || previous.progress.total !== identities.length) ||
-        [...accepted].some(id => !identities.includes(id)) || [...knownScores].some(id => !scores.some(score => score.id === id)))
+        [...accepted].some(id => !identities.includes(id)) || [...knownScores, ...submittedScores].some(id => !scores.some(score => score.id === id)))
         throw Error('Export progress differs from original OTEL observation identities');
     const connection = options.connection === undefined ? langfuseConfig(repo) : langfuseConnection(options.connection);
     const client = await platformClient(repo, connection);
@@ -219,7 +221,8 @@ async function exportOtelReport(report: LocalReport, path: string, repo: string,
         const record = (status: LocalReport['export']['status'], error?: string) => {
             const next: LocalReport['export'] = { backend: 'langfuse', status, target, url: target.baseUrl, error,
                 progress: { total: identities.length, acceptedEventIds: identities.filter(id => accepted.has(id)), rejectedEventIds: [],
-                    ...(scoreTimestamp ? { scoreTimestamp } : {}), knownScoreIds: scores.filter(score => knownScores.has(score.id)).map(score => score.id) } };
+                    ...(scoreTimestamp ? { scoreTimestamp } : {}), knownScoreIds: scores.filter(score => knownScores.has(score.id)).map(score => score.id),
+                    submittedScoreIds: [...submittedScores] } };
             writeExportState(path, next); report.export = next;
         };
         // Persist before sending: after any interruption, query visibility instead of duplicating v4 observations.
@@ -258,10 +261,15 @@ async function exportOtelReport(report: LocalReport, path: string, repo: string,
             for (const id of observationsMatch.matchedIds) accepted.add(id);
             failure = observationsMatch.complete ? undefined : observationsMatch.gaps.join('; ');
             await readScores();
-            const missing = scoreTimestamp ? scores.filter(score => !knownScores.has(score.id)) : [];
+            const unresolved = [...submittedScores].some(id => !knownScores.has(id));
+            const missing = scoreTimestamp && !unresolved ? scores.filter(score => !knownScores.has(score.id) && !submittedScores.has(score.id)) : [];
             if (missing.length) {
                 // Score identity also includes name and timestamp; never overwrite a remotely observed drift.
-                try { for (const score of missing) await client.api.scores.create(score, { maxRetries: 0 }); }
+                try { for (const score of missing) {
+                    submittedScores.add(score.id);
+                    record('partial', 'Score submission started; remote visibility unconfirmed');
+                    await client.api.scores.create(score, { maxRetries: 0 });
+                } }
                 catch (error) { failure = scanEvidence(String(error)).value; }
                 await readScores();
             }

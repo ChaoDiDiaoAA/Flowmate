@@ -141,3 +141,15 @@ test('derived F1 gaps count affected Trials instead of adding incompatible Claim
     r.trials[1]!.metricPlan![2] = { metricId: 'DR02', version: 1, unit: 'Gold Claim', notApplicable: 'Synthetic mismatched applicability' };
     expect(aggregateTrials(r).metrics.find(m => m.metricId === 'DR03')).toMatchObject({ value: null, notApplicable: 0, missing: 2 });
 });
+
+test('pending scoring checkpoints preserve original execution before F1 scores exist', () => {
+    const r = report(['UNJUDGEABLE']), trial = r.trials[0]!;
+    trial.metricPlan!.push({ metricId: 'DR01', version: 1, unit: '事实Claim', denominator: null },
+        { metricId: 'DR02', version: 1, unit: 'Gold Claim', denominator: 1 },
+        { metricId: 'DR03', version: 1, unit: '派生F1', denominator: null });
+    Object.assign(trial, { scoringState: 'prepared' });
+    expect(aggregateTrials(r).cases[0]).toMatchObject({ started: 1, planned: 1 });
+    expect(trial.execution!.started).toBe(true); expect(trial.scores).toEqual([]);
+    Object.assign(trial, { scoringState: 'complete' });
+    expect(() => aggregateTrials(r)).toThrow('Trial F1');
+});

@@ -31,18 +31,22 @@ export const EvaluationWorkflowRequestSchema = z.discriminatedUnion('action', [
   request('candidate.validate', { candidateId: uuid, expectedRevision: revision, replay: z.boolean().optional() }),
   request('candidate.review', { ...feedback, target: z.object({ kind: z.literal('candidate-review'), id: uuid, revision }).strict() }),
   request('candidate.publish', publication), request('benchmark.list', { ...paging }), request('benchmark.run', { selection: z.enum(['smoke', 'full']) }),
+  request('score.retry', { runId: id, operationId: uuid.optional(), trialId: id.optional(), failedOnly: z.literal(true) }),
+  request('score.list', { runId: id }),
+  request('score.show', { runId: id, revisionId: id, executionId: id, trialId: id.optional() }),
+  request('score.upload', { runId: id, revisionId: id }),
   // Domain services validate these JSON declarations with the existing authoring and experiment schemas before any side effect.
   request('experiment.preview', { plan: record }), request('experiment.run', { plan: record }),
-  request('experiment.list', { ...paging }), request('experiment.show', { experimentId: id }), request('experiment.compare', { experimentId: id }),
-  request('baseline.create', { experimentId: id, armId: id, baselineId: id.optional() }), request('baseline.list', { ...paging }),
-  request('gate.check', { baselineId: id, experimentId: id, armId: id, fullRelease: z.boolean().optional() }),
+  request('experiment.list', { ...paging }), request('experiment.show', { experimentId: id }), request('experiment.compare', { experimentId: id, scoringRevision: id.optional() }),
+  request('baseline.create', { experimentId: id, armId: id, baselineId: id.optional(), scoringRevision: id.optional() }), request('baseline.list', { ...paging }),
+  request('gate.check', { baselineId: id, experimentId: id, armId: id, fullRelease: z.boolean().optional(), scoringRevision: id.optional() }),
   request('record.read', { kind: WorkflowRecordReferenceSchema.shape.kind, id, part: z.enum(['record', 'platform', 'feedback']).optional(),
     experimentId: id.optional(), viewId: uuid.optional(), offset: count.optional(), limit: z.number().int().min(1).max(32000).optional() }),
 ]);
 export type EvaluationWorkflowRequest = z.infer<typeof EvaluationWorkflowRequestSchema>;
 export function isWorkflowReadOnly(action: EvaluationWorkflowRequest['action']): boolean {
   return ['settings.get', 'trace.list', 'trace.show', 'candidate.list', 'candidate.show', 'benchmark.list',
-    'experiment.preview', 'experiment.list', 'experiment.show', 'baseline.list', 'record.read'].includes(action);
+    'experiment.preview', 'experiment.list', 'experiment.show', 'baseline.list', 'record.read', 'score.list', 'score.show'].includes(action);
 }
 export const EVALUATION_WORKSPACE_UNAVAILABLE_REASON = 'Evaluation loop writes require an explicit repository workspace. This installed build has no repository binding; capture, upload, mining and candidate/experiment writes are unavailable. Saved Benchmark reports and their Export remain available.';
 
@@ -74,6 +78,7 @@ const experiment = z.object({ contract: z.literal('flowmate-experiment/v1'), id,
   arms: z.array(z.object({ id, status: z.enum(['pending', 'running', 'complete', 'blocked', 'stopped']), executionIds: z.array(id),
     reason: text.optional(), runtimeRepository: text.optional(), sourceCommit: text.optional() }).strict()), reason: text.optional() }).strict();
 const baseline = z.object({ contract: z.literal('flowmate-baseline/v1'), id, createdAt: z.string().datetime(), experimentId: id, armId: id,
+  scoringRevision: id.optional(),
   executionIds: z.array(id), plan: record, conditions: z.array(z.unknown()), evidenceKind: z.enum(['model', 'controlled', 'unknown']),
   reference:baselineReferenceSchema.optional(),thresholds:gateThresholdsSchema.optional() }).strict();
 const baselineSummary = baseline.omit({ conditions: true,reference:true }).extend({ projection: z.literal('summary'), conditionCount: count,
@@ -91,6 +96,7 @@ const preview = z.object({ plan: record, attribution: z.enum(['single-axis', 'co
   datasets: z.array(z.object({ id, revision, caseIds: z.array(text), regressionCaseIds: z.array(text), caseCount: count, total: count }).strict()),
   caseCount: count, totalTrials: count }).strict();
 const gate = z.object({ id: id.optional(), baselineId: id.optional(), experimentId: id.optional(), armId: id.optional(),
+  scoringRevision: id.optional(),
   status: z.enum(['pass', 'fail', 'blocked']), exitCode: z.union([z.literal(0), z.literal(1), z.literal(2)]), fullRelease: z.boolean(),
   scope: record, reasons: z.array(record), deltas: z.array(record) }).strict();
 const gateSummary = gate.extend({ projection: z.literal('summary'), reasonCount: count, deltaCount: count, record: WorkflowRecordReferenceSchema }).strict();
@@ -99,7 +105,12 @@ const result = <const A extends string, S extends z.ZodTypeAny>(action: A, data:
 const traceView = z.union([TraceBundleSchema, WorkflowTraceSummarySchema]);
 const candidateView = z.union([candidate, WorkflowCandidateSummarySchema]);
 const feedbackView = z.union([feedbackRecord, feedbackSummary]);
+export const EvaluationRunProgressSchema = z.object({ storedTrials: count, startedTrials: count, endedTrials: count, stopConfirmedTrials: count,
+      scoredTrials: count, processedTrials: count.optional(), scoringErrorTrials: count.optional(), unjudgeableTrials: count.optional(),
+      judgeTasksPrepared: count.optional(), judgeTasksEnded: count.optional(), judgeTasksUnknown: count.optional(),
+      judgeTasksSubmitted: count, judgeTasksCompleted: count, verifiedTrials: count }).strict();
 export const EvaluationWorkflowResultSchema = z.discriminatedUnion('action', [
+  result('score.retry', record), result('score.list', record), result('score.show', record), result('score.upload', record),
   result('settings.get', settingsView), result('settings.save', settingsView),
   result('trace.list', z.object({ items: z.array(traceView), page: EvaluationReadPageSchema.optional(), viewId: uuid.optional(), saved: count.optional(), gaps: z.array(text).optional() }).strict()),
   result('trace.pull', z.object({ items: z.array(traceView), page: EvaluationReadPageSchema.optional(), viewId: uuid.optional(), saved: count.optional(), gaps: z.array(text).optional() }).strict()),
@@ -116,12 +127,11 @@ export const EvaluationWorkflowResultSchema = z.discriminatedUnion('action', [
   result('candidate.publish', z.object({ publication: publicationRecord }).strict()),
   result('benchmark.list', z.object({ items: z.array(z.union([publicationRecord, publicationSummary])), page: EvaluationReadPageSchema.optional(), viewId: uuid.optional() }).strict()),
   result('benchmark.run', z.object({ run: z.object({ runId: id, selection: z.enum(['smoke', 'full']), expectedCases: count, plannedTrials: count,
-    observedTrials: count, progress: z.object({ storedTrials: count, startedTrials: count, endedTrials: count, stopConfirmedTrials: count,
-      scoredTrials: count, judgeTasksSubmitted: count, judgeTasksCompleted: count, verifiedTrials: count }).strict().optional(),
+    observedTrials: count, progress: EvaluationRunProgressSchema.optional(),
     executionComplete: z.boolean(), scoringComplete: z.boolean(), exportComplete: z.boolean(), gate: z.enum(['pass', 'fail', 'blocked']),
     exitCode: z.union([z.literal(0), z.literal(1), z.literal(2)]), reportPath: text, readmePath: text }).strict() }).strict()),
   result('experiment.preview', z.object({ preview }).strict()),
-  result('experiment.run', z.object({ experiment }).strict()), result('experiment.show', z.object({ experiment }).strict()),
+  result('experiment.run', z.object({ experiment, progress: EvaluationRunProgressSchema.optional() }).strict()), result('experiment.show', z.object({ experiment, progress: EvaluationRunProgressSchema.optional() }).strict()),
   result('experiment.list', z.object({ items: z.array(z.union([experiment, experiment.extend({ projection: z.literal('summary') }).strict()])),
     page: EvaluationReadPageSchema.optional(), viewId: uuid.optional() }).strict()),
   result('experiment.compare', z.object({ comparisons: z.array(record) }).strict()),

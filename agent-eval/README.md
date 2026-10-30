@@ -2,7 +2,7 @@
 
 [评测指南](../docs/public/EVALUATION.zh-CN.md) · [基准制作](../docs/public/EVALUATION-BENCHMARK.zh-CN.md) · [Langfuse 评测与问题定位操作指南](Langfuse评测与问题定位操作指南.md) · [源码职责](src/README.md)
 
-通过隔离本机 Host 执行真实产品任务，将原始执行、业务交付、质量评分和回归比较保存在同一次 Run 中。Langfuse 用于观察实际模型、工具、子 Agent 和评分；本地保存的原始证据用于复核比较与 Gate。
+通过隔离本机 Host 执行真实产品任务，将原始执行、业务交付、质量评分和回归比较保存在同一次 Run 中。实际 Smoke／Full 结果、Full 中断与续跑边界及网页操作见上方中文指南。Langfuse 用于观察实际模型、工具、子 Agent 和评分；本地保存的原始证据用于复核比较与 Gate。
 
 ## 两个运行入口
 
@@ -174,3 +174,24 @@ bun --no-env-file run eval -- judge calibrate --dir <独立参考目录> --execu
 ```
 
 第一条检查单项，第二条按参考中声明的组合合并评分。参考必须保留 tune／validation、来源组和 `agent-authored`／`human-reference` 身份。工程样例和模拟传输通过不代表真实语义校准或人工批准。
+
+## 执行预算与评分故障恢复
+
+预算是 Run 的执行条件，不改变 Case、Gold 或评分标准。业务默认 Trial 600 秒、单 Run 180 秒、模型调用 16 次；研究默认分别为 900 秒、300 秒、24 次。准备和停止后的采证各 60 秒，停止确认沿用 5 秒。环境变量 `FLOWMATE_EVAL_BUSINESS_*`／`FLOWMATE_EVAL_RESEARCH_*` 可覆盖 `TRIAL_TIMEOUT_MS`、`RUN_TIMEOUT_MS`、`MAX_MODEL_CALLS`，同一实验两模型共用解析值。显式旧 `timeoutMs` 仍约束整题的业务执行，指定 `trialTimeoutMs` 后才分开；已确认研究 Plan 的预算继续生效，不被控制器改写。
+
+Judge 默认输出预算为 32768 token，受模型和传输上限约束。发送前核对输入估算、输出预留和安全余量；过大时只使用既有 shared-text 无损共享编码。仍放不下则记录 `judge_context_capacity`，不提交模型、不截断关键证据、不拆分多次评分。
+
+执行及停止事实先保存，再提交 Judge。显示分别区分执行结束、评分处理结束、必要评分充分、评分错误／证据不足和平台核对。完整证据证明没有机会时保留空比例及原计数；ERROR、未知采证和一侧零机会不能被当成通过。历史统计摘要按其原规则校验并保留，新记录使用 `statisticsPolicyVersion: 2`；旧统计不证明当前 Gate 可比。
+
+评分设施错误需要明确补评分。只有 `score retry` 调用 Judge，**不会重跑 Agent**；`score list/show` 只读，`score upload` 只上传已保存的分数。保留并复用操作 UUID，查询未知结果时不另建操作：
+
+```powershell
+bun --no-env-file run eval -- score retry --run-id <RunId> --failed-only --operation-id <UUID>
+bun --no-env-file run eval -- score list --run-id <RunId>
+bun --no-env-file run eval -- score show --run-id <RunId> --revision-id <RevisionId> --execution-id <ExecutionId>
+bun --no-env-file run eval -- score upload --run-id <RunId> --revision-id <RevisionId>
+```
+
+可用 `--trial <TrialId>` 限定补评分。新结果保存在同一 `run.json.scoringRevisions`，原执行、分数与 Judge 不覆盖；默认查看 Original，不自动选最新或最高分。比较、Baseline 和 Gate 使用修订时明确传 `--scoring-revision <RevisionId>`。条件不兼容仍 blocked。
+
+修订上传只向已核对的原 Trace 添加带修订身份的 Score，不重传观察树。写入状态未知时回读原身份，不盲重发。接口不执行自动 Agent 断点续跑、额外校准或案例发布。

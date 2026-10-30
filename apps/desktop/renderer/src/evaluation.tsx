@@ -233,9 +233,10 @@ export function EvaluationPage({ desktop, control, revision, onControl, onModels
   }
   async function makePreview() {
     const ticket = generation.current, numbers = Object.fromEntries(Object.entries(limits).filter(([, value]) => value.trim()).map(([key, value]) => [key, Number(value)]));
-    const { timeoutMs, stopGraceMs, ...budget } = numbers;
+    const { timeoutMs, trialTimeoutMs, stopGraceMs, ...budget } = numbers;
     const request = EvaluationPreviewRequestSchema.safeParse({ datasetId, selection, ...(selection === 'case' ? { caseId } : {}), repeat: Number(repeat), judge,
       configuration: { ...(timeoutMs === undefined ? {} : { timeoutMs }), ...(stopGraceMs === undefined ? {} : { stopGraceMs }),
+        ...(trialTimeoutMs === undefined ? {} : { trialTimeoutMs }),
         ...(environment.trim() ? { environment: environment.trim() } : {}), ...(Object.keys(budget).length ? { budget } : {}) } });
     if (!request.success) { setMessage('Check the registered Dataset, Case, repetition count and run limits.'); return; }
     const result = await window.flowmate.previewEvaluation(request.data); if (ticket !== generation.current) return;
@@ -275,7 +276,7 @@ export function EvaluationPage({ desktop, control, revision, onControl, onModels
           <label className="field"><span>Judge mode</span><select aria-label="Judge mode" value={judge} onChange={event => change(() => setJudge(event.target.value))}><option value="auto">Auto</option><option value="required">Required when applicable</option><option value="off">Off · required unmeasured stays unmet</option></select></label>
           <label className="field full"><span>Environment</span><input value={environment} maxLength={80} placeholder="Shared default" spellCheck={false}
             onChange={event => change(() => setEnvironment(event.target.value))} /></label>
-          <details className="field full"><summary>Run limits</summary><div className="form-grid">{[['maxModelCalls', 'Model requests'], ['maxToolCalls', 'Tool calls'], ['toolTimeoutMs', 'Tool timeout (ms)'], ['timeoutMs', 'Run timeout (ms)'], ['stopGraceMs', 'Stop wait (ms)']].map(([key, label]) =>
+          <details className="field full"><summary>Run limits</summary><div className="form-grid">{[['maxModelCalls', 'Model requests'], ['maxToolCalls', 'Tool calls'], ['toolTimeoutMs', 'Tool timeout (ms)'], ['trialTimeoutMs', 'Trial timeout (ms)'], ['timeoutMs', 'Agent run timeout (ms)'], ['stopGraceMs', 'Stop wait (ms)']].map(([key, label]) =>
             <label className="field" key={key}><span>{label}</span><input type="number" min={1} step={1} value={limits[key!] ?? ''} placeholder="Shared default" onChange={event => change(() => setLimits({ ...limits, [key!]: event.target.value }))} /></label>)}</div></details>
           <button className="secondary-button" disabled={!catalog?.items.length} onClick={() => void action(makePreview)}>Preview evaluation</button>
           <button className="text-button" disabled={selection !== 'case' || !caseId || datasetId === 'all'} onClick={() => void action(() => inspect())}>Inspect Case</button>
@@ -283,6 +284,14 @@ export function EvaluationPage({ desktop, control, revision, onControl, onModels
         {preview && <section aria-label="Evaluation preview"><h3>Run preview</h3><p>{preview.plan.caseCount} Cases · {preview.plan.total} Trials · Judge calls: at most {preview.plan.judgeMaxGenerations}</p>
           <p>Cost: unknown. Backend: local. Required Judge: {preview.plan.judgeRequired ? 'yes' : 'no'}.</p>
           <p>Native model capabilities are resolved on explicit startup. No model or platform request is made by this preview.</p>
+          <details><summary>Resolved evaluation budgets</summary>
+            {preview.plan.configuration.evaluationBudgets && <pre>{json(preview.plan.configuration.evaluationBudgets)}</pre>}
+            <div className="evaluation-table-wrap"><table aria-label="Evaluation budgets by Case"><thead><tr><th>Case / profile</th><th>Trial timeout</th><th>Agent run timeout</th><th>Model requests</th><th>Prepare / capture</th><th>Stop wait / source</th></tr></thead>
+              <tbody>{preview.plan.datasets.flatMap(dataset => dataset.cases.map(task => <tr key={dataset.id + '/' + task.caseId}><td>{task.caseId}<p>{task.evaluationBudget?.profile ?? 'unknown'}</p></td>
+                <td>{task.evaluationBudget ? task.evaluationBudget.trialTimeoutMs + ' ms' : 'unknown'}</td><td>{task.evaluationBudget ? task.evaluationBudget.runTimeoutMs + ' ms' : 'unknown'}</td>
+                <td>{task.evaluationBudget?.maxModelCalls ?? 'unknown'}</td><td>{task.evaluationBudget ? task.evaluationBudget.prepareTimeoutMs + ' / ' + task.evaluationBudget.captureTimeoutMs + ' ms' : 'unknown'}</td>
+                <td>{task.evaluationBudget ? task.evaluationBudget.stopGraceMs + ' ms / ' + task.evaluationBudget.source : 'unknown'}</td></tr>))}</tbody></table></div>
+          </details>
           {preview.issues.map((issue, index) => <p role="alert" key={index}>{issue}</p>)}<details><summary>Members, scoring and run conditions</summary><pre>{json({ plan: preview.plan, models: preview.settings })}</pre></details></section>}
         <button className="primary-button" disabled={!preview?.ready || blocked || working} onClick={() => void action(start)}>Start evaluation</button>
       </section>
